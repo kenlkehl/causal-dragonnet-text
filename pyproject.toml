@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cdt-causal"
+version = "0.1.0"
+description = "Causal inference from clinical text using DragonNet"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Ken Kehl", email = "kenneth_kehl@dfci.harvard.edu"}
+]
+keywords = ["causal inference", "machine learning", "clinical text", "nlp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+]
+
+dependencies = [
+    "torch>=2.0.0",
+    "sentence-transformers>=2.2.0",
+    "pandas>=1.5.0",
+    "numpy>=1.23.0",
+    "scikit-learn>=1.2.0",
+    "tqdm>=4.65.0",
+    "pyarrow",
+    "joblib>=1.2.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "mypy>=1.0.0",
+]
+
+[project.scripts]
+cdt = "cdt.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/kenlkehl/causal-dragonnet-text"
+Documentation = "https://github.com/kenlkehl/causal-dragonnet-text"
+Repository = "https://github.com/kenlkehl/causal-dragonnet-text"
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310']
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false

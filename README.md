@@ -1,0 +1,319 @@
+# Causal DragonNet Text (CDT)
+
+A framework for clinical causal inference using electronic health record (EHR) text as the primary input. CDT estimates treatment effects from unstructured clinical narratives by learning confounder representations directly from text.
+
+## Clinical Research Objective
+
+Observational studies using EHR data are essential for comparative effectiveness research when randomized trials are infeasible or unethical. However, standard approaches rely on structured covariates (diagnoses, labs, demographics) which may fail to capture critical confounders documented only in clinical notes—such as functional status, symptom severity, patient preferences, or nuanced disease characteristics.
+
+CDT addresses this gap by:
+- **Extracting confounders from clinical text** using sentence embeddings and learnable confounder representations
+- **Estimating treatment effects** using a DragonNet architecture that jointly models propensity scores and potential outcomes
+- **Validating methods via plasmode simulation** to assess sensitivity to unmeasured confounding and model misspecification
+
+This enables researchers to leverage the rich information in clinical narratives for causal inference while providing tools to evaluate the robustness of their estimates.
+
+## How It Works
+
+### Architecture Overview
+
+CDT processes clinical text through three stages:
+
+1. **Text Embedding**: Clinical notes are chunked and embedded using a sentence transformer (default: `all-MiniLM-L6-v2`)
+
+2. **Confounder Extraction**: A feature extractor learns to identify confounder-relevant patterns from embeddings using:
+   - Learnable latent confounders (data-driven patterns)
+   - Optional explicit confounders (user-specified clinical queries like "What is the patient's performance status?")
+
+3. **Causal Inference**: A DragonNet model takes the extracted confounders and jointly predicts:
+   - Treatment propensity P(T=1|X)
+   - Potential outcomes E[Y|T=0,X] and E[Y|T=1,X]
+   - Individual treatment effects (ITE) as the difference in potential outcomes
+
+### Workflow Modes
+
+#### Applied Inference
+
+For estimating treatment effects on real clinical data:
+
+```
+Clinical Text → Embeddings → Confounder Features → DragonNet → Treatment Effect Estimates
+```
+
+The system supports:
+- **K-fold cross-validation**: Out-of-sample predictions across all data
+- **Fixed train/val/test splits**: When data comes pre-split
+
+#### Plasmode Simulation
+
+Plasmode simulation generates synthetic outcomes while preserving the real covariate (text) distribution. This enables:
+
+- **Method validation**: Test if your model can recover known treatment effects
+- **Sensitivity analysis**: Assess robustness across different outcome-generating processes
+
+The plasmode workflow:
+1. Train a "generator" model on real data to learn confounder representations
+2. Generate synthetic outcomes with known true treatment effects using the learned confounders
+3. Train an "evaluator" model on the synthetic data
+4. Compare estimated effects to ground truth
+
+Available generation modes:
+- `phi_linear`: Linear relationship between confounders and outcomes
+- `deep_nonlinear`: Deep neural network outcome model
+- `uplift_nonlinear`: Linear baseline with nonlinear treatment effect heterogeneity
+
+#### Multi-Treatment Pretraining
+
+When labeled data for your target treatment comparison is limited, you can pretrain on a larger dataset with multiple treatments. This learns general confounder representations that transfer to the binary treatment setting.
+
+Pretraining → Applied Inference (with pretrained weights) → [Optional: Plasmode Validation]
+
+## Installation
+
+### Prerequisites
+
+- Python 3.8+
+- CUDA-capable GPU (recommended for practical use)
+
+### Clone the Repository
+
+```bash
+git clone https://github.com/kenlkehl/causal-dragonnet-text.git
+cd causal-dragonnet-text
+```
+
+### Install uv (Recommended Package Manager)
+
+[uv](https://github.com/astral-sh/uv) is a fast Python package manager. Install it via:
+
+```bash
+# On macOS/Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Or with pip
+pip install uv
+```
+
+### Create Environment and Install
+
+```bash
+# Create a virtual environment
+uv venv --python 3.10
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# Install CDT in editable mode
+uv pip install -e .
+
+# For development (includes testing/linting tools)
+uv pip install -e ".[dev]"
+```
+
+### Alternative: Standard pip Installation
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+## Dataset Requirements
+
+CDT expects datasets in Parquet or CSV format with specific columns depending on your workflow.
+
+### Binary Causal Inference (Applied Inference)
+
+Required columns:
+
+| Column | Description | Type |
+|--------|-------------|------|
+| `clinical_text` | The clinical narrative text | string |
+| `treatment_indicator` | Binary treatment assignment (0 or 1) | int/float |
+| `outcome_indicator` | Binary outcome (0 or 1) | int/float |
+| `split` | Data split: "train", "val", "test" | string |
+
+The `split` column is required for fixed-split mode but optional for cross-validation mode (where all data is used and split automatically).
+
+Example:
+```
+| clinical_text                          | treatment_indicator | outcome_indicator | split |
+|----------------------------------------|---------------------|-------------------|-------|
+| "58yo male with stage IV NSCLC..."     | 1                   | 0                 | train |
+| "Patient presents with dyspnea..."     | 0                   | 1                 | train |
+| "History of smoking, 40 pack-years..." | 1                   | 1                 | test  |
+```
+
+### Multi-Treatment Pretraining
+
+For pretraining on multi-treatment data, use these columns:
+
+| Column | Description | Type |
+|--------|-------------|------|
+| `clinical_text` | The clinical narrative text | string |
+| `treatment` | Treatment category (can be string or integer) | any |
+| `outcome_indicator` | Binary outcome (0 or 1) | int/float |
+
+The `treatment` column can have any number of unique values representing different treatments.
+
+## Running Experiments
+
+### Basic Usage
+
+```bash
+# Generate a default configuration file
+cdt init --output my_config.json
+
+# Edit my_config.json to set your dataset paths and parameters
+
+# Run the experiment
+cdt run --config my_config.json
+```
+
+### Configuration Structure
+
+A configuration file controls all aspects of the experiment:
+
+```json
+{
+  "output_dir": "./results",
+  "seed": 42,
+  "device": "cuda:0",
+  "num_workers": 1,
+  "cache_dir": "./cache",
+
+  "pretraining": {
+    "enabled": false,
+    "dataset_path": "./pretrain_data.parquet",
+    "treatment_column": "treatment"
+  },
+
+  "applied_inference": {
+    "dataset_path": "./analysis_data.parquet",
+    "text_column": "clinical_text",
+    "outcome_column": "outcome_indicator",
+    "treatment_column": "treatment_indicator",
+    "split_column": "split",
+    "cv_folds": 5,
+    "use_pretrained_weights": true,
+
+    "architecture": {
+      "num_latent_confounders": 20,
+      "features_per_confounder": 4
+    },
+
+    "training": {
+      "epochs": 50,
+      "batch_size": 8,
+      "learning_rate": 0.0001
+    }
+  },
+
+  "plasmode_experiments": {
+    "enabled": false,
+    "num_repeats": 3,
+    "plasmode_scenarios": [
+      {"generation_mode": "phi_linear", "target_ate_logit": 0.5}
+    ]
+  }
+}
+```
+
+### Key Configuration Options
+
+**Applied Inference:**
+- `cv_folds`: Set to >1 for cross-validation, or 0/1 for fixed train/val/test splits
+- `use_pretrained_weights`: Whether to initialize from pretraining (requires pretraining to be run first)
+- `num_latent_confounders`: Number of learnable confounder patterns
+- `explicit_confounder_texts`: Optional list of clinical questions to guide confounder extraction
+
+**Plasmode:**
+- `generation_mode`: How synthetic outcomes are generated
+- `target_ate_logit`: The true average treatment effect (on logit scale) to simulate
+- `num_repeats`: Number of simulation replicates per scenario
+
+### CLI Options
+
+```bash
+cdt run --config config.json \
+    --device cuda:1 \           # Override GPU device
+    --workers 4 \               # Parallel workers for CV folds
+    --output-dir ./my_results \ # Override output directory
+    --skip-pretraining \        # Skip pretraining phase
+    --skip-plasmode \           # Skip plasmode experiments
+    --verbose                   # Enable debug logging
+```
+
+## Output Files
+
+After running, results are saved to the output directory:
+
+```
+output_dir/
+├── config.json                    # Copy of experiment configuration
+├── summary.json                   # High-level results summary
+├── applied_inference/
+│   ├── predictions.parquet        # Per-sample treatment effect estimates
+│   └── training_log.csv           # Training metrics per epoch
+└── plasmode_experiments/          # (if enabled)
+    ├── results.csv                # Aggregated plasmode metrics
+    └── simulated_datasets/        # (if save_datasets=true)
+```
+
+The `predictions.parquet` file contains:
+- `y0_pred`: Predicted outcome probability under control
+- `y1_pred`: Predicted outcome probability under treatment
+- `ite_pred`: Individual treatment effect (y1_pred - y0_pred)
+- `propensity_pred`: Predicted probability of receiving treatment
+- `cv_fold`: Which cross-validation fold (if using CV)
+
+## Example Workflows
+
+### Simple Binary Treatment Analysis
+
+```bash
+# 1. Create config
+cdt init -o simple_config.json
+
+# 2. Edit simple_config.json:
+#    - Set applied_inference.dataset_path to your data
+#    - Set cv_folds: 5 for cross-validation
+#    - Disable pretraining and plasmode
+
+# 3. Run
+cdt run --config simple_config.json
+```
+
+### Full Pipeline with Pretraining and Validation
+
+```bash
+# 1. Create config with all features enabled
+cdt init -o full_config.json
+
+# 2. Edit full_config.json:
+#    - Enable pretraining, set dataset_path
+#    - Configure applied_inference
+#    - Enable plasmode_experiments with multiple scenarios
+
+# 3. Run complete pipeline
+cdt run --config full_config.json --workers 4
+```
+
+## Citation
+
+If you use CDT in your research, please cite:
+
+```bibtex
+@software{cdt2024,
+  author = {Kehl, Ken},
+  title = {Causal DragonNet Text: Clinical Causal Inference from EHR Text},
+  year = {2024},
+  url = {https://github.com/kenlkehl/causal-dragonnet-text}
+}
+```
+
+## License
+
+MIT License - see [LICENSE](LICENSE) for details.
+
+## Contact
+
+Ken Kehl - kenneth_kehl@dfci.harvard.edu

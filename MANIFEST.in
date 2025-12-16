@@ -1,0 +1,7 @@
+include README.md
+include LICENSE
+include pyproject.toml
+recursive-include examples *.json
+recursive-include cdt *.py
+global-exclude __pycache__
+global-exclude *.py[co]
