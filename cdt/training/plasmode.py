@@ -239,54 +239,100 @@ def _run_single_plasmode_experiment(
         entry['scenario_idx'] = hyperparams.get('scenario_idx') if hyperparams else -1
         entry['repeat_idx'] = hyperparams.get('repeat_idx') if hyperparams else -1
     
-    # Step 2: Generate synthetic outcomes
-    plasmode_df = _generate_plasmode_data(
-        train_df,
-        generator,
-        scenario,
-        applied_config,
-        device,
-        cache
-    )
-    
+    # Step 2: Generate synthetic outcomes (and optionally return confounders)
+    use_generator_confounders = getattr(plasmode_config, 'evaluator_use_generator_confounders', False)
+
+    if use_generator_confounders:
+        # Oracle mode: extract and reuse generator's confounders
+        plasmode_df, all_confounders = _generate_plasmode_data(
+            train_df,
+            generator,
+            scenario,
+            applied_config,
+            device,
+            cache,
+            return_confounders=True
+        )
+        logger.info("Oracle mode: Evaluator will use generator's confounders directly")
+    else:
+        # Realistic mode: evaluator learns its own confounders
+        plasmode_df = _generate_plasmode_data(
+            train_df,
+            generator,
+            scenario,
+            applied_config,
+            device,
+            cache,
+            return_confounders=False
+        )
+        all_confounders = None
+
     # Step 2.5: Split into Train/Validation for honest evaluation
     sim_train_df, sim_val_df = train_test_split(
         plasmode_df, test_size=0.2, random_state=42
     )
-    
+
     # Mark the split in the dataframe for saving
     plasmode_df['sim_split'] = 'train'
     plasmode_df.loc[sim_val_df.index, 'sim_split'] = 'validation'
-    
+
     # Step 3: Train evaluator on SIMULATED TRAINING set
-    evaluator, eval_history = _train_plasmode_evaluator(
-        sim_train_df,
-        sim_val_df,
-        applied_config,
-        plasmode_config,
-        device,
-        cache,
-        pretrained_weights_path
-    )
-    
+    if use_generator_confounders:
+        # Oracle mode: train on pre-extracted confounders
+        train_indices = plasmode_df.index.get_indexer(sim_train_df.index)
+        val_indices_split = plasmode_df.index.get_indexer(sim_val_df.index)
+        train_confounders = all_confounders[train_indices]
+        val_confounders = all_confounders[val_indices_split]
+
+        evaluator, eval_history = _train_confounder_evaluator(
+            train_confounders,
+            sim_train_df,
+            val_confounders,
+            sim_val_df,
+            applied_config,
+            plasmode_config,
+            device
+        )
+    else:
+        # Realistic mode: train on text, learn own confounders
+        evaluator, eval_history = _train_plasmode_evaluator(
+            sim_train_df,
+            sim_val_df,
+            applied_config,
+            plasmode_config,
+            device,
+            cache,
+            pretrained_weights_path
+        )
+
     # Tag history
     for entry in eval_history:
         entry['model_type'] = 'evaluator'
         entry['generation_mode'] = scenario.generation_mode
         entry['scenario_idx'] = hyperparams.get('scenario_idx') if hyperparams else -1
         entry['repeat_idx'] = hyperparams.get('repeat_idx') if hyperparams else -1
-        
+        entry['oracle_mode'] = use_generator_confounders
+
     combined_history = gen_history + eval_history
 
     # Step 4: Generate predictions for ALL data (for saving)
-    preds_dict = _predict_plasmode_evaluator(
-        evaluator,
-        plasmode_df,
-        applied_config,
-        plasmode_config,
-        device,
-        cache
-    )
+    if use_generator_confounders:
+        # Oracle mode: predict using pre-extracted confounders
+        preds_dict = _predict_confounder_evaluator(
+            evaluator,
+            all_confounders,
+            device
+        )
+    else:
+        # Realistic mode: predict via text -> embedding -> confounder pipeline
+        preds_dict = _predict_plasmode_evaluator(
+            evaluator,
+            plasmode_df,
+            applied_config,
+            plasmode_config,
+            device,
+            cache
+        )
     
     # Add estimated metrics to dataframe
     plasmode_df['estimated_ite'] = preds_dict['ite']
@@ -318,13 +364,16 @@ def _run_single_plasmode_experiment(
     val_indices = np.where(plasmode_df['sim_split'] == 'validation')[0]
     val_predictions = preds_dict['ite'][val_indices]
     val_df_subset = plasmode_df.iloc[val_indices]
-    
+
     metrics = _evaluate_plasmode_performance(
         val_df_subset,
         val_predictions,
         scenario.target_ate_logit
     )
-    
+
+    # Add oracle mode flag to metrics
+    metrics['oracle_mode'] = use_generator_confounders
+
     return metrics, combined_history
 
 
@@ -511,10 +560,25 @@ def _generate_plasmode_data(
     scenario: PlasmodeConfig,
     applied_config: AppliedInferenceConfig,
     device: torch.device,
-    cache: Optional[EmbeddingCache]
-) -> pd.DataFrame:
-    """Generate synthetic plasmode outcomes using learned confounders."""
-    
+    cache: Optional[EmbeddingCache],
+    return_confounders: bool = False
+) -> Union[pd.DataFrame, Tuple[pd.DataFrame, np.ndarray]]:
+    """Generate synthetic plasmode outcomes using learned confounders.
+
+    Args:
+        train_df: Training dataframe with text data
+        generator: Trained generator model
+        scenario: Plasmode scenario configuration
+        applied_config: Applied inference configuration
+        device: Torch device
+        cache: Optional embedding cache
+        return_confounders: If True, also return the extracted confounder matrix
+
+    Returns:
+        If return_confounders=False: plasmode_df
+        If return_confounders=True: (plasmode_df, confounders_array)
+    """
+
     # Extract confounder representations
     gen_dataset = ClinicalTextDataset(
         data=train_df,
@@ -527,9 +591,9 @@ def _generate_plasmode_data(
         chunk_overlap=generator.chunk_overlap,
         cache=cache
     )
-    
+
     gen_loader = DataLoader(gen_dataset, batch_size=32, shuffle=False, collate_fn=collate_batch)
-    
+
     all_confounders = []
     generator.eval()
     with torch.no_grad():
@@ -540,16 +604,16 @@ def _generate_plasmode_data(
             ]
             confounders = generator.get_confounder_features(chunk_embeddings)
             all_confounders.append(confounders.cpu())
-    
+
     all_confounders = torch.cat(all_confounders, dim=0).numpy()
     plasmode_df = train_df.copy()
-    
+
     # Treatments
     if scenario.preserve_observed_treatments:
         treatments = train_df[applied_config.treatment_column].values
     else:
         treatments = np.random.binomial(1, 0.5, size=len(train_df))
-    
+
     # Outcomes and True ITE
     if scenario.generation_mode == "phi_linear":
         outcomes, true_ite, true_y0, true_y1 = _generate_linear_outcomes(all_confounders, treatments, scenario)
@@ -559,13 +623,15 @@ def _generate_plasmode_data(
         outcomes, true_ite, true_y0, true_y1 = _generate_uplift_outcomes(all_confounders, treatments, scenario, device)
     else:
         raise ValueError(f"Unknown generation mode: {scenario.generation_mode}")
-    
+
     plasmode_df[applied_config.treatment_column] = treatments
     plasmode_df[applied_config.outcome_column] = outcomes
     plasmode_df['true_ite'] = true_ite
     plasmode_df['true_y0_logit'] = true_y0
     plasmode_df['true_y1_logit'] = true_y1
-    
+
+    if return_confounders:
+        return plasmode_df, all_confounders
     return plasmode_df
 
 
@@ -947,6 +1013,260 @@ def _predict_plasmode_evaluator(
             all_y1_logits.append(preds['y1_logit'].cpu().numpy())
             all_propensity.append(preds['propensity'].cpu().numpy())
             
+    return {
+        'ite': np.concatenate(all_ite_logits),
+        'y0_logit': np.concatenate(all_y0_logits),
+        'y1_logit': np.concatenate(all_y1_logits),
+        'propensity': np.concatenate(all_propensity)
+    }
+
+
+# =============================================================================
+# Confounder-based evaluator (oracle mode: uses generator's confounders directly)
+# =============================================================================
+
+class ConfounderDataset(torch.utils.data.Dataset):
+    """Simple dataset for pre-extracted confounders."""
+
+    def __init__(self, confounders: np.ndarray, treatments: np.ndarray, outcomes: np.ndarray):
+        self.confounders = torch.tensor(confounders, dtype=torch.float32)
+        self.treatments = torch.tensor(treatments, dtype=torch.float32)
+        self.outcomes = torch.tensor(outcomes, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.confounders)
+
+    def __getitem__(self, idx):
+        return {
+            'confounders': self.confounders[idx],
+            'treatment': self.treatments[idx],
+            'outcome': self.outcomes[idx]
+        }
+
+
+def _train_confounder_evaluator(
+    train_confounders: np.ndarray,
+    train_df: pd.DataFrame,
+    val_confounders: np.ndarray,
+    val_df: pd.DataFrame,
+    applied_config: AppliedInferenceConfig,
+    plasmode_config: PlasmodeExperimentConfig,
+    device: torch.device
+) -> Tuple[nn.Module, List[Dict[str, Any]]]:
+    """
+    Train a DragonNet evaluator directly on pre-extracted confounders (oracle mode).
+
+    This bypasses the text -> embedding -> confounder pipeline and trains only
+    the DragonNet heads on the generator's confounder representations.
+
+    Args:
+        train_confounders: Confounder matrix for training set (n_train, n_features)
+        train_df: Training dataframe with outcome and treatment columns
+        val_confounders: Confounder matrix for validation set (n_val, n_features)
+        val_df: Validation dataframe with outcome and treatment columns
+        applied_config: Applied inference configuration
+        plasmode_config: Plasmode experiment configuration
+        device: Torch device
+
+    Returns:
+        Tuple of (trained DragonNet model, training history)
+    """
+    from ..models.dragonnet import DragonNet
+
+    input_dim = train_confounders.shape[1]
+    eval_arch = plasmode_config.evaluator_architecture
+    eval_training = plasmode_config.evaluator_training
+
+    # Create DragonNet that takes confounders directly
+    dragonnet = DragonNet(
+        input_dim=input_dim,
+        representation_dim=eval_arch.dragonnet_representation_dim,
+        hidden_outcome_dim=eval_arch.dragonnet_hidden_outcome_dim
+    ).to(device)
+
+    # Create datasets
+    train_dataset = ConfounderDataset(
+        confounders=train_confounders,
+        treatments=train_df[applied_config.treatment_column].values,
+        outcomes=train_df[applied_config.outcome_column].values
+    )
+    val_dataset = ConfounderDataset(
+        confounders=val_confounders,
+        treatments=val_df[applied_config.treatment_column].values,
+        outcomes=val_df[applied_config.outcome_column].values
+    )
+
+    train_loader = DataLoader(train_dataset, batch_size=eval_training.batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+
+    # Optimizer
+    if eval_training.optimizer == "adamw":
+        optimizer = torch.optim.AdamW(dragonnet.parameters(), lr=eval_training.learning_rate)
+    else:
+        optimizer = torch.optim.Adam(dragonnet.parameters(), lr=eval_training.learning_rate)
+
+    # Learning rate scheduler
+    if eval_training.lr_schedule == "linear":
+        scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1.0, end_factor=0.1, total_iters=eval_training.epochs
+        )
+    else:
+        scheduler = None
+
+    history = []
+    alpha_propensity = eval_training.alpha_propensity
+    beta_targreg = eval_training.beta_targreg
+
+    for epoch in range(eval_training.epochs):
+        # Training
+        dragonnet.train()
+        epoch_loss = 0.0
+        n_batches = 0
+
+        for batch in train_loader:
+            confounders = batch['confounders'].to(device)
+            treatments = batch['treatment'].to(device)
+            outcomes = batch['outcome'].to(device)
+
+            optimizer.zero_grad()
+
+            y0_logit, y1_logit, t_logit, phi = dragonnet(confounders)
+
+            # Propensity loss
+            propensity_loss = F.binary_cross_entropy_with_logits(
+                t_logit.squeeze(-1), treatments
+            )
+
+            # Outcome loss (factual only)
+            factual_logit = torch.where(
+                treatments.unsqueeze(1) > 0.5,
+                y1_logit,
+                y0_logit
+            )
+            outcome_loss = F.binary_cross_entropy_with_logits(
+                factual_logit.squeeze(-1), outcomes
+            )
+
+            # Targeted regularization
+            targreg_loss = torch.tensor(0.0, device=device)
+            if beta_targreg > 0:
+                propensity = torch.sigmoid(t_logit).clamp(1e-3, 1 - 1e-3)
+                H = (treatments.unsqueeze(1) / propensity) - \
+                    ((1 - treatments.unsqueeze(1)) / (1 - propensity))
+                factual_prob = torch.sigmoid(factual_logit)
+                moment = torch.mean((outcomes.unsqueeze(1) - factual_prob) * H)
+                targreg_loss = moment ** 2
+
+            total_loss = outcome_loss + alpha_propensity * propensity_loss + beta_targreg * targreg_loss
+            total_loss.backward()
+            optimizer.step()
+
+            epoch_loss += total_loss.item()
+            n_batches += 1
+
+        if scheduler:
+            scheduler.step()
+
+        # Validation
+        dragonnet.eval()
+        val_loss = 0.0
+        val_batches = 0
+        all_y0, all_y1, all_prop = [], [], []
+        all_targets, all_treatments_val = [], []
+
+        with torch.no_grad():
+            for batch in val_loader:
+                confounders = batch['confounders'].to(device)
+                treatments = batch['treatment'].to(device)
+                outcomes = batch['outcome'].to(device)
+
+                y0_logit, y1_logit, t_logit, phi = dragonnet(confounders)
+
+                propensity_loss = F.binary_cross_entropy_with_logits(
+                    t_logit.squeeze(-1), treatments
+                )
+                factual_logit = torch.where(
+                    treatments.unsqueeze(1) > 0.5,
+                    y1_logit,
+                    y0_logit
+                )
+                outcome_loss = F.binary_cross_entropy_with_logits(
+                    factual_logit.squeeze(-1), outcomes
+                )
+                val_loss += (outcome_loss + alpha_propensity * propensity_loss).item()
+                val_batches += 1
+
+                all_y0.append(torch.sigmoid(y0_logit).cpu())
+                all_y1.append(torch.sigmoid(y1_logit).cpu())
+                all_prop.append(torch.sigmoid(t_logit).cpu())
+                all_targets.append(outcomes.cpu())
+                all_treatments_val.append(treatments.cpu())
+
+        # Compute AUROCs
+        y_true = torch.cat(all_targets).numpy()
+        t_true = torch.cat(all_treatments_val).numpy()
+        y0_scores = torch.cat(all_y0).numpy().squeeze()
+        y1_scores = torch.cat(all_y1).numpy().squeeze()
+        prop_scores = torch.cat(all_prop).numpy().squeeze()
+
+        try:
+            auroc_y0 = roc_auc_score(y_true[t_true == 0], y0_scores[t_true == 0]) if (t_true == 0).sum() > 0 else np.nan
+            auroc_y1 = roc_auc_score(y_true[t_true == 1], y1_scores[t_true == 1]) if (t_true == 1).sum() > 0 else np.nan
+            auroc_prop = roc_auc_score(t_true, prop_scores)
+        except:
+            auroc_y0, auroc_y1, auroc_prop = np.nan, np.nan, np.nan
+
+        epoch_log = {
+            'epoch': epoch + 1,
+            'train_loss': epoch_loss / max(n_batches, 1),
+            'val_loss': val_loss / max(val_batches, 1),
+            'val_auroc_y0': auroc_y0,
+            'val_auroc_y1': auroc_y1,
+            'val_auroc_prop': auroc_prop,
+        }
+        history.append(epoch_log)
+
+    return dragonnet, history
+
+
+def _predict_confounder_evaluator(
+    dragonnet: nn.Module,
+    confounders: np.ndarray,
+    device: torch.device
+) -> dict:
+    """
+    Generate ITE predictions from a DragonNet using pre-extracted confounders.
+
+    Args:
+        dragonnet: Trained DragonNet model
+        confounders: Confounder matrix (n_samples, n_features)
+        device: Torch device
+
+    Returns:
+        Dictionary with 'ite', 'y0_logit', 'y1_logit', 'propensity' arrays
+    """
+    dragonnet.eval()
+
+    dataset = torch.utils.data.TensorDataset(
+        torch.tensor(confounders, dtype=torch.float32)
+    )
+    loader = DataLoader(dataset, batch_size=32, shuffle=False)
+
+    all_ite_logits = []
+    all_y0_logits = []
+    all_y1_logits = []
+    all_propensity = []
+
+    with torch.no_grad():
+        for (batch_confounders,) in loader:
+            batch_confounders = batch_confounders.to(device)
+            y0_logit, y1_logit, t_logit, phi = dragonnet(batch_confounders)
+
+            all_ite_logits.append((y1_logit - y0_logit).squeeze(-1).cpu().numpy())
+            all_y0_logits.append(y0_logit.squeeze(-1).cpu().numpy())
+            all_y1_logits.append(y1_logit.squeeze(-1).cpu().numpy())
+            all_propensity.append(torch.sigmoid(t_logit).squeeze(-1).cpu().numpy())
+
     return {
         'ite': np.concatenate(all_ite_logits),
         'y0_logit': np.concatenate(all_y0_logits),
