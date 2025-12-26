@@ -23,26 +23,16 @@ class DragonNet(nn.Module):
         self.representation_fc5 = nn.Linear(representation_dim, representation_dim)
         self.representation_fc6 = nn.Linear(representation_dim, representation_dim)
 
-        # Binary treatment propensity head (always randomly initialized)
-        self.propensity_fc1 = nn.Linear(representation_dim, representation_dim)
-        self.propensity_fc2 = nn.Linear(representation_dim, representation_dim)
-        self.propensity_fc3 = nn.Linear(representation_dim, representation_dim)
-        self.propensity_fc4 = nn.Linear(representation_dim, 1)
-        
+        # Binary treatment propensity head (matches old_cdt: single linear layer)
+        self.propensity_fc1 = nn.Linear(representation_dim, 1)        
 
-        # Binary outcome heads (always randomly initialized)
+        # Binary outcome heads (matches old_cdt: 2 hidden layers)
         self.outcome0_fc1 = nn.Linear(representation_dim, hidden_outcome_dim)
         self.outcome0_fc2 = nn.Linear(hidden_outcome_dim, hidden_outcome_dim)
-        self.outcome0_fc2a = nn.Linear(hidden_outcome_dim, hidden_outcome_dim)
-        self.outcome0_fc2b = nn.Linear(hidden_outcome_dim, hidden_outcome_dim)
-        self.outcome0_fc2c = nn.Linear(hidden_outcome_dim, hidden_outcome_dim)
         self.outcome0_fc3 = nn.Linear(hidden_outcome_dim, 1)
 
         self.outcome1_fc1 = nn.Linear(representation_dim, hidden_outcome_dim)
         self.outcome1_fc2 = nn.Linear(hidden_outcome_dim, hidden_outcome_dim)
-        self.outcome1_fc2a = nn.Linear(hidden_outcome_dim, hidden_outcome_dim)
-        self.outcome1_fc2b = nn.Linear(hidden_outcome_dim, hidden_outcome_dim)
-        self.outcome1_fc2c = nn.Linear(hidden_outcome_dim, hidden_outcome_dim)
         self.outcome1_fc3 = nn.Linear(hidden_outcome_dim, 1)
 
         
@@ -54,23 +44,14 @@ class DragonNet(nn.Module):
         phi = F.relu(self.representation_fc5(phi))
         phi = F.elu(self.representation_fc6(phi))
 
-        t = F.relu(self.propensity_fc1(phi))
-        t = F.relu(self.propensity_fc2(t))
-        t = F.relu(self.propensity_fc3(t))
-        t_logit = self.propensity_fc4(t)
+        t_logit = self.propensity_fc1(phi)
 
         y0 = F.relu(self.outcome0_fc1(phi))
-        y0 = F.relu(self.outcome0_fc2(y0))
-        y0 = F.relu(self.outcome0_fc2a(y0))
-        y0 = F.relu(self.outcome0_fc2b(y0))
-        y0 = F.elu(self.outcome0_fc2c(y0))
+        y0 = F.elu(self.outcome0_fc2(y0))
         y0_logit = self.outcome0_fc3(y0)
 
         y1 = F.relu(self.outcome1_fc1(phi))
-        y1 = F.relu(self.outcome1_fc2(y1))
-        y1 = F.relu(self.outcome1_fc2a(y1))
-        y1 = F.relu(self.outcome1_fc2b(y1))
-        y1 = F.elu(self.outcome1_fc2c(y1))
+        y1 = F.elu(self.outcome1_fc2(y1))
         y1_logit = self.outcome1_fc3(y1)
 
         return y0_logit, y1_logit, t_logit, phi

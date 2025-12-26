@@ -32,7 +32,6 @@ class CausalDragonnetText(nn.Module):
         num_latent_confounders: int = 20,
         features_per_confounder: int = 1,
         explicit_confounder_texts: Optional[List[str]] = None,
-        explicit_confounder_embeddings: Optional[torch.Tensor] = None,
         aggregator_mode: str = 'attn',
         dragonnet_representation_dim: int = 128,
         dragonnet_hidden_outcome_dim: int = 64,
@@ -49,7 +48,6 @@ class CausalDragonnetText(nn.Module):
             num_latent_confounders: Number of learnable confounder patterns
             features_per_confounder: Features extracted per confounder
             explicit_confounder_texts: Optional list of explicit confounder queries
-            explicit_confounder_embeddings: Optional pre-computed embeddings
             aggregator_mode: Aggregation mode for chunks
             dragonnet_representation_dim: DragonNet representation dimension
             dragonnet_hidden_outcome_dim: DragonNet outcome hidden dimension
@@ -95,13 +93,8 @@ class CausalDragonnetText(nn.Module):
             aggregator_mode=aggregator_mode,
             sentence_transformer_model=self.sentence_transformer_model,
             phantom_confounders=0,
-            device=self._device,
-            explicit_confounder_embeddings=explicit_confounder_embeddings
+            device=self._device
         )
-        
-        # LayerNorm for confounder features to ensure consistent scale before DragonNet
-        # This prevents ITE range attenuation by normalizing inputs to the representation layers
-        self.confounder_norm = nn.LayerNorm(self.feature_extractor.output_dim)
         
         # Binary treatment Causal Inference Net
         if model_type == "uplift":
@@ -145,9 +138,8 @@ class CausalDragonnetText(nn.Module):
             t_logit: (batch, 1) - treatment propensity logit
             phi: (batch, representation_dim) - learned representation
         """
-        # Extract confounder features from chunks and normalize
+        # Extract confounder features from chunks
         x_representation = self.feature_extractor(chunk_embeddings_list)
-        x_representation = self.confounder_norm(x_representation)
         
         if self.model_type == "uplift":
             # UpliftNet returns: y0_logit, tau_logit, t_logit, phi
@@ -238,7 +230,6 @@ class CausalDragonnetText(nn.Module):
         """
         with torch.no_grad():
             x_representation = self.feature_extractor(chunk_embeddings_list)
-            x_representation = self.confounder_norm(x_representation)
             
             if self.model_type == "uplift":
                 y0_logit, tau_logit, t_logit, phi = self.net(x_representation)
@@ -343,7 +334,6 @@ class CausalDragonnetText(nn.Module):
         """
         with torch.no_grad():
             x_representation = self.feature_extractor(chunk_embeddings_list)
-            x_representation = self.confounder_norm(x_representation)
             
             # Both models return phi as the last element
             if self.model_type == "uplift":
@@ -361,6 +351,4 @@ class CausalDragonnetText(nn.Module):
         Extract confounder features (before Causal Net).
         """
         with torch.no_grad():
-            x_representation = self.feature_extractor(chunk_embeddings_list)
-            x_representation = self.confounder_norm(x_representation)
-            return x_representation
+            return self.feature_extractor(chunk_embeddings_list)

@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold
 from sklearn.metrics import roc_auc_score
 from joblib import Parallel, delayed
 from sentence_transformers import SentenceTransformer
@@ -214,27 +214,47 @@ def _worker_wrapper(task: Dict[str, Any]) -> Optional[Tuple[dict, List[Dict[str,
         save_log_path = dataset_dir / f"{base_name}_log.csv"
         
     try:
-        # Single split per repeat: train_fraction determines the split
-        metrics, logs = _run_single_plasmode_experiment(
-            train_df=task['train_df'],
-            scenario=scenario,
-            applied_config=task['applied_config'],
-            plasmode_config=plasmode_config,
-            device=task['device'],
-            cache=task['cache'],
-            pretrained_weights_path=task['pretrained_weights_path'],
-            save_dataset_path=save_dataset_path,
-            save_config_path=save_config_path,
-            save_log_path=save_log_path,
-            hyperparams=hyperparams,
-            precomputed_embeddings=precomputed_embeddings
-        )
+        # Dispatch based on cv_folds setting
+        cv_folds = getattr(plasmode_config, 'cv_folds', 1)
+        
+        if cv_folds > 1:
+            # K-Fold Cross-Validation mode: out-of-sample predictions for all patients
+            metrics, logs = _run_cv_plasmode_experiment(
+                train_df=task['train_df'],
+                scenario=scenario,
+                applied_config=task['applied_config'],
+                plasmode_config=plasmode_config,
+                device=task['device'],
+                cache=task['cache'],
+                pretrained_weights_path=task['pretrained_weights_path'],
+                save_dataset_path=save_dataset_path,
+                save_config_path=save_config_path,
+                save_log_path=save_log_path,
+                hyperparams=hyperparams,
+                precomputed_embeddings=precomputed_embeddings
+            )
+        else:
+            # Fixed-split mode: 80/20 train/validation split (original behavior)
+            metrics, logs = _run_single_plasmode_experiment(
+                train_df=task['train_df'],
+                scenario=scenario,
+                applied_config=task['applied_config'],
+                plasmode_config=plasmode_config,
+                device=task['device'],
+                cache=task['cache'],
+                pretrained_weights_path=task['pretrained_weights_path'],
+                save_dataset_path=save_dataset_path,
+                save_config_path=save_config_path,
+                save_log_path=save_log_path,
+                hyperparams=hyperparams,
+                precomputed_embeddings=precomputed_embeddings
+            )
         
         metrics['scenario_idx'] = scenario_idx
         metrics['repeat_idx'] = repeat_idx
         metrics['generation_mode'] = scenario.generation_mode
         metrics['target_ate'] = scenario.target_ate_logit
-        metrics['train_fraction'] = plasmode_config.train_fraction
+        metrics['cv_folds'] = cv_folds
         
         return metrics, logs
         
@@ -243,6 +263,236 @@ def _worker_wrapper(task: Dict[str, Any]) -> Optional[Tuple[dict, List[Dict[str,
         return None
     finally:
         cuda_cleanup()
+
+
+def _run_cv_plasmode_experiment(
+    train_df: pd.DataFrame,
+    scenario: PlasmodeConfig,
+    applied_config: AppliedInferenceConfig,
+    plasmode_config: PlasmodeExperimentConfig,
+    device: torch.device,
+    cache: Optional[EmbeddingCache],
+    pretrained_weights_path: Optional[Path],
+    save_dataset_path: Optional[Path] = None,
+    save_config_path: Optional[Path] = None,
+    save_log_path: Optional[Path] = None,
+    hyperparams: Optional[Dict[str, Any]] = None,
+    precomputed_embeddings: Dict[Tuple[str], Any] = None
+) -> Tuple[dict, List[Dict[str, Any]]]:
+    """
+    Run K-fold cross-validation plasmode experiment for out-of-sample predictions.
+    
+    Per-fold approach:
+    1. Train generator on train_idx subset (80%)
+    2. Generate synthetic outcomes for ALL patients using that generator
+    3. Train evaluator on same train_idx subset (with simulated outcomes)
+    4. Generate predictions for test_idx subset only (20%)
+    5. Store predictions with fold assignment
+    
+    This ensures each patient gets truly out-of-sample predictions from a model
+    that was not trained on that patient.
+    """
+    k = plasmode_config.cv_folds
+    logger.info(f"Starting {k}-Fold Cross-Validation plasmode experiment on {len(train_df)} samples")
+    
+    # Reset index to ensure KFold works with indices
+    train_df = train_df.reset_index(drop=True)
+    
+    kf = KFold(n_splits=k, shuffle=True, random_state=hyperparams.get('seed', 42) if hyperparams else 42)
+    
+    # Get precomputed embeddings if available
+    gen_texts = plasmode_config.generator_architecture.explicit_confounder_texts
+    gen_embeddings = precomputed_embeddings.get(tuple(gen_texts)) if gen_texts and precomputed_embeddings else None
+    eval_texts = plasmode_config.evaluator_architecture.explicit_confounder_texts
+    eval_embeddings = precomputed_embeddings.get(tuple(eval_texts)) if eval_texts and precomputed_embeddings else None
+    
+    use_generator_phi = getattr(plasmode_config, 'evaluator_use_generator_confounders', False)
+    
+    # Storage for aggregated results
+    all_fold_predictions = []
+    all_training_logs = []
+    
+    for fold, (train_idx, test_idx) in enumerate(kf.split(train_df)):
+        logger.info(f"FOLD {fold+1}/{k}: Training on {len(train_idx)} samples, testing on {len(test_idx)}")
+        
+        fold_train_df = train_df.iloc[train_idx].copy()
+        fold_test_df = train_df.iloc[test_idx].copy()
+        
+        # Step 1: Train generator on FOLD TRAINING data only
+        generator, gen_history = _train_plasmode_generator(
+            fold_train_df,
+            applied_config,
+            plasmode_config,
+            device,
+            cache,
+            pretrained_weights_path,
+            explicit_confounder_embeddings=gen_embeddings
+        )
+        
+        # Tag generator history
+        for entry in gen_history:
+            entry['model_type'] = 'generator'
+            entry['generation_mode'] = scenario.generation_mode
+            entry['fold'] = fold + 1
+            entry['scenario_idx'] = hyperparams.get('scenario_idx') if hyperparams else -1
+            entry['repeat_idx'] = hyperparams.get('repeat_idx') if hyperparams else -1
+        
+        # Step 2: Generate synthetic outcomes for ALL patients using this fold's generator
+        # (Same DGP assumption - we apply the learned generation process to all data)
+        if use_generator_phi:
+            plasmode_df, all_phi = _generate_plasmode_data(
+                train_df,  # Generate for ALL patients
+                generator,
+                scenario,
+                applied_config,
+                device,
+                cache,
+                return_confounders=True
+            )
+        else:
+            plasmode_df = _generate_plasmode_data(
+                train_df,  # Generate for ALL patients
+                generator,
+                scenario,
+                applied_config,
+                device,
+                cache,
+                return_confounders=False
+            )
+            all_phi = None
+        
+        # Now subset plasmode_df to match our fold splits
+        fold_train_plasmode = plasmode_df.iloc[train_idx].copy()
+        fold_test_plasmode = plasmode_df.iloc[test_idx].copy()
+        
+        # Step 3: Train evaluator on FOLD TRAINING data (with simulated outcomes)
+        # Split train into train/val for early stopping
+        eval_train_df, eval_val_df = train_test_split(
+            fold_train_plasmode, test_size=0.1, random_state=42
+        )
+        
+        if use_generator_phi:
+            # Oracle mode: get phi for train/val splits
+            train_phi_idx = fold_train_plasmode.index.get_indexer(eval_train_df.index)
+            val_phi_idx = fold_train_plasmode.index.get_indexer(eval_val_df.index)
+            
+            # Standardize based on training set
+            train_phi = all_phi[train_idx][train_phi_idx]
+            val_phi = all_phi[train_idx][val_phi_idx]
+            phi_mean = np.mean(train_phi, axis=0)
+            phi_std = np.std(train_phi, axis=0) + 1e-8
+            
+            # Standardize all phi
+            all_phi_std = (all_phi - phi_mean) / phi_std
+            train_phi = all_phi_std[train_idx][train_phi_idx]
+            val_phi = all_phi_std[train_idx][val_phi_idx]
+            test_phi = all_phi_std[test_idx]
+            
+            evaluator, eval_history = _train_confounder_evaluator(
+                train_phi,
+                eval_train_df,
+                val_phi,
+                eval_val_df,
+                applied_config,
+                plasmode_config,
+                device
+            )
+        else:
+            evaluator, eval_history = _train_plasmode_evaluator(
+                eval_train_df,
+                eval_val_df,
+                applied_config,
+                plasmode_config,
+                device,
+                cache,
+                pretrained_weights_path,
+                explicit_confounder_embeddings=eval_embeddings
+            )
+        
+        # Tag evaluator history
+        for entry in eval_history:
+            entry['model_type'] = 'evaluator'
+            entry['generation_mode'] = scenario.generation_mode
+            entry['fold'] = fold + 1
+            entry['scenario_idx'] = hyperparams.get('scenario_idx') if hyperparams else -1
+            entry['repeat_idx'] = hyperparams.get('repeat_idx') if hyperparams else -1
+            entry['oracle_mode'] = use_generator_phi
+        
+        all_training_logs.extend(gen_history)
+        all_training_logs.extend(eval_history)
+        
+        # Step 4: Generate predictions for HELD-OUT TEST data only
+        if use_generator_phi:
+            preds_dict = _predict_confounder_evaluator(
+                evaluator,
+                test_phi,
+                device
+            )
+        else:
+            preds_dict = _predict_plasmode_evaluator(
+                evaluator,
+                fold_test_plasmode,
+                applied_config,
+                plasmode_config,
+                device,
+                cache
+            )
+        
+        # Store predictions with test data
+        fold_test_plasmode = fold_test_plasmode.copy()
+        fold_test_plasmode['estimated_ite'] = preds_dict['ite']
+        fold_test_plasmode['estimated_y0_logit'] = preds_dict['y0_logit']
+        fold_test_plasmode['estimated_y1_logit'] = preds_dict['y1_logit']
+        fold_test_plasmode['estimated_propensity'] = preds_dict['propensity']
+        fold_test_plasmode['cv_fold'] = fold + 1
+        
+        all_fold_predictions.append(fold_test_plasmode)
+        
+        # Cleanup fold-specific models
+        del generator, evaluator
+        cuda_cleanup()
+        
+        logger.info(f"FOLD {fold+1}/{k} complete")
+    
+    # Combine all fold predictions (each patient appears exactly once)
+    combined_df = pd.concat(all_fold_predictions).sort_index()
+    
+    # Verify we have predictions for all patients
+    assert len(combined_df) == len(train_df), f"Expected {len(train_df)} predictions, got {len(combined_df)}"
+    
+    # Save combined dataset if requested
+    if save_dataset_path is not None:
+        logger.info(f"Saving combined CV plasmode dataset to {save_dataset_path}")
+        combined_df.to_parquet(save_dataset_path, index=False)
+        
+        if save_config_path is not None and hyperparams is not None:
+            try:
+                hyperparams_copy = hyperparams.copy()
+                hyperparams_copy['cv_folds'] = k
+                with open(save_config_path, 'w') as f:
+                    json.dump(hyperparams_copy, f, indent=2)
+            except Exception as e:
+                logger.warning(f"Failed to save simulation parameters: {e}")
+                
+        if save_log_path is not None:
+            try:
+                pd.DataFrame(all_training_logs).to_csv(save_log_path, index=False)
+            except Exception as e:
+                logger.warning(f"Failed to save training log: {e}")
+    
+    # Step 5: Evaluate on ALL predictions (all are out-of-sample)
+    metrics = _evaluate_plasmode_performance(
+        combined_df,
+        combined_df['estimated_ite'].values,
+        scenario.target_ate_logit
+    )
+    
+    metrics['oracle_mode'] = use_generator_phi
+    metrics['cv_folds'] = k
+    
+    logger.info(f"CV Plasmode complete: ATE bias={metrics['ate_bias']:.4f}, ITE corr={metrics['ite_correlation']:.4f}")
+    
+    return metrics, all_training_logs
 
 
 def _run_single_plasmode_experiment(
@@ -259,41 +509,15 @@ def _run_single_plasmode_experiment(
     hyperparams: Optional[Dict[str, Any]] = None,
     precomputed_embeddings: Dict[Tuple[str], Any] = None
 ) -> Tuple[dict, List[Dict[str, Any]]]:
-    """Run a single plasmode experiment with train/eval split. Returns (metrics, training_logs)
-    
-    Flow:
-    1. Split data into train_split (train_fraction) and eval_split (1 - train_fraction)
-    2. Train generator on train_split only
-    3. Generate synthetic outcomes for both train_split and eval_split
-    4. Train evaluator on train_split (with simulated outcomes)
-    5. Predict on eval_split and calculate metrics
-    
-    This ensures:
-    - Consistent DGP within each experiment (one generator per repeat)
-    - Out-of-sample evaluation (evaluator never sees eval_split during training)
-    - Statistical robustness via multiple repeats across the experiment
-    """
-    
-    # Get train_fraction from config (default 0.8)
-    train_fraction = getattr(plasmode_config, 'train_fraction', 0.8)
-    seed = hyperparams.get('seed', 42) if hyperparams else 42
-    
-    # Step 0: Split data into train and eval sets for this experiment
-    train_split_df, eval_split_df = train_test_split(
-        train_df, train_size=train_fraction, random_state=seed
-    )
-    train_split_df = train_split_df.reset_index(drop=True)
-    eval_split_df = eval_split_df.reset_index(drop=True)
-    
-    logger.info(f"Single-split experiment: Training on {len(train_split_df)} samples, evaluating on {len(eval_split_df)}")
+    """Run a single plasmode experiment. Returns (metrics, training_logs)"""
     
     # Get precomputed embeddings for generator if available
     gen_texts = plasmode_config.generator_architecture.explicit_confounder_texts
     gen_embeddings = precomputed_embeddings.get(tuple(gen_texts)) if gen_texts and precomputed_embeddings else None
     
-    # Step 1: Train generator on TRAIN SPLIT only
+    # Step 1: Train generator to learn confounders (Binary Model)
     generator, gen_history = _train_plasmode_generator(
-        train_split_df,
+        train_df,
         applied_config,
         plasmode_config,
         device,
@@ -306,26 +530,17 @@ def _run_single_plasmode_experiment(
     for entry in gen_history:
         entry['model_type'] = 'generator'
         entry['generation_mode'] = scenario.generation_mode
+        # Add hyperparams to log for context if needed
         entry['scenario_idx'] = hyperparams.get('scenario_idx') if hyperparams else -1
         entry['repeat_idx'] = hyperparams.get('repeat_idx') if hyperparams else -1
     
-    # Step 2: Generate synthetic outcomes for BOTH splits using the same generator
+    # Step 2: Generate synthetic outcomes (and optionally return confounders)
     use_generator_phi = getattr(plasmode_config, 'evaluator_use_generator_confounders', False)
-    
-    # Generate for train split (for evaluator training)
+
     if use_generator_phi:
-        train_plasmode_df, train_phi = _generate_plasmode_data(
-            train_split_df,
-            generator,
-            scenario,
-            applied_config,
-            device,
-            cache,
-            return_confounders=True
-        )
-        # Generate for eval split (for metrics)
-        eval_plasmode_df, eval_phi = _generate_plasmode_data(
-            eval_split_df,
+        # Oracle mode: extract and reuse generator's phi representation
+        plasmode_df, all_phi = _generate_plasmode_data(
+            train_df,
             generator,
             scenario,
             applied_config,
@@ -335,8 +550,9 @@ def _run_single_plasmode_experiment(
         )
         logger.info("Oracle mode: Evaluator will use generator's phi representation directly")
     else:
-        train_plasmode_df = _generate_plasmode_data(
-            train_split_df,
+        # Realistic mode: evaluator learns its own confounders
+        plasmode_df = _generate_plasmode_data(
+            train_df,
             generator,
             scenario,
             applied_config,
@@ -344,52 +560,55 @@ def _run_single_plasmode_experiment(
             cache,
             return_confounders=False
         )
-        eval_plasmode_df = _generate_plasmode_data(
-            eval_split_df,
-            generator,
-            scenario,
-            applied_config,
-            device,
-            cache,
-            return_confounders=False
+        all_phi = None
+
+    # Step 2.5: When cv_folds == 1, train on full dataset (no validation split)
+    # Validation metrics will be missing since we train on all data
+    cv_folds = getattr(plasmode_config, 'cv_folds', 1)
+    
+    if cv_folds == 1:
+        # No validation split - train on everything
+        sim_train_df = plasmode_df
+        sim_val_df = None
+        plasmode_df['sim_split'] = 'train'  # All data is training data
+        logger.info("cv_folds=1: Training evaluator on full dataset (no validation split)")
+    else:
+        # Split into Train/Validation for honest evaluation (legacy behavior)
+        sim_train_df, sim_val_df = train_test_split(
+            plasmode_df, test_size=0.2, random_state=42
         )
-        train_phi = None
-        eval_phi = None
-    
-    # Mark splits in dataframes
-    train_plasmode_df['sim_split'] = 'train'
-    eval_plasmode_df['sim_split'] = 'eval'
-    
-    # Step 3: Train evaluator on TRAIN SPLIT only
-    # Use a small portion of train for validation/early stopping (10%)
-    eval_train_df, eval_val_df = train_test_split(
-        train_plasmode_df, test_size=0.1, random_state=42
-    )
-    
+        plasmode_df['sim_split'] = 'train'
+        plasmode_df.loc[sim_val_df.index, 'sim_split'] = 'validation'
+
+    # Step 3: Train evaluator on SIMULATED TRAINING set
     if use_generator_phi:
         # Oracle mode: train on pre-extracted phi representations
-        train_indices = train_plasmode_df.index.get_indexer(eval_train_df.index)
-        val_indices = train_plasmode_df.index.get_indexer(eval_val_df.index)
+        train_indices = plasmode_df.index.get_indexer(sim_train_df.index)
         
         # Standardize based on TRAIN set statistics for stability
-        phi_train_subset = train_phi[train_indices]
+        # The generator's phi output can have arbitrary scale, which hurts the evaluator's initialization
+        phi_train_subset = all_phi[train_indices]
         phi_mean = np.mean(phi_train_subset, axis=0)
         phi_std = np.std(phi_train_subset, axis=0) + 1e-8
         
-        logger.info(f"Oracle Mode: Standardizing phi. Train Mean range: [{phi_mean.min():.3f}, {phi_mean.max():.3f}]")
+        logger.info(f"Oracle Mode: Standardizing all_phi. Train Mean range: [{phi_mean.min():.3f}, {phi_mean.max():.3f}]")
         
-        # Standardize train and eval phi with same stats
-        train_phi_std = (train_phi - phi_mean) / phi_std
-        eval_phi_std = (eval_phi - phi_mean) / phi_std
+        # Standardize EVERYTHING so that prediction uses same scale
+        all_phi = (all_phi - phi_mean) / phi_std
         
-        train_phi_for_training = train_phi_std[train_indices]
-        val_phi_for_training = train_phi_std[val_indices]
+        train_phi = all_phi[train_indices]
         
+        if sim_val_df is not None:
+            val_indices_split = plasmode_df.index.get_indexer(sim_val_df.index)
+            val_phi = all_phi[val_indices_split]
+        else:
+            val_phi = None
+
         evaluator, eval_history = _train_confounder_evaluator(
-            train_phi_for_training,
-            eval_train_df,
-            val_phi_for_training,
-            eval_val_df,
+            train_phi,
+            sim_train_df,
+            val_phi,
+            sim_val_df,
             applied_config,
             plasmode_config,
             device
@@ -401,8 +620,8 @@ def _run_single_plasmode_experiment(
 
         # Realistic mode: train on text, learn own confounders
         evaluator, eval_history = _train_plasmode_evaluator(
-            eval_train_df,
-            eval_val_df,
+            sim_train_df,
+            sim_val_df,
             applied_config,
             plasmode_config,
             device,
@@ -421,40 +640,40 @@ def _run_single_plasmode_experiment(
 
     combined_history = gen_history + eval_history
 
-    # Step 4: Generate predictions for EVAL SPLIT only (the held-out data)
+    # Step 4: Generate predictions for ALL data (for saving)
     if use_generator_phi:
+        # Oracle mode: predict using pre-extracted phi representations
         preds_dict = _predict_confounder_evaluator(
             evaluator,
-            eval_phi_std,
+            all_phi,
             device
         )
     else:
+        # Realistic mode: predict via text -> embedding -> confounder pipeline
         preds_dict = _predict_plasmode_evaluator(
             evaluator,
-            eval_plasmode_df,
+            plasmode_df,
             applied_config,
             plasmode_config,
             device,
             cache
         )
     
-    # Add estimated metrics to eval dataframe
-    eval_plasmode_df['estimated_ite'] = preds_dict['ite']
-    eval_plasmode_df['estimated_y0_logit'] = preds_dict['y0_logit']
-    eval_plasmode_df['estimated_y1_logit'] = preds_dict['y1_logit']
-    eval_plasmode_df['estimated_propensity'] = preds_dict['propensity']
+    # Add estimated metrics to dataframe
+    plasmode_df['estimated_ite'] = preds_dict['ite']
+    plasmode_df['estimated_y0_logit'] = preds_dict['y0_logit']
+    plasmode_df['estimated_y1_logit'] = preds_dict['y1_logit']
+    plasmode_df['estimated_propensity'] = preds_dict['propensity']
     
-    # Save dataset (eval split only - the held-out data with out-of-sample predictions)
+    # Save dataset, params, and logs if requested
     if save_dataset_path is not None:
-        logger.info(f"Saving simulated dataset (eval split only) to {save_dataset_path}")
-        eval_plasmode_df.to_parquet(save_dataset_path, index=False)
+        logger.info(f"Saving simulated dataset to {save_dataset_path}")
+        plasmode_df.to_parquet(save_dataset_path, index=False)
         
         if save_config_path is not None and hyperparams is not None:
             try:
-                hyperparams_copy = hyperparams.copy()
-                hyperparams_copy['train_fraction'] = train_fraction
                 with open(save_config_path, 'w') as f:
-                    json.dump(hyperparams_copy, f, indent=2)
+                    json.dump(hyperparams, f, indent=2)
                 logger.info(f"Saved params to {save_config_path}")
             except Exception as e:
                 logger.warning(f"Failed to save simulation parameters: {e}")
@@ -466,20 +685,30 @@ def _run_single_plasmode_experiment(
             except Exception as e:
                 logger.warning(f"Failed to save training log: {e}")
     
-    # Step 5: Evaluate performance on EVAL SPLIT only (out-of-sample)
-    metrics = _evaluate_plasmode_performance(
-        eval_plasmode_df,
-        preds_dict['ite'],
-        scenario.target_ate_logit
-    )
-    
-    logger.info(f"Experiment complete: ATE bias={metrics['ate_bias']:.4f}, ITE corr={metrics['ite_correlation']:.4f}")
+    # Step 5: Evaluate performance
+    # When cv_folds == 1, we evaluate on ALL data (in-sample, since no CV)
+    # When cv_folds > 1 in single-experiment mode (legacy), evaluate on validation set
+    if cv_folds == 1:
+        # All data is training data - evaluate on full dataset
+        metrics = _evaluate_plasmode_performance(
+            plasmode_df,
+            preds_dict['ite'],
+            scenario.target_ate_logit
+        )
+        logger.info("cv_folds=1: Evaluating on full dataset (in-sample)")
+    else:
+        # Legacy behavior: evaluate only on validation set
+        val_indices = np.where(plasmode_df['sim_split'] == 'validation')[0]
+        val_predictions = preds_dict['ite'][val_indices]
+        val_df_subset = plasmode_df.iloc[val_indices]
+        metrics = _evaluate_plasmode_performance(
+            val_df_subset,
+            val_predictions,
+            scenario.target_ate_logit
+        )
 
-    # Add metadata to metrics
+    # Add oracle mode flag to metrics
     metrics['oracle_mode'] = use_generator_phi
-    metrics['train_fraction'] = train_fraction
-    metrics['n_train'] = len(train_split_df)
-    metrics['n_eval'] = len(eval_split_df)
 
     return metrics, combined_history
 

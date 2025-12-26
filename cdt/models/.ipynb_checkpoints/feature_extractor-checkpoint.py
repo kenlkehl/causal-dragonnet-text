@@ -61,8 +61,7 @@ class FeatureExtractor(nn.Module):
         aggregator_mode: str,
         sentence_transformer_model: SentenceTransformer,
         phantom_confounders: int = 0,
-        device: Optional[torch.device] = None,
-        explicit_confounder_embeddings: Optional[torch.Tensor] = None
+        device: Optional[torch.device] = None
     ):
         """
         Initialize feature extractor.
@@ -77,7 +76,6 @@ class FeatureExtractor(nn.Module):
             phantom_confounders: Number of "phantom" confounders to pad output with zeros
                                  (used when current model has fewer confounders than pretrained)
             device: Device to create tensors on (default: CPU, will be moved later)
-            explicit_confounder_embeddings: Optional pre-computed embeddings tensor (avoids re-encoding)
         """
         super().__init__()
         
@@ -99,25 +97,14 @@ class FeatureExtractor(nn.Module):
         else:
             self.latent_confounders = None
         
-        # Initialize explicit confounders
-        if explicit_confounder_embeddings is not None:
-             # Use pre-computed embeddings (already encoded)
-            logger.info(f"FeatureExtractor: Using {len(explicit_confounder_embeddings)} pre-computed explicit confounder embeddings.")
-            # Ensure they are on the correct device
-            explicit_embeddings = explicit_confounder_embeddings.to(device)
-            self.register_buffer('explicit_confounders', explicit_embeddings)
-            self.num_explicit = explicit_embeddings.size(0)
-            
-        elif explicit_confounder_texts:
-            # Fallback: Encode from texts (Force CPU to avoid CUDA init crashes in workers)
-            logger.info(f"FeatureExtractor: Encoding {len(explicit_confounder_texts)} explicit confounders (CPU Fallback).")
+        # Initialize explicit confounders from query texts
+        if explicit_confounder_texts:
             explicit_embeddings = sentence_transformer_model.encode(
                 explicit_confounder_texts,
                 convert_to_tensor=True,
-                show_progress_bar=False,
-                device='cpu'
+                show_progress_bar=False
             )
-            # Ensure explicit embeddings are on the correct device
+            # Ensure explicit embeddings are on the same device as latent confounders
             explicit_embeddings = explicit_embeddings.to(device)
             # Store as non-trainable parameter
             self.register_buffer('explicit_confounders', explicit_embeddings)

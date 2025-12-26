@@ -229,7 +229,8 @@ def _train_single_model(
         dragonnet_hidden_outcome_dim=arch_config.dragonnet_hidden_outcome_dim,
         chunk_size=arch_config.chunk_size,
         chunk_overlap=arch_config.chunk_overlap,
-        device=str(device)
+        device=str(device),
+        model_type=arch_config.model_type
     )
     
     # Load pretrained weights
@@ -290,7 +291,7 @@ def _train_single_model(
     
     # Optimization
     train_config = config.training
-    optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.learning_rate)
+    optimizer = torch.optim.AdamW(\n        model.parameters(), \n        lr=train_config.learning_rate,\n        weight_decay=1e-4  # Match old_cdt behavior\n    )
     
     if train_config.lr_schedule == "linear":
         total_steps = len(train_loader) * train_config.epochs

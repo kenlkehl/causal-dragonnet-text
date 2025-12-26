@@ -74,7 +74,6 @@ class AppliedInferenceConfig:
     architecture: ModelArchitectureConfig = field(default_factory=ModelArchitectureConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     use_pretrained_weights: bool = True
-    skip: bool = False  # Skip applied inference, go straight to plasmode
 
 
 @dataclass
@@ -83,7 +82,6 @@ class PlasmodeExperimentConfig:
     enabled: bool = False
     num_repeats: int = 1
     save_datasets: bool = False
-    train_fraction: float = 0.8  # Fraction of data for training generator/evaluator (rest is eval)
     generator_architecture: ModelArchitectureConfig = field(default_factory=ModelArchitectureConfig)
     generator_training: TrainingConfig = field(default_factory=TrainingConfig)
     evaluator_architecture: ModelArchitectureConfig = field(default_factory=ModelArchitectureConfig)
@@ -146,7 +144,6 @@ class ExperimentConfig:
             enabled=plasmode_data.get('enabled', False),
             num_repeats=plasmode_data.get('num_repeats', 1),
             save_datasets=plasmode_data.get('save_datasets', False),
-            train_fraction=plasmode_data.get('train_fraction', 0.8),
             generator_architecture=ModelArchitectureConfig(**plasmode_data.get('generator_architecture', {})),
             generator_training=TrainingConfig(**plasmode_data.get('generator_training', {})),
             evaluator_architecture=ModelArchitectureConfig(**plasmode_data.get('evaluator_architecture', {})),

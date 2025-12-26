@@ -69,13 +69,19 @@ class ExperimentRunner:
         else:
             pretrained_weights_path = None
             logger.info("Pretraining disabled, skipping")
-        
-        logger.info("\n" + "="*80)
-        logger.info("PHASE 2: APPLIED INFERENCE")
-        logger.info("="*80)
-        applied_results = self._run_applied_inference(pretrained_weights_path)
-        results['applied_inference'] = applied_results
-        
+
+        if self.config.applied_inference.skip:
+            logger.info("\n" + "="*80)
+            logger.info("PHASE 2: APPLIED INFERENCE (SKIPPED)")
+            logger.info("="*80)
+            logger.info("Applied inference skipped via config.applied_inference.skip=True")
+        else:
+            logger.info("\n" + "="*80)
+            logger.info("PHASE 2: APPLIED INFERENCE")
+            logger.info("="*80)
+            applied_results = self._run_applied_inference(pretrained_weights_path)
+            results['applied_inference'] = applied_results
+
         if self.config.plasmode_experiments.enabled:
             logger.info("\n" + "="*80)
             logger.info("PHASE 3: PLASMODE EXPERIMENTS")

@@ -4,6 +4,8 @@
 from .components import ConfounderAggregator
 from .feature_extractor import FeatureExtractor
 from .dragonnet import DragonNet
+from .uplift import UpliftNet
+from .outcome_heads import OutcomeHeadsOnly, UpliftHeadsOnly
 from .causal_dragonnet import CausalDragonnetText
 from .multitreatment import MultiTreatmentDragonNetInternal, MultiTreatmentDragonnetText
 
@@ -11,6 +13,9 @@ __all__ = [
     'ConfounderAggregator',
     'FeatureExtractor',
     'DragonNet',
+    'UpliftNet',
+    'OutcomeHeadsOnly',
+    'UpliftHeadsOnly',
     'CausalDragonnetText',
     'MultiTreatmentDragonNetInternal',
     'MultiTreatmentDragonnetText',
