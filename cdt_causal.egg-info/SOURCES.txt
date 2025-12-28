@@ -24,9 +24,6 @@ cdt/models/feature_extractor.py
 cdt/models/multitreatment.py
 cdt/models/outcome_heads.py
 cdt/models/uplift.py
-cdt/models/.ipynb_checkpoints/causal_dragonnet-checkpoint.py
-cdt/models/.ipynb_checkpoints/feature_extractor-checkpoint.py
-cdt/models/.ipynb_checkpoints/uplift-checkpoint.py
 cdt/training/__init__.py
 cdt/training/plasmode.py
 cdt/training/pretraining.py
@@ -45,15 +42,4 @@ cdt_causal.egg-info/top_level.txt
 examples/config.json
 examples/config_advanced.json
 examples/config_simple.json
-examples/dfci_config.json
 examples/.ipynb_checkpoints/dfci_config-checkpoint.json
-old_cdt/__init__.py
-old_cdt/aggregators.py
-old_cdt/config.py
-old_cdt/data.py
-old_cdt/experiment.py
-old_cdt/launcher.py
-old_cdt/model.py
-old_cdt/run_grid.py
-old_cdt/utils.py
-old_cdt/worker.py

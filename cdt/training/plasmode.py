@@ -310,11 +310,11 @@ def _run_single_plasmode_experiment(
         entry['repeat_idx'] = hyperparams.get('repeat_idx') if hyperparams else -1
     
     # Step 2: Generate synthetic outcomes for BOTH splits using the same generator
-    use_generator_phi = getattr(plasmode_config, 'evaluator_use_generator_confounders', False)
+    oracle_mode = getattr(plasmode_config, 'oracle_mode', False)
     
     # Generate for train split (for evaluator training)
-    if use_generator_phi:
-        train_plasmode_df, train_phi = _generate_plasmode_data(
+    if oracle_mode:
+        train_plasmode_df, train_confounder_features = _generate_plasmode_data(
             train_split_df,
             generator,
             scenario,
@@ -324,7 +324,7 @@ def _run_single_plasmode_experiment(
             return_confounders=True
         )
         # Generate for eval split (for metrics)
-        eval_plasmode_df, eval_phi = _generate_plasmode_data(
+        eval_plasmode_df, eval_confounder_features = _generate_plasmode_data(
             eval_split_df,
             generator,
             scenario,
@@ -333,7 +333,7 @@ def _run_single_plasmode_experiment(
             cache,
             return_confounders=True
         )
-        logger.info("Oracle mode: Evaluator will use generator's phi representation directly")
+        logger.info("Oracle mode: Evaluator will use generator's confounder_features directly")
     else:
         train_plasmode_df = _generate_plasmode_data(
             train_split_df,
@@ -353,43 +353,21 @@ def _run_single_plasmode_experiment(
             cache,
             return_confounders=False
         )
-        train_phi = None
-        eval_phi = None
+        train_confounder_features = None
+        eval_confounder_features = None
     
     # Mark splits in dataframes
     train_plasmode_df['sim_split'] = 'train'
     eval_plasmode_df['sim_split'] = 'eval'
     
-    # Step 3: Train evaluator on TRAIN SPLIT only
-    # Use a small portion of train for validation/early stopping (10%)
-    eval_train_df, eval_val_df = train_test_split(
-        train_plasmode_df, test_size=0.1, random_state=42
-    )
-    
-    if use_generator_phi:
-        # Oracle mode: train on pre-extracted phi representations
-        train_indices = train_plasmode_df.index.get_indexer(eval_train_df.index)
-        val_indices = train_plasmode_df.index.get_indexer(eval_val_df.index)
-        
-        # Standardize based on TRAIN set statistics for stability
-        phi_train_subset = train_phi[train_indices]
-        phi_mean = np.mean(phi_train_subset, axis=0)
-        phi_std = np.std(phi_train_subset, axis=0) + 1e-8
-        
-        logger.info(f"Oracle Mode: Standardizing phi. Train Mean range: [{phi_mean.min():.3f}, {phi_mean.max():.3f}]")
-        
-        # Standardize train and eval phi with same stats
-        train_phi_std = (train_phi - phi_mean) / phi_std
-        eval_phi_std = (eval_phi - phi_mean) / phi_std
-        
-        train_phi_for_training = train_phi_std[train_indices]
-        val_phi_for_training = train_phi_std[val_indices]
-        
+    # Step 3: Train evaluator on TRAIN SPLIT (no validation holdout)
+    if oracle_mode:
+        # Oracle mode: train on pre-extracted confounder_features (no standardization)
         evaluator, eval_history = _train_confounder_evaluator(
-            train_phi_for_training,
-            eval_train_df,
-            val_phi_for_training,
-            eval_val_df,
+            train_confounder_features,
+            train_plasmode_df,
+            None,  # No validation set
+            None,
             applied_config,
             plasmode_config,
             device
@@ -401,8 +379,8 @@ def _run_single_plasmode_experiment(
 
         # Realistic mode: train on text, learn own confounders
         evaluator, eval_history = _train_plasmode_evaluator(
-            eval_train_df,
-            eval_val_df,
+            train_plasmode_df,
+            None,  # No validation set
             applied_config,
             plasmode_config,
             device,
@@ -417,15 +395,15 @@ def _run_single_plasmode_experiment(
         entry['generation_mode'] = scenario.generation_mode
         entry['scenario_idx'] = hyperparams.get('scenario_idx') if hyperparams else -1
         entry['repeat_idx'] = hyperparams.get('repeat_idx') if hyperparams else -1
-        entry['oracle_mode'] = use_generator_phi
+        entry['oracle_mode'] = oracle_mode
 
     combined_history = gen_history + eval_history
 
     # Step 4: Generate predictions for EVAL SPLIT only (the held-out data)
-    if use_generator_phi:
+    if oracle_mode:
         preds_dict = _predict_confounder_evaluator(
             evaluator,
-            eval_phi_std,
+            eval_confounder_features,
             device
         )
     else:
@@ -476,7 +454,7 @@ def _run_single_plasmode_experiment(
     logger.info(f"Experiment complete: ATE bias={metrics['ate_bias']:.4f}, ITE corr={metrics['ite_correlation']:.4f}")
 
     # Add metadata to metrics
-    metrics['oracle_mode'] = use_generator_phi
+    metrics['oracle_mode'] = oracle_mode
     metrics['train_fraction'] = train_fraction
     metrics['n_train'] = len(train_split_df)
     metrics['n_eval'] = len(eval_split_df)
@@ -704,7 +682,7 @@ def _generate_plasmode_data(
 
     gen_loader = DataLoader(gen_dataset, batch_size=32, shuffle=False, collate_fn=collate_batch)
 
-    all_phi = []
+    all_confounders = []
     generator.eval()
     with torch.no_grad():
         for batch in gen_loader:
@@ -712,17 +690,15 @@ def _generate_plasmode_data(
                 batch['chunk_embeddings'][i, :, :].to(device).contiguous()
                 for i in range(batch['chunk_embeddings'].size(0))
             ]
-            # Extract confounders, then get phi representation from DragonNet/UpliftNet
-            confounders = generator.get_confounder_features(chunk_embeddings)
-            # Both DragonNet and UpliftNet return phi as the 4th element
-            # DragonNet: (y0_logit, y1_logit, t_logit, phi)
-            # UpliftNet: (y0_logit, tau_logit, t_logit, phi)
-            _, _, _, phi = generator.net(confounders)
-            all_phi.append(phi.cpu())
+            # Extract raw confounder features (before DragonNet)
+            # Use feature_extractor directly to get raw confounders without LayerNorm
+            # This ensures generator and evaluator share the same confounder space
+            confounders = generator.feature_extractor(chunk_embeddings)
+            all_confounders.append(confounders.cpu())
 
-    # Use phi (the DragonNet's learned representation) for ITE generation
-    # This ensures the evaluator can recover ITEs since it learns the same phi space
-    all_phi = torch.cat(all_phi, dim=0).numpy()
+    # Use raw confounder features for ITE generation
+    # This is before DragonNet, so both generator and evaluator can learn in this space
+    all_confounders = torch.cat(all_confounders, dim=0).numpy()
     plasmode_df = train_df.copy()
 
     # Treatments
@@ -731,13 +707,13 @@ def _generate_plasmode_data(
     else:
         treatments = np.random.binomial(1, 0.5, size=len(train_df))
 
-    # Outcomes and True ITE - generated from phi representation
+    # Outcomes and True ITE - generated from raw confounder features
     if scenario.generation_mode == "phi_linear":
-        outcomes, true_ite, true_y0, true_y1 = _generate_linear_outcomes(all_phi, treatments, scenario)
+        outcomes, true_ite, true_y0, true_y1 = _generate_linear_outcomes(all_confounders, treatments, scenario)
     elif scenario.generation_mode == "deep_nonlinear":
-        outcomes, true_ite, true_y0, true_y1 = _generate_deep_nonlinear_outcomes(all_phi, treatments, scenario, device)
+        outcomes, true_ite, true_y0, true_y1 = _generate_deep_nonlinear_outcomes(all_confounders, treatments, scenario, device)
     elif scenario.generation_mode == "uplift_nonlinear":
-        outcomes, true_ite, true_y0, true_y1 = _generate_uplift_outcomes(all_phi, treatments, scenario, device)
+        outcomes, true_ite, true_y0, true_y1 = _generate_uplift_outcomes(all_confounders, treatments, scenario, device)
     else:
         raise ValueError(f"Unknown generation mode: {scenario.generation_mode}")
 
@@ -748,7 +724,7 @@ def _generate_plasmode_data(
     plasmode_df['true_y1_logit'] = true_y1
 
     if return_confounders:
-        return plasmode_df, all_phi
+        return plasmode_df, all_confounders
     return plasmode_df
 
 
@@ -775,13 +751,15 @@ def _generate_linear_outcomes(confounders, treatments, scenario):
     v0 = np.random.randn(n_features, 1)
     v0 = v0 / np.linalg.norm(v0)  # Unit vector
     s0 = confounders @ v0
-    logits_y0 = base_logit + scenario.outcome_heterogeneity_scale * _standardize(s0.flatten())
+    s0 = _standardize(s0)  # Z-score to ensure zero mean, unit variance
+    logits_y0 = base_logit + scenario.outcome_heterogeneity_scale * s0.flatten()
 
     # 2. ITE Component - use normalized unit vector projection
     v_ite = np.random.randn(n_features, 1)
     v_ite = v_ite / np.linalg.norm(v_ite)  # Unit vector
     s_ite = confounders @ v_ite
-    true_ite_logits = scenario.target_ate_logit + scenario.ite_heterogeneity_scale * _standardize(s_ite.flatten())
+    s_ite = _standardize(s_ite)  # Z-score to ensure zero mean, unit variance
+    true_ite_logits = scenario.target_ate_logit + scenario.ite_heterogeneity_scale * s_ite.flatten()
 
     # 3. Combine
     logits_y1 = logits_y0 + true_ite_logits
@@ -857,7 +835,7 @@ def _generate_uplift_outcomes(confounders, treatments, scenario, device):
     v0 = np.random.randn(n_features, 1)
     v0 = v0 / np.linalg.norm(v0)  # Unit vector
     s0 = confounders @ v0
-    logits_y0 = base_logit + scenario.outcome_heterogeneity_scale * _standardize(s0.flatten())
+    logits_y0 = base_logit + scenario.outcome_heterogeneity_scale * s0.flatten()
 
     # 2. Uplift Model
     if scenario.uplift_hidden_dims:
@@ -888,8 +866,8 @@ def _generate_uplift_outcomes(confounders, treatments, scenario, device):
         v_ite = v_ite / np.linalg.norm(v_ite)  # Unit vector
         ite_raw = (confounders @ v_ite).flatten()
 
-    # Standardize then scale (matching old working code pattern)
-    true_ite_logits = scenario.target_ate_logit + scenario.ite_heterogeneity_scale * _standardize(ite_raw)
+    # Scale raw ITE
+    true_ite_logits = scenario.target_ate_logit + scenario.ite_heterogeneity_scale * ite_raw
 
     logits_y1 = logits_y0 + true_ite_logits
     final_logits = logits_y0 + (true_ite_logits * treatments)
@@ -909,7 +887,7 @@ def _train_plasmode_evaluator(
     pretrained_weights_path: Optional[Path],
     explicit_confounder_embeddings: Optional[torch.Tensor] = None
 ) -> Tuple[CausalDragonnetText, List[Dict[str, Any]]]:
-    """Train evaluator model on plasmode TRAINING data. Returns (model, history).
+    """Train evaluator model on plasmode TRAINING data (realistic mode). Returns (model, history).
     
     Args:
         train_df: Training dataframe
@@ -1169,57 +1147,57 @@ class ConfounderDataset(torch.utils.data.Dataset):
 
 
 def _train_confounder_evaluator(
-    train_phi: np.ndarray,
+    train_confounder_features: np.ndarray,
     train_df: pd.DataFrame,
-    val_phi: Optional[np.ndarray],
+    val_confounder_features: Optional[np.ndarray],
     val_df: Optional[pd.DataFrame],
     applied_config: AppliedInferenceConfig,
     plasmode_config: PlasmodeExperimentConfig,
     device: torch.device
 ) -> Tuple[nn.Module, List[Dict[str, Any]]]:
     """
-    Train a DragonNet evaluator directly on pre-extracted phi representations (oracle mode).
+    Train outcome heads directly on pre-extracted confounder_features (oracle mode).
 
     This bypasses the text -> embedding -> confounder pipeline and trains only
-    the DragonNet on the generator's learned phi representations. Since ITEs are
-    generated from phi, this ensures the evaluator can properly recover them.
+    lightweight outcome heads on the generator's confounder_features. Since ITEs are
+    generated from confounder_features, this ensures the evaluator can properly recover them.
 
     Args:
-        train_phi: Phi representation matrix for training set (n_train, representation_dim)
+        train_confounder_features: Confounder features matrix for training set
+            Shape: (n_train, num_confounders * features_per_confounder)
         train_df: Training dataframe with outcome and treatment columns
-        val_phi: Phi representation matrix for validation set. If None, skip validation.
+        val_confounder_features: Confounder features matrix for validation set. If None, skip validation.
         val_df: Validation dataframe. If None, skip validation.
         applied_config: Applied inference configuration
         plasmode_config: Plasmode experiment configuration
         device: Torch device
 
     Returns:
-        Tuple of (trained DragonNet model, training history)
+        Tuple of (trained outcome heads model, training history)
     """
     from ..models.outcome_heads import OutcomeHeadsOnly, UpliftHeadsOnly
 
-    phi_dim = train_phi.shape[1]
+    confounder_dim = train_confounder_features.shape[1]
     eval_arch = plasmode_config.evaluator_architecture
     eval_training = plasmode_config.evaluator_training
 
-    # Create lightweight outcome heads that take phi directly (no representation layers!)
-    # This matches the old_cdt architecture where phi was fed directly to outcome heads.
-    # Using full DragonNet/UpliftNet here would double-process phi through 6 more
+    # Create lightweight outcome heads that take confounder_features directly (no representation layers!)
+    # Using full DragonNet/UpliftNet here would double-process through 6 more
     # representation layers, causing severe attenuation of the ITE signal.
     if eval_arch.model_type == "uplift":
         model = UpliftHeadsOnly(
-            phi_dim=phi_dim,
+            confounder_dim=confounder_dim,
             hidden_outcome_dim=eval_arch.dragonnet_hidden_outcome_dim
         ).to(device)
     else:
         model = OutcomeHeadsOnly(
-            phi_dim=phi_dim,
+            confounder_dim=confounder_dim,
             hidden_outcome_dim=eval_arch.dragonnet_hidden_outcome_dim
         ).to(device)
 
     # Create training dataset
     train_dataset = ConfounderDataset(
-        confounders=train_phi,
+        confounders=train_confounder_features,
         treatments=train_df[applied_config.treatment_column].values,
         outcomes=train_df[applied_config.outcome_column].values
     )
@@ -1227,9 +1205,9 @@ def _train_confounder_evaluator(
 
     # Create validation dataset (optional)
     val_loader = None
-    if val_phi is not None and val_df is not None:
+    if val_confounder_features is not None and val_df is not None:
         val_dataset = ConfounderDataset(
-            confounders=val_phi,
+            confounders=val_confounder_features,
             treatments=val_df[applied_config.treatment_column].values,
             outcomes=val_df[applied_config.outcome_column].values
         )
@@ -1390,15 +1368,15 @@ def _train_confounder_evaluator(
 
 def _predict_confounder_evaluator(
     model: nn.Module,
-    phi: np.ndarray,
+    confounder_features: np.ndarray,
     device: torch.device
 ) -> dict:
     """
-    Generate ITE predictions from outcome heads using pre-extracted phi representations.
+    Generate ITE predictions from outcome heads using pre-extracted confounder_features.
 
     Args:
         model: Trained OutcomeHeadsOnly/UpliftHeadsOnly model
-        phi: Phi representation matrix (n_samples, representation_dim)
+        confounder_features: Confounder features matrix (n_samples, num_confounders * features_per_confounder)
         device: Torch device
 
     Returns:
@@ -1410,7 +1388,7 @@ def _predict_confounder_evaluator(
     is_uplift = isinstance(model, UpliftHeadsOnly)
 
     dataset = torch.utils.data.TensorDataset(
-        torch.tensor(phi, dtype=torch.float32)
+        torch.tensor(confounder_features, dtype=torch.float32)
     )
     loader = DataLoader(dataset, batch_size=32, shuffle=False)
 
@@ -1420,15 +1398,15 @@ def _predict_confounder_evaluator(
     all_propensity = []
 
     with torch.no_grad():
-        for (batch_phi,) in loader:
-            batch_phi = batch_phi.to(device)
+        for (batch_cf,) in loader:
+            batch_cf = batch_cf.to(device)
 
             if is_uplift:
-                y0_logit, tau_logit, t_logit, _ = model(batch_phi)
+                y0_logit, tau_logit, t_logit, _ = model(batch_cf)
                 y1_logit = y0_logit + tau_logit
                 ite_logit = tau_logit
             else:
-                y0_logit, y1_logit, t_logit, _ = model(batch_phi)
+                y0_logit, y1_logit, t_logit, _ = model(batch_cf)
                 ite_logit = y1_logit - y0_logit
 
             all_ite_logits.append(ite_logit.squeeze(-1).cpu().numpy())

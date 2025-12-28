@@ -99,10 +99,6 @@ class CausalDragonnetText(nn.Module):
             explicit_confounder_embeddings=explicit_confounder_embeddings
         )
         
-        # LayerNorm for confounder features to ensure consistent scale before DragonNet
-        # This prevents ITE range attenuation by normalizing inputs to the representation layers
-        self.confounder_norm = nn.LayerNorm(self.feature_extractor.output_dim)
-        
         # Binary treatment Causal Inference Net
         if model_type == "uplift":
             self.net = UpliftNet(
@@ -143,22 +139,21 @@ class CausalDragonnetText(nn.Module):
             y0_logit: (batch, 1) - outcome prediction under control
             y1_logit: (batch, 1) - outcome prediction under treatment
             t_logit: (batch, 1) - treatment propensity logit
-            phi: (batch, representation_dim) - learned representation
+            final_common_layer: (batch, representation_dim) - shared representation before outcome heads
         """
-        # Extract confounder features from chunks and normalize
-        x_representation = self.feature_extractor(chunk_embeddings_list)
-        x_representation = self.confounder_norm(x_representation)
+        # Extract confounder features from chunks
+        confounder_features = self.feature_extractor(chunk_embeddings_list)
         
         if self.model_type == "uplift":
-            # UpliftNet returns: y0_logit, tau_logit, t_logit, phi
-            y0_logit, tau_logit, t_logit, phi = self.net(x_representation)
+            # UpliftNet returns: y0_logit, tau_logit, t_logit, final_common_layer
+            y0_logit, tau_logit, t_logit, final_common_layer = self.net(confounder_features)
             # Reconstruct y1_logit = y0_logit + tau_logit
             y1_logit = y0_logit + tau_logit
         else:
-            # DragonNet returns: y0_logit, y1_logit, t_logit, phi
-            y0_logit, y1_logit, t_logit, phi = self.net(x_representation)
+            # DragonNet returns: y0_logit, y1_logit, t_logit, final_common_layer
+            y0_logit, y1_logit, t_logit, final_common_layer = self.net(confounder_features)
         
-        return y0_logit, y1_logit, t_logit, phi
+        return y0_logit, y1_logit, t_logit, final_common_layer
     
     def train_step(
         self,
@@ -237,17 +232,16 @@ class CausalDragonnetText(nn.Module):
         Make predictions for inference.
         """
         with torch.no_grad():
-            x_representation = self.feature_extractor(chunk_embeddings_list)
-            x_representation = self.confounder_norm(x_representation)
+            confounder_features = self.feature_extractor(chunk_embeddings_list)
             
             if self.model_type == "uplift":
-                y0_logit, tau_logit, t_logit, phi = self.net(x_representation)
+                y0_logit, tau_logit, t_logit, final_common_layer = self.net(confounder_features)
                 y1_logit = y0_logit + tau_logit
                 
                 # In uplift mode, we can return tau directly
                 tau_pred = tau_logit.squeeze(-1)  # If linear activation, this IS the ITE on logit scale
             else:
-                y0_logit, y1_logit, t_logit, phi = self.net(x_representation)
+                y0_logit, y1_logit, t_logit, final_common_layer = self.net(confounder_features)
                 tau_pred = (y1_logit - y0_logit).squeeze(-1)
 
             # Convert to probabilities
@@ -262,7 +256,7 @@ class CausalDragonnetText(nn.Module):
                 'y0_logit': y0_logit.squeeze(-1),
                 'y1_logit': y1_logit.squeeze(-1),
                 't_logit': t_logit.squeeze(-1),
-                'representation': phi,
+                'final_common_layer': final_common_layer,
                 'tau_pred': tau_pred # Added explicit tau return
             }
     
@@ -334,33 +328,34 @@ class CausalDragonnetText(nn.Module):
         logger.info(f"Model loaded from {path}")
         return model
     
-    def get_representation(
+    def get_final_common_layer(
         self,
         chunk_embeddings_list: List[torch.Tensor]
     ) -> torch.Tensor:
         """
-        Extract learned representations (phi).
+        Extract the final common layer (shared representation before outcome heads).
         """
         with torch.no_grad():
-            x_representation = self.feature_extractor(chunk_embeddings_list)
-            x_representation = self.confounder_norm(x_representation)
+            confounder_features = self.feature_extractor(chunk_embeddings_list)
             
-            # Both models return phi as the last element
+            # Both models return final_common_layer as the last element
             if self.model_type == "uplift":
-                _, _, _, phi = self.net(x_representation)
+                _, _, _, final_common_layer = self.net(confounder_features)
             else:
-                _, _, _, phi = self.net(x_representation)
+                _, _, _, final_common_layer = self.net(confounder_features)
                 
-            return phi
+            return final_common_layer
     
     def get_confounder_features(
         self,
         chunk_embeddings_list: List[torch.Tensor]
     ) -> torch.Tensor:
         """
-        Extract confounder features (before Causal Net).
+        Extract confounder features (before DragonNet/UpliftNet representation layers).
+        
+        This is the raw output of FeatureExtractor with shape:
+            (batch, num_confounders * features_per_confounder)
         """
         with torch.no_grad():
-            x_representation = self.feature_extractor(chunk_embeddings_list)
-            x_representation = self.confounder_norm(x_representation)
-            return x_representation
+            confounder_features = self.feature_extractor(chunk_embeddings_list)
+            return confounder_features

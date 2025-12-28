@@ -36,25 +36,34 @@ class DragonNet(nn.Module):
         self.outcome1_fc3 = nn.Linear(hidden_outcome_dim, 1)
 
         
-    def forward(self, x_representation):
-        phi = F.relu(self.representation_fc1(x_representation))
-        phi = F.relu(self.representation_fc2(phi))
-        phi = F.relu(self.representation_fc3(phi))
-        phi = F.relu(self.representation_fc4(phi))
-        phi = F.relu(self.representation_fc5(phi))
-        phi = F.elu(self.representation_fc6(phi))
+    def forward(self, confounder_features):
+        """
+        Args:
+            confounder_features: Output from FeatureExtractor
+                Shape: (batch, num_confounders * features_per_confounder)
+        
+        Returns:
+            y0_logit, y1_logit, t_logit, final_common_layer
+        """
+        h = F.relu(self.representation_fc1(confounder_features))
+        h = F.relu(self.representation_fc2(h))
+        h = F.relu(self.representation_fc3(h))
+        h = F.relu(self.representation_fc4(h))
+        h = F.relu(self.representation_fc5(h))
+        final_common_layer = F.elu(self.representation_fc6(h))
 
-        t_logit = self.propensity_fc1(phi)
+        t_logit = self.propensity_fc1(final_common_layer)
 
-        y0 = F.relu(self.outcome0_fc1(phi))
+        y0 = F.relu(self.outcome0_fc1(final_common_layer))
         y0 = F.elu(self.outcome0_fc2(y0))
         y0_logit = self.outcome0_fc3(y0)
 
-        y1 = F.relu(self.outcome1_fc1(phi))
+        y1 = F.relu(self.outcome1_fc1(final_common_layer))
         y1 = F.elu(self.outcome1_fc2(y1))
         y1_logit = self.outcome1_fc3(y1)
 
-        return y0_logit, y1_logit, t_logit, phi
+        return y0_logit, y1_logit, t_logit, final_common_layer
+
 
     def load_pretrained_representation(self, pretrained_state_dict):
         """

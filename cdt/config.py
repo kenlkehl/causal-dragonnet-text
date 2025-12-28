@@ -89,9 +89,10 @@ class PlasmodeExperimentConfig:
     evaluator_architecture: ModelArchitectureConfig = field(default_factory=ModelArchitectureConfig)
     evaluator_training: TrainingConfig = field(default_factory=TrainingConfig)
     plasmode_scenarios: List[PlasmodeConfig] = field(default_factory=list)
-    # If True, evaluator uses generator's pre-extracted confounders directly (oracle mode).
-    # If False (default), evaluator learns its own confounders from text (realistic mode).
-    evaluator_use_generator_confounders: bool = False
+    # Oracle mode: evaluator trains directly on generator's confounder_features.
+    # - True: Evaluator sees exact confounder features used to generate ITEs (no text processing)
+    # - False (default): Evaluator learns its own confounders from text (realistic mode)
+    oracle_mode: bool = False
 
 
 @dataclass
@@ -152,7 +153,8 @@ class ExperimentConfig:
             evaluator_architecture=ModelArchitectureConfig(**plasmode_data.get('evaluator_architecture', {})),
             evaluator_training=TrainingConfig(**plasmode_data.get('evaluator_training', {})),
             plasmode_scenarios=[PlasmodeConfig(**s) for s in plasmode_data.get('plasmode_scenarios', [])],
-            evaluator_use_generator_confounders=plasmode_data.get('evaluator_use_generator_confounders', False)
+            # Support both old and new config variable names
+            oracle_mode=plasmode_data.get('oracle_mode', plasmode_data.get('evaluator_use_generator_confounders', False))
         )
         
         return cls(

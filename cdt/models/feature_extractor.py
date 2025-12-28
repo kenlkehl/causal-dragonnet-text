@@ -153,6 +153,10 @@ class FeatureExtractor(nn.Module):
             self.confounder_projection = nn.Parameter(init_proj)
         else:
             self.confounder_projection = None
+        
+        # BatchNorm to standardize confounder features per-feature across samples
+        # This normalizes each confounder independently (unlike LayerNorm which averages across features)
+        self.feature_norm = nn.BatchNorm1d(self.output_dim, affine=False)
 
     @property
     def out_per_conf(self):
@@ -237,5 +241,8 @@ class FeatureExtractor(nn.Module):
                 device=device, dtype=pooled.dtype
             )
             pooled = torch.cat([pooled, phantom_pad], dim=1)
+        
+        # Apply BatchNorm to standardize each confounder feature independently across samples
+        pooled = self.feature_norm(pooled)
         
         return pooled

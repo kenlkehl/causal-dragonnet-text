@@ -67,23 +67,31 @@ class UpliftNet(nn.Module):
         self.effect_fc3 = nn.Linear(hidden_outcome_dim, 1)
 
         
-    def forward(self, x_representation):
+    def forward(self, confounder_features):
+        """
+        Args:
+            confounder_features: Output from FeatureExtractor
+                Shape: (batch, num_confounders * features_per_confounder)
+        
+        Returns:
+            y0_logit, tau_logit, t_logit, final_common_layer
+        """
         # Shared Representation
-        phi = F.relu(self.representation_fc1(x_representation))
-        phi = F.relu(self.representation_fc2(phi))
-        phi = F.relu(self.representation_fc3(phi))
-        phi = F.relu(self.representation_fc4(phi))
-        phi = F.relu(self.representation_fc5(phi))
-        phi = F.elu(self.representation_fc6(phi))
+        h = F.relu(self.representation_fc1(confounder_features))
+        h = F.relu(self.representation_fc2(h))
+        h = F.relu(self.representation_fc3(h))
+        h = F.relu(self.representation_fc4(h))
+        h = F.relu(self.representation_fc5(h))
+        final_common_layer = F.elu(self.representation_fc6(h))
 
         # Propensity
-        t = F.relu(self.propensity_fc1(phi))
+        t = F.relu(self.propensity_fc1(final_common_layer))
         t = F.relu(self.propensity_fc2(t))
         t = F.relu(self.propensity_fc3(t))
         t_logit = self.propensity_fc4(t)
 
         # Baseline Outcome (Y0)
-        y0 = F.relu(self.baseline_fc1(phi))
+        y0 = F.relu(self.baseline_fc1(final_common_layer))
         y0 = F.relu(self.baseline_fc2(y0))
         y0 = F.relu(self.baseline_fc2a(y0))
         y0 = F.relu(self.baseline_fc2b(y0))
@@ -91,14 +99,14 @@ class UpliftNet(nn.Module):
         y0_logit = self.baseline_fc3(y0)
 
         # Treatment Effect (Tau)
-        tau = F.relu(self.effect_fc1(phi))
+        tau = F.relu(self.effect_fc1(final_common_layer))
         tau = F.relu(self.effect_fc2(tau))
         tau = F.relu(self.effect_fc2a(tau))
         tau = F.relu(self.effect_fc2b(tau))
         tau = F.elu(self.effect_fc2c(tau))
         tau_logit = self.effect_fc3(tau)
 
-        return y0_logit, tau_logit, t_logit, phi
+        return y0_logit, tau_logit, t_logit, final_common_layer
 
     def load_pretrained_representation(self, pretrained_state_dict):
         """
