@@ -2,7 +2,9 @@
   "output_dir": "./cdt_refactored_results",
   "seed": 42,
   "num_workers": 10,
-  "gpu_ids": [3],
+  "gpu_ids": [
+    3
+  ],
   "cache_dir": "./cdt_refactored_cache",
   "pretraining": {
     "enabled": false,
@@ -35,7 +37,7 @@
     }
   },
   "applied_inference": {
-    "skip" : true,
+    "skip": true,
     "dataset_path": "./analysis_dataset.parquet",
     "text_column": "clinical_text",
     "outcome_column": "outcome_indicator",
@@ -43,6 +45,7 @@
     "split_column": "split",
     "architecture": {
       "model_type": "dragonnet",
+      "arctanh_transform": false,
       "embedding_model_name": "all-MiniLM-L6-v2",
       "dragonnet_representation_dim": 128,
       "dragonnet_hidden_outcome_dim": 64,
@@ -67,22 +70,25 @@
   },
   "plasmode_experiments": {
     "enabled": true,
-    "num_repeats":  10,
+    "num_repeats": 10,
     "save_datasets": true,
     "evaluator_use_generator_confounders": false,
     "train_fraction": 0.8,
     "generator_architecture": {
       "model_type": "dragonnet",
       "embedding_model_name": "all-MiniLM-L6-v2",
+      "arctanh_transform": false,
       "dragonnet_representation_dim": 128,
       "dragonnet_hidden_outcome_dim": 64,
       "aggregator_mode": "attn",
       "num_latent_confounders": 0,
       "features_per_confounder": 1,
-      "explicit_confounder_texts": ["What is the patient's level of physical strength/performance status?",
-                "What is the patient's smoking history?",
-                "What mutations does the tumor have?",
-                "What is the tumor's PD-L1 expression?"],
+      "explicit_confounder_texts": [
+        "What is the patient's level of physical strength/performance status?",
+        "What is the patient's smoking history?",
+        "What mutations does the tumor have?",
+        "What is the tumor's PD-L1 expression?"
+      ],
       "chunk_size": 128,
       "chunk_overlap": 32
     },
@@ -99,15 +105,18 @@
     "evaluator_architecture": {
       "model_type": "dragonnet",
       "embedding_model_name": "all-MiniLM-L6-v2",
+      "arctanh_transform": false,
       "dragonnet_representation_dim": 128,
       "dragonnet_hidden_outcome_dim": 64,
       "aggregator_mode": "attn",
       "num_latent_confounders": 20,
       "features_per_confounder": 1,
-      "explicit_confounder_texts": ["What is the patient's level of physical strength/performance status?",
-                "What is the patient's smoking history?",
-                "What mutations does the tumor have?",
-                "What is the tumor's PD-L1 expression?"],
+      "explicit_confounder_texts": [
+        "What is the patient's level of physical strength/performance status?",
+        "What is the patient's smoking history?",
+        "What mutations does the tumor have?",
+        "What is the tumor's PD-L1 expression?"
+      ],
       "chunk_size": 128,
       "chunk_overlap": 32
     },

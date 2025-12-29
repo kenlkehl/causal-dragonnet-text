@@ -135,7 +135,8 @@ class MultiTreatmentDragonnetText(nn.Module):
         dragonnet_hidden_outcome_dim: int = 64,
         chunk_size: int = 128,
         chunk_overlap: int = 32,
-        device: str = "cuda:0"
+        device: str = "cuda:0",
+        arctanh_transform: bool = False
     ):
         """
         Initialize multi-treatment DragonNet for text.
@@ -152,6 +153,7 @@ class MultiTreatmentDragonnetText(nn.Module):
             chunk_size: Text chunk size in words
             chunk_overlap: Overlap between chunks
             device: Device string
+            arctanh_transform: If True, apply arctanh to cosine similarities before BatchNorm
         """
         super().__init__()
         
@@ -172,6 +174,7 @@ class MultiTreatmentDragonnetText(nn.Module):
             'dragonnet_hidden_outcome_dim': dragonnet_hidden_outcome_dim,
             'chunk_size': chunk_size,
             'chunk_overlap': chunk_overlap,
+            'arctanh_transform': arctanh_transform
         }
         
         # Load sentence transformer (not registered as a submodule)
@@ -192,7 +195,8 @@ class MultiTreatmentDragonnetText(nn.Module):
             aggregator_mode=aggregator_mode,
             sentence_transformer_model=self.sentence_transformer_model,
             phantom_confounders=0,
-            device=self._device
+            device=self._device,
+            arctanh_transform=arctanh_transform
         )
         
         # Multi-treatment DragonNet - registered as submodule

@@ -26,6 +26,7 @@ Requires-Dist: scikit-learn>=1.2.0
 Requires-Dist: tqdm>=4.65.0
 Requires-Dist: pyarrow
 Requires-Dist: joblib>=1.2.0
+Requires-Dist: openai>=1.0.0
 Provides-Extra: dev
 Requires-Dist: pytest>=7.0.0; extra == "dev"
 Requires-Dist: black>=23.0.0; extra == "dev"

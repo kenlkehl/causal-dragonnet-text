@@ -62,7 +62,8 @@ class FeatureExtractor(nn.Module):
         sentence_transformer_model: SentenceTransformer,
         phantom_confounders: int = 0,
         device: Optional[torch.device] = None,
-        explicit_confounder_embeddings: Optional[torch.Tensor] = None
+        explicit_confounder_embeddings: Optional[torch.Tensor] = None,
+        arctanh_transform: bool = False
     ):
         """
         Initialize feature extractor.
@@ -78,6 +79,8 @@ class FeatureExtractor(nn.Module):
                                  (used when current model has fewer confounders than pretrained)
             device: Device to create tensors on (default: CPU, will be moved later)
             explicit_confounder_embeddings: Optional pre-computed embeddings tensor (avoids re-encoding)
+            arctanh_transform: If True, apply arctanh to cosine similarities before BatchNorm.
+                               This stretches values near ±1 towards ±∞, expanding compressed ranges.
         """
         super().__init__()
         
@@ -86,6 +89,7 @@ class FeatureExtractor(nn.Module):
         self.explicit_confounder_texts = explicit_confounder_texts
         self.features_per_confounder = features_per_confounder
         self.phantom_confounders = phantom_confounders
+        self.arctanh_transform = arctanh_transform
         
         # Use CPU as default device for initialization, will be moved later
         if device is None:
@@ -241,6 +245,11 @@ class FeatureExtractor(nn.Module):
                 device=device, dtype=pooled.dtype
             )
             pooled = torch.cat([pooled, phantom_pad], dim=1)
+        
+        # Optional arctanh to stretch compressed cosine similarities before standardization
+        if self.arctanh_transform:
+            # Clamp to avoid ±∞ at exactly ±1
+            pooled = torch.arctanh(torch.clamp(pooled, -0.999, 0.999))
         
         # Apply BatchNorm to standardize each confounder feature independently across samples
         pooled = self.feature_norm(pooled)

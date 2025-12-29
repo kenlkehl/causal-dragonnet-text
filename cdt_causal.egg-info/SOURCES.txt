@@ -43,3 +43,9 @@ examples/config.json
 examples/config_advanced.json
 examples/config_simple.json
 examples/.ipynb_checkpoints/dfci_config-checkpoint.json
+synthetic_data/__init__.py
+synthetic_data/cli.py
+synthetic_data/config.py
+synthetic_data/generator.py
+synthetic_data/llm_client.py
+synthetic_data/prompts.py

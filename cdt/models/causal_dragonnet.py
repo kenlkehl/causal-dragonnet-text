@@ -39,7 +39,8 @@ class CausalDragonnetText(nn.Module):
         chunk_size: int = 128,
         chunk_overlap: int = 32,
         device: str = "cuda:0",
-        model_type: str = "dragonnet"  # "dragonnet" or "uplift"
+        model_type: str = "dragonnet",  # "dragonnet" or "uplift"
+        arctanh_transform: bool = False
     ):
         """
         Initialize binary treatment DragonNet for text.
@@ -57,6 +58,7 @@ class CausalDragonnetText(nn.Module):
             chunk_overlap: Overlap between chunks
             device: Device string
             model_type: Architecture type ("dragonnet" or "uplift")
+            arctanh_transform: If True, apply arctanh to cosine similarities before BatchNorm
         """
         super().__init__()
         
@@ -76,7 +78,8 @@ class CausalDragonnetText(nn.Module):
             'dragonnet_hidden_outcome_dim': dragonnet_hidden_outcome_dim,
             'chunk_size': chunk_size,
             'chunk_overlap': chunk_overlap,
-            'model_type': model_type
+            'model_type': model_type,
+            'arctanh_transform': arctanh_transform
         }
         
         # Load sentence transformer (not a PyTorch submodule)
@@ -96,7 +99,8 @@ class CausalDragonnetText(nn.Module):
             sentence_transformer_model=self.sentence_transformer_model,
             phantom_confounders=0,
             device=self._device,
-            explicit_confounder_embeddings=explicit_confounder_embeddings
+            explicit_confounder_embeddings=explicit_confounder_embeddings,
+            arctanh_transform=arctanh_transform
         )
         
         # Binary treatment Causal Inference Net

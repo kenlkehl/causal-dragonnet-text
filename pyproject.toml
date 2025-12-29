@@ -29,7 +29,8 @@ dependencies = [
     "scikit-learn>=1.2.0",
     "tqdm>=4.65.0",
     "pyarrow",
-    "joblib>=1.2.0"
+    "joblib>=1.2.0",
+    "openai>=1.0.0"
 ]
 
 [project.optional-dependencies]

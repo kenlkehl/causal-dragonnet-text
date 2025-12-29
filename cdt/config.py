@@ -21,6 +21,7 @@ class ModelArchitectureConfig:
     explicit_confounder_texts: Optional[List[str]] = None
     chunk_size: int = 128
     chunk_overlap: int = 32
+    arctanh_transform: bool = False  # Apply arctanh to stretch cosine similarities before BatchNorm
 
 
 @dataclass
