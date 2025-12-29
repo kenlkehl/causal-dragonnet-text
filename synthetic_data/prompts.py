@@ -181,6 +181,13 @@ Generate a comprehensive clinical history document that:
 6. Contains typical clinical details like vital signs, lab values, physical exam findings
 7. Reflects the clinical decision-making around treatment selection
 
+CRITICAL REQUIREMENT: Do NOT mention which specific treatment the patient was ultimately assigned to or received.
+The clinical history should describe the patient's condition, characteristics, and the treatment decision-making process,
+but should END BEFORE the actual treatment is selected or administered. This is essential because the document
+will be used for causal inference and the treatment assignment must be predicted from the confounders, not read from the text.
+
+The document should read as if it captures the patient's state at the moment of treatment decision, before the treatment is revealed.
+
 Important: The patient characteristics should be embedded naturally in the clinical narrative, not listed explicitly.
 Write the document as if it were real clinical notes, imaging reports, and pathology reports that have been concatenated together.
 
