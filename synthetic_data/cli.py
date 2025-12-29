@@ -48,6 +48,18 @@ Examples:
         default=1.0,
         help="Treatment coefficient in outcome equation on logit scale (default: 1.0)",
     )
+    parser.add_argument(
+        "--target-treatment-rate",
+        type=float,
+        default=0.5,
+        help="Target proportion of patients receiving treatment=1 (default: 0.5)",
+    )
+    parser.add_argument(
+        "--target-control-outcome-rate",
+        type=float,
+        default=0.2,
+        help="Target outcome rate in control group (treatment=0) (default: 0.2)",
+    )
     
     # LLM parameters
     parser.add_argument(
@@ -122,6 +134,8 @@ Examples:
         clinical_question=args.clinical_question,
         dataset_size=args.dataset_size,
         treatment_coefficient=args.treatment_coefficient,
+        target_treatment_rate=args.target_treatment_rate,
+        target_control_outcome_rate=args.target_control_outcome_rate,
         output_dir=args.output_dir,
         seed=args.seed,
         llm=LLMConfig(
@@ -142,8 +156,8 @@ Examples:
         )
         
         print(f"\n✓ Generated {len(df)} patients")
-        print(f"  - Treatment rate: {df['treatment'].mean():.1%}")
-        print(f"  - Outcome rate: {df['outcome'].mean():.1%}")
+        print(f"  - Treatment rate: {df['treatment_indicator'].mean():.1%}")
+        print(f"  - Outcome rate: {df['outcome_indicator'].mean():.1%}")
         print(f"  - Output: {args.output_dir}/dataset.parquet")
         print(f"  - Metadata: {args.output_dir}/metadata.json")
         

@@ -30,6 +30,7 @@ cdt/training/pretraining.py
 cdt/training/.ipynb_checkpoints/plasmode-checkpoint.py
 cdt/training/.ipynb_checkpoints/pretraining-checkpoint.py
 cdt/utils/__init__.py
+cdt/utils/diagnostics.py
 cdt/utils/io.py
 cdt/utils/model_loading.py
 cdt/utils/system.py

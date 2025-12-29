@@ -34,6 +34,10 @@ class SyntheticDataConfig:
     dataset_size: int = 500
     treatment_coefficient: float = 1.0  # Coefficient for treatment in outcome equation (logit scale)
     
+    # Target rates (intercepts will be calibrated to achieve these)
+    target_treatment_rate: float = 0.5  # Proportion of patients receiving treatment=1
+    target_control_outcome_rate: float = 0.2  # Outcome rate in control group (treatment=0)
+    
     # Output
     output_dir: str = "./synthetic_output"
     

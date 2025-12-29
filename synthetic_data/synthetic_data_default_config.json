@@ -2,6 +2,8 @@
   "clinical_question": "Compare the effectiveness of letrozole+palbociclib with letrozole+ribociclib for the first line treatment of metastatic ER positive breast cancer.",
   "dataset_size": 500,
   "treatment_coefficient": 1.0,
+  "target_treatment_rate": 0.5,
+  "target_control_outcome_rate": 0.2,
   "output_dir": "./synthetic_output",
   "llm": {
     "api_base_url": "http://localhost:8000/v1",

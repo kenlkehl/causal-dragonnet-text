@@ -81,11 +81,22 @@ def generate_synthetic_dataset(
     logger.info(f"Outcome equation has {len(outcome_eq['coefficients'])} terms")
     
     # Step 3: Generate summary statistics
-    logger.info("Step 3/5: Generating summary statistics...")
+    logger.info("Step 3/6: Generating summary statistics...")
     summary_stats = _generate_summary_statistics(client, config.clinical_question, confounders)
     
-    # Step 4: Generate patient data
-    logger.info(f"Step 4/5: Generating {config.dataset_size} patients...")
+    # Step 4: Calibrate intercepts to hit target rates
+    logger.info("Step 4/6: Calibrating intercepts to target rates...")
+    treatment_eq, outcome_eq = _calibrate_intercepts(
+        confounders=confounders,
+        summary_stats=summary_stats,
+        treatment_eq=treatment_eq,
+        outcome_eq=outcome_eq,
+        target_treatment_rate=config.target_treatment_rate,
+        target_control_outcome_rate=config.target_control_outcome_rate,
+    )
+    
+    # Step 5: Generate patient data
+    logger.info(f"Step 5/6: Generating {config.dataset_size} patients...")
     patient_data = _generate_all_patients(
         client=client,
         config=config,
@@ -97,8 +108,8 @@ def generate_synthetic_dataset(
         show_progress=show_progress,
     )
     
-    # Step 5: Assemble dataset
-    logger.info("Step 5/5: Assembling dataset...")
+    # Step 6: Assemble dataset
+    logger.info("Step 6/6: Assembling dataset...")
     df = pd.DataFrame(patient_data)
     
     # Compile metadata
@@ -110,8 +121,8 @@ def generate_synthetic_dataset(
         "summary_statistics": summary_stats,
         "dataset_statistics": {
             "n_patients": len(df),
-            "treatment_rate": df["treatment"].mean(),
-            "outcome_rate": df["outcome"].mean(),
+            "treatment_rate": df["treatment_indicator"].mean(),
+            "outcome_rate": df["outcome_indicator"].mean(),
             "mean_treatment_logit": df["true_treatment_logit"].mean(),
             "std_treatment_logit": df["true_treatment_logit"].std(),
             "mean_outcome_logit": df["true_outcome_logit"].mean(),
@@ -205,6 +216,116 @@ def _generate_summary_statistics(
     )
     
     return response.get("summary_statistics", {})
+
+
+def _calibrate_intercepts(
+    confounders: List[Dict[str, Any]],
+    summary_stats: Dict[str, Any],
+    treatment_eq: Dict[str, Any],
+    outcome_eq: Dict[str, Any],
+    target_treatment_rate: float,
+    target_control_outcome_rate: float,
+    n_samples: int = 10000,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Calibrate equation intercepts to achieve target marginal rates.
+    
+    Uses Monte Carlo sampling and binary search to find intercepts that yield
+    the desired treatment rate and control group outcome rate.
+    
+    Args:
+        confounders: List of confounder definitions
+        summary_stats: Summary statistics for sampling
+        treatment_eq: Treatment assignment equation (will be modified)
+        outcome_eq: Outcome equation (will be modified)
+        target_treatment_rate: Desired proportion receiving treatment=1
+        target_control_outcome_rate: Desired outcome rate when treatment=0
+        n_samples: Number of Monte Carlo samples for calibration
+        
+    Returns:
+        Tuple of (calibrated_treatment_eq, calibrated_outcome_eq)
+    """
+    from scipy.optimize import brentq
+    
+    # Sample characteristics for calibration
+    sampled_chars = [
+        _sample_patient_characteristics(confounders, summary_stats)
+        for _ in range(n_samples)
+    ]
+    
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
+    
+    def compute_linear_predictor(characteristics, equation, confounders, summary_stats, treatment=None):
+        """Compute linear predictor WITHOUT intercept."""
+        # Temporarily set intercept to 0
+        original_intercept = equation.get("intercept", 0.0)
+        equation["intercept"] = 0.0
+        logit = _compute_logit(characteristics, confounders, summary_stats, equation, treatment=treatment)
+        equation["intercept"] = original_intercept
+        return logit
+    
+    # Compute linear predictors for all samples (without intercept)
+    treatment_lps = np.array([
+        compute_linear_predictor(chars, treatment_eq, confounders, summary_stats)
+        for chars in sampled_chars
+    ])
+    
+    outcome_lps = np.array([
+        compute_linear_predictor(chars, outcome_eq, confounders, summary_stats, treatment=0)
+        for chars in sampled_chars
+    ])
+    
+    # Calibrate treatment intercept
+    def treatment_rate_error(intercept):
+        probs = sigmoid(intercept + treatment_lps)
+        return probs.mean() - target_treatment_rate
+    
+    try:
+        # Search for intercept in reasonable range
+        calibrated_treatment_intercept = brentq(treatment_rate_error, -10, 10)
+    except ValueError:
+        # If target is outside achievable range, use boundary
+        logger.warning(f"Could not achieve target treatment rate {target_treatment_rate}, using closest achievable")
+        if treatment_rate_error(-10) > 0:
+            calibrated_treatment_intercept = -10
+        else:
+            calibrated_treatment_intercept = 10
+    
+    # Calibrate outcome intercept (for control group)
+    def outcome_rate_error(intercept):
+        probs = sigmoid(intercept + outcome_lps)
+        return probs.mean() - target_control_outcome_rate
+    
+    try:
+        calibrated_outcome_intercept = brentq(outcome_rate_error, -10, 10)
+    except ValueError:
+        logger.warning(f"Could not achieve target control outcome rate {target_control_outcome_rate}, using closest achievable")
+        if outcome_rate_error(-10) > 0:
+            calibrated_outcome_intercept = -10
+        else:
+            calibrated_outcome_intercept = 10
+    
+    # Update equations with calibrated intercepts
+    original_treatment_intercept = treatment_eq.get("intercept", 0.0)
+    original_outcome_intercept = outcome_eq.get("intercept", 0.0)
+    
+    treatment_eq["intercept"] = calibrated_treatment_intercept
+    treatment_eq["original_intercept"] = original_treatment_intercept
+    
+    outcome_eq["intercept"] = calibrated_outcome_intercept
+    outcome_eq["original_intercept"] = original_outcome_intercept
+    
+    logger.info(f"Calibrated treatment intercept: {original_treatment_intercept:.3f} -> {calibrated_treatment_intercept:.3f}")
+    logger.info(f"Calibrated outcome intercept: {original_outcome_intercept:.3f} -> {calibrated_outcome_intercept:.3f}")
+    
+    # Verify achieved rates
+    achieved_treatment_rate = sigmoid(calibrated_treatment_intercept + treatment_lps).mean()
+    achieved_outcome_rate = sigmoid(calibrated_outcome_intercept + outcome_lps).mean()
+    logger.info(f"Achieved treatment rate: {achieved_treatment_rate:.3f} (target: {target_treatment_rate:.3f})")
+    logger.info(f"Achieved control outcome rate: {achieved_outcome_rate:.3f} (target: {target_control_outcome_rate:.3f})")
+    
+    return treatment_eq, outcome_eq
 
 
 def _sample_patient_characteristics(
@@ -376,8 +497,8 @@ def _generate_single_patient(
         "patient_id": patient_idx,
         "patient_prompt": patient_prompt,
         "clinical_history": clinical_history,
-        "treatment": treatment,
-        "outcome": outcome,
+        "treatment_indicator": treatment,
+        "outcome_indicator": outcome,
         "true_treatment_logit": treatment_logit,
         "true_outcome_logit": outcome_logit,
     }
