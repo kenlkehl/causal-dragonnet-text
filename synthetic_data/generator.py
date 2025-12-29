@@ -496,7 +496,7 @@ def _generate_single_patient(
     return {
         "patient_id": patient_idx,
         "patient_prompt": patient_prompt,
-        "clinical_history": clinical_history,
+        "clinical_text": clinical_history,
         "treatment_indicator": treatment,
         "outcome_indicator": outcome,
         "true_treatment_logit": treatment_logit,

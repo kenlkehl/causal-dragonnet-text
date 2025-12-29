@@ -167,12 +167,14 @@ class ExperimentRunner:
         logger.info(f"Loading dataset: {applied_config.dataset_path}")
         df = load_dataset(applied_config.dataset_path)
         
+        # Only validate split_column if using fixed split mode (cv_folds <= 1)
+        split_col_to_validate = applied_config.split_column if applied_config.cv_folds <= 1 else None
         validate_dataset(
             df,
             text_column=applied_config.text_column,
             outcome_column=applied_config.outcome_column,
             treatment_column=applied_config.treatment_column,
-            split_column=applied_config.split_column
+            split_column=split_col_to_validate
         )
         
         output_dir = ensure_dir(self.output_dir / "applied_inference")
@@ -220,12 +222,13 @@ class ExperimentRunner:
         logger.info(f"Loading dataset: {applied_config.dataset_path}")
         df = load_dataset(applied_config.dataset_path)
         
+        # Plasmode uses all data without splits
         validate_dataset(
             df,
             text_column=applied_config.text_column,
             outcome_column=applied_config.outcome_column,
             treatment_column=applied_config.treatment_column,
-            split_column=applied_config.split_column
+            split_column=None  # Plasmode doesn't require split column
         )
         
         output_dir = ensure_dir(self.output_dir / "plasmode_experiments")
