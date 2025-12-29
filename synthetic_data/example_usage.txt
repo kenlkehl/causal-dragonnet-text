@@ -1,0 +1,4 @@
+python -m synthetic_data.cli \
+  --api-url http://localhost:8000/v1 \
+  --dataset-size 500 \
+  --output-dir ./synthetic_outputs

@@ -16,7 +16,10 @@ from joblib import Parallel, delayed
 from ..config import AppliedInferenceConfig
 from ..models.causal_dragonnet import CausalDragonnetText
 from ..data import ClinicalTextDataset, collate_batch, load_dataset, EmbeddingCache
-from ..utils import cuda_cleanup, get_memory_info, load_pretrained_with_dimension_matching
+from ..utils import (
+    cuda_cleanup, get_memory_info, load_pretrained_with_dimension_matching,
+    compute_latent_drift, log_latent_drift, compute_confounder_feature_stats, log_confounder_stats
+)
 
 
 logger = logging.getLogger(__name__)
@@ -246,6 +249,11 @@ def _train_single_model(
         except Exception as e:
             logger.warning(f"    ✗ Failed to load pretrained weights: {e}")
     
+    # Snapshot initial latent confounders for drift tracking
+    initial_latents = None
+    if model.feature_extractor.latent_confounders is not None:
+        initial_latents = model.feature_extractor.latent_confounders.data.clone()
+    
     # Initialize latents if needed
     if pretrained_weights_path is None and config.training.init_latents_from_kmeans:
         _initialize_latents_kmeans(model, train_df, cache, device)
@@ -291,7 +299,11 @@ def _train_single_model(
     
     # Optimization
     train_config = config.training
-    optimizer = torch.optim.AdamW(\n        model.parameters(), \n        lr=train_config.learning_rate,\n        weight_decay=1e-4  # Match old_cdt behavior\n    )
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=train_config.learning_rate,
+        weight_decay=1e-4  # Match old_cdt behavior
+    )
     
     if train_config.lr_schedule == "linear":
         total_steps = len(train_loader) * train_config.epochs
@@ -335,6 +347,11 @@ def _train_single_model(
     # Restore best
     if best_model_state:
         model.load_state_dict(best_model_state)
+    
+    # Compute and log latent drift
+    if initial_latents is not None and model.feature_extractor.latent_confounders is not None:
+        drift_df = compute_latent_drift(initial_latents, model.feature_extractor.latent_confounders.data)
+        log_latent_drift(drift_df, prefix="Applied ")
         
     return model, history
 
@@ -366,7 +383,7 @@ def _predict_dataset(
         collate_fn=collate_batch
     )
     
-    return _generate_predictions(model, loader, device)
+    return _generate_predictions(model, loader, device, config)
 
 
 def _train_epoch(
@@ -505,12 +522,14 @@ def _compute_epoch_metrics(epoch_loss, loader, all_targets, all_treatments, all_
 def _generate_predictions(
     model: CausalDragonnetText,
     loader: DataLoader,
-    device: torch.device
+    device: torch.device,
+    config: AppliedInferenceConfig = None
 ) -> dict:
     """Generate predictions on test set."""
     all_y0 = []
     all_y1 = []
     all_propensity = []
+    all_confounder_features = []  # For diagnostics
     
     model.eval()
     
@@ -520,6 +539,10 @@ def _generate_predictions(
                 batch['chunk_embeddings'][i, :, :].to(device).contiguous()
                 for i in range(batch['chunk_embeddings'].size(0))
             ]
+            
+            # Extract confounder features for diagnostics
+            features = model.feature_extractor(chunk_embeddings_list)
+            all_confounder_features.append(features.cpu().numpy())
             
             preds = model.predict(chunk_embeddings_list)
             
@@ -531,6 +554,21 @@ def _generate_predictions(
     y1_prob = np.concatenate(all_y1)
     propensity = np.concatenate(all_propensity)
     ite = y1_prob - y0_prob
+    
+    # Log confounder feature statistics if config provided
+    if config is not None:
+        confounder_features = np.concatenate(all_confounder_features, axis=0)
+        arch = config.architecture
+        num_explicit = len(arch.explicit_confounder_texts) if arch.explicit_confounder_texts else 0
+        num_total = num_explicit + arch.num_latent_confounders
+        stats_df = compute_confounder_feature_stats(
+            confounder_features,
+            num_confounders=num_total,
+            features_per_confounder=arch.features_per_confounder,
+            explicit_confounder_texts=arch.explicit_confounder_texts,
+            num_latent=arch.num_latent_confounders
+        )
+        log_confounder_stats(stats_df, prefix="Applied Inference ")
     
     return {
         'y0_prob': y0_prob,

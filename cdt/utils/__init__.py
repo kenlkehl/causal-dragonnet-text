@@ -25,6 +25,14 @@ from .model_loading import (
     extract_feature_extractor_config
 )
 
+from .diagnostics import (
+    compute_confounder_feature_stats,
+    compute_latent_drift,
+    log_confounder_stats,
+    log_latent_drift,
+    extract_confounder_features_batch
+)
+
 __all__ = [
     'limit_threads',
     'set_seed',
@@ -40,4 +48,9 @@ __all__ = [
     'check_checkpoint_compatibility',
     'create_compatible_model_from_checkpoint',
     'extract_feature_extractor_config',
+    'compute_confounder_feature_stats',
+    'compute_latent_drift',
+    'log_confounder_stats',
+    'log_latent_drift',
+    'extract_confounder_features_batch',
 ]

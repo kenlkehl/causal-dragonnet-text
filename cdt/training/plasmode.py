@@ -22,7 +22,10 @@ from sentence_transformers import SentenceTransformer
 from ..config import AppliedInferenceConfig, PlasmodeExperimentConfig, PlasmodeConfig
 from ..models.causal_dragonnet import CausalDragonnetText
 from ..data import ClinicalTextDataset, collate_batch, EmbeddingCache
-from ..utils import cuda_cleanup, get_memory_info, set_seed, load_pretrained_with_dimension_matching
+from ..utils import (
+    cuda_cleanup, get_memory_info, set_seed, load_pretrained_with_dimension_matching,
+    compute_latent_drift, log_latent_drift, compute_confounder_feature_stats, log_confounder_stats
+)
 
 
 logger = logging.getLogger(__name__)
@@ -543,6 +546,11 @@ def _train_plasmode_generator(
         except Exception as e:
             logger.warning(f"Failed to load pretrained weights: {e}")
     
+    # Snapshot initial latent confounders for drift tracking
+    initial_latents = None
+    if generator.feature_extractor.latent_confounders is not None:
+        initial_latents = generator.feature_extractor.latent_confounders.data.clone()
+    
     # Create dataset
     gen_dataset = ClinicalTextDataset(
         data=generator_df,
@@ -639,6 +647,12 @@ def _train_plasmode_generator(
         history.append(epoch_log)
     
     generator.eval()
+    
+    # Compute and log latent drift
+    if initial_latents is not None and generator.feature_extractor.latent_confounders is not None:
+        drift_df = compute_latent_drift(initial_latents, generator.feature_extractor.latent_confounders.data)
+        log_latent_drift(drift_df, prefix="Generator ")
+    
     return generator, history
 
 
@@ -922,6 +936,11 @@ def _train_plasmode_evaluator(
         except Exception as e:
             logger.warning(f"Failed to load pretrained weights: {e}")
     
+    # Snapshot initial latent confounders for drift tracking
+    initial_latents = None
+    if evaluator.feature_extractor.latent_confounders is not None:
+        initial_latents = evaluator.feature_extractor.latent_confounders.data.clone()
+    
     # Training dataset
     train_dataset = ClinicalTextDataset(
         data=train_df,
@@ -1072,6 +1091,11 @@ def _train_plasmode_evaluator(
             }
         history.append(epoch_log)
 
+    # Compute and log latent drift
+    if initial_latents is not None and evaluator.feature_extractor.latent_confounders is not None:
+        drift_df = compute_latent_drift(initial_latents, evaluator.feature_extractor.latent_confounders.data)
+        log_latent_drift(drift_df, prefix="Evaluator ")
+
     return evaluator, history
 
 
@@ -1104,16 +1128,36 @@ def _predict_plasmode_evaluator(
     all_y0_logits = []
     all_y1_logits = []
     all_propensity = []
+    all_confounder_features = []  # For diagnostics
     
     with torch.no_grad():
         for batch in tqdm(loader, desc="Generating predictions", leave=False):
             chunk_embeddings = [batch['chunk_embeddings'][i, :, :].to(device).contiguous() for i in range(batch['chunk_embeddings'].size(0))]
+            
+            # Extract confounder features for diagnostics
+            features = evaluator.feature_extractor(chunk_embeddings)
+            all_confounder_features.append(features.cpu().numpy())
+            
             preds = evaluator.predict(chunk_embeddings)
             
             all_ite_logits.append((preds['y1_logit'] - preds['y0_logit']).cpu().numpy())
             all_y0_logits.append(preds['y0_logit'].cpu().numpy())
             all_y1_logits.append(preds['y1_logit'].cpu().numpy())
             all_propensity.append(preds['propensity'].cpu().numpy())
+    
+    # Log confounder feature statistics
+    confounder_features = np.concatenate(all_confounder_features, axis=0)
+    eval_arch = plasmode_config.evaluator_architecture
+    num_explicit = len(eval_arch.explicit_confounder_texts) if eval_arch.explicit_confounder_texts else 0
+    num_total = num_explicit + eval_arch.num_latent_confounders
+    stats_df = compute_confounder_feature_stats(
+        confounder_features,
+        num_confounders=num_total,
+        features_per_confounder=eval_arch.features_per_confounder,
+        explicit_confounder_texts=eval_arch.explicit_confounder_texts,
+        num_latent=eval_arch.num_latent_confounders
+    )
+    log_confounder_stats(stats_df, prefix="Evaluator Inference ")
             
     return {
         'ite': np.concatenate(all_ite_logits),
