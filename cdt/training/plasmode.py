@@ -363,14 +363,14 @@ def _run_single_plasmode_experiment(
     train_plasmode_df['sim_split'] = 'train'
     eval_plasmode_df['sim_split'] = 'eval'
     
-    # Step 3: Train evaluator on TRAIN SPLIT (no validation holdout)
+    # Step 3: Train evaluator on TRAIN SPLIT (pass eval split for AUROC monitoring only, not early stopping)
     if oracle_mode:
         # Oracle mode: train on pre-extracted confounder_features (no standardization)
         evaluator, eval_history = _train_confounder_evaluator(
             train_confounder_features,
             train_plasmode_df,
-            None,  # No validation set
-            None,
+            eval_confounder_features,  # For validation metrics (monitoring only)
+            eval_plasmode_df,
             applied_config,
             plasmode_config,
             device
@@ -383,7 +383,7 @@ def _run_single_plasmode_experiment(
         # Realistic mode: train on text, learn own confounders
         evaluator, eval_history = _train_plasmode_evaluator(
             train_plasmode_df,
-            None,  # No validation set
+            eval_plasmode_df,  # For validation metrics (monitoring only, no early stopping)
             applied_config,
             plasmode_config,
             device,

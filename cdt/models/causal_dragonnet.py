@@ -83,10 +83,11 @@ class CausalDragonnetText(nn.Module):
         }
         
         # Load sentence transformer (not a PyTorch submodule)
+        # Pass device directly to avoid initial allocation on cuda:0
         self.sentence_transformer_model = SentenceTransformer(
-            sentence_transformer_model_name
+            sentence_transformer_model_name,
+            device=self._device
         )
-        self.sentence_transformer_model.to(self._device)
         self.embedding_dim = self.sentence_transformer_model.get_sentence_embedding_dimension()
         
         # Feature extractor - registered as submodule
