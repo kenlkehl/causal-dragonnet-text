@@ -75,7 +75,9 @@ def generate_synthetic_dataset(
     # Step 2: Generate regression equations
     logger.info("Step 2/5: Generating regression equations...")
     treatment_eq, outcome_eq = _generate_equations(
-        client, config.clinical_question, confounders, config.treatment_coefficient
+        client, config.clinical_question, confounders, config.treatment_coefficient,
+        main_coef_scale=config.main_coefficient_scale,
+        interaction_coef_scale=config.interaction_coefficient_scale,
     )
     logger.info(f"Treatment equation has {len(treatment_eq['coefficients'])} terms")
     logger.info(f"Outcome equation has {len(outcome_eq['coefficients'])} terms")
@@ -85,7 +87,7 @@ def generate_synthetic_dataset(
     summary_stats = _generate_summary_statistics(client, config.clinical_question, confounders)
     
     # Step 4: Calibrate intercepts to hit target rates
-    logger.info("Step 4/6: Calibrating intercepts to target rates...")
+    logger.info("Step 4/7: Calibrating intercepts to target rates...")
     treatment_eq, outcome_eq = _calibrate_intercepts(
         confounders=confounders,
         summary_stats=summary_stats,
@@ -94,9 +96,19 @@ def generate_synthetic_dataset(
         target_treatment_rate=config.target_treatment_rate,
         target_control_outcome_rate=config.target_control_outcome_rate,
     )
-    
-    # Step 5: Generate patient data
-    logger.info(f"Step 5/6: Generating {config.dataset_size} patients...")
+
+    # Step 5: Rescale coefficients to achieve target logit std
+    logger.info("Step 5/7: Rescaling coefficients for target logit std...")
+    treatment_eq, outcome_eq = _rescale_for_target_logit_std(
+        confounders=confounders,
+        summary_stats=summary_stats,
+        treatment_eq=treatment_eq,
+        outcome_eq=outcome_eq,
+        target_logit_std=config.target_logit_std,
+    )
+
+    # Step 6: Generate patient data
+    logger.info(f"Step 6/7: Generating {config.dataset_size} patients...")
     patient_data = _generate_all_patients(
         client=client,
         config=config,
@@ -109,7 +121,7 @@ def generate_synthetic_dataset(
     )
     
     # Step 6: Assemble dataset
-    logger.info("Step 6/6: Assembling dataset...")
+    logger.info("Step 7/7: Assembling dataset...")
     df = pd.DataFrame(patient_data)
     
     # Compile metadata
@@ -171,28 +183,45 @@ def _generate_equations(
     clinical_question: str,
     confounders: List[Dict[str, Any]],
     treatment_coefficient: float,
+    main_coef_scale: float = 0.3,
+    interaction_coef_scale: float = 0.1,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Generate treatment and outcome regression equations."""
+    """Generate treatment and outcome regression equations with scaled coefficients."""
     confounder_list = format_confounder_list(confounders)
-    
+
     prompt = REGRESSION_EQUATION_PROMPT.format(
         clinical_question=clinical_question,
         confounder_list=confounder_list,
         treatment_coefficient=treatment_coefficient,
     )
-    
+
     response = client.generate_json(
         prompt=prompt,
         system_prompt=CLINICAL_SYSTEM_PROMPT,
         temperature=0.5,  # Lower temperature for more consistent equations
     )
-    
+
     treatment_eq = response.get("treatment_equation", {})
     outcome_eq = response.get("outcome_equation", {})
-    
+
+    # Scale LLM-generated coefficients to keep logits in reasonable range
+    def scale_coefficients(coefficients: Dict[str, float], scale: float) -> Dict[str, float]:
+        return {k: v * scale for k, v in coefficients.items()}
+
+    if "coefficients" in treatment_eq:
+        treatment_eq["coefficients"] = scale_coefficients(treatment_eq["coefficients"], main_coef_scale)
+    if "coefficients" in outcome_eq:
+        outcome_eq["coefficients"] = scale_coefficients(outcome_eq["coefficients"], main_coef_scale)
+
+    # Scale any existing interactions from LLM
+    for inter in treatment_eq.get("interactions", []):
+        inter["coefficient"] = inter.get("coefficient", 0) * interaction_coef_scale
+    for inter in outcome_eq.get("interactions", []):
+        inter["coefficient"] = inter.get("coefficient", 0) * interaction_coef_scale
+
     # Add fixed treatment coefficient to outcome equation
     outcome_eq["treatment_coefficient"] = treatment_coefficient
-    
+
     # Add treatment-confounder interactions to outcome equation (for heterogeneous treatment effects)
     # Each continuous confounder and each categorical dummy gets a treatment interaction
     treatment_interactions = []
@@ -200,7 +229,7 @@ def _generate_equations(
         name = conf["name"]
         if conf["type"] == "continuous":
             # Interaction: treatment * z_scored_confounder
-            coef = np.random.uniform(-0.3, 0.3)
+            coef = np.random.uniform(-1.0, 1.0) * interaction_coef_scale
             treatment_interactions.append({
                 "term": name,
                 "coefficient": coef
@@ -209,14 +238,14 @@ def _generate_equations(
             # For categorical, add interaction with each non-reference category
             for cat in conf["categories"][1:]:  # Skip reference category
                 dummy_name = f"{name}_{cat}"
-                coef = np.random.uniform(-0.3, 0.3)
+                coef = np.random.uniform(-1.0, 1.0) * interaction_coef_scale
                 treatment_interactions.append({
                     "term": dummy_name,
                     "coefficient": coef
                 })
     outcome_eq["treatment_interactions"] = treatment_interactions
     logger.info(f"Added {len(treatment_interactions)} treatment-confounder interactions to outcome equation")
-    
+
     # Add pairwise confounder-confounder interactions to treatment equation
     # Get all coefficient names (continuous names + categorical dummies)
     coef_names = []
@@ -227,25 +256,25 @@ def _generate_equations(
         else:
             for cat in conf["categories"][1:]:  # Skip reference category
                 coef_names.append(f"{name}_{cat}")
-    
+
     # Create all pairwise interactions
     existing_interactions = treatment_eq.get("interactions", [])
     existing_pairs = {tuple(sorted(inter.get("terms", []))) for inter in existing_interactions}
-    
+
     new_interactions = []
     for i, term1 in enumerate(coef_names):
         for term2 in coef_names[i+1:]:
             pair = tuple(sorted([term1, term2]))
             if pair not in existing_pairs:
-                coef = np.random.uniform(-0.3, 0.3)
+                coef = np.random.uniform(-1.0, 1.0) * interaction_coef_scale
                 new_interactions.append({
                     "terms": [term1, term2],
                     "coefficient": coef
                 })
-    
+
     treatment_eq["interactions"] = existing_interactions + new_interactions
     logger.info(f"Added {len(new_interactions)} pairwise confounder interactions to treatment equation")
-    
+
     return treatment_eq, outcome_eq
 
 
@@ -378,6 +407,104 @@ def _calibrate_intercepts(
     logger.info(f"Achieved treatment rate: {achieved_treatment_rate:.3f} (target: {target_treatment_rate:.3f})")
     logger.info(f"Achieved control outcome rate: {achieved_outcome_rate:.3f} (target: {target_control_outcome_rate:.3f})")
     
+    return treatment_eq, outcome_eq
+
+
+def _rescale_for_target_logit_std(
+    confounders: List[Dict[str, Any]],
+    summary_stats: Dict[str, Any],
+    treatment_eq: Dict[str, Any],
+    outcome_eq: Dict[str, Any],
+    target_logit_std: float = 2.0,
+    n_samples: int = 10000,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Rescale all coefficients (except intercept) to achieve target logit std.
+
+    This ensures the final logits have a reasonable range for meaningful probabilities.
+    """
+    # Sample characteristics
+    sampled_chars = [
+        _sample_patient_characteristics(confounders, summary_stats)
+        for _ in range(n_samples)
+    ]
+
+    def compute_logit_without_intercept(characteristics, equation, treatment=None):
+        """Compute logit with intercept temporarily set to 0."""
+        original_intercept = equation.get("intercept", 0.0)
+        equation["intercept"] = 0.0
+        logit = _compute_logit(characteristics, confounders, summary_stats, equation, treatment=treatment)
+        equation["intercept"] = original_intercept
+        return logit
+
+    # Compute current logit stds
+    treatment_logits = np.array([
+        compute_logit_without_intercept(chars, treatment_eq)
+        for chars in sampled_chars
+    ])
+    outcome_logits_0 = np.array([
+        compute_logit_without_intercept(chars, outcome_eq, treatment=0)
+        for chars in sampled_chars
+    ])
+    outcome_logits_1 = np.array([
+        compute_logit_without_intercept(chars, outcome_eq, treatment=1)
+        for chars in sampled_chars
+    ])
+
+    treatment_std = np.std(treatment_logits)
+    outcome_std_0 = np.std(outcome_logits_0)
+    outcome_std_1 = np.std(outcome_logits_1)
+    outcome_std = max(outcome_std_0, outcome_std_1)  # Use the larger one
+
+    logger.info(f"Current logit std - treatment: {treatment_std:.2f}, outcome: {outcome_std:.2f}")
+
+    def scale_equation_coefficients(equation: Dict, scale: float) -> Dict:
+        """Scale all coefficients in an equation (except intercept and treatment_coefficient)."""
+        eq = equation.copy()
+
+        # Scale main coefficients
+        if "coefficients" in eq:
+            eq["coefficients"] = {k: v * scale for k, v in eq["coefficients"].items()}
+
+        # Scale interactions
+        if "interactions" in eq:
+            eq["interactions"] = [
+                {**inter, "coefficient": inter.get("coefficient", 0) * scale}
+                for inter in eq["interactions"]
+            ]
+
+        # Scale treatment interactions (for outcome equation)
+        if "treatment_interactions" in eq:
+            eq["treatment_interactions"] = [
+                {**inter, "coefficient": inter.get("coefficient", 0) * scale}
+                for inter in eq["treatment_interactions"]
+            ]
+
+        return eq
+
+    # Compute scale factors
+    if treatment_std > 0:
+        treatment_scale = target_logit_std / treatment_std
+        treatment_eq = scale_equation_coefficients(treatment_eq, treatment_scale)
+        logger.info(f"Scaled treatment coefficients by {treatment_scale:.3f}")
+
+    if outcome_std > 0:
+        outcome_scale = target_logit_std / outcome_std
+        outcome_eq = scale_equation_coefficients(outcome_eq, outcome_scale)
+        logger.info(f"Scaled outcome coefficients by {outcome_scale:.3f}")
+
+    # Verify new stds
+    treatment_logits_new = np.array([
+        compute_logit_without_intercept(chars, treatment_eq)
+        for chars in sampled_chars
+    ])
+    outcome_logits_new = np.array([
+        compute_logit_without_intercept(chars, outcome_eq, treatment=0)
+        for chars in sampled_chars
+    ])
+
+    logger.info(f"New logit std - treatment: {np.std(treatment_logits_new):.2f}, outcome: {np.std(outcome_logits_new):.2f}")
+
     return treatment_eq, outcome_eq
 
 

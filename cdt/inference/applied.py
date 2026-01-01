@@ -152,12 +152,12 @@ def _process_fold(
     # 3. Predict on Held-out Test fold
     preds = _predict_dataset(model, test_df, config, device, cache)
     
-    # 4. Store predictions with indices to reconstruct dataframe
+    # 4. Store predictions with indices to reconstruct dataframe (logit scale)
     preds_df = test_df.copy()
-    preds_df['y0_pred'] = preds['y0_prob']
-    preds_df['y1_pred'] = preds['y1_prob']
-    preds_df['ite_pred'] = preds['ite']
-    preds_df['propensity_pred'] = preds['propensity']
+    preds_df['y0_pred'] = preds['y0_logit']
+    preds_df['y1_pred'] = preds['y1_logit']
+    preds_df['ite_pred'] = preds['ite_logit']
+    preds_df['propensity_pred'] = preds['propensity_logit']
     preds_df['cv_fold'] = fold + 1
     
     # Cleanup
@@ -200,12 +200,12 @@ def _run_fixed_split_inference(
     logger.info("Generating predictions on test set...")
     preds = _predict_dataset(model, test_df, config, device, cache)
     
-    # Combine
+    # Combine (logit scale)
     results_df = test_df.copy()
-    results_df['y0_pred'] = preds['y0_prob']
-    results_df['y1_pred'] = preds['y1_prob']
-    results_df['ite_pred'] = preds['ite']
-    results_df['propensity_pred'] = preds['propensity']
+    results_df['y0_pred'] = preds['y0_logit']
+    results_df['y1_pred'] = preds['y1_logit']
+    results_df['ite_pred'] = preds['ite_logit']
+    results_df['propensity_pred'] = preds['propensity_logit']
     
     _save_and_summarize(results_df, output_path)
 
@@ -545,15 +545,16 @@ def _generate_predictions(
             all_confounder_features.append(features.cpu().numpy())
             
             preds = model.predict(chunk_embeddings_list)
-            
-            all_y0.append(preds['y0_prob'].cpu().numpy())
-            all_y1.append(preds['y1_prob'].cpu().numpy())
-            all_propensity.append(preds['propensity'].cpu().numpy())
-    
-    y0_prob = np.concatenate(all_y0)
-    y1_prob = np.concatenate(all_y1)
-    propensity = np.concatenate(all_propensity)
-    ite = y1_prob - y0_prob
+
+            # Use logit-scale predictions
+            all_y0.append(preds['y0_logit'].cpu().numpy())
+            all_y1.append(preds['y1_logit'].cpu().numpy())
+            all_propensity.append(preds['t_logit'].cpu().numpy())
+
+    y0_logit = np.concatenate(all_y0)
+    y1_logit = np.concatenate(all_y1)
+    propensity_logit = np.concatenate(all_propensity)
+    ite_logit = y1_logit - y0_logit
     
     # Log confounder feature statistics if config provided
     if config is not None:
@@ -569,12 +570,12 @@ def _generate_predictions(
             num_latent=arch.num_latent_confounders
         )
         log_confounder_stats(stats_df, prefix="Applied Inference ")
-    
+
     return {
-        'y0_prob': y0_prob,
-        'y1_prob': y1_prob,
-        'propensity': propensity,
-        'ite': ite
+        'y0_logit': y0_logit,
+        'y1_logit': y1_logit,
+        'propensity_logit': propensity_logit,
+        'ite_logit': ite_logit
     }
 
 

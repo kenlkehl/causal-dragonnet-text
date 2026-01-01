@@ -423,7 +423,7 @@ def _run_single_plasmode_experiment(
     eval_plasmode_df['estimated_ite'] = preds_dict['ite']
     eval_plasmode_df['estimated_y0_logit'] = preds_dict['y0_logit']
     eval_plasmode_df['estimated_y1_logit'] = preds_dict['y1_logit']
-    eval_plasmode_df['estimated_propensity'] = preds_dict['propensity']
+    eval_plasmode_df['estimated_propensity_logit'] = preds_dict['propensity_logit']
     
     # Save dataset (eval split only - the held-out data with out-of-sample predictions)
     if save_dataset_path is not None:
@@ -1143,8 +1143,8 @@ def _predict_plasmode_evaluator(
             all_ite_logits.append((preds['y1_logit'] - preds['y0_logit']).cpu().numpy())
             all_y0_logits.append(preds['y0_logit'].cpu().numpy())
             all_y1_logits.append(preds['y1_logit'].cpu().numpy())
-            all_propensity.append(preds['propensity'].cpu().numpy())
-    
+            all_propensity.append(preds['t_logit'].cpu().numpy())  # Use logit scale
+
     # Log confounder feature statistics
     confounder_features = np.concatenate(all_confounder_features, axis=0)
     eval_arch = plasmode_config.evaluator_architecture
@@ -1158,12 +1158,12 @@ def _predict_plasmode_evaluator(
         num_latent=eval_arch.num_latent_confounders
     )
     log_confounder_stats(stats_df, prefix="Evaluator Inference ")
-            
+
     return {
         'ite': np.concatenate(all_ite_logits),
         'y0_logit': np.concatenate(all_y0_logits),
         'y1_logit': np.concatenate(all_y1_logits),
-        'propensity': np.concatenate(all_propensity)
+        'propensity_logit': np.concatenate(all_propensity)
     }
 
 
@@ -1456,13 +1456,13 @@ def _predict_confounder_evaluator(
             all_ite_logits.append(ite_logit.squeeze(-1).cpu().numpy())
             all_y0_logits.append(y0_logit.squeeze(-1).cpu().numpy())
             all_y1_logits.append(y1_logit.squeeze(-1).cpu().numpy())
-            all_propensity.append(torch.sigmoid(t_logit).squeeze(-1).cpu().numpy())
+            all_propensity.append(t_logit.squeeze(-1).cpu().numpy())  # Keep on logit scale
 
     return {
         'ite': np.concatenate(all_ite_logits),
         'y0_logit': np.concatenate(all_y0_logits),
         'y1_logit': np.concatenate(all_y1_logits),
-        'propensity': np.concatenate(all_propensity)
+        'propensity_logit': np.concatenate(all_propensity)
     }
 
 
