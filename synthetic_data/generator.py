@@ -193,6 +193,59 @@ def _generate_equations(
     # Add fixed treatment coefficient to outcome equation
     outcome_eq["treatment_coefficient"] = treatment_coefficient
     
+    # Add treatment-confounder interactions to outcome equation (for heterogeneous treatment effects)
+    # Each continuous confounder and each categorical dummy gets a treatment interaction
+    treatment_interactions = []
+    for conf in confounders:
+        name = conf["name"]
+        if conf["type"] == "continuous":
+            # Interaction: treatment * z_scored_confounder
+            coef = np.random.uniform(-0.3, 0.3)
+            treatment_interactions.append({
+                "term": name,
+                "coefficient": coef
+            })
+        else:
+            # For categorical, add interaction with each non-reference category
+            for cat in conf["categories"][1:]:  # Skip reference category
+                dummy_name = f"{name}_{cat}"
+                coef = np.random.uniform(-0.3, 0.3)
+                treatment_interactions.append({
+                    "term": dummy_name,
+                    "coefficient": coef
+                })
+    outcome_eq["treatment_interactions"] = treatment_interactions
+    logger.info(f"Added {len(treatment_interactions)} treatment-confounder interactions to outcome equation")
+    
+    # Add pairwise confounder-confounder interactions to treatment equation
+    # Get all coefficient names (continuous names + categorical dummies)
+    coef_names = []
+    for conf in confounders:
+        name = conf["name"]
+        if conf["type"] == "continuous":
+            coef_names.append(name)
+        else:
+            for cat in conf["categories"][1:]:  # Skip reference category
+                coef_names.append(f"{name}_{cat}")
+    
+    # Create all pairwise interactions
+    existing_interactions = treatment_eq.get("interactions", [])
+    existing_pairs = {tuple(sorted(inter.get("terms", []))) for inter in existing_interactions}
+    
+    new_interactions = []
+    for i, term1 in enumerate(coef_names):
+        for term2 in coef_names[i+1:]:
+            pair = tuple(sorted([term1, term2]))
+            if pair not in existing_pairs:
+                coef = np.random.uniform(-0.3, 0.3)
+                new_interactions.append({
+                    "terms": [term1, term2],
+                    "coefficient": coef
+                })
+    
+    treatment_eq["interactions"] = existing_interactions + new_interactions
+    logger.info(f"Added {len(new_interactions)} pairwise confounder interactions to treatment equation")
+    
     return treatment_eq, outcome_eq
 
 
@@ -443,6 +496,28 @@ def _compute_logit(
     if treatment is not None:
         treatment_coef = equation.get("treatment_coefficient", 0.0)
         logit += treatment_coef * treatment
+        
+        # Apply treatment-confounder interactions (for heterogeneous treatment effects)
+        treatment_interactions = equation.get("treatment_interactions", [])
+        for interaction in treatment_interactions:
+            term = interaction.get("term", "")
+            coef = interaction.get("coefficient", 0.0)
+            
+            # Check if it's a continuous variable (in z_values)
+            if term in z_values:
+                logit += coef * treatment * z_values[term]
+            else:
+                # Check if it's a categorical dummy
+                for conf in confounders:
+                    if conf["type"] == "categorical":
+                        name = conf["name"]
+                        for cat in conf["categories"][1:]:  # Skip reference category
+                            dummy_name = f"{name}_{cat}"
+                            if term == dummy_name:
+                                # Add interaction if this category is selected
+                                if characteristics.get(name) == cat:
+                                    logit += coef * treatment
+                                break
     
     return logit
 
@@ -474,6 +549,15 @@ def _generate_single_patient(
     outcome_prob = 1.0 / (1.0 + np.exp(-outcome_logit))
     outcome = int(np.random.random() < outcome_prob)
     
+    # Compute potential outcome logits for causal inference
+    outcome_logit_0 = _compute_logit(
+        characteristics, confounders, summary_stats, outcome_eq, treatment=0
+    )
+    outcome_logit_1 = _compute_logit(
+        characteristics, confounders, summary_stats, outcome_eq, treatment=1
+    )
+    true_ite = outcome_logit_1 - outcome_logit_0
+    
     # Format patient characteristics as prompt
     patient_prompt = format_patient_characteristics(characteristics, confounders)
     
@@ -501,6 +585,9 @@ def _generate_single_patient(
         "outcome_indicator": outcome,
         "true_treatment_logit": treatment_logit,
         "true_outcome_logit": outcome_logit,
+        "outcome_logit_0": outcome_logit_0,
+        "outcome_logit_1": outcome_logit_1,
+        "true_ite": true_ite,
     }
 
 

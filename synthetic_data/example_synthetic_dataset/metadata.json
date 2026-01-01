@@ -1,0 +1,2163 @@
+{
+  "config": {
+    "clinical_question": "Compare the effectiveness of letrozole+palbociclib with letrozole+ribociclib for the first line treatment of metastatic ER positive breast cancer.",
+    "dataset_size": 1000,
+    "treatment_coefficient": 1.0,
+    "target_treatment_rate": 0.5,
+    "target_control_outcome_rate": 0.2,
+    "output_dir": "./synthetic_interactions_outputs",
+    "llm": {
+      "api_base_url": "http://localhost:8000/v1",
+      "api_key": "",
+      "model_name": "openai/gpt-oss-120b",
+      "temperature": 0.7,
+      "max_tokens": 20000,
+      "timeout": 120.0
+    },
+    "seed": 42
+  },
+  "confounders": [
+    {
+      "name": "age",
+      "type": "continuous",
+      "description": "Patient age in years at initiation of first\u2011line therapy"
+    },
+    {
+      "name": "ecog_performance_status",
+      "type": "categorical",
+      "categories": [
+        "0",
+        "1",
+        "2",
+        "3"
+      ],
+      "description": "Eastern Cooperative Oncology Group performance status score"
+    },
+    {
+      "name": "menopausal_status",
+      "type": "categorical",
+      "categories": [
+        "pre\u2011menopausal",
+        "peri\u2011menopausal",
+        "post\u2011menopausal"
+      ],
+      "description": "Menopausal status at treatment start (relevant for aromatase\u2011inhibitor eligibility)"
+    },
+    {
+      "name": "site_of_metastasis",
+      "type": "categorical",
+      "categories": [
+        "bone\u2011only",
+        "liver",
+        "lung",
+        "visceral (non\u2011liver/non\u2011lung)",
+        "multiple sites"
+      ],
+      "description": "Predominant anatomic site(s) of metastatic disease"
+    },
+    {
+      "name": "baseline_liver_function",
+      "type": "continuous",
+      "description": "Serum total bilirubin (mg/dL) measured within 14\u202fdays before therapy"
+    },
+    {
+      "name": "cardiovascular_comorbidity",
+      "type": "categorical",
+      "categories": [
+        "none",
+        "mild (e.g., controlled hypertension)",
+        "moderate (e.g., prior MI, heart failure NYHA I\u2011II)",
+        "severe (e.g., NYHA III\u2011IV, recent coronary event)"
+      ],
+      "description": "Severity of pre\u2011existing cardiovascular disease, influencing CDK4/6 inhibitor selection"
+    },
+    {
+      "name": "prior_adjuvant_or_neoadjuvant_therapy",
+      "type": "categorical",
+      "categories": [
+        "none",
+        "adjuvant chemotherapy only",
+        "neoadjuvant chemotherapy only",
+        "both adjuvant & neoadjuvant chemotherapy"
+      ],
+      "description": "History of systemic therapy before metastatic diagnosis"
+    },
+    {
+      "name": "ki67_index",
+      "type": "continuous",
+      "description": "Baseline tumor Ki\u201167 proliferation index expressed as a percentage"
+    },
+    {
+      "name": "her2_status",
+      "type": "categorical",
+      "categories": [
+        "negative",
+        "equivocal",
+        "positive"
+      ],
+      "description": "Immunohistochemistry/ISH result for HER2; HER2\u2011positive disease may alter treatment choice"
+    },
+    {
+      "name": "insurance_coverage",
+      "type": "categorical",
+      "categories": [
+        "private",
+        "Medicare",
+        "Medicaid",
+        "uninsured"
+      ],
+      "description": "Type of health insurance, which can affect access to specific CDK4/6 inhibitors and supportive care"
+    }
+  ],
+  "treatment_equation": {
+    "intercept": 1.0195422324709604,
+    "coefficients": {
+      "age": 0.05,
+      "baseline_liver_function": -2.0,
+      "ki67_index": 0.1,
+      "ecog_performance_status_1": -1.0,
+      "ecog_performance_status_2": -3.0,
+      "ecog_performance_status_3": -6.0,
+      "menopausal_status_peri": -5.0,
+      "menopausal_status_post": 0.0,
+      "site_of_metastasis_liver": 2.0,
+      "site_of_metastasis_lung": 1.0,
+      "site_of_metastasis_visceral": 1.5,
+      "site_of_metastasis_multiple": 0.5,
+      "cardiovascular_comorbidity_mild": -2.0,
+      "cardiovascular_comorbidity_moderate": -5.0,
+      "cardiovascular_comorbidity_severe": -8.0,
+      "prior_adjuvant_or_neoadjuvant_therapy_adjuvant": 1.0,
+      "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant": 0.5,
+      "prior_adjuvant_or_neoadjuvant_therapy_both": 0.0,
+      "her2_status_equivocal": -1.0,
+      "her2_status_positive": -3.0,
+      "insurance_coverage_medicare": -5.0,
+      "insurance_coverage_medicaid": -10.0,
+      "insurance_coverage_uninsured": -20.0
+    },
+    "interactions": [
+      {
+        "terms": [
+          "age",
+          "cardiovascular_comorbidity_moderate"
+        ],
+        "coefficient": -5.0
+      },
+      {
+        "terms": [
+          "menopausal_status_post",
+          "her2_status_positive"
+        ],
+        "coefficient": 20.0
+      },
+      {
+        "terms": [
+          "site_of_metastasis_liver",
+          "baseline_liver_function"
+        ],
+        "coefficient": -10.0
+      },
+      {
+        "terms": [
+          "age",
+          "ecog_performance_status_1"
+        ],
+        "coefficient": -0.08018289402378498
+      },
+      {
+        "terms": [
+          "age",
+          "ecog_performance_status_2"
+        ],
+        "coefficient": -0.026358009469778454
+      },
+      {
+        "terms": [
+          "age",
+          "ecog_performance_status_3"
+        ],
+        "coefficient": 0.17110557683580813
+      },
+      {
+        "terms": [
+          "age",
+          "menopausal_status_peri\u2011menopausal"
+        ],
+        "coefficient": -0.18019573070498415
+      },
+      {
+        "terms": [
+          "age",
+          "menopausal_status_post\u2011menopausal"
+        ],
+        "coefficient": 0.008540663048166974
+      },
+      {
+        "terms": [
+          "age",
+          "site_of_metastasis_liver"
+        ],
+        "coefficient": 0.05544874131722549
+      },
+      {
+        "terms": [
+          "age",
+          "site_of_metastasis_lung"
+        ],
+        "coefficient": -0.27212975236800135
+      },
+      {
+        "terms": [
+          "age",
+          "site_of_metastasis_visceral (non\u2011liver/non\u2011lung)"
+        ],
+        "coefficient": 0.06452691114086301
+      },
+      {
+        "terms": [
+          "age",
+          "site_of_metastasis_multiple sites"
+        ],
+        "coefficient": -0.19768552578762508
+      },
+      {
+        "terms": [
+          "age",
+          "baseline_liver_function"
+        ],
+        "coefficient": -0.26096904420883227
+      },
+      {
+        "terms": [
+          "age",
+          "cardiovascular_comorbidity_mild (e.g., controlled hypertension)"
+        ],
+        "coefficient": 0.2693313223519999
+      },
+      {
+        "terms": [
+          "age",
+          "cardiovascular_comorbidity_moderate (e.g., prior MI, heart failure NYHA I\u2011II)"
+        ],
+        "coefficient": 0.2793792198447356
+      },
+      {
+        "terms": [
+          "age",
+          "cardiovascular_comorbidity_severe (e.g., NYHA III\u2011IV, recent coronary event)"
+        ],
+        "coefficient": 0.18503840886987666
+      },
+      {
+        "terms": [
+          "age",
+          "prior_adjuvant_or_neoadjuvant_therapy_adjuvant chemotherapy only"
+        ],
+        "coefficient": -0.1172317384959776
+      },
+      {
+        "terms": [
+          "age",
+          "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant chemotherapy only"
+        ],
+        "coefficient": -0.24139673159616967
+      },
+      {
+        "terms": [
+          "age",
+          "prior_adjuvant_or_neoadjuvant_therapy_both adjuvant & neoadjuvant chemotherapy"
+        ],
+        "coefficient": 0.11053981590729411
+      },
+      {
+        "terms": [
+          "age",
+          "ki67_index"
+        ],
+        "coefficient": -0.03590850375623922
+      },
+      {
+        "terms": [
+          "age",
+          "her2_status_equivocal"
+        ],
+        "coefficient": -0.2267770590931327
+      },
+      {
+        "terms": [
+          "age",
+          "her2_status_positive"
+        ],
+        "coefficient": -0.0028938539332378777
+      },
+      {
+        "terms": [
+          "age",
+          "insurance_coverage_Medicare"
+        ],
+        "coefficient": -0.27936688733086895
+      },
+      {
+        "terms": [
+          "age",
+          "insurance_coverage_Medicaid"
+        ],
+        "coefficient": 0.24559224124726925
+      },
+      {
+        "terms": [
+          "age",
+          "insurance_coverage_uninsured"
+        ],
+        "coefficient": -0.14473201103998984
+      },
+      {
+        "terms": [
+          "ecog_performance_status_1",
+          "ecog_performance_status_2"
+        ],
+        "coefficient": 0.09751337061238918
+      },
+      {
+        "terms": [
+          "ecog_performance_status_1",
+          "ecog_performance_status_3"
+        ],
+        "coefficient": -0.11297335434635342
+      },
+      {
+        "terms": [
+          "ecog_performance_status_1",
+          "menopausal_status_peri\u2011menopausal"
+        ],
+        "coefficient": 0.012040812706686499
+      },
+      {
+        "terms": [
+          "ecog_performance_status_1",
+          "menopausal_status_post\u2011menopausal"
+        ],
+        "coefficient": 0.028026167605967767
+      },
+      {
+        "terms": [
+          "ecog_performance_status_1",
+          "site_of_metastasis_liver"
+        ],
+        "coefficient": -0.18908732668468375
+      },
+      {
+        "terms": [
+          "ecog_performance_status_1",
+          "site_of_metastasis_lung"
+        ],
+        "coefficient": 0.2817507766587351
+      },
+      {
+        "terms": [
+          "ecog_performance_status_1",
+          "site_of_metastasis_visceral (non\u2011liver/non\u2011lung)"
+        ],
+        "coefficient": 0.16507969401666872
+      },
+      {
+        "terms": [
+          "ecog_performance_status_1",
+          "site_of_metastasis_multiple sites"
+        ],
+        "coefficient": 0.2636993649385135
+      },
+      {
+        "terms": [
+          "ecog_performance_status_1",
+          "baseline_liver_function"
+        ],
+        "coefficient": 0.2368964102565893
+      },
+      {
+        "terms": [
+          "ecog_performance_status_1",
+          "cardiovascular_comorbidity_mild (e.g., controlled hypertension)"
+        ],
+        "coefficient": 0.058739987286651085
+      },
+      {
+        "terms": [
+          "ecog_performance_status_1",
+          "cardiovascular_comorbidity_moderate (e.g., prior MI, heart failure NYHA I\u2011II)"
+        ],
+        "coefficient": 0.2531245410138701
+      },
+      {
+        "terms": [
+          "ecog_performance_status_1",
+          "cardiovascular_comorbidity_severe (e.g., NYHA III\u2011IV, recent coronary event)"
+        ],
+        "coefficient": -0.2469044987688483
+      },
+      {
+        "terms": [
+          "ecog_performance_status_1",
+          "prior_adjuvant_or_neoadjuvant_therapy_adjuvant chemotherapy only"
+        ],
+        "coefficient": -0.18241028254851288
+      },
+      {
+        "terms": [
+          "ecog_performance_status_1",
+          "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant chemotherapy only"
+        ],
+        "coefficient": -0.27286362665367714
+      },
+      {
+        "terms": [
+          "ecog_performance_status_1",
+          "prior_adjuvant_or_neoadjuvant_therapy_both adjuvant & neoadjuvant chemotherapy"
+        ],
+        "coefficient": -0.10480180154204138
+      },
+      {
+        "terms": [
+          "ecog_performance_status_1",
+          "ki67_index"
+        ],
+        "coefficient": -0.0667936261863108
+      },
+      {
+        "terms": [
+          "ecog_performance_status_1",
+          "her2_status_equivocal"
+        ],
+        "coefficient": -0.13719058093566244
+      },
+      {
+        "terms": [
+          "ecog_performance_status_1",
+          "her2_status_positive"
+        ],
+        "coefficient": 0.19724250549115757
+      },
+      {
+        "terms": [
+          "ecog_performance_status_1",
+          "insurance_coverage_Medicare"
+        ],
+        "coefficient": -0.08594800398384642
+      },
+      {
+        "terms": [
+          "ecog_performance_status_1",
+          "insurance_coverage_Medicaid"
+        ],
+        "coefficient": -0.13143929418757153
+      },
+      {
+        "terms": [
+          "ecog_performance_status_1",
+          "insurance_coverage_uninsured"
+        ],
+        "coefficient": 0.02561764989494908
+      },
+      {
+        "terms": [
+          "ecog_performance_status_2",
+          "ecog_performance_status_3"
+        ],
+        "coefficient": -0.2154454650151424
+      },
+      {
+        "terms": [
+          "ecog_performance_status_2",
+          "menopausal_status_peri\u2011menopausal"
+        ],
+        "coefficient": 0.1813181884524238
+      },
+      {
+        "terms": [
+          "ecog_performance_status_2",
+          "menopausal_status_post\u2011menopausal"
+        ],
+        "coefficient": -0.2552696137921375
+      },
+      {
+        "terms": [
+          "ecog_performance_status_2",
+          "site_of_metastasis_liver"
+        ],
+        "coefficient": 0.2921321619603104
+      },
+      {
+        "terms": [
+          "ecog_performance_status_2",
+          "site_of_metastasis_lung"
+        ],
+        "coefficient": 0.16334686157799444
+      },
+      {
+        "terms": [
+          "ecog_performance_status_2",
+          "site_of_metastasis_visceral (non\u2011liver/non\u2011lung)"
+        ],
+        "coefficient": -0.18077059107949656
+      },
+      {
+        "terms": [
+          "ecog_performance_status_2",
+          "site_of_metastasis_multiple sites"
+        ],
+        "coefficient": -0.29668672972583854
+      },
+      {
+        "terms": [
+          "ecog_performance_status_2",
+          "baseline_liver_function"
+        ],
+        "coefficient": 0.18927685707290048
+      },
+      {
+        "terms": [
+          "ecog_performance_status_2",
+          "cardiovascular_comorbidity_mild (e.g., controlled hypertension)"
+        ],
+        "coefficient": 0.12411440630857029
+      },
+      {
+        "terms": [
+          "ecog_performance_status_2",
+          "cardiovascular_comorbidity_moderate (e.g., prior MI, heart failure NYHA I\u2011II)"
+        ],
+        "coefficient": 0.13740430082459237
+      },
+      {
+        "terms": [
+          "ecog_performance_status_2",
+          "cardiovascular_comorbidity_severe (e.g., NYHA III\u2011IV, recent coronary event)"
+        ],
+        "coefficient": 0.16276220801156743
+      },
+      {
+        "terms": [
+          "ecog_performance_status_2",
+          "prior_adjuvant_or_neoadjuvant_therapy_adjuvant chemotherapy only"
+        ],
+        "coefficient": -0.2555732089595458
+      },
+      {
+        "terms": [
+          "ecog_performance_status_2",
+          "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant chemotherapy only"
+        ],
+        "coefficient": -0.08492056287343644
+      },
+      {
+        "terms": [
+          "ecog_performance_status_2",
+          "prior_adjuvant_or_neoadjuvant_therapy_both adjuvant & neoadjuvant chemotherapy"
+        ],
+        "coefficient": -0.23047856428492217
+      },
+      {
+        "terms": [
+          "ecog_performance_status_2",
+          "ki67_index"
+        ],
+        "coefficient": 0.21786205552535615
+      },
+      {
+        "terms": [
+          "ecog_performance_status_2",
+          "her2_status_equivocal"
+        ],
+        "coefficient": 0.07397887609653475
+      },
+      {
+        "terms": [
+          "ecog_performance_status_2",
+          "her2_status_positive"
+        ],
+        "coefficient": -0.10146118508841048
+      },
+      {
+        "terms": [
+          "ecog_performance_status_2",
+          "insurance_coverage_Medicare"
+        ],
+        "coefficient": -0.2618649898283858
+      },
+      {
+        "terms": [
+          "ecog_performance_status_2",
+          "insurance_coverage_Medicaid"
+        ],
+        "coefficient": -0.11341060697060268
+      },
+      {
+        "terms": [
+          "ecog_performance_status_2",
+          "insurance_coverage_uninsured"
+        ],
+        "coefficient": -0.10489000678395177
+      },
+      {
+        "terms": [
+          "ecog_performance_status_3",
+          "menopausal_status_peri\u2011menopausal"
+        ],
+        "coefficient": 0.13776370700283846
+      },
+      {
+        "terms": [
+          "ecog_performance_status_3",
+          "menopausal_status_post\u2011menopausal"
+        ],
+        "coefficient": 0.08253448281312786
+      },
+      {
+        "terms": [
+          "ecog_performance_status_3",
+          "site_of_metastasis_liver"
+        ],
+        "coefficient": 0.23232764554579594
+      },
+      {
+        "terms": [
+          "ecog_performance_status_3",
+          "site_of_metastasis_lung"
+        ],
+        "coefficient": -0.016671044902830445
+      },
+      {
+        "terms": [
+          "ecog_performance_status_3",
+          "site_of_metastasis_visceral (non\u2011liver/non\u2011lung)"
+        ],
+        "coefficient": -0.228243452437019
+      },
+      {
+        "terms": [
+          "ecog_performance_status_3",
+          "site_of_metastasis_multiple sites"
+        ],
+        "coefficient": 0.12794687233379698
+      },
+      {
+        "terms": [
+          "ecog_performance_status_3",
+          "baseline_liver_function"
+        ],
+        "coefficient": 0.15647102917013844
+      },
+      {
+        "terms": [
+          "ecog_performance_status_3",
+          "cardiovascular_comorbidity_mild (e.g., controlled hypertension)"
+        ],
+        "coefficient": 0.03676631854169776
+      },
+      {
+        "terms": [
+          "ecog_performance_status_3",
+          "cardiovascular_comorbidity_moderate (e.g., prior MI, heart failure NYHA I\u2011II)"
+        ],
+        "coefficient": 0.1625803079727366
+      },
+      {
+        "terms": [
+          "ecog_performance_status_3",
+          "cardiovascular_comorbidity_severe (e.g., NYHA III\u2011IV, recent coronary event)"
+        ],
+        "coefficient": -0.003722642181365532
+      },
+      {
+        "terms": [
+          "ecog_performance_status_3",
+          "prior_adjuvant_or_neoadjuvant_therapy_adjuvant chemotherapy only"
+        ],
+        "coefficient": 0.013639697629196423
+      },
+      {
+        "terms": [
+          "ecog_performance_status_3",
+          "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant chemotherapy only"
+        ],
+        "coefficient": -0.043475388984870245
+      },
+      {
+        "terms": [
+          "ecog_performance_status_3",
+          "prior_adjuvant_or_neoadjuvant_therapy_both adjuvant & neoadjuvant chemotherapy"
+        ],
+        "coefficient": -0.2847485239535429
+      },
+      {
+        "terms": [
+          "ecog_performance_status_3",
+          "ki67_index"
+        ],
+        "coefficient": -0.2352651438040173
+      },
+      {
+        "terms": [
+          "ecog_performance_status_3",
+          "her2_status_equivocal"
+        ],
+        "coefficient": -0.2811424885879594
+      },
+      {
+        "terms": [
+          "ecog_performance_status_3",
+          "her2_status_positive"
+        ],
+        "coefficient": 0.08184624675826824
+      },
+      {
+        "terms": [
+          "ecog_performance_status_3",
+          "insurance_coverage_Medicare"
+        ],
+        "coefficient": -0.11138641135420399
+      },
+      {
+        "terms": [
+          "ecog_performance_status_3",
+          "insurance_coverage_Medicaid"
+        ],
+        "coefficient": 0.005142414698821651
+      },
+      {
+        "terms": [
+          "ecog_performance_status_3",
+          "insurance_coverage_uninsured"
+        ],
+        "coefficient": 0.24453988435565582
+      },
+      {
+        "terms": [
+          "menopausal_status_peri\u2011menopausal",
+          "menopausal_status_post\u2011menopausal"
+        ],
+        "coefficient": -0.15042466251067502
+      },
+      {
+        "terms": [
+          "menopausal_status_peri\u2011menopausal",
+          "site_of_metastasis_liver"
+        ],
+        "coefficient": -0.053770246178622166
+      },
+      {
+        "terms": [
+          "menopausal_status_peri\u2011menopausal",
+          "site_of_metastasis_lung"
+        ],
+        "coefficient": 0.1533306831258292
+      },
+      {
+        "terms": [
+          "menopausal_status_peri\u2011menopausal",
+          "site_of_metastasis_visceral (non\u2011liver/non\u2011lung)"
+        ],
+        "coefficient": -0.16272110070502652
+      },
+      {
+        "terms": [
+          "menopausal_status_peri\u2011menopausal",
+          "site_of_metastasis_multiple sites"
+        ],
+        "coefficient": -0.25381205410272417
+      },
+      {
+        "terms": [
+          "menopausal_status_peri\u2011menopausal",
+          "baseline_liver_function"
+        ],
+        "coefficient": -0.12614912825173918
+      },
+      {
+        "terms": [
+          "menopausal_status_peri\u2011menopausal",
+          "cardiovascular_comorbidity_mild (e.g., controlled hypertension)"
+        ],
+        "coefficient": -0.20326722764759736
+      },
+      {
+        "terms": [
+          "menopausal_status_peri\u2011menopausal",
+          "cardiovascular_comorbidity_moderate (e.g., prior MI, heart failure NYHA I\u2011II)"
+        ],
+        "coefficient": 0.2578185914055438
+      },
+      {
+        "terms": [
+          "menopausal_status_peri\u2011menopausal",
+          "cardiovascular_comorbidity_severe (e.g., NYHA III\u2011IV, recent coronary event)"
+        ],
+        "coefficient": 0.18487222773865014
+      },
+      {
+        "terms": [
+          "menopausal_status_peri\u2011menopausal",
+          "prior_adjuvant_or_neoadjuvant_therapy_adjuvant chemotherapy only"
+        ],
+        "coefficient": 0.08004225390625408
+      },
+      {
+        "terms": [
+          "menopausal_status_peri\u2011menopausal",
+          "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant chemotherapy only"
+        ],
+        "coefficient": 0.22287635411263057
+      },
+      {
+        "terms": [
+          "menopausal_status_peri\u2011menopausal",
+          "prior_adjuvant_or_neoadjuvant_therapy_both adjuvant & neoadjuvant chemotherapy"
+        ],
+        "coefficient": 0.18220324613946864
+      },
+      {
+        "terms": [
+          "menopausal_status_peri\u2011menopausal",
+          "ki67_index"
+        ],
+        "coefficient": -0.18805796466837849
+      },
+      {
+        "terms": [
+          "menopausal_status_peri\u2011menopausal",
+          "her2_status_equivocal"
+        ],
+        "coefficient": 0.23553539909398663
+      },
+      {
+        "terms": [
+          "menopausal_status_peri\u2011menopausal",
+          "her2_status_positive"
+        ],
+        "coefficient": 0.023605345149390444
+      },
+      {
+        "terms": [
+          "menopausal_status_peri\u2011menopausal",
+          "insurance_coverage_Medicare"
+        ],
+        "coefficient": 0.18446409309843753
+      },
+      {
+        "terms": [
+          "menopausal_status_peri\u2011menopausal",
+          "insurance_coverage_Medicaid"
+        ],
+        "coefficient": 0.23765477995409595
+      },
+      {
+        "terms": [
+          "menopausal_status_peri\u2011menopausal",
+          "insurance_coverage_uninsured"
+        ],
+        "coefficient": -0.10919791501688167
+      },
+      {
+        "terms": [
+          "menopausal_status_post\u2011menopausal",
+          "site_of_metastasis_liver"
+        ],
+        "coefficient": -0.23396884528339396
+      },
+      {
+        "terms": [
+          "menopausal_status_post\u2011menopausal",
+          "site_of_metastasis_lung"
+        ],
+        "coefficient": -0.163238902474835
+      },
+      {
+        "terms": [
+          "menopausal_status_post\u2011menopausal",
+          "site_of_metastasis_visceral (non\u2011liver/non\u2011lung)"
+        ],
+        "coefficient": -0.04373532682424619
+      },
+      {
+        "terms": [
+          "menopausal_status_post\u2011menopausal",
+          "site_of_metastasis_multiple sites"
+        ],
+        "coefficient": 0.19080885955349586
+      },
+      {
+        "terms": [
+          "menopausal_status_post\u2011menopausal",
+          "baseline_liver_function"
+        ],
+        "coefficient": 0.216438349953806
+      },
+      {
+        "terms": [
+          "menopausal_status_post\u2011menopausal",
+          "cardiovascular_comorbidity_mild (e.g., controlled hypertension)"
+        ],
+        "coefficient": -0.29582872168128554
+      },
+      {
+        "terms": [
+          "menopausal_status_post\u2011menopausal",
+          "cardiovascular_comorbidity_moderate (e.g., prior MI, heart failure NYHA I\u2011II)"
+        ],
+        "coefficient": 0.006448381546539428
+      },
+      {
+        "terms": [
+          "menopausal_status_post\u2011menopausal",
+          "cardiovascular_comorbidity_severe (e.g., NYHA III\u2011IV, recent coronary event)"
+        ],
+        "coefficient": -0.049553398110732616
+      },
+      {
+        "terms": [
+          "menopausal_status_post\u2011menopausal",
+          "prior_adjuvant_or_neoadjuvant_therapy_adjuvant chemotherapy only"
+        ],
+        "coefficient": -0.16673531371756184
+      },
+      {
+        "terms": [
+          "menopausal_status_post\u2011menopausal",
+          "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant chemotherapy only"
+        ],
+        "coefficient": -0.2280807795997903
+      },
+      {
+        "terms": [
+          "menopausal_status_post\u2011menopausal",
+          "prior_adjuvant_or_neoadjuvant_therapy_both adjuvant & neoadjuvant chemotherapy"
+        ],
+        "coefficient": -0.09743089715782322
+      },
+      {
+        "terms": [
+          "menopausal_status_post\u2011menopausal",
+          "ki67_index"
+        ],
+        "coefficient": 0.2657458223475115
+      },
+      {
+        "terms": [
+          "menopausal_status_post\u2011menopausal",
+          "her2_status_equivocal"
+        ],
+        "coefficient": -0.10607824078754685
+      },
+      {
+        "terms": [
+          "menopausal_status_post\u2011menopausal",
+          "her2_status_positive"
+        ],
+        "coefficient": 0.011274373046019637
+      },
+      {
+        "terms": [
+          "menopausal_status_post\u2011menopausal",
+          "insurance_coverage_Medicare"
+        ],
+        "coefficient": 0.12181137533710673
+      },
+      {
+        "terms": [
+          "menopausal_status_post\u2011menopausal",
+          "insurance_coverage_Medicaid"
+        ],
+        "coefficient": -0.0818222385724236
+      },
+      {
+        "terms": [
+          "menopausal_status_post\u2011menopausal",
+          "insurance_coverage_uninsured"
+        ],
+        "coefficient": 0.28306924963257635
+      },
+      {
+        "terms": [
+          "site_of_metastasis_liver",
+          "site_of_metastasis_lung"
+        ],
+        "coefficient": 0.27746837696526677
+      },
+      {
+        "terms": [
+          "site_of_metastasis_liver",
+          "site_of_metastasis_visceral (non\u2011liver/non\u2011lung)"
+        ],
+        "coefficient": -0.1489306225047815
+      },
+      {
+        "terms": [
+          "site_of_metastasis_liver",
+          "site_of_metastasis_multiple sites"
+        ],
+        "coefficient": -0.0016508964645687296
+      },
+      {
+        "terms": [
+          "site_of_metastasis_liver",
+          "cardiovascular_comorbidity_mild (e.g., controlled hypertension)"
+        ],
+        "coefficient": -0.11947301410993819
+      },
+      {
+        "terms": [
+          "site_of_metastasis_liver",
+          "cardiovascular_comorbidity_moderate (e.g., prior MI, heart failure NYHA I\u2011II)"
+        ],
+        "coefficient": -0.12909570337351942
+      },
+      {
+        "terms": [
+          "site_of_metastasis_liver",
+          "cardiovascular_comorbidity_severe (e.g., NYHA III\u2011IV, recent coronary event)"
+        ],
+        "coefficient": -0.2778678315872803
+      },
+      {
+        "terms": [
+          "site_of_metastasis_liver",
+          "prior_adjuvant_or_neoadjuvant_therapy_adjuvant chemotherapy only"
+        ],
+        "coefficient": 0.0657386003879381
+      },
+      {
+        "terms": [
+          "site_of_metastasis_liver",
+          "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant chemotherapy only"
+        ],
+        "coefficient": 0.0016074139373168927
+      },
+      {
+        "terms": [
+          "site_of_metastasis_liver",
+          "prior_adjuvant_or_neoadjuvant_therapy_both adjuvant & neoadjuvant chemotherapy"
+        ],
+        "coefficient": -0.2691127492500064
+      },
+      {
+        "terms": [
+          "site_of_metastasis_liver",
+          "ki67_index"
+        ],
+        "coefficient": -0.13281212145803314
+      },
+      {
+        "terms": [
+          "site_of_metastasis_liver",
+          "her2_status_equivocal"
+        ],
+        "coefficient": 0.24495953157999223
+      },
+      {
+        "terms": [
+          "site_of_metastasis_liver",
+          "her2_status_positive"
+        ],
+        "coefficient": -0.15626286559981653
+      },
+      {
+        "terms": [
+          "site_of_metastasis_liver",
+          "insurance_coverage_Medicare"
+        ],
+        "coefficient": -0.21306307674526614
+      },
+      {
+        "terms": [
+          "site_of_metastasis_liver",
+          "insurance_coverage_Medicaid"
+        ],
+        "coefficient": -0.006328343833462202
+      },
+      {
+        "terms": [
+          "site_of_metastasis_liver",
+          "insurance_coverage_uninsured"
+        ],
+        "coefficient": 0.29139027246636046
+      },
+      {
+        "terms": [
+          "site_of_metastasis_lung",
+          "site_of_metastasis_visceral (non\u2011liver/non\u2011lung)"
+        ],
+        "coefficient": -0.15476683709309974
+      },
+      {
+        "terms": [
+          "site_of_metastasis_lung",
+          "site_of_metastasis_multiple sites"
+        ],
+        "coefficient": 0.10328132844352711
+      },
+      {
+        "terms": [
+          "site_of_metastasis_lung",
+          "baseline_liver_function"
+        ],
+        "coefficient": 0.15697176919723055
+      },
+      {
+        "terms": [
+          "site_of_metastasis_lung",
+          "cardiovascular_comorbidity_mild (e.g., controlled hypertension)"
+        ],
+        "coefficient": -0.15741747360456018
+      },
+      {
+        "terms": [
+          "site_of_metastasis_lung",
+          "cardiovascular_comorbidity_moderate (e.g., prior MI, heart failure NYHA I\u2011II)"
+        ],
+        "coefficient": 0.13692980916711572
+      },
+      {
+        "terms": [
+          "site_of_metastasis_lung",
+          "cardiovascular_comorbidity_severe (e.g., NYHA III\u2011IV, recent coronary event)"
+        ],
+        "coefficient": -0.07933012036844805
+      },
+      {
+        "terms": [
+          "site_of_metastasis_lung",
+          "prior_adjuvant_or_neoadjuvant_therapy_adjuvant chemotherapy only"
+        ],
+        "coefficient": 0.07938349835614766
+      },
+      {
+        "terms": [
+          "site_of_metastasis_lung",
+          "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant chemotherapy only"
+        ],
+        "coefficient": 0.08011782645653681
+      },
+      {
+        "terms": [
+          "site_of_metastasis_lung",
+          "prior_adjuvant_or_neoadjuvant_therapy_both adjuvant & neoadjuvant chemotherapy"
+        ],
+        "coefficient": 0.021464810444855098
+      },
+      {
+        "terms": [
+          "site_of_metastasis_lung",
+          "ki67_index"
+        ],
+        "coefficient": -0.245826137967355
+      },
+      {
+        "terms": [
+          "site_of_metastasis_lung",
+          "her2_status_equivocal"
+        ],
+        "coefficient": 0.2011814973535428
+      },
+      {
+        "terms": [
+          "site_of_metastasis_lung",
+          "her2_status_positive"
+        ],
+        "coefficient": -0.1075319610169585
+      },
+      {
+        "terms": [
+          "site_of_metastasis_lung",
+          "insurance_coverage_Medicare"
+        ],
+        "coefficient": -0.18808889376008747
+      },
+      {
+        "terms": [
+          "site_of_metastasis_lung",
+          "insurance_coverage_Medicaid"
+        ],
+        "coefficient": -0.2755349150671416
+      },
+      {
+        "terms": [
+          "site_of_metastasis_lung",
+          "insurance_coverage_uninsured"
+        ],
+        "coefficient": 0.05453576591294507
+      },
+      {
+        "terms": [
+          "site_of_metastasis_visceral (non\u2011liver/non\u2011lung)",
+          "site_of_metastasis_multiple sites"
+        ],
+        "coefficient": 0.10653861710536944
+      },
+      {
+        "terms": [
+          "site_of_metastasis_visceral (non\u2011liver/non\u2011lung)",
+          "baseline_liver_function"
+        ],
+        "coefficient": -0.2900473026432863
+      },
+      {
+        "terms": [
+          "site_of_metastasis_visceral (non\u2011liver/non\u2011lung)",
+          "cardiovascular_comorbidity_mild (e.g., controlled hypertension)"
+        ],
+        "coefficient": 0.0072558349795686095
+      },
+      {
+        "terms": [
+          "site_of_metastasis_visceral (non\u2011liver/non\u2011lung)",
+          "cardiovascular_comorbidity_moderate (e.g., prior MI, heart failure NYHA I\u2011II)"
+        ],
+        "coefficient": -0.16410253488123722
+      },
+      {
+        "terms": [
+          "site_of_metastasis_visceral (non\u2011liver/non\u2011lung)",
+          "cardiovascular_comorbidity_severe (e.g., NYHA III\u2011IV, recent coronary event)"
+        ],
+        "coefficient": 0.0871036742456699
+      },
+      {
+        "terms": [
+          "site_of_metastasis_visceral (non\u2011liver/non\u2011lung)",
+          "prior_adjuvant_or_neoadjuvant_therapy_adjuvant chemotherapy only"
+        ],
+        "coefficient": -0.19538014259700515
+      },
+      {
+        "terms": [
+          "site_of_metastasis_visceral (non\u2011liver/non\u2011lung)",
+          "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant chemotherapy only"
+        ],
+        "coefficient": 0.11456264286147955
+      },
+      {
+        "terms": [
+          "site_of_metastasis_visceral (non\u2011liver/non\u2011lung)",
+          "prior_adjuvant_or_neoadjuvant_therapy_both adjuvant & neoadjuvant chemotherapy"
+        ],
+        "coefficient": -0.06795879221967754
+      },
+      {
+        "terms": [
+          "site_of_metastasis_visceral (non\u2011liver/non\u2011lung)",
+          "ki67_index"
+        ],
+        "coefficient": 0.26203799324204075
+      },
+      {
+        "terms": [
+          "site_of_metastasis_visceral (non\u2011liver/non\u2011lung)",
+          "her2_status_equivocal"
+        ],
+        "coefficient": -0.21748743351240404
+      },
+      {
+        "terms": [
+          "site_of_metastasis_visceral (non\u2011liver/non\u2011lung)",
+          "her2_status_positive"
+        ],
+        "coefficient": -0.09536018936984489
+      },
+      {
+        "terms": [
+          "site_of_metastasis_visceral (non\u2011liver/non\u2011lung)",
+          "insurance_coverage_Medicare"
+        ],
+        "coefficient": -0.23191588725564655
+      },
+      {
+        "terms": [
+          "site_of_metastasis_visceral (non\u2011liver/non\u2011lung)",
+          "insurance_coverage_Medicaid"
+        ],
+        "coefficient": 0.25481617096713766
+      },
+      {
+        "terms": [
+          "site_of_metastasis_visceral (non\u2011liver/non\u2011lung)",
+          "insurance_coverage_uninsured"
+        ],
+        "coefficient": 0.22640361202858855
+      },
+      {
+        "terms": [
+          "site_of_metastasis_multiple sites",
+          "baseline_liver_function"
+        ],
+        "coefficient": -0.14523502337090663
+      },
+      {
+        "terms": [
+          "site_of_metastasis_multiple sites",
+          "cardiovascular_comorbidity_mild (e.g., controlled hypertension)"
+        ],
+        "coefficient": 0.09599042762050741
+      },
+      {
+        "terms": [
+          "site_of_metastasis_multiple sites",
+          "cardiovascular_comorbidity_moderate (e.g., prior MI, heart failure NYHA I\u2011II)"
+        ],
+        "coefficient": 0.1903333201207295
+      },
+      {
+        "terms": [
+          "site_of_metastasis_multiple sites",
+          "cardiovascular_comorbidity_severe (e.g., NYHA III\u2011IV, recent coronary event)"
+        ],
+        "coefficient": 0.0331204869596774
+      },
+      {
+        "terms": [
+          "site_of_metastasis_multiple sites",
+          "prior_adjuvant_or_neoadjuvant_therapy_adjuvant chemotherapy only"
+        ],
+        "coefficient": 0.01779034701360388
+      },
+      {
+        "terms": [
+          "site_of_metastasis_multiple sites",
+          "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant chemotherapy only"
+        ],
+        "coefficient": -0.15488862545972898
+      },
+      {
+        "terms": [
+          "site_of_metastasis_multiple sites",
+          "prior_adjuvant_or_neoadjuvant_therapy_both adjuvant & neoadjuvant chemotherapy"
+        ],
+        "coefficient": -0.24413833931646045
+      },
+      {
+        "terms": [
+          "site_of_metastasis_multiple sites",
+          "ki67_index"
+        ],
+        "coefficient": 0.23832945477199602
+      },
+      {
+        "terms": [
+          "site_of_metastasis_multiple sites",
+          "her2_status_equivocal"
+        ],
+        "coefficient": 0.24025083429799826
+      },
+      {
+        "terms": [
+          "site_of_metastasis_multiple sites",
+          "her2_status_positive"
+        ],
+        "coefficient": 0.07986087436396078
+      },
+      {
+        "terms": [
+          "site_of_metastasis_multiple sites",
+          "insurance_coverage_Medicare"
+        ],
+        "coefficient": -0.09658212537077959
+      },
+      {
+        "terms": [
+          "site_of_metastasis_multiple sites",
+          "insurance_coverage_Medicaid"
+        ],
+        "coefficient": -0.09047425523240346
+      },
+      {
+        "terms": [
+          "site_of_metastasis_multiple sites",
+          "insurance_coverage_uninsured"
+        ],
+        "coefficient": 0.13557340732214362
+      },
+      {
+        "terms": [
+          "baseline_liver_function",
+          "cardiovascular_comorbidity_mild (e.g., controlled hypertension)"
+        ],
+        "coefficient": 0.23826615597154627
+      },
+      {
+        "terms": [
+          "baseline_liver_function",
+          "cardiovascular_comorbidity_moderate (e.g., prior MI, heart failure NYHA I\u2011II)"
+        ],
+        "coefficient": 0.23225185455907033
+      },
+      {
+        "terms": [
+          "baseline_liver_function",
+          "cardiovascular_comorbidity_severe (e.g., NYHA III\u2011IV, recent coronary event)"
+        ],
+        "coefficient": 0.16792532751457429
+      },
+      {
+        "terms": [
+          "baseline_liver_function",
+          "prior_adjuvant_or_neoadjuvant_therapy_adjuvant chemotherapy only"
+        ],
+        "coefficient": 0.08521898769257263
+      },
+      {
+        "terms": [
+          "baseline_liver_function",
+          "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant chemotherapy only"
+        ],
+        "coefficient": -0.24951602100297068
+      },
+      {
+        "terms": [
+          "baseline_liver_function",
+          "prior_adjuvant_or_neoadjuvant_therapy_both adjuvant & neoadjuvant chemotherapy"
+        ],
+        "coefficient": -0.20302277154323173
+      },
+      {
+        "terms": [
+          "baseline_liver_function",
+          "ki67_index"
+        ],
+        "coefficient": 0.23913251311624756
+      },
+      {
+        "terms": [
+          "baseline_liver_function",
+          "her2_status_equivocal"
+        ],
+        "coefficient": 0.06385743579575398
+      },
+      {
+        "terms": [
+          "baseline_liver_function",
+          "her2_status_positive"
+        ],
+        "coefficient": -0.2944817690300222
+      },
+      {
+        "terms": [
+          "baseline_liver_function",
+          "insurance_coverage_Medicare"
+        ],
+        "coefficient": -0.23911707428038073
+      },
+      {
+        "terms": [
+          "baseline_liver_function",
+          "insurance_coverage_Medicaid"
+        ],
+        "coefficient": 0.0981010614648335
+      },
+      {
+        "terms": [
+          "baseline_liver_function",
+          "insurance_coverage_uninsured"
+        ],
+        "coefficient": -0.2969630496922688
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_mild (e.g., controlled hypertension)",
+          "cardiovascular_comorbidity_moderate (e.g., prior MI, heart failure NYHA I\u2011II)"
+        ],
+        "coefficient": -0.2035151691495008
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_mild (e.g., controlled hypertension)",
+          "cardiovascular_comorbidity_severe (e.g., NYHA III\u2011IV, recent coronary event)"
+        ],
+        "coefficient": 0.029240273619951684
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_mild (e.g., controlled hypertension)",
+          "prior_adjuvant_or_neoadjuvant_therapy_adjuvant chemotherapy only"
+        ],
+        "coefficient": 0.11513711861561593
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_mild (e.g., controlled hypertension)",
+          "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant chemotherapy only"
+        ],
+        "coefficient": 0.09117675570156031
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_mild (e.g., controlled hypertension)",
+          "prior_adjuvant_or_neoadjuvant_therapy_both adjuvant & neoadjuvant chemotherapy"
+        ],
+        "coefficient": -0.16543841432366413
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_mild (e.g., controlled hypertension)",
+          "ki67_index"
+        ],
+        "coefficient": 0.12730753280852153
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_mild (e.g., controlled hypertension)",
+          "her2_status_equivocal"
+        ],
+        "coefficient": -0.15765054750191995
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_mild (e.g., controlled hypertension)",
+          "her2_status_positive"
+        ],
+        "coefficient": -0.10476018110443935
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_mild (e.g., controlled hypertension)",
+          "insurance_coverage_Medicare"
+        ],
+        "coefficient": 0.14789484307081446
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_mild (e.g., controlled hypertension)",
+          "insurance_coverage_Medicaid"
+        ],
+        "coefficient": 0.08977973942832879
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_mild (e.g., controlled hypertension)",
+          "insurance_coverage_uninsured"
+        ],
+        "coefficient": 0.2095340462965068
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_moderate (e.g., prior MI, heart failure NYHA I\u2011II)",
+          "cardiovascular_comorbidity_severe (e.g., NYHA III\u2011IV, recent coronary event)"
+        ],
+        "coefficient": 0.09456773538020602
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_moderate (e.g., prior MI, heart failure NYHA I\u2011II)",
+          "prior_adjuvant_or_neoadjuvant_therapy_adjuvant chemotherapy only"
+        ],
+        "coefficient": 0.04098516200128299
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_moderate (e.g., prior MI, heart failure NYHA I\u2011II)",
+          "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant chemotherapy only"
+        ],
+        "coefficient": -0.2437951393031445
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_moderate (e.g., prior MI, heart failure NYHA I\u2011II)",
+          "prior_adjuvant_or_neoadjuvant_therapy_both adjuvant & neoadjuvant chemotherapy"
+        ],
+        "coefficient": -0.07937051816433988
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_moderate (e.g., prior MI, heart failure NYHA I\u2011II)",
+          "ki67_index"
+        ],
+        "coefficient": -0.14087857939096474
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_moderate (e.g., prior MI, heart failure NYHA I\u2011II)",
+          "her2_status_equivocal"
+        ],
+        "coefficient": -0.15360621397254984
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_moderate (e.g., prior MI, heart failure NYHA I\u2011II)",
+          "her2_status_positive"
+        ],
+        "coefficient": 0.28380633285146734
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_moderate (e.g., prior MI, heart failure NYHA I\u2011II)",
+          "insurance_coverage_Medicare"
+        ],
+        "coefficient": -0.06414136519994376
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_moderate (e.g., prior MI, heart failure NYHA I\u2011II)",
+          "insurance_coverage_Medicaid"
+        ],
+        "coefficient": 0.23522793310626794
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_moderate (e.g., prior MI, heart failure NYHA I\u2011II)",
+          "insurance_coverage_uninsured"
+        ],
+        "coefficient": 0.07868317559835775
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_severe (e.g., NYHA III\u2011IV, recent coronary event)",
+          "prior_adjuvant_or_neoadjuvant_therapy_adjuvant chemotherapy only"
+        ],
+        "coefficient": 0.17688678212498904
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_severe (e.g., NYHA III\u2011IV, recent coronary event)",
+          "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant chemotherapy only"
+        ],
+        "coefficient": 0.0015822558631152783
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_severe (e.g., NYHA III\u2011IV, recent coronary event)",
+          "prior_adjuvant_or_neoadjuvant_therapy_both adjuvant & neoadjuvant chemotherapy"
+        ],
+        "coefficient": 0.04614233077581548
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_severe (e.g., NYHA III\u2011IV, recent coronary event)",
+          "ki67_index"
+        ],
+        "coefficient": -0.004489383708681682
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_severe (e.g., NYHA III\u2011IV, recent coronary event)",
+          "her2_status_equivocal"
+        ],
+        "coefficient": -0.1828542073211733
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_severe (e.g., NYHA III\u2011IV, recent coronary event)",
+          "her2_status_positive"
+        ],
+        "coefficient": 0.13347126915690322
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_severe (e.g., NYHA III\u2011IV, recent coronary event)",
+          "insurance_coverage_Medicare"
+        ],
+        "coefficient": -0.13153658253548653
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_severe (e.g., NYHA III\u2011IV, recent coronary event)",
+          "insurance_coverage_Medicaid"
+        ],
+        "coefficient": -0.28541042014112766
+      },
+      {
+        "terms": [
+          "cardiovascular_comorbidity_severe (e.g., NYHA III\u2011IV, recent coronary event)",
+          "insurance_coverage_uninsured"
+        ],
+        "coefficient": 0.08728337754430071
+      },
+      {
+        "terms": [
+          "prior_adjuvant_or_neoadjuvant_therapy_adjuvant chemotherapy only",
+          "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant chemotherapy only"
+        ],
+        "coefficient": -0.19373359235577065
+      },
+      {
+        "terms": [
+          "prior_adjuvant_or_neoadjuvant_therapy_adjuvant chemotherapy only",
+          "prior_adjuvant_or_neoadjuvant_therapy_both adjuvant & neoadjuvant chemotherapy"
+        ],
+        "coefficient": 0.2642751506117486
+      },
+      {
+        "terms": [
+          "prior_adjuvant_or_neoadjuvant_therapy_adjuvant chemotherapy only",
+          "ki67_index"
+        ],
+        "coefficient": 0.27235714620155244
+      },
+      {
+        "terms": [
+          "prior_adjuvant_or_neoadjuvant_therapy_adjuvant chemotherapy only",
+          "her2_status_equivocal"
+        ],
+        "coefficient": 0.24891863413226906
+      },
+      {
+        "terms": [
+          "prior_adjuvant_or_neoadjuvant_therapy_adjuvant chemotherapy only",
+          "her2_status_positive"
+        ],
+        "coefficient": -0.07790477984673336
+      },
+      {
+        "terms": [
+          "prior_adjuvant_or_neoadjuvant_therapy_adjuvant chemotherapy only",
+          "insurance_coverage_Medicare"
+        ],
+        "coefficient": -0.29072603008267955
+      },
+      {
+        "terms": [
+          "prior_adjuvant_or_neoadjuvant_therapy_adjuvant chemotherapy only",
+          "insurance_coverage_Medicaid"
+        ],
+        "coefficient": 0.2569911375526352
+      },
+      {
+        "terms": [
+          "prior_adjuvant_or_neoadjuvant_therapy_adjuvant chemotherapy only",
+          "insurance_coverage_uninsured"
+        ],
+        "coefficient": -0.04308951100961139
+      },
+      {
+        "terms": [
+          "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant chemotherapy only",
+          "prior_adjuvant_or_neoadjuvant_therapy_both adjuvant & neoadjuvant chemotherapy"
+        ],
+        "coefficient": 0.2799928914262017
+      },
+      {
+        "terms": [
+          "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant chemotherapy only",
+          "ki67_index"
+        ],
+        "coefficient": 0.2781719862535517
+      },
+      {
+        "terms": [
+          "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant chemotherapy only",
+          "her2_status_equivocal"
+        ],
+        "coefficient": 0.21180567328041605
+      },
+      {
+        "terms": [
+          "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant chemotherapy only",
+          "her2_status_positive"
+        ],
+        "coefficient": -0.12333066475824858
+      },
+      {
+        "terms": [
+          "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant chemotherapy only",
+          "insurance_coverage_Medicare"
+        ],
+        "coefficient": -0.06894136283884483
+      },
+      {
+        "terms": [
+          "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant chemotherapy only",
+          "insurance_coverage_Medicaid"
+        ],
+        "coefficient": 0.21068200291011413
+      },
+      {
+        "terms": [
+          "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant chemotherapy only",
+          "insurance_coverage_uninsured"
+        ],
+        "coefficient": -0.10984679690623339
+      },
+      {
+        "terms": [
+          "prior_adjuvant_or_neoadjuvant_therapy_both adjuvant & neoadjuvant chemotherapy",
+          "ki67_index"
+        ],
+        "coefficient": -0.1983043519883445
+      },
+      {
+        "terms": [
+          "prior_adjuvant_or_neoadjuvant_therapy_both adjuvant & neoadjuvant chemotherapy",
+          "her2_status_equivocal"
+        ],
+        "coefficient": 0.034080757475010104
+      },
+      {
+        "terms": [
+          "prior_adjuvant_or_neoadjuvant_therapy_both adjuvant & neoadjuvant chemotherapy",
+          "her2_status_positive"
+        ],
+        "coefficient": 0.2616928644964686
+      },
+      {
+        "terms": [
+          "prior_adjuvant_or_neoadjuvant_therapy_both adjuvant & neoadjuvant chemotherapy",
+          "insurance_coverage_Medicare"
+        ],
+        "coefficient": 0.1176178780049838
+      },
+      {
+        "terms": [
+          "prior_adjuvant_or_neoadjuvant_therapy_both adjuvant & neoadjuvant chemotherapy",
+          "insurance_coverage_Medicaid"
+        ],
+        "coefficient": 0.04203670205361898
+      },
+      {
+        "terms": [
+          "prior_adjuvant_or_neoadjuvant_therapy_both adjuvant & neoadjuvant chemotherapy",
+          "insurance_coverage_uninsured"
+        ],
+        "coefficient": -0.24169410373753886
+      },
+      {
+        "terms": [
+          "ki67_index",
+          "her2_status_equivocal"
+        ],
+        "coefficient": 0.06900433601950184
+      },
+      {
+        "terms": [
+          "ki67_index",
+          "her2_status_positive"
+        ],
+        "coefficient": 0.294032310062558
+      },
+      {
+        "terms": [
+          "ki67_index",
+          "insurance_coverage_Medicare"
+        ],
+        "coefficient": -0.21594959085808557
+      },
+      {
+        "terms": [
+          "ki67_index",
+          "insurance_coverage_Medicaid"
+        ],
+        "coefficient": 0.010997791418242031
+      },
+      {
+        "terms": [
+          "ki67_index",
+          "insurance_coverage_uninsured"
+        ],
+        "coefficient": 0.22642384315677327
+      },
+      {
+        "terms": [
+          "her2_status_equivocal",
+          "her2_status_positive"
+        ],
+        "coefficient": 0.14446117065252267
+      },
+      {
+        "terms": [
+          "her2_status_equivocal",
+          "insurance_coverage_Medicare"
+        ],
+        "coefficient": 0.11820944459716076
+      },
+      {
+        "terms": [
+          "her2_status_equivocal",
+          "insurance_coverage_Medicaid"
+        ],
+        "coefficient": 0.12149045039226558
+      },
+      {
+        "terms": [
+          "her2_status_equivocal",
+          "insurance_coverage_uninsured"
+        ],
+        "coefficient": -0.08430530926814689
+      },
+      {
+        "terms": [
+          "her2_status_positive",
+          "insurance_coverage_Medicare"
+        ],
+        "coefficient": -0.12384489344130398
+      },
+      {
+        "terms": [
+          "her2_status_positive",
+          "insurance_coverage_Medicaid"
+        ],
+        "coefficient": 0.18561669328710817
+      },
+      {
+        "terms": [
+          "her2_status_positive",
+          "insurance_coverage_uninsured"
+        ],
+        "coefficient": 0.18606803680750844
+      },
+      {
+        "terms": [
+          "insurance_coverage_Medicare",
+          "insurance_coverage_Medicaid"
+        ],
+        "coefficient": 0.22024339114806218
+      },
+      {
+        "terms": [
+          "insurance_coverage_Medicare",
+          "insurance_coverage_uninsured"
+        ],
+        "coefficient": 0.2479443315338828
+      },
+      {
+        "terms": [
+          "insurance_coverage_Medicaid",
+          "insurance_coverage_uninsured"
+        ],
+        "coefficient": 0.006805439316562689
+      }
+    ],
+    "original_intercept": -3.0
+  },
+  "outcome_equation": {
+    "intercept": -10,
+    "coefficients": {
+      "age": -10.0,
+      "baseline_liver_function": -30.0,
+      "ki67_index": 25.0,
+      "ecog_performance_status_1": 40.0,
+      "ecog_performance_status_2": 80.0,
+      "ecog_performance_status_3": 150.0,
+      "menopausal_status_peri": 10.0,
+      "menopausal_status_post": 0.0,
+      "site_of_metastasis_liver": 60.0,
+      "site_of_metastasis_lung": 50.0,
+      "site_of_metastasis_visceral": 70.0,
+      "site_of_metastasis_multiple": 80.0,
+      "cardiovascular_comorbidity_mild": 20.0,
+      "cardiovascular_comorbidity_moderate": 50.0,
+      "cardiovascular_comorbidity_severe": 90.0,
+      "prior_adjuvant_or_neoadjuvant_therapy_adjuvant": 10.0,
+      "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant": 15.0,
+      "prior_adjuvant_or_neoadjuvant_therapy_both": 20.0,
+      "her2_status_equivocal": 30.0,
+      "her2_status_positive": 60.0,
+      "insurance_coverage_medicare": 5.0,
+      "insurance_coverage_medicaid": 10.0,
+      "insurance_coverage_uninsured": 20.0
+    },
+    "interactions": [
+      {
+        "terms": [
+          "age",
+          "ki67_index"
+        ],
+        "coefficient": 5.0
+      },
+      {
+        "terms": [
+          "ecog_performance_status_2",
+          "site_of_metastasis_multiple"
+        ],
+        "coefficient": 20.0
+      },
+      {
+        "terms": [
+          "menopausal_status_post",
+          "her2_status_positive"
+        ],
+        "coefficient": -10.0
+      }
+    ],
+    "treatment_coefficient": 1.0,
+    "treatment_interactions": [
+      {
+        "term": "age",
+        "coefficient": -0.0752759286915825
+      },
+      {
+        "term": "ecog_performance_status_1",
+        "coefficient": 0.27042858384594964
+      },
+      {
+        "term": "ecog_performance_status_2",
+        "coefficient": 0.13919636508684308
+      },
+      {
+        "term": "ecog_performance_status_3",
+        "coefficient": 0.05919509051822197
+      },
+      {
+        "term": "menopausal_status_peri\u2011menopausal",
+        "coefficient": -0.2063888157345381
+      },
+      {
+        "term": "menopausal_status_post\u2011menopausal",
+        "coefficient": -0.2064032877982784
+      },
+      {
+        "term": "site_of_metastasis_liver",
+        "coefficient": -0.2651498326990803
+      },
+      {
+        "term": "site_of_metastasis_lung",
+        "coefficient": 0.21970568746496105
+      },
+      {
+        "term": "site_of_metastasis_visceral (non\u2011liver/non\u2011lung)",
+        "coefficient": 0.06066900704592526
+      },
+      {
+        "term": "site_of_metastasis_multiple sites",
+        "coefficient": 0.12484354667762732
+      },
+      {
+        "term": "baseline_liver_function",
+        "coefficient": -0.28764930342251854
+      },
+      {
+        "term": "cardiovascular_comorbidity_mild (e.g., controlled hypertension)",
+        "coefficient": 0.28194591129719654
+      },
+      {
+        "term": "cardiovascular_comorbidity_moderate (e.g., prior MI, heart failure NYHA I\u2011II)",
+        "coefficient": 0.19946558448025303
+      },
+      {
+        "term": "cardiovascular_comorbidity_severe (e.g., NYHA III\u2011IV, recent coronary event)",
+        "coefficient": -0.1725965335930343
+      },
+      {
+        "term": "prior_adjuvant_or_neoadjuvant_therapy_adjuvant chemotherapy only",
+        "coefficient": -0.19090501967573964
+      },
+      {
+        "term": "prior_adjuvant_or_neoadjuvant_therapy_neoadjuvant chemotherapy only",
+        "coefficient": -0.1899572940879397
+      },
+      {
+        "term": "prior_adjuvant_or_neoadjuvant_therapy_both adjuvant & neoadjuvant chemotherapy",
+        "coefficient": -0.11745465422427737
+      },
+      {
+        "term": "ki67_index",
+        "coefficient": 0.014853858979342716
+      },
+      {
+        "term": "her2_status_equivocal",
+        "coefficient": -0.04083298881473052
+      },
+      {
+        "term": "her2_status_positive",
+        "coefficient": -0.12526251588117485
+      },
+      {
+        "term": "insurance_coverage_Medicare",
+        "coefficient": 0.0671117368334277
+      },
+      {
+        "term": "insurance_coverage_Medicaid",
+        "coefficient": -0.2163036836087749
+      },
+      {
+        "term": "insurance_coverage_uninsured",
+        "coefficient": -0.12471321087886911
+      }
+    ],
+    "original_intercept": -12.0
+  },
+  "summary_statistics": {
+    "age": {
+      "type": "continuous",
+      "mean": 63.5,
+      "std": 11.8
+    },
+    "ecog_performance_status": {
+      "type": "categorical",
+      "proportions": {
+        "0": 0.2,
+        "1": 0.45,
+        "2": 0.25,
+        "3": 0.1
+      }
+    },
+    "menopausal_status": {
+      "type": "categorical",
+      "proportions": {
+        "pre-menopausal": 0.1,
+        "peri-menopausal": 0.15,
+        "post-menopausal": 0.75
+      }
+    },
+    "site_of_metastasis": {
+      "type": "categorical",
+      "proportions": {
+        "bone-only": 0.3,
+        "liver": 0.25,
+        "lung": 0.15,
+        "visceral (non-liver/non-lung)": 0.1,
+        "multiple sites": 0.2
+      }
+    },
+    "baseline_liver_function": {
+      "type": "continuous",
+      "mean": 0.8,
+      "std": 0.4
+    },
+    "cardiovascular_comorbidity": {
+      "type": "categorical",
+      "proportions": {
+        "none": 0.4,
+        "mild (e.g., controlled hypertension)": 0.3,
+        "moderate (e.g., prior MI, heart failure NYHA I-II)": 0.2,
+        "severe (e.g., NYHA III-IV, recent coronary event)": 0.1
+      }
+    },
+    "prior_adjuvant_or_neoadjuvant_therapy": {
+      "type": "categorical",
+      "proportions": {
+        "none": 0.05,
+        "adjuvant chemotherapy only": 0.45,
+        "neoadjuvant chemotherapy only": 0.2,
+        "both adjuvant & neoadjuvant chemotherapy": 0.3
+      }
+    },
+    "ki67_index": {
+      "type": "continuous",
+      "mean": 20.0,
+      "std": 15.0
+    },
+    "her2_status": {
+      "type": "categorical",
+      "proportions": {
+        "negative": 0.85,
+        "equivocal": 0.1,
+        "positive": 0.05
+      }
+    },
+    "insurance_coverage": {
+      "type": "categorical",
+      "proportions": {
+        "private": 0.55,
+        "Medicare": 0.3,
+        "Medicaid": 0.1,
+        "uninsured": 0.05
+      }
+    }
+  },
+  "dataset_statistics": {
+    "n_patients": 1000,
+    "treatment_rate": 0.5,
+    "outcome_rate": 0.903,
+    "mean_treatment_logit": -0.7105651149356308,
+    "std_treatment_logit": 4.752305365058138,
+    "mean_outcome_logit": 84.15409077542418,
+    "std_outcome_logit": 67.30204484564997
+  }
+}
