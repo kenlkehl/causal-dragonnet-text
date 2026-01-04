@@ -385,6 +385,33 @@ def _generate_equations_vllm(
         for interaction in outcome_eq["interactions"]:
             interaction["coefficient"] *= interaction_coef_scale
     
+    # Add fixed treatment coefficient to outcome equation (CRITICAL for ITE)
+    outcome_eq["treatment_coefficient"] = treatment_coefficient
+    
+    # Add treatment-confounder interactions to outcome equation (for heterogeneous treatment effects)
+    # Each continuous confounder and each categorical dummy gets a treatment interaction
+    treatment_interactions = []
+    for conf in confounders:
+        name = conf["name"]
+        if conf["type"] == "continuous":
+            # Interaction: treatment * z_scored_confounder
+            coef = np.random.uniform(-1.0, 1.0) * interaction_coef_scale
+            treatment_interactions.append({
+                "term": name,
+                "coefficient": coef
+            })
+        else:
+            # For categorical, add interaction with each non-reference category
+            for cat in conf["categories"][1:]:  # Skip reference category
+                dummy_name = f"{name}_{cat}"
+                coef = np.random.uniform(-1.0, 1.0) * interaction_coef_scale
+                treatment_interactions.append({
+                    "term": dummy_name,
+                    "coefficient": coef
+                })
+    outcome_eq["treatment_interactions"] = treatment_interactions
+    logger.info(f"Added treatment_coefficient={treatment_coefficient} and {len(treatment_interactions)} treatment-confounder interactions to outcome equation")
+    
     return treatment_eq, outcome_eq
 
 

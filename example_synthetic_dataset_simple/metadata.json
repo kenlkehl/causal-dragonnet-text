@@ -101,7 +101,22 @@
         "coefficient": 0.24599701320995304
       }
     ],
-    "original_intercept": -1.2
+    "original_intercept": -1.2,
+    "treatment_coefficient": 1.0,
+    "treatment_interactions": [
+      {
+        "term": "ecog_performance_status_1",
+        "coefficient": -0.025091976230527502
+      },
+      {
+        "term": "ecog_performance_status_2",
+        "coefficient": 0.09014286128198323
+      },
+      {
+        "term": "ecog_performance_status_3",
+        "coefficient": 0.04639878836228102
+      }
+    ]
   },
   "summary_statistics": {
     "age": {

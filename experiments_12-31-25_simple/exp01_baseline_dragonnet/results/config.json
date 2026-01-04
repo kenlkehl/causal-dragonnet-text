@@ -1,0 +1,143 @@
+{
+  "output_dir": "./experiments_12-31-25_simple/exp01_baseline_dragonnet/results",
+  "seed": 42,
+  "device": null,
+  "num_workers": 10,
+  "gpu_ids": [
+    0,
+    1
+  ],
+  "cache_dir": "./experiments_12-31-25_simple/exp01_baseline_dragonnet/cache",
+  "pretraining": {
+    "enabled": false,
+    "dataset_path": null,
+    "treatment_column": "treatment",
+    "architecture": {
+      "model_type": "dragonnet",
+      "embedding_model_name": "all-MiniLM-L6-v2",
+      "dragonnet_representation_dim": 128,
+      "dragonnet_hidden_outcome_dim": 64,
+      "aggregator_mode": "attn",
+      "num_latent_confounders": 20,
+      "features_per_confounder": 4,
+      "explicit_confounder_texts": null,
+      "chunk_size": 128,
+      "chunk_overlap": 32,
+      "arctanh_transform": false
+    },
+    "training": {
+      "learning_rate": 0.0001,
+      "optimizer": "adamw",
+      "lr_schedule": "linear",
+      "epochs": 50,
+      "batch_size": 8,
+      "alpha_propensity": 1.0,
+      "beta_targreg": 0.1,
+      "init_latents_from_kmeans": true
+    }
+  },
+  "applied_inference": {
+    "dataset_path": "/home/klkehl/gemini_pcori_experiment/causal-dragonnet-text/example_synthetic_dataset_simple/dataset.parquet",
+    "text_column": "clinical_text",
+    "outcome_column": "outcome_indicator",
+    "treatment_column": "treatment_indicator",
+    "split_column": "split",
+    "cv_folds": 5,
+    "architecture": {
+      "model_type": "dragonnet",
+      "embedding_model_name": "all-MiniLM-L6-v2",
+      "dragonnet_representation_dim": 128,
+      "dragonnet_hidden_outcome_dim": 64,
+      "aggregator_mode": "attn",
+      "num_latent_confounders": 20,
+      "features_per_confounder": 4,
+      "explicit_confounder_texts": null,
+      "chunk_size": 128,
+      "chunk_overlap": 32,
+      "arctanh_transform": false
+    },
+    "training": {
+      "learning_rate": 0.0001,
+      "optimizer": "adamw",
+      "lr_schedule": "linear",
+      "epochs": 50,
+      "batch_size": 8,
+      "alpha_propensity": 1.0,
+      "beta_targreg": 0.1,
+      "init_latents_from_kmeans": true
+    },
+    "use_pretrained_weights": false,
+    "skip": false
+  },
+  "plasmode_experiments": {
+    "enabled": true,
+    "num_repeats": 50,
+    "save_datasets": false,
+    "train_fraction": 0.8,
+    "generator_architecture": {
+      "model_type": "dragonnet",
+      "embedding_model_name": "all-MiniLM-L6-v2",
+      "dragonnet_representation_dim": 128,
+      "dragonnet_hidden_outcome_dim": 64,
+      "aggregator_mode": "attn",
+      "num_latent_confounders": 20,
+      "features_per_confounder": 4,
+      "explicit_confounder_texts": null,
+      "chunk_size": 128,
+      "chunk_overlap": 32,
+      "arctanh_transform": false
+    },
+    "generator_training": {
+      "learning_rate": 0.0001,
+      "optimizer": "adamw",
+      "lr_schedule": "linear",
+      "epochs": 50,
+      "batch_size": 8,
+      "alpha_propensity": 1.0,
+      "beta_targreg": 0.1,
+      "init_latents_from_kmeans": true
+    },
+    "evaluator_architecture": {
+      "model_type": "dragonnet",
+      "embedding_model_name": "all-MiniLM-L6-v2",
+      "dragonnet_representation_dim": 128,
+      "dragonnet_hidden_outcome_dim": 64,
+      "aggregator_mode": "attn",
+      "num_latent_confounders": 20,
+      "features_per_confounder": 4,
+      "explicit_confounder_texts": null,
+      "chunk_size": 128,
+      "chunk_overlap": 32,
+      "arctanh_transform": false
+    },
+    "evaluator_training": {
+      "learning_rate": 0.0001,
+      "optimizer": "adamw",
+      "lr_schedule": "linear",
+      "epochs": 50,
+      "batch_size": 8,
+      "alpha_propensity": 1.0,
+      "beta_targreg": 0.1,
+      "init_latents_from_kmeans": true
+    },
+    "plasmode_scenarios": [
+      {
+        "generation_mode": "phi_linear",
+        "preserve_observed_treatments": true,
+        "baseline_control_outcome_rate": 0.2,
+        "target_ate_logit": 0.5,
+        "outcome_heterogeneity_scale": 1.0,
+        "ite_heterogeneity_scale": 1.0,
+        "deep_nonlinear_hidden_dims": [
+          64,
+          32
+        ],
+        "deep_nonlinear_dropout": 0.0,
+        "uplift_hidden_dims": [],
+        "uplift_activation": "relu",
+        "uplift_dropout": 0.0
+      }
+    ],
+    "oracle_mode": false
+  }
+}
