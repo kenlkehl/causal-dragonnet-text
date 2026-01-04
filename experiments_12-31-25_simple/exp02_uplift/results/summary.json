@@ -1,9 +1,0 @@
-{
-  "config_hash": "c1d56ebf64ea",
-  "seed": 42,
-  "device": "cuda:0",
-  "results": {
-    "applied_inference": "experiments_12-31-25_simple/exp02_uplift/results/applied_inference/predictions.parquet",
-    "plasmode_experiments": "experiments_12-31-25_simple/exp02_uplift/results/plasmode_experiments/results.csv"
-  }
-}
