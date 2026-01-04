@@ -69,7 +69,7 @@ def generate_synthetic_dataset(
     
     # Step 1: Generate confounders
     logger.info("Step 1/5: Generating confounders...")
-    confounders = _generate_confounders(client, config.clinical_question)
+    confounders = _generate_confounders(client, config.clinical_question, num_confounders=config.num_confounders)
     logger.info(f"Generated {len(confounders)} confounders: {[c['name'] for c in confounders]}")
     
     # Step 2: Generate regression equations
@@ -156,9 +156,18 @@ def generate_synthetic_dataset(
     return df, metadata
 
 
-def _generate_confounders(client: LLMClient, clinical_question: str) -> List[Dict[str, Any]]:
+def _generate_confounders(client: LLMClient, clinical_question: str, num_confounders: Optional[int] = None) -> List[Dict[str, Any]]:
     """Generate confounders using LLM."""
-    prompt = CONFOUNDER_GENERATION_PROMPT.format(clinical_question=clinical_question)
+    # Determine the instruction for number of confounders
+    if num_confounders is not None:
+        num_confounders_instruction = f"exactly {num_confounders} confounders"
+    else:
+        num_confounders_instruction = "8-12 confounders"
+    
+    prompt = CONFOUNDER_GENERATION_PROMPT.format(
+        clinical_question=clinical_question,
+        num_confounders_instruction=num_confounders_instruction
+    )
     
     response = client.generate_json(
         prompt=prompt,
@@ -284,6 +293,107 @@ def _generate_summary_statistics(
     confounders: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """Generate summary statistics for confounders."""
+    confounder_list = format_confounder_list(confounders)
+    
+    prompt = SUMMARY_STATISTICS_PROMPT.format(
+        clinical_question=clinical_question,
+        confounder_list=confounder_list,
+    )
+    
+    response = client.generate_json(
+        prompt=prompt,
+        system_prompt=CLINICAL_SYSTEM_PROMPT,
+        temperature=0.5,
+    )
+    
+    return response.get("summary_statistics", {})
+
+
+# ============================================================================
+# vLLM-based helper functions for batch generation
+# ============================================================================
+
+def _generate_confounders_vllm(client: 'VLLMBatchClient', clinical_question: str, num_confounders: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Generate confounders using vLLM batch client."""
+    if num_confounders is not None:
+        num_confounders_instruction = f"exactly {num_confounders} confounders"
+    else:
+        num_confounders_instruction = "8-12 confounders"
+    
+    prompt = CONFOUNDER_GENERATION_PROMPT.format(
+        clinical_question=clinical_question,
+        num_confounders_instruction=num_confounders_instruction
+    )
+    
+    response = client.generate_json(
+        prompt=prompt,
+        system_prompt=CLINICAL_SYSTEM_PROMPT,
+        temperature=0.7,
+    )
+    
+    confounders = response.get("confounders", [])
+    
+    for conf in confounders:
+        if "name" not in conf or "type" not in conf:
+            raise ValueError(f"Invalid confounder structure: {conf}")
+        if conf["type"] == "categorical" and "categories" not in conf:
+            raise ValueError(f"Categorical confounder missing categories: {conf}")
+    
+    return confounders
+
+
+def _generate_equations_vllm(
+    client: 'VLLMBatchClient',
+    clinical_question: str,
+    confounders: List[Dict[str, Any]],
+    treatment_coefficient: float,
+    main_coef_scale: float = 0.3,
+    interaction_coef_scale: float = 0.1,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Generate treatment and outcome regression equations using vLLM."""
+    confounder_list = format_confounder_list(confounders)
+    
+    prompt = REGRESSION_EQUATION_PROMPT.format(
+        clinical_question=clinical_question,
+        confounder_list=confounder_list,
+        treatment_coefficient=treatment_coefficient,
+    )
+    
+    response = client.generate_json(
+        prompt=prompt,
+        system_prompt=CLINICAL_SYSTEM_PROMPT,
+        temperature=0.5,
+    )
+    
+    treatment_eq = response.get("treatment_equation", {})
+    outcome_eq = response.get("outcome_equation", {})
+    
+    # Scale coefficients
+    if "coefficients" in treatment_eq:
+        treatment_eq["coefficients"] = {
+            k: v * main_coef_scale for k, v in treatment_eq["coefficients"].items()
+        }
+    if "interactions" in treatment_eq:
+        for interaction in treatment_eq["interactions"]:
+            interaction["coefficient"] *= interaction_coef_scale
+    
+    if "coefficients" in outcome_eq:
+        outcome_eq["coefficients"] = {
+            k: v * main_coef_scale for k, v in outcome_eq["coefficients"].items()
+        }
+    if "interactions" in outcome_eq:
+        for interaction in outcome_eq["interactions"]:
+            interaction["coefficient"] *= interaction_coef_scale
+    
+    return treatment_eq, outcome_eq
+
+
+def _generate_summary_statistics_vllm(
+    client: 'VLLMBatchClient',
+    clinical_question: str,
+    confounders: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Generate summary statistics using vLLM."""
     confounder_list = format_confounder_list(confounders)
     
     prompt = SUMMARY_STATISTICS_PROMPT.format(
@@ -697,12 +807,20 @@ def _generate_single_patient(
     # Reserve tokens for prompt (system prompt + patient history prompt ~1500-2000 tokens)
     history_max_tokens = max(1000, config.llm.max_tokens - 2000)
     
-    clinical_history = client.generate(
-        prompt=history_prompt,
-        system_prompt=CLINICAL_SYSTEM_PROMPT,
-        temperature=0.8,  # Higher temperature for more varied text
-        max_tokens=history_max_tokens,
-    )
+    try:
+        clinical_history = client.generate(
+            prompt=history_prompt,
+            system_prompt=CLINICAL_SYSTEM_PROMPT,
+            temperature=0.8,  # Higher temperature for more varied text
+            max_tokens=history_max_tokens,
+        )
+        # Handle None response from LLM
+        if clinical_history is None:
+            logger.warning(f"Patient {patient_idx}: LLM returned None for clinical_history")
+            clinical_history = ""
+    except Exception as e:
+        logger.error(f"Patient {patient_idx}: Failed to generate clinical_history: {e}")
+        clinical_history = ""
     
     return {
         "patient_id": patient_idx,
@@ -728,20 +846,63 @@ def _generate_all_patients(
     num_workers: int = 4,
     show_progress: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Generate data for all patients with parallel LLM calls."""
-    patient_data = []
+    """Generate data for all patients with parallel LLM calls and checkpoint support."""
+    output_dir = Path(config.output_dir)
+    checkpoint_path = output_dir / "checkpoint.json"
+    
+    # Load existing checkpoint if present
+    completed_patients = {}
+    if checkpoint_path.exists():
+        try:
+            with open(checkpoint_path, 'r', encoding='utf-8') as f:
+                checkpoint_data = json.load(f)
+                completed_patients = {p['patient_id']: p for p in checkpoint_data.get('patients', [])}
+            logger.info(f"Resuming from checkpoint: {len(completed_patients)} patients already completed")
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning(f"Could not load checkpoint, starting fresh: {e}")
+            completed_patients = {}
+    
+    # Determine which patients still need to be generated
+    remaining_indices = [i for i in range(config.dataset_size) if i not in completed_patients]
+    logger.info(f"Need to generate {len(remaining_indices)} patients (checkpoint has {len(completed_patients)})")
+    
+    if not remaining_indices:
+        # All patients already generated
+        patient_data = list(completed_patients.values())
+        patient_data.sort(key=lambda x: x["patient_id"])
+        return patient_data
+    
+    # Collect all patient data (starting with checkpoint data)
+    patient_data = list(completed_patients.values())
+    checkpoint_interval = 10  # Save checkpoint every N patients
+    patients_since_checkpoint = 0
+    
+    def save_checkpoint():
+        """Save current progress to checkpoint file."""
+        checkpoint_content = {
+            'patients': patient_data,
+            'total_expected': config.dataset_size,
+        }
+        with open(checkpoint_path, 'w', encoding='utf-8') as f:
+            json.dump(checkpoint_content, f, ensure_ascii=False)
+        logger.debug(f"Checkpoint saved: {len(patient_data)} patients")
     
     if num_workers <= 1:
         # Sequential generation
-        iterator = range(config.dataset_size)
+        iterator = remaining_indices
         if show_progress:
-            iterator = tqdm(iterator, desc="Generating patients")
+            iterator = tqdm(iterator, desc="Generating patients", initial=len(completed_patients), total=config.dataset_size)
         
         for i in iterator:
             data = _generate_single_patient(
                 i, client, config, confounders, summary_stats, treatment_eq, outcome_eq
             )
             patient_data.append(data)
+            patients_since_checkpoint += 1
+            
+            if patients_since_checkpoint >= checkpoint_interval:
+                save_checkpoint()
+                patients_since_checkpoint = 0
     else:
         # Parallel generation
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
@@ -750,18 +911,228 @@ def _generate_all_patients(
                     _generate_single_patient,
                     i, client, config, confounders, summary_stats, treatment_eq, outcome_eq
                 ): i
-                for i in range(config.dataset_size)
+                for i in remaining_indices
             }
             
             iterator = as_completed(futures)
             if show_progress:
-                iterator = tqdm(iterator, total=config.dataset_size, desc="Generating patients")
+                iterator = tqdm(iterator, total=len(remaining_indices), desc="Generating patients", 
+                               initial=len(completed_patients))
             
             for future in iterator:
                 data = future.result()
                 patient_data.append(data)
+                patients_since_checkpoint += 1
+                
+                if patients_since_checkpoint >= checkpoint_interval:
+                    save_checkpoint()
+                    patients_since_checkpoint = 0
+    
+    # Final checkpoint save
+    save_checkpoint()
     
     # Sort by patient_id to ensure reproducibility
     patient_data.sort(key=lambda x: x["patient_id"])
     
+    # # Clean up checkpoint file on successful completion
+    # if checkpoint_path.exists():
+    #     checkpoint_path.unlink()
+    #     logger.info("Generation complete, checkpoint file removed")
+    
     return patient_data
+
+
+def generate_synthetic_dataset_batch(
+    config: SyntheticDataConfig,
+    vllm_config: 'VLLMConfig',
+    show_progress: bool = True,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Generate a synthetic clinical dataset using direct vLLM batch inference.
+    
+    This is much faster than the HTTP API approach because:
+    1. No HTTP overhead
+    2. vLLM handles batching optimally
+    3. All clinical histories generated in one batch
+    
+    Args:
+        config: Configuration for generation
+        vllm_config: vLLM configuration (model, tensor_parallel_size, etc.)
+        show_progress: Whether to show progress bar
+        
+    Returns:
+        Tuple of (dataset DataFrame, metadata dictionary)
+    """
+    from .vllm_batch_client import VLLMBatchClient, VLLMConfig
+    
+    config.validate()
+    
+    # Set random seeds
+    random.seed(config.seed)
+    np.random.seed(config.seed)
+    
+    # Create output directory
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    logger.info(f"Starting batch synthetic data generation for: {config.clinical_question[:80]}...")
+    
+    # Initialize vLLM client for all LLM operations (no HTTP server needed)
+    logger.info("Initializing vLLM for offline batch inference...")
+    vllm_client = VLLMBatchClient(vllm_config)
+    
+    # Step 1: Generate confounders using vLLM
+    logger.info("Step 1/6: Generating confounders...")
+    confounders = _generate_confounders_vllm(vllm_client, config.clinical_question, num_confounders=config.num_confounders)
+    logger.info(f"Generated {len(confounders)} confounders: {[c['name'] for c in confounders]}")
+    
+    # Step 2: Generate regression equations
+    logger.info("Step 2/6: Generating regression equations...")
+    treatment_eq, outcome_eq = _generate_equations_vllm(
+        vllm_client, config.clinical_question, confounders, config.treatment_coefficient,
+        main_coef_scale=config.main_coefficient_scale,
+        interaction_coef_scale=config.interaction_coefficient_scale,
+    )
+    logger.info(f"Treatment equation has {len(treatment_eq['coefficients'])} terms")
+    logger.info(f"Outcome equation has {len(outcome_eq['coefficients'])} terms")
+    
+    # Step 3: Generate summary statistics
+    logger.info("Step 3/6: Generating summary statistics...")
+    summary_stats = _generate_summary_statistics_vllm(vllm_client, config.clinical_question, confounders)
+    
+    # Step 4: Calibrate and rescale
+    logger.info("Step 4/6: Calibrating intercepts and rescaling coefficients...")
+    treatment_eq, outcome_eq = _calibrate_intercepts(
+        confounders=confounders,
+        summary_stats=summary_stats,
+        treatment_eq=treatment_eq,
+        outcome_eq=outcome_eq,
+        target_treatment_rate=config.target_treatment_rate,
+        target_control_outcome_rate=config.target_control_outcome_rate,
+    )
+    treatment_eq, outcome_eq = _rescale_for_target_logit_std(
+        confounders=confounders,
+        summary_stats=summary_stats,
+        treatment_eq=treatment_eq,
+        outcome_eq=outcome_eq,
+        target_logit_std=config.target_logit_std,
+    )
+    
+    # Step 5: Pre-generate all patient data (without clinical text)
+    logger.info(f"Step 5/6: Generating {config.dataset_size} patient records...")
+    patient_records = []
+    history_prompts = []
+    
+    iterator = range(config.dataset_size)
+    if show_progress:
+        iterator = tqdm(iterator, desc="Building patient records")
+    
+    for patient_idx in iterator:
+        # Sample characteristics
+        characteristics = _sample_patient_characteristics(confounders, summary_stats)
+        
+        # Compute treatment logit and sample treatment
+        treatment_logit = _compute_logit(
+            characteristics, confounders, summary_stats, treatment_eq
+        )
+        treatment_prob = 1.0 / (1.0 + np.exp(-treatment_logit))
+        treatment = int(np.random.random() < treatment_prob)
+        
+        # Compute outcome logit and sample outcome
+        outcome_logit = _compute_logit(
+            characteristics, confounders, summary_stats, outcome_eq, treatment=treatment
+        )
+        outcome_prob = 1.0 / (1.0 + np.exp(-outcome_logit))
+        outcome = int(np.random.random() < outcome_prob)
+        
+        # Compute potential outcome logits
+        outcome_logit_0 = _compute_logit(
+            characteristics, confounders, summary_stats, outcome_eq, treatment=0
+        )
+        outcome_logit_1 = _compute_logit(
+            characteristics, confounders, summary_stats, outcome_eq, treatment=1
+        )
+        true_ite = outcome_logit_1 - outcome_logit_0
+        
+        # Format patient characteristics as prompt
+        patient_prompt = format_patient_characteristics(characteristics, confounders)
+        
+        # Build clinical history prompt
+        history_prompt = PATIENT_HISTORY_PROMPT.format(
+            patient_characteristics=patient_prompt,
+            clinical_question=config.clinical_question,
+        )
+        history_prompts.append(history_prompt)
+        
+        patient_records.append({
+            "patient_id": patient_idx,
+            "patient_prompt": patient_prompt,
+            "clinical_text": None,  # Will be filled by batch generation
+            "treatment_indicator": treatment,
+            "outcome_indicator": outcome,
+            "true_treatment_logit": treatment_logit,
+            "true_outcome_logit": outcome_logit,
+            "outcome_logit_0": outcome_logit_0,
+            "outcome_logit_1": outcome_logit_1,
+            "true_ite": true_ite,
+        })
+    
+    # Step 6: Batch generate all clinical histories using vLLM
+    logger.info(f"Step 6/6: Batch generating {len(history_prompts)} clinical histories with vLLM...")
+    
+    # Generate all clinical histories in one batch
+    clinical_texts = vllm_client.generate_batch(
+        prompts=history_prompts,
+        system_prompt=CLINICAL_SYSTEM_PROMPT,
+        temperature=0.8,
+        max_tokens=vllm_config.max_tokens,
+    )
+    
+    # Merge clinical texts with patient records, stripping reasoning prefix
+    for i, text in enumerate(clinical_texts):
+        cleaned_text = VLLMBatchClient.strip_reasoning_prefix(
+            text if text else "", 
+            vllm_config.reasoning_marker
+        )
+        patient_records[i]["clinical_text"] = cleaned_text
+    
+    logger.info("Batch generation complete!")
+    
+    # Assemble dataset
+    logger.info("Assembling dataset...")
+    df = pd.DataFrame(patient_records)
+    
+    # Compile metadata
+    metadata = {
+        "config": asdict(config),
+        "confounders": confounders,
+        "treatment_equation": treatment_eq,
+        "outcome_equation": outcome_eq,
+        "summary_statistics": summary_stats,
+        "dataset_statistics": {
+            "n_patients": len(df),
+            "treatment_rate": df["treatment_indicator"].mean(),
+            "outcome_rate": df["outcome_indicator"].mean(),
+            "mean_treatment_logit": df["true_treatment_logit"].mean(),
+            "std_treatment_logit": df["true_treatment_logit"].std(),
+            "mean_outcome_logit": df["true_outcome_logit"].mean(),
+            "std_outcome_logit": df["true_outcome_logit"].std(),
+            "clinical_text_stats": {
+                "non_empty_count": (df["clinical_text"].str.len() > 0).sum(),
+                "mean_length": df["clinical_text"].str.len().mean(),
+            }
+        }
+    }
+    
+    # Save outputs
+    dataset_path = output_dir / "dataset.parquet"
+    metadata_path = output_dir / "metadata.json"
+    
+    df.to_parquet(dataset_path, index=False)
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, default=str, ensure_ascii=False)
+    
+    logger.info(f"Dataset saved to {dataset_path}")
+    logger.info(f"Metadata saved to {metadata_path}")
+    
+    return df, metadata

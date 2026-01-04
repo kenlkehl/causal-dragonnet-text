@@ -6,7 +6,7 @@ import logging
 import sys
 
 from .config import SyntheticDataConfig, LLMConfig, DEFAULT_CLINICAL_QUESTION
-from .generator import generate_synthetic_dataset
+from .generator import generate_synthetic_dataset, generate_synthetic_dataset_batch
 
 
 def main():
@@ -59,6 +59,12 @@ Examples:
         type=float,
         default=0.2,
         help="Target outcome rate in control group (treatment=0) (default: 0.2)",
+    )
+    parser.add_argument(
+        "--num-confounders",
+        type=int,
+        default=None,
+        help="Number of confounders to generate (default: 8-12, determined by LLM)",
     )
     
     # LLM parameters
@@ -119,6 +125,23 @@ Examples:
         action="store_true",
         help="Enable verbose logging",
     )
+    parser.add_argument(
+        "--use-vllm-batch",
+        action="store_true",
+        help="Use direct vLLM batch inference (faster, no server needed)",
+    )
+    parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=2,
+        help="Tensor parallel size for vLLM (default: 2)",
+    )
+    parser.add_argument(
+        "--reasoning-marker",
+        type=str,
+        default="assistantfinal",
+        help="Marker to strip reasoning prefix from clinical text (default: 'assistantfinal'). Set to empty string to disable.",
+    )
     
     args = parser.parse_args()
     
@@ -136,6 +159,7 @@ Examples:
         treatment_coefficient=args.treatment_coefficient,
         target_treatment_rate=args.target_treatment_rate,
         target_control_outcome_rate=args.target_control_outcome_rate,
+        num_confounders=args.num_confounders,
         output_dir=args.output_dir,
         seed=args.seed,
         llm=LLMConfig(
@@ -149,11 +173,27 @@ Examples:
     
     # Run generation
     try:
-        df, metadata = generate_synthetic_dataset(
-            config=config,
-            num_workers=args.num_workers,
-            show_progress=True,
-        )
+        if args.use_vllm_batch:
+            # Use direct vLLM batch inference (faster)
+            from .vllm_batch_client import VLLMConfig
+            vllm_config = VLLMConfig(
+                model_name=args.model,
+                tensor_parallel_size=args.tensor_parallel_size,
+                temperature=args.temperature,
+                max_tokens=args.max_tokens,
+                reasoning_marker=args.reasoning_marker if args.reasoning_marker else None,
+            )
+            df, metadata = generate_synthetic_dataset_batch(
+                config=config,
+                vllm_config=vllm_config,
+                show_progress=True,
+            )
+        else:
+            df, metadata = generate_synthetic_dataset(
+                config=config,
+                num_workers=args.num_workers,
+                show_progress=True,
+            )
         
         print(f"\n✓ Generated {len(df)} patients")
         print(f"  - Treatment rate: {df['treatment_indicator'].mean():.1%}")

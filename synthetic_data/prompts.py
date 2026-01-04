@@ -23,7 +23,7 @@ CONFOUNDER_GENERATION_PROMPT = """Given the following comparative effectiveness 
 Generate a comprehensive list of realistic confounding variables that would influence both treatment assignment and outcome in a real-world clinical setting.
 
 Requirements:
-1. Include 8-12 confounders total
+1. Include {num_confounders_instruction} total
 2. Mix of categorical (3-5 categories each) and continuous variables
 3. Common confounders might include: age, sex (if applicable to the cancer type), performance status, comorbidities, prior treatments, biomarkers, disease stage, etc.
 4. Be specific to the clinical context of the question

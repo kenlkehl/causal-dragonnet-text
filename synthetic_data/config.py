@@ -2,7 +2,7 @@
 """Configuration classes for synthetic data generation."""
 
 from dataclasses import dataclass, field, asdict
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 from pathlib import Path
 import json
 
@@ -20,8 +20,8 @@ class LLMConfig:
     api_key: str = ""  # Can be blank for local models
     model_name: str = "openai/gpt-oss-120b"  # Model name to use
     temperature: float = 0.7
-    max_tokens: int = 25000
-    timeout: float = 120.0  # Request timeout in seconds
+    max_tokens: int = 12000
+    timeout: float = 300.0  # Request timeout in seconds
 
 
 @dataclass
@@ -42,6 +42,9 @@ class SyntheticDataConfig:
     main_coefficient_scale: float = 0.3  # Scale for main effect coefficients
     interaction_coefficient_scale: float = 0.1  # Scale for interaction coefficients
     target_logit_std: float = 2.0  # Target std for final logits (after rescaling)
+    
+    # Number of confounders (None = use LLM default of 8-12)
+    num_confounders: Optional[int] = None
     
     # Output
     output_dir: str = "./synthetic_output"
