@@ -20,7 +20,6 @@ from .io import (
 
 from .model_loading import (
     load_pretrained_with_dimension_matching,
-    check_checkpoint_compatibility,
     create_compatible_model_from_checkpoint,
     extract_feature_extractor_config
 )
@@ -45,7 +44,6 @@ __all__ = [
     'atomic_save',
     'ensure_dir',
     'load_pretrained_with_dimension_matching',
-    'check_checkpoint_compatibility',
     'create_compatible_model_from_checkpoint',
     'extract_feature_extractor_config',
     'compute_confounder_feature_stats',

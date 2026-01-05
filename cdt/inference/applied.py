@@ -225,9 +225,10 @@ def _train_single_model(
     model = CausalDragonnetText(
         sentence_transformer_model_name=arch_config.embedding_model_name,
         num_latent_confounders=arch_config.num_latent_confounders,
-        features_per_confounder=arch_config.features_per_confounder,
         explicit_confounder_texts=arch_config.explicit_confounder_texts,
-        aggregator_mode=arch_config.aggregator_mode,
+        value_dim=arch_config.value_dim,
+        num_attention_heads=arch_config.num_attention_heads,
+        attention_dropout=arch_config.attention_dropout,
         dragonnet_representation_dim=arch_config.dragonnet_representation_dim,
         dragonnet_hidden_outcome_dim=arch_config.dragonnet_hidden_outcome_dim,
         chunk_size=arch_config.chunk_size,
@@ -560,14 +561,9 @@ def _generate_predictions(
     if config is not None:
         confounder_features = np.concatenate(all_confounder_features, axis=0)
         arch = config.architecture
-        num_explicit = len(arch.explicit_confounder_texts) if arch.explicit_confounder_texts else 0
-        num_total = num_explicit + arch.num_latent_confounders
         stats_df = compute_confounder_feature_stats(
             confounder_features,
-            num_confounders=num_total,
-            features_per_confounder=arch.features_per_confounder,
-            explicit_confounder_texts=arch.explicit_confounder_texts,
-            num_latent=arch.num_latent_confounders
+            projection_dim=arch.dragonnet_representation_dim
         )
         log_confounder_stats(stats_df, prefix="Applied Inference ")
 

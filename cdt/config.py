@@ -15,13 +15,14 @@ class ModelArchitectureConfig:
     embedding_model_name: str = "all-MiniLM-L6-v2"
     dragonnet_representation_dim: int = 128
     dragonnet_hidden_outcome_dim: int = 64
-    aggregator_mode: str = "attn"
     num_latent_confounders: int = 20
-    features_per_confounder: int = 1
     explicit_confounder_texts: Optional[List[str]] = None
     chunk_size: int = 128
     chunk_overlap: int = 32
-    arctanh_transform: bool = False  # Apply arctanh to stretch cosine similarities before BatchNorm
+    # Cross-attention aggregation parameters
+    value_dim: int = 128  # Output dimension per confounder in cross-attention
+    num_attention_heads: int = 4  # Number of attention heads per confounder
+    attention_dropout: float = 0.1  # Dropout on attention weights
 
 
 @dataclass
@@ -207,21 +208,19 @@ def create_default_config(output_path: str) -> None:
             dataset_path="./pretrain_dataset.parquet",
             treatment_column="treatment",
             architecture=ModelArchitectureConfig(
-                num_latent_confounders=50,
-                features_per_confounder=1
+                num_latent_confounders=50
             ),
             training=TrainingConfig(
                 epochs=10,
                 batch_size=8
             )
         ),
-        
+
         applied_inference=AppliedInferenceConfig(
             dataset_path="./dataset.parquet",
             cv_folds=5,  # Default to 5-fold CV
             architecture=ModelArchitectureConfig(
-                num_latent_confounders=20,
-                features_per_confounder=4
+                num_latent_confounders=20
             ),
             training=TrainingConfig(
                 epochs=50,

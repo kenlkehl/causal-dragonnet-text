@@ -517,9 +517,10 @@ def _train_plasmode_generator(
     generator = CausalDragonnetText(
         sentence_transformer_model_name=gen_arch.embedding_model_name,
         num_latent_confounders=gen_arch.num_latent_confounders,
-        features_per_confounder=gen_arch.features_per_confounder,
         explicit_confounder_texts=gen_arch.explicit_confounder_texts,
-        aggregator_mode=gen_arch.aggregator_mode,
+        value_dim=gen_arch.value_dim,
+        num_attention_heads=gen_arch.num_attention_heads,
+        attention_dropout=gen_arch.attention_dropout,
         dragonnet_representation_dim=gen_arch.dragonnet_representation_dim,
         dragonnet_hidden_outcome_dim=gen_arch.dragonnet_hidden_outcome_dim,
         chunk_size=gen_arch.chunk_size,
@@ -918,9 +919,10 @@ def _train_plasmode_evaluator(
     evaluator = CausalDragonnetText(
         sentence_transformer_model_name=eval_arch.embedding_model_name,
         num_latent_confounders=eval_arch.num_latent_confounders,
-        features_per_confounder=eval_arch.features_per_confounder,
         explicit_confounder_texts=eval_arch.explicit_confounder_texts,
-        aggregator_mode=eval_arch.aggregator_mode,
+        value_dim=eval_arch.value_dim,
+        num_attention_heads=eval_arch.num_attention_heads,
+        attention_dropout=eval_arch.attention_dropout,
         dragonnet_representation_dim=eval_arch.dragonnet_representation_dim,
         dragonnet_hidden_outcome_dim=eval_arch.dragonnet_hidden_outcome_dim,
         chunk_size=eval_arch.chunk_size,
@@ -1148,14 +1150,9 @@ def _predict_plasmode_evaluator(
     # Log confounder feature statistics
     confounder_features = np.concatenate(all_confounder_features, axis=0)
     eval_arch = plasmode_config.evaluator_architecture
-    num_explicit = len(eval_arch.explicit_confounder_texts) if eval_arch.explicit_confounder_texts else 0
-    num_total = num_explicit + eval_arch.num_latent_confounders
     stats_df = compute_confounder_feature_stats(
         confounder_features,
-        num_confounders=num_total,
-        features_per_confounder=eval_arch.features_per_confounder,
-        explicit_confounder_texts=eval_arch.explicit_confounder_texts,
-        num_latent=eval_arch.num_latent_confounders
+        projection_dim=eval_arch.dragonnet_representation_dim
     )
     log_confounder_stats(stats_df, prefix="Evaluator Inference ")
 

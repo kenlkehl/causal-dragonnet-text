@@ -14,61 +14,38 @@ logger = logging.getLogger(__name__)
 
 def compute_confounder_feature_stats(
     features: np.ndarray,
-    num_confounders: int,
-    features_per_confounder: int = 1,
-    explicit_confounder_texts: Optional[List[str]] = None,
-    num_latent: int = 0
+    projection_dim: Optional[int] = None
 ) -> pd.DataFrame:
     """
-    Compute statistics for each confounder feature.
-    
+    Compute statistics for projected confounder features.
+
+    With the cross-attention architecture, features are a projected representation
+    of dimension projection_dim (typically matching dragonnet_representation_dim).
+
     Args:
-        features: Array of shape (n_samples, n_features) where 
-                  n_features = (num_confounders * features_per_confounder)
-        num_confounders: Total number of confounders (explicit + latent)
-        features_per_confounder: Number of feature dimensions per confounder
-        explicit_confounder_texts: Optional list of explicit confounder query texts
-        num_latent: Number of latent confounders
-    
+        features: Array of shape (n_samples, projection_dim)
+        projection_dim: Expected feature dimension (optional, for validation)
+
     Returns:
-        DataFrame with per-feature statistics
+        DataFrame with per-dimension statistics
     """
     n_samples, n_features = features.shape
-    expected_features = num_confounders * features_per_confounder
-    
-    if n_features != expected_features:
-        logger.warning(f"Feature dimension mismatch: got {n_features}, expected {expected_features}")
-    
-    # Build confounder names
-    num_explicit = len(explicit_confounder_texts) if explicit_confounder_texts else 0
-    
+
+    if projection_dim is not None and n_features != projection_dim:
+        logger.warning(f"Feature dimension mismatch: got {n_features}, expected {projection_dim}")
+
     records = []
     for feat_idx in range(n_features):
-        confounder_idx = feat_idx // features_per_confounder
-        sub_feature_idx = feat_idx % features_per_confounder
-        
-        # Determine confounder name
-        if confounder_idx < num_explicit and explicit_confounder_texts:
-            # Truncate long explicit confounder texts
-            text = explicit_confounder_texts[confounder_idx]
-            confounder_name = f"explicit_{confounder_idx}: {text[:50]}..."
-        else:
-            latent_idx = confounder_idx - num_explicit
-            confounder_name = f"latent_{latent_idx}"
-        
-        # Compute stats
         feat_values = features[:, feat_idx]
         records.append({
-            'confounder_idx': confounder_idx,
-            'sub_feature_idx': sub_feature_idx,
-            'confounder_name': confounder_name,
+            'feature_idx': feat_idx,
             'mean': np.mean(feat_values),
             'std': np.std(feat_values),
             'min': np.min(feat_values),
             'max': np.max(feat_values),
             'range': np.max(feat_values) - np.min(feat_values)
         })
-    
+
     return pd.DataFrame(records)
 
 
@@ -115,22 +92,25 @@ def log_confounder_stats(stats_df: pd.DataFrame, prefix: str = "") -> None:
     """Log confounder feature statistics in a readable format."""
     if stats_df.empty:
         return
-    
-    logger.info(f"{prefix}Confounder Feature Statistics (n={len(stats_df)} features):")
-    
-    # Summary by confounder
-    summary = stats_df.groupby('confounder_idx').agg({
-        'mean': 'mean',
-        'std': 'mean', 
-        'range': 'mean',
-        'confounder_name': 'first'
-    }).reset_index()
-    
-    for _, row in summary.iterrows():
-        logger.info(
-            f"  [{row['confounder_idx']:2d}] {row['confounder_name'][:60]:60s} | "
-            f"mean={row['mean']:+.3f} std={row['std']:.3f} range={row['range']:.3f}"
-        )
+
+    logger.info(f"{prefix}Projected Feature Statistics (n={len(stats_df)} dimensions):")
+
+    # Overall summary
+    overall_mean = stats_df['mean'].mean()
+    overall_std = stats_df['std'].mean()
+    overall_range = stats_df['range'].mean()
+
+    logger.info(f"  Overall: mean={overall_mean:+.3f} std={overall_std:.3f} range={overall_range:.3f}")
+
+    # Log a few extreme dimensions
+    if len(stats_df) > 10:
+        top_range = stats_df.nlargest(5, 'range')
+        logger.info(f"  Top 5 by range:")
+        for _, row in top_range.iterrows():
+            logger.info(
+                f"    [dim {row['feature_idx']:3d}] mean={row['mean']:+.3f} "
+                f"std={row['std']:.3f} range={row['range']:.3f}"
+            )
 
 
 def log_latent_drift(drift_df: pd.DataFrame, prefix: str = "") -> None:

@@ -30,56 +30,56 @@ class CausalDragonnetText(nn.Module):
         self,
         sentence_transformer_model_name: str = 'all-MiniLM-L6-v2',
         num_latent_confounders: int = 20,
-        features_per_confounder: int = 1,
         explicit_confounder_texts: Optional[List[str]] = None,
         explicit_confounder_embeddings: Optional[torch.Tensor] = None,
-        aggregator_mode: str = 'attn',
+        value_dim: int = 128,
+        num_attention_heads: int = 4,
+        attention_dropout: float = 0.1,
         dragonnet_representation_dim: int = 128,
         dragonnet_hidden_outcome_dim: int = 64,
         chunk_size: int = 128,
         chunk_overlap: int = 32,
         device: str = "cuda:0",
-        model_type: str = "dragonnet",  # "dragonnet" or "uplift"
-        arctanh_transform: bool = False
+        model_type: str = "dragonnet"  # "dragonnet" or "uplift"
     ):
         """
         Initialize binary treatment DragonNet for text.
-        
+
         Args:
             sentence_transformer_model_name: Name of sentence transformer model
             num_latent_confounders: Number of learnable confounder patterns
-            features_per_confounder: Features extracted per confounder
             explicit_confounder_texts: Optional list of explicit confounder queries
             explicit_confounder_embeddings: Optional pre-computed embeddings
-            aggregator_mode: Aggregation mode for chunks
+            value_dim: Output dimension per confounder in cross-attention
+            num_attention_heads: Number of attention heads per confounder
+            attention_dropout: Dropout rate on attention weights
             dragonnet_representation_dim: DragonNet representation dimension
             dragonnet_hidden_outcome_dim: DragonNet outcome hidden dimension
             chunk_size: Text chunk size in words
             chunk_overlap: Overlap between chunks
             device: Device string
             model_type: Architecture type ("dragonnet" or "uplift")
-            arctanh_transform: If True, apply arctanh to cosine similarities before BatchNorm
         """
         super().__init__()
-        
+
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self._device = torch.device(device)
         self.model_type = model_type
-        
+
         # Store config for checkpointing
         self.config = {
             'sentence_transformer_model_name': sentence_transformer_model_name,
             'num_latent_confounders': num_latent_confounders,
-            'features_per_confounder': features_per_confounder,
             'explicit_confounder_texts': explicit_confounder_texts,
-            'aggregator_mode': aggregator_mode,
+            'value_dim': value_dim,
+            'num_attention_heads': num_attention_heads,
+            'attention_dropout': attention_dropout,
             'dragonnet_representation_dim': dragonnet_representation_dim,
             'dragonnet_hidden_outcome_dim': dragonnet_hidden_outcome_dim,
             'chunk_size': chunk_size,
             'chunk_overlap': chunk_overlap,
-            'model_type': model_type,
-            'arctanh_transform': arctanh_transform
+            'model_type': model_type
         }
         
         # Load sentence transformer (not a PyTorch submodule)
@@ -95,13 +95,14 @@ class CausalDragonnetText(nn.Module):
             embedding_dim=self.embedding_dim,
             num_latent_confounders=num_latent_confounders,
             explicit_confounder_texts=explicit_confounder_texts,
-            features_per_confounder=features_per_confounder,
-            aggregator_mode=aggregator_mode,
+            value_dim=value_dim,
+            num_attention_heads=num_attention_heads,
+            attention_dropout=attention_dropout,
+            projection_dim=dragonnet_representation_dim,  # Match DragonNet input
             sentence_transformer_model=self.sentence_transformer_model,
             phantom_confounders=0,
             device=self._device,
-            explicit_confounder_embeddings=explicit_confounder_embeddings,
-            arctanh_transform=arctanh_transform
+            explicit_confounder_embeddings=explicit_confounder_embeddings
         )
         
         # Binary treatment Causal Inference Net
@@ -357,9 +358,9 @@ class CausalDragonnetText(nn.Module):
     ) -> torch.Tensor:
         """
         Extract confounder features (before DragonNet/UpliftNet representation layers).
-        
+
         This is the raw output of FeatureExtractor with shape:
-            (batch, num_confounders * features_per_confounder)
+            (batch, projection_dim) where projection_dim = dragonnet_representation_dim
         """
         with torch.no_grad():
             confounder_features = self.feature_extractor(chunk_embeddings_list)
