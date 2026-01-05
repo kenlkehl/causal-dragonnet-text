@@ -108,7 +108,7 @@ def log_confounder_stats(stats_df: pd.DataFrame, prefix: str = "") -> None:
         logger.info(f"  Top 5 by range:")
         for _, row in top_range.iterrows():
             logger.info(
-                f"    [dim {row['feature_idx']:3d}] mean={row['mean']:+.3f} "
+                f"    [dim {int(row['feature_idx']):3d}] mean={row['mean']:+.3f} "
                 f"std={row['std']:.3f} range={row['range']:.3f}"
             )
 
