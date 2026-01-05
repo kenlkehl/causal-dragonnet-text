@@ -94,6 +94,80 @@ class ClinicalTextDataset(Dataset):
         }
 
 
+class ModernBertClinicalTextDataset(Dataset):
+    """Dataset that returns raw text for ModernBERT processing.
+    
+    Unlike ClinicalTextDataset which pre-computes embeddings, this dataset
+    returns raw text strings that are tokenized by the model during forward pass.
+    This is more memory-efficient and allows end-to-end fine-tuning.
+    """
+    
+    def __init__(
+        self,
+        data: pd.DataFrame,
+        text_column: str,
+        outcome_column: str,
+        treatment_column: str
+    ):
+        """
+        Initialize dataset.
+        
+        Args:
+            data: DataFrame with text, outcomes, and treatments
+            text_column: Name of text column
+            outcome_column: Name of outcome column
+            treatment_column: Name of treatment column
+        """
+        self.data = data.reset_index(drop=True)
+        self.text_column = text_column
+        
+        self.texts = data[text_column].tolist()
+        self.outcomes = torch.tensor(
+            data[outcome_column].values,
+            dtype=torch.float32
+        )
+        self.treatments = torch.tensor(
+            data[treatment_column].values,
+            dtype=torch.float32
+        )
+        
+        logger.info(f"ModernBertClinicalTextDataset created: {len(self)} samples")
+    
+    def __len__(self) -> int:
+        return len(self.data)
+    
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        return {
+            'text': self.texts[idx],
+            'outcome': self.outcomes[idx],
+            'treatment': self.treatments[idx],
+            'text_id': idx
+        }
+
+
+def collate_modernbert_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Collate batch for ModernBERT dataset.
+    
+    Args:
+        batch: List of samples from dataset
+    
+    Returns:
+        Batched data with texts as list of strings
+    """
+    texts = [item['text'] for item in batch]
+    outcomes = torch.stack([item['outcome'] for item in batch])
+    treatments = torch.stack([item['treatment'] for item in batch])
+    text_ids = [item['text_id'] for item in batch]
+    
+    return {
+        'texts': texts,
+        'outcome': outcomes,
+        'treatment': treatments,
+        'text_id': text_ids
+    }
+
+
 def collate_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Collate batch with variable-length sequences.

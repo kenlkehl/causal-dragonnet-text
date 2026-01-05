@@ -12,17 +12,25 @@ import hashlib
 class ModelArchitectureConfig:
     """Configuration for model architecture."""
     model_type: str = "dragonnet"  # "dragonnet" or "uplift"
+    # Model backbone selection: "sentence_transformer" (original) or "modernbert" (new)
+    model_backbone: str = "sentence_transformer"
+    # Sentence transformer settings (used when model_backbone="sentence_transformer")
     embedding_model_name: str = "all-MiniLM-L6-v2"
-    dragonnet_representation_dim: int = 128
-    dragonnet_hidden_outcome_dim: int = 64
     num_latent_confounders: int = 20
     explicit_confounder_texts: Optional[List[str]] = None
     chunk_size: int = 128
     chunk_overlap: int = 32
-    # Cross-attention aggregation parameters
+    # Cross-attention aggregation parameters (sentence_transformer only)
     value_dim: int = 128  # Output dimension per confounder in cross-attention
     num_attention_heads: int = 4  # Number of attention heads per confounder
     attention_dropout: float = 0.1  # Dropout on attention weights
+    # ModernBERT settings (used when model_backbone="modernbert")
+    modernbert_model_name: str = "answerdotai/ModernBERT-base"
+    freeze_modernbert: bool = False
+    modernbert_max_length: int = 8192
+    # Shared settings
+    dragonnet_representation_dim: int = 128
+    dragonnet_hidden_outcome_dim: int = 64
 
 
 @dataclass

@@ -8,6 +8,8 @@ from .uplift import UpliftNet
 from .outcome_heads import OutcomeHeadsOnly, UpliftHeadsOnly
 from .causal_dragonnet import CausalDragonnetText
 from .multitreatment import MultiTreatmentDragonNetInternal, MultiTreatmentDragonnetText
+from .modernbert_extractor import ModernBertFeatureExtractor
+from .causal_modernbert import CausalModernBertText
 
 __all__ = [
     'ConfounderAggregator',
@@ -19,4 +21,6 @@ __all__ = [
     'CausalDragonnetText',
     'MultiTreatmentDragonNetInternal',
     'MultiTreatmentDragonnetText',
+    'ModernBertFeatureExtractor',
+    'CausalModernBertText',
 ]

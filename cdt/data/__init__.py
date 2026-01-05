@@ -4,7 +4,9 @@
 
 from .dataset import (
     ClinicalTextDataset,
+    ModernBertClinicalTextDataset,
     collate_batch,
+    collate_modernbert_batch,
     load_dataset,
     validate_dataset
 )
@@ -22,7 +24,9 @@ from .cache import (
 
 __all__ = [
     'ClinicalTextDataset',
+    'ModernBertClinicalTextDataset',
     'collate_batch',
+    'collate_modernbert_batch',
     'load_dataset',
     'validate_dataset',
     'chunk_text',

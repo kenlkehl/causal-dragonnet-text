@@ -3,7 +3,7 @@
 
 import logging
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple, Any
+from typing import Optional, List, Dict, Tuple, Any, Union
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -15,7 +15,12 @@ from joblib import Parallel, delayed
 
 from ..config import AppliedInferenceConfig
 from ..models.causal_dragonnet import CausalDragonnetText
-from ..data import ClinicalTextDataset, collate_batch, load_dataset, EmbeddingCache
+from ..models.causal_modernbert import CausalModernBertText
+from ..data import (
+    ClinicalTextDataset, ModernBertClinicalTextDataset,
+    collate_batch, collate_modernbert_batch,
+    load_dataset, EmbeddingCache
+)
 from ..utils import (
     cuda_cleanup, get_memory_info, load_pretrained_with_dimension_matching,
     compute_latent_drift, log_latent_drift, compute_confounder_feature_stats, log_confounder_stats
@@ -217,85 +222,125 @@ def _train_single_model(
     device: torch.device,
     cache: Optional[EmbeddingCache],
     pretrained_weights_path: Optional[Path]
-) -> Tuple[CausalDragonnetText, List[Dict[str, Any]]]:
+) -> Tuple[Union[CausalDragonnetText, CausalModernBertText], List[Dict[str, Any]]]:
     """Helper to train a single model instance."""
     
-    # Create model
     arch_config = config.architecture
-    model = CausalDragonnetText(
-        sentence_transformer_model_name=arch_config.embedding_model_name,
-        num_latent_confounders=arch_config.num_latent_confounders,
-        explicit_confounder_texts=arch_config.explicit_confounder_texts,
-        value_dim=arch_config.value_dim,
-        num_attention_heads=arch_config.num_attention_heads,
-        attention_dropout=arch_config.attention_dropout,
-        dragonnet_representation_dim=arch_config.dragonnet_representation_dim,
-        dragonnet_hidden_outcome_dim=arch_config.dragonnet_hidden_outcome_dim,
-        chunk_size=arch_config.chunk_size,
-        chunk_overlap=arch_config.chunk_overlap,
-        device=str(device),
-        model_type=arch_config.model_type
-    )
+    use_modernbert = getattr(arch_config, 'model_backbone', 'sentence_transformer') == 'modernbert'
     
-    # Load pretrained weights
-    if pretrained_weights_path is not None and config.use_pretrained_weights:
-        try:
-            pretrained_checkpoint = torch.load(
-                pretrained_weights_path, map_location=device, weights_only=False
-            )
-            load_pretrained_with_dimension_matching(
-                model, pretrained_checkpoint, strict=False, auto_adjust=True
-            )
-            logger.info("    ✓ Loaded pretrained weights")
-        except Exception as e:
-            logger.warning(f"    ✗ Failed to load pretrained weights: {e}")
+    if use_modernbert:
+        # Create ModernBERT-based model
+        model = CausalModernBertText(
+            modernbert_model_name=arch_config.modernbert_model_name,
+            projection_dim=arch_config.dragonnet_representation_dim,
+            freeze_bert=arch_config.freeze_modernbert,
+            max_length=arch_config.modernbert_max_length,
+            dragonnet_representation_dim=arch_config.dragonnet_representation_dim,
+            dragonnet_hidden_outcome_dim=arch_config.dragonnet_hidden_outcome_dim,
+            device=str(device),
+            model_type=arch_config.model_type
+        )
+        logger.info("Using ModernBERT backbone")
+        
+        # No latent tracking for ModernBERT
+        initial_latents = None
+        
+        # Create datasets for ModernBERT
+        train_dataset = ModernBertClinicalTextDataset(
+            data=train_df,
+            text_column=config.text_column,
+            outcome_column=config.outcome_column,
+            treatment_column=config.treatment_column
+        )
+        
+        val_dataset = ModernBertClinicalTextDataset(
+            data=val_df,
+            text_column=config.text_column,
+            outcome_column=config.outcome_column,
+            treatment_column=config.treatment_column
+        )
+        
+        collate_fn = collate_modernbert_batch
+        
+    else:
+        # Create SentenceTransformer-based model (original)
+        model = CausalDragonnetText(
+            sentence_transformer_model_name=arch_config.embedding_model_name,
+            num_latent_confounders=arch_config.num_latent_confounders,
+            explicit_confounder_texts=arch_config.explicit_confounder_texts,
+            value_dim=arch_config.value_dim,
+            num_attention_heads=arch_config.num_attention_heads,
+            attention_dropout=arch_config.attention_dropout,
+            dragonnet_representation_dim=arch_config.dragonnet_representation_dim,
+            dragonnet_hidden_outcome_dim=arch_config.dragonnet_hidden_outcome_dim,
+            chunk_size=arch_config.chunk_size,
+            chunk_overlap=arch_config.chunk_overlap,
+            device=str(device),
+            model_type=arch_config.model_type
+        )
+        
+        # Load pretrained weights (SentenceTransformer only)
+        if pretrained_weights_path is not None and config.use_pretrained_weights:
+            try:
+                pretrained_checkpoint = torch.load(
+                    pretrained_weights_path, map_location=device, weights_only=False
+                )
+                load_pretrained_with_dimension_matching(
+                    model, pretrained_checkpoint, strict=False, auto_adjust=True
+                )
+                logger.info("    ✓ Loaded pretrained weights")
+            except Exception as e:
+                logger.warning(f"    ✗ Failed to load pretrained weights: {e}")
+        
+        # Snapshot initial latent confounders for drift tracking
+        initial_latents = None
+        if model.feature_extractor.latent_confounders is not None:
+            initial_latents = model.feature_extractor.latent_confounders.data.clone()
+        
+        # Initialize latents if needed
+        if pretrained_weights_path is None and config.training.init_latents_from_kmeans:
+            _initialize_latents_kmeans(model, train_df, cache, device)
+        
+        # Create datasets for SentenceTransformer
+        train_dataset = ClinicalTextDataset(
+            data=train_df,
+            text_column=config.text_column,
+            outcome_column=config.outcome_column,
+            treatment_column=config.treatment_column,
+            model=model.sentence_transformer_model,
+            device=device,
+            chunk_size=arch_config.chunk_size,
+            chunk_overlap=arch_config.chunk_overlap,
+            cache=cache
+        )
+        
+        val_dataset = ClinicalTextDataset(
+            data=val_df,
+            text_column=config.text_column,
+            outcome_column=config.outcome_column,
+            treatment_column=config.treatment_column,
+            model=model.sentence_transformer_model,
+            device=device,
+            chunk_size=arch_config.chunk_size,
+            chunk_overlap=arch_config.chunk_overlap,
+            cache=cache
+        )
+        
+        collate_fn = collate_batch
     
-    # Snapshot initial latent confounders for drift tracking
-    initial_latents = None
-    if model.feature_extractor.latent_confounders is not None:
-        initial_latents = model.feature_extractor.latent_confounders.data.clone()
-    
-    # Initialize latents if needed
-    if pretrained_weights_path is None and config.training.init_latents_from_kmeans:
-        _initialize_latents_kmeans(model, train_df, cache, device)
-    
-    # Datasets & Loaders
-    train_dataset = ClinicalTextDataset(
-        data=train_df,
-        text_column=config.text_column,
-        outcome_column=config.outcome_column,
-        treatment_column=config.treatment_column,
-        model=model.sentence_transformer_model,
-        device=device,
-        chunk_size=arch_config.chunk_size,
-        chunk_overlap=arch_config.chunk_overlap,
-        cache=cache
-    )
-    
-    val_dataset = ClinicalTextDataset(
-        data=val_df,
-        text_column=config.text_column,
-        outcome_column=config.outcome_column,
-        treatment_column=config.treatment_column,
-        model=model.sentence_transformer_model,
-        device=device,
-        chunk_size=arch_config.chunk_size,
-        chunk_overlap=arch_config.chunk_overlap,
-        cache=cache
-    )
-    
+    # Create data loaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.training.batch_size,
         shuffle=True,
-        collate_fn=collate_batch
+        collate_fn=collate_fn
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.training.batch_size,
         shuffle=False,
-        collate_fn=collate_batch
+        collate_fn=collate_fn
     )
     
     # Optimization
@@ -303,7 +348,7 @@ def _train_single_model(
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=train_config.learning_rate,
-        weight_decay=1e-4  # Match old_cdt behavior
+        weight_decay=1e-4
     )
     
     if train_config.lr_schedule == "linear":
@@ -321,10 +366,10 @@ def _train_single_model(
     
     for epoch in range(train_config.epochs):
         model.train()
-        train_stats = _train_epoch(model, train_loader, optimizer, scheduler, device, train_config)
+        train_stats = _train_epoch_modernbert(model, train_loader, optimizer, scheduler, device, train_config) if use_modernbert else _train_epoch(model, train_loader, optimizer, scheduler, device, train_config)
         
         model.eval()
-        val_stats = _eval_epoch(model, val_loader, device, train_config)
+        val_stats = _eval_epoch_modernbert(model, val_loader, device, train_config) if use_modernbert else _eval_epoch(model, val_loader, device, train_config)
         
         # Record history
         epoch_log = {
@@ -349,42 +394,60 @@ def _train_single_model(
     if best_model_state:
         model.load_state_dict(best_model_state)
     
-    # Compute and log latent drift
-    if initial_latents is not None and model.feature_extractor.latent_confounders is not None:
-        drift_df = compute_latent_drift(initial_latents, model.feature_extractor.latent_confounders.data)
-        log_latent_drift(drift_df, prefix="Applied ")
+    # Compute and log latent drift (SentenceTransformer only)
+    if not use_modernbert and initial_latents is not None:
+        if hasattr(model.feature_extractor, 'latent_confounders') and model.feature_extractor.latent_confounders is not None:
+            drift_df = compute_latent_drift(initial_latents, model.feature_extractor.latent_confounders.data)
+            log_latent_drift(drift_df, prefix="Applied ")
         
     return model, history
 
 
 def _predict_dataset(
-    model: CausalDragonnetText,
+    model: Union[CausalDragonnetText, CausalModernBertText],
     df: pd.DataFrame,
     config: AppliedInferenceConfig,
     device: torch.device,
     cache: Optional[EmbeddingCache]
 ) -> dict:
     """Generate predictions for a dataframe."""
-    dataset = ClinicalTextDataset(
-        data=df,
-        text_column=config.text_column,
-        outcome_column=config.outcome_column,
-        treatment_column=config.treatment_column,
-        model=model.sentence_transformer_model,
-        device=device,
-        chunk_size=config.architecture.chunk_size,
-        chunk_overlap=config.architecture.chunk_overlap,
-        cache=cache
-    )
+    arch_config = config.architecture
+    use_modernbert = getattr(arch_config, 'model_backbone', 'sentence_transformer') == 'modernbert'
+    
+    if use_modernbert:
+        dataset = ModernBertClinicalTextDataset(
+            data=df,
+            text_column=config.text_column,
+            outcome_column=config.outcome_column,
+            treatment_column=config.treatment_column
+        )
+        collate_fn = collate_modernbert_batch
+    else:
+        dataset = ClinicalTextDataset(
+            data=df,
+            text_column=config.text_column,
+            outcome_column=config.outcome_column,
+            treatment_column=config.treatment_column,
+            model=model.sentence_transformer_model,
+            device=device,
+            chunk_size=arch_config.chunk_size,
+            chunk_overlap=arch_config.chunk_overlap,
+            cache=cache
+        )
+        collate_fn = collate_batch
     
     loader = DataLoader(
         dataset,
         batch_size=config.training.batch_size,
         shuffle=False,
-        collate_fn=collate_batch
+        collate_fn=collate_fn
     )
     
-    return _generate_predictions(model, loader, device, config)
+    if use_modernbert:
+        return _generate_predictions_modernbert(model, loader, device, config)
+    else:
+        return _generate_predictions(model, loader, device, config)
+
 
 
 def _train_epoch(
@@ -655,3 +718,145 @@ def _initialize_latents_kmeans(
         logger.warning("scikit-learn not available, skipping k-means initialization")
     except Exception as e:
         logger.warning(f"K-means initialization failed: {e}")
+
+
+# =============================================================================
+# ModernBERT-specific training and evaluation functions
+# =============================================================================
+
+def _train_epoch_modernbert(
+    model: CausalModernBertText,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
+    device: torch.device,
+    config
+) -> dict:
+    """Train for one epoch with ModernBERT model."""
+    epoch_loss = 0.0
+    all_targets = []
+    all_treatments = []
+    all_y0 = []
+    all_y1 = []
+    all_prop = []
+    
+    for batch in tqdm(loader, desc="Training", leave=False):
+        # Move tensors to device
+        batch['outcome'] = batch['outcome'].to(device)
+        batch['treatment'] = batch['treatment'].to(device)
+        # 'texts' stays as list of strings
+        
+        optimizer.zero_grad()
+        
+        losses = model.train_step(
+            batch,
+            alpha_propensity=config.alpha_propensity,
+            beta_targreg=config.beta_targreg
+        )
+        
+        losses['loss'].backward()
+        optimizer.step()
+        
+        if scheduler is not None:
+            scheduler.step()
+        
+        epoch_loss += losses['loss'].item()
+        
+        # Collect for metrics
+        all_targets.append(batch['outcome'].detach().cpu())
+        all_treatments.append(batch['treatment'].detach().cpu())
+        all_y0.append(losses['y0_logit'].detach().cpu())
+        all_y1.append(losses['y1_logit'].detach().cpu())
+        all_prop.append(losses['t_logit'].detach().cpu())
+    
+    return _compute_epoch_metrics(epoch_loss, loader, all_targets, all_treatments, all_y0, all_y1, all_prop)
+
+
+def _eval_epoch_modernbert(
+    model: CausalModernBertText,
+    loader: DataLoader,
+    device: torch.device,
+    config
+) -> dict:
+    """Evaluate for one epoch with ModernBERT model."""
+    epoch_loss = 0.0
+    all_targets = []
+    all_treatments = []
+    all_y0 = []
+    all_y1 = []
+    all_prop = []
+    
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Validation", leave=False):
+            # Move tensors to device
+            batch['outcome'] = batch['outcome'].to(device)
+            batch['treatment'] = batch['treatment'].to(device)
+            # 'texts' stays as list of strings
+            
+            losses = model.train_step(
+                batch,
+                alpha_propensity=config.alpha_propensity,
+                beta_targreg=config.beta_targreg
+            )
+            
+            epoch_loss += losses['loss'].item()
+            
+            all_targets.append(batch['outcome'].detach().cpu())
+            all_treatments.append(batch['treatment'].detach().cpu())
+            all_y0.append(losses['y0_logit'].detach().cpu())
+            all_y1.append(losses['y1_logit'].detach().cpu())
+            all_prop.append(losses['t_logit'].detach().cpu())
+    
+    return _compute_epoch_metrics(epoch_loss, loader, all_targets, all_treatments, all_y0, all_y1, all_prop)
+
+
+def _generate_predictions_modernbert(
+    model: CausalModernBertText,
+    loader: DataLoader,
+    device: torch.device,
+    config: AppliedInferenceConfig = None
+) -> dict:
+    """Generate predictions on test set with ModernBERT model."""
+    all_y0 = []
+    all_y1 = []
+    all_propensity = []
+    all_features = []
+    
+    model.eval()
+    
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Predicting", leave=False):
+            texts = batch['texts']
+            
+            # Extract features for diagnostics
+            features = model.get_features(texts)
+            all_features.append(features.cpu().numpy())
+            
+            preds = model.predict(texts)
+            
+            # Use logit-scale predictions
+            all_y0.append(preds['y0_logit'].cpu().numpy())
+            all_y1.append(preds['y1_logit'].cpu().numpy())
+            all_propensity.append(preds['t_logit'].cpu().numpy())
+    
+    y0_logit = np.concatenate(all_y0)
+    y1_logit = np.concatenate(all_y1)
+    propensity_logit = np.concatenate(all_propensity)
+    ite_logit = y1_logit - y0_logit
+    
+    # Log feature statistics if config provided
+    if config is not None:
+        feature_array = np.concatenate(all_features, axis=0)
+        arch = config.architecture
+        stats_df = compute_confounder_feature_stats(
+            feature_array,
+            projection_dim=arch.dragonnet_representation_dim
+        )
+        log_confounder_stats(stats_df, prefix="Applied Inference ModernBERT ")
+    
+    return {
+        'y0_logit': y0_logit,
+        'y1_logit': y1_logit,
+        'propensity_logit': propensity_logit,
+        'ite_logit': ite_logit
+    }
