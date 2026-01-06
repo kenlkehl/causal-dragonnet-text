@@ -142,6 +142,13 @@ Examples:
         default="assistantfinal",
         help="Marker to strip reasoning prefix from clinical text (default: 'assistantfinal'). Set to empty string to disable.",
     )
+
+    parser.add_argument(
+        "--vllm-download-dir",
+        type=str,
+        default="./",
+        help="Download directory for vllm model",
+    )
     
     args = parser.parse_args()
     
@@ -181,6 +188,7 @@ Examples:
                 tensor_parallel_size=args.tensor_parallel_size,
                 temperature=args.temperature,
                 max_tokens=args.max_tokens,
+                download_dir = args.vllm_download_dir,
                 reasoning_marker=args.reasoning_marker if args.reasoning_marker else None,
             )
             df, metadata = generate_synthetic_dataset_batch(
