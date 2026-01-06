@@ -1,0 +1,217 @@
+{
+  "config": {
+    "clinical_question": "Compare the effectiveness of letrozole+palbociclib with letrozole+ribociclib for the first line treatment of metastatic ER positive breast cancer.",
+    "dataset_size": 1000,
+    "treatment_coefficient": 1.0,
+    "target_treatment_rate": 0.5,
+    "target_control_outcome_rate": 0.2,
+    "main_coefficient_scale": 0.3,
+    "interaction_coefficient_scale": 0.1,
+    "target_logit_std": 2.0,
+    "num_confounders": 4,
+    "output_dir": "./example_synthetic_data_simple",
+    "llm": {
+      "api_base_url": "http://localhost:8000/v1",
+      "api_key": "",
+      "model_name": "openai/gpt-oss-120b",
+      "temperature": 0.7,
+      "max_tokens": 50000,
+      "timeout": 300.0
+    },
+    "seed": 42
+  },
+  "confounders": [
+    {
+      "name": "age",
+      "type": "continuous",
+      "description": "Patient age at initiation of first‑line therapy, measured in years"
+    },
+    {
+      "name": "ecog_performance_status",
+      "type": "categorical",
+      "categories": [
+        "0",
+        "1",
+        "2",
+        "3",
+        "4"
+      ],
+      "description": "Eastern Cooperative Oncology Group (ECOG) performance status at treatment start"
+    },
+    {
+      "name": "prior_adjuvant_endocrine_therapy",
+      "type": "categorical",
+      "categories": [
+        "none",
+        "adjuvant_aromatase_inhibitor",
+        "adjuvant_tamoxifen",
+        "adjuvant_sequential_ai_then_tamoxifen"
+      ],
+      "description": "Type of adjuvant endocrine therapy received before metastatic recurrence"
+    },
+    {
+      "name": "baseline_number_of_metastatic_sites",
+      "type": "continuous",
+      "description": "Count of distinct organ sites (bone, liver, lung, brain, lymph nodes, etc.) with measurable disease at baseline"
+    }
+  ],
+  "treatment_equation": {
+    "intercept": 0.03819532321199964,
+    "coefficients": {
+      "age": 1.3641003416793123,
+      "ecog_performance_status_1": -0.5456401366717248,
+      "ecog_performance_status_2": -1.6369204100151746,
+      "ecog_performance_status_3": -3.2738408200303493,
+      "ecog_performance_status_4": -4.910761230045524,
+      "prior_adjuvant_endocrine_therapy_adjuvant_aromatase_inhibitor": 1.0912802733434497,
+      "prior_adjuvant_endocrine_therapy_adjuvant_tamoxifen": -0.5456401366717248,
+      "prior_adjuvant_endocrine_therapy_adjuvant_sequential_ai_then_tamoxifen": 0.0,
+      "baseline_number_of_metastatic_sites": -0.8184602050075873
+    },
+    "interactions": [
+      {
+        "terms": [
+          "age",
+          "ecog_performance_status_2"
+        ],
+        "coefficient": 0.09094002277862083
+      },
+      {
+        "terms": [
+          "prior_adjuvant_endocrine_therapy_adjuvant_aromatase_inhibitor",
+          "baseline_number_of_metastatic_sites"
+        ],
+        "coefficient": -0.12731603189006915
+      },
+      {
+        "terms": [
+          "ecog_performance_status_3",
+          "baseline_number_of_metastatic_sites"
+        ],
+        "coefficient": -0.07275201822289665
+      }
+    ],
+    "original_intercept": -0.2
+  },
+  "outcome_equation": {
+    "intercept": -1.4972768416448878,
+    "coefficients": {
+      "age": -0.5321868795985562,
+      "ecog_performance_status_1": 0.7982803193978342,
+      "ecog_performance_status_2": 1.5965606387956683,
+      "ecog_performance_status_3": 2.6609343979927806,
+      "ecog_performance_status_4": 3.9914015969891707,
+      "prior_adjuvant_endocrine_therapy_adjuvant_aromatase_inhibitor": -0.5321868795985562,
+      "prior_adjuvant_endocrine_therapy_adjuvant_tamoxifen": 0.2660934397992781,
+      "prior_adjuvant_endocrine_therapy_adjuvant_sequential_ai_then_tamoxifen": 0.0,
+      "baseline_number_of_metastatic_sites": 1.3304671989963903
+    },
+    "interactions": [
+      {
+        "terms": [
+          "age",
+          "prior_adjuvant_endocrine_therapy_adjuvant_aromatase_inhibitor"
+        ],
+        "coefficient": -0.08869781326642605
+      },
+      {
+        "terms": [
+          "ecog_performance_status_2",
+          "baseline_number_of_metastatic_sites"
+        ],
+        "coefficient": 0.1773956265328521
+      },
+      {
+        "terms": [
+          "prior_adjuvant_endocrine_therapy_adjuvant_tamoxifen",
+          "baseline_number_of_metastatic_sites"
+        ],
+        "coefficient": 0.13304671989963904
+      }
+    ],
+    "treatment_coefficient": 1.0,
+    "treatment_interactions": [
+      {
+        "term": "age",
+        "coefficient": -0.22256034221809287
+      },
+      {
+        "term": "ecog_performance_status_1",
+        "coefficient": 0.7995474677290694
+      },
+      {
+        "term": "ecog_performance_status_2",
+        "coefficient": 0.4115471065946023
+      },
+      {
+        "term": "ecog_performance_status_3",
+        "coefficient": 0.17501583616914793
+      },
+      {
+        "term": "ecog_performance_status_4",
+        "coefficient": -0.6102078879433623
+      },
+      {
+        "term": "prior_adjuvant_endocrine_therapy_adjuvant_aromatase_inhibitor",
+        "coefficient": -0.6102506759569363
+      },
+      {
+        "term": "prior_adjuvant_endocrine_therapy_adjuvant_tamoxifen",
+        "coefficient": -0.783940344945571
+      },
+      {
+        "term": "prior_adjuvant_endocrine_therapy_adjuvant_sequential_ai_then_tamoxifen",
+        "coefficient": 0.6495804680112959
+      },
+      {
+        "term": "baseline_number_of_metastatic_sites",
+        "coefficient": 0.1793736086006322
+      }
+    ],
+    "original_intercept": -1.2
+  },
+  "summary_statistics": {
+    "age": {
+      "type": "continuous",
+      "mean": 62.3,
+      "std": 11.4
+    },
+    "ecog_performance_status": {
+      "type": "categorical",
+      "proportions": {
+        "0": 0.2,
+        "1": 0.45,
+        "2": 0.25,
+        "3": 0.08,
+        "4": 0.02
+      }
+    },
+    "prior_adjuvant_endocrine_therapy": {
+      "type": "categorical",
+      "proportions": {
+        "none": 0.15,
+        "adjuvant_aromatase_inhibitor": 0.4,
+        "adjuvant_tamoxifen": 0.25,
+        "adjuvant_sequential_ai_then_tamoxifen": 0.2
+      }
+    },
+    "baseline_number_of_metastatic_sites": {
+      "type": "continuous",
+      "mean": 1.8,
+      "std": 0.9
+    }
+  },
+  "dataset_statistics": {
+    "n_patients": 1000,
+    "treatment_rate": 0.39,
+    "outcome_rate": 0.489,
+    "mean_treatment_logit": -0.7701454467960387,
+    "std_treatment_logit": 2.0035631129475058,
+    "mean_outcome_logit": -0.12605864756519375,
+    "std_outcome_logit": 1.5850239121279563,
+    "clinical_text_stats": {
+      "non_empty_count": "1000",
+      "mean_length": 8494.777
+    }
+  }
+}
