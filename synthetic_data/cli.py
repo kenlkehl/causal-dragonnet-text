@@ -95,7 +95,7 @@ Examples:
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=20000,
+        default=50000,
         help="Max tokens per LLM response (default: 20000)",
     )
     
