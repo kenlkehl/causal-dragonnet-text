@@ -1,4 +1,4 @@
 .claude/
-./experiments_*/
+./experiments*/
 __pycache__/
 .ipynb*/

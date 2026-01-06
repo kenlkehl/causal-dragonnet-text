@@ -838,7 +838,7 @@ def _generate_single_patient(
         clinical_history = client.generate(
             prompt=history_prompt,
             system_prompt=CLINICAL_SYSTEM_PROMPT,
-            temperature=0.8,  # Higher temperature for more varied text
+            temperature=0.4,  # Lower temperature for more faithful confounder representation
             max_tokens=history_max_tokens,
         )
         # Handle None response from LLM
@@ -1111,7 +1111,7 @@ def generate_synthetic_dataset_batch(
     clinical_texts = vllm_client.generate_batch(
         prompts=history_prompts,
         system_prompt=CLINICAL_SYSTEM_PROMPT,
-        temperature=0.8,
+        temperature=0.4,  # Lower temperature for more faithful confounder representation
         max_tokens=vllm_config.max_tokens,
     )
     
