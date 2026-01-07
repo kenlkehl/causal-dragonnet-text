@@ -10,7 +10,8 @@ from tqdm import tqdm
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import KFold, train_test_split
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, r2_score, mean_squared_error
+from scipy.stats import pearsonr
 from joblib import Parallel, delayed
 
 from ..config import AppliedInferenceConfig
@@ -33,23 +34,28 @@ def run_applied_inference(
     cache: Optional[EmbeddingCache] = None,
     pretrained_weights_path: Optional[Path] = None,
     gpu_ids: Optional[List[int]] = None,
-    num_workers: int = 1
+    num_workers: int = 1,
+    outcome_type: str = "binary"
 ) -> None:
     """
     Run applied causal inference on real data.
+    
+    Args:
+        outcome_type: "binary" or "continuous" - affects loss function and metrics
     """
     logger.info("="*80)
     logger.info("APPLIED CAUSAL INFERENCE")
     logger.info("="*80)
+    logger.info(f"Outcome type: {outcome_type}")
     
     # Determine mode
     if config.cv_folds > 1:
         _run_cv_inference(
-            dataset, config, output_path, device, cache, pretrained_weights_path, gpu_ids, num_workers
+            dataset, config, output_path, device, cache, pretrained_weights_path, gpu_ids, num_workers, outcome_type
         )
     else:
         _run_fixed_split_inference(
-            dataset, config, output_path, device, cache, pretrained_weights_path
+            dataset, config, output_path, device, cache, pretrained_weights_path, outcome_type
         )
 
 
@@ -61,7 +67,8 @@ def _run_cv_inference(
     cache: Optional[EmbeddingCache],
     pretrained_weights_path: Optional[Path],
     gpu_ids: Optional[List[int]] = None,
-    num_workers: int = 1
+    num_workers: int = 1,
+    outcome_type: str = "binary"
 ) -> None:
     """Run K-Fold Cross-Validation inference."""
     k = config.cv_folds
@@ -79,16 +86,13 @@ def _run_cv_inference(
     else:
         devices = [device]
     
-    # num_workers is now passed directly
-    # num_workers = getattr(config, 'num_workers', 1)
-    
     if num_workers > 1:
         logger.info(f"Parallelizing across {num_workers} workers on devices: {devices}")
         
         results = Parallel(n_jobs=num_workers)(
             delayed(_process_fold)(
                 fold, train_idx, test_idx, dataset, config, 
-                devices[fold % len(devices)], cache, pretrained_weights_path
+                devices[fold % len(devices)], cache, pretrained_weights_path, outcome_type
             )
             for fold, (train_idx, test_idx) in enumerate(splits)
         )
@@ -97,7 +101,7 @@ def _run_cv_inference(
         for fold, (train_idx, test_idx) in enumerate(splits):
             results.append(_process_fold(
                 fold, train_idx, test_idx, dataset, config, 
-                devices[0], cache, pretrained_weights_path
+                devices[0], cache, pretrained_weights_path, outcome_type
             ))
     
     # Unpack results
@@ -122,7 +126,8 @@ def _process_fold(
     config: AppliedInferenceConfig,
     device: torch.device,
     cache: Optional[EmbeddingCache],
-    pretrained_weights_path: Optional[Path]
+    pretrained_weights_path: Optional[Path],
+    outcome_type: str = "binary"
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
     """Process a single fold (can be run in parallel)."""
     # Re-configure logger for worker process
@@ -142,7 +147,7 @@ def _process_fold(
     
     # 2. Train Model on this fold
     model, history = _train_single_model(
-        fold_train_df, fold_val_df, config, device, cache, pretrained_weights_path
+        fold_train_df, fold_val_df, config, device, cache, pretrained_weights_path, outcome_type
     )
     
     # Log History
@@ -150,7 +155,7 @@ def _process_fold(
         entry['fold'] = fold + 1
     
     # 3. Predict on Held-out Test fold
-    preds = _predict_dataset(model, test_df, config, device, cache)
+    preds = _predict_dataset(model, test_df, config, device, cache, outcome_type)
     
     # 4. Store predictions with indices to reconstruct dataframe (logit scale)
     preds_df = test_df.copy()
@@ -174,7 +179,8 @@ def _run_fixed_split_inference(
     output_path: Path,
     device: torch.device,
     cache: Optional[EmbeddingCache],
-    pretrained_weights_path: Optional[Path]
+    pretrained_weights_path: Optional[Path],
+    outcome_type: str = "binary"
 ) -> None:
     """Run inference using fixed train/val/test splits."""
     logger.info("Running Fixed Split Inference (Train/Val/Test)")
@@ -188,7 +194,7 @@ def _run_fixed_split_inference(
     
     # Train
     model, history = _train_single_model(
-        train_df, val_df, config, device, cache, pretrained_weights_path
+        train_df, val_df, config, device, cache, pretrained_weights_path, outcome_type
     )
     
     # Save training logs
@@ -198,7 +204,7 @@ def _run_fixed_split_inference(
     
     # Predict on Test
     logger.info("Generating predictions on test set...")
-    preds = _predict_dataset(model, test_df, config, device, cache)
+    preds = _predict_dataset(model, test_df, config, device, cache, outcome_type)
     
     # Combine (logit scale)
     results_df = test_df.copy()
@@ -216,7 +222,8 @@ def _train_single_model(
     config: AppliedInferenceConfig,
     device: torch.device,
     cache: Optional[EmbeddingCache],
-    pretrained_weights_path: Optional[Path]
+    pretrained_weights_path: Optional[Path],
+    outcome_type: str = "binary"
 ) -> Tuple[CausalDragonnetText, List[Dict[str, Any]]]:
     """Helper to train a single model instance."""
     
@@ -321,23 +328,43 @@ def _train_single_model(
     
     for epoch in range(train_config.epochs):
         model.train()
-        train_stats = _train_epoch(model, train_loader, optimizer, scheduler, device, train_config)
+        train_stats = _train_epoch(model, train_loader, optimizer, scheduler, device, train_config, outcome_type)
         
         model.eval()
-        val_stats = _eval_epoch(model, val_loader, device, train_config)
+        val_stats = _eval_epoch(model, val_loader, device, train_config, outcome_type)
         
-        # Record history
+        # Record history - use appropriate metrics based on outcome_type
         epoch_log = {
             'epoch': epoch + 1,
             'train_loss': train_stats['loss'],
-            'train_auroc_y0': train_stats['auroc_y0'],
-            'train_auroc_y1': train_stats['auroc_y1'],
-            'train_auroc_prop': train_stats['auroc_prop'],
             'val_loss': val_stats['loss'],
-            'val_auroc_y0': val_stats['auroc_y0'],
-            'val_auroc_y1': val_stats['auroc_y1'],
-            'val_auroc_prop': val_stats['auroc_prop'],
         }
+        
+        if outcome_type == "continuous":
+            # Continuous outcome metrics
+            epoch_log.update({
+                'train_r2_y0': train_stats.get('r2_y0'),
+                'train_r2_y1': train_stats.get('r2_y1'),
+                'train_mse_y0': train_stats.get('mse_y0'),
+                'train_mse_y1': train_stats.get('mse_y1'),
+                'train_auroc_prop': train_stats.get('auroc_prop'),
+                'val_r2_y0': val_stats.get('r2_y0'),
+                'val_r2_y1': val_stats.get('r2_y1'),
+                'val_mse_y0': val_stats.get('mse_y0'),
+                'val_mse_y1': val_stats.get('mse_y1'),
+                'val_auroc_prop': val_stats.get('auroc_prop'),
+            })
+        else:
+            # Binary outcome metrics
+            epoch_log.update({
+                'train_auroc_y0': train_stats.get('auroc_y0'),
+                'train_auroc_y1': train_stats.get('auroc_y1'),
+                'train_auroc_prop': train_stats.get('auroc_prop'),
+                'val_auroc_y0': val_stats.get('auroc_y0'),
+                'val_auroc_y1': val_stats.get('auroc_y1'),
+                'val_auroc_prop': val_stats.get('auroc_prop'),
+            })
+        
         history.append(epoch_log)
         
         # Save best
@@ -362,7 +389,8 @@ def _predict_dataset(
     df: pd.DataFrame,
     config: AppliedInferenceConfig,
     device: torch.device,
-    cache: Optional[EmbeddingCache]
+    cache: Optional[EmbeddingCache],
+    outcome_type: str = "binary"
 ) -> dict:
     """Generate predictions for a dataframe."""
     dataset = ClinicalTextDataset(
@@ -384,7 +412,7 @@ def _predict_dataset(
         collate_fn=collate_batch
     )
     
-    return _generate_predictions(model, loader, device, config)
+    return _generate_predictions(model, loader, device, config, outcome_type)
 
 
 def _train_epoch(
@@ -393,7 +421,8 @@ def _train_epoch(
     optimizer: torch.optim.Optimizer,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
     device: torch.device,
-    config
+    config,
+    outcome_type: str = "binary"
 ) -> dict:
     """Train for one epoch."""
     epoch_loss = 0.0
@@ -420,11 +449,11 @@ def _train_epoch(
         losses = model.train_step(
             batch,
             alpha_propensity=config.alpha_propensity,
-            beta_targreg=config.beta_targreg
+            beta_targreg=config.beta_targreg,
+            outcome_type=outcome_type
         )
         
         losses['loss'].backward()
-        #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         
         if scheduler is not None:
@@ -439,14 +468,15 @@ def _train_epoch(
         all_y1.append(losses['y1_logit'].detach().cpu())
         all_prop.append(losses['t_logit'].detach().cpu())
     
-    return _compute_epoch_metrics(epoch_loss, loader, all_targets, all_treatments, all_y0, all_y1, all_prop)
+    return _compute_epoch_metrics(epoch_loss, loader, all_targets, all_treatments, all_y0, all_y1, all_prop, outcome_type)
 
 
 def _eval_epoch(
     model: CausalDragonnetText,
     loader: DataLoader,
     device: torch.device,
-    config
+    config,
+    outcome_type: str = "binary"
 ) -> dict:
     """Evaluate for one epoch."""
     epoch_loss = 0.0
@@ -472,7 +502,8 @@ def _eval_epoch(
             losses = model.train_step(
                 batch,
                 alpha_propensity=config.alpha_propensity,
-                beta_targreg=config.beta_targreg
+                beta_targreg=config.beta_targreg,
+                outcome_type=outcome_type
             )
             
             epoch_loss += losses['loss'].item()
@@ -483,48 +514,100 @@ def _eval_epoch(
             all_y1.append(losses['y1_logit'].detach().cpu())
             all_prop.append(losses['t_logit'].detach().cpu())
     
-    return _compute_epoch_metrics(epoch_loss, loader, all_targets, all_treatments, all_y0, all_y1, all_prop)
+    return _compute_epoch_metrics(epoch_loss, loader, all_targets, all_treatments, all_y0, all_y1, all_prop, outcome_type)
 
 
-def _compute_epoch_metrics(epoch_loss, loader, all_targets, all_treatments, all_y0, all_y1, all_prop):
-    """Helper to compute AUROCs from collected batch outputs."""
+def _compute_epoch_metrics(epoch_loss, loader, all_targets, all_treatments, all_y0, all_y1, all_prop, outcome_type="binary"):
+    """Helper to compute metrics from collected batch outputs.
+    
+    For binary outcomes: Computes AUROC for Y0, Y1, and propensity.
+    For continuous outcomes: Computes R², MSE, and Pearson correlation.
+    """
     y_true = torch.cat(all_targets).numpy()
     t_true = torch.cat(all_treatments).numpy()
     y0_scores = torch.cat(all_y0).numpy()
     y1_scores = torch.cat(all_y1).numpy()
-    prop_scores = torch.sigmoid(torch.cat(all_prop)).numpy() # sigmoid for prop score
+    prop_scores = torch.sigmoid(torch.cat(all_prop)).numpy()  # sigmoid for prop score
     
-    # Safe AUROC calculation
+    # Safe AUROC calculation (for propensity, always binary)
     def safe_auc(y, score):
         try:
             if len(np.unique(y)) < 2: return None
             return roc_auc_score(y, score)
         except: return None
-
-    # AUROC Y0 (on T=0 samples)
-    mask0 = (t_true == 0)
-    auroc_y0 = safe_auc(y_true[mask0], y0_scores[mask0]) if mask0.any() else None
     
-    # AUROC Y1 (on T=1 samples)
-    mask1 = (t_true == 1)
-    auroc_y1 = safe_auc(y_true[mask1], y1_scores[mask1]) if mask1.any() else None
-    
-    # AUROC Propensity
+    # Propensity AUROC (always computed, treatment is always binary)
     auroc_prop = safe_auc(t_true, prop_scores)
     
-    return {
-        'loss': epoch_loss / len(loader),
-        'auroc_y0': auroc_y0,
-        'auroc_y1': auroc_y1,
-        'auroc_prop': auroc_prop
-    }
+    if outcome_type == "continuous":
+        # Continuous outcome metrics: R², MSE, Pearson correlation
+        mask0 = (t_true == 0)
+        mask1 = (t_true == 1)
+        
+        def safe_r2(y, pred):
+            try:
+                if len(y) < 2: return None
+                return r2_score(y, pred)
+            except: return None
+        
+        def safe_mse(y, pred):
+            try:
+                if len(y) < 1: return None
+                return mean_squared_error(y, pred)
+            except: return None
+        
+        def safe_pearson(y, pred):
+            try:
+                if len(y) < 2: return None
+                r, _ = pearsonr(y, pred)
+                return r
+            except: return None
+        
+        # Y0 metrics (on T=0 samples)
+        r2_y0 = safe_r2(y_true[mask0], y0_scores[mask0]) if mask0.any() else None
+        mse_y0 = safe_mse(y_true[mask0], y0_scores[mask0]) if mask0.any() else None
+        pearson_y0 = safe_pearson(y_true[mask0], y0_scores[mask0]) if mask0.any() else None
+        
+        # Y1 metrics (on T=1 samples)
+        r2_y1 = safe_r2(y_true[mask1], y1_scores[mask1]) if mask1.any() else None
+        mse_y1 = safe_mse(y_true[mask1], y1_scores[mask1]) if mask1.any() else None
+        pearson_y1 = safe_pearson(y_true[mask1], y1_scores[mask1]) if mask1.any() else None
+        
+        return {
+            'loss': epoch_loss / len(loader),
+            'r2_y0': r2_y0,
+            'r2_y1': r2_y1,
+            'mse_y0': mse_y0,
+            'mse_y1': mse_y1,
+            'pearson_y0': pearson_y0,
+            'pearson_y1': pearson_y1,
+            'auroc_prop': auroc_prop
+        }
+    else:
+        # Binary outcome metrics: AUROC
+        mask0 = (t_true == 0)
+        mask1 = (t_true == 1)
+        
+        # AUROC Y0 (on T=0 samples)
+        auroc_y0 = safe_auc(y_true[mask0], y0_scores[mask0]) if mask0.any() else None
+        
+        # AUROC Y1 (on T=1 samples)
+        auroc_y1 = safe_auc(y_true[mask1], y1_scores[mask1]) if mask1.any() else None
+        
+        return {
+            'loss': epoch_loss / len(loader),
+            'auroc_y0': auroc_y0,
+            'auroc_y1': auroc_y1,
+            'auroc_prop': auroc_prop
+        }
 
 
 def _generate_predictions(
     model: CausalDragonnetText,
     loader: DataLoader,
     device: torch.device,
-    config: AppliedInferenceConfig = None
+    config: AppliedInferenceConfig = None,
+    outcome_type: str = "binary"
 ) -> dict:
     """Generate predictions on test set."""
     all_y0 = []
@@ -545,9 +628,9 @@ def _generate_predictions(
             features = model.feature_extractor(chunk_embeddings_list)
             all_confounder_features.append(features.cpu().numpy())
             
-            preds = model.predict(chunk_embeddings_list)
+            preds = model.predict(chunk_embeddings_list, outcome_type=outcome_type)
 
-            # Use logit-scale predictions
+            # Use logit-scale predictions (for continuous, these are raw predictions)
             all_y0.append(preds['y0_logit'].cpu().numpy())
             all_y1.append(preds['y1_logit'].cpu().numpy())
             all_propensity.append(preds['t_logit'].cpu().numpy())

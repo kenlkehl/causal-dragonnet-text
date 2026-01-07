@@ -24,7 +24,8 @@ def run_pretraining(
     config: PretrainingConfig,
     output_path: Path,
     device: torch.device,
-    cache: Optional[EmbeddingCache] = None
+    cache: Optional[EmbeddingCache] = None,
+    outcome_type: str = "binary"
 ) -> None:
     """
     Run multi-treatment pretraining.
@@ -35,6 +36,7 @@ def run_pretraining(
         output_path: Path to save pretrained weights
         device: PyTorch device
         cache: Optional embedding cache
+        outcome_type: "binary" or "continuous" - affects outcome loss function
     """
     logger.info("="*80)
     logger.info("MULTI-TREATMENT PRETRAINING")
@@ -129,6 +131,7 @@ def run_pretraining(
     logger.info(f"  Learning rate: {train_config.learning_rate}")
     logger.info(f"  Alpha (propensity): {train_config.alpha_propensity}")
     logger.info(f"  Beta (targreg): {train_config.beta_targreg}")
+    logger.info(f"  Outcome type: {outcome_type}")
     
     model.train()
     
@@ -166,7 +169,8 @@ def run_pretraining(
             losses = model.train_step(
                 batch,
                 alpha_propensity=train_config.alpha_propensity,
-                beta_targreg=train_config.beta_targreg
+                beta_targreg=train_config.beta_targreg,
+                outcome_type=outcome_type
             )
             
             losses['loss'].backward()

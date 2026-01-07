@@ -46,6 +46,10 @@ class SyntheticDataConfig:
     # Number of confounders (None = use LLM default of 8-12)
     num_confounders: Optional[int] = None
     
+    # Outcome type: "binary" or "continuous"
+    outcome_type: str = "binary"
+    outcome_noise_std: float = 1.0  # Noise std for continuous outcomes
+    
     # Output
     output_dir: str = "./synthetic_output"
     
@@ -54,6 +58,7 @@ class SyntheticDataConfig:
     
     # Reproducibility
     seed: int = 42
+
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary."""

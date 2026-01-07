@@ -15,7 +15,8 @@ from tqdm import tqdm
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, r2_score, mean_squared_error
+from scipy.stats import pearsonr
 from joblib import Parallel, delayed
 from sentence_transformers import SentenceTransformer
 
@@ -41,7 +42,8 @@ def run_plasmode_experiments(
     pretrained_weights_path: Optional[Path] = None,
     num_repeats: int = 3,
     num_workers: int = 1,
-    gpu_ids: Optional[List[int]] = None
+    gpu_ids: Optional[List[int]] = None,
+    outcome_type: str = "binary"
 ) -> None:
     """
     Run plasmode sensitivity experiments with parallel execution.
@@ -129,7 +131,8 @@ def run_plasmode_experiments(
                 'cache': cache,
                 'pretrained_weights_path': pretrained_weights_path,
                 'dataset_dir': dataset_dir,
-                'precomputed_embeddings': precomputed_embeddings
+                'precomputed_embeddings': precomputed_embeddings,
+                'outcome_type': outcome_type
             })
 
     # Execute tasks in parallel
@@ -189,6 +192,7 @@ def _worker_wrapper(task: Dict[str, Any]) -> Optional[Tuple[dict, List[Dict[str,
     dataset_dir = task['dataset_dir']
     plasmode_config = task['plasmode_config']
     precomputed_embeddings = task.get('precomputed_embeddings', {})
+    outcome_type = task.get('outcome_type', 'binary')
     
     # Set seed unique to this repeat
     current_seed = random.randint(0, 1000)
@@ -230,7 +234,8 @@ def _worker_wrapper(task: Dict[str, Any]) -> Optional[Tuple[dict, List[Dict[str,
             save_config_path=save_config_path,
             save_log_path=save_log_path,
             hyperparams=hyperparams,
-            precomputed_embeddings=precomputed_embeddings
+            precomputed_embeddings=precomputed_embeddings,
+            outcome_type=outcome_type
         )
         
         metrics['scenario_idx'] = scenario_idx
@@ -260,7 +265,8 @@ def _run_single_plasmode_experiment(
     save_config_path: Optional[Path] = None,
     save_log_path: Optional[Path] = None,
     hyperparams: Optional[Dict[str, Any]] = None,
-    precomputed_embeddings: Dict[Tuple[str], Any] = None
+    precomputed_embeddings: Dict[Tuple[str], Any] = None,
+    outcome_type: str = "binary"
 ) -> Tuple[dict, List[Dict[str, Any]]]:
     """Run a single plasmode experiment with train/eval split. Returns (metrics, training_logs)
     
@@ -324,7 +330,8 @@ def _run_single_plasmode_experiment(
             applied_config,
             device,
             cache,
-            return_confounders=True
+            return_confounders=True,
+            outcome_type=outcome_type
         )
         # Generate for eval split (for metrics)
         eval_plasmode_df, eval_confounder_features = _generate_plasmode_data(
@@ -334,7 +341,8 @@ def _run_single_plasmode_experiment(
             applied_config,
             device,
             cache,
-            return_confounders=True
+            return_confounders=True,
+            outcome_type=outcome_type
         )
         logger.info("Oracle mode: Evaluator will use generator's confounder_features directly")
     else:
@@ -345,7 +353,8 @@ def _run_single_plasmode_experiment(
             applied_config,
             device,
             cache,
-            return_confounders=False
+            return_confounders=False,
+            outcome_type=outcome_type
         )
         eval_plasmode_df = _generate_plasmode_data(
             eval_split_df,
@@ -354,7 +363,8 @@ def _run_single_plasmode_experiment(
             applied_config,
             device,
             cache,
-            return_confounders=False
+            return_confounders=False,
+            outcome_type=outcome_type
         )
         train_confounder_features = None
         eval_confounder_features = None
@@ -373,7 +383,8 @@ def _run_single_plasmode_experiment(
             eval_plasmode_df,
             applied_config,
             plasmode_config,
-            device
+            device,
+            outcome_type=outcome_type
         )
     else:
         # Get precomputed embeddings for evaluator if available
@@ -389,7 +400,8 @@ def _run_single_plasmode_experiment(
             device,
             cache,
             pretrained_weights_path,
-            explicit_confounder_embeddings=eval_embeddings
+            explicit_confounder_embeddings=eval_embeddings,
+            outcome_type=outcome_type
         )
 
     # Tag history
@@ -465,38 +477,92 @@ def _run_single_plasmode_experiment(
     return metrics, combined_history
 
 
-def _compute_epoch_metrics(epoch_loss, loader, all_targets, all_treatments, all_y0, all_y1, all_prop):
-    """Helper to compute AUROCs from collected batch outputs."""
+def _compute_epoch_metrics(epoch_loss, loader, all_targets, all_treatments, all_y0, all_y1, all_prop, outcome_type="binary"):
+    """Helper to compute metrics from collected batch outputs.
+    
+    For binary outcomes: Computes AUROC for Y0, Y1, and propensity.
+    For continuous outcomes: Computes R², MSE, and Pearson correlation.
+    """
     y_true = torch.cat(all_targets).numpy()
     t_true = torch.cat(all_treatments).numpy()
     y0_scores = torch.cat(all_y0).numpy()
     y1_scores = torch.cat(all_y1).numpy()
-    prop_scores = torch.sigmoid(torch.cat(all_prop)).numpy() # sigmoid for prop score
+    prop_scores = torch.sigmoid(torch.cat(all_prop)).numpy()  # sigmoid for prop score
     
-    # Safe AUROC calculation
+    # Safe AUROC calculation (for propensity, always binary)
     def safe_auc(y, score):
         try:
             if len(np.unique(y)) < 2: return None
             return roc_auc_score(y, score)
         except: return None
-
-    # AUROC Y0 (on T=0 samples)
-    mask0 = (t_true == 0)
-    auroc_y0 = safe_auc(y_true[mask0], y0_scores[mask0]) if mask0.any() else None
     
-    # AUROC Y1 (on T=1 samples)
-    mask1 = (t_true == 1)
-    auroc_y1 = safe_auc(y_true[mask1], y1_scores[mask1]) if mask1.any() else None
-    
-    # AUROC Propensity
+    # Propensity AUROC (always computed, treatment is always binary)
     auroc_prop = safe_auc(t_true, prop_scores)
     
-    return {
-        'loss': epoch_loss / len(loader),
-        'auroc_y0': auroc_y0,
-        'auroc_y1': auroc_y1,
-        'auroc_prop': auroc_prop
-    }
+    if outcome_type == "continuous":
+        # Continuous outcome metrics: R², MSE, Pearson correlation
+        mask0 = (t_true == 0)
+        mask1 = (t_true == 1)
+        
+        def safe_r2(y, pred):
+            try:
+                if len(y) < 2: return None
+                return r2_score(y, pred)
+            except: return None
+        
+        def safe_mse(y, pred):
+            try:
+                if len(y) < 1: return None
+                return mean_squared_error(y, pred)
+            except: return None
+        
+        def safe_pearson(y, pred):
+            try:
+                if len(y) < 2: return None
+                r, _ = pearsonr(y, pred)
+                return r
+            except: return None
+        
+        # Y0 metrics (on T=0 samples)
+        r2_y0 = safe_r2(y_true[mask0], y0_scores[mask0]) if mask0.any() else None
+        mse_y0 = safe_mse(y_true[mask0], y0_scores[mask0]) if mask0.any() else None
+        pearson_y0 = safe_pearson(y_true[mask0], y0_scores[mask0]) if mask0.any() else None
+        
+        # Y1 metrics (on T=1 samples)
+        r2_y1 = safe_r2(y_true[mask1], y1_scores[mask1]) if mask1.any() else None
+        mse_y1 = safe_mse(y_true[mask1], y1_scores[mask1]) if mask1.any() else None
+        pearson_y1 = safe_pearson(y_true[mask1], y1_scores[mask1]) if mask1.any() else None
+        
+        return {
+            'loss': epoch_loss / len(loader),
+            'r2_y0': r2_y0,
+            'r2_y1': r2_y1,
+            'mse_y0': mse_y0,
+            'mse_y1': mse_y1,
+            'pearson_y0': pearson_y0,
+            'pearson_y1': pearson_y1,
+            'auroc_prop': auroc_prop,
+            # For compatibility, also include None for auroc keys
+            'auroc_y0': None,
+            'auroc_y1': None
+        }
+    else:
+        # Binary outcome metrics: AUROC
+        mask0 = (t_true == 0)
+        mask1 = (t_true == 1)
+        
+        # AUROC Y0 (on T=0 samples)
+        auroc_y0 = safe_auc(y_true[mask0], y0_scores[mask0]) if mask0.any() else None
+        
+        # AUROC Y1 (on T=1 samples)
+        auroc_y1 = safe_auc(y_true[mask1], y1_scores[mask1]) if mask1.any() else None
+        
+        return {
+            'loss': epoch_loss / len(loader),
+            'auroc_y0': auroc_y0,
+            'auroc_y1': auroc_y1,
+            'auroc_prop': auroc_prop
+        }
 
 
 def _train_plasmode_generator(
@@ -664,7 +730,8 @@ def _generate_plasmode_data(
     applied_config: AppliedInferenceConfig,
     device: torch.device,
     cache: Optional[EmbeddingCache],
-    return_confounders: bool = False
+    return_confounders: bool = False,
+    outcome_type: str = "binary"
 ) -> Union[pd.DataFrame, Tuple[pd.DataFrame, np.ndarray]]:
     """Generate synthetic plasmode outcomes using learned confounders.
 
@@ -676,6 +743,7 @@ def _generate_plasmode_data(
         device: Torch device
         cache: Optional embedding cache
         return_confounders: If True, also return the extracted confounder matrix
+        outcome_type: "binary" or "continuous" - affects outcome generation
 
     Returns:
         If return_confounders=False: plasmode_df
@@ -724,11 +792,11 @@ def _generate_plasmode_data(
 
     # Outcomes and True ITE - generated from raw confounder features
     if scenario.generation_mode == "phi_linear":
-        outcomes, true_ite, true_y0, true_y1 = _generate_linear_outcomes(all_confounders, treatments, scenario)
+        outcomes, true_ite, true_y0, true_y1 = _generate_linear_outcomes(all_confounders, treatments, scenario, outcome_type)
     elif scenario.generation_mode == "deep_nonlinear":
-        outcomes, true_ite, true_y0, true_y1 = _generate_deep_nonlinear_outcomes(all_confounders, treatments, scenario, device)
+        outcomes, true_ite, true_y0, true_y1 = _generate_deep_nonlinear_outcomes(all_confounders, treatments, scenario, device, outcome_type)
     elif scenario.generation_mode == "uplift_nonlinear":
-        outcomes, true_ite, true_y0, true_y1 = _generate_uplift_outcomes(all_confounders, treatments, scenario, device)
+        outcomes, true_ite, true_y0, true_y1 = _generate_uplift_outcomes(all_confounders, treatments, scenario, device, outcome_type)
     else:
         raise ValueError(f"Unknown generation mode: {scenario.generation_mode}")
 
@@ -751,10 +819,13 @@ def _standardize(x: np.ndarray) -> np.ndarray:
     return (x - np.mean(x)) / std
 
 
-def _generate_linear_outcomes(confounders, treatments, scenario):
+def _generate_linear_outcomes(confounders, treatments, scenario, outcome_type="binary"):
     """
     Linear outcomes with explainable heterogeneity.
     Uses unit vector projections and z-score standardization (matching old working code).
+    
+    For binary outcomes: samples from Bernoulli distribution using sigmoid(logit).
+    For continuous outcomes: uses the logit directly as the outcome value.
     """
     n_samples, n_features = confounders.shape
     np.random.seed(42)
@@ -780,14 +851,23 @@ def _generate_linear_outcomes(confounders, treatments, scenario):
     logits_y1 = logits_y0 + true_ite_logits
     final_logit = logits_y0 + (true_ite_logits * treatments)
 
-    probs = 1 / (1 + np.exp(-final_logit))
-    outcomes = np.random.binomial(1, probs)
+    if outcome_type == "continuous":
+        # Continuous outcomes: use logit directly as outcome value
+        outcomes = final_logit
+    else:
+        # Binary outcomes: sample from Bernoulli
+        probs = 1 / (1 + np.exp(-final_logit))
+        outcomes = np.random.binomial(1, probs)
+    
     return outcomes, true_ite_logits, logits_y0, logits_y1
 
 
-def _generate_deep_nonlinear_outcomes(confounders, treatments, scenario, device):
+def _generate_deep_nonlinear_outcomes(confounders, treatments, scenario, device, outcome_type="binary"):
     """
     Deep nonlinear outcomes. Uses z-score standardization then scales (matching old working code).
+    
+    For binary outcomes: samples from Bernoulli distribution using sigmoid(logit).
+    For continuous outcomes: uses the logit directly as the outcome value.
     """
     # Initialize MLP
     input_dim = confounders.shape[1] + 1
@@ -829,16 +909,24 @@ def _generate_deep_nonlinear_outcomes(confounders, treatments, scenario, device)
         logits_y1 = logits_y0 + true_ite_logits
         final_logits = logits_y0 + (true_ite_logits * treatments)
 
-        probs = 1 / (1 + np.exp(-final_logits))
-        outcomes = np.random.binomial(1, probs)
+        if outcome_type == "continuous":
+            # Continuous outcomes: use logit directly as outcome value
+            outcomes = final_logits
+        else:
+            # Binary outcomes: sample from Bernoulli
+            probs = 1 / (1 + np.exp(-final_logits))
+            outcomes = np.random.binomial(1, probs)
 
     return outcomes, true_ite_logits, logits_y0, logits_y1
 
 
-def _generate_uplift_outcomes(confounders, treatments, scenario, device):
+def _generate_uplift_outcomes(confounders, treatments, scenario, device, outcome_type="binary"):
     """
     Uplift model (Linear Base + Nonlinear ITE).
     Uses unit vector projections and z-score standardization (matching old working code).
+    
+    For binary outcomes: samples from Bernoulli distribution using sigmoid(logit).
+    For continuous outcomes: uses the logit directly as the outcome value.
     """
     n_samples, n_features = confounders.shape
     np.random.seed(42)
@@ -887,8 +975,14 @@ def _generate_uplift_outcomes(confounders, treatments, scenario, device):
     logits_y1 = logits_y0 + true_ite_logits
     final_logits = logits_y0 + (true_ite_logits * treatments)
 
-    probs = 1 / (1 + np.exp(-final_logits))
-    outcomes = np.random.binomial(1, probs)
+    if outcome_type == "continuous":
+        # Continuous outcomes: use logit directly as outcome value
+        outcomes = final_logits
+    else:
+        # Binary outcomes: sample from Bernoulli
+        probs = 1 / (1 + np.exp(-final_logits))
+        outcomes = np.random.binomial(1, probs)
+    
     return outcomes, true_ite_logits, logits_y0, logits_y1
 
 
@@ -900,7 +994,8 @@ def _train_plasmode_evaluator(
     device: torch.device,
     cache: Optional[EmbeddingCache],
     pretrained_weights_path: Optional[Path],
-    explicit_confounder_embeddings: Optional[torch.Tensor] = None
+    explicit_confounder_embeddings: Optional[torch.Tensor] = None,
+    outcome_type: str = "binary"
 ) -> Tuple[CausalDragonnetText, List[Dict[str, Any]]]:
     """Train evaluator model on plasmode TRAINING data (realistic mode). Returns (model, history).
     
@@ -1017,7 +1112,7 @@ def _train_plasmode_evaluator(
             batch['chunk_embeddings'] = [batch['chunk_embeddings'][i, :, :].contiguous() for i in range(batch['chunk_embeddings'].size(0))]
             
             optimizer.zero_grad()
-            losses = evaluator.train_step(batch, alpha_propensity=eval_train.alpha_propensity, beta_targreg=eval_train.beta_targreg)
+            losses = evaluator.train_step(batch, alpha_propensity=eval_train.alpha_propensity, beta_targreg=eval_train.beta_targreg, outcome_type=outcome_type)
             losses['loss'].backward()
             #torch.nn.utils.clip_grad_norm_(evaluator.parameters(), max_norm=1.0)
             optimizer.step()
@@ -1036,7 +1131,7 @@ def _train_plasmode_evaluator(
             all_y1.append(losses['y1_logit'].detach().cpu())
             all_prop.append(losses['t_logit'].detach().cpu())
 
-        train_metrics = _compute_epoch_metrics(epoch_losses['total'], eval_loader, all_targets, all_treatments, all_y0, all_y1, all_prop)
+        train_metrics = _compute_epoch_metrics(epoch_losses['total'], eval_loader, all_targets, all_treatments, all_y0, all_y1, all_prop, outcome_type)
 
         # VALIDATION LOOP (only if val_df was provided)
         if val_loader is not None:
@@ -1053,7 +1148,7 @@ def _train_plasmode_evaluator(
                     batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
                     batch['chunk_embeddings'] = [batch['chunk_embeddings'][i, :, :].contiguous() for i in range(batch['chunk_embeddings'].size(0))]
                     
-                    losses = evaluator.train_step(batch, alpha_propensity=eval_train.alpha_propensity, beta_targreg=eval_train.beta_targreg)
+                    losses = evaluator.train_step(batch, alpha_propensity=eval_train.alpha_propensity, beta_targreg=eval_train.beta_targreg, outcome_type=outcome_type)
                     val_losses['total'] += losses['loss'].item()
                     val_losses['outcome'] += losses['outcome_loss'].item()
                     val_losses['propensity'] += losses['propensity_loss'].item()
@@ -1065,7 +1160,7 @@ def _train_plasmode_evaluator(
                     val_y1.append(losses['y1_logit'].detach().cpu())
                     val_prop.append(losses['t_logit'].detach().cpu())
             
-            val_metrics = _compute_epoch_metrics(val_losses['total'], val_loader, val_targets, val_treatments, val_y0, val_y1, val_prop)
+            val_metrics = _compute_epoch_metrics(val_losses['total'], val_loader, val_targets, val_treatments, val_y0, val_y1, val_prop, outcome_type)
             
             epoch_log = {
                 'epoch': epoch + 1,

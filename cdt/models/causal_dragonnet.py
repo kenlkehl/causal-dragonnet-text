@@ -165,10 +165,17 @@ class CausalDragonnetText(nn.Module):
         self,
         batch: Dict[str, Any],
         alpha_propensity: float = 1.0,
-        beta_targreg: float = 0.1
+        beta_targreg: float = 0.1,
+        outcome_type: str = "binary"
     ) -> Dict[str, torch.Tensor]:
         """
         Perform single training step.
+        
+        Args:
+            batch: Dictionary with chunk_embeddings, treatment, outcome
+            alpha_propensity: Weight for propensity loss
+            beta_targreg: Weight for targeted regularization loss
+            outcome_type: "binary" for BCE loss or "continuous" for MSE loss
         
         Returns:
             Dictionary with loss components and detached predictions
@@ -180,23 +187,31 @@ class CausalDragonnetText(nn.Module):
         # Forward pass
         y0_logit, y1_logit, t_logit, phi = self.forward(chunk_embeddings_list)
         
-        # Propensity loss
+        # Propensity loss (always binary)
         propensity_loss = F.binary_cross_entropy_with_logits(
             t_logit.squeeze(-1),
             treatments
         )
         
         # Outcome loss - factual outcome only
-        factual_logit = torch.where(
+        factual_pred = torch.where(
             treatments.unsqueeze(1) > 0.5,
             y1_logit,
             y0_logit
         )
         
-        outcome_loss = F.binary_cross_entropy_with_logits(
-            factual_logit.squeeze(-1),
-            outcomes
-        )
+        if outcome_type == "continuous":
+            # MSE loss for continuous outcomes
+            outcome_loss = F.mse_loss(
+                factual_pred.squeeze(-1),
+                outcomes
+            )
+        else:
+            # BCE loss for binary outcomes (default)
+            outcome_loss = F.binary_cross_entropy_with_logits(
+                factual_pred.squeeze(-1),
+                outcomes
+            )
         
         # Targeted regularization (R-loss)
         if beta_targreg > 0:
@@ -206,8 +221,15 @@ class CausalDragonnetText(nn.Module):
                 H = (treatments.unsqueeze(1) / propensity) - \
                     ((1 - treatments.unsqueeze(1)) / (1 - propensity))
             
-            factual_prob = torch.sigmoid(factual_logit)
-            moment = torch.mean((outcomes.unsqueeze(1) - factual_prob) * H)
+            if outcome_type == "continuous":
+                # For continuous outcomes, use residual directly (no sigmoid)
+                residual = outcomes.unsqueeze(1) - factual_pred
+                moment = torch.mean(residual * H)
+            else:
+                # For binary outcomes, use probability residual
+                factual_prob = torch.sigmoid(factual_pred)
+                moment = torch.mean((outcomes.unsqueeze(1) - factual_prob) * H)
+            
             targreg_loss = moment ** 2
         else:
             targreg_loss = torch.tensor(0.0, device=self._device)
@@ -224,7 +246,7 @@ class CausalDragonnetText(nn.Module):
             'outcome_loss': outcome_loss.detach(),
             'propensity_loss': propensity_loss.detach(),
             'targreg_loss': targreg_loss.detach() if isinstance(targreg_loss, torch.Tensor) else targreg_loss,
-            # Return predictions for AUROC calculation
+            # Return predictions for metrics calculation
             'y0_logit': y0_logit.detach(),
             'y1_logit': y1_logit.detach(),
             't_logit': t_logit.detach()
@@ -232,10 +254,19 @@ class CausalDragonnetText(nn.Module):
     
     def predict(
         self,
-        chunk_embeddings_list: List[torch.Tensor]
+        chunk_embeddings_list: List[torch.Tensor],
+        outcome_type: str = "binary"
     ) -> Dict[str, torch.Tensor]:
         """
         Make predictions for inference.
+        
+        Args:
+            chunk_embeddings_list: List of chunk embedding tensors
+            outcome_type: "binary" or "continuous" - affects output format
+        
+        Returns:
+            Dictionary with predictions. For binary outcomes, includes probabilities.
+            For continuous outcomes, y0_pred/y1_pred are raw values (no sigmoid).
         """
         with torch.no_grad():
             confounder_features = self.feature_extractor(chunk_embeddings_list)
@@ -249,22 +280,39 @@ class CausalDragonnetText(nn.Module):
             else:
                 y0_logit, y1_logit, t_logit, final_common_layer = self.net(confounder_features)
                 tau_pred = (y1_logit - y0_logit).squeeze(-1)
-
-            # Convert to probabilities
-            y0_prob = torch.sigmoid(y0_logit).squeeze(-1)
-            y1_prob = torch.sigmoid(y1_logit).squeeze(-1)
+            
+            # Propensity is always a probability
             propensity = torch.sigmoid(t_logit).squeeze(-1)
             
-            return {
-                'y0_prob': y0_prob,
-                'y1_prob': y1_prob,
-                'propensity': propensity,
-                'y0_logit': y0_logit.squeeze(-1),
-                'y1_logit': y1_logit.squeeze(-1),
-                't_logit': t_logit.squeeze(-1),
-                'final_common_layer': final_common_layer,
-                'tau_pred': tau_pred # Added explicit tau return
-            }
+            if outcome_type == "continuous":
+                # For continuous outcomes, return raw predictions (no sigmoid)
+                return {
+                    'y0_pred': y0_logit.squeeze(-1),  # Raw continuous prediction
+                    'y1_pred': y1_logit.squeeze(-1),  # Raw continuous prediction
+                    'y0_prob': y0_logit.squeeze(-1),  # Alias for compatibility
+                    'y1_prob': y1_logit.squeeze(-1),  # Alias for compatibility
+                    'propensity': propensity,
+                    'y0_logit': y0_logit.squeeze(-1),
+                    'y1_logit': y1_logit.squeeze(-1),
+                    't_logit': t_logit.squeeze(-1),
+                    'final_common_layer': final_common_layer,
+                    'tau_pred': tau_pred
+                }
+            else:
+                # For binary outcomes, convert to probabilities
+                y0_prob = torch.sigmoid(y0_logit).squeeze(-1)
+                y1_prob = torch.sigmoid(y1_logit).squeeze(-1)
+                
+                return {
+                    'y0_prob': y0_prob,
+                    'y1_prob': y1_prob,
+                    'propensity': propensity,
+                    'y0_logit': y0_logit.squeeze(-1),
+                    'y1_logit': y1_logit.squeeze(-1),
+                    't_logit': t_logit.squeeze(-1),
+                    'final_common_layer': final_common_layer,
+                    'tau_pred': tau_pred
+                }
     
     def save_checkpoint(
         self,

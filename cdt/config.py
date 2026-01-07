@@ -106,6 +106,7 @@ class ExperimentConfig:
     num_workers: int = 1
     gpu_ids: Optional[List[int]] = None  
     cache_dir: Optional[str] = None
+    outcome_type: str = "binary"  # "binary" or "continuous"
     
     pretraining: PretrainingConfig = field(default_factory=PretrainingConfig)
     applied_inference: AppliedInferenceConfig = field(default_factory=AppliedInferenceConfig)
@@ -166,6 +167,7 @@ class ExperimentConfig:
             num_workers=data.get('num_workers', 1),
             gpu_ids=data.get('gpu_ids'),
             cache_dir=data.get('cache_dir'),
+            outcome_type=data.get('outcome_type', 'binary'),
             pretraining=pretraining,
             applied_inference=applied,
             plasmode_experiments=plasmode

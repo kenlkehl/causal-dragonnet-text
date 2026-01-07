@@ -149,6 +149,19 @@ Examples:
         default="./",
         help="Download directory for vllm model",
     )
+    parser.add_argument(
+        "--outcome-type",
+        type=str,
+        choices=["binary", "continuous"],
+        default="binary",
+        help="Type of outcome: 'binary' (default) or 'continuous'",
+    )
+    parser.add_argument(
+        "--outcome-noise-std",
+        type=float,
+        default=1.0,
+        help="Noise standard deviation for continuous outcomes (default: 1.0)",
+    )
     
     args = parser.parse_args()
     
@@ -167,6 +180,8 @@ Examples:
         target_treatment_rate=args.target_treatment_rate,
         target_control_outcome_rate=args.target_control_outcome_rate,
         num_confounders=args.num_confounders,
+        outcome_type=args.outcome_type,
+        outcome_noise_std=args.outcome_noise_std,
         output_dir=args.output_dir,
         seed=args.seed,
         llm=LLMConfig(
@@ -205,7 +220,10 @@ Examples:
         
         print(f"\n✓ Generated {len(df)} patients")
         print(f"  - Treatment rate: {df['treatment_indicator'].mean():.1%}")
-        print(f"  - Outcome rate: {df['outcome_indicator'].mean():.1%}")
+        if args.outcome_type == "continuous":
+            print(f"  - Outcome mean: {df['outcome_indicator'].mean():.2f} (std: {df['outcome_indicator'].std():.2f})")
+        else:
+            print(f"  - Outcome rate: {df['outcome_indicator'].mean():.1%}")
         print(f"  - Output: {args.output_dir}/dataset.parquet")
         print(f"  - Metadata: {args.output_dir}/metadata.json")
         

@@ -244,7 +244,8 @@ class MultiTreatmentDragonnetText(nn.Module):
         self,
         batch: Dict[str, Any],
         alpha_propensity: float = 1.0,
-        beta_targreg: float = 0.1
+        beta_targreg: float = 0.1,
+        outcome_type: str = "binary"
     ) -> Dict[str, torch.Tensor]:
         """
         Perform single training step.
@@ -253,6 +254,7 @@ class MultiTreatmentDragonnetText(nn.Module):
             batch: Batch dictionary with chunk_embeddings, treatment, outcome
             alpha_propensity: Weight for propensity loss
             beta_targreg: Weight for targeted regularization
+            outcome_type: "binary" or "continuous" - affects outcome loss function
         
         Returns:
             Dictionary with loss components
@@ -274,16 +276,26 @@ class MultiTreatmentDragonnetText(nn.Module):
             torch.arange(batch_size, device=self._device),
             treatments
         ]
-        outcome_loss = F.binary_cross_entropy_with_logits(
-            observed_outcome_logits,
-            outcomes
-        )
+        
+        if outcome_type == "continuous":
+            # For continuous outcomes, use MSE loss
+            outcome_loss = F.mse_loss(observed_outcome_logits, outcomes)
+        else:
+            # For binary outcomes, use BCE with logits
+            outcome_loss = F.binary_cross_entropy_with_logits(
+                observed_outcome_logits,
+                outcomes
+            )
         
         # Targeted regularization
         # Encourages separation between potential outcomes
         if beta_targreg > 0:
-            # For each sample, get predictions for all treatments
-            all_preds = torch.sigmoid(outcome_logits)  # (batch, num_treatments)
+            if outcome_type == "continuous":
+                # For continuous: use raw predictions
+                all_preds = outcome_logits
+            else:
+                # For binary: use sigmoid probabilities
+                all_preds = torch.sigmoid(outcome_logits)  # (batch, num_treatments)
             
             # Compute variance across treatments as regularization
             targreg_loss = -torch.mean(torch.var(all_preds, dim=1))

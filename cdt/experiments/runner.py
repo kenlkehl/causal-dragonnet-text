@@ -141,7 +141,8 @@ class ExperimentRunner:
             config=pretrain_config,
             output_path=weights_path,
             device=self.device,
-            cache=cache
+            cache=cache,
+            outcome_type=self.config.outcome_type
         )
         
         logger.info(f"Pretraining complete: {weights_path}")
@@ -195,7 +196,8 @@ class ExperimentRunner:
             cache=cache,
             pretrained_weights_path=pretrained_weights_path,
             gpu_ids=self.config.gpu_ids,
-            num_workers=self.config.num_workers
+            num_workers=self.config.num_workers,
+            outcome_type=self.config.outcome_type
         )
         
         logger.info(f"Applied inference complete: {predictions_path}")
@@ -251,7 +253,8 @@ class ExperimentRunner:
             pretrained_weights_path=pretrained_weights_path,
             num_repeats=plasmode_config.num_repeats,
             num_workers=self.config.num_workers,
-            gpu_ids=self.config.gpu_ids
+            gpu_ids=self.config.gpu_ids,
+            outcome_type=self.config.outcome_type
         )
         
         logger.info(f"Plasmode experiments complete: {results_path}")
