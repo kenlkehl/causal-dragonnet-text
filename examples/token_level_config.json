@@ -1,0 +1,61 @@
+{
+  "output_dir": "../pcori_experiments/token_level_embeddings_no_batchnorm_no_layernorm_1-8-25",
+  "seed": 42,
+  "devices": ["cuda:0", "cuda:1"],
+  "num_workers": 5,
+  "outcome_type": "binary",
+
+  "model": {
+    "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+    "model_type": "dragonnet",
+    "num_latent_confounders": 50,
+    "aggregation_method": "attention",
+    "topk": 5,
+    "anchor_strength": 0.1,
+    "dragonnet_representation_dim": 128,
+    "dragonnet_hidden_outcome_dim": 64,
+    "max_length": 10000,
+    "explicit_confounder_texts": [
+      "patient age at diagnosis or treatment initiation",
+      "ECOG performance status score of 0 indicating fully active",
+      "ECOG performance status score of 1 indicating restricted activity",
+      "ECOG performance status score of 2 indicating ambulatory but unable to work",
+      "ECOG performance status score of 3 indicating limited self-care",
+      "pre-menopausal status before menopause",
+      "peri-menopausal status transitional menopause",
+      "post-menopausal status after menopause",
+      "bone-only metastasis without visceral involvement",
+      "lung metastasis pulmonary metastatic disease",
+      "liver metastasis hepatic metastatic disease",
+      "brain metastasis central nervous system involvement",
+      "multiple visceral metastases widespread disease",
+      "no prior adjuvant endocrine therapy",
+      "prior tamoxifen adjuvant therapy",
+      "prior aromatase inhibitor adjuvant therapy",
+      "sequential tamoxifen then aromatase inhibitor therapy",
+      "Charlson comorbidity index score burden of comorbidities",
+      "baseline liver function ALT alanine aminotransferase level",
+      "baseline neutrophil count absolute neutrophil count",
+      "body mass index BMI weight status",
+      "no prior chemotherapy for metastatic disease",
+      "one line of prior metastatic chemotherapy",
+      "two or more lines of prior metastatic chemotherapy"
+    ]
+  },
+
+  "training": {
+    "learning_rate": 1e-5,
+    "epochs": 25,
+    "batch_size": 8,
+    "alpha_propensity": 1.0,
+    "beta_targreg": 0.1
+  },
+
+  "data": {
+    "dataset_path": "./example_synthetic_dataset_simple_strict/dataset.parquet",
+    "text_column": "clinical_text",
+    "outcome_column": "outcome_indicator",
+    "treatment_column": "treatment_indicator",
+    "cv_folds": 5
+  }
+}

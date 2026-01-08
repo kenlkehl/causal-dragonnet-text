@@ -8,6 +8,8 @@ from .uplift import UpliftNet
 from .outcome_heads import OutcomeHeadsOnly, UpliftHeadsOnly
 from .causal_dragonnet import CausalDragonnetText
 from .multitreatment import MultiTreatmentDragonNetInternal, MultiTreatmentDragonnetText
+from .token_level_extractor import TokenLevelFeatureExtractor
+from .causal_dragonnet_token import CausalDragonnetTokenLevel
 
 __all__ = [
     'ConfounderAggregator',
@@ -19,4 +21,6 @@ __all__ = [
     'CausalDragonnetText',
     'MultiTreatmentDragonNetInternal',
     'MultiTreatmentDragonnetText',
+    'TokenLevelFeatureExtractor',
+    'CausalDragonnetTokenLevel',
 ]

@@ -23,6 +23,11 @@ class ModelArchitectureConfig:
     value_dim: int = 128  # Output dimension per confounder in cross-attention
     num_attention_heads: int = 4  # Number of attention heads per confounder
     attention_dropout: float = 0.1  # Dropout on attention weights
+    # Token-level feature extractor parameters
+    feature_extractor_type: str = "chunk"  # "chunk" (original) or "token_level" (frozen backbone)
+    token_aggregation_method: str = "attention"  # "max", "mean", "attention", "topk"
+    token_aggregation_topk: int = 5  # Top-k for topk aggregation
+    anchor_regularization_strength: float = 0.0  # Regularization to keep projections near anchors
 
 
 @dataclass

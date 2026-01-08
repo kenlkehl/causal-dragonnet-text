@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import KFold, train_test_split
+from sklearn.model_selection import KFold
 from sklearn.metrics import roc_auc_score, r2_score, mean_squared_error
 from scipy.stats import pearsonr
 from joblib import Parallel, delayed
@@ -135,19 +135,15 @@ def _process_fold(
     logger = logging.getLogger(__name__)
     
     logger.info(f"FOLD {fold+1} starting on {device}")
-    
+
     # 1. Prepare Data for this Fold
-    train_val_df = dataset.iloc[train_idx]
+    train_df = dataset.iloc[train_idx]
     test_df = dataset.iloc[test_idx]
-    
-    # 90% Train, 10% Internal Validation (for early stopping)
-    fold_train_df, fold_val_df = train_test_split(
-        train_val_df, test_size=0.1, random_state=42
-    )
-    
+
     # 2. Train Model on this fold
+    # Use held-out test fold for validation metrics (no internal split)
     model, history = _train_single_model(
-        fold_train_df, fold_val_df, config, device, cache, pretrained_weights_path, outcome_type
+        train_df, test_df, config, device, cache, pretrained_weights_path, outcome_type
     )
     
     # Log History
