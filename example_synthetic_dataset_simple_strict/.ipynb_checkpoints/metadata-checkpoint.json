@@ -1,0 +1,379 @@
+{
+  "config": {
+    "clinical_question": "Compare the effectiveness of letrozole+palbociclib with letrozole+ribociclib for the first line treatment of metastatic ER positive breast cancer.",
+    "dataset_size": 1000,
+    "treatment_coefficient": 1.0,
+    "target_treatment_rate": 0.5,
+    "target_control_outcome_rate": 0.2,
+    "main_coefficient_scale": 0.3,
+    "interaction_coefficient_scale": 0.1,
+    "target_logit_std": 2.0,
+    "num_confounders": null,
+    "output_dir": "./example_synthetic_dataset_simple_strict",
+    "llm": {
+      "api_base_url": "http://localhost:8000/v1",
+      "api_key": "",
+      "model_name": "openai/gpt-oss-120b",
+      "temperature": 0.7,
+      "max_tokens": 50000,
+      "timeout": 300.0
+    },
+    "seed": 42
+  },
+  "confounders": [
+    {
+      "name": "age",
+      "type": "continuous",
+      "description": "Patient age at initiation of first‑line therapy, measured in years"
+    },
+    {
+      "name": "ecog_performance_status",
+      "type": "categorical",
+      "categories": [
+        "0",
+        "1",
+        "2",
+        "3"
+      ],
+      "description": "Eastern Cooperative Oncology Group performance status score at baseline"
+    },
+    {
+      "name": "menopausal_status",
+      "type": "categorical",
+      "categories": [
+        "pre‑menopausal",
+        "peri‑menopausal",
+        "post‑menopausal"
+      ],
+      "description": "Menopausal state at the start of treatment"
+    },
+    {
+      "name": "visceral_metastasis_site",
+      "type": "categorical",
+      "categories": [
+        "bone‑only",
+        "lung",
+        "liver",
+        "brain",
+        "multiple_viscera"
+      ],
+      "description": "Location of metastatic disease involving visceral organs"
+    },
+    {
+      "name": "prior_adjuvant_endocrine_therapy",
+      "type": "categorical",
+      "categories": [
+        "none",
+        "tamoxifen_only",
+        "aromatase_inhibitor_only",
+        "sequential_tamoxifen_then_AI",
+        "other"
+      ],
+      "description": "Type of endocrine therapy received in the adjuvant setting before recurrence"
+    },
+    {
+      "name": "comorbidity_index",
+      "type": "continuous",
+      "description": "Charlson comorbidity index score reflecting overall burden of non‑cancer comorbidities"
+    },
+    {
+      "name": "baseline_liver_function_alt",
+      "type": "continuous",
+      "description": "Serum alanine aminotransferase (ALT) level at baseline, expressed in U/L"
+    },
+    {
+      "name": "baseline_neutrophil_count",
+      "type": "continuous",
+      "description": "Absolute neutrophil count at baseline, expressed in 10^9/L"
+    },
+    {
+      "name": "body_mass_index",
+      "type": "continuous",
+      "description": "Body mass index (kg/m²) measured within 30 days prior to therapy start"
+    },
+    {
+      "name": "prior_metastatic_chemotherapy",
+      "type": "categorical",
+      "categories": [
+        "none",
+        "one_line",
+        "two_or_more_lines",
+        "unknown"
+      ],
+      "description": "Number of chemotherapy lines received for metastatic disease before initiating the CDK4/6‑inhibitor regimen"
+    }
+  ],
+  "treatment_equation": {
+    "intercept": 0.1848392001989323,
+    "coefficients": {
+      "age": 1.1323311157725189,
+      "comorbidity_index": -0.6793986694635112,
+      "baseline_liver_function_alt": -0.45293244630900753,
+      "baseline_neutrophil_count": 0.22646622315450377,
+      "body_mass_index": 0.0905864892618015,
+      "ecog_performance_status_1": -1.3587973389270225,
+      "ecog_performance_status_2": -2.717594677854045,
+      "ecog_performance_status_3": -4.076392016781068,
+      "menopausal_status_peri-menopausal": 0.45293244630900753,
+      "menopausal_status_post-menopausal": 0.9058648926180151,
+      "visceral_metastasis_site_lung": -0.22646622315450377,
+      "visceral_metastasis_site_liver": -0.9058648926180151,
+      "visceral_metastasis_site_brain": -1.3587973389270225,
+      "visceral_metastasis_site_multiple_viscera": -0.6793986694635112,
+      "prior_adjuvant_endocrine_therapy_tamoxifen_only": 0.22646622315450377,
+      "prior_adjuvant_endocrine_therapy_aromatase_inhibitor_only": -0.45293244630900753,
+      "prior_adjuvant_endocrine_therapy_sequential_tamoxifen_then_AI": 0.0,
+      "prior_adjuvant_endocrine_therapy_other": 0.0905864892618015,
+      "prior_metastatic_chemotherapy_one_line": -1.1323311157725189,
+      "prior_metastatic_chemotherapy_two_or_more_lines": -2.2646622315450378,
+      "prior_metastatic_chemotherapy_unknown": -0.45293244630900753
+    },
+    "interactions": [
+      {
+        "terms": [
+          "age",
+          "comorbidity_index"
+        ],
+        "coefficient": -0.12078198568240202
+      },
+      {
+        "terms": [
+          "menopausal_status_post-menopausal",
+          "visceral_metastasis_site_liver"
+        ],
+        "coefficient": -0.181172978523603
+      },
+      {
+        "terms": [
+          "prior_adjuvant_endocrine_therapy_aromatase_inhibitor_only",
+          "prior_metastatic_chemotherapy_one_line"
+        ],
+        "coefficient": -0.10568423747210177
+      }
+    ],
+    "original_intercept": -0.4
+  },
+  "outcome_equation": {
+    "intercept": -1.7089213762008795,
+    "coefficients": {
+      "age": -0.5472544046383258,
+      "comorbidity_index": 0.8208816069574886,
+      "baseline_liver_function_alt": 0.6840680057979072,
+      "baseline_neutrophil_count": -0.2736272023191629,
+      "body_mass_index": 0.13681360115958144,
+      "ecog_performance_status_1": 1.0945088092766515,
+      "ecog_performance_status_2": 2.189017618553303,
+      "ecog_performance_status_3": 3.557153630149118,
+      "menopausal_status_peri-menopausal": 0.13681360115958144,
+      "menopausal_status_post-menopausal": 0.2736272023191629,
+      "visceral_metastasis_site_lung": 0.8208816069574886,
+      "visceral_metastasis_site_liver": 1.6417632139149771,
+      "visceral_metastasis_site_brain": 2.462644820872466,
+      "visceral_metastasis_site_multiple_viscera": 1.231322410436233,
+      "prior_adjuvant_endocrine_therapy_tamoxifen_only": -0.13681360115958144,
+      "prior_adjuvant_endocrine_therapy_aromatase_inhibitor_only": 0.0,
+      "prior_adjuvant_endocrine_therapy_sequential_tamoxifen_then_AI": 0.05472544046383258,
+      "prior_adjuvant_endocrine_therapy_other": 0.08208816069574885,
+      "prior_metastatic_chemotherapy_one_line": 0.5472544046383258,
+      "prior_metastatic_chemotherapy_two_or_more_lines": 1.231322410436233,
+      "prior_metastatic_chemotherapy_unknown": 0.2736272023191629
+    },
+    "interactions": [
+      {
+        "terms": [
+          "age",
+          "menopausal_status_post-menopausal"
+        ],
+        "coefficient": -0.045604533719860486
+      },
+      {
+        "terms": [
+          "visceral_metastasis_site_liver",
+          "prior_adjuvant_endocrine_therapy_aromatase_inhibitor_only"
+        ],
+        "coefficient": 0.13681360115958144
+      },
+      {
+        "terms": [
+          "comorbidity_index",
+          "baseline_neutrophil_count"
+        ],
+        "coefficient": 0.07296725395177676
+      }
+    ],
+    "treatment_coefficient": 1.0,
+    "treatment_interactions": [
+      {
+        "term": "age",
+        "coefficient": -0.22886157522060582
+      },
+      {
+        "term": "ecog_performance_status_1",
+        "coefficient": 0.822184631387782
+      },
+      {
+        "term": "ecog_performance_status_2",
+        "coefficient": 0.423199021685663
+      },
+      {
+        "term": "ecog_performance_status_3",
+        "coefficient": 0.17997096677256313
+      },
+      {
+        "term": "menopausal_status_peri‑menopausal",
+        "coefficient": -0.6274843804378543
+      },
+      {
+        "term": "menopausal_status_post‑menopausal",
+        "coefficient": -0.627528379885777
+      },
+      {
+        "term": "visceral_metastasis_site_lung",
+        "coefficient": -0.8061356324093716
+      },
+      {
+        "term": "visceral_metastasis_site_liver",
+        "coefficient": 0.6679716954960632
+      },
+      {
+        "term": "visceral_metastasis_site_brain",
+        "coefficient": 0.1844521185050902
+      },
+      {
+        "term": "visceral_metastasis_site_multiple_viscera",
+        "coefficient": 0.379562115611122
+      },
+      {
+        "term": "prior_adjuvant_endocrine_therapy_tamoxifen_only",
+        "coefficient": -0.8745408238284418
+      },
+      {
+        "term": "prior_adjuvant_endocrine_therapy_aromatase_inhibitor_only",
+        "coefficient": 0.857200787928653
+      },
+      {
+        "term": "prior_adjuvant_endocrine_therapy_sequential_tamoxifen_then_AI",
+        "coefficient": 0.606435664892092
+      },
+      {
+        "term": "prior_adjuvant_endocrine_therapy_other",
+        "coefficient": -0.5247456290783044
+      },
+      {
+        "term": "comorbidity_index",
+        "coefficient": -0.5804089604728598
+      },
+      {
+        "term": "baseline_liver_function_alt",
+        "coefficient": -0.5775275882377934
+      },
+      {
+        "term": "baseline_neutrophil_count",
+        "coefficient": -0.3570976492750407
+      },
+      {
+        "term": "body_mass_index",
+        "coefficient": 0.04516022084623245
+      },
+      {
+        "term": "prior_metastatic_chemotherapy_one_line",
+        "coefficient": -0.12414462768560433
+      },
+      {
+        "term": "prior_metastatic_chemotherapy_two_or_more_lines",
+        "coefficient": -0.38083590862250655
+      },
+      {
+        "term": "prior_metastatic_chemotherapy_unknown",
+        "coefficient": 0.20403996436123037
+      }
+    ],
+    "original_intercept": -1.2
+  },
+  "summary_statistics": {
+    "age": {
+      "type": "continuous",
+      "mean": 62.5,
+      "std": 11.3
+    },
+    "ecog_performance_status": {
+      "type": "categorical",
+      "proportions": {
+        "0": 0.2,
+        "1": 0.5,
+        "2": 0.2,
+        "3": 0.1
+      }
+    },
+    "menopausal_status": {
+      "type": "categorical",
+      "proportions": {
+        "pre-menopausal": 0.15,
+        "peri-menopausal": 0.05,
+        "post-menopausal": 0.8
+      }
+    },
+    "visceral_metastasis_site": {
+      "type": "categorical",
+      "proportions": {
+        "bone-only": 0.3,
+        "lung": 0.2,
+        "liver": 0.25,
+        "brain": 0.05,
+        "multiple_viscera": 0.2
+      }
+    },
+    "prior_adjuvant_endocrine_therapy": {
+      "type": "categorical",
+      "proportions": {
+        "none": 0.1,
+        "tamoxifen_only": 0.3,
+        "aromatase_inhibitor_only": 0.4,
+        "sequential_tamoxifen_then_AI": 0.15,
+        "other": 0.05
+      }
+    },
+    "comorbidity_index": {
+      "type": "continuous",
+      "mean": 4.2,
+      "std": 2.1
+    },
+    "baseline_liver_function_alt": {
+      "type": "continuous",
+      "mean": 32.0,
+      "std": 14.5
+    },
+    "baseline_neutrophil_count": {
+      "type": "continuous",
+      "mean": 4.6,
+      "std": 1.4
+    },
+    "body_mass_index": {
+      "type": "continuous",
+      "mean": 27.3,
+      "std": 5.2
+    },
+    "prior_metastatic_chemotherapy": {
+      "type": "categorical",
+      "proportions": {
+        "none": 0.7,
+        "one_line": 0.2,
+        "two_or_more_lines": 0.05,
+        "unknown": 0.05
+      }
+    }
+  },
+  "dataset_statistics": {
+    "n_patients": 1000,
+    "treatment_rate": 0.154,
+    "outcome_rate": 0.719,
+    "mean_treatment_logit": -2.5852723966196307,
+    "std_treatment_logit": 1.943944216284123,
+    "mean_outcome_logit": 1.2845438050334774,
+    "std_outcome_logit": 1.576725865121567,
+    "clinical_text_stats": {
+      "non_empty_count": "1000",
+      "mean_length": 8618.325
+    }
+  }
+}
