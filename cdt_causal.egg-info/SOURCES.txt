@@ -18,9 +18,11 @@ cdt/inference/applied.py
 cdt/inference/interpretation.py
 cdt/models/__init__.py
 cdt/models/causal_dragonnet.py
+cdt/models/causal_modernbert.py
 cdt/models/components.py
 cdt/models/dragonnet.py
 cdt/models/feature_extractor.py
+cdt/models/modernbert_extractor.py
 cdt/models/multitreatment.py
 cdt/models/outcome_heads.py
 cdt/models/uplift.py
@@ -43,7 +45,6 @@ cdt_causal.egg-info/top_level.txt
 examples/config.json
 examples/config_advanced.json
 examples/config_simple.json
-examples/.ipynb_checkpoints/dfci_config-checkpoint.json
 synthetic_data/__init__.py
 synthetic_data/cli.py
 synthetic_data/config.py
