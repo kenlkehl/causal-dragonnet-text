@@ -795,23 +795,36 @@ def _generate_single_patient(
     treatment_eq: Dict[str, Any],
     outcome_eq: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Generate data for a single patient."""
+    """Generate data for a single patient.
+    
+    For binary outcomes: Samples from Bernoulli distribution using sigmoid(logit).
+    For continuous outcomes: Uses the logit directly, optionally with Gaussian noise.
+    """
     # Sample characteristics
     characteristics = _sample_patient_characteristics(confounders, summary_stats)
     
-    # Compute treatment logit and sample treatment
+    # Compute treatment logit and sample treatment (always binary)
     treatment_logit = _compute_logit(
         characteristics, confounders, summary_stats, treatment_eq
     )
     treatment_prob = 1.0 / (1.0 + np.exp(-treatment_logit))
     treatment = int(np.random.random() < treatment_prob)
     
-    # Compute outcome logit and sample outcome
+    # Compute outcome logit
     outcome_logit = _compute_logit(
         characteristics, confounders, summary_stats, outcome_eq, treatment=treatment
     )
-    outcome_prob = 1.0 / (1.0 + np.exp(-outcome_logit))
-    outcome = int(np.random.random() < outcome_prob)
+    
+    # Generate outcome based on outcome_type
+    outcome_type = getattr(config, 'outcome_type', 'binary')
+    if outcome_type == "continuous":
+        # Continuous outcome: use logit directly with optional noise
+        noise_std = getattr(config, 'outcome_noise_std', 1.0)
+        outcome = outcome_logit + np.random.normal(0, noise_std)
+    else:
+        # Binary outcome: sample from Bernoulli
+        outcome_prob = 1.0 / (1.0 + np.exp(-outcome_logit))
+        outcome = int(np.random.random() < outcome_prob)
     
     # Compute potential outcome logits for causal inference
     outcome_logit_0 = _compute_logit(
@@ -838,7 +851,7 @@ def _generate_single_patient(
         clinical_history = client.generate(
             prompt=history_prompt,
             system_prompt=CLINICAL_SYSTEM_PROMPT,
-            temperature=0.8,  # Higher temperature for more varied text
+            temperature=0.4,  # Lower temperature for more faithful confounder representation
             max_tokens=history_max_tokens,
         )
         # Handle None response from LLM
@@ -1058,19 +1071,28 @@ def generate_synthetic_dataset_batch(
         # Sample characteristics
         characteristics = _sample_patient_characteristics(confounders, summary_stats)
         
-        # Compute treatment logit and sample treatment
+        # Compute treatment logit and sample treatment (always binary)
         treatment_logit = _compute_logit(
             characteristics, confounders, summary_stats, treatment_eq
         )
         treatment_prob = 1.0 / (1.0 + np.exp(-treatment_logit))
         treatment = int(np.random.random() < treatment_prob)
         
-        # Compute outcome logit and sample outcome
+        # Compute outcome logit
         outcome_logit = _compute_logit(
             characteristics, confounders, summary_stats, outcome_eq, treatment=treatment
         )
-        outcome_prob = 1.0 / (1.0 + np.exp(-outcome_logit))
-        outcome = int(np.random.random() < outcome_prob)
+        
+        # Generate outcome based on outcome_type
+        outcome_type = getattr(config, 'outcome_type', 'binary')
+        if outcome_type == "continuous":
+            # Continuous outcome: use logit directly with optional noise
+            noise_std = getattr(config, 'outcome_noise_std', 1.0)
+            outcome = outcome_logit + np.random.normal(0, noise_std)
+        else:
+            # Binary outcome: sample from Bernoulli
+            outcome_prob = 1.0 / (1.0 + np.exp(-outcome_logit))
+            outcome = int(np.random.random() < outcome_prob)
         
         # Compute potential outcome logits
         outcome_logit_0 = _compute_logit(
@@ -1111,7 +1133,7 @@ def generate_synthetic_dataset_batch(
     clinical_texts = vllm_client.generate_batch(
         prompts=history_prompts,
         system_prompt=CLINICAL_SYSTEM_PROMPT,
-        temperature=0.8,
+        temperature=0.4,  # Lower temperature for more faithful confounder representation
         max_tokens=vllm_config.max_tokens,
     )
     

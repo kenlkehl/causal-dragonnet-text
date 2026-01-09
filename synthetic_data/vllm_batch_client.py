@@ -19,6 +19,7 @@ class VLLMConfig:
     max_model_len: Optional[int] = None  # Use model default
     temperature: float = 0.8
     max_tokens: int = 10000
+    download_dir: str = "./"
     reasoning_marker: Optional[str] = "assistantfinal"  # Text after this marker is the real output
 
 
@@ -40,6 +41,7 @@ class VLLMBatchClient:
             tensor_parallel_size=config.tensor_parallel_size,
             gpu_memory_utilization=config.gpu_memory_utilization,
             max_model_len=config.max_model_len,
+            download_dir = config.download_dir,
             trust_remote_code=True,
         )
         logger.info("vLLM model loaded successfully")

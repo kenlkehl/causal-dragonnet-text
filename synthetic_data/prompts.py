@@ -163,7 +163,7 @@ Respond with JSON in this exact format:
 PATIENT_HISTORY_PROMPT = """You are generating a realistic synthetic clinical history document for a cancer patient.
 This document should simulate concatenated clinical notes, radiology reports, and pathology reports.
 
-Patient Characteristics:
+Patient Characteristics (YOU MUST ACCURATELY REPRESENT THESE EXACT VALUES):
 {patient_characteristics}
 
 Clinical Context: {clinical_question}
@@ -175,21 +175,29 @@ Generate a comprehensive clinical history document that:
    - At least one radiology report (CT, PET, or MRI)
    - At least one pathology report
    - One or more follow-up notes
-3. Naturally incorporates ALL the patient characteristics listed above
+3. **CRITICAL: ACCURATELY incorporates ALL the patient characteristics listed above with their EXACT VALUES**
 4. Uses realistic medical terminology and abbreviations
 5. Includes dates (use relative dates like "3 months prior", "at diagnosis")
 6. Contains typical clinical details like vital signs, lab values, physical exam findings
 7. Reflects the clinical decision-making around treatment selection
 
-CRITICAL REQUIREMENT: Do NOT mention which specific treatment the patient was ultimately assigned to or received.
+CRITICAL REQUIREMENT #1: Do NOT mention which specific treatment the patient was ultimately assigned to or received.
 The clinical history should describe the patient's condition, characteristics, and the treatment decision-making process,
 but should END BEFORE the actual treatment is selected or administered. This is essential because the document
 will be used for causal inference and the treatment assignment must be predicted from the confounders, not read from the text.
 
+CRITICAL REQUIREMENT #2: YOU MUST FAITHFULLY REPRESENT THE EXACT CONFOUNDER VALUES PROVIDED ABOVE.
+- If the patient has 2 metastatic sites, the text must describe EXACTLY 2 metastatic sites (not more, not fewer)
+- If the patient's age is 58 years, the text must state the patient is 58 years old
+- If ECOG performance status is 1, describe functional status consistent with ECOG 1
+- For categorical variables, use the EXACT category provided
+- For numeric variables (like number of metastatic sites), the count in the text MUST MATCH the specified value
+- Do NOT embellish, add extra sites/conditions, or change any values
+
 The document should read as if it captures the patient's state at the moment of treatment decision, before the treatment is revealed.
 
-Important: The patient characteristics should be embedded naturally in the clinical narrative, not listed explicitly.
 Write the document as if it were real clinical notes, imaging reports, and pathology reports that have been concatenated together.
+The confounder values should appear explicitly in the clinical narrative (e.g., "58-year-old female", "ECOG PS 1", "2 metastatic sites involving bone and liver").
 
 Begin the clinical history document now:"""
 
@@ -207,21 +215,28 @@ def format_confounder_list(confounders: list) -> str:
 
 
 def format_patient_characteristics(characteristics: dict, confounders: list) -> str:
-    """Format patient characteristics into readable text for history generation."""
+    """Format patient characteristics into readable text for history generation.
+
+    Values are formatted with emphasis to ensure the LLM faithfully represents them.
+    """
     lines = []
     confounder_map = {c["name"]: c for c in confounders}
-    
+
     for name, value in characteristics.items():
         conf = confounder_map.get(name, {})
         desc = conf.get("description", name.replace("_", " ").title())
-        
+
         if conf.get("type") == "continuous":
             # Format continuous with units if known
             if "age" in name.lower():
-                lines.append(f"- {desc}: {value:.0f} years")
+                lines.append(f"- {desc}: EXACTLY {value:.0f} years old")
+            elif "metastatic" in name.lower() or "sites" in name.lower():
+                # Metastatic sites should be an integer count
+                int_value = int(round(value))
+                lines.append(f"- {desc}: EXACTLY {int_value} site(s) - do not add or remove any")
             else:
                 lines.append(f"- {desc}: {value:.2f}")
         else:
-            lines.append(f"- {desc}: {value}")
+            lines.append(f"- {desc}: EXACTLY \"{value}\" (use this exact category)")
     
     return "\n".join(lines)
