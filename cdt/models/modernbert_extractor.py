@@ -82,9 +82,10 @@ class ModernBertFeatureExtractor(nn.Module):
         else:
             self.projection = None
         
-        # BatchNorm to standardize output across samples
-        self.feature_norm = nn.BatchNorm1d(self.output_dim, affine=False)
-        
+        # Note: BatchNorm removed - unstable with small batch sizes
+        # Using LayerNorm instead for stable normalization
+        self.feature_norm = nn.LayerNorm(self.output_dim)
+
         logger.info(f"ModernBertFeatureExtractor initialized:")
         logger.info(f"  Model: {model_name}")
         logger.info(f"  Output dim: {self.output_dim}")

@@ -26,6 +26,7 @@ cdt/models/modernbert_extractor.py
 cdt/models/multitreatment.py
 cdt/models/outcome_heads.py
 cdt/models/uplift.py
+cdt/models/.ipynb_checkpoints/modernbert_extractor-checkpoint.py
 cdt/training/__init__.py
 cdt/training/plasmode.py
 cdt/training/pretraining.py
@@ -43,8 +44,7 @@ cdt_causal.egg-info/entry_points.txt
 cdt_causal.egg-info/requires.txt
 cdt_causal.egg-info/top_level.txt
 examples/config.json
-examples/config_advanced.json
-examples/config_simple.json
+examples/.ipynb_checkpoints/config-checkpoint.json
 synthetic_data/__init__.py
 synthetic_data/cli.py
 synthetic_data/config.py

@@ -1,6 +1,7 @@
 # cdt/inference/applied.py
 """Applied causal inference on real clinical data."""
 
+import gc
 import logging
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Any, Union
@@ -9,7 +10,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import KFold, train_test_split
+from sklearn.model_selection import KFold
 from sklearn.metrics import roc_auc_score
 from joblib import Parallel, delayed
 
@@ -133,21 +134,19 @@ def _process_fold(
     # Re-configure logger for worker process
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     logger = logging.getLogger(__name__)
-    
+
     logger.info(f"FOLD {fold+1} starting on {device}")
-    
+
     # 1. Prepare Data for this Fold
-    train_val_df = dataset.iloc[train_idx]
+    # Use all training indices for training - no internal validation split
+    # Validation metrics will be computed on the held-out test fold
+    train_df = dataset.iloc[train_idx]
     test_df = dataset.iloc[test_idx]
-    
-    # 90% Train, 10% Internal Validation (for early stopping)
-    fold_train_df, fold_val_df = train_test_split(
-        train_val_df, test_size=0.1, random_state=42
-    )
-    
+
     # 2. Train Model on this fold
+    # Pass test_df as val_df so validation metrics represent held-out fold performance
     model, history = _train_single_model(
-        fold_train_df, fold_val_df, config, device, cache, pretrained_weights_path
+        train_df, test_df, config, device, cache, pretrained_weights_path
     )
     
     # Log History
@@ -164,12 +163,28 @@ def _process_fold(
     preds_df['ite_pred'] = preds['ite_logit']
     preds_df['propensity_pred'] = preds['propensity_logit']
     preds_df['cv_fold'] = fold + 1
-    
-    # Cleanup
+
+    # Aggressive GPU cleanup to prevent OOM across folds
+    # Move model to CPU first to release GPU memory before deletion
+    model.cpu()
     del model
+    del preds
+    del train_df, test_df
+
+    # Force garbage collection before CUDA cleanup
+    gc.collect()
+
+    # Clear CUDA cache aggressively
+    if torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+    # Second round of cleanup
+    gc.collect()
     cuda_cleanup()
-    
-    logger.info(f"FOLD {fold+1} complete")
+
+    logger.info(f"FOLD {fold+1} complete | {get_memory_info()}")
     return preds_df, history
 
 
@@ -399,7 +414,14 @@ def _train_single_model(
         if hasattr(model.feature_extractor, 'latent_confounders') and model.feature_extractor.latent_confounders is not None:
             drift_df = compute_latent_drift(initial_latents, model.feature_extractor.latent_confounders.data)
             log_latent_drift(drift_df, prefix="Applied ")
-        
+
+    # Cleanup training artifacts to free GPU memory
+    del train_loader, val_loader, train_dataset, val_dataset
+    del optimizer, best_model_state
+    if scheduler is not None:
+        del scheduler
+    gc.collect()
+
     return model, history
 
 
@@ -442,11 +464,17 @@ def _predict_dataset(
         shuffle=False,
         collate_fn=collate_fn
     )
-    
+
     if use_modernbert:
-        return _generate_predictions_modernbert(model, loader, device, config)
+        result = _generate_predictions_modernbert(model, loader, device, config)
     else:
-        return _generate_predictions(model, loader, device, config)
+        result = _generate_predictions(model, loader, device, config)
+
+    # Cleanup prediction artifacts
+    del loader, dataset
+    gc.collect()
+
+    return result
 
 
 
