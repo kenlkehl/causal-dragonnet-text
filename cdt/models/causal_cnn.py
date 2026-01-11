@@ -1,0 +1,376 @@
+# cdt/models/causal_cnn.py
+"""Causal inference model using simple 1D CNN for text representation."""
+
+import logging
+from typing import Optional, List, Dict, Any, Tuple
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .cnn_extractor import CNNFeatureExtractor
+from .dragonnet import DragonNet
+from .uplift import UpliftNet
+
+
+logger = logging.getLogger(__name__)
+
+
+class CausalCNNText(nn.Module):
+    """
+    Causal inference model using a simple 1D CNN for text encoding.
+
+    Simplified architecture:
+    - 1D CNN encodes text into feature vector (word-level tokenization)
+    - DragonNet/UpliftNet predicts outcomes and propensity
+
+    Much faster to train than transformer-based models while still
+    capturing useful patterns in clinical text.
+
+    IMPORTANT: Call fit_tokenizer(texts) with training data before
+    using the model for training or inference.
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int = 128,
+        num_filters: int = 256,
+        kernel_sizes: List[int] = [3, 4, 5, 7],
+        cnn_dropout: float = 0.1,
+        max_length: int = 2048,
+        min_word_freq: int = 2,
+        max_vocab_size: Optional[int] = 50000,
+        projection_dim: Optional[int] = 128,
+        dragonnet_representation_dim: int = 128,
+        dragonnet_hidden_outcome_dim: int = 64,
+        device: str = "cuda:0",
+        model_type: str = "dragonnet"  # "dragonnet" or "uplift"
+    ):
+        """
+        Initialize causal inference model with CNN.
+
+        Args:
+            embedding_dim: Dimension of word embeddings
+            num_filters: Number of CNN filters per kernel size
+            kernel_sizes: List of kernel sizes for n-gram capture
+            cnn_dropout: Dropout rate in CNN
+            max_length: Maximum sequence length in tokens
+            min_word_freq: Minimum word frequency for vocabulary inclusion
+            max_vocab_size: Maximum vocabulary size
+            projection_dim: Dimension to project CNN output to (should match dragonnet input)
+            dragonnet_representation_dim: DragonNet representation dimension
+            dragonnet_hidden_outcome_dim: DragonNet outcome hidden dimension
+            device: Device string
+            model_type: Architecture type ("dragonnet" or "uplift")
+        """
+        super().__init__()
+
+        self._device = torch.device(device)
+        self.model_type = model_type
+
+        # Store config for checkpointing
+        self.config = {
+            'embedding_dim': embedding_dim,
+            'num_filters': num_filters,
+            'kernel_sizes': kernel_sizes,
+            'cnn_dropout': cnn_dropout,
+            'max_length': max_length,
+            'min_word_freq': min_word_freq,
+            'max_vocab_size': max_vocab_size,
+            'projection_dim': projection_dim,
+            'dragonnet_representation_dim': dragonnet_representation_dim,
+            'dragonnet_hidden_outcome_dim': dragonnet_hidden_outcome_dim,
+            'model_type': model_type
+        }
+
+        # Feature extractor using CNN with word-level tokenization
+        self.feature_extractor = CNNFeatureExtractor(
+            embedding_dim=embedding_dim,
+            num_filters=num_filters,
+            kernel_sizes=kernel_sizes,
+            projection_dim=projection_dim,
+            dropout=cnn_dropout,
+            max_length=max_length,
+            min_word_freq=min_word_freq,
+            max_vocab_size=max_vocab_size,
+            device=self._device
+        )
+
+        # Binary treatment Causal Inference Net
+        input_dim = self.feature_extractor.output_dim
+
+        if model_type == "uplift":
+            self.net = UpliftNet(
+                input_dim=input_dim,
+                representation_dim=dragonnet_representation_dim,
+                hidden_outcome_dim=dragonnet_hidden_outcome_dim
+            )
+            logger.info("Using UpliftNet architecture (Base + ITE parametrization)")
+        else:
+            self.net = DragonNet(
+                input_dim=input_dim,
+                representation_dim=dragonnet_representation_dim,
+                hidden_outcome_dim=dragonnet_hidden_outcome_dim
+            )
+            logger.info("Using classic DragonNet architecture")
+
+        # Alias for backward compatibility
+        self.dragonnet = self.net
+
+        # Move to device
+        self.to(self._device)
+
+        logger.info(f"CausalCNNText initialized:")
+        logger.info(f"  CNN embedding dim: {embedding_dim}")
+        logger.info(f"  CNN num filters: {num_filters}")
+        logger.info(f"  CNN kernel sizes: {kernel_sizes}")
+        logger.info(f"  Feature extractor output: {input_dim}")
+        logger.info(f"  Device: {self._device}")
+
+    def forward(
+        self,
+        texts: List[str]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Forward pass through the complete model.
+
+        Args:
+            texts: List of text strings
+
+        Returns:
+            y0_logit: (batch, 1) - outcome prediction under control
+            y1_logit: (batch, 1) - outcome prediction under treatment
+            t_logit: (batch, 1) - treatment propensity logit
+            final_common_layer: (batch, representation_dim) - shared representation
+        """
+        # Extract features from texts using CNN
+        features = self.feature_extractor(texts)
+
+        if self.model_type == "uplift":
+            # UpliftNet returns: y0_logit, tau_logit, t_logit, final_common_layer
+            y0_logit, tau_logit, t_logit, final_common_layer = self.net(features)
+            # Reconstruct y1_logit = y0_logit + tau_logit
+            y1_logit = y0_logit + tau_logit
+        else:
+            # DragonNet returns: y0_logit, y1_logit, t_logit, final_common_layer
+            y0_logit, y1_logit, t_logit, final_common_layer = self.net(features)
+
+        return y0_logit, y1_logit, t_logit, final_common_layer
+
+    def train_step(
+        self,
+        batch: Dict[str, Any],
+        alpha_propensity: float = 1.0,
+        beta_targreg: float = 0.1
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Perform single training step.
+
+        Args:
+            batch: Dictionary with 'texts', 'treatment', 'outcome' keys
+            alpha_propensity: Weight for propensity loss
+            beta_targreg: Weight for targeted regularization
+
+        Returns:
+            Dictionary with loss components and detached predictions
+        """
+        texts = batch['texts']
+        treatments = batch['treatment']  # (batch,)
+        outcomes = batch['outcome']  # (batch,)
+
+        # Forward pass
+        y0_logit, y1_logit, t_logit, phi = self.forward(texts)
+
+        # Propensity loss
+        propensity_loss = F.binary_cross_entropy_with_logits(
+            t_logit.squeeze(-1),
+            treatments
+        )
+
+        # Outcome loss - factual outcome only
+        factual_logit = torch.where(
+            treatments.unsqueeze(1) > 0.5,
+            y1_logit,
+            y0_logit
+        )
+
+        outcome_loss = F.binary_cross_entropy_with_logits(
+            factual_logit.squeeze(-1),
+            outcomes
+        )
+
+        # Targeted regularization (R-loss)
+        if beta_targreg > 0:
+            with torch.no_grad():
+                propensity = torch.sigmoid(t_logit).clamp(1e-3, 1 - 1e-3)
+                H = (treatments.unsqueeze(1) / propensity) - \
+                    ((1 - treatments.unsqueeze(1)) / (1 - propensity))
+
+            factual_prob = torch.sigmoid(factual_logit)
+            moment = torch.mean((outcomes.unsqueeze(1) - factual_prob) * H)
+            targreg_loss = moment ** 2
+        else:
+            targreg_loss = torch.tensor(0.0, device=self._device)
+
+        # Total loss
+        total_loss = (
+            outcome_loss +
+            alpha_propensity * propensity_loss +
+            beta_targreg * targreg_loss
+        )
+
+        return {
+            'loss': total_loss,
+            'outcome_loss': outcome_loss.detach(),
+            'propensity_loss': propensity_loss.detach(),
+            'targreg_loss': targreg_loss.detach() if isinstance(targreg_loss, torch.Tensor) else targreg_loss,
+            'y0_logit': y0_logit.detach(),
+            'y1_logit': y1_logit.detach(),
+            't_logit': t_logit.detach()
+        }
+
+    def predict(
+        self,
+        texts: List[str]
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Make predictions for inference.
+
+        Args:
+            texts: List of text strings
+
+        Returns:
+            Dictionary with prediction outputs
+        """
+        with torch.no_grad():
+            features = self.feature_extractor(texts)
+
+            if self.model_type == "uplift":
+                y0_logit, tau_logit, t_logit, final_common_layer = self.net(features)
+                y1_logit = y0_logit + tau_logit
+                tau_pred = tau_logit.squeeze(-1)
+            else:
+                y0_logit, y1_logit, t_logit, final_common_layer = self.net(features)
+                tau_pred = (y1_logit - y0_logit).squeeze(-1)
+
+            # Convert to probabilities
+            y0_prob = torch.sigmoid(y0_logit).squeeze(-1)
+            y1_prob = torch.sigmoid(y1_logit).squeeze(-1)
+            propensity = torch.sigmoid(t_logit).squeeze(-1)
+
+            return {
+                'y0_prob': y0_prob,
+                'y1_prob': y1_prob,
+                'propensity': propensity,
+                'y0_logit': y0_logit.squeeze(-1),
+                'y1_logit': y1_logit.squeeze(-1),
+                't_logit': t_logit.squeeze(-1),
+                'final_common_layer': final_common_layer,
+                'tau_pred': tau_pred
+            }
+
+    def get_features(
+        self,
+        texts: List[str]
+    ) -> torch.Tensor:
+        """
+        Extract feature representations from texts.
+
+        Args:
+            texts: List of text strings
+
+        Returns:
+            Feature tensor: (batch, output_dim)
+        """
+        with torch.no_grad():
+            return self.feature_extractor(texts)
+
+    def fit_tokenizer(self, texts: List[str]) -> 'CausalCNNText':
+        """
+        Fit the word tokenizer on training texts.
+
+        This MUST be called before using the model for training or inference.
+        The tokenizer builds a vocabulary from the provided texts.
+
+        Args:
+            texts: List of training text strings
+
+        Returns:
+            self for method chaining
+        """
+        self.feature_extractor.fit_tokenizer(texts)
+        return self
+
+    def save_checkpoint(
+        self,
+        path: str,
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        epoch: Optional[int] = None,
+        metrics: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Save model checkpoint including tokenizer state.
+        """
+        checkpoint = {
+            'config': self.config,
+            'model_state_dict': self.state_dict(),
+            'feature_extractor': self.feature_extractor.state_dict(),
+            'dragonnet': self.net.state_dict(),
+            'tokenizer_state': self.feature_extractor.get_tokenizer_state(),
+        }
+
+        if optimizer is not None:
+            checkpoint['optimizer_state_dict'] = optimizer.state_dict()
+
+        if epoch is not None:
+            checkpoint['epoch'] = epoch
+
+        if metrics is not None:
+            checkpoint['metrics'] = metrics
+
+        torch.save(checkpoint, path)
+        logger.info(f"Checkpoint saved to {path}")
+
+    @classmethod
+    def load_from_checkpoint(
+        cls,
+        path: str,
+        device: Optional[str] = None
+    ) -> 'CausalCNNText':
+        """
+        Load model from checkpoint including tokenizer state.
+        """
+        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+        config = checkpoint['config']
+
+        if device is not None:
+            config['device'] = device
+
+        # Create model
+        model = cls(**config)
+
+        # Load tokenizer state first (rebuilds embedding layer with correct vocab size)
+        if 'tokenizer_state' in checkpoint:
+            model.feature_extractor.load_tokenizer_state(checkpoint['tokenizer_state'])
+
+        # Load state dict (after tokenizer so embedding has correct size)
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        else:
+            if 'feature_extractor' in checkpoint:
+                model.feature_extractor.load_state_dict(
+                    checkpoint['feature_extractor'],
+                    strict=False
+                )
+            if 'dragonnet' in checkpoint:
+                model.net.load_state_dict(
+                    checkpoint['dragonnet'],
+                    strict=False
+                )
+
+        logger.info(f"Model loaded from {path}")
+        return model
+
+    def to(self, device):
+        """Override to track device properly."""
+        self._device = device if isinstance(device, torch.device) else torch.device(device)
+        return super().to(device)

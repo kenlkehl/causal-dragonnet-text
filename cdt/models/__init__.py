@@ -10,6 +10,8 @@ from .causal_dragonnet import CausalDragonnetText
 from .multitreatment import MultiTreatmentDragonNetInternal, MultiTreatmentDragonnetText
 from .modernbert_extractor import ModernBertFeatureExtractor
 from .causal_modernbert import CausalModernBertText
+from .cnn_extractor import CNNFeatureExtractor, WordTokenizer
+from .causal_cnn import CausalCNNText
 
 __all__ = [
     'ConfounderAggregator',
@@ -23,4 +25,7 @@ __all__ = [
     'MultiTreatmentDragonnetText',
     'ModernBertFeatureExtractor',
     'CausalModernBertText',
+    'CNNFeatureExtractor',
+    'WordTokenizer',
+    'CausalCNNText',
 ]

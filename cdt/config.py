@@ -12,7 +12,7 @@ import hashlib
 class ModelArchitectureConfig:
     """Configuration for model architecture."""
     model_type: str = "dragonnet"  # "dragonnet" or "uplift"
-    # Model backbone selection: "sentence_transformer" (original) or "modernbert" (new)
+    # Model backbone selection: "sentence_transformer", "modernbert", or "cnn"
     model_backbone: str = "sentence_transformer"
     # Sentence transformer settings (used when model_backbone="sentence_transformer")
     embedding_model_name: str = "all-MiniLM-L6-v2"
@@ -28,6 +28,14 @@ class ModelArchitectureConfig:
     modernbert_model_name: str = "answerdotai/ModernBERT-base"
     freeze_modernbert: bool = False
     modernbert_max_length: int = 8192
+    # CNN settings (used when model_backbone="cnn")
+    cnn_embedding_dim: int = 128  # Word embedding dimension
+    cnn_num_filters: int = 256  # Number of filters per kernel size
+    cnn_kernel_sizes: List[int] = field(default_factory=lambda: [3, 4, 5, 7])
+    cnn_dropout: float = 0.1
+    cnn_max_length: int = 2048  # Max sequence length in tokens (words)
+    cnn_min_word_freq: int = 2  # Minimum word frequency for vocabulary
+    cnn_max_vocab_size: int = 50000  # Maximum vocabulary size
     # Shared settings
     dragonnet_representation_dim: int = 128
     dragonnet_hidden_outcome_dim: int = 64

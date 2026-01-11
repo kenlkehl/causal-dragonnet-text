@@ -17,6 +17,7 @@ from joblib import Parallel, delayed
 from ..config import AppliedInferenceConfig
 from ..models.causal_dragonnet import CausalDragonnetText
 from ..models.causal_modernbert import CausalModernBertText
+from ..models.causal_cnn import CausalCNNText
 from ..data import (
     ClinicalTextDataset, ModernBertClinicalTextDataset,
     collate_batch, collate_modernbert_batch,
@@ -237,13 +238,58 @@ def _train_single_model(
     device: torch.device,
     cache: Optional[EmbeddingCache],
     pretrained_weights_path: Optional[Path]
-) -> Tuple[Union[CausalDragonnetText, CausalModernBertText], List[Dict[str, Any]]]:
+) -> Tuple[Union[CausalDragonnetText, CausalModernBertText, CausalCNNText], List[Dict[str, Any]]]:
     """Helper to train a single model instance."""
-    
+
     arch_config = config.architecture
-    use_modernbert = getattr(arch_config, 'model_backbone', 'sentence_transformer') == 'modernbert'
-    
-    if use_modernbert:
+    model_backbone = getattr(arch_config, 'model_backbone', 'sentence_transformer')
+    use_modernbert = model_backbone == 'modernbert'
+    use_cnn = model_backbone == 'cnn'
+
+    if use_cnn:
+        # Create CNN-based model
+        model = CausalCNNText(
+            embedding_dim=arch_config.cnn_embedding_dim,
+            num_filters=arch_config.cnn_num_filters,
+            kernel_sizes=arch_config.cnn_kernel_sizes,
+            cnn_dropout=arch_config.cnn_dropout,
+            max_length=arch_config.cnn_max_length,
+            min_word_freq=getattr(arch_config, 'cnn_min_word_freq', 2),
+            max_vocab_size=getattr(arch_config, 'cnn_max_vocab_size', 50000),
+            projection_dim=arch_config.dragonnet_representation_dim,
+            dragonnet_representation_dim=arch_config.dragonnet_representation_dim,
+            dragonnet_hidden_outcome_dim=arch_config.dragonnet_hidden_outcome_dim,
+            device=str(device),
+            model_type=arch_config.model_type
+        )
+        logger.info("Using CNN backbone")
+
+        # Fit word tokenizer on training texts for this fold
+        train_texts = train_df[config.text_column].tolist()
+        model.fit_tokenizer(train_texts)
+        logger.info(f"Fitted word tokenizer on {len(train_texts)} training texts")
+
+        # No latent tracking for CNN
+        initial_latents = None
+
+        # Create datasets for CNN (same as ModernBERT - uses raw text)
+        train_dataset = ModernBertClinicalTextDataset(
+            data=train_df,
+            text_column=config.text_column,
+            outcome_column=config.outcome_column,
+            treatment_column=config.treatment_column
+        )
+
+        val_dataset = ModernBertClinicalTextDataset(
+            data=val_df,
+            text_column=config.text_column,
+            outcome_column=config.outcome_column,
+            treatment_column=config.treatment_column
+        )
+
+        collate_fn = collate_modernbert_batch
+
+    elif use_modernbert:
         # Create ModernBERT-based model
         model = CausalModernBertText(
             modernbert_model_name=arch_config.modernbert_model_name,
@@ -379,12 +425,15 @@ def _train_single_model(
     best_model_state = None
     history = []
     
+    # Select training functions based on backbone
+    use_text_interface = use_modernbert or use_cnn  # Both use raw text strings
+
     for epoch in range(train_config.epochs):
         model.train()
-        train_stats = _train_epoch_modernbert(model, train_loader, optimizer, scheduler, device, train_config) if use_modernbert else _train_epoch(model, train_loader, optimizer, scheduler, device, train_config)
-        
+        train_stats = _train_epoch_modernbert(model, train_loader, optimizer, scheduler, device, train_config) if use_text_interface else _train_epoch(model, train_loader, optimizer, scheduler, device, train_config)
+
         model.eval()
-        val_stats = _eval_epoch_modernbert(model, val_loader, device, train_config) if use_modernbert else _eval_epoch(model, val_loader, device, train_config)
+        val_stats = _eval_epoch_modernbert(model, val_loader, device, train_config) if use_text_interface else _eval_epoch(model, val_loader, device, train_config)
         
         # Record history
         epoch_log = {
@@ -410,7 +459,7 @@ def _train_single_model(
         model.load_state_dict(best_model_state)
     
     # Compute and log latent drift (SentenceTransformer only)
-    if not use_modernbert and initial_latents is not None:
+    if not use_text_interface and initial_latents is not None:
         if hasattr(model.feature_extractor, 'latent_confounders') and model.feature_extractor.latent_confounders is not None:
             drift_df = compute_latent_drift(initial_latents, model.feature_extractor.latent_confounders.data)
             log_latent_drift(drift_df, prefix="Applied ")
@@ -426,7 +475,7 @@ def _train_single_model(
 
 
 def _predict_dataset(
-    model: Union[CausalDragonnetText, CausalModernBertText],
+    model: Union[CausalDragonnetText, CausalModernBertText, CausalCNNText],
     df: pd.DataFrame,
     config: AppliedInferenceConfig,
     device: torch.device,
@@ -434,9 +483,10 @@ def _predict_dataset(
 ) -> dict:
     """Generate predictions for a dataframe."""
     arch_config = config.architecture
-    use_modernbert = getattr(arch_config, 'model_backbone', 'sentence_transformer') == 'modernbert'
-    
-    if use_modernbert:
+    model_backbone = getattr(arch_config, 'model_backbone', 'sentence_transformer')
+    use_text_interface = model_backbone in ('modernbert', 'cnn')
+
+    if use_text_interface:
         dataset = ModernBertClinicalTextDataset(
             data=df,
             text_column=config.text_column,
@@ -457,7 +507,7 @@ def _predict_dataset(
             cache=cache
         )
         collate_fn = collate_batch
-    
+
     loader = DataLoader(
         dataset,
         batch_size=config.training.batch_size,
@@ -465,7 +515,7 @@ def _predict_dataset(
         collate_fn=collate_fn
     )
 
-    if use_modernbert:
+    if use_text_interface:
         result = _generate_predictions_modernbert(model, loader, device, config)
     else:
         result = _generate_predictions(model, loader, device, config)
