@@ -1,34 +1,56 @@
 # Causal DragonNet Text (CDT)
 
-A framework for clinical causal inference using electronic health record (EHR) text as the primary input. CDT estimates treatment effects from unstructured clinical narratives by learning confounder representations directly from text.
+A framework for clinical causal inference using electronic health record (EHR) text as the primary input. CDT estimates treatment effects from unstructured clinical narratives using semantically-initialized CNNs with DragonNet causal inference heads.
 
 ## Clinical Research Objective
 
 Observational studies using EHR data are essential for comparative effectiveness research when randomized trials are infeasible or unethical. However, standard approaches rely on structured covariates (diagnoses, labs, demographics) which may fail to capture critical confounders documented only in clinical notes—such as functional status, symptom severity, patient preferences, or nuanced disease characteristics.
 
 CDT addresses this gap by:
-- **Extracting confounders from clinical text** using sentence embeddings and learnable confounder representations
+- **Extracting confounders from clinical text** using 1D CNNs with semantically meaningful filters
 - **Estimating treatment effects** using a DragonNet architecture that jointly models propensity scores and potential outcomes
 - **Validating methods via plasmode simulation** to assess sensitivity to unmeasured confounding and model misspecification
-
-This enables researchers to leverage the rich information in clinical narratives for causal inference while providing tools to evaluate the robustness of their estimates.
 
 ## How It Works
 
 ### Architecture Overview
 
-CDT processes clinical text through three stages:
+CDT processes clinical text through a CNN-based pipeline:
 
-1. **Text Embedding**: Clinical notes are chunked and embedded using a sentence transformer (default: `all-MiniLM-L6-v2`)
+1. **Word-Level Tokenization**: Clinical notes are tokenized at the word level with a vocabulary built from training data
 
-2. **Confounder Extraction**: A feature extractor learns to identify confounder-relevant patterns from embeddings using:
-   - Learnable latent confounders (data-driven patterns)
-   - Optional explicit confounders (user-specified clinical queries like "What is the patient's performance status?")
+2. **Semantic Embeddings**: Word embeddings can be initialized from ClinicalBERT (Bio_ClinicalBERT) by:
+   - Tokenizing each vocabulary word with BERT's subword tokenizer
+   - Averaging the subword embeddings
+   - Projecting to the CNN embedding dimension
 
-3. **Causal Inference**: A DragonNet model takes the extracted confounders and jointly predicts:
+3. **CNN Feature Extraction**: 1D convolutions with multiple kernel sizes (e.g., 3, 4, 5, 7 words) extract n-gram patterns. Filters can be initialized from:
+   - **Explicit clinical concepts**: User-specified phrases like "stage iv cancer", "performance status poor"
+   - **Latent patterns**: Data-driven filters learned via k-means clustering of training n-grams
+
+4. **DragonNet Causal Inference**: The CNN features feed into a DragonNet that jointly predicts:
    - Treatment propensity P(T=1|X)
    - Potential outcomes E[Y|T=0,X] and E[Y|T=1,X]
    - Individual treatment effects (ITE) as the difference in potential outcomes
+
+### Semantic Filter Initialization
+
+The key innovation is initializing CNN filters with clinical meaning:
+
+```
+Kernel Size 3 (3-word phrases):
+  - "stage iv cancer"
+  - "performance status poor"
+  - "disease progression noted"
+  ...
+
+Kernel Size 5 (5-word phrases):
+  - "white blood cell count elevated"
+  - "computed tomography scan of chest"
+  ...
+```
+
+Each explicit concept is converted to an embedding sequence using the BERT-initialized word embeddings, creating a filter that responds strongly to that clinical pattern. Additional "latent" filters are learned by clustering n-grams from the training corpus.
 
 ### Workflow Modes
 
@@ -37,7 +59,7 @@ CDT processes clinical text through three stages:
 For estimating treatment effects on real clinical data:
 
 ```
-Clinical Text → Embeddings → Confounder Features → DragonNet → Treatment Effect Estimates
+Clinical Text → Word Tokens → CNN Features → DragonNet → Treatment Effect Estimates
 ```
 
 The system supports:
@@ -53,20 +75,9 @@ Plasmode simulation generates synthetic outcomes while preserving the real covar
 
 The plasmode workflow:
 1. Train a "generator" model on real data to learn confounder representations
-2. Generate synthetic outcomes with known true treatment effects using the learned confounders
+2. Generate synthetic outcomes with known true treatment effects
 3. Train an "evaluator" model on the synthetic data
 4. Compare estimated effects to ground truth
-
-Available generation modes:
-- `phi_linear`: Linear relationship between confounders and outcomes
-- `deep_nonlinear`: Deep neural network outcome model
-- `uplift_nonlinear`: Linear baseline with nonlinear treatment effect heterogeneity
-
-#### Multi-Treatment Pretraining
-
-When labeled data for your target treatment comparison is limited, you can pretrain on a larger dataset with multiple treatments. This learns general confounder representations that transfer to the binary treatment setting.
-
-Pretraining → Applied Inference (with pretrained weights) → [Optional: Plasmode Validation]
 
 ## Installation
 
@@ -118,20 +129,14 @@ pip install -e .
 
 ## Dataset Requirements
 
-CDT expects datasets in Parquet or CSV format with specific columns depending on your workflow.
-
-### Binary Causal Inference (Applied Inference)
-
-Required columns:
+CDT expects datasets in Parquet or CSV format with the following columns:
 
 | Column | Description | Type |
 |--------|-------------|------|
 | `clinical_text` | The clinical narrative text | string |
 | `treatment_indicator` | Binary treatment assignment (0 or 1) | int/float |
 | `outcome_indicator` | Binary outcome (0 or 1) | int/float |
-| `split` | Data split: "train", "val", "test" | string |
-
-The `split` column is required for fixed-split mode but optional for cross-validation mode (where all data is used and split automatically).
+| `split` | Data split: "train", "val", "test" (optional for CV) | string |
 
 Example:
 ```
@@ -141,18 +146,6 @@ Example:
 | "Patient presents with dyspnea..."     | 0                   | 1                 | train |
 | "History of smoking, 40 pack-years..." | 1                   | 1                 | test  |
 ```
-
-### Multi-Treatment Pretraining
-
-For pretraining on multi-treatment data, use these columns:
-
-| Column | Description | Type |
-|--------|-------------|------|
-| `clinical_text` | The clinical narrative text | string |
-| `treatment` | Treatment category (can be string or integer) | any |
-| `outcome_indicator` | Binary outcome (0 or 1) | int/float |
-
-The `treatment` column can have any number of unique values representing different treatments.
 
 ## Running Experiments
 
@@ -174,44 +167,61 @@ A configuration file controls all aspects of the experiment:
 
 ```json
 {
-  "output_dir": "./results",
+  "output_dir": "./cdt_results",
   "seed": 42,
   "device": "cuda:0",
   "num_workers": 1,
-  "cache_dir": "./cache",
-
-  "pretraining": {
-    "enabled": false,
-    "dataset_path": "./pretrain_data.parquet",
-    "treatment_column": "treatment"
-  },
 
   "applied_inference": {
-    "dataset_path": "./analysis_data.parquet",
+    "dataset_path": "./data/clinical_notes.parquet",
     "text_column": "clinical_text",
     "outcome_column": "outcome_indicator",
     "treatment_column": "treatment_indicator",
-    "split_column": "split",
     "cv_folds": 5,
-    "use_pretrained_weights": true,
 
     "architecture": {
-      "num_latent_confounders": 20,
-      "features_per_confounder": 4
+      "model_type": "dragonnet",
+      "cnn_embedding_dim": 128,
+      "cnn_num_filters": 256,
+      "cnn_kernel_sizes": [3, 4, 5, 7],
+      "cnn_max_length": 2048,
+      "cnn_min_word_freq": 2,
+      "cnn_max_vocab_size": 50000,
+
+      "cnn_init_embeddings_from": "emilyalsentzer/Bio_ClinicalBERT",
+      "cnn_freeze_embeddings": false,
+
+      "cnn_explicit_filter_concepts": {
+        "3": ["stage iv cancer", "performance status poor", "disease progression noted"],
+        "4": ["no evidence of disease", "complete response to treatment"],
+        "5": ["white blood cell count elevated"],
+        "7": ["patient was started on first line chemotherapy regimen"]
+      },
+      "cnn_num_latent_filters": 64,
+
+      "dragonnet_representation_dim": 128,
+      "dragonnet_hidden_outcome_dim": 64
     },
 
     "training": {
       "epochs": 50,
       "batch_size": 8,
-      "learning_rate": 0.0001
+      "learning_rate": 0.0001,
+      "alpha_propensity": 1.0,
+      "beta_targreg": 0.1
     }
   },
 
   "plasmode_experiments": {
     "enabled": false,
     "num_repeats": 3,
+    "train_fraction": 0.8,
     "plasmode_scenarios": [
-      {"generation_mode": "phi_linear", "target_ate_logit": 0.5}
+      {
+        "generation_mode": "phi_linear",
+        "target_ate_logit": 0.5,
+        "ite_heterogeneity_scale": 1.0
+      }
     ]
   }
 }
@@ -219,16 +229,31 @@ A configuration file controls all aspects of the experiment:
 
 ### Key Configuration Options
 
-**Applied Inference:**
-- `cv_folds`: Set to >1 for cross-validation, or 0/1 for fixed train/val/test splits
-- `use_pretrained_weights`: Whether to initialize from pretraining (requires pretraining to be run first)
-- `num_latent_confounders`: Number of learnable confounder patterns
-- `explicit_confounder_texts`: Optional list of clinical questions to guide confounder extraction
+**CNN Architecture:**
+- `cnn_embedding_dim`: Dimension of word embeddings (default: 128)
+- `cnn_num_filters`: Number of filters per kernel size (default: 256)
+- `cnn_kernel_sizes`: List of kernel sizes for n-gram detection (default: [3, 4, 5, 7])
+- `cnn_max_length`: Maximum sequence length in words (default: 2048)
+
+**Semantic Initialization:**
+- `cnn_init_embeddings_from`: HuggingFace model for embedding initialization (e.g., "emilyalsentzer/Bio_ClinicalBERT")
+- `cnn_freeze_embeddings`: Whether to freeze BERT-initialized embeddings during training
+- `cnn_explicit_filter_concepts`: Dict mapping kernel size (as string) to list of concept phrases
+- `cnn_num_latent_filters`: Number of k-means derived filters per kernel size
+
+**DragonNet Head:**
+- `dragonnet_representation_dim`: Dimension of shared representation layer
+- `dragonnet_hidden_outcome_dim`: Hidden dimension for outcome prediction heads
+
+**Training:**
+- `alpha_propensity`: Weight for propensity score loss
+- `beta_targreg`: Weight for targeted regularization loss
+- `cv_folds`: Number of cross-validation folds (0 or 1 for fixed splits)
 
 **Plasmode:**
-- `generation_mode`: How synthetic outcomes are generated
-- `target_ate_logit`: The true average treatment effect (on logit scale) to simulate
-- `num_repeats`: Number of simulation replicates per scenario
+- `generation_mode`: How synthetic outcomes are generated ("phi_linear")
+- `target_ate_logit`: True average treatment effect (logit scale) to simulate
+- `ite_heterogeneity_scale`: Scale of individual treatment effect heterogeneity
 
 ### CLI Options
 
@@ -237,7 +262,7 @@ cdt run --config config.json \
     --device cuda:1 \           # Override GPU device
     --workers 4 \               # Parallel workers for CV folds
     --output-dir ./my_results \ # Override output directory
-    --skip-pretraining \        # Skip pretraining phase
+    --skip-applied \            # Skip applied inference
     --skip-plasmode \           # Skip plasmode experiments
     --verbose                   # Enable debug logging
 ```
@@ -249,7 +274,6 @@ After running, results are saved to the output directory:
 ```
 output_dir/
 ├── config.json                    # Copy of experiment configuration
-├── summary.json                   # High-level results summary
 ├── applied_inference/
 │   ├── predictions.parquet        # Per-sample treatment effect estimates
 │   └── training_log.csv           # Training metrics per epoch
@@ -259,43 +283,50 @@ output_dir/
 ```
 
 The `predictions.parquet` file contains:
-- `y0_pred`: Predicted outcome probability under control
-- `y1_pred`: Predicted outcome probability under treatment
-- `ite_pred`: Individual treatment effect (y1_pred - y0_pred)
-- `propensity_pred`: Predicted probability of receiving treatment
+- `y0_logit`: Predicted outcome logit under control
+- `y1_logit`: Predicted outcome logit under treatment
+- `ite_logit`: Individual treatment effect (y1_logit - y0_logit)
+- `propensity_logit`: Predicted treatment propensity (logit scale)
 - `cv_fold`: Which cross-validation fold (if using CV)
 
-## Example Workflows
+## Example: Semantic CNN for Oncology
 
-### Simple Binary Treatment Analysis
+See `examples/semantic_cnn_config.json` for a complete configuration with clinical oncology concepts:
 
-```bash
-# 1. Create config
-cdt init -o simple_config.json
-
-# 2. Edit simple_config.json:
-#    - Set applied_inference.dataset_path to your data
-#    - Set cv_folds: 5 for cross-validation
-#    - Disable pretraining and plasmode
-
-# 3. Run
-cdt run --config simple_config.json
+```json
+{
+  "cnn_explicit_filter_concepts": {
+    "3": [
+      "stage iv cancer",
+      "performance status poor",
+      "disease progression noted",
+      "tumor size increased",
+      "lymph node positive",
+      "prior chemotherapy received",
+      "adverse event reported",
+      "patient tolerated well"
+    ],
+    "4": [
+      "no evidence of disease",
+      "complete response to treatment",
+      "partial response to therapy",
+      "stable disease on imaging",
+      "progressive disease confirmed today"
+    ],
+    "5": [
+      "white blood cell count elevated",
+      "eastern cooperative oncology group performance",
+      "computed tomography scan of chest"
+    ],
+    "7": [
+      "patient was started on first line chemotherapy regimen",
+      "imaging revealed new metastatic lesions in the liver"
+    ]
+  }
+}
 ```
 
-### Full Pipeline with Pretraining and Validation
-
-```bash
-# 1. Create config with all features enabled
-cdt init -o full_config.json
-
-# 2. Edit full_config.json:
-#    - Enable pretraining, set dataset_path
-#    - Configure applied_inference
-#    - Enable plasmode_experiments with multiple scenarios
-
-# 3. Run complete pipeline
-cdt run --config full_config.json --workers 4
-```
+These concepts create CNN filters that specifically detect clinically meaningful patterns in the text.
 
 ## Citation
 

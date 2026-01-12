@@ -402,6 +402,256 @@ class CNNFeatureExtractor(nn.Module):
 
         return self
 
+    def init_embeddings_from_bert(
+        self,
+        bert_model_name: str = "emilyalsentzer/Bio_ClinicalBERT",
+        freeze: bool = False
+    ) -> 'CNNFeatureExtractor':
+        """
+        Initialize word embeddings from a BERT model.
+
+        For each word in our vocabulary:
+        1. Tokenize with BERT tokenizer → get subword tokens
+        2. Look up subword embeddings from BERT
+        3. Average the subword embeddings
+        4. Project to our embedding dimension
+
+        Args:
+            bert_model_name: HuggingFace model name for BERT
+            freeze: If True, freeze embeddings after initialization
+
+        Returns:
+            self for method chaining
+        """
+        from transformers import AutoTokenizer, AutoModel
+
+        if not self.tokenizer._is_fitted:
+            raise RuntimeError(
+                "Tokenizer must be fitted before initializing embeddings from BERT. "
+                "Call fit_tokenizer() first."
+            )
+
+        logger.info(f"Initializing embeddings from {bert_model_name}")
+
+        # Load BERT tokenizer and model
+        bert_tokenizer = AutoTokenizer.from_pretrained(bert_model_name)
+        bert_model = AutoModel.from_pretrained(bert_model_name)
+        bert_model.eval()
+
+        # Get BERT embedding weights
+        bert_embeddings = bert_model.embeddings.word_embeddings.weight  # (vocab, 768)
+        bert_dim = bert_embeddings.size(1)
+
+        # Create projection layer if dimensions differ
+        if bert_dim != self._embedding_dim:
+            projection = nn.Linear(bert_dim, self._embedding_dim, bias=False)
+            nn.init.xavier_uniform_(projection.weight)
+            projection = projection.to(bert_embeddings.device)
+        else:
+            projection = None
+
+        # Map each vocabulary word to BERT embedding
+        initialized_count = 0
+        with torch.no_grad():
+            for word, idx in self.tokenizer.word_to_id.items():
+                if word in [self.tokenizer.PAD_TOKEN, self.tokenizer.UNK_TOKEN]:
+                    continue
+
+                # Tokenize word with BERT tokenizer
+                bert_tokens = bert_tokenizer.encode(word, add_special_tokens=False)
+
+                if bert_tokens:
+                    # Average subword embeddings
+                    subword_embs = bert_embeddings[bert_tokens]  # (num_subwords, 768)
+                    word_emb = subword_embs.mean(dim=0)  # (768,)
+
+                    # Project to our embedding dimension
+                    if projection is not None:
+                        word_emb = projection(word_emb)
+
+                    self.embedding.weight.data[idx] = word_emb.to(self._device)
+                    initialized_count += 1
+
+        # Freeze if requested
+        if freeze:
+            self.embedding.weight.requires_grad = False
+            logger.info("  Embeddings frozen (requires_grad=False)")
+
+        logger.info(f"  Initialized {initialized_count}/{len(self.tokenizer.word_to_id)} "
+                    f"word embeddings from BERT")
+
+        return self
+
+    def init_filters(
+        self,
+        texts: List[str],
+        explicit_concepts: Optional[Dict[str, List[str]]] = None,
+        num_latent_per_kernel: int = 64,
+        bert_model_name: Optional[str] = None,
+        freeze: bool = False
+    ) -> 'CNNFeatureExtractor':
+        """
+        Initialize CNN filters from explicit concepts and k-means clustering.
+
+        For each kernel size k with num_filters=N:
+        - First len(concepts[k]) filters: from explicit concepts
+        - Next num_latent_per_kernel filters: from k-means on training n-grams
+        - Remaining: keep random initialization
+
+        Args:
+            texts: Training texts for k-means clustering of n-grams
+            explicit_concepts: Dict mapping kernel_size (as string) to list of concept phrases
+            num_latent_per_kernel: Number of k-means derived filters per kernel size
+            bert_model_name: If provided, use BERT embeddings for concepts
+                            (otherwise use current embedding layer)
+            freeze: If True, freeze all conv layer weights after initialization
+
+        Returns:
+            self for method chaining
+        """
+        import numpy as np
+        from sklearn.cluster import MiniBatchKMeans
+
+        if not self.tokenizer._is_fitted:
+            raise RuntimeError(
+                "Tokenizer must be fitted before initializing filters. "
+                "Call fit_tokenizer() first."
+            )
+
+        logger.info("Initializing CNN filters from concepts and k-means")
+
+        # Parse explicit concepts
+        if explicit_concepts is None:
+            explicit_concepts = {}
+
+        # Normalize keys to int
+        concepts_by_kernel = {
+            int(k): v for k, v in explicit_concepts.items()
+        }
+
+        # Helper to get word embedding
+        def get_word_embedding(word: str) -> torch.Tensor:
+            """Get embedding for a word from current embedding layer."""
+            idx = self.tokenizer.word_to_id.get(
+                word.lower(),
+                self.tokenizer.UNK_ID
+            )
+            return self.embedding.weight[idx].detach().clone()
+
+        for conv in self.convs:
+            kernel_size = conv.kernel_size[0]
+            num_filters = conv.out_channels
+
+            concepts = concepts_by_kernel.get(kernel_size, [])
+            num_explicit = len(concepts)
+            filter_idx = 0
+
+            # Phase 1: Initialize filters from explicit concepts
+            if concepts:
+                logger.info(f"  Kernel {kernel_size}: {num_explicit} explicit concept filters")
+                with torch.no_grad():
+                    for concept in concepts:
+                        if filter_idx >= num_filters:
+                            break
+
+                        concept_words = concept.lower().split()[:kernel_size]
+
+                        # Pad if concept has fewer words than kernel size
+                        while len(concept_words) < kernel_size:
+                            concept_words.append(concept_words[-1] if concept_words else "the")
+
+                        # Build filter: stack word embeddings
+                        filter_weights = torch.stack([
+                            get_word_embedding(w) for w in concept_words
+                        ], dim=1)  # (embed_dim, kernel_size)
+
+                        conv.weight.data[filter_idx] = filter_weights.to(self._device)
+                        filter_idx += 1
+
+            # Phase 2: Initialize filters from k-means clustering of n-grams
+            remaining_for_kmeans = min(
+                num_latent_per_kernel,
+                num_filters - filter_idx
+            )
+
+            if remaining_for_kmeans > 0 and texts:
+                logger.info(f"  Kernel {kernel_size}: {remaining_for_kmeans} k-means filters")
+
+                # Extract n-grams from training texts
+                ngram_embeddings = []
+                max_ngrams = 100000  # Limit for memory
+
+                for text in texts:
+                    tokens = self.tokenizer._tokenize(text)
+                    for i in range(len(tokens) - kernel_size + 1):
+                        ngram = tokens[i:i+kernel_size]
+
+                        # Get embedding for each token
+                        token_embs = []
+                        for tok in ngram:
+                            idx = self.tokenizer.word_to_id.get(tok, self.tokenizer.UNK_ID)
+                            token_embs.append(
+                                self.embedding.weight[idx].detach().cpu()
+                            )
+
+                        # Stack to (embed_dim, k) then flatten
+                        ngram_emb = torch.stack(token_embs, dim=1)  # (embed_dim, k)
+                        ngram_embeddings.append(ngram_emb.flatten().numpy())
+
+                        if len(ngram_embeddings) >= max_ngrams:
+                            break
+                    if len(ngram_embeddings) >= max_ngrams:
+                        break
+
+                if len(ngram_embeddings) >= remaining_for_kmeans:
+                    # Run k-means
+                    ngram_array = np.stack(ngram_embeddings)
+                    kmeans = MiniBatchKMeans(
+                        n_clusters=remaining_for_kmeans,
+                        random_state=42,
+                        n_init=3,
+                        batch_size=min(1000, len(ngram_embeddings))
+                    )
+                    kmeans.fit(ngram_array)
+
+                    # Reshape centers to filter weights
+                    centers = torch.tensor(
+                        kmeans.cluster_centers_,
+                        dtype=torch.float32
+                    )
+                    centers = centers.reshape(
+                        remaining_for_kmeans,
+                        self._embedding_dim,
+                        kernel_size
+                    )
+
+                    with torch.no_grad():
+                        for i in range(remaining_for_kmeans):
+                            if filter_idx >= num_filters:
+                                break
+                            conv.weight.data[filter_idx] = centers[i].to(self._device)
+                            filter_idx += 1
+                else:
+                    logger.warning(
+                        f"  Kernel {kernel_size}: Not enough n-grams "
+                        f"({len(ngram_embeddings)}) for {remaining_for_kmeans} k-means filters"
+                    )
+
+            # Remaining filters keep random initialization
+            remaining = num_filters - filter_idx
+            if remaining > 0:
+                logger.info(f"  Kernel {kernel_size}: {remaining} random filters (unchanged)")
+
+        # Freeze conv weights if requested
+        if freeze:
+            for conv in self.convs:
+                conv.weight.requires_grad = False
+                if conv.bias is not None:
+                    conv.bias.requires_grad = False
+            logger.info("  CNN filters frozen (requires_grad=False)")
+
+        return self
+
     @property
     def output_dim(self) -> int:
         """Total output dimension after optional projection."""
@@ -475,8 +725,9 @@ class CNNFeatureExtractor(nn.Module):
             features = self.projection(features)
 
         # Apply final normalization
-        output = self.feature_norm(features)
-
+        #output = self.feature_norm(features)
+        output=features
+        
         return output
 
     def to(self, device):

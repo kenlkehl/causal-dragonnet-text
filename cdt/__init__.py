@@ -1,7 +1,7 @@
 """
 Causal Dragonnet Text (CDT)
 
-A package for causal inference from clinical text using DragonNet models with multi-treatment pretraining.
+A package for causal inference from clinical text using CNN-based DragonNet models.
 """
 
 __version__ = "0.1.0"
@@ -9,8 +9,9 @@ __version__ = "0.1.0"
 from .config import (
     ExperimentConfig,
     AppliedInferenceConfig,
-    PretrainingConfig,
     PlasmodeExperimentConfig,
+    ModelArchitectureConfig,
+    TrainingConfig,
     create_default_config
 )
 
@@ -18,9 +19,10 @@ from .experiments import ExperimentRunner
 
 __all__ = [
     'ExperimentConfig',
-    'AppliedInferenceConfig', 
-    'PretrainingConfig',
+    'AppliedInferenceConfig',
     'PlasmodeExperimentConfig',
+    'ModelArchitectureConfig',
+    'TrainingConfig',
     'ExperimentRunner',
     'create_default_config',
 ]
