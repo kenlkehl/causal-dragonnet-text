@@ -10,10 +10,13 @@ import hashlib
 
 @dataclass
 class ModelArchitectureConfig:
-    """Configuration for CNN model architecture."""
+    """Configuration for model architecture."""
     model_type: str = "dragonnet"  # "dragonnet" or "uplift"
 
-    # CNN architecture
+    # Feature extractor type: "cnn" or "bert"
+    feature_extractor_type: str = "cnn"
+
+    # CNN architecture (used when feature_extractor_type="cnn")
     cnn_embedding_dim: int = 128  # Word embedding dimension
     cnn_kernel_sizes: List[int] = field(default_factory=lambda: [3, 4, 5, 7])
     cnn_dropout: float = 0.1
@@ -21,18 +24,26 @@ class ModelArchitectureConfig:
     cnn_min_word_freq: int = 2  # Minimum word frequency for vocabulary
     cnn_max_vocab_size: int = 50000  # Maximum vocabulary size
 
-    # Embedding initialization
+    # CNN embedding initialization
     cnn_use_random_embedding_init: bool = False  # If True, use random init (ignore cnn_init_embeddings_from)
     cnn_init_embeddings_from: Optional[str] = None  # e.g., "emilyalsentzer/Bio_ClinicalBERT"
     cnn_freeze_embeddings: bool = False  # Whether to freeze BERT-initialized embeddings
 
-    # Filter initialization: specify each filter type separately
+    # CNN filter initialization: specify each filter type separately
     # Total filters per kernel = max(explicit_count_per_kernel) + kmeans + random
     # Dict mapping kernel_size (as string in JSON) to list of concept phrases
     cnn_explicit_filter_concepts: Optional[Dict[str, List[str]]] = None
     cnn_num_kmeans_filters: int = 64  # Number of k-means derived filters per kernel size
     cnn_num_random_filters: int = 0  # Number of randomly initialized filters per kernel size
     cnn_freeze_filters: bool = False  # Whether to freeze CNN filters after initialization
+
+    # BERT architecture (used when feature_extractor_type="bert")
+    bert_model_name: str = "bert-base-uncased"  # HuggingFace model name or path
+    bert_max_length: int = 512  # Max sequence length in subword tokens
+    bert_projection_dim: Optional[int] = 128  # Projection dim after CLS; None = use raw hidden size
+    bert_dropout: float = 0.1  # Dropout rate for projection layer
+    bert_freeze_encoder: bool = False  # If True, freeze transformer (only train projection + DragonNet)
+    bert_gradient_checkpointing: bool = False  # Enable gradient checkpointing for memory efficiency
 
     # DragonNet head dimensions
     dragonnet_representation_dim: int = 128

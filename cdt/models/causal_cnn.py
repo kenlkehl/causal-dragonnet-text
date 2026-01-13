@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .cnn_extractor import CNNFeatureExtractor
+from .bert_extractor import BertFeatureExtractor
 from .dragonnet import DragonNet
 from .uplift import UpliftNet
 
@@ -17,21 +18,28 @@ logger = logging.getLogger(__name__)
 
 class CausalCNNText(nn.Module):
     """
-    Causal inference model using a simple 1D CNN for text encoding.
+    Causal inference model for text using CNN or BERT feature extraction.
 
-    Simplified architecture:
-    - 1D CNN encodes text into feature vector (word-level tokenization)
+    Architecture:
+    - Feature extractor (CNN or BERT) encodes text into feature vector
     - DragonNet/UpliftNet predicts outcomes and propensity
 
-    Much faster to train than transformer-based models while still
-    capturing useful patterns in clinical text.
+    CNN mode:
+    - 1D CNN with word-level tokenization
+    - Much faster to train than transformers
+    - IMPORTANT: Call fit_tokenizer(texts) with training data before use
 
-    IMPORTANT: Call fit_tokenizer(texts) with training data before
-    using the model for training or inference.
+    BERT mode:
+    - HuggingFace transformer with CLS token extraction
+    - Fine-tuning or frozen encoder options
+    - No fit_tokenizer() needed (uses pretrained tokenizer)
     """
 
     def __init__(
         self,
+        # Feature extractor type
+        feature_extractor_type: str = "cnn",
+        # CNN-specific args
         embedding_dim: int = 128,
         kernel_sizes: List[int] = [3, 4, 5, 7],
         explicit_filter_concepts: Optional[Dict[str, List[str]]] = None,
@@ -42,26 +50,40 @@ class CausalCNNText(nn.Module):
         min_word_freq: int = 2,
         max_vocab_size: Optional[int] = 50000,
         projection_dim: Optional[int] = 128,
+        # BERT-specific args
+        bert_model_name: str = "bert-base-uncased",
+        bert_max_length: int = 512,
+        bert_projection_dim: Optional[int] = 128,
+        bert_dropout: float = 0.1,
+        bert_freeze_encoder: bool = False,
+        bert_gradient_checkpointing: bool = False,
+        # DragonNet args
         dragonnet_representation_dim: int = 128,
         dragonnet_hidden_outcome_dim: int = 64,
         device: str = "cuda:0",
         model_type: str = "dragonnet"  # "dragonnet" or "uplift"
     ):
         """
-        Initialize causal inference model with CNN.
+        Initialize causal inference model with CNN or BERT feature extractor.
 
         Args:
-            embedding_dim: Dimension of word embeddings
-            kernel_sizes: List of kernel sizes for n-gram capture
-            explicit_filter_concepts: Dict mapping kernel_size (as string) to list of
-                concept phrases. These become explicit filters.
-            num_kmeans_filters: Number of k-means derived filters per kernel size
-            num_random_filters: Number of randomly initialized filters per kernel size
-            cnn_dropout: Dropout rate in CNN
-            max_length: Maximum sequence length in tokens
-            min_word_freq: Minimum word frequency for vocabulary inclusion
-            max_vocab_size: Maximum vocabulary size
-            projection_dim: Dimension to project CNN output to (should match dragonnet input)
+            feature_extractor_type: "cnn" or "bert"
+            embedding_dim: (CNN) Dimension of word embeddings
+            kernel_sizes: (CNN) List of kernel sizes for n-gram capture
+            explicit_filter_concepts: (CNN) Dict mapping kernel_size to concept phrases
+            num_kmeans_filters: (CNN) Number of k-means derived filters per kernel size
+            num_random_filters: (CNN) Number of randomly initialized filters per kernel size
+            cnn_dropout: (CNN) Dropout rate
+            max_length: (CNN) Maximum sequence length in tokens
+            min_word_freq: (CNN) Minimum word frequency for vocabulary inclusion
+            max_vocab_size: (CNN) Maximum vocabulary size
+            projection_dim: (CNN) Dimension to project CNN output to
+            bert_model_name: (BERT) HuggingFace model name or path
+            bert_max_length: (BERT) Maximum sequence length in subword tokens
+            bert_projection_dim: (BERT) Projection dimension after CLS token
+            bert_dropout: (BERT) Dropout rate for projection layer
+            bert_freeze_encoder: (BERT) Whether to freeze transformer weights
+            bert_gradient_checkpointing: (BERT) Enable gradient checkpointing
             dragonnet_representation_dim: DragonNet representation dimension
             dragonnet_hidden_outcome_dim: DragonNet outcome hidden dimension
             device: Device string
@@ -71,9 +93,11 @@ class CausalCNNText(nn.Module):
 
         self._device = torch.device(device)
         self.model_type = model_type
+        self.feature_extractor_type = feature_extractor_type
 
         # Store config for checkpointing
         self.config = {
+            'feature_extractor_type': feature_extractor_type,
             'embedding_dim': embedding_dim,
             'kernel_sizes': kernel_sizes,
             'explicit_filter_concepts': explicit_filter_concepts,
@@ -84,25 +108,46 @@ class CausalCNNText(nn.Module):
             'min_word_freq': min_word_freq,
             'max_vocab_size': max_vocab_size,
             'projection_dim': projection_dim,
+            'bert_model_name': bert_model_name,
+            'bert_max_length': bert_max_length,
+            'bert_projection_dim': bert_projection_dim,
+            'bert_dropout': bert_dropout,
+            'bert_freeze_encoder': bert_freeze_encoder,
+            'bert_gradient_checkpointing': bert_gradient_checkpointing,
             'dragonnet_representation_dim': dragonnet_representation_dim,
             'dragonnet_hidden_outcome_dim': dragonnet_hidden_outcome_dim,
             'model_type': model_type
         }
 
-        # Feature extractor using CNN with word-level tokenization
-        self.feature_extractor = CNNFeatureExtractor(
-            embedding_dim=embedding_dim,
-            kernel_sizes=kernel_sizes,
-            explicit_filter_concepts=explicit_filter_concepts,
-            num_kmeans_filters=num_kmeans_filters,
-            num_random_filters=num_random_filters,
-            projection_dim=projection_dim,
-            dropout=cnn_dropout,
-            max_length=max_length,
-            min_word_freq=min_word_freq,
-            max_vocab_size=max_vocab_size,
-            device=self._device
-        )
+        # Initialize feature extractor based on type
+        if feature_extractor_type == "bert":
+            self.feature_extractor = BertFeatureExtractor(
+                model_name=bert_model_name,
+                projection_dim=bert_projection_dim,
+                max_length=bert_max_length,
+                dropout=bert_dropout,
+                freeze_encoder=bert_freeze_encoder,
+                device=self._device
+            )
+            if bert_gradient_checkpointing:
+                self.feature_extractor.gradient_checkpointing_enable()
+            logger.info(f"Using BERT feature extractor: {bert_model_name}")
+        else:
+            # CNN feature extractor (default)
+            self.feature_extractor = CNNFeatureExtractor(
+                embedding_dim=embedding_dim,
+                kernel_sizes=kernel_sizes,
+                explicit_filter_concepts=explicit_filter_concepts,
+                num_kmeans_filters=num_kmeans_filters,
+                num_random_filters=num_random_filters,
+                projection_dim=projection_dim,
+                dropout=cnn_dropout,
+                max_length=max_length,
+                min_word_freq=min_word_freq,
+                max_vocab_size=max_vocab_size,
+                device=self._device
+            )
+            logger.info("Using CNN feature extractor")
 
         # Binary treatment Causal Inference Net
         input_dim = self.feature_extractor.output_dim
@@ -129,9 +174,7 @@ class CausalCNNText(nn.Module):
         self.to(self._device)
 
         logger.info(f"CausalCNNText initialized:")
-        logger.info(f"  CNN embedding dim: {embedding_dim}")
-        logger.info(f"  CNN kernel sizes: {kernel_sizes}")
-        logger.info(f"  Filters per kernel: {self.feature_extractor._num_filters}")
+        logger.info(f"  Feature extractor: {feature_extractor_type}")
         logger.info(f"  Feature extractor output: {input_dim}")
         logger.info(f"  Device: {self._device}")
 
@@ -297,8 +340,8 @@ class CausalCNNText(nn.Module):
         """
         Fit the word tokenizer on training texts.
 
-        This MUST be called before using the model for training or inference.
-        The tokenizer builds a vocabulary from the provided texts.
+        For CNN: This MUST be called before using the model for training or inference.
+        For BERT: This is a no-op (BERT uses its pretrained tokenizer).
 
         Args:
             texts: List of training text strings
@@ -306,7 +349,9 @@ class CausalCNNText(nn.Module):
         Returns:
             self for method chaining
         """
-        self.feature_extractor.fit_tokenizer(texts)
+        if hasattr(self.feature_extractor, 'fit_tokenizer'):
+            self.feature_extractor.fit_tokenizer(texts)
+        # BERT uses pretrained tokenizer, no fitting needed
         return self
 
     def save_checkpoint(
@@ -324,8 +369,14 @@ class CausalCNNText(nn.Module):
             'model_state_dict': self.state_dict(),
             'feature_extractor': self.feature_extractor.state_dict(),
             'dragonnet': self.net.state_dict(),
-            'tokenizer_state': self.feature_extractor.get_tokenizer_state(),
+            'feature_extractor_type': self.feature_extractor_type,
         }
+
+        # Save tokenizer state for CNN, or extractor state for BERT
+        if self.feature_extractor_type == "cnn":
+            checkpoint['tokenizer_state'] = self.feature_extractor.get_tokenizer_state()
+        else:
+            checkpoint['extractor_state'] = self.feature_extractor.get_state()
 
         if optimizer is not None:
             checkpoint['optimizer_state_dict'] = optimizer.state_dict()
@@ -357,8 +408,8 @@ class CausalCNNText(nn.Module):
         # Create model
         model = cls(**config)
 
-        # Load tokenizer state first (rebuilds embedding layer with correct vocab size)
-        if 'tokenizer_state' in checkpoint:
+        # Load tokenizer state for CNN (rebuilds embedding layer with correct vocab size)
+        if model.feature_extractor_type == "cnn" and 'tokenizer_state' in checkpoint:
             model.feature_extractor.load_tokenizer_state(checkpoint['tokenizer_state'])
 
         # Load state dict (after tokenizer so embedding has correct size)

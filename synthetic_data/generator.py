@@ -66,7 +66,13 @@ def generate_synthetic_dataset(
     output_dir.mkdir(parents=True, exist_ok=True)
     
     logger.info(f"Starting synthetic data generation for: {config.clinical_question[:80]}...")
-    
+
+    # Log positivity enforcement settings
+    if getattr(config, 'enforce_positivity', False):
+        logger.info(f"Positivity enforcement ENABLED: treatment rate per stratum bounded to [{config.min_treatment_rate_per_stratum:.2f}, {config.max_treatment_rate_per_stratum:.2f}]")
+    else:
+        logger.info("Positivity enforcement disabled (realistic observational data)")
+
     # Step 1: Generate confounders
     logger.info("Step 1/5: Generating confounders...")
     confounders = _generate_confounders(client, config.clinical_question, num_confounders=config.num_confounders)
@@ -681,8 +687,33 @@ def _sample_patient_characteristics(
             
             chosen = np.random.choice(categories, p=probs)
             characteristics[name] = chosen
-    
+
     return characteristics
+
+
+def _enforce_positivity(
+    treatment_prob: float,
+    min_rate: float = 0.1,
+    max_rate: float = 0.9,
+) -> float:
+    """
+    Enforce positivity bounds on treatment probability.
+
+    Clips the treatment probability to ensure both treatment and control
+    groups have adequate representation in each confounder stratum.
+    This is essential for valid causal inference - without positivity,
+    counterfactual outcomes cannot be estimated for subpopulations that
+    never receive treatment.
+
+    Args:
+        treatment_prob: Original treatment probability from logistic model
+        min_rate: Minimum allowed P(T=1|X) - ensures some patients get treated
+        max_rate: Maximum allowed P(T=1|X) - ensures some patients remain control
+
+    Returns:
+        Clipped treatment probability within [min_rate, max_rate]
+    """
+    return np.clip(treatment_prob, min_rate, max_rate)
 
 
 def _compute_logit(
@@ -808,6 +839,15 @@ def _generate_single_patient(
         characteristics, confounders, summary_stats, treatment_eq
     )
     treatment_prob = 1.0 / (1.0 + np.exp(-treatment_logit))
+
+    # Apply positivity enforcement if enabled
+    if getattr(config, 'enforce_positivity', False):
+        treatment_prob = _enforce_positivity(
+            treatment_prob,
+            min_rate=getattr(config, 'min_treatment_rate_per_stratum', 0.1),
+            max_rate=getattr(config, 'max_treatment_rate_per_stratum', 0.9),
+        )
+
     treatment = int(np.random.random() < treatment_prob)
     
     # Compute outcome logit
@@ -1016,7 +1056,13 @@ def generate_synthetic_dataset_batch(
     output_dir.mkdir(parents=True, exist_ok=True)
     
     logger.info(f"Starting batch synthetic data generation for: {config.clinical_question[:80]}...")
-    
+
+    # Log positivity enforcement settings
+    if getattr(config, 'enforce_positivity', False):
+        logger.info(f"Positivity enforcement ENABLED: treatment rate per stratum bounded to [{config.min_treatment_rate_per_stratum:.2f}, {config.max_treatment_rate_per_stratum:.2f}]")
+    else:
+        logger.info("Positivity enforcement disabled (realistic observational data)")
+
     # Initialize vLLM client for all LLM operations (no HTTP server needed)
     logger.info("Initializing vLLM for offline batch inference...")
     vllm_client = VLLMBatchClient(vllm_config)
@@ -1076,8 +1122,17 @@ def generate_synthetic_dataset_batch(
             characteristics, confounders, summary_stats, treatment_eq
         )
         treatment_prob = 1.0 / (1.0 + np.exp(-treatment_logit))
+
+        # Apply positivity enforcement if enabled
+        if getattr(config, 'enforce_positivity', False):
+            treatment_prob = _enforce_positivity(
+                treatment_prob,
+                min_rate=getattr(config, 'min_treatment_rate_per_stratum', 0.1),
+                max_rate=getattr(config, 'max_treatment_rate_per_stratum', 0.9),
+            )
+
         treatment = int(np.random.random() < treatment_prob)
-        
+
         # Compute outcome logit
         outcome_logit = _compute_logit(
             characteristics, confounders, summary_stats, outcome_eq, treatment=treatment

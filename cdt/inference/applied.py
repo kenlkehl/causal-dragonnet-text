@@ -1,5 +1,5 @@
 # cdt/inference/applied.py
-"""Applied causal inference on real clinical data - CNN-based approach."""
+"""Applied causal inference on real clinical data with CNN or BERT feature extraction."""
 
 import gc
 import json
@@ -264,11 +264,16 @@ def _train_single_model(
     config: AppliedInferenceConfig,
     device: torch.device
 ) -> Tuple[CausalCNNText, List[Dict[str, Any]]]:
-    """Train a single CNN model instance."""
+    """Train a single model instance (CNN or BERT feature extractor)."""
     arch_config = config.architecture
 
-    # Create CNN-based model
+    # Get feature extractor type (default to "cnn" for backward compatibility)
+    feature_extractor_type = getattr(arch_config, 'feature_extractor_type', 'cnn')
+
+    # Create model with appropriate feature extractor
     model = CausalCNNText(
+        feature_extractor_type=feature_extractor_type,
+        # CNN args
         embedding_dim=arch_config.cnn_embedding_dim,
         kernel_sizes=arch_config.cnn_kernel_sizes,
         explicit_filter_concepts=arch_config.cnn_explicit_filter_concepts,
@@ -279,35 +284,48 @@ def _train_single_model(
         min_word_freq=getattr(arch_config, 'cnn_min_word_freq', 2),
         max_vocab_size=getattr(arch_config, 'cnn_max_vocab_size', 50000),
         projection_dim=arch_config.dragonnet_representation_dim,
+        # BERT args
+        bert_model_name=getattr(arch_config, 'bert_model_name', 'bert-base-uncased'),
+        bert_max_length=getattr(arch_config, 'bert_max_length', 512),
+        bert_projection_dim=getattr(arch_config, 'bert_projection_dim', 128),
+        bert_dropout=getattr(arch_config, 'bert_dropout', 0.1),
+        bert_freeze_encoder=getattr(arch_config, 'bert_freeze_encoder', False),
+        bert_gradient_checkpointing=getattr(arch_config, 'bert_gradient_checkpointing', False),
+        # DragonNet args
         dragonnet_representation_dim=arch_config.dragonnet_representation_dim,
         dragonnet_hidden_outcome_dim=arch_config.dragonnet_hidden_outcome_dim,
         device=str(device),
         model_type=arch_config.model_type
     )
-    logger.info("Created CNN model")
+    logger.info(f"Created model with {feature_extractor_type.upper()} feature extractor")
 
-    # Fit word tokenizer on training texts
     train_texts = train_df[config.text_column].tolist()
-    model.fit_tokenizer(train_texts)
-    logger.info(f"Fitted word tokenizer on {len(train_texts)} training texts")
 
-    # Initialize embeddings from BERT if configured (unless random init is explicitly requested)
-    use_random_init = getattr(arch_config, 'cnn_use_random_embedding_init', False)
-    if not use_random_init and getattr(arch_config, 'cnn_init_embeddings_from', None):
-        model.feature_extractor.init_embeddings_from_bert(
-            arch_config.cnn_init_embeddings_from,
-            freeze=getattr(arch_config, 'cnn_freeze_embeddings', False)
-        )
-    elif use_random_init:
-        logger.info("Using random embedding initialization (cnn_use_random_embedding_init=True)")
+    if feature_extractor_type == "cnn":
+        # CNN-specific initialization
+        # Fit word tokenizer on training texts
+        model.fit_tokenizer(train_texts)
+        logger.info(f"Fitted word tokenizer on {len(train_texts)} training texts")
 
-    # Initialize filters from explicit concepts and/or k-means
-    # (filter config is already in the model from constructor)
-    if arch_config.cnn_explicit_filter_concepts or arch_config.cnn_num_kmeans_filters > 0:
-        model.feature_extractor.init_filters(
-            texts=train_texts,
-            freeze=arch_config.cnn_freeze_filters
-        )
+        # Initialize embeddings from BERT if configured (unless random init is explicitly requested)
+        use_random_init = getattr(arch_config, 'cnn_use_random_embedding_init', False)
+        if not use_random_init and getattr(arch_config, 'cnn_init_embeddings_from', None):
+            model.feature_extractor.init_embeddings_from_bert(
+                arch_config.cnn_init_embeddings_from,
+                freeze=getattr(arch_config, 'cnn_freeze_embeddings', False)
+            )
+        elif use_random_init:
+            logger.info("Using random embedding initialization (cnn_use_random_embedding_init=True)")
+
+        # Initialize filters from explicit concepts and/or k-means
+        if arch_config.cnn_explicit_filter_concepts or arch_config.cnn_num_kmeans_filters > 0:
+            model.feature_extractor.init_filters(
+                texts=train_texts,
+                freeze=arch_config.cnn_freeze_filters
+            )
+    else:
+        # BERT uses pretrained tokenizer, no fit_tokenizer needed
+        logger.info(f"Using BERT feature extractor: {arch_config.bert_model_name}")
 
     # Create datasets
     train_dataset = ClinicalTextDataset(
@@ -607,6 +625,7 @@ def _save_filter_interpretations(
     Generate and save filter interpretation analysis.
 
     Saves both a JSON file with structured data and a text summary.
+    Only applicable for CNN feature extractors.
 
     Args:
         model: Trained CausalCNNText model
@@ -614,6 +633,11 @@ def _save_filter_interpretations(
         output_dir: Directory to save interpretation files
         top_k: Number of top n-grams per filter
     """
+    # Filter interpretations only available for CNN models
+    if model.feature_extractor_type != "cnn":
+        logger.info("Filter interpretations not available for BERT feature extractor (CNN-only feature)")
+        return
+
     logger.info(f"Analyzing filter activations on {len(train_texts)} texts...")
 
     # Get structured interpretations

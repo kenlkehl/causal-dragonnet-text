@@ -13,6 +13,7 @@ cdt/experiments/runner.py
 cdt/inference/__init__.py
 cdt/inference/applied.py
 cdt/models/__init__.py
+cdt/models/bert_extractor.py
 cdt/models/causal_cnn.py
 cdt/models/cnn_extractor.py
 cdt/models/components.py
@@ -30,6 +31,8 @@ cdt_causal.egg-info/dependency_links.txt
 cdt_causal.egg-info/entry_points.txt
 cdt_causal.egg-info/requires.txt
 cdt_causal.egg-info/top_level.txt
+examples/bert_config.json
+examples/modernbert_config.json
 examples/semantic_cnn_config.json
 synthetic_data/__init__.py
 synthetic_data/cli.py

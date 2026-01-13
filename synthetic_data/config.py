@@ -38,6 +38,11 @@ class SyntheticDataConfig:
     target_treatment_rate: float = 0.5  # Proportion of patients receiving treatment=1
     target_control_outcome_rate: float = 0.2  # Outcome rate in control group (treatment=0)
 
+    # Positivity enforcement - ensures adequate treatment/control overlap for causal inference
+    enforce_positivity: bool = False  # If True, ensures minimum treatment rate per confounder stratum
+    min_treatment_rate_per_stratum: float = 0.1  # Minimum P(T=1|X) for each stratum (requires enforce_positivity=True)
+    max_treatment_rate_per_stratum: float = 0.9  # Maximum P(T=1|X) for each stratum (requires enforce_positivity=True)
+
     # Coefficient scaling (to keep logits in reasonable range)
     main_coefficient_scale: float = 0.3  # Scale for main effect coefficients
     interaction_coefficient_scale: float = 0.1  # Scale for interaction coefficients
@@ -87,9 +92,18 @@ class SyntheticDataConfig:
         """Validate configuration."""
         if self.dataset_size < 1:
             raise ValueError("dataset_size must be at least 1")
-        
+
         if not self.clinical_question.strip():
             raise ValueError("clinical_question cannot be empty")
-        
+
         if not self.llm.api_base_url:
             raise ValueError("llm.api_base_url is required")
+
+        # Validate positivity enforcement parameters
+        if self.enforce_positivity:
+            if not (0 < self.min_treatment_rate_per_stratum < 1):
+                raise ValueError("min_treatment_rate_per_stratum must be between 0 and 1 (exclusive)")
+            if not (0 < self.max_treatment_rate_per_stratum < 1):
+                raise ValueError("max_treatment_rate_per_stratum must be between 0 and 1 (exclusive)")
+            if self.min_treatment_rate_per_stratum >= self.max_treatment_rate_per_stratum:
+                raise ValueError("min_treatment_rate_per_stratum must be less than max_treatment_rate_per_stratum")
