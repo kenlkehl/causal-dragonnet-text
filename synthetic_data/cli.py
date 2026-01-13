@@ -3,7 +3,9 @@
 
 import argparse
 import logging
+import os
 import sys
+from pathlib import Path
 
 from .config import SyntheticDataConfig, LLMConfig, DEFAULT_CLINICAL_QUESTION
 from .generator import generate_synthetic_dataset, generate_synthetic_dataset_batch
@@ -22,11 +24,22 @@ Examples:
   # Generate with OpenAI API
   python -m synthetic_data.cli --api-url https://api.openai.com/v1 --api-key $OPENAI_API_KEY --model gpt-4
 
-  # Custom clinical question
-  python -m synthetic_data.cli --clinical-question "Compare pembrolizumab with nivolumab for NSCLC" 
+  # Load from config file (CLI args override config file values)
+  python -m synthetic_data.cli --config my_config.json --dataset-size 1000
+
+  # Custom clinical question with positivity enforcement
+  python -m synthetic_data.cli --clinical-question "Compare pembrolizumab with nivolumab for NSCLC" --enforce-positivity
         """,
     )
-    
+
+    # Config file (loaded first, then CLI args override)
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to JSON config file. CLI arguments override config file values.",
+    )
+
     # Clinical question
     parser.add_argument(
         "--clinical-question",
@@ -66,7 +79,26 @@ Examples:
         default=None,
         help="Number of confounders to generate (default: 8-12, determined by LLM)",
     )
-    
+
+    # Positivity enforcement
+    parser.add_argument(
+        "--enforce-positivity",
+        action="store_true",
+        help="Enforce minimum treatment/control rates per confounder stratum (avoids positivity violations)",
+    )
+    parser.add_argument(
+        "--min-treatment-rate",
+        type=float,
+        default=0.1,
+        help="Minimum P(T=1|X) per stratum when --enforce-positivity is set (default: 0.1)",
+    )
+    parser.add_argument(
+        "--max-treatment-rate",
+        type=float,
+        default=0.9,
+        help="Maximum P(T=1|X) per stratum when --enforce-positivity is set (default: 0.9)",
+    )
+
     # LLM parameters
     parser.add_argument(
         "--api-url",
@@ -164,35 +196,89 @@ Examples:
     )
     
     args = parser.parse_args()
-    
+
     # Setup logging
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-    
-    # Build configuration
-    config = SyntheticDataConfig(
-        clinical_question=args.clinical_question,
-        dataset_size=args.dataset_size,
-        treatment_coefficient=args.treatment_coefficient,
-        target_treatment_rate=args.target_treatment_rate,
-        target_control_outcome_rate=args.target_control_outcome_rate,
-        num_confounders=args.num_confounders,
-        outcome_type=args.outcome_type,
-        outcome_noise_std=args.outcome_noise_std,
-        output_dir=args.output_dir,
-        seed=args.seed,
-        llm=LLMConfig(
-            api_base_url=args.api_url,
-            api_key=args.api_key,
-            model_name=args.model,
-            temperature=args.temperature,
-            max_tokens=args.max_tokens,
-        ),
-    )
-    
+
+    # Build configuration: load from file first, then override with CLI args
+    if args.config:
+        logging.info(f"Loading config from: {args.config}")
+        config = SyntheticDataConfig.from_json(args.config)
+        # Override with any explicitly provided CLI args
+        # We check against defaults to see if user provided a value
+        if args.clinical_question != DEFAULT_CLINICAL_QUESTION:
+            config.clinical_question = args.clinical_question
+        if args.dataset_size != 500:
+            config.dataset_size = args.dataset_size
+        if args.treatment_coefficient != 1.0:
+            config.treatment_coefficient = args.treatment_coefficient
+        if args.target_treatment_rate != 0.5:
+            config.target_treatment_rate = args.target_treatment_rate
+        if args.target_control_outcome_rate != 0.2:
+            config.target_control_outcome_rate = args.target_control_outcome_rate
+        if args.enforce_positivity:
+            config.enforce_positivity = True
+        if args.min_treatment_rate != 0.1:
+            config.min_treatment_rate_per_stratum = args.min_treatment_rate
+        if args.max_treatment_rate != 0.9:
+            config.max_treatment_rate_per_stratum = args.max_treatment_rate
+        if args.num_confounders is not None:
+            config.num_confounders = args.num_confounders
+        if args.outcome_type != "binary":
+            config.outcome_type = args.outcome_type
+        if args.outcome_noise_std != 1.0:
+            config.outcome_noise_std = args.outcome_noise_std
+        if args.output_dir != "./synthetic_output":
+            config.output_dir = args.output_dir
+        if args.seed != 42:
+            config.seed = args.seed
+        # LLM overrides
+        if args.api_url != "http://localhost:8000/v1":
+            config.llm.api_base_url = args.api_url
+        if args.api_key != "":
+            config.llm.api_key = args.api_key
+        if args.model != "openai/gpt-oss-120b":
+            config.llm.model_name = args.model
+        if args.temperature != 0.7:
+            config.llm.temperature = args.temperature
+        if args.max_tokens != 50000:
+            config.llm.max_tokens = args.max_tokens
+    else:
+        # Build config from CLI args
+        config = SyntheticDataConfig(
+            clinical_question=args.clinical_question,
+            dataset_size=args.dataset_size,
+            treatment_coefficient=args.treatment_coefficient,
+            target_treatment_rate=args.target_treatment_rate,
+            target_control_outcome_rate=args.target_control_outcome_rate,
+            enforce_positivity=args.enforce_positivity,
+            min_treatment_rate_per_stratum=args.min_treatment_rate,
+            max_treatment_rate_per_stratum=args.max_treatment_rate,
+            num_confounders=args.num_confounders,
+            outcome_type=args.outcome_type,
+            outcome_noise_std=args.outcome_noise_std,
+            output_dir=args.output_dir,
+            seed=args.seed,
+            llm=LLMConfig(
+                api_base_url=args.api_url,
+                api_key=args.api_key,
+                model_name=args.model,
+                temperature=args.temperature,
+                max_tokens=args.max_tokens,
+            ),
+        )
+
+    # Save config to output directory before generation
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    config_output_path = output_dir / "generation_config.json"
+    config.to_json(str(config_output_path))
+    logging.info(f"Config saved to: {config_output_path}")
+
     # Run generation
     try:
         if args.use_vllm_batch:
@@ -220,12 +306,15 @@ Examples:
         
         print(f"\n✓ Generated {len(df)} patients")
         print(f"  - Treatment rate: {df['treatment_indicator'].mean():.1%}")
-        if args.outcome_type == "continuous":
+        if config.outcome_type == "continuous":
             print(f"  - Outcome mean: {df['outcome_indicator'].mean():.2f} (std: {df['outcome_indicator'].std():.2f})")
         else:
             print(f"  - Outcome rate: {df['outcome_indicator'].mean():.1%}")
-        print(f"  - Output: {args.output_dir}/dataset.parquet")
-        print(f"  - Metadata: {args.output_dir}/metadata.json")
+        if config.enforce_positivity:
+            print(f"  - Positivity enforcement: ON (min={config.min_treatment_rate_per_stratum:.0%}, max={config.max_treatment_rate_per_stratum:.0%})")
+        print(f"  - Config: {config.output_dir}/generation_config.json")
+        print(f"  - Dataset: {config.output_dir}/dataset.parquet")
+        print(f"  - Metadata: {config.output_dir}/metadata.json")
         
     except Exception as e:
         logging.error(f"Generation failed: {e}", exc_info=True)
