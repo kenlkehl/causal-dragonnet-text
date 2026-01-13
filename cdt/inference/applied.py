@@ -2,6 +2,7 @@
 """Applied causal inference on real clinical data - CNN-based approach."""
 
 import gc
+import json
 import logging
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Any
@@ -35,7 +36,9 @@ def run_applied_inference(
     cache=None,  # Kept for API compatibility, not used
     pretrained_weights_path: Optional[Path] = None,
     gpu_ids: Optional[List[int]] = None,
-    num_workers: int = 1
+    num_workers: int = 1,
+    save_filter_interpretations: bool = False,
+    filter_interpretation_top_k: int = 10
 ) -> None:
     """
     Run applied causal inference on real data using CNN backbone.
@@ -49,6 +52,8 @@ def run_applied_inference(
         pretrained_weights_path: Unused, kept for API compatibility
         gpu_ids: List of GPU IDs for parallel processing
         num_workers: Number of parallel workers
+        save_filter_interpretations: Whether to save filter interpretation analysis
+        filter_interpretation_top_k: Number of top n-grams per filter to save
     """
     logger.info("=" * 80)
     logger.info("APPLIED CAUSAL INFERENCE (CNN)")
@@ -57,11 +62,13 @@ def run_applied_inference(
     # Determine mode
     if config.cv_folds > 1:
         _run_cv_inference(
-            dataset, config, output_path, device, gpu_ids, num_workers
+            dataset, config, output_path, device, gpu_ids, num_workers,
+            save_filter_interpretations, filter_interpretation_top_k
         )
     else:
         _run_fixed_split_inference(
-            dataset, config, output_path, device
+            dataset, config, output_path, device,
+            save_filter_interpretations, filter_interpretation_top_k
         )
 
 
@@ -71,7 +78,9 @@ def _run_cv_inference(
     output_path: Path,
     device: torch.device,
     gpu_ids: Optional[List[int]] = None,
-    num_workers: int = 1
+    num_workers: int = 1,
+    save_filter_interpretations: bool = False,
+    filter_interpretation_top_k: int = 10
 ) -> None:
     """Run K-Fold Cross-Validation inference."""
     k = config.cv_folds
@@ -119,6 +128,29 @@ def _run_cv_inference(
     log_path = output_path.parent / "training_log.csv"
     pd.DataFrame(all_training_logs).to_csv(log_path, index=False)
     logger.info(f"Training logs saved to: {log_path}")
+
+    # Save filter interpretations for the last fold if requested
+    # (In CV mode, we train one more model on the last fold's training data for interpretation)
+    if save_filter_interpretations:
+        logger.info("Generating filter interpretations from final fold model...")
+        last_fold = k - 1
+        train_idx, _ = splits[last_fold]
+        train_df = dataset.iloc[train_idx]
+        val_df = dataset.iloc[splits[last_fold][1]]  # Use test as val for this
+
+        # Train a model on the last fold for interpretation
+        model, _ = _train_single_model(train_df, val_df, config, devices[0])
+        train_texts = train_df[config.text_column].tolist()
+        _save_filter_interpretations(
+            model, train_texts, output_path.parent,
+            top_k=filter_interpretation_top_k
+        )
+
+        # Cleanup
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def _process_fold(
@@ -182,7 +214,9 @@ def _run_fixed_split_inference(
     dataset: pd.DataFrame,
     config: AppliedInferenceConfig,
     output_path: Path,
-    device: torch.device
+    device: torch.device,
+    save_filter_interpretations: bool = False,
+    filter_interpretation_top_k: int = 10
 ) -> None:
     """Run inference using fixed train/val/test splits."""
     logger.info("Running Fixed Split Inference (Train/Val/Test)")
@@ -201,6 +235,14 @@ def _run_fixed_split_inference(
     log_path = output_path.parent / "training_log.csv"
     pd.DataFrame(history).to_csv(log_path, index=False)
     logger.info(f"Training logs saved to: {log_path}")
+
+    # Save filter interpretations if requested
+    if save_filter_interpretations:
+        train_texts = train_df[config.text_column].tolist()
+        _save_filter_interpretations(
+            model, train_texts, output_path.parent,
+            top_k=filter_interpretation_top_k
+        )
 
     # Predict on Test
     logger.info("Generating predictions on test set...")
@@ -228,8 +270,10 @@ def _train_single_model(
     # Create CNN-based model
     model = CausalCNNText(
         embedding_dim=arch_config.cnn_embedding_dim,
-        num_filters=arch_config.cnn_num_filters,
         kernel_sizes=arch_config.cnn_kernel_sizes,
+        explicit_filter_concepts=arch_config.cnn_explicit_filter_concepts,
+        num_kmeans_filters=arch_config.cnn_num_kmeans_filters,
+        num_random_filters=arch_config.cnn_num_random_filters,
         cnn_dropout=arch_config.cnn_dropout,
         max_length=arch_config.cnn_max_length,
         min_word_freq=getattr(arch_config, 'cnn_min_word_freq', 2),
@@ -258,20 +302,12 @@ def _train_single_model(
         logger.info("Using random embedding initialization (cnn_use_random_embedding_init=True)")
 
     # Initialize filters from explicit concepts and/or k-means
-    use_semantic_init = getattr(arch_config, 'cnn_use_semantic_init', True)
-    if use_semantic_init:
-        explicit_concepts = getattr(arch_config, 'cnn_explicit_filter_concepts', None)
-        num_latent = getattr(arch_config, 'cnn_num_latent_filters', 0)
-        if explicit_concepts or num_latent > 0:
-            model.feature_extractor.init_filters(
-                texts=train_texts,
-                explicit_concepts=explicit_concepts,
-                num_latent_per_kernel=num_latent,
-                bert_model_name=getattr(arch_config, 'cnn_init_embeddings_from', None),
-                freeze=getattr(arch_config, 'cnn_freeze_filters', False)
-            )
-    else:
-        logger.info("Skipping semantic filter initialization (cnn_use_semantic_init=False)")
+    # (filter config is already in the model from constructor)
+    if arch_config.cnn_explicit_filter_concepts or arch_config.cnn_num_kmeans_filters > 0:
+        model.feature_extractor.init_filters(
+            texts=train_texts,
+            freeze=arch_config.cnn_freeze_filters
+        )
 
     # Create datasets
     train_dataset = ClinicalTextDataset(
@@ -559,3 +595,47 @@ def _save_and_summarize(results_df: pd.DataFrame, output_path: Path) -> None:
     logger.info(f"  Mean ITE: {results_df['ite_pred'].mean():.4f}")
     logger.info(f"  Std ITE: {results_df['ite_pred'].std():.4f}")
     logger.info(f"  Mean propensity: {results_df['propensity_pred'].mean():.4f}")
+
+
+def _save_filter_interpretations(
+    model: CausalCNNText,
+    train_texts: List[str],
+    output_dir: Path,
+    top_k: int = 10
+) -> None:
+    """
+    Generate and save filter interpretation analysis.
+
+    Saves both a JSON file with structured data and a text summary.
+
+    Args:
+        model: Trained CausalCNNText model
+        train_texts: Training texts to analyze activations on
+        output_dir: Directory to save interpretation files
+        top_k: Number of top n-grams per filter
+    """
+    logger.info(f"Analyzing filter activations on {len(train_texts)} texts...")
+
+    # Get structured interpretations
+    interpretations = model.feature_extractor.interpret_filters(
+        train_texts,
+        top_k=top_k,
+        batch_size=32
+    )
+
+    # Save JSON with full data
+    json_path = output_dir / "filter_interpretations.json"
+    with open(json_path, 'w') as f:
+        json.dump(interpretations, f, indent=2)
+    logger.info(f"Filter interpretations saved to: {json_path}")
+
+    # Save human-readable summary
+    summary = model.feature_extractor.get_filter_summary(
+        train_texts,
+        top_k=top_k,
+        batch_size=32
+    )
+    summary_path = output_dir / "filter_interpretations_summary.txt"
+    with open(summary_path, 'w') as f:
+        f.write(summary)
+    logger.info(f"Filter interpretation summary saved to: {summary_path}")

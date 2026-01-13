@@ -295,8 +295,10 @@ def _train_cnn_model(
 
     model = CausalCNNText(
         embedding_dim=arch_config.cnn_embedding_dim,
-        num_filters=arch_config.cnn_num_filters,
         kernel_sizes=arch_config.cnn_kernel_sizes,
+        explicit_filter_concepts=arch_config.cnn_explicit_filter_concepts,
+        num_kmeans_filters=arch_config.cnn_num_kmeans_filters,
+        num_random_filters=arch_config.cnn_num_random_filters,
         cnn_dropout=arch_config.cnn_dropout,
         max_length=arch_config.cnn_max_length,
         min_word_freq=getattr(arch_config, 'cnn_min_word_freq', 2),
@@ -322,21 +324,13 @@ def _train_cnn_model(
     elif use_random_init:
         logger.info("Using random embedding initialization (cnn_use_random_embedding_init=True)")
 
-    # Initialize filters
-    use_semantic_init = getattr(arch_config, 'cnn_use_semantic_init', True)
-    if use_semantic_init:
-        explicit_concepts = getattr(arch_config, 'cnn_explicit_filter_concepts', None)
-        num_latent = getattr(arch_config, 'cnn_num_latent_filters', 0)
-        if explicit_concepts or num_latent > 0:
-            model.feature_extractor.init_filters(
-                texts=train_texts,
-                explicit_concepts=explicit_concepts,
-                num_latent_per_kernel=num_latent,
-                bert_model_name=getattr(arch_config, 'cnn_init_embeddings_from', None),
-                freeze=getattr(arch_config, 'cnn_freeze_filters', False)
-            )
-    else:
-        logger.info("Skipping semantic filter initialization (cnn_use_semantic_init=False)")
+    # Initialize filters from explicit concepts and/or k-means
+    # (filter config is already in the model from constructor)
+    if arch_config.cnn_explicit_filter_concepts or arch_config.cnn_num_kmeans_filters > 0:
+        model.feature_extractor.init_filters(
+            texts=train_texts,
+            freeze=arch_config.cnn_freeze_filters
+        )
 
     # Create datasets
     train_dataset = ClinicalTextDataset(

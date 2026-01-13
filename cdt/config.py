@@ -15,7 +15,6 @@ class ModelArchitectureConfig:
 
     # CNN architecture
     cnn_embedding_dim: int = 128  # Word embedding dimension
-    cnn_num_filters: int = 256  # Number of filters per kernel size
     cnn_kernel_sizes: List[int] = field(default_factory=lambda: [3, 4, 5, 7])
     cnn_dropout: float = 0.1
     cnn_max_length: int = 2048  # Max sequence length in tokens (words)
@@ -27,16 +26,30 @@ class ModelArchitectureConfig:
     cnn_init_embeddings_from: Optional[str] = None  # e.g., "emilyalsentzer/Bio_ClinicalBERT"
     cnn_freeze_embeddings: bool = False  # Whether to freeze BERT-initialized embeddings
 
-    # Filter initialization: explicit concepts + latent (data-driven)
+    # Filter initialization: specify each filter type separately
+    # Total filters per kernel = max(explicit_count_per_kernel) + kmeans + random
     # Dict mapping kernel_size (as string in JSON) to list of concept phrases
     cnn_explicit_filter_concepts: Optional[Dict[str, List[str]]] = None
-    cnn_num_latent_filters: int = 64  # Number of k-means derived filters per kernel size
+    cnn_num_kmeans_filters: int = 64  # Number of k-means derived filters per kernel size
+    cnn_num_random_filters: int = 0  # Number of randomly initialized filters per kernel size
     cnn_freeze_filters: bool = False  # Whether to freeze CNN filters after initialization
-    cnn_use_semantic_init: bool = True  # Whether to use semantic filter initialization (concepts + k-means)
 
     # DragonNet head dimensions
     dragonnet_representation_dim: int = 128
     dragonnet_hidden_outcome_dim: int = 64
+
+    def get_num_filters_per_kernel(self) -> int:
+        """
+        Compute total number of filters per kernel size.
+
+        Total = max(explicit concepts per kernel) + kmeans + random
+        This ensures all kernel sizes have the same number of output channels.
+        """
+        max_explicit = 0
+        if self.cnn_explicit_filter_concepts:
+            for concepts in self.cnn_explicit_filter_concepts.values():
+                max_explicit = max(max_explicit, len(concepts))
+        return max_explicit + self.cnn_num_kmeans_filters + self.cnn_num_random_filters
 
 
 @dataclass
@@ -106,6 +119,10 @@ class ExperimentConfig:
     num_workers: int = 1
     gpu_ids: Optional[List[int]] = None
 
+    # Filter interpretation settings
+    save_filter_interpretations: bool = False  # Save post-hoc filter interpretations after training
+    filter_interpretation_top_k: int = 10  # Number of top n-grams per filter to save
+
     applied_inference: AppliedInferenceConfig = field(default_factory=AppliedInferenceConfig)
     plasmode_experiments: PlasmodeExperimentConfig = field(default_factory=PlasmodeExperimentConfig)
 
@@ -155,6 +172,8 @@ class ExperimentConfig:
             device=data.get('device'),
             num_workers=data.get('num_workers', 1),
             gpu_ids=data.get('gpu_ids'),
+            save_filter_interpretations=data.get('save_filter_interpretations', False),
+            filter_interpretation_top_k=data.get('filter_interpretation_top_k', 10),
             applied_inference=applied,
             plasmode_experiments=plasmode
         )
@@ -190,7 +209,8 @@ def create_default_config(output_path: str) -> None:
             cv_folds=5,
             architecture=ModelArchitectureConfig(
                 cnn_init_embeddings_from="emilyalsentzer/Bio_ClinicalBERT",
-                cnn_num_latent_filters=64
+                cnn_num_kmeans_filters=64,
+                cnn_num_random_filters=0
             ),
             training=TrainingConfig(
                 epochs=50,

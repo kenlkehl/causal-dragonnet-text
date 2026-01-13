@@ -248,8 +248,10 @@ class CNNFeatureExtractor(nn.Module):
     def __init__(
         self,
         embedding_dim: int = 128,
-        num_filters: int = 256,
         kernel_sizes: List[int] = [3, 4, 5, 7],
+        explicit_filter_concepts: Optional[Dict[str, List[str]]] = None,
+        num_kmeans_filters: int = 64,
+        num_random_filters: int = 0,
         projection_dim: Optional[int] = 128,
         dropout: float = 0.1,
         max_length: int = 2048,
@@ -262,8 +264,11 @@ class CNNFeatureExtractor(nn.Module):
 
         Args:
             embedding_dim: Dimension of word embeddings
-            num_filters: Number of filters per kernel size
             kernel_sizes: List of kernel sizes (captures different n-gram lengths)
+            explicit_filter_concepts: Dict mapping kernel_size (as string) to list of
+                concept phrases. These become explicit filters initialized from concepts.
+            num_kmeans_filters: Number of k-means derived filters per kernel size
+            num_random_filters: Number of randomly initialized filters per kernel size
             projection_dim: Final output dimension. If None, use num_filters * len(kernel_sizes)
             dropout: Dropout rate
             max_length: Maximum sequence length in tokens
@@ -272,6 +277,24 @@ class CNNFeatureExtractor(nn.Module):
             device: Device to place model on
         """
         super().__init__()
+
+        # Store filter config for later initialization
+        self._explicit_filter_concepts = explicit_filter_concepts or {}
+        self._num_kmeans_filters = num_kmeans_filters
+        self._num_random_filters = num_random_filters
+
+        # Compute total filters per kernel: max(explicit) + kmeans + random
+        max_explicit = 0
+        if self._explicit_filter_concepts:
+            for concepts in self._explicit_filter_concepts.values():
+                max_explicit = max(max_explicit, len(concepts))
+        num_filters = max_explicit + num_kmeans_filters + num_random_filters
+
+        if num_filters == 0:
+            raise ValueError(
+                "Total filters per kernel is 0. Specify at least one of: "
+                "explicit_filter_concepts, num_kmeans_filters, or num_random_filters"
+            )
 
         self.max_length = max_length
         self._projection_dim = projection_dim
@@ -312,6 +335,17 @@ class CNNFeatureExtractor(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
+        # Filter metadata: tracks initialization type for each filter
+        # {filter_id: {"init_type": "random"|"explicit"|"kmeans", "concept": str|None}}
+        self._filter_metadata: Dict[str, Dict[str, Any]] = {}
+        for k in kernel_sizes:
+            for f in range(num_filters):
+                filter_id = f"kernel_{k}_filter_{f}"
+                self._filter_metadata[filter_id] = {
+                    "init_type": "random",
+                    "concept": None
+                }
+
         # Calculate CNN output dimension
         cnn_output_dim = num_filters * len(kernel_sizes)
         self.hidden_size = cnn_output_dim
@@ -333,10 +367,14 @@ class CNNFeatureExtractor(nn.Module):
         # Final normalization
         self.feature_norm = nn.LayerNorm(self.output_dim)
 
+        # Store computed num_filters for reference
+        self._num_filters = num_filters
+
         logger.info(f"CNNFeatureExtractor initialized:")
         logger.info(f"  Embedding dim: {embedding_dim}")
-        logger.info(f"  Num filters: {num_filters}")
         logger.info(f"  Kernel sizes: {kernel_sizes}")
+        logger.info(f"  Filters per kernel: {num_filters} "
+                    f"(explicit: {max_explicit}, kmeans: {num_kmeans_filters}, random: {num_random_filters})")
         logger.info(f"  CNN output dim: {cnn_output_dim}")
         logger.info(f"  Output dim: {self.output_dim}")
         logger.info(f"  NOTE: Call fit_tokenizer() before training")
@@ -485,25 +523,23 @@ class CNNFeatureExtractor(nn.Module):
     def init_filters(
         self,
         texts: List[str],
-        explicit_concepts: Optional[Dict[str, List[str]]] = None,
-        num_latent_per_kernel: int = 64,
-        bert_model_name: Optional[str] = None,
         freeze: bool = False
     ) -> 'CNNFeatureExtractor':
         """
         Initialize CNN filters from explicit concepts and k-means clustering.
 
-        For each kernel size k with num_filters=N:
+        Uses the configuration provided at construction time:
+        - explicit_filter_concepts: explicit concept phrases per kernel size
+        - num_kmeans_filters: filters derived from k-means on training n-grams
+        - num_random_filters: randomly initialized filters (already random from init)
+
+        For each kernel size k:
         - First len(concepts[k]) filters: from explicit concepts
-        - Next num_latent_per_kernel filters: from k-means on training n-grams
-        - Remaining: keep random initialization
+        - Next num_kmeans_filters: from k-means on training n-grams
+        - Last num_random_filters: keep random initialization
 
         Args:
             texts: Training texts for k-means clustering of n-grams
-            explicit_concepts: Dict mapping kernel_size (as string) to list of concept phrases
-            num_latent_per_kernel: Number of k-means derived filters per kernel size
-            bert_model_name: If provided, use BERT embeddings for concepts
-                            (otherwise use current embedding layer)
             freeze: If True, freeze all conv layer weights after initialization
 
         Returns:
@@ -518,11 +554,15 @@ class CNNFeatureExtractor(nn.Module):
                 "Call fit_tokenizer() first."
             )
 
-        logger.info("Initializing CNN filters from concepts and k-means")
+        # Use stored configuration
+        explicit_concepts = self._explicit_filter_concepts
+        num_kmeans = self._num_kmeans_filters
+        num_random = self._num_random_filters
 
-        # Parse explicit concepts
-        if explicit_concepts is None:
-            explicit_concepts = {}
+        logger.info("Initializing CNN filters:")
+        logger.info(f"  Explicit concepts: {sum(len(v) for v in explicit_concepts.values())} total")
+        logger.info(f"  K-means filters per kernel: {num_kmeans}")
+        logger.info(f"  Random filters per kernel: {num_random}")
 
         # Normalize keys to int
         concepts_by_kernel = {
@@ -566,11 +606,19 @@ class CNNFeatureExtractor(nn.Module):
                         ], dim=1)  # (embed_dim, kernel_size)
 
                         conv.weight.data[filter_idx] = filter_weights.to(self._device)
+
+                        # Track metadata
+                        fid = f"kernel_{kernel_size}_filter_{filter_idx}"
+                        self._filter_metadata[fid] = {
+                            "init_type": "explicit",
+                            "concept": concept
+                        }
+
                         filter_idx += 1
 
             # Phase 2: Initialize filters from k-means clustering of n-grams
             remaining_for_kmeans = min(
-                num_latent_per_kernel,
+                num_kmeans,
                 num_filters - filter_idx
             )
 
@@ -630,6 +678,14 @@ class CNNFeatureExtractor(nn.Module):
                             if filter_idx >= num_filters:
                                 break
                             conv.weight.data[filter_idx] = centers[i].to(self._device)
+
+                            # Track metadata
+                            fid = f"kernel_{kernel_size}_filter_{filter_idx}"
+                            self._filter_metadata[fid] = {
+                                "init_type": "kmeans",
+                                "concept": None
+                            }
+
                             filter_idx += 1
                 else:
                     logger.warning(
@@ -734,3 +790,273 @@ class CNNFeatureExtractor(nn.Module):
         """Override to track device properly."""
         self._device = device if isinstance(device, torch.device) else torch.device(device)
         return super().to(device)
+
+    def interpret_filters(
+        self,
+        texts: List[str],
+        top_k: int = 10,
+        batch_size: int = 32,
+        min_activation: float = 0.0,
+        deduplicate: bool = True
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Find the n-grams that most strongly activate each CNN filter.
+
+        For each filter, this method runs all texts through the model and
+        identifies which n-grams produce the highest activation values.
+        This provides post-hoc interpretability for learned filters.
+
+        Args:
+            texts: List of text strings to analyze (typically training data)
+            top_k: Number of top-activating n-grams to return per filter
+            batch_size: Batch size for processing texts
+            min_activation: Minimum activation value to consider
+            deduplicate: If True, return unique n-grams only (by text)
+
+        Returns:
+            Dictionary mapping filter identifiers to filter info with top activations:
+            {
+                "kernel_3_filter_0": {
+                    "init_type": "explicit",  # or "kmeans" or "random"
+                    "concept": "stage iv cancer",  # original concept text if explicit, else None
+                    "top_ngrams": [
+                        {"ngram": "chest pain", "activation": 2.45, "count": 12},
+                        {"ngram": "shortness of", "activation": 2.31, "count": 8},
+                        ...
+                    ]
+                },
+                ...
+            }
+        """
+        import heapq
+
+        if not self.tokenizer._is_fitted:
+            raise RuntimeError("Tokenizer must be fitted before interpreting filters.")
+
+        self.eval()
+
+        # Track top-k per filter using heaps (min-heap, so we keep largest)
+        # Store: {filter_id: [(activation, ngram_text), ...]}
+        # We keep more than top_k during collection to handle deduplication later
+        collect_k = top_k * 5 if deduplicate else top_k
+        filter_heaps: Dict[str, List[tuple]] = {}
+        filter_ngram_counts: Dict[str, Dict[str, int]] = {}  # For counting occurrences
+
+        # Initialize storage for each filter
+        for conv in self.convs:
+            kernel_size = conv.kernel_size[0]
+            for filter_idx in range(conv.out_channels):
+                filter_id = f"kernel_{kernel_size}_filter_{filter_idx}"
+                filter_heaps[filter_id] = []
+                filter_ngram_counts[filter_id] = {}
+
+        # Process texts in batches
+        with torch.no_grad():
+            for batch_start in range(0, len(texts), batch_size):
+                batch_texts = texts[batch_start:batch_start + batch_size]
+
+                # Tokenize
+                encoded = self.tokenizer(
+                    batch_texts,
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_length,
+                    return_tensors='pt'
+                )
+
+                input_ids = encoded['input_ids'].to(self._device)
+                attention_mask = encoded['attention_mask'].to(self._device)
+
+                # Get token lists for each text (for reconstructing n-grams)
+                batch_tokens = [self.tokenizer._tokenize(t) for t in batch_texts]
+
+                # Embed: (batch, seq_len, embed_dim)
+                x = self.embedding(input_ids)
+                x = x * attention_mask.unsqueeze(-1).float()
+
+                # Transpose for conv: (batch, embed_dim, seq_len)
+                x = x.transpose(1, 2)
+
+                # Process each conv layer
+                for conv in self.convs:
+                    kernel_size = conv.kernel_size[0]
+
+                    # Conv output: (batch, num_filters, seq_len)
+                    h = F.relu(conv(x))
+                    # Mask padding positions with -inf for topk
+                    h = h.masked_fill(~attention_mask.unsqueeze(1).bool(), float('-inf'))
+
+                    # For each filter, find top activations across batch using GPU
+                    for filter_idx in range(conv.out_channels):
+                        filter_id = f"kernel_{kernel_size}_filter_{filter_idx}"
+                        heap = filter_heaps[filter_id]
+                        counts = filter_ngram_counts[filter_id]
+
+                        # Get activations for this filter: (batch, seq_len)
+                        filter_acts = h[:, filter_idx, :]
+
+                        # Find top-k positions per sample (on GPU)
+                        # Limit k to sequence length
+                        k_per_sample = min(collect_k, filter_acts.size(1))
+                        if k_per_sample == 0:
+                            continue
+
+                        top_vals, top_pos = torch.topk(filter_acts, k_per_sample, dim=1)
+
+                        # Move to CPU for n-gram extraction
+                        top_vals = top_vals.cpu()
+                        top_pos = top_pos.cpu()
+
+                        # Extract n-grams for top positions
+                        for sample_idx in range(len(batch_texts)):
+                            sample_tokens = batch_tokens[sample_idx]
+                            seq_len = len(sample_tokens)
+
+                            if seq_len < kernel_size:
+                                continue
+
+                            for k_idx in range(k_per_sample):
+                                act_val = top_vals[sample_idx, k_idx].item()
+                                pos = top_pos[sample_idx, k_idx].item()
+
+                                # Skip if below threshold or invalid position
+                                if act_val <= min_activation or act_val == float('-inf'):
+                                    continue
+                                if pos + kernel_size > seq_len:
+                                    continue
+
+                                # Extract n-gram
+                                ngram_tokens = sample_tokens[pos:pos + kernel_size]
+                                ngram_text = " ".join(ngram_tokens)
+
+                                # Update count
+                                counts[ngram_text] = counts.get(ngram_text, 0) + 1
+
+                                # Add to heap (keep top collect_k)
+                                if len(heap) < collect_k:
+                                    heapq.heappush(heap, (act_val, ngram_text))
+                                elif act_val > heap[0][0]:
+                                    heapq.heapreplace(heap, (act_val, ngram_text))
+
+        # Build final results
+        results: Dict[str, Dict[str, Any]] = {}
+
+        for filter_id, heap in filter_heaps.items():
+            # Get metadata for this filter
+            metadata = self._filter_metadata.get(filter_id, {
+                "init_type": "random",
+                "concept": None
+            })
+
+            if not heap:
+                results[filter_id] = {
+                    "init_type": metadata["init_type"],
+                    "concept": metadata["concept"],
+                    "top_ngrams": []
+                }
+                continue
+
+            counts = filter_ngram_counts[filter_id]
+
+            if deduplicate:
+                # Group by n-gram, keep max activation
+                ngram_best: Dict[str, float] = {}
+                for act_val, ngram_text in heap:
+                    if ngram_text not in ngram_best or act_val > ngram_best[ngram_text]:
+                        ngram_best[ngram_text] = act_val
+
+                # Build result list with counts
+                ngram_list = [
+                    {
+                        "ngram": ngram,
+                        "activation": act,
+                        "count": counts.get(ngram, 1)
+                    }
+                    for ngram, act in ngram_best.items()
+                ]
+                # Sort by activation and take top-k
+                ngram_list.sort(key=lambda x: x["activation"], reverse=True)
+                top_ngrams = ngram_list[:top_k]
+            else:
+                # Sort heap and take top-k
+                sorted_heap = sorted(heap, key=lambda x: x[0], reverse=True)[:top_k]
+                top_ngrams = [
+                    {"ngram": ngram, "activation": act, "count": counts.get(ngram, 1)}
+                    for act, ngram in sorted_heap
+                ]
+
+            results[filter_id] = {
+                "init_type": metadata["init_type"],
+                "concept": metadata["concept"],
+                "top_ngrams": top_ngrams
+            }
+
+        return results
+
+    def get_filter_summary(
+        self,
+        texts: List[str],
+        top_k: int = 5,
+        batch_size: int = 32
+    ) -> str:
+        """
+        Generate a human-readable summary of what each filter detects.
+
+        Args:
+            texts: List of text strings to analyze
+            top_k: Number of top n-grams to show per filter
+            batch_size: Batch size for processing
+
+        Returns:
+            Formatted string summary of filter interpretations
+        """
+        interpretations = self.interpret_filters(
+            texts, top_k=top_k, batch_size=batch_size
+        )
+
+        lines = ["=" * 60, "CNN Filter Interpretation Summary", "=" * 60, ""]
+
+        # Group by kernel size
+        kernel_sizes = sorted(set(
+            int(fid.split("_")[1]) for fid in interpretations.keys()
+        ))
+
+        for kernel_size in kernel_sizes:
+            lines.append(f"Kernel Size {kernel_size} ({kernel_size}-grams)")
+            lines.append("-" * 40)
+
+            # Get filters for this kernel size
+            filter_ids = [
+                fid for fid in interpretations.keys()
+                if fid.startswith(f"kernel_{kernel_size}_")
+            ]
+            filter_ids.sort(key=lambda x: int(x.split("_")[-1]))
+
+            for filter_id in filter_ids:
+                filter_info = interpretations[filter_id]
+                top_ngrams = filter_info.get("top_ngrams", [])
+                init_type = filter_info.get("init_type", "random")
+                concept = filter_info.get("concept")
+
+                if not top_ngrams:
+                    continue
+
+                filter_num = filter_id.split("_")[-1]
+
+                # Build init type indicator
+                if init_type == "explicit":
+                    init_label = f"[EXPLICIT: \"{concept}\"]"
+                elif init_type == "kmeans":
+                    init_label = "[KMEANS]"
+                else:
+                    init_label = "[RANDOM]"
+
+                ngram_strs = [
+                    f'"{ng["ngram"]}" ({ng["activation"]:.2f}, n={ng["count"]})'
+                    for ng in top_ngrams[:3]  # Show top 3 in summary
+                ]
+                lines.append(f"  Filter {filter_num} {init_label}: {', '.join(ngram_strs)}")
+
+            lines.append("")
+
+        return "\n".join(lines)

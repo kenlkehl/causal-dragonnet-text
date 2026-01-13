@@ -33,8 +33,10 @@ class CausalCNNText(nn.Module):
     def __init__(
         self,
         embedding_dim: int = 128,
-        num_filters: int = 256,
         kernel_sizes: List[int] = [3, 4, 5, 7],
+        explicit_filter_concepts: Optional[Dict[str, List[str]]] = None,
+        num_kmeans_filters: int = 64,
+        num_random_filters: int = 0,
         cnn_dropout: float = 0.1,
         max_length: int = 2048,
         min_word_freq: int = 2,
@@ -50,8 +52,11 @@ class CausalCNNText(nn.Module):
 
         Args:
             embedding_dim: Dimension of word embeddings
-            num_filters: Number of CNN filters per kernel size
             kernel_sizes: List of kernel sizes for n-gram capture
+            explicit_filter_concepts: Dict mapping kernel_size (as string) to list of
+                concept phrases. These become explicit filters.
+            num_kmeans_filters: Number of k-means derived filters per kernel size
+            num_random_filters: Number of randomly initialized filters per kernel size
             cnn_dropout: Dropout rate in CNN
             max_length: Maximum sequence length in tokens
             min_word_freq: Minimum word frequency for vocabulary inclusion
@@ -70,8 +75,10 @@ class CausalCNNText(nn.Module):
         # Store config for checkpointing
         self.config = {
             'embedding_dim': embedding_dim,
-            'num_filters': num_filters,
             'kernel_sizes': kernel_sizes,
+            'explicit_filter_concepts': explicit_filter_concepts,
+            'num_kmeans_filters': num_kmeans_filters,
+            'num_random_filters': num_random_filters,
             'cnn_dropout': cnn_dropout,
             'max_length': max_length,
             'min_word_freq': min_word_freq,
@@ -85,8 +92,10 @@ class CausalCNNText(nn.Module):
         # Feature extractor using CNN with word-level tokenization
         self.feature_extractor = CNNFeatureExtractor(
             embedding_dim=embedding_dim,
-            num_filters=num_filters,
             kernel_sizes=kernel_sizes,
+            explicit_filter_concepts=explicit_filter_concepts,
+            num_kmeans_filters=num_kmeans_filters,
+            num_random_filters=num_random_filters,
             projection_dim=projection_dim,
             dropout=cnn_dropout,
             max_length=max_length,
@@ -121,8 +130,8 @@ class CausalCNNText(nn.Module):
 
         logger.info(f"CausalCNNText initialized:")
         logger.info(f"  CNN embedding dim: {embedding_dim}")
-        logger.info(f"  CNN num filters: {num_filters}")
         logger.info(f"  CNN kernel sizes: {kernel_sizes}")
+        logger.info(f"  Filters per kernel: {self.feature_extractor._num_filters}")
         logger.info(f"  Feature extractor output: {input_dim}")
         logger.info(f"  Device: {self._device}")
 

@@ -6,7 +6,6 @@ setup.py
 cdt/__init__.py
 cdt/cli.py
 cdt/config.py
-cdt/.ipynb_checkpoints/config-checkpoint.py
 cdt/data/__init__.py
 cdt/data/dataset.py
 cdt/experiments/__init__.py
@@ -20,10 +19,6 @@ cdt/models/components.py
 cdt/models/dragonnet.py
 cdt/models/outcome_heads.py
 cdt/models/uplift.py
-cdt/models/.ipynb_checkpoints/causal_cnn-checkpoint.py
-cdt/models/.ipynb_checkpoints/cnn_extractor-checkpoint.py
-cdt/models/.ipynb_checkpoints/components-checkpoint.py
-cdt/models/.ipynb_checkpoints/dragonnet-checkpoint.py
 cdt/training/__init__.py
 cdt/training/plasmode.py
 cdt/utils/__init__.py
@@ -36,7 +31,6 @@ cdt_causal.egg-info/entry_points.txt
 cdt_causal.egg-info/requires.txt
 cdt_causal.egg-info/top_level.txt
 examples/semantic_cnn_config.json
-examples/.ipynb_checkpoints/semantic_cnn_config-checkpoint.json
 synthetic_data/__init__.py
 synthetic_data/cli.py
 synthetic_data/config.py
