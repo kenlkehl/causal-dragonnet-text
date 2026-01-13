@@ -6,8 +6,8 @@ python -m synthetic_data.cli \
 
 python -m synthetic_data.cli \
   --dataset-size 1000 \
-  --num-confounders 4 \
-  --max-tokens 50000 \ 
-  --use-vllm-batch \ 
-  --tensor-parallel-size 2 \ 
-  --output-dir ./example_synthetic_data_simple
+  --num-confounders 1 \
+  --max-tokens 50000 \
+  --use-vllm-batch \
+  --tensor-parallel-size 2 \
+  --output-dir ../example_synthetic_data_one_confounder
