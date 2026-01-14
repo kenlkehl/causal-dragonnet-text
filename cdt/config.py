@@ -76,6 +76,24 @@ class TrainingConfig:
 
 
 @dataclass
+class PropensityTrimmingConfig:
+    """Configuration for propensity score trimming before causal inference.
+
+    When enabled, trains a propensity-only model using k-fold cross-validation
+    to generate out-of-sample propensity scores, then trims the dataset by
+    removing patients with propensity scores outside the specified bounds.
+    This helps enforce positivity assumption for causal inference.
+    """
+    enabled: bool = False  # Whether to trim by propensity before DragonNet training
+    min_propensity: float = 0.1  # Remove patients with P(T=1|X) below this
+    max_propensity: float = 0.9  # Remove patients with P(T=1|X) above this
+    cv_folds: int = 5  # Number of CV folds for propensity model training
+    propensity_epochs: int = 20  # Training epochs for propensity model
+    propensity_learning_rate: float = 1e-4  # Learning rate for propensity model
+    propensity_batch_size: int = 8  # Batch size for propensity model
+
+
+@dataclass
 class PlasmodeConfig:
     """Configuration for plasmode simulation."""
     generation_mode: str = "phi_linear"
@@ -102,6 +120,7 @@ class AppliedInferenceConfig:
     cv_folds: int = 5  # Number of CV folds (0 or 1 = fixed split)
     architecture: ModelArchitectureConfig = field(default_factory=ModelArchitectureConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    propensity_trimming: PropensityTrimmingConfig = field(default_factory=PropensityTrimmingConfig)
     use_pretrained_weights: bool = False  # Not used for CNN, kept for API compatibility
     skip: bool = False  # Skip applied inference, go straight to plasmode
 
@@ -118,6 +137,7 @@ class PlasmodeExperimentConfig:
     evaluator_architecture: ModelArchitectureConfig = field(default_factory=ModelArchitectureConfig)
     evaluator_training: TrainingConfig = field(default_factory=TrainingConfig)
     plasmode_scenarios: List[PlasmodeConfig] = field(default_factory=list)
+    propensity_trimming: PropensityTrimmingConfig = field(default_factory=PropensityTrimmingConfig)
     oracle_mode: bool = False  # If True, evaluator sees generator's exact features
 
 
@@ -159,6 +179,7 @@ class ExperimentConfig:
         applied = AppliedInferenceConfig(
             **{k: ModelArchitectureConfig(**v) if k == 'architecture'
                else TrainingConfig(**v) if k == 'training'
+               else PropensityTrimmingConfig(**v) if k == 'propensity_trimming'
                else v
                for k, v in data.get('applied_inference', {}).items()}
         )
@@ -174,6 +195,7 @@ class ExperimentConfig:
             evaluator_architecture=ModelArchitectureConfig(**plasmode_data.get('evaluator_architecture', {})),
             evaluator_training=TrainingConfig(**plasmode_data.get('evaluator_training', {})),
             plasmode_scenarios=[PlasmodeConfig(**s) for s in plasmode_data.get('plasmode_scenarios', [])],
+            propensity_trimming=PropensityTrimmingConfig(**plasmode_data.get('propensity_trimming', {})),
             oracle_mode=plasmode_data.get('oracle_mode', False)
         )
 

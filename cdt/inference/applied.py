@@ -59,6 +59,50 @@ def run_applied_inference(
     logger.info("APPLIED CAUSAL INFERENCE (CNN)")
     logger.info("=" * 80)
 
+    # Propensity trimming preprocessing (if enabled)
+    trimming_stats = None
+    if hasattr(config, 'propensity_trimming') and config.propensity_trimming.enabled:
+        logger.info("=" * 80)
+        logger.info("PROPENSITY-BASED DATASET TRIMMING")
+        logger.info("=" * 80)
+
+        from ..training.propensity_trimming import (
+            train_propensity_model_cv, trim_by_propensity
+        )
+
+        # Train propensity model with CV to get out-of-sample scores
+        dataset, propensity_training_log = train_propensity_model_cv(
+            dataset, config, device, num_workers, gpu_ids
+        )
+
+        # Save propensity model training log
+        training_log_path = output_path.parent / "propensity_trimming_training_log.csv"
+        propensity_training_log.to_csv(training_log_path, index=False)
+        logger.info(f"Propensity training log saved to: {training_log_path}")
+
+        original_size = len(dataset)
+
+        # Trim dataset
+        dataset, trimming_stats = trim_by_propensity(
+            dataset,
+            config.propensity_trimming.min_propensity,
+            config.propensity_trimming.max_propensity
+        )
+
+        logger.info(f"Dataset trimmed: {original_size} -> {len(dataset)} "
+                   f"({trimming_stats['removed_low']} below min, "
+                   f"{trimming_stats['removed_high']} above max)")
+
+        # Save trimming stats
+        trimming_stats_path = output_path.parent / "propensity_trimming_stats.json"
+        with open(trimming_stats_path, 'w') as f:
+            json.dump(trimming_stats, f, indent=2)
+        logger.info(f"Trimming stats saved to: {trimming_stats_path}")
+
+        logger.info("=" * 80)
+        logger.info("CONTINUING WITH DRAGONNET TRAINING ON TRIMMED DATASET")
+        logger.info("=" * 80)
+
     # Determine mode
     if config.cv_folds > 1:
         _run_cv_inference(
@@ -182,12 +226,18 @@ def _process_fold(
     # 3. Predict on Held-out Test fold
     preds = _predict_dataset(model, test_df, config, device)
 
-    # 4. Store predictions with indices to reconstruct dataframe (logit scale)
+    # 4. Store predictions with indices to reconstruct dataframe
     preds_df = test_df.copy()
+    # Logit scale
     preds_df['y0_pred'] = preds['y0_logit']
     preds_df['y1_pred'] = preds['y1_logit']
     preds_df['ite_pred'] = preds['ite_logit']
     preds_df['propensity_pred'] = preds['propensity_logit']
+    # Probability scale
+    preds_df['y0_prob'] = preds['y0_prob']
+    preds_df['y1_prob'] = preds['y1_prob']
+    preds_df['ite_prob'] = preds['ite_prob']
+    preds_df['propensity_prob'] = preds['propensity_prob']
     preds_df['cv_fold'] = fold + 1
 
     # Aggressive GPU cleanup to prevent OOM across folds
@@ -248,12 +298,18 @@ def _run_fixed_split_inference(
     logger.info("Generating predictions on test set...")
     preds = _predict_dataset(model, test_df, config, device)
 
-    # Combine (logit scale)
+    # Combine predictions
     results_df = test_df.copy()
+    # Logit scale
     results_df['y0_pred'] = preds['y0_logit']
     results_df['y1_pred'] = preds['y1_logit']
     results_df['ite_pred'] = preds['ite_logit']
     results_df['propensity_pred'] = preds['propensity_logit']
+    # Probability scale
+    results_df['y0_prob'] = preds['y0_prob']
+    results_df['y1_prob'] = preds['y1_prob']
+    results_df['ite_prob'] = preds['ite_prob']
+    results_df['propensity_prob'] = preds['propensity_prob']
 
     _save_and_summarize(results_df, output_path)
 
@@ -594,11 +650,21 @@ def _generate_predictions(
     propensity_logit = np.concatenate(all_propensity)
     ite_logit = y1_logit - y0_logit
 
+    # Convert to probabilities using sigmoid
+    y0_prob = 1.0 / (1.0 + np.exp(-y0_logit))
+    y1_prob = 1.0 / (1.0 + np.exp(-y1_logit))
+    propensity_prob = 1.0 / (1.0 + np.exp(-propensity_logit))
+    ite_prob = y1_prob - y0_prob
+
     return {
         'y0_logit': y0_logit,
         'y1_logit': y1_logit,
         'propensity_logit': propensity_logit,
-        'ite_logit': ite_logit
+        'ite_logit': ite_logit,
+        'y0_prob': y0_prob,
+        'y1_prob': y1_prob,
+        'propensity_prob': propensity_prob,
+        'ite_prob': ite_prob
     }
 
 

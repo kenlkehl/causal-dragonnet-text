@@ -49,6 +49,45 @@ def run_plasmode_experiments(
 
     train_df = dataset.copy()
 
+    # Propensity trimming preprocessing (if enabled)
+    if hasattr(plasmode_config, 'propensity_trimming') and plasmode_config.propensity_trimming.enabled:
+        logger.info("=" * 80)
+        logger.info("PROPENSITY-BASED DATASET TRIMMING FOR PLASMODE")
+        logger.info("=" * 80)
+
+        from .propensity_trimming import train_propensity_model_cv, trim_by_propensity
+
+        # Train propensity model with CV to get out-of-sample scores
+        train_df, propensity_training_log = train_propensity_model_cv(
+            train_df, applied_config, device, num_workers, gpu_ids
+        )
+
+        # Save propensity model training log
+        training_log_path = output_path.parent / "plasmode_propensity_trimming_training_log.csv"
+        propensity_training_log.to_csv(training_log_path, index=False)
+        logger.info(f"Propensity training log saved to: {training_log_path}")
+
+        original_size = len(train_df)
+
+        # Trim dataset
+        train_df, trimming_stats = trim_by_propensity(
+            train_df,
+            plasmode_config.propensity_trimming.min_propensity,
+            plasmode_config.propensity_trimming.max_propensity
+        )
+
+        logger.info(f"Plasmode base data trimmed: {original_size} -> {len(train_df)} "
+                   f"({trimming_stats['removed_low']} below min, "
+                   f"{trimming_stats['removed_high']} above max)")
+
+        # Save trimming stats
+        trimming_stats_path = output_path.parent / "plasmode_propensity_trimming_stats.json"
+        with open(trimming_stats_path, 'w') as f:
+            json.dump(trimming_stats, f, indent=2)
+        logger.info(f"Trimming stats saved to: {trimming_stats_path}")
+
+        logger.info("=" * 80)
+
     logger.info(f"Using {len(train_df)} samples for plasmode generation base")
     logger.info(f"Running {len(plasmode_config.plasmode_scenarios)} scenarios x {num_repeats} repeats")
 
@@ -255,9 +294,16 @@ def _run_single_plasmode_experiment(
     # Step 4: Generate predictions for eval split
     preds_dict = _predict_cnn_model(evaluator, eval_plasmode_df, applied_config, device)
 
+    # Logit scale predictions
     eval_plasmode_df['estimated_ite'] = preds_dict['ite']
     eval_plasmode_df['estimated_y0_logit'] = preds_dict['y0_logit']
     eval_plasmode_df['estimated_y1_logit'] = preds_dict['y1_logit']
+    eval_plasmode_df['estimated_propensity_logit'] = preds_dict['propensity_logit']
+    # Probability scale predictions
+    eval_plasmode_df['estimated_y0_prob'] = preds_dict['y0_prob']
+    eval_plasmode_df['estimated_y1_prob'] = preds_dict['y1_prob']
+    eval_plasmode_df['estimated_ite_prob'] = preds_dict['ite_prob']
+    eval_plasmode_df['estimated_propensity_prob'] = preds_dict['propensity_prob']
 
     # Save dataset
     if save_dataset_path is not None:
@@ -552,12 +598,23 @@ def _predict_cnn_model(
     y0_logit = np.concatenate(all_y0)
     y1_logit = np.concatenate(all_y1)
     prop_logit = np.concatenate(all_prop)
+    ite_logit = y1_logit - y0_logit
+
+    # Convert to probabilities using sigmoid
+    y0_prob = 1.0 / (1.0 + np.exp(-y0_logit))
+    y1_prob = 1.0 / (1.0 + np.exp(-y1_logit))
+    propensity_prob = 1.0 / (1.0 + np.exp(-prop_logit))
+    ite_prob = y1_prob - y0_prob
 
     return {
         'y0_logit': y0_logit,
         'y1_logit': y1_logit,
         'propensity_logit': prop_logit,
-        'ite': y1_logit - y0_logit
+        'ite': ite_logit,  # kept for backward compat
+        'y0_prob': y0_prob,
+        'y1_prob': y1_prob,
+        'propensity_prob': propensity_prob,
+        'ite_prob': ite_prob
     }
 
 
