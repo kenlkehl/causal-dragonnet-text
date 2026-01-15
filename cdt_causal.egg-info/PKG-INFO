@@ -259,7 +259,7 @@ A configuration file controls all aspects of the experiment:
     "plasmode_scenarios": [
       {
         "generation_mode": "phi_linear",
-        "target_ate_logit": 0.5,
+        "target_ate_prob": 0.10,
         "ite_heterogeneity_scale": 1.0
       }
     ]
@@ -292,7 +292,7 @@ A configuration file controls all aspects of the experiment:
 
 **Plasmode:**
 - `generation_mode`: How synthetic outcomes are generated ("phi_linear")
-- `target_ate_logit`: True average treatment effect (logit scale) to simulate
+- `target_ate_prob`: True average treatment effect on probability scale (e.g., 0.10 = 10% increase)
 - `ite_heterogeneity_scale`: Scale of individual treatment effect heterogeneity
 
 ### CLI Options
@@ -323,10 +323,10 @@ output_dir/
 ```
 
 The `predictions.parquet` file contains:
-- `y0_logit`: Predicted outcome logit under control
-- `y1_logit`: Predicted outcome logit under treatment
-- `ite_logit`: Individual treatment effect (y1_logit - y0_logit)
-- `propensity_logit`: Predicted treatment propensity (logit scale)
+- `pred_y0_prob`: Predicted outcome probability under control
+- `pred_y1_prob`: Predicted outcome probability under treatment
+- `pred_ite_prob`: Predicted individual treatment effect on probability scale (pred_y1_prob - pred_y0_prob)
+- `pred_propensity_prob`: Predicted treatment propensity (probability)
 - `cv_fold`: Which cross-validation fold (if using CV)
 
 ## Example: Semantic CNN for Oncology

@@ -99,7 +99,7 @@ class PlasmodeConfig:
     generation_mode: str = "phi_linear"
     preserve_observed_treatments: bool = True
     baseline_control_outcome_rate: float = 0.20
-    target_ate_logit: float = 0.50
+    target_ate_prob: float = 0.10  # Target ATE on probability scale (e.g., 0.10 = 10% increase in outcome probability)
     outcome_heterogeneity_scale: float = 1.0
     ite_heterogeneity_scale: float = 1.0
     deep_nonlinear_hidden_dims: List[int] = field(default_factory=lambda: [64, 32])
@@ -258,7 +258,7 @@ def create_default_config(output_path: str) -> None:
             plasmode_scenarios=[
                 PlasmodeConfig(
                     generation_mode="phi_linear",
-                    target_ate_logit=0.5
+                    target_ate_prob=0.10
                 )
             ]
         )

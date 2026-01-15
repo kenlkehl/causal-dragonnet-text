@@ -27,10 +27,10 @@ class PropensityNet(nn.Module):
 
         # Shared representation layers (same as DragonNet)
         self.representation_fc1 = nn.Linear(input_dim, representation_dim)
-        self.representation_fc2 = nn.Linear(representation_dim, representation_dim)
-        self.representation_fc3 = nn.Linear(representation_dim, representation_dim)
-        self.representation_fc4 = nn.Linear(representation_dim, representation_dim)
-        self.representation_fc5 = nn.Linear(representation_dim, representation_dim)
+        # self.representation_fc2 = nn.Linear(representation_dim, representation_dim)
+        # self.representation_fc3 = nn.Linear(representation_dim, representation_dim)
+        # self.representation_fc4 = nn.Linear(representation_dim, representation_dim)
+        # self.representation_fc5 = nn.Linear(representation_dim, representation_dim)
         self.representation_fc6 = nn.Linear(representation_dim, representation_dim)
 
         # Single propensity head (same as DragonNet)
@@ -47,10 +47,10 @@ class PropensityNet(nn.Module):
             t_logit: Propensity logits (batch, 1)
         """
         h = F.relu(self.representation_fc1(features))
-        h = F.relu(self.representation_fc2(h))
-        h = F.relu(self.representation_fc3(h))
-        h = F.relu(self.representation_fc4(h))
-        h = F.relu(self.representation_fc5(h))
+        # h = F.relu(self.representation_fc2(h))
+        # h = F.relu(self.representation_fc3(h))
+        # h = F.relu(self.representation_fc4(h))
+        # h = F.relu(self.representation_fc5(h))
         h = F.elu(self.representation_fc6(h))
 
         t_logit = self.propensity_fc1(h)
@@ -79,12 +79,12 @@ class PropensityOnlyModel(nn.Module):
         embedding_dim: int = 128,
         kernel_sizes: List[int] = [3, 4, 5, 7],
         explicit_filter_concepts: Optional[Dict[str, List[str]]] = None,
-        num_kmeans_filters: int = 64,
-        num_random_filters: int = 0,
-        cnn_dropout: float = 0.1,
-        max_length: int = 2048,
+        num_kmeans_filters: int = 0,
+        num_random_filters: int = 256,
+        cnn_dropout: float = 0.0,
+        max_length: int = 8192,
         min_word_freq: int = 2,
-        max_vocab_size: Optional[int] = 50000,
+        max_vocab_size: Optional[int] = 20000,
         projection_dim: Optional[int] = 128,
         # BERT-specific args
         bert_model_name: str = "bert-base-uncased",

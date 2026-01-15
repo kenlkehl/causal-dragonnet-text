@@ -81,7 +81,7 @@ def generate_synthetic_dataset(
     # Step 2: Generate regression equations
     logger.info("Step 2/5: Generating regression equations...")
     treatment_eq, outcome_eq = _generate_equations(
-        client, config.clinical_question, confounders, config.treatment_coefficient,
+        client, config.clinical_question, confounders, config.treatment_effect_prob,
         main_coef_scale=config.main_coefficient_scale,
         interaction_coef_scale=config.interaction_coefficient_scale,
     )
@@ -92,8 +92,19 @@ def generate_synthetic_dataset(
     logger.info("Step 3/6: Generating summary statistics...")
     summary_stats = _generate_summary_statistics(client, config.clinical_question, confounders)
     
-    # Step 4: Calibrate intercepts to hit target rates
-    logger.info("Step 4/7: Calibrating intercepts to target rates...")
+    # Step 4: Rescale coefficients first to achieve target logit std
+    # (Order matters: rescaling changes the linear predictor, so intercepts must be calibrated afterward)
+    logger.info("Step 4/7: Rescaling coefficients for target variability...")
+    treatment_eq, outcome_eq = _rescale_for_target_logit_std(
+        confounders=confounders,
+        summary_stats=summary_stats,
+        treatment_eq=treatment_eq,
+        outcome_eq=outcome_eq,
+        target_logit_std=config.target_logit_std,
+    )
+
+    # Step 5: Calibrate intercepts to hit target rates (after rescaling)
+    logger.info("Step 5/7: Calibrating intercepts to target rates...")
     treatment_eq, outcome_eq = _calibrate_intercepts(
         confounders=confounders,
         summary_stats=summary_stats,
@@ -101,16 +112,6 @@ def generate_synthetic_dataset(
         outcome_eq=outcome_eq,
         target_treatment_rate=config.target_treatment_rate,
         target_control_outcome_rate=config.target_control_outcome_rate,
-    )
-
-    # Step 5: Rescale coefficients to achieve target logit std
-    logger.info("Step 5/7: Rescaling coefficients for target logit std...")
-    treatment_eq, outcome_eq = _rescale_for_target_logit_std(
-        confounders=confounders,
-        summary_stats=summary_stats,
-        treatment_eq=treatment_eq,
-        outcome_eq=outcome_eq,
-        target_logit_std=config.target_logit_std,
     )
 
     # Step 6: Generate patient data
@@ -141,10 +142,12 @@ def generate_synthetic_dataset(
             "n_patients": len(df),
             "treatment_rate": df["treatment_indicator"].mean(),
             "outcome_rate": df["outcome_indicator"].mean(),
-            "mean_treatment_logit": df["true_treatment_logit"].mean(),
-            "std_treatment_logit": df["true_treatment_logit"].std(),
-            "mean_outcome_logit": df["true_outcome_logit"].mean(),
-            "std_outcome_logit": df["true_outcome_logit"].std(),
+            "mean_treatment_prob": df["true_treatment_prob"].mean(),
+            "std_treatment_prob": df["true_treatment_prob"].std(),
+            "mean_outcome_prob": df["true_outcome_prob"].mean(),
+            "std_outcome_prob": df["true_outcome_prob"].std(),
+            "mean_ite_prob": df["true_ite_prob"].mean(),
+            "std_ite_prob": df["true_ite_prob"].std(),
         }
     }
     
@@ -193,6 +196,72 @@ def _generate_confounders(client: LLMClient, clinical_question: str, num_confoun
     return confounders
 
 
+def _get_valid_coefficient_names(confounders: List[Dict[str, Any]]) -> set:
+    """
+    Build a set of valid coefficient names from the confounder definitions.
+
+    For continuous variables: the variable name itself
+    For categorical variables: variablename_category for each non-reference category
+    """
+    valid_names = set()
+    for conf in confounders:
+        name = conf["name"]
+        if conf["type"] == "continuous":
+            valid_names.add(name)
+        else:
+            # Categorical: add dummies for all non-reference categories
+            for cat in conf["categories"][1:]:  # Skip reference category (first)
+                valid_names.add(f"{name}_{cat}")
+    return valid_names
+
+
+def _validate_equation_coefficients(
+    equation: Dict[str, Any],
+    valid_names: set,
+    equation_name: str,
+) -> Dict[str, Any]:
+    """
+    Filter equation coefficients to only include valid confounder names.
+
+    Removes any coefficients or interaction terms that reference variables
+    not in the valid_names set, logging warnings for removed items.
+    """
+    validated = equation.copy()
+
+    # Filter main coefficients
+    if "coefficients" in validated:
+        original_coefs = validated["coefficients"]
+        filtered_coefs = {}
+        for name, value in original_coefs.items():
+            if name in valid_names:
+                filtered_coefs[name] = value
+            else:
+                logger.warning(
+                    f"{equation_name}: Removing invalid coefficient '{name}' "
+                    f"(not in confounder list)"
+                )
+        validated["coefficients"] = filtered_coefs
+
+    # Filter interactions
+    if "interactions" in validated:
+        original_interactions = validated["interactions"]
+        filtered_interactions = []
+        for interaction in original_interactions:
+            terms = interaction.get("terms", [])
+            # Check if all terms are valid
+            if all(term in valid_names for term in terms):
+                filtered_interactions.append(interaction)
+            else:
+                invalid_terms = [t for t in terms if t not in valid_names]
+                logger.warning(
+                    f"{equation_name}: Removing invalid interaction with terms {terms} "
+                    f"(invalid terms: {invalid_terms})"
+                )
+        validated["interactions"] = filtered_interactions
+
+    return validated
+
+
 def _generate_equations(
     client: LLMClient,
     clinical_question: str,
@@ -218,6 +287,11 @@ def _generate_equations(
 
     treatment_eq = response.get("treatment_equation", {})
     outcome_eq = response.get("outcome_equation", {})
+
+    # Validate coefficients - remove any that don't match the confounder list
+    valid_names = _get_valid_coefficient_names(confounders)
+    treatment_eq = _validate_equation_coefficients(treatment_eq, valid_names, "treatment_equation")
+    outcome_eq = _validate_equation_coefficients(outcome_eq, valid_names, "outcome_equation")
 
     # Scale LLM-generated coefficients to keep logits in reasonable range
     def scale_coefficients(coefficients: Dict[str, float], scale: float) -> Dict[str, float]:
@@ -373,7 +447,12 @@ def _generate_equations_vllm(
     
     treatment_eq = response.get("treatment_equation", {})
     outcome_eq = response.get("outcome_equation", {})
-    
+
+    # Validate coefficients - remove any that don't match the confounder list
+    valid_names = _get_valid_coefficient_names(confounders)
+    treatment_eq = _validate_equation_coefficients(treatment_eq, valid_names, "treatment_equation")
+    outcome_eq = _validate_equation_coefficients(outcome_eq, valid_names, "outcome_equation")
+
     # Scale coefficients
     if "coefficients" in treatment_eq:
         treatment_eq["coefficients"] = {
@@ -382,7 +461,7 @@ def _generate_equations_vllm(
     if "interactions" in treatment_eq:
         for interaction in treatment_eq["interactions"]:
             interaction["coefficient"] *= interaction_coef_scale
-    
+
     if "coefficients" in outcome_eq:
         outcome_eq["coefficients"] = {
             k: v * main_coef_scale for k, v in outcome_eq["coefficients"].items()
@@ -390,7 +469,7 @@ def _generate_equations_vllm(
     if "interactions" in outcome_eq:
         for interaction in outcome_eq["interactions"]:
             interaction["coefficient"] *= interaction_coef_scale
-    
+
     # Add fixed treatment coefficient to outcome equation (CRITICAL for ITE)
     outcome_eq["treatment_coefficient"] = treatment_coefficient
     
@@ -866,27 +945,32 @@ def _generate_single_patient(
         outcome_prob = 1.0 / (1.0 + np.exp(-outcome_logit))
         outcome = int(np.random.random() < outcome_prob)
     
-    # Compute potential outcome logits for causal inference
+    # Compute potential outcome probabilities for causal inference
     outcome_logit_0 = _compute_logit(
         characteristics, confounders, summary_stats, outcome_eq, treatment=0
     )
     outcome_logit_1 = _compute_logit(
         characteristics, confounders, summary_stats, outcome_eq, treatment=1
     )
-    true_ite = outcome_logit_1 - outcome_logit_0
-    
+    outcome_prob_0 = 1.0 / (1.0 + np.exp(-outcome_logit_0))
+    outcome_prob_1 = 1.0 / (1.0 + np.exp(-outcome_logit_1))
+    true_ite_prob = outcome_prob_1 - outcome_prob_0
+
+    # Compute probability for factual outcome
+    outcome_prob = 1.0 / (1.0 + np.exp(-outcome_logit))
+
     # Format patient characteristics as prompt
     patient_prompt = format_patient_characteristics(characteristics, confounders)
-    
+
     # Generate clinical history
     history_prompt = PATIENT_HISTORY_PROMPT.format(
         patient_characteristics=patient_prompt,
         clinical_question=config.clinical_question,
     )
-    
+
     # Reserve tokens for prompt (system prompt + patient history prompt ~1500-2000 tokens)
     history_max_tokens = max(1000, config.llm.max_tokens - 2000)
-    
+
     try:
         clinical_history = client.generate(
             prompt=history_prompt,
@@ -901,18 +985,18 @@ def _generate_single_patient(
     except Exception as e:
         logger.error(f"Patient {patient_idx}: Failed to generate clinical_history: {e}")
         clinical_history = ""
-    
+
     return {
         "patient_id": patient_idx,
         "patient_prompt": patient_prompt,
         "clinical_text": clinical_history,
         "treatment_indicator": treatment,
         "outcome_indicator": outcome,
-        "true_treatment_logit": treatment_logit,
-        "true_outcome_logit": outcome_logit,
-        "outcome_logit_0": outcome_logit_0,
-        "outcome_logit_1": outcome_logit_1,
-        "true_ite": true_ite,
+        "true_treatment_prob": treatment_prob,
+        "true_outcome_prob": outcome_prob,
+        "true_y0_prob": outcome_prob_0,
+        "true_y1_prob": outcome_prob_1,
+        "true_ite_prob": true_ite_prob,
     }
 
 
@@ -1075,7 +1159,7 @@ def generate_synthetic_dataset_batch(
     # Step 2: Generate regression equations
     logger.info("Step 2/6: Generating regression equations...")
     treatment_eq, outcome_eq = _generate_equations_vllm(
-        vllm_client, config.clinical_question, confounders, config.treatment_coefficient,
+        vllm_client, config.clinical_question, confounders, config.treatment_effect_prob,
         main_coef_scale=config.main_coefficient_scale,
         interaction_coef_scale=config.interaction_coefficient_scale,
     )
@@ -1086,8 +1170,16 @@ def generate_synthetic_dataset_batch(
     logger.info("Step 3/6: Generating summary statistics...")
     summary_stats = _generate_summary_statistics_vllm(vllm_client, config.clinical_question, confounders)
     
-    # Step 4: Calibrate and rescale
-    logger.info("Step 4/6: Calibrating intercepts and rescaling coefficients...")
+    # Step 4: Rescale coefficients first, then calibrate intercepts
+    # (Order matters: rescaling changes the linear predictor, so intercepts must be calibrated afterward)
+    logger.info("Step 4/6: Rescaling coefficients and calibrating intercepts...")
+    treatment_eq, outcome_eq = _rescale_for_target_logit_std(
+        confounders=confounders,
+        summary_stats=summary_stats,
+        treatment_eq=treatment_eq,
+        outcome_eq=outcome_eq,
+        target_logit_std=config.target_logit_std,
+    )
     treatment_eq, outcome_eq = _calibrate_intercepts(
         confounders=confounders,
         summary_stats=summary_stats,
@@ -1096,14 +1188,7 @@ def generate_synthetic_dataset_batch(
         target_treatment_rate=config.target_treatment_rate,
         target_control_outcome_rate=config.target_control_outcome_rate,
     )
-    treatment_eq, outcome_eq = _rescale_for_target_logit_std(
-        confounders=confounders,
-        summary_stats=summary_stats,
-        treatment_eq=treatment_eq,
-        outcome_eq=outcome_eq,
-        target_logit_std=config.target_logit_std,
-    )
-    
+
     # Step 5: Pre-generate all patient data (without clinical text)
     logger.info(f"Step 5/6: Generating {config.dataset_size} patient records...")
     patient_records = []
@@ -1149,36 +1234,41 @@ def generate_synthetic_dataset_batch(
             outcome_prob = 1.0 / (1.0 + np.exp(-outcome_logit))
             outcome = int(np.random.random() < outcome_prob)
         
-        # Compute potential outcome logits
+        # Compute potential outcome probabilities
         outcome_logit_0 = _compute_logit(
             characteristics, confounders, summary_stats, outcome_eq, treatment=0
         )
         outcome_logit_1 = _compute_logit(
             characteristics, confounders, summary_stats, outcome_eq, treatment=1
         )
-        true_ite = outcome_logit_1 - outcome_logit_0
-        
+        outcome_prob_0 = 1.0 / (1.0 + np.exp(-outcome_logit_0))
+        outcome_prob_1 = 1.0 / (1.0 + np.exp(-outcome_logit_1))
+        true_ite_prob = outcome_prob_1 - outcome_prob_0
+
+        # Compute probability for factual outcome
+        outcome_prob = 1.0 / (1.0 + np.exp(-outcome_logit))
+
         # Format patient characteristics as prompt
         patient_prompt = format_patient_characteristics(characteristics, confounders)
-        
+
         # Build clinical history prompt
         history_prompt = PATIENT_HISTORY_PROMPT.format(
             patient_characteristics=patient_prompt,
             clinical_question=config.clinical_question,
         )
         history_prompts.append(history_prompt)
-        
+
         patient_records.append({
             "patient_id": patient_idx,
             "patient_prompt": patient_prompt,
             "clinical_text": None,  # Will be filled by batch generation
             "treatment_indicator": treatment,
             "outcome_indicator": outcome,
-            "true_treatment_logit": treatment_logit,
-            "true_outcome_logit": outcome_logit,
-            "outcome_logit_0": outcome_logit_0,
-            "outcome_logit_1": outcome_logit_1,
-            "true_ite": true_ite,
+            "true_treatment_prob": treatment_prob,
+            "true_outcome_prob": outcome_prob,
+            "true_y0_prob": outcome_prob_0,
+            "true_y1_prob": outcome_prob_1,
+            "true_ite_prob": true_ite_prob,
         })
     
     # Step 6: Batch generate all clinical histories using vLLM
@@ -1217,10 +1307,12 @@ def generate_synthetic_dataset_batch(
             "n_patients": len(df),
             "treatment_rate": df["treatment_indicator"].mean(),
             "outcome_rate": df["outcome_indicator"].mean(),
-            "mean_treatment_logit": df["true_treatment_logit"].mean(),
-            "std_treatment_logit": df["true_treatment_logit"].std(),
-            "mean_outcome_logit": df["true_outcome_logit"].mean(),
-            "std_outcome_logit": df["true_outcome_logit"].std(),
+            "mean_treatment_prob": df["true_treatment_prob"].mean(),
+            "std_treatment_prob": df["true_treatment_prob"].std(),
+            "mean_outcome_prob": df["true_outcome_prob"].mean(),
+            "std_outcome_prob": df["true_outcome_prob"].std(),
+            "mean_ite_prob": df["true_ite_prob"].mean(),
+            "std_ite_prob": df["true_ite_prob"].std(),
             "clinical_text_stats": {
                 "non_empty_count": (df["clinical_text"].str.len() > 0).sum(),
                 "mean_length": df["clinical_text"].str.len().mean(),

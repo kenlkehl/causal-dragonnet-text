@@ -32,7 +32,7 @@ class SyntheticDataConfig:
 
     # Dataset parameters
     dataset_size: int = 500
-    treatment_coefficient: float = 0.5  # Coefficient for treatment in outcome equation (logit scale)
+    treatment_effect_prob: float = 0.10  # Target average treatment effect on probability scale (e.g., 0.10 = 10% increase)
 
     # Target rates (intercepts will be calibrated to achieve these)
     target_treatment_rate: float = 0.5  # Proportion of patients receiving treatment=1
@@ -43,10 +43,10 @@ class SyntheticDataConfig:
     min_treatment_rate_per_stratum: float = 0.1  # Minimum P(T=1|X) for each stratum (requires enforce_positivity=True)
     max_treatment_rate_per_stratum: float = 0.9  # Maximum P(T=1|X) for each stratum (requires enforce_positivity=True)
 
-    # Coefficient scaling (to keep logits in reasonable range)
+    # Internal coefficient scaling (advanced users only)
     main_coefficient_scale: float = 0.3  # Scale for main effect coefficients
     interaction_coefficient_scale: float = 0.1  # Scale for interaction coefficients
-    target_logit_std: float = 2.0  # Target std for final logits (after rescaling)
+    target_logit_std: float = 2.0  # Target std of logits; lower values compress propensities toward 0.5
     
     # Number of confounders (None = use LLM default of 8-12)
     num_confounders: Optional[int] = None

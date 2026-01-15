@@ -228,16 +228,11 @@ def _process_fold(
 
     # 4. Store predictions with indices to reconstruct dataframe
     preds_df = test_df.copy()
-    # Logit scale
-    preds_df['y0_pred'] = preds['y0_logit']
-    preds_df['y1_pred'] = preds['y1_logit']
-    preds_df['ite_pred'] = preds['ite_logit']
-    preds_df['propensity_pred'] = preds['propensity_logit']
-    # Probability scale
-    preds_df['y0_prob'] = preds['y0_prob']
-    preds_df['y1_prob'] = preds['y1_prob']
-    preds_df['ite_prob'] = preds['ite_prob']
-    preds_df['propensity_prob'] = preds['propensity_prob']
+    # Probability scale predictions (pred_* prefix indicates predicted values)
+    preds_df['pred_y0_prob'] = preds['y0_prob']
+    preds_df['pred_y1_prob'] = preds['y1_prob']
+    preds_df['pred_ite_prob'] = preds['ite_prob']
+    preds_df['pred_propensity_prob'] = preds['propensity_prob']
     preds_df['cv_fold'] = fold + 1
 
     # Aggressive GPU cleanup to prevent OOM across folds
@@ -298,18 +293,12 @@ def _run_fixed_split_inference(
     logger.info("Generating predictions on test set...")
     preds = _predict_dataset(model, test_df, config, device)
 
-    # Combine predictions
+    # Combine predictions (probability scale, pred_* prefix indicates predicted values)
     results_df = test_df.copy()
-    # Logit scale
-    results_df['y0_pred'] = preds['y0_logit']
-    results_df['y1_pred'] = preds['y1_logit']
-    results_df['ite_pred'] = preds['ite_logit']
-    results_df['propensity_pred'] = preds['propensity_logit']
-    # Probability scale
-    results_df['y0_prob'] = preds['y0_prob']
-    results_df['y1_prob'] = preds['y1_prob']
-    results_df['ite_prob'] = preds['ite_prob']
-    results_df['propensity_prob'] = preds['propensity_prob']
+    results_df['pred_y0_prob'] = preds['y0_prob']
+    results_df['pred_y1_prob'] = preds['y1_prob']
+    results_df['pred_ite_prob'] = preds['ite_prob']
+    results_df['pred_propensity_prob'] = preds['propensity_prob']
 
     _save_and_summarize(results_df, output_path)
 
@@ -657,10 +646,6 @@ def _generate_predictions(
     ite_prob = y1_prob - y0_prob
 
     return {
-        'y0_logit': y0_logit,
-        'y1_logit': y1_logit,
-        'propensity_logit': propensity_logit,
-        'ite_logit': ite_logit,
         'y0_prob': y0_prob,
         'y1_prob': y1_prob,
         'propensity_prob': propensity_prob,
@@ -676,9 +661,12 @@ def _save_and_summarize(results_df: pd.DataFrame, output_path: Path) -> None:
     logger.info(f"Predictions saved to: {output_path}")
     logger.info("\nPrediction Summary:")
     logger.info(f"  Samples: {len(results_df)}")
-    logger.info(f"  Mean ITE: {results_df['ite_pred'].mean():.4f}")
-    logger.info(f"  Std ITE: {results_df['ite_pred'].std():.4f}")
-    logger.info(f"  Mean propensity: {results_df['propensity_pred'].mean():.4f}")
+    logger.info("  Predicted ITE (probability scale):")
+    logger.info(f"    Mean: {results_df['pred_ite_prob'].mean():.4f}")
+    logger.info(f"    Std: {results_df['pred_ite_prob'].std():.4f}")
+    logger.info(f"    Min: {results_df['pred_ite_prob'].min():.4f}")
+    logger.info(f"    Max: {results_df['pred_ite_prob'].max():.4f}")
+    logger.info(f"  Mean predicted propensity: {results_df['pred_propensity_prob'].mean():.4f}")
 
 
 def _save_filter_interpretations(

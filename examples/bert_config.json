@@ -81,7 +81,7 @@
         "generation_mode": "phi_linear",
         "preserve_observed_treatments": true,
         "baseline_control_outcome_rate": 0.2,
-        "target_ate_logit": 0.5,
+        "target_ate_prob": 0.10,
         "outcome_heterogeneity_scale": 1.0,
         "ite_heterogeneity_scale": 1.0
       }

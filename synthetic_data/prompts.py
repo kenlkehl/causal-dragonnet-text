@@ -58,35 +58,36 @@ Clinical Question: "{clinical_question}"
 Confounders:
 {confounder_list}
 
-Generate two plausible regression equations for a simulation:
+Generate two plausible regression equations for a simulation.
+
+CRITICAL: You must ONLY use the confounders listed above. Do NOT invent or add any variables that are not in the confounder list. Every coefficient name must correspond to a confounder from the list above.
 
 1. TREATMENT ASSIGNMENT equation: Predicts logit(P(treatment=1)) based on confounders
    - Should reflect realistic clinical decision-making
    - Some confounders should have stronger effects than others
-   - Include 2-3 interaction terms between clinically related confounders
+   - Include interaction terms ONLY if there are 2+ confounders (use pairs from the list above)
 
 2. OUTCOME equation: Predicts logit(P(outcome=1)) based on confounders AND treatment
    - The treatment coefficient is FIXED at {treatment_coefficient} (do not include treatment in your coefficients)
    - Should reflect known prognostic factors
-   - Include 2-3 interaction terms
+   - Include interaction terms ONLY if there are 2+ confounders
    - Some confounders may affect outcome differently than treatment assignment
 
 For continuous variables, coefficients represent effect per 1 SD increase.
 For categorical variables, coefficients are relative to the reference category (first listed).
 
-Respond with JSON in this exact format:
+Respond with JSON in this exact format (example shows structure only - use YOUR confounders from above):
 {{
   "treatment_equation": {{
     "intercept": -0.5,
     "coefficients": {{
-      "age": 0.3,
-      "ecog_performance_status_1": -0.2,
-      "ecog_performance_status_2": -0.5,
-      "ecog_performance_status_3": -0.8
+      "<confounder_name>": 0.3,
+      "<categorical_confounder>_<category2>": -0.2,
+      "<categorical_confounder>_<category3>": -0.5
     }},
     "interactions": [
       {{
-        "terms": ["age", "comorbidity_count"],
+        "terms": ["<confounder1>", "<confounder2>"],
         "coefficient": 0.1
       }}
     ]
@@ -94,22 +95,24 @@ Respond with JSON in this exact format:
   "outcome_equation": {{
     "intercept": -1.0,
     "coefficients": {{
-      "age": -0.2,
-      "ecog_performance_status_1": 0.3,
-      "ecog_performance_status_2": 0.6,
-      "ecog_performance_status_3": 1.2
+      "<confounder_name>": -0.2,
+      "<categorical_confounder>_<category2>": 0.3,
+      "<categorical_confounder>_<category3>": 0.6
     }},
     "interactions": [
       {{
-        "terms": ["age", "prior_treatment"],
+        "terms": ["<confounder1>", "<confounder2>"],
         "coefficient": -0.15
       }}
     ]
   }}
 }}
 
-Note: For categorical variables with N categories, create N-1 dummy variable coefficients (excluding the reference/first category).
-The coefficient names for dummies should be: variablename_categoryvalue"""
+IMPORTANT RULES:
+- For categorical variables with N categories, create N-1 dummy coefficients (excluding the reference/first category)
+- Dummy variable names must be: variablename_categoryvalue (e.g., "ecog_status_2" for category "2" of "ecog_status")
+- If there is only 1 confounder, the "interactions" arrays should be empty []
+- Do NOT include any variables that are not in the confounder list above"""
 
 
 # =============================================================================

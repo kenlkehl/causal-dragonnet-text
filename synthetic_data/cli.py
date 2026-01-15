@@ -56,10 +56,10 @@ Examples:
         help="Number of patients to generate (default: 500)",
     )
     parser.add_argument(
-        "--treatment-coefficient",
+        "--treatment-effect",
         type=float,
-        default=1.0,
-        help="Treatment coefficient in outcome equation on logit scale (default: 1.0)",
+        default=0.20,
+        help="Target treatment effect on probability scale (e.g., 0.10 = 10%% increase in outcome probability, default: 0.20)",
     )
     parser.add_argument(
         "--target-treatment-rate",
@@ -70,8 +70,8 @@ Examples:
     parser.add_argument(
         "--target-control-outcome-rate",
         type=float,
-        default=0.2,
-        help="Target outcome rate in control group (treatment=0) (default: 0.2)",
+        default=0.5,
+        help="Target outcome rate in control group (treatment=0) (default: 0.5)",
     )
     parser.add_argument(
         "--num-confounders",
@@ -97,6 +97,12 @@ Examples:
         type=float,
         default=0.9,
         help="Maximum P(T=1|X) per stratum when --enforce-positivity is set (default: 0.9)",
+    )
+    parser.add_argument(
+        "--target-logit-std",
+        type=float,
+        default=2.0,
+        help="Target std of logits; lower values compress propensities toward 0.5 (default: 2.0)",
     )
 
     # LLM parameters
@@ -214,11 +220,11 @@ Examples:
             config.clinical_question = args.clinical_question
         if args.dataset_size != 500:
             config.dataset_size = args.dataset_size
-        if args.treatment_coefficient != 1.0:
-            config.treatment_coefficient = args.treatment_coefficient
+        if args.treatment_effect != 0.20:
+            config.treatment_effect_prob = args.treatment_effect
         if args.target_treatment_rate != 0.5:
             config.target_treatment_rate = args.target_treatment_rate
-        if args.target_control_outcome_rate != 0.2:
+        if args.target_control_outcome_rate != 0.5:
             config.target_control_outcome_rate = args.target_control_outcome_rate
         if args.enforce_positivity:
             config.enforce_positivity = True
@@ -226,6 +232,8 @@ Examples:
             config.min_treatment_rate_per_stratum = args.min_treatment_rate
         if args.max_treatment_rate != 0.9:
             config.max_treatment_rate_per_stratum = args.max_treatment_rate
+        if args.target_logit_std != 2.0:
+            config.target_logit_std = args.target_logit_std
         if args.num_confounders is not None:
             config.num_confounders = args.num_confounders
         if args.outcome_type != "binary":
@@ -252,12 +260,13 @@ Examples:
         config = SyntheticDataConfig(
             clinical_question=args.clinical_question,
             dataset_size=args.dataset_size,
-            treatment_coefficient=args.treatment_coefficient,
+            treatment_effect_prob=args.treatment_effect,
             target_treatment_rate=args.target_treatment_rate,
             target_control_outcome_rate=args.target_control_outcome_rate,
             enforce_positivity=args.enforce_positivity,
             min_treatment_rate_per_stratum=args.min_treatment_rate,
             max_treatment_rate_per_stratum=args.max_treatment_rate,
+            target_logit_std=args.target_logit_std,
             num_confounders=args.num_confounders,
             outcome_type=args.outcome_type,
             outcome_noise_std=args.outcome_noise_std,
