@@ -1323,7 +1323,7 @@ def generate_synthetic_dataset_batch(
     # Step 2: Generate regression equations
     logger.info("Step 2/6: Generating regression equations...")
     treatment_eq, outcome_eq = _generate_equations_vllm(
-        vllm_client, config.clinical_question, confounders, config.treatment_effect_prob,
+        vllm_client, config.clinical_question, confounders, config.treatment_effect,
         main_coef_scale=config.main_coefficient_scale,
         interaction_coef_scale=config.interaction_coefficient_scale,
     )
@@ -1334,23 +1334,20 @@ def generate_synthetic_dataset_batch(
     logger.info("Step 3/6: Generating summary statistics...")
     summary_stats = _generate_summary_statistics_vllm(vllm_client, config.clinical_question, confounders)
     
-    # Step 4: Rescale coefficients first, then calibrate intercepts
-    # (Order matters: rescaling changes the linear predictor, so intercepts must be calibrated afterward)
-    logger.info("Step 4/6: Rescaling coefficients and calibrating intercepts...")
-    treatment_eq, outcome_eq = _rescale_for_target_logit_std(
+    # Step 4: Rescale treatment coefficients and calibrate treatment intercept
+    # (For continuous outcomes, outcome equation doesn't need logit rescaling)
+    logger.info("Step 4/6: Rescaling treatment coefficients and calibrating treatment intercept...")
+    treatment_eq = _rescale_treatment_for_target_logit_std(
         confounders=confounders,
         summary_stats=summary_stats,
         treatment_eq=treatment_eq,
-        outcome_eq=outcome_eq,
-        target_logit_std=config.target_logit_std,
+        target_logit_std=config.target_treatment_logit_std,
     )
-    treatment_eq, outcome_eq = _calibrate_intercepts(
+    treatment_eq = _calibrate_treatment_intercept(
         confounders=confounders,
         summary_stats=summary_stats,
         treatment_eq=treatment_eq,
-        outcome_eq=outcome_eq,
         target_treatment_rate=config.target_treatment_rate,
-        target_control_outcome_rate=config.target_control_outcome_rate,
     )
 
     # Step 5: Pre-generate all patient data (without clinical text)
@@ -1382,35 +1379,34 @@ def generate_synthetic_dataset_batch(
 
         treatment = int(np.random.random() < treatment_prob)
 
-        # Compute outcome logit
-        outcome_logit = _compute_logit(
-            characteristics, confounders, summary_stats, outcome_eq, treatment=treatment
-        )
-        
-        # Generate outcome based on outcome_type
-        outcome_type = getattr(config, 'outcome_type', 'binary')
-        if outcome_type == "continuous":
-            # Continuous outcome: use logit directly with optional noise
-            noise_std = getattr(config, 'outcome_noise_std', 1.0)
-            outcome = outcome_logit + np.random.normal(0, noise_std)
-        else:
-            # Binary outcome: sample from Bernoulli
-            outcome_prob = 1.0 / (1.0 + np.exp(-outcome_logit))
-            outcome = int(np.random.random() < outcome_prob)
-        
-        # Compute potential outcome probabilities
-        outcome_logit_0 = _compute_logit(
-            characteristics, confounders, summary_stats, outcome_eq, treatment=0
-        )
-        outcome_logit_1 = _compute_logit(
-            characteristics, confounders, summary_stats, outcome_eq, treatment=1
-        )
-        outcome_prob_0 = 1.0 / (1.0 + np.exp(-outcome_logit_0))
-        outcome_prob_1 = 1.0 / (1.0 + np.exp(-outcome_logit_1))
-        true_ite_prob = outcome_prob_1 - outcome_prob_0
+        # Generate continuous outcomes using log-normal distribution
+        # Base log-mean from control outcome mean
+        log_baseline = np.log(config.target_control_outcome_mean)
 
-        # Compute probability for factual outcome
-        outcome_prob = 1.0 / (1.0 + np.exp(-outcome_logit))
+        # Compute confounder effects on log-scale (use outcome equation coefficients)
+        confounder_effect = _compute_confounder_effect(
+            characteristics, confounders, summary_stats, outcome_eq
+        )
+
+        # Generate noise
+        noise_std = config.target_outcome_log_std
+        noise = np.random.normal(0, noise_std)
+
+        # Potential outcomes (log-space, then exponentiate)
+        log_y0 = log_baseline + confounder_effect + noise
+        y0 = np.exp(log_y0)
+
+        # Treatment effect: additive on original scale
+        y1 = y0 + config.treatment_effect
+
+        # Ensure y1 is positive (treatment effect could be negative)
+        y1 = max(0.01, y1)
+
+        # Observed outcome
+        outcome = y1 if treatment == 1 else y0
+
+        # True ITE (difference in months)
+        true_ite = y1 - y0
 
         # Format patient characteristics as prompt
         patient_prompt = format_patient_characteristics(characteristics, confounders)
@@ -1427,12 +1423,11 @@ def generate_synthetic_dataset_batch(
             "patient_prompt": patient_prompt,
             "clinical_text": None,  # Will be filled by batch generation
             "treatment_indicator": treatment,
-            "outcome_indicator": outcome,
+            "outcome_indicator": outcome,  # Continuous survival in months
             "true_treatment_prob": treatment_prob,
-            "true_outcome_prob": outcome_prob,
-            "true_y0_prob": outcome_prob_0,
-            "true_y1_prob": outcome_prob_1,
-            "true_ite_prob": true_ite_prob,
+            "true_y0": y0,  # Potential outcome under control
+            "true_y1": y1,  # Potential outcome under treatment
+            "true_ite": true_ite,  # Treatment effect in months
         })
     
     # Step 6: Batch generate all clinical histories using vLLM
@@ -1470,13 +1465,16 @@ def generate_synthetic_dataset_batch(
         "dataset_statistics": {
             "n_patients": len(df),
             "treatment_rate": df["treatment_indicator"].mean(),
-            "outcome_rate": df["outcome_indicator"].mean(),
+            "outcome_mean": df["outcome_indicator"].mean(),
+            "outcome_std": df["outcome_indicator"].std(),
             "mean_treatment_prob": df["true_treatment_prob"].mean(),
             "std_treatment_prob": df["true_treatment_prob"].std(),
-            "mean_outcome_prob": df["true_outcome_prob"].mean(),
-            "std_outcome_prob": df["true_outcome_prob"].std(),
-            "mean_ite_prob": df["true_ite_prob"].mean(),
-            "std_ite_prob": df["true_ite_prob"].std(),
+            "mean_y0": df["true_y0"].mean(),
+            "std_y0": df["true_y0"].std(),
+            "mean_y1": df["true_y1"].mean(),
+            "std_y1": df["true_y1"].std(),
+            "mean_ite": df["true_ite"].mean(),
+            "std_ite": df["true_ite"].std(),
             "clinical_text_stats": {
                 "non_empty_count": (df["clinical_text"].str.len() > 0).sum(),
                 "mean_length": df["clinical_text"].str.len().mean(),

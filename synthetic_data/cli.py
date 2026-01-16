@@ -58,8 +58,8 @@ Examples:
     parser.add_argument(
         "--treatment-effect",
         type=float,
-        default=0.20,
-        help="Target treatment effect on probability scale (e.g., 0.10 = 10%% increase in outcome probability, default: 0.20)",
+        default=2.0,
+        help="Target treatment effect in months (ATE, e.g., 2.0 = 2 month increase in survival, default: 2.0)",
     )
     parser.add_argument(
         "--target-treatment-rate",
@@ -68,10 +68,10 @@ Examples:
         help="Target proportion of patients receiving treatment=1 (default: 0.5)",
     )
     parser.add_argument(
-        "--target-control-outcome-rate",
+        "--target-control-outcome-mean",
         type=float,
-        default=0.5,
-        help="Target outcome rate in control group (treatment=0) (default: 0.5)",
+        default=6.0,
+        help="Target mean survival in months for control group (treatment=0) (default: 6.0)",
     )
     parser.add_argument(
         "--num-confounders",
@@ -99,10 +99,10 @@ Examples:
         help="Maximum P(T=1|X) per stratum when --enforce-positivity is set (default: 0.9)",
     )
     parser.add_argument(
-        "--target-logit-std",
+        "--target-treatment-logit-std",
         type=float,
         default=2.0,
-        help="Target std of logits; lower values compress propensities toward 0.5 (default: 2.0)",
+        help="Target std of treatment logits; lower values compress propensities toward 0.5 (default: 2.0)",
     )
 
     # LLM parameters
@@ -188,17 +188,10 @@ Examples:
         help="Download directory for vllm model",
     )
     parser.add_argument(
-        "--outcome-type",
-        type=str,
-        choices=["binary", "continuous"],
-        default="binary",
-        help="Type of outcome: 'binary' (default) or 'continuous'",
-    )
-    parser.add_argument(
-        "--outcome-noise-std",
+        "--target-outcome-log-std",
         type=float,
-        default=1.0,
-        help="Noise standard deviation for continuous outcomes (default: 1.0)",
+        default=0.5,
+        help="Std of log-outcomes; controls outcome variability (default: 0.5)",
     )
     
     args = parser.parse_args()
@@ -220,26 +213,24 @@ Examples:
             config.clinical_question = args.clinical_question
         if args.dataset_size != 500:
             config.dataset_size = args.dataset_size
-        if args.treatment_effect != 0.20:
-            config.treatment_effect_prob = args.treatment_effect
+        if args.treatment_effect != 2.0:
+            config.treatment_effect = args.treatment_effect
         if args.target_treatment_rate != 0.5:
             config.target_treatment_rate = args.target_treatment_rate
-        if args.target_control_outcome_rate != 0.5:
-            config.target_control_outcome_rate = args.target_control_outcome_rate
+        if args.target_control_outcome_mean != 6.0:
+            config.target_control_outcome_mean = args.target_control_outcome_mean
         if args.enforce_positivity:
             config.enforce_positivity = True
         if args.min_treatment_rate != 0.1:
             config.min_treatment_rate_per_stratum = args.min_treatment_rate
         if args.max_treatment_rate != 0.9:
             config.max_treatment_rate_per_stratum = args.max_treatment_rate
-        if args.target_logit_std != 2.0:
-            config.target_logit_std = args.target_logit_std
+        if args.target_treatment_logit_std != 2.0:
+            config.target_treatment_logit_std = args.target_treatment_logit_std
         if args.num_confounders is not None:
             config.num_confounders = args.num_confounders
-        if args.outcome_type != "binary":
-            config.outcome_type = args.outcome_type
-        if args.outcome_noise_std != 1.0:
-            config.outcome_noise_std = args.outcome_noise_std
+        if args.target_outcome_log_std != 0.5:
+            config.target_outcome_log_std = args.target_outcome_log_std
         if args.output_dir != "./synthetic_output":
             config.output_dir = args.output_dir
         if args.seed != 42:
@@ -260,16 +251,15 @@ Examples:
         config = SyntheticDataConfig(
             clinical_question=args.clinical_question,
             dataset_size=args.dataset_size,
-            treatment_effect_prob=args.treatment_effect,
+            treatment_effect=args.treatment_effect,
             target_treatment_rate=args.target_treatment_rate,
-            target_control_outcome_rate=args.target_control_outcome_rate,
+            target_control_outcome_mean=args.target_control_outcome_mean,
             enforce_positivity=args.enforce_positivity,
             min_treatment_rate_per_stratum=args.min_treatment_rate,
             max_treatment_rate_per_stratum=args.max_treatment_rate,
-            target_logit_std=args.target_logit_std,
+            target_treatment_logit_std=args.target_treatment_logit_std,
             num_confounders=args.num_confounders,
-            outcome_type=args.outcome_type,
-            outcome_noise_std=args.outcome_noise_std,
+            target_outcome_log_std=args.target_outcome_log_std,
             output_dir=args.output_dir,
             seed=args.seed,
             llm=LLMConfig(
@@ -315,10 +305,7 @@ Examples:
         
         print(f"\n✓ Generated {len(df)} patients")
         print(f"  - Treatment rate: {df['treatment_indicator'].mean():.1%}")
-        if config.outcome_type == "continuous":
-            print(f"  - Outcome mean: {df['outcome_indicator'].mean():.2f} (std: {df['outcome_indicator'].std():.2f})")
-        else:
-            print(f"  - Outcome rate: {df['outcome_indicator'].mean():.1%}")
+        print(f"  - Outcome mean: {df['outcome_indicator'].mean():.2f} months (std: {df['outcome_indicator'].std():.2f})")
         if config.enforce_positivity:
             print(f"  - Positivity enforcement: ON (min={config.min_treatment_rate_per_stratum:.0%}, max={config.max_treatment_rate_per_stratum:.0%})")
         print(f"  - Config: {config.output_dir}/generation_config.json")
