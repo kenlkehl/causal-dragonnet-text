@@ -81,37 +81,33 @@ def generate_synthetic_dataset(
     # Step 2: Generate regression equations
     logger.info("Step 2/5: Generating regression equations...")
     treatment_eq, outcome_eq = _generate_equations(
-        client, config.clinical_question, confounders, config.treatment_effect_prob,
+        client, config.clinical_question, confounders, config.treatment_effect,
         main_coef_scale=config.main_coefficient_scale,
         interaction_coef_scale=config.interaction_coefficient_scale,
     )
     logger.info(f"Treatment equation has {len(treatment_eq['coefficients'])} terms")
     logger.info(f"Outcome equation has {len(outcome_eq['coefficients'])} terms")
-    
+
     # Step 3: Generate summary statistics
     logger.info("Step 3/6: Generating summary statistics...")
     summary_stats = _generate_summary_statistics(client, config.clinical_question, confounders)
-    
-    # Step 4: Rescale coefficients first to achieve target logit std
-    # (Order matters: rescaling changes the linear predictor, so intercepts must be calibrated afterward)
-    logger.info("Step 4/7: Rescaling coefficients for target variability...")
-    treatment_eq, outcome_eq = _rescale_for_target_logit_std(
+
+    # Step 4: Rescale treatment coefficients for target logit std (treatment is still binary)
+    logger.info("Step 4/7: Rescaling treatment coefficients for target variability...")
+    treatment_eq = _rescale_treatment_for_target_logit_std(
         confounders=confounders,
         summary_stats=summary_stats,
         treatment_eq=treatment_eq,
-        outcome_eq=outcome_eq,
-        target_logit_std=config.target_logit_std,
+        target_logit_std=config.target_treatment_logit_std,
     )
 
-    # Step 5: Calibrate intercepts to hit target rates (after rescaling)
-    logger.info("Step 5/7: Calibrating intercepts to target rates...")
-    treatment_eq, outcome_eq = _calibrate_intercepts(
+    # Step 5: Calibrate treatment intercept for target treatment rate
+    logger.info("Step 5/7: Calibrating treatment intercept...")
+    treatment_eq = _calibrate_treatment_intercept(
         confounders=confounders,
         summary_stats=summary_stats,
         treatment_eq=treatment_eq,
-        outcome_eq=outcome_eq,
         target_treatment_rate=config.target_treatment_rate,
-        target_control_outcome_rate=config.target_control_outcome_rate,
     )
 
     # Step 6: Generate patient data
@@ -141,13 +137,16 @@ def generate_synthetic_dataset(
         "dataset_statistics": {
             "n_patients": len(df),
             "treatment_rate": df["treatment_indicator"].mean(),
-            "outcome_rate": df["outcome_indicator"].mean(),
+            "mean_outcome": df["outcome_indicator"].mean(),
+            "std_outcome": df["outcome_indicator"].std(),
             "mean_treatment_prob": df["true_treatment_prob"].mean(),
             "std_treatment_prob": df["true_treatment_prob"].std(),
-            "mean_outcome_prob": df["true_outcome_prob"].mean(),
-            "std_outcome_prob": df["true_outcome_prob"].std(),
-            "mean_ite_prob": df["true_ite_prob"].mean(),
-            "std_ite_prob": df["true_ite_prob"].std(),
+            "mean_y0": df["true_y0"].mean(),
+            "std_y0": df["true_y0"].std(),
+            "mean_y1": df["true_y1"].mean(),
+            "std_y1": df["true_y1"].std(),
+            "mean_ite": df["true_ite"].mean(),
+            "std_ite": df["true_ite"].std(),
         }
     }
     
@@ -730,6 +729,172 @@ def _rescale_for_target_logit_std(
     return treatment_eq, outcome_eq
 
 
+def _rescale_treatment_for_target_logit_std(
+    confounders: List[Dict[str, Any]],
+    summary_stats: Dict[str, Any],
+    treatment_eq: Dict[str, Any],
+    target_logit_std: float = 2.0,
+    n_samples: int = 10000,
+) -> Dict[str, Any]:
+    """
+    Rescale treatment equation coefficients to achieve target logit std.
+
+    For continuous outcomes, we only rescale the treatment equation (not outcome).
+    """
+    # Sample characteristics
+    sampled_chars = [
+        _sample_patient_characteristics(confounders, summary_stats)
+        for _ in range(n_samples)
+    ]
+
+    def compute_logit_without_intercept(characteristics, equation):
+        original_intercept = equation.get("intercept", 0.0)
+        equation["intercept"] = 0.0
+        logit = _compute_logit(characteristics, confounders, summary_stats, equation)
+        equation["intercept"] = original_intercept
+        return logit
+
+    treatment_logits = np.array([
+        compute_logit_without_intercept(chars, treatment_eq)
+        for chars in sampled_chars
+    ])
+
+    treatment_std = np.std(treatment_logits)
+    logger.info(f"Current treatment logit std: {treatment_std:.2f}")
+
+    def scale_equation_coefficients(equation: Dict, scale: float) -> Dict:
+        eq = equation.copy()
+        if "coefficients" in eq:
+            eq["coefficients"] = {k: v * scale for k, v in eq["coefficients"].items()}
+        if "interactions" in eq:
+            eq["interactions"] = [
+                {**inter, "coefficient": inter.get("coefficient", 0) * scale}
+                for inter in eq["interactions"]
+            ]
+        return eq
+
+    if treatment_std > 0:
+        treatment_scale = target_logit_std / treatment_std
+        treatment_eq = scale_equation_coefficients(treatment_eq, treatment_scale)
+        logger.info(f"Scaled treatment coefficients by {treatment_scale:.3f}")
+
+    return treatment_eq
+
+
+def _calibrate_treatment_intercept(
+    confounders: List[Dict[str, Any]],
+    summary_stats: Dict[str, Any],
+    treatment_eq: Dict[str, Any],
+    target_treatment_rate: float,
+    n_samples: int = 10000,
+) -> Dict[str, Any]:
+    """
+    Calibrate treatment equation intercept to achieve target treatment rate.
+    """
+    from scipy.optimize import brentq
+
+    sampled_chars = [
+        _sample_patient_characteristics(confounders, summary_stats)
+        for _ in range(n_samples)
+    ]
+
+    def sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
+
+    def compute_linear_predictor(characteristics, equation):
+        original_intercept = equation.get("intercept", 0.0)
+        equation["intercept"] = 0.0
+        logit = _compute_logit(characteristics, confounders, summary_stats, equation)
+        equation["intercept"] = original_intercept
+        return logit
+
+    treatment_lps = np.array([
+        compute_linear_predictor(chars, treatment_eq)
+        for chars in sampled_chars
+    ])
+
+    def treatment_rate_error(intercept):
+        probs = sigmoid(intercept + treatment_lps)
+        return probs.mean() - target_treatment_rate
+
+    try:
+        calibrated_intercept = brentq(treatment_rate_error, -10, 10)
+    except ValueError:
+        logger.warning(f"Could not achieve target treatment rate {target_treatment_rate}")
+        calibrated_intercept = 0.0
+
+    original_intercept = treatment_eq.get("intercept", 0.0)
+    treatment_eq["intercept"] = calibrated_intercept
+    treatment_eq["original_intercept"] = original_intercept
+
+    achieved_rate = sigmoid(calibrated_intercept + treatment_lps).mean()
+    logger.info(f"Calibrated treatment intercept: {original_intercept:.3f} -> {calibrated_intercept:.3f}")
+    logger.info(f"Achieved treatment rate: {achieved_rate:.3f} (target: {target_treatment_rate:.3f})")
+
+    return treatment_eq
+
+
+def _compute_confounder_effect(
+    characteristics: Dict[str, Any],
+    confounders: List[Dict[str, Any]],
+    summary_stats: Dict[str, Any],
+    equation: Dict[str, Any],
+) -> float:
+    """
+    Compute confounder effects for continuous outcome (log-scale).
+
+    Returns the linear predictor contribution from confounders only
+    (excludes intercept and treatment effect).
+    """
+    effect = 0.0
+    coefficients = equation.get("coefficients", {})
+
+    # Build z-scored continuous values
+    z_values = {}
+    for conf in confounders:
+        name = conf["name"]
+        if conf["type"] == "continuous":
+            stats = summary_stats.get(name, {})
+            mean = stats.get("mean", 0.0)
+            std = stats.get("std", 1.0)
+            if std == 0:
+                std = 1.0
+            z_values[name] = (characteristics[name] - mean) / std
+
+    # Apply coefficients
+    for coef_name, coef_value in coefficients.items():
+        if coef_name in z_values:
+            effect += coef_value * z_values[coef_name]
+            continue
+
+        # Check categorical dummies
+        for conf in confounders:
+            if conf["type"] == "categorical":
+                name = conf["name"]
+                for cat in conf["categories"][1:]:
+                    dummy_name = f"{name}_{cat}"
+                    if coef_name == dummy_name:
+                        if characteristics.get(name) == cat:
+                            effect += coef_value
+                        break
+
+    # Apply interactions
+    interactions = equation.get("interactions", [])
+    for interaction in interactions:
+        terms = interaction.get("terms", [])
+        coef = interaction.get("coefficient", 0.0)
+        product = 1.0
+        for term in terms:
+            if term in z_values:
+                product *= z_values[term]
+            else:
+                product = 0.0
+                break
+        effect += coef * product
+
+    return effect
+
+
 def _sample_patient_characteristics(
     confounders: List[Dict[str, Any]],
     summary_stats: Dict[str, Any],
@@ -905,14 +1070,14 @@ def _generate_single_patient(
     treatment_eq: Dict[str, Any],
     outcome_eq: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Generate data for a single patient.
-    
-    For binary outcomes: Samples from Bernoulli distribution using sigmoid(logit).
-    For continuous outcomes: Uses the logit directly, optionally with Gaussian noise.
+    """Generate data for a single patient with continuous outcomes (log-normal survival).
+
+    Outcomes are generated using log-normal distribution to ensure positivity.
+    Treatment effects are additive on the original (months) scale.
     """
     # Sample characteristics
     characteristics = _sample_patient_characteristics(confounders, summary_stats)
-    
+
     # Compute treatment logit and sample treatment (always binary)
     treatment_logit = _compute_logit(
         characteristics, confounders, summary_stats, treatment_eq
@@ -928,36 +1093,36 @@ def _generate_single_patient(
         )
 
     treatment = int(np.random.random() < treatment_prob)
-    
-    # Compute outcome logit
-    outcome_logit = _compute_logit(
-        characteristics, confounders, summary_stats, outcome_eq, treatment=treatment
-    )
-    
-    # Generate outcome based on outcome_type
-    outcome_type = getattr(config, 'outcome_type', 'binary')
-    if outcome_type == "continuous":
-        # Continuous outcome: use logit directly with optional noise
-        noise_std = getattr(config, 'outcome_noise_std', 1.0)
-        outcome = outcome_logit + np.random.normal(0, noise_std)
-    else:
-        # Binary outcome: sample from Bernoulli
-        outcome_prob = 1.0 / (1.0 + np.exp(-outcome_logit))
-        outcome = int(np.random.random() < outcome_prob)
-    
-    # Compute potential outcome probabilities for causal inference
-    outcome_logit_0 = _compute_logit(
-        characteristics, confounders, summary_stats, outcome_eq, treatment=0
-    )
-    outcome_logit_1 = _compute_logit(
-        characteristics, confounders, summary_stats, outcome_eq, treatment=1
-    )
-    outcome_prob_0 = 1.0 / (1.0 + np.exp(-outcome_logit_0))
-    outcome_prob_1 = 1.0 / (1.0 + np.exp(-outcome_logit_1))
-    true_ite_prob = outcome_prob_1 - outcome_prob_0
 
-    # Compute probability for factual outcome
-    outcome_prob = 1.0 / (1.0 + np.exp(-outcome_logit))
+    # Generate continuous outcomes using log-normal distribution
+    # Base log-mean from control outcome mean
+    log_baseline = np.log(config.target_control_outcome_mean)
+
+    # Compute confounder effects on log-scale (use outcome equation coefficients)
+    confounder_effect = _compute_confounder_effect(
+        characteristics, confounders, summary_stats, outcome_eq
+    )
+
+    # Generate noise
+    noise_std = config.target_outcome_log_std
+    noise = np.random.normal(0, noise_std)
+
+    # Potential outcomes (log-space, then exponentiate)
+    log_y0 = log_baseline + confounder_effect + noise
+    y0 = np.exp(log_y0)
+
+    # Treatment effect: additive on original scale
+    # To get additive effect, we compute y1 = y0 + treatment_effect
+    y1 = y0 + config.treatment_effect
+
+    # Ensure y1 is positive (treatment effect could be negative)
+    y1 = max(0.01, y1)
+
+    # Observed outcome
+    outcome = y1 if treatment == 1 else y0
+
+    # True ITE (difference in months)
+    true_ite = y1 - y0
 
     # Format patient characteristics as prompt
     patient_prompt = format_patient_characteristics(characteristics, confounders)
@@ -991,12 +1156,11 @@ def _generate_single_patient(
         "patient_prompt": patient_prompt,
         "clinical_text": clinical_history,
         "treatment_indicator": treatment,
-        "outcome_indicator": outcome,
+        "outcome_indicator": outcome,  # Continuous survival in months
         "true_treatment_prob": treatment_prob,
-        "true_outcome_prob": outcome_prob,
-        "true_y0_prob": outcome_prob_0,
-        "true_y1_prob": outcome_prob_1,
-        "true_ite_prob": true_ite_prob,
+        "true_y0": y0,  # Potential outcome under control
+        "true_y1": y1,  # Potential outcome under treatment
+        "true_ite": true_ite,  # Treatment effect in months
     }
 
 

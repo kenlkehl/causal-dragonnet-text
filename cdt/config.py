@@ -95,11 +95,13 @@ class PropensityTrimmingConfig:
 
 @dataclass
 class PlasmodeConfig:
-    """Configuration for plasmode simulation."""
+    """Configuration for plasmode simulation with continuous outcomes (survival in months)."""
     generation_mode: str = "phi_linear"
     preserve_observed_treatments: bool = True
-    baseline_control_outcome_rate: float = 0.20
-    target_ate_prob: float = 0.10  # Target ATE on probability scale (e.g., 0.10 = 10% increase in outcome probability)
+    # Continuous outcome parameters (survival in months)
+    baseline_control_outcome_mean: float = 6.0  # Mean survival in months for control group
+    target_ate: float = 2.0  # Target ATE in months (e.g., 2.0 = 2 months additional survival)
+    outcome_noise_std: float = 0.5  # Noise std in log-space for log-normal outcome generation
     outcome_heterogeneity_scale: float = 1.0
     ite_heterogeneity_scale: float = 1.0
     deep_nonlinear_hidden_dims: List[int] = field(default_factory=lambda: [64, 32])
@@ -258,7 +260,7 @@ def create_default_config(output_path: str) -> None:
             plasmode_scenarios=[
                 PlasmodeConfig(
                     generation_mode="phi_linear",
-                    target_ate_prob=0.10
+                    target_ate=2.0  # 2 months additional survival
                 )
             ]
         )

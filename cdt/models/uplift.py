@@ -12,22 +12,22 @@ logger = logging.getLogger(__name__)
 
 class UpliftNet(nn.Module):
     """
-    Uplift Modeling Network (Base + ITE parametrization).
-    
+    Uplift Modeling Network (Base + ITE parametrization) for continuous outcomes.
+
     Architecture:
     - Shared Representation Phi(X)
-    - Propensity Head: Phi(X) -> pi(X)
-    - Baseline Head: Phi(X) -> mu_0(X)  (Prognostic score)
-    - Effect Head: Phi(X) -> tau(X)     (Treatment effect)
-    
+    - Propensity Head: Phi(X) -> pi(X) (binary, logit output)
+    - Baseline Head: Phi(X) -> mu_0(X) (positive via Softplus, survival in months)
+    - Effect Head: Phi(X) -> tau(X) (linear, can be negative or positive)
+
     This parametrization forces the model to explicitly learn the treatment heterogeneity
     separate from the baseline risk, preventing the prognostic signal from drowning out
     the causal signal.
-    
+
     Theoretical Justification:
-    Like DragonNet, this architecture uses a shared representation regularized by the 
-    propensity score (confounding control). By explicitly parametrizing Tau(X), 
-    we reduce regularization bias where the model collapses ITE to the ATE 
+    Like DragonNet, this architecture uses a shared representation regularized by the
+    propensity score (confounding control). By explicitly parametrizing Tau(X),
+    we reduce regularization bias where the model collapses ITE to the ATE
     to satisfy the dominant prognostic loss.
     """
     
@@ -72,9 +72,12 @@ class UpliftNet(nn.Module):
         Args:
             confounder_features: Output from FeatureExtractor
                 Shape: (batch, num_confounders * features_per_confounder)
-        
+
         Returns:
-            y0_logit, tau_logit, t_logit, final_common_layer
+            y0_pred: (batch, 1) - baseline survival prediction (positive, via Softplus)
+            tau: (batch, 1) - treatment effect (can be negative or positive)
+            t_logit: (batch, 1) - treatment propensity logit
+            final_common_layer: (batch, representation_dim) - shared representation
         """
         # Shared Representation
         h = F.relu(self.representation_fc1(confounder_features))
@@ -90,23 +93,23 @@ class UpliftNet(nn.Module):
         t = F.relu(self.propensity_fc3(t))
         t_logit = self.propensity_fc4(t)
 
-        # Baseline Outcome (Y0)
+        # Baseline Outcome (Y0) - positive via Softplus
         y0 = F.relu(self.baseline_fc1(final_common_layer))
         y0 = F.relu(self.baseline_fc2(y0))
         y0 = F.relu(self.baseline_fc2a(y0))
         y0 = F.relu(self.baseline_fc2b(y0))
         y0 = F.elu(self.baseline_fc2c(y0))
-        y0_logit = self.baseline_fc3(y0)
+        y0_pred = F.softplus(self.baseline_fc3(y0))  # Positive continuous outcome
 
-        # Treatment Effect (Tau)
+        # Treatment Effect (Tau) - linear, can be negative or positive
         tau = F.relu(self.effect_fc1(final_common_layer))
         tau = F.relu(self.effect_fc2(tau))
         tau = F.relu(self.effect_fc2a(tau))
         tau = F.relu(self.effect_fc2b(tau))
         tau = F.elu(self.effect_fc2c(tau))
-        tau_logit = self.effect_fc3(tau)
+        tau = self.effect_fc3(tau)  # Linear output, no activation
 
-        return y0_logit, tau_logit, t_logit, final_common_layer
+        return y0_pred, tau, t_logit, final_common_layer
 
     def load_pretrained_representation(self, pretrained_state_dict):
         """

@@ -2,9 +2,11 @@
 
 ## Project Overview
 
-CDT is a framework for **clinical causal inference using electronic health record (EHR) text**. It estimates treatment effects from unstructured clinical narratives using neural networks with DragonNet-style causal inference heads.
+CDT is a framework for **clinical causal inference using electronic health record (EHR) text**. It estimates treatment effects on **continuous outcomes (survival in months)** from unstructured clinical narratives using neural networks with DragonNet-style causal inference heads.
 
 **Core research goal**: Extract confounders from clinical text that may not be captured in structured EHR data (e.g., functional status, symptom severity, patient preferences) and use them for causal inference.
+
+**Outcome type**: Continuous (survival in months, no censoring). Outcome heads use Softplus activation to ensure positive predictions.
 
 ## Repository Structure
 
@@ -55,9 +57,10 @@ Clinical Text → Feature Extractor (CNN/BERT) → DragonNet → [P(T|X), E[Y|T=
   - **BERT** (`bert_extractor.py`): Any HuggingFace transformer, CLS token extraction, optional projection layer. Higher capacity.
 
 - **DragonNet** (`dragonnet.py`): Jointly predicts:
-  - Treatment propensity: P(T=1|X)
-  - Potential outcomes: E[Y|T=0,X] and E[Y|T=1,X]
+  - Treatment propensity: P(T=1|X) (binary, sigmoid)
+  - Potential outcomes: E[Y|T=0,X] and E[Y|T=1,X] (continuous, Softplus for positivity)
   - Uses shared representation layers, separate outcome heads
+  - ITE = E[Y|T=1,X] - E[Y|T=0,X] (in months)
 
 ### 2. CNN Semantic Initialization
 
@@ -138,7 +141,9 @@ ExperimentConfig                    # Top-level config
     ├── num_repeats: int
     ├── plasmode_scenarios: List[PlasmodeConfig]
     │   ├── generation_mode: str    # e.g., "phi_linear"
-    │   └── target_ate_prob: float  # Known true ATE
+    │   ├── baseline_control_outcome_mean: float  # Mean survival (months) for control
+    │   ├── target_ate: float       # True ATE in months
+    │   └── outcome_noise_std: float  # Noise std in log-space
     └── generator_*/evaluator_*     # Separate configs for gen/eval
 ```
 
@@ -147,7 +152,7 @@ ExperimentConfig                    # Top-level config
 Parquet or CSV with columns:
 - `clinical_text`: Raw clinical narrative text
 - `treatment_indicator`: Binary (0/1)
-- `outcome_indicator`: Binary (0/1)
+- `outcome_indicator`: Continuous (survival in months)
 - `split` (optional): "train"/"val"/"test" for fixed splits
 
 ## Important Code Patterns
@@ -180,14 +185,18 @@ for batch in train_loader:
     optimizer.step()
 
 # Prediction
-preds = model.predict(texts)  # Returns dict with y0_prob, y1_prob, propensity, ite
+preds = model.predict(texts)  # Returns dict with y0_pred, y1_pred, ite, propensity
 ```
 
 ### Key Model Methods
 
 - `CausalCNNText.fit_tokenizer(texts)`: Required for CNN, builds vocabulary
 - `CausalCNNText.train_step(batch, alpha_propensity, beta_targreg)`: Returns loss dict
-- `CausalCNNText.predict(texts)`: Returns predictions on probability scale
+- `CausalCNNText.predict(texts)`: Returns predictions (continuous outcomes in months)
+  - `y0_pred`: Predicted survival under control
+  - `y1_pred`: Predicted survival under treatment
+  - `ite`: Individual treatment effect (y1 - y0, in months)
+  - `propensity`: Treatment probability
 - `CausalCNNText.get_features(texts)`: Extract feature representations
 - `CNNFeatureExtractor.interpret_filters(texts)`: Post-hoc filter interpretation
 
@@ -197,13 +206,14 @@ preds = model.predict(texts)  # Returns dict with y0_prob, y1_prob, propensity, 
 1. Generate confounders (LLM)
 2. Generate regression equations (LLM) - treatment/outcome models
 3. Generate summary statistics (LLM) - confounder distributions
-4. Rescale coefficients for target logit std
-5. Calibrate intercepts for target treatment/outcome rates
+4. Rescale treatment coefficients for target logit std
+5. Calibrate treatment intercept for target treatment rate
 6. For each patient:
    a. Sample characteristics from distributions
-   b. Compute treatment probability, sample treatment
-   c. Compute outcome probability, sample outcome
-   d. Generate clinical history text (LLM)
+   b. Compute treatment probability, sample treatment (binary)
+   c. Generate outcome using log-normal distribution (positive, continuous)
+   d. Compute potential outcomes Y0, Y1 and ITE (in months)
+   e. Generate clinical history text (LLM)
 7. Save dataset + metadata
 ```
 
@@ -218,8 +228,8 @@ Outputs:
 total_loss = outcome_loss + alpha_propensity * propensity_loss + beta_targreg * targreg_loss
 ```
 
-- **outcome_loss**: BCE on factual outcome (Y given actual T)
-- **propensity_loss**: BCE on treatment prediction
+- **outcome_loss**: MSE on factual outcome (continuous survival, Y given actual T)
+- **propensity_loss**: BCE on treatment prediction (binary)
 - **targreg_loss**: Targeted regularization (R-loss) for debiasing
 
 ## Propensity Trimming

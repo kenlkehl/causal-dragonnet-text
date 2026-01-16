@@ -189,8 +189,8 @@ class CausalCNNText(nn.Module):
             texts: List of text strings
 
         Returns:
-            y0_logit: (batch, 1) - outcome prediction under control
-            y1_logit: (batch, 1) - outcome prediction under treatment
+            y0_pred: (batch, 1) - predicted survival under control (positive, continuous)
+            y1_pred: (batch, 1) - predicted survival under treatment (positive, continuous)
             t_logit: (batch, 1) - treatment propensity logit
             final_common_layer: (batch, representation_dim) - shared representation
         """
@@ -198,15 +198,15 @@ class CausalCNNText(nn.Module):
         features = self.feature_extractor(texts)
 
         if self.model_type == "uplift":
-            # UpliftNet returns: y0_logit, tau_logit, t_logit, final_common_layer
-            y0_logit, tau_logit, t_logit, final_common_layer = self.net(features)
-            # Reconstruct y1_logit = y0_logit + tau_logit
-            y1_logit = y0_logit + tau_logit
+            # UpliftNet returns: y0_pred, tau, t_logit, final_common_layer
+            y0_pred, tau, t_logit, final_common_layer = self.net(features)
+            # Reconstruct y1_pred = y0_pred + tau
+            y1_pred = y0_pred + tau
         else:
-            # DragonNet returns: y0_logit, y1_logit, t_logit, final_common_layer
-            y0_logit, y1_logit, t_logit, final_common_layer = self.net(features)
+            # DragonNet returns: y0_pred, y1_pred, t_logit, final_common_layer
+            y0_pred, y1_pred, t_logit, final_common_layer = self.net(features)
 
-        return y0_logit, y1_logit, t_logit, final_common_layer
+        return y0_pred, y1_pred, t_logit, final_common_layer
 
     def train_step(
         self,
@@ -215,7 +215,7 @@ class CausalCNNText(nn.Module):
         beta_targreg: float = 0.1
     ) -> Dict[str, torch.Tensor]:
         """
-        Perform single training step.
+        Perform single training step for continuous outcomes.
 
         Args:
             batch: Dictionary with 'texts', 'treatment', 'outcome' keys
@@ -227,38 +227,38 @@ class CausalCNNText(nn.Module):
         """
         texts = batch['texts']
         treatments = batch['treatment']  # (batch,)
-        outcomes = batch['outcome']  # (batch,)
+        outcomes = batch['outcome']  # (batch,) - continuous survival in months
 
         # Forward pass
-        y0_logit, y1_logit, t_logit, phi = self.forward(texts)
+        y0_pred, y1_pred, t_logit, phi = self.forward(texts)
 
-        # Propensity loss
+        # Propensity loss (still binary cross-entropy for treatment)
         propensity_loss = F.binary_cross_entropy_with_logits(
             t_logit.squeeze(-1),
             treatments
         )
 
-        # Outcome loss - factual outcome only
-        factual_logit = torch.where(
+        # Outcome loss - MSE for continuous outcomes (factual only)
+        factual_pred = torch.where(
             treatments.unsqueeze(1) > 0.5,
-            y1_logit,
-            y0_logit
+            y1_pred,
+            y0_pred
         )
 
-        outcome_loss = F.binary_cross_entropy_with_logits(
-            factual_logit.squeeze(-1),
+        outcome_loss = F.mse_loss(
+            factual_pred.squeeze(-1),
             outcomes
         )
 
-        # Targeted regularization (R-loss)
+        # Targeted regularization (R-loss) for continuous outcomes
         if beta_targreg > 0:
             with torch.no_grad():
                 propensity = torch.sigmoid(t_logit).clamp(1e-3, 1 - 1e-3)
                 H = (treatments.unsqueeze(1) / propensity) - \
                     ((1 - treatments.unsqueeze(1)) / (1 - propensity))
 
-            factual_prob = torch.sigmoid(factual_logit)
-            moment = torch.mean((outcomes.unsqueeze(1) - factual_prob) * H)
+            # Use raw predictions for continuous outcomes (no sigmoid)
+            moment = torch.mean((outcomes.unsqueeze(1) - factual_pred) * H)
             targreg_loss = moment ** 2
         else:
             targreg_loss = torch.tensor(0.0, device=self._device)
@@ -275,8 +275,8 @@ class CausalCNNText(nn.Module):
             'outcome_loss': outcome_loss.detach(),
             'propensity_loss': propensity_loss.detach(),
             'targreg_loss': targreg_loss.detach() if isinstance(targreg_loss, torch.Tensor) else targreg_loss,
-            'y0_logit': y0_logit.detach(),
-            'y1_logit': y1_logit.detach(),
+            'y0_pred': y0_pred.detach(),
+            'y1_pred': y1_pred.detach(),
             't_logit': t_logit.detach()
         }
 
@@ -285,39 +285,41 @@ class CausalCNNText(nn.Module):
         texts: List[str]
     ) -> Dict[str, torch.Tensor]:
         """
-        Make predictions for inference.
+        Make predictions for inference with continuous outcomes.
 
         Args:
             texts: List of text strings
 
         Returns:
-            Dictionary with prediction outputs
+            Dictionary with prediction outputs:
+            - y0_pred: Predicted survival under control (months)
+            - y1_pred: Predicted survival under treatment (months)
+            - ite: Individual treatment effect (y1 - y0, in months)
+            - propensity: Treatment propensity probability
+            - t_logit: Treatment propensity logit
+            - final_common_layer: Shared representation
         """
         with torch.no_grad():
             features = self.feature_extractor(texts)
 
             if self.model_type == "uplift":
-                y0_logit, tau_logit, t_logit, final_common_layer = self.net(features)
-                y1_logit = y0_logit + tau_logit
-                tau_pred = tau_logit.squeeze(-1)
+                y0_pred, tau, t_logit, final_common_layer = self.net(features)
+                y1_pred = y0_pred + tau
+                ite = tau.squeeze(-1)
             else:
-                y0_logit, y1_logit, t_logit, final_common_layer = self.net(features)
-                tau_pred = (y1_logit - y0_logit).squeeze(-1)
+                y0_pred, y1_pred, t_logit, final_common_layer = self.net(features)
+                ite = (y1_pred - y0_pred).squeeze(-1)
 
-            # Convert to probabilities
-            y0_prob = torch.sigmoid(y0_logit).squeeze(-1)
-            y1_prob = torch.sigmoid(y1_logit).squeeze(-1)
+            # Propensity is still binary (sigmoid)
             propensity = torch.sigmoid(t_logit).squeeze(-1)
 
             return {
-                'y0_prob': y0_prob,
-                'y1_prob': y1_prob,
+                'y0_pred': y0_pred.squeeze(-1),  # Continuous survival prediction
+                'y1_pred': y1_pred.squeeze(-1),  # Continuous survival prediction
+                'ite': ite,  # Treatment effect in months
                 'propensity': propensity,
-                'y0_logit': y0_logit.squeeze(-1),
-                'y1_logit': y1_logit.squeeze(-1),
                 't_logit': t_logit.squeeze(-1),
                 'final_common_layer': final_common_layer,
-                'tau_pred': tau_pred
             }
 
     def get_features(

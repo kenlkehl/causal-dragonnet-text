@@ -11,8 +11,12 @@ logger = logging.getLogger(__name__)
 
 
 class DragonNet(nn.Module):
-    """Binary treatment DragonNet. Can be initialized from pretrained multi-treatment model."""
-    
+    """Binary treatment DragonNet with continuous outcome heads (survival in months).
+
+    Outcome heads use Softplus activation to ensure positive predictions.
+    Propensity head remains binary (logit output).
+    """
+
     def __init__(self, input_dim, representation_dim=200, hidden_outcome_dim=100):
         super().__init__()
         # Shared representation layers (can be loaded from pretrained)
@@ -24,9 +28,9 @@ class DragonNet(nn.Module):
         self.representation_fc6 = nn.Linear(representation_dim, representation_dim)
 
         # Binary treatment propensity head (matches old_cdt: single linear layer)
-        self.propensity_fc1 = nn.Linear(representation_dim, 1)        
+        self.propensity_fc1 = nn.Linear(representation_dim, 1)
 
-        # Binary outcome heads (matches old_cdt: 2 hidden layers)
+        # Continuous outcome heads (survival in months, Softplus for positivity)
         self.outcome0_fc1 = nn.Linear(representation_dim, hidden_outcome_dim)
         self.outcome0_fc2 = nn.Linear(hidden_outcome_dim, hidden_outcome_dim)
         self.outcome0_fc3 = nn.Linear(hidden_outcome_dim, 1)
@@ -41,9 +45,12 @@ class DragonNet(nn.Module):
         Args:
             confounder_features: Output from FeatureExtractor
                 Shape: (batch, num_confounders * features_per_confounder)
-        
+
         Returns:
-            y0_logit, y1_logit, t_logit, final_common_layer
+            y0_pred: (batch, 1) - predicted survival under control (positive, via Softplus)
+            y1_pred: (batch, 1) - predicted survival under treatment (positive, via Softplus)
+            t_logit: (batch, 1) - treatment propensity logit
+            final_common_layer: (batch, representation_dim) - shared representation
         """
         h = F.relu(self.representation_fc1(confounder_features))
         #h = F.relu(self.representation_fc2(h))
@@ -56,13 +63,13 @@ class DragonNet(nn.Module):
 
         y0 = F.relu(self.outcome0_fc1(final_common_layer))
         y0 = F.elu(self.outcome0_fc2(y0))
-        y0_logit = self.outcome0_fc3(y0)
+        y0_pred = F.softplus(self.outcome0_fc3(y0))  # Positive continuous outcome
 
         y1 = F.relu(self.outcome1_fc1(final_common_layer))
         y1 = F.elu(self.outcome1_fc2(y1))
-        y1_logit = self.outcome1_fc3(y1)
+        y1_pred = F.softplus(self.outcome1_fc3(y1))  # Positive continuous outcome
 
-        return y0_logit, y1_logit, t_logit, final_common_layer
+        return y0_pred, y1_pred, t_logit, final_common_layer
 
 
     def load_pretrained_representation(self, pretrained_state_dict):

@@ -26,41 +26,40 @@ class LLMConfig:
 
 @dataclass
 class SyntheticDataConfig:
-    """Configuration for synthetic dataset generation."""
+    """Configuration for synthetic dataset generation with continuous outcomes (survival in months)."""
     # Clinical research question
     clinical_question: str = DEFAULT_CLINICAL_QUESTION
 
     # Dataset parameters
     dataset_size: int = 500
-    treatment_effect_prob: float = 0.10  # Target average treatment effect on probability scale (e.g., 0.10 = 10% increase)
 
-    # Target rates (intercepts will be calibrated to achieve these)
+    # Treatment distribution parameters (binary treatment assignment)
     target_treatment_rate: float = 0.5  # Proportion of patients receiving treatment=1
-    target_control_outcome_rate: float = 0.2  # Outcome rate in control group (treatment=0)
+    target_treatment_logit_std: float = 2.0  # Target std of treatment logits; controls propensity spread
 
     # Positivity enforcement - ensures adequate treatment/control overlap for causal inference
     enforce_positivity: bool = False  # If True, ensures minimum treatment rate per confounder stratum
     min_treatment_rate_per_stratum: float = 0.1  # Minimum P(T=1|X) for each stratum (requires enforce_positivity=True)
     max_treatment_rate_per_stratum: float = 0.9  # Maximum P(T=1|X) for each stratum (requires enforce_positivity=True)
 
+    # Outcome distribution parameters (continuous survival in months, log-normal)
+    target_control_outcome_mean: float = 6.0  # Mean survival in months for control group
+    treatment_effect: float = 2.0  # Target ATE in months (additive effect on original scale)
+    target_outcome_log_std: float = 0.5  # Std of log-outcomes; controls outcome variability
+
     # Internal coefficient scaling (advanced users only)
     main_coefficient_scale: float = 0.3  # Scale for main effect coefficients
     interaction_coefficient_scale: float = 0.1  # Scale for interaction coefficients
-    target_logit_std: float = 2.0  # Target std of logits; lower values compress propensities toward 0.5
-    
+
     # Number of confounders (None = use LLM default of 8-12)
     num_confounders: Optional[int] = None
-    
-    # Outcome type: "binary" or "continuous"
-    outcome_type: str = "binary"
-    outcome_noise_std: float = 1.0  # Noise std for continuous outcomes
-    
+
     # Output
     output_dir: str = "./synthetic_output"
-    
+
     # LLM settings
     llm: LLMConfig = field(default_factory=LLMConfig)
-    
+
     # Reproducibility
     seed: int = 42
 
@@ -107,3 +106,9 @@ class SyntheticDataConfig:
                 raise ValueError("max_treatment_rate_per_stratum must be between 0 and 1 (exclusive)")
             if self.min_treatment_rate_per_stratum >= self.max_treatment_rate_per_stratum:
                 raise ValueError("min_treatment_rate_per_stratum must be less than max_treatment_rate_per_stratum")
+
+        # Validate continuous outcome parameters
+        if self.target_control_outcome_mean <= 0:
+            raise ValueError("target_control_outcome_mean must be positive (survival months)")
+        if self.target_outcome_log_std <= 0:
+            raise ValueError("target_outcome_log_std must be positive")

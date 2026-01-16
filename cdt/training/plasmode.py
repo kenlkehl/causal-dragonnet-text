@@ -105,7 +105,7 @@ def run_plasmode_experiments(
         logger.info(f"\n{'=' * 80}")
         logger.info(f"SCENARIO {scenario_idx + 1}/{len(plasmode_config.plasmode_scenarios)}")
         logger.info(f"  Mode: {scenario.generation_mode}")
-        logger.info(f"  Target ATE (prob): {scenario.target_ate_prob}")
+        logger.info(f"  Target ATE (months): {scenario.target_ate}")
         logger.info(f"{'=' * 80}")
 
         for repeat_idx in range(num_repeats):
@@ -162,12 +162,12 @@ def run_plasmode_experiments(
         logger.info(f"{'=' * 80}")
 
         summary = results_df.groupby('generation_mode').agg({
-            'ate_bias_prob': ['mean', 'std'],
-            'ate_rmse_prob': ['mean', 'std'],
-            'ite_correlation_prob': ['mean', 'std'],
+            'ate_bias': ['mean', 'std'],
+            'ate_rmse': ['mean', 'std'],
+            'ite_correlation': ['mean', 'std'],
         }).round(4)
 
-        logger.info("\nSummary by generation mode (probability scale):")
+        logger.info("\nSummary by generation mode (survival months):")
         logger.info(f"\n{summary}")
     else:
         logger.error("No successful experiments completed")
@@ -211,7 +211,7 @@ def _worker_wrapper(task: Dict[str, Any]) -> Optional[Tuple[dict, List[Dict[str,
         metrics['scenario_idx'] = scenario_idx
         metrics['repeat_idx'] = repeat_idx
         metrics['generation_mode'] = scenario.generation_mode
-        metrics['target_ate_prob'] = scenario.target_ate_prob
+        metrics['target_ate'] = scenario.target_ate
         metrics['train_fraction'] = plasmode_config.train_fraction
 
         return metrics, logs
@@ -294,24 +294,24 @@ def _run_single_plasmode_experiment(
     # Step 4: Generate predictions for eval split
     preds_dict = _predict_cnn_model(evaluator, eval_plasmode_df, applied_config, device)
 
-    # Probability scale predictions only
-    eval_plasmode_df['estimated_y0_prob'] = preds_dict['y0_prob']
-    eval_plasmode_df['estimated_y1_prob'] = preds_dict['y1_prob']
-    eval_plasmode_df['estimated_ite_prob'] = preds_dict['ite_prob']
-    eval_plasmode_df['estimated_propensity_prob'] = preds_dict['propensity_prob']
+    # Continuous outcome predictions (survival in months)
+    eval_plasmode_df['estimated_y0'] = preds_dict['y0_pred']
+    eval_plasmode_df['estimated_y1'] = preds_dict['y1_pred']
+    eval_plasmode_df['estimated_ite'] = preds_dict['ite']
+    eval_plasmode_df['estimated_propensity'] = preds_dict['propensity']
 
     # Save dataset
     if save_dataset_path is not None:
         eval_plasmode_df.to_parquet(save_dataset_path, index=False)
 
-    # Step 5: Evaluate (probability scale)
+    # Step 5: Evaluate (continuous outcomes in months)
     metrics = _evaluate_plasmode_performance(
         eval_plasmode_df,
-        scenario.target_ate_prob
+        scenario.target_ate
     )
 
-    logger.info(f"Experiment complete: ATE bias={metrics['ate_bias_prob']:.4f}, "
-                f"ITE corr={metrics['ite_correlation_prob']:.4f}")
+    logger.info(f"Experiment complete: ATE bias={metrics['ate_bias']:.2f} months, "
+                f"ITE corr={metrics['ite_correlation']:.4f}")
 
     metrics['n_train'] = len(train_split_df)
     metrics['n_eval'] = len(eval_split_df)
@@ -489,7 +489,7 @@ def _generate_plasmode_data(
     applied_config: AppliedInferenceConfig,
     device: torch.device
 ) -> pd.DataFrame:
-    """Generate synthetic outcomes using the generator model."""
+    """Generate synthetic continuous outcomes (survival in months) using log-normal distribution."""
 
     plasmode_df = df.copy()
 
@@ -519,45 +519,53 @@ def _generate_plasmode_data(
 
     confounder_features = np.concatenate(all_features, axis=0)
 
-    # Generate synthetic ITEs based on scenario
+    # Generate synthetic continuous outcomes using log-normal distribution
     np.random.seed(42)
 
-    # Convert target ATE from probability scale to logit scale for simulation
-    # Use baseline control outcome rate to compute approximate logit ITE
-    p0 = scenario.baseline_control_outcome_rate
-    p1 = min(0.99, max(0.01, p0 + scenario.target_ate_prob))  # Clamp to valid range
-    target_ate_logit = np.log(p1 / (1 - p1)) - np.log(p0 / (1 - p0))
+    # Base log-mean from baseline control outcome mean
+    log_baseline = np.log(scenario.baseline_control_outcome_mean)
 
     if scenario.generation_mode == "phi_linear":
-        # Simple linear ITE based on features
+        # Linear confounder effects on log-scale
         weights = np.random.randn(confounder_features.shape[1]) * 0.1
-        base_ite = confounder_features @ weights
-        base_ite = base_ite * scenario.ite_heterogeneity_scale
-        ite_logit = base_ite + target_ate_logit
-
+        confounder_effect = confounder_features @ weights
+        confounder_effect = confounder_effect * scenario.outcome_heterogeneity_scale
     else:
-        # Default: constant ATE
-        ite_logit = np.full(len(df), target_ate_logit)
+        # No confounder effects (constant baseline)
+        confounder_effect = np.zeros(len(df))
 
-    # Generate Y0 and Y1 (internally using logit space for proper simulation)
-    y0_logit = np.random.randn(len(df)) * scenario.outcome_heterogeneity_scale
-    y0_logit += np.log(scenario.baseline_control_outcome_rate / (1 - scenario.baseline_control_outcome_rate))
+    # Generate heterogeneous treatment effects if specified
+    if scenario.generation_mode == "phi_linear" and scenario.ite_heterogeneity_scale > 0:
+        weights_ite = np.random.randn(confounder_features.shape[1]) * 0.05
+        ite_heterogeneity = confounder_features @ weights_ite
+        ite_heterogeneity = ite_heterogeneity * scenario.ite_heterogeneity_scale
+    else:
+        ite_heterogeneity = np.zeros(len(df))
 
-    y1_logit = y0_logit + ite_logit
+    # Generate noise (log-space)
+    noise = np.random.randn(len(df)) * scenario.outcome_noise_std
 
-    # Sample outcomes
+    # Potential outcomes (log-space, then exponentiate)
+    log_y0 = log_baseline + confounder_effect + noise
+    y0 = np.exp(log_y0)
+
+    # Treatment effect: additive on original scale
+    # ITE = target_ate + heterogeneity
+    ite = scenario.target_ate + ite_heterogeneity
+    y1 = y0 + ite
+
+    # Ensure y1 is positive
+    y1 = np.maximum(0.01, y1)
+
+    # Observed outcome based on treatment
     treatments = df[applied_config.treatment_column].values
-    y0_prob = 1 / (1 + np.exp(-y0_logit))
-    y1_prob = 1 / (1 + np.exp(-y1_logit))
-
-    observed_prob = np.where(treatments == 1, y1_prob, y0_prob)
-    observed_outcome = (np.random.rand(len(df)) < observed_prob).astype(float)
+    observed_outcome = np.where(treatments == 1, y1, y0)
 
     plasmode_df[applied_config.outcome_column] = observed_outcome
-    # Probability scale ground truth only
-    plasmode_df['true_y0_prob'] = y0_prob
-    plasmode_df['true_y1_prob'] = y1_prob
-    plasmode_df['true_ite_prob'] = y1_prob - y0_prob
+    # Continuous ground truth (survival in months)
+    plasmode_df['true_y0'] = y0
+    plasmode_df['true_y1'] = y1
+    plasmode_df['true_ite'] = y1 - y0
 
     return plasmode_df
 
@@ -568,7 +576,7 @@ def _predict_cnn_model(
     applied_config: AppliedInferenceConfig,
     device: torch.device
 ) -> dict:
-    """Generate predictions."""
+    """Generate continuous outcome predictions (survival in months)."""
 
     dataset = ClinicalTextDataset(
         data=df,
@@ -587,60 +595,60 @@ def _predict_cnn_model(
     model.eval()
     all_y0 = []
     all_y1 = []
+    all_ite = []
     all_prop = []
 
     with torch.no_grad():
         for batch in loader:
             texts = batch['texts']
             preds = model.predict(texts)
-            all_y0.append(preds['y0_logit'].cpu().numpy())
-            all_y1.append(preds['y1_logit'].cpu().numpy())
-            all_prop.append(preds['t_logit'].cpu().numpy())
+            all_y0.append(preds['y0_pred'].cpu().numpy())
+            all_y1.append(preds['y1_pred'].cpu().numpy())
+            all_ite.append(preds['ite'].cpu().numpy())
+            all_prop.append(preds['propensity'].cpu().numpy())
 
-    y0_logit = np.concatenate(all_y0)
-    y1_logit = np.concatenate(all_y1)
-    prop_logit = np.concatenate(all_prop)
-    ite_logit = y1_logit - y0_logit
-
-    # Convert to probabilities using sigmoid
-    y0_prob = 1.0 / (1.0 + np.exp(-y0_logit))
-    y1_prob = 1.0 / (1.0 + np.exp(-y1_logit))
-    propensity_prob = 1.0 / (1.0 + np.exp(-prop_logit))
-    ite_prob = y1_prob - y0_prob
+    y0_pred = np.concatenate(all_y0)
+    y1_pred = np.concatenate(all_y1)
+    ite = np.concatenate(all_ite)
+    propensity = np.concatenate(all_prop)
 
     return {
-        'y0_prob': y0_prob,
-        'y1_prob': y1_prob,
-        'propensity_prob': propensity_prob,
-        'ite_prob': ite_prob
+        'y0_pred': y0_pred,  # Continuous survival prediction (months)
+        'y1_pred': y1_pred,  # Continuous survival prediction (months)
+        'ite': ite,  # Treatment effect in months
+        'propensity': propensity  # Treatment probability
     }
 
 
 def _evaluate_plasmode_performance(
     df: pd.DataFrame,
-    target_ate_prob: float
+    target_ate: float
 ) -> dict:
-    """Evaluate plasmode performance on probability scale."""
+    """Evaluate plasmode performance for continuous outcomes (survival in months)."""
 
-    # Probability scale evaluation
-    true_ite_prob = df['true_ite_prob'].values
-    estimated_ite_prob = df['estimated_ite_prob'].values
-    true_ate_prob = true_ite_prob.mean()
-    estimated_ate_prob = estimated_ite_prob.mean()
+    # Continuous outcome evaluation
+    true_ite = df['true_ite'].values
+    estimated_ite = df['estimated_ite'].values
+    true_ate = true_ite.mean()
+    estimated_ate = estimated_ite.mean()
 
-    ate_bias_prob = estimated_ate_prob - true_ate_prob
-    ate_rmse_prob = np.sqrt((estimated_ate_prob - true_ate_prob) ** 2)
+    ate_bias = estimated_ate - true_ate
+    ate_rmse = np.sqrt((estimated_ate - true_ate) ** 2)
 
-    # ITE correlation (probability scale)
-    if np.std(true_ite_prob) > 0 and np.std(estimated_ite_prob) > 0:
-        ite_correlation_prob = np.corrcoef(true_ite_prob, estimated_ite_prob)[0, 1]
+    # ITE correlation (continuous)
+    if np.std(true_ite) > 0 and np.std(estimated_ite) > 0:
+        ite_correlation = np.corrcoef(true_ite, estimated_ite)[0, 1]
     else:
-        ite_correlation_prob = 0.0
+        ite_correlation = 0.0
+
+    # ITE RMSE
+    ite_rmse = np.sqrt(np.mean((estimated_ite - true_ite) ** 2))
 
     return {
-        'true_ate_prob': true_ate_prob,
-        'estimated_ate_prob': estimated_ate_prob,
-        'ate_bias_prob': ate_bias_prob,
-        'ate_rmse_prob': ate_rmse_prob,
-        'ite_correlation_prob': ite_correlation_prob,
+        'true_ate': true_ate,
+        'estimated_ate': estimated_ate,
+        'ate_bias': ate_bias,
+        'ate_rmse': ate_rmse,
+        'ite_correlation': ite_correlation,
+        'ite_rmse': ite_rmse,
     }

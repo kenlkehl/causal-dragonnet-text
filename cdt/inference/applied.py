@@ -12,7 +12,7 @@ from tqdm import tqdm
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import KFold
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, mean_squared_error, mean_absolute_error
 from joblib import Parallel, delayed
 
 from ..config import AppliedInferenceConfig
@@ -228,11 +228,11 @@ def _process_fold(
 
     # 4. Store predictions with indices to reconstruct dataframe
     preds_df = test_df.copy()
-    # Probability scale predictions (pred_* prefix indicates predicted values)
-    preds_df['pred_y0_prob'] = preds['y0_prob']
-    preds_df['pred_y1_prob'] = preds['y1_prob']
-    preds_df['pred_ite_prob'] = preds['ite_prob']
-    preds_df['pred_propensity_prob'] = preds['propensity_prob']
+    # Continuous outcome predictions (pred_* prefix indicates predicted values)
+    preds_df['pred_y0'] = preds['y0_pred']  # Survival months under control
+    preds_df['pred_y1'] = preds['y1_pred']  # Survival months under treatment
+    preds_df['pred_ite'] = preds['ite']  # Treatment effect in months
+    preds_df['pred_propensity'] = preds['propensity']  # Treatment probability
     preds_df['cv_fold'] = fold + 1
 
     # Aggressive GPU cleanup to prevent OOM across folds
@@ -293,12 +293,12 @@ def _run_fixed_split_inference(
     logger.info("Generating predictions on test set...")
     preds = _predict_dataset(model, test_df, config, device)
 
-    # Combine predictions (probability scale, pred_* prefix indicates predicted values)
+    # Combine predictions (continuous outcomes, pred_* prefix indicates predicted values)
     results_df = test_df.copy()
-    results_df['pred_y0_prob'] = preds['y0_prob']
-    results_df['pred_y1_prob'] = preds['y1_prob']
-    results_df['pred_ite_prob'] = preds['ite_prob']
-    results_df['pred_propensity_prob'] = preds['propensity_prob']
+    results_df['pred_y0'] = preds['y0_pred']  # Survival months under control
+    results_df['pred_y1'] = preds['y1_pred']  # Survival months under treatment
+    results_df['pred_ite'] = preds['ite']  # Treatment effect in months
+    results_df['pred_propensity'] = preds['propensity']  # Treatment probability
 
     _save_and_summarize(results_df, output_path)
 
@@ -434,12 +434,12 @@ def _train_single_model(
         epoch_log = {
             'epoch': epoch + 1,
             'train_loss': train_stats['loss'],
-            'train_auroc_y0': train_stats['auroc_y0'],
-            'train_auroc_y1': train_stats['auroc_y1'],
+            'train_rmse_y0': train_stats['rmse_y0'],
+            'train_rmse_y1': train_stats['rmse_y1'],
             'train_auroc_prop': train_stats['auroc_prop'],
             'val_loss': val_stats['loss'],
-            'val_auroc_y0': val_stats['auroc_y0'],
-            'val_auroc_y1': val_stats['auroc_y1'],
+            'val_rmse_y0': val_stats['rmse_y0'],
+            'val_rmse_y1': val_stats['rmse_y1'],
             'val_auroc_prop': val_stats['auroc_prop'],
         }
         history.append(epoch_log)
@@ -533,8 +533,8 @@ def _train_epoch(
         # Collect for metrics
         all_targets.append(batch['outcome'].detach().cpu())
         all_treatments.append(batch['treatment'].detach().cpu())
-        all_y0.append(losses['y0_logit'].detach().cpu())
-        all_y1.append(losses['y1_logit'].detach().cpu())
+        all_y0.append(losses['y0_pred'].detach().cpu())
+        all_y1.append(losses['y1_pred'].detach().cpu())
         all_prop.append(losses['t_logit'].detach().cpu())
 
     return _compute_epoch_metrics(epoch_loss, loader, all_targets, all_treatments, all_y0, all_y1, all_prop)
@@ -569,22 +569,29 @@ def _eval_epoch(
 
             all_targets.append(batch['outcome'].detach().cpu())
             all_treatments.append(batch['treatment'].detach().cpu())
-            all_y0.append(losses['y0_logit'].detach().cpu())
-            all_y1.append(losses['y1_logit'].detach().cpu())
+            all_y0.append(losses['y0_pred'].detach().cpu())
+            all_y1.append(losses['y1_pred'].detach().cpu())
             all_prop.append(losses['t_logit'].detach().cpu())
 
     return _compute_epoch_metrics(epoch_loss, loader, all_targets, all_treatments, all_y0, all_y1, all_prop)
 
 
 def _compute_epoch_metrics(epoch_loss, loader, all_targets, all_treatments, all_y0, all_y1, all_prop):
-    """Helper to compute AUROCs from collected batch outputs."""
+    """Helper to compute metrics from collected batch outputs (RMSE for outcomes, AUROC for propensity)."""
     y_true = torch.cat(all_targets).numpy()
     t_true = torch.cat(all_treatments).numpy()
-    y0_scores = torch.cat(all_y0).numpy()
-    y1_scores = torch.cat(all_y1).numpy()
+    y0_preds = torch.cat(all_y0).numpy()
+    y1_preds = torch.cat(all_y1).numpy()
     prop_scores = torch.sigmoid(torch.cat(all_prop)).numpy()
 
-    # Safe AUROC calculation
+    # RMSE for continuous outcome predictions
+    mask0 = (t_true == 0)
+    mask1 = (t_true == 1)
+
+    rmse_y0 = np.sqrt(mean_squared_error(y_true[mask0], y0_preds[mask0])) if mask0.any() else None
+    rmse_y1 = np.sqrt(mean_squared_error(y_true[mask1], y1_preds[mask1])) if mask1.any() else None
+
+    # Safe AUROC calculation for propensity (still binary)
     def safe_auc(y, score):
         try:
             if len(np.unique(y)) < 2:
@@ -593,21 +600,12 @@ def _compute_epoch_metrics(epoch_loss, loader, all_targets, all_treatments, all_
         except Exception:
             return None
 
-    # AUROC Y0 (on T=0 samples)
-    mask0 = (t_true == 0)
-    auroc_y0 = safe_auc(y_true[mask0], y0_scores[mask0]) if mask0.any() else None
-
-    # AUROC Y1 (on T=1 samples)
-    mask1 = (t_true == 1)
-    auroc_y1 = safe_auc(y_true[mask1], y1_scores[mask1]) if mask1.any() else None
-
-    # AUROC Propensity
     auroc_prop = safe_auc(t_true, prop_scores)
 
     return {
         'loss': epoch_loss / len(loader),
-        'auroc_y0': auroc_y0,
-        'auroc_y1': auroc_y1,
+        'rmse_y0': rmse_y0,
+        'rmse_y1': rmse_y1,
         'auroc_prop': auroc_prop
     }
 
@@ -617,9 +615,10 @@ def _generate_predictions(
     loader: DataLoader,
     device: torch.device
 ) -> dict:
-    """Generate predictions on test set."""
+    """Generate predictions on test set (continuous outcomes)."""
     all_y0 = []
     all_y1 = []
+    all_ite = []
     all_propensity = []
 
     model.eval()
@@ -630,43 +629,42 @@ def _generate_predictions(
 
             preds = model.predict(texts)
 
-            all_y0.append(preds['y0_logit'].cpu().numpy())
-            all_y1.append(preds['y1_logit'].cpu().numpy())
-            all_propensity.append(preds['t_logit'].cpu().numpy())
+            all_y0.append(preds['y0_pred'].cpu().numpy())
+            all_y1.append(preds['y1_pred'].cpu().numpy())
+            all_ite.append(preds['ite'].cpu().numpy())
+            all_propensity.append(preds['propensity'].cpu().numpy())
 
-    y0_logit = np.concatenate(all_y0)
-    y1_logit = np.concatenate(all_y1)
-    propensity_logit = np.concatenate(all_propensity)
-    ite_logit = y1_logit - y0_logit
-
-    # Convert to probabilities using sigmoid
-    y0_prob = 1.0 / (1.0 + np.exp(-y0_logit))
-    y1_prob = 1.0 / (1.0 + np.exp(-y1_logit))
-    propensity_prob = 1.0 / (1.0 + np.exp(-propensity_logit))
-    ite_prob = y1_prob - y0_prob
+    y0_pred = np.concatenate(all_y0)
+    y1_pred = np.concatenate(all_y1)
+    ite = np.concatenate(all_ite)
+    propensity = np.concatenate(all_propensity)
 
     return {
-        'y0_prob': y0_prob,
-        'y1_prob': y1_prob,
-        'propensity_prob': propensity_prob,
-        'ite_prob': ite_prob
+        'y0_pred': y0_pred,  # Continuous survival prediction (months)
+        'y1_pred': y1_pred,  # Continuous survival prediction (months)
+        'ite': ite,  # Treatment effect in months
+        'propensity': propensity  # Treatment probability
     }
 
 
 def _save_and_summarize(results_df: pd.DataFrame, output_path: Path) -> None:
-    """Save results and print summary."""
+    """Save results and print summary for continuous outcomes."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     results_df.to_parquet(output_path, index=False)
 
     logger.info(f"Predictions saved to: {output_path}")
     logger.info("\nPrediction Summary:")
     logger.info(f"  Samples: {len(results_df)}")
-    logger.info("  Predicted ITE (probability scale):")
-    logger.info(f"    Mean: {results_df['pred_ite_prob'].mean():.4f}")
-    logger.info(f"    Std: {results_df['pred_ite_prob'].std():.4f}")
-    logger.info(f"    Min: {results_df['pred_ite_prob'].min():.4f}")
-    logger.info(f"    Max: {results_df['pred_ite_prob'].max():.4f}")
-    logger.info(f"  Mean predicted propensity: {results_df['pred_propensity_prob'].mean():.4f}")
+    logger.info("  Predicted ITE (survival months):")
+    logger.info(f"    Mean: {results_df['pred_ite'].mean():.2f} months")
+    logger.info(f"    Std: {results_df['pred_ite'].std():.2f} months")
+    logger.info(f"    Min: {results_df['pred_ite'].min():.2f} months")
+    logger.info(f"    Max: {results_df['pred_ite'].max():.2f} months")
+    logger.info(f"  Predicted Y0 (control survival):")
+    logger.info(f"    Mean: {results_df['pred_y0'].mean():.2f} months")
+    logger.info(f"  Predicted Y1 (treatment survival):")
+    logger.info(f"    Mean: {results_df['pred_y1'].mean():.2f} months")
+    logger.info(f"  Mean predicted propensity: {results_df['pred_propensity'].mean():.4f}")
 
 
 def _save_filter_interpretations(
