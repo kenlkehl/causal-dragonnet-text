@@ -1,0 +1,312 @@
+{
+  "config": {
+    "clinical_question": "Compare the effectiveness of letrozole+palbociclib with letrozole+ribociclib for the first line treatment of metastatic ER positive breast cancer.",
+    "dataset_size": 1000,
+    "treatment_effect_prob": 0.2,
+    "target_treatment_rate": 0.5,
+    "target_control_outcome_rate": 0.5,
+    "enforce_positivity": false,
+    "min_treatment_rate_per_stratum": 0.1,
+    "max_treatment_rate_per_stratum": 0.9,
+    "main_coefficient_scale": 0.3,
+    "interaction_coefficient_scale": 0.1,
+    "target_logit_std": 1.5,
+    "num_confounders": 10,
+    "outcome_type": "binary",
+    "outcome_noise_std": 1.0,
+    "output_dir": "./example_synthetic_data_ten_confounders_broader_logit",
+    "llm": {
+      "api_base_url": "http://localhost:8000/v1",
+      "api_key": "",
+      "model_name": "openai/gpt-oss-120b",
+      "temperature": 0.7,
+      "max_tokens": 30000,
+      "timeout": 300.0
+    },
+    "seed": 42
+  },
+  "confounders": [
+    {
+      "name": "age",
+      "type": "continuous",
+      "description": "Patient age at initiation of first‑line therapy, in years"
+    },
+    {
+      "name": "ecog_performance_status",
+      "type": "categorical",
+      "categories": [
+        "0",
+        "1",
+        "2",
+        "3"
+      ],
+      "description": "Eastern Cooperative Oncology Group performance status score"
+    },
+    {
+      "name": "menopausal_status",
+      "type": "categorical",
+      "categories": [
+        "pre‑menopausal",
+        "peri‑menopausal",
+        "post‑menopausal"
+      ],
+      "description": "Hormonal menopausal classification at baseline"
+    },
+    {
+      "name": "disease_burden",
+      "type": "categorical",
+      "categories": [
+        "bone‑only",
+        "non‑visceral soft‑tissue",
+        "visceral (non‑liver)",
+        "visceral with liver involvement"
+      ],
+      "description": "Pattern of metastatic disease at treatment start"
+    },
+    {
+      "name": "prior_adjuvant_endocrine_therapy",
+      "type": "categorical",
+      "categories": [
+        "none",
+        "tamoxifen only",
+        "aromatase inhibitor only",
+        "sequential tamoxifen then AI"
+      ],
+      "description": "Type of endocrine therapy received in the adjuvant setting"
+    },
+    {
+      "name": "baseline_alt",
+      "type": "continuous",
+      "description": "Serum alanine aminotransferase (ALT) level at baseline, U/L"
+    },
+    {
+      "name": "baseline_qtc_interval",
+      "type": "continuous",
+      "description": "Corrected QT interval on baseline ECG, milliseconds"
+    },
+    {
+      "name": "body_mass_index",
+      "type": "continuous",
+      "description": "Body mass index (kg/m²) measured at treatment initiation"
+    },
+    {
+      "name": "diabetes_status",
+      "type": "categorical",
+      "categories": [
+        "no diabetes",
+        "diet‑controlled",
+        "oral medication",
+        "insulin therapy"
+      ],
+      "description": "Presence and management intensity of diabetes mellitus"
+    },
+    {
+      "name": "baseline_neutrophil_count",
+      "type": "continuous",
+      "description": "Absolute neutrophil count at baseline, ×10⁹/L"
+    }
+  ],
+  "treatment_equation": {
+    "intercept": 1.2458397434999762,
+    "coefficients": {
+      "age": -0.8079849509342872,
+      "baseline_alt": -0.4847909705605723,
+      "baseline_qtc_interval": 0.6463879607474298,
+      "body_mass_index": 0.16159699018685744,
+      "baseline_neutrophil_count": 0.3231939803737149,
+      "ecog_performance_status_1": -0.9695819411211446,
+      "ecog_performance_status_2": -1.9391638822422892,
+      "ecog_performance_status_3": -3.231939803737149
+    },
+    "interactions": [],
+    "original_intercept": -0.5
+  },
+  "outcome_equation": {
+    "intercept": 1.0591387901014895,
+    "coefficients": {
+      "age": -0.6316255043461713,
+      "baseline_alt": -0.2105418347820571,
+      "baseline_qtc_interval": -0.10527091739102855,
+      "body_mass_index": -0.10527091739102855,
+      "baseline_neutrophil_count": 0.2105418347820571,
+      "ecog_performance_status_1": -0.8421673391282284,
+      "ecog_performance_status_2": -1.6843346782564568,
+      "ecog_performance_status_3": -2.526502017384685
+    },
+    "interactions": [
+      {
+        "terms": [
+          "age",
+          "baseline_neutrophil_count"
+        ],
+        "coefficient": -0.028072244637607616
+      }
+    ],
+    "treatment_coefficient": 0.2,
+    "treatment_interactions": [
+      {
+        "term": "age",
+        "coefficient": -0.17609702379610084
+      },
+      {
+        "term": "ecog_performance_status_1",
+        "coefficient": 0.6326281135604402
+      },
+      {
+        "term": "ecog_performance_status_2",
+        "coefficient": 0.3256295344486335
+      },
+      {
+        "term": "ecog_performance_status_3",
+        "coefficient": 0.13847825519773782
+      },
+      {
+        "term": "menopausal_status_peri‑menopausal",
+        "coefficient": -0.4828164438138395
+      },
+      {
+        "term": "menopausal_status_post‑menopausal",
+        "coefficient": -0.48285029908998356
+      },
+      {
+        "term": "disease_burden_non‑visceral soft‑tissue",
+        "coefficient": -0.6202792474291094
+      },
+      {
+        "term": "disease_burden_visceral (non‑liver)",
+        "coefficient": 0.5139693172325124
+      },
+      {
+        "term": "disease_burden_visceral with liver involvement",
+        "coefficient": 0.14192626730949623
+      },
+      {
+        "term": "prior_adjuvant_endocrine_therapy_tamoxifen only",
+        "coefficient": 0.29205321531341155
+      },
+      {
+        "term": "prior_adjuvant_endocrine_therapy_aromatase inhibitor only",
+        "coefficient": -0.6729134679595302
+      },
+      {
+        "term": "prior_adjuvant_endocrine_therapy_sequential tamoxifen then AI",
+        "coefficient": 0.6595712163756766
+      },
+      {
+        "term": "baseline_alt",
+        "coefficient": 0.46662055702608773
+      },
+      {
+        "term": "baseline_qtc_interval",
+        "coefficient": -0.40376434288556
+      },
+      {
+        "term": "body_mass_index",
+        "coefficient": -0.44659436790705487
+      },
+      {
+        "term": "diabetes_status_diet‑controlled",
+        "coefficient": -0.4443773025278848
+      },
+      {
+        "term": "diabetes_status_oral medication",
+        "coefficient": -0.2747679822674606
+      },
+      {
+        "term": "diabetes_status_insulin therapy",
+        "coefficient": 0.03474843025671941
+      },
+      {
+        "term": "baseline_neutrophil_count",
+        "coefficient": -0.0955228042743176
+      }
+    ],
+    "original_intercept": -1.0
+  },
+  "summary_statistics": {
+    "age": {
+      "type": "continuous",
+      "mean": 64.2,
+      "std": 11.3
+    },
+    "ecog_performance_status": {
+      "type": "categorical",
+      "proportions": {
+        "0": 0.2,
+        "1": 0.45,
+        "2": 0.25,
+        "3": 0.1
+      }
+    },
+    "menopausal_status": {
+      "type": "categorical",
+      "proportions": {
+        "pre-menopausal": 0.15,
+        "peri-menopausal": 0.1,
+        "post-menopausal": 0.75
+      }
+    },
+    "disease_burden": {
+      "type": "categorical",
+      "proportions": {
+        "bone-only": 0.3,
+        "non-visceral soft-tissue": 0.15,
+        "visceral (non-liver)": 0.25,
+        "visceral with liver involvement": 0.3
+      }
+    },
+    "prior_adjuvant_endocrine_therapy": {
+      "type": "categorical",
+      "proportions": {
+        "none": 0.05,
+        "tamoxifen only": 0.25,
+        "aromatase inhibitor only": 0.45,
+        "sequential tamoxifen then AI": 0.25
+      }
+    },
+    "baseline_alt": {
+      "type": "continuous",
+      "mean": 24.0,
+      "std": 13.0
+    },
+    "baseline_qtc_interval": {
+      "type": "continuous",
+      "mean": 425.0,
+      "std": 25.0
+    },
+    "body_mass_index": {
+      "type": "continuous",
+      "mean": 27.3,
+      "std": 5.5
+    },
+    "diabetes_status": {
+      "type": "categorical",
+      "proportions": {
+        "no diabetes": 0.7,
+        "diet-controlled": 0.1,
+        "oral medication": 0.15,
+        "insulin therapy": 0.05
+      }
+    },
+    "baseline_neutrophil_count": {
+      "type": "continuous",
+      "mean": 4.2,
+      "std": 1.5
+    }
+  },
+  "dataset_statistics": {
+    "n_patients": 1000,
+    "treatment_rate": 0.518,
+    "outcome_rate": 0.511,
+    "mean_treatment_prob": 0.49209967567024965,
+    "std_treatment_prob": 0.26381547101093905,
+    "mean_outcome_prob": 0.5000673473216609,
+    "std_outcome_prob": 0.24874039125579145,
+    "mean_ite_prob": 0.05360264911783622,
+    "std_ite_prob": 0.19072274777114845,
+    "clinical_text_stats": {
+      "non_empty_count": "1000",
+      "mean_length": 8948.819
+    }
+  }
+}
