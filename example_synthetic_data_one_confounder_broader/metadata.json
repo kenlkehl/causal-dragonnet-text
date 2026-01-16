@@ -1,0 +1,137 @@
+{
+  "config": {
+    "clinical_question": "Compare the effectiveness of letrozole+palbociclib with letrozole+ribociclib for the first line treatment of metastatic ER positive breast cancer.",
+    "dataset_size": 1000,
+    "target_treatment_rate": 0.5,
+    "target_treatment_logit_std": 2.0,
+    "enforce_positivity": false,
+    "min_treatment_rate_per_stratum": 0.1,
+    "max_treatment_rate_per_stratum": 0.9,
+    "target_control_outcome_mean": 6.0,
+    "treatment_effect": 4.0,
+    "target_outcome_log_std": 1.0,
+    "main_coefficient_scale": 0.3,
+    "interaction_coefficient_scale": 0.1,
+    "num_confounders": 1,
+    "output_dir": "./example_synthetic_data_one_confounder",
+    "llm": {
+      "api_base_url": "http://localhost:8000/v1",
+      "api_key": "",
+      "model_name": "openai/gpt-oss-120b",
+      "temperature": 0.7,
+      "max_tokens": 30000,
+      "timeout": 300.0
+    },
+    "seed": 42
+  },
+  "confounders": [
+    {
+      "name": "visceral_disease_status",
+      "type": "categorical",
+      "categories": [
+        "bone_only",
+        "lung_only",
+        "liver_only",
+        "multiple_viscera",
+        "no_viscera"
+      ],
+      "description": "Extent and location of visceral metastases at baseline, which influences both clinician choice of CDK4/6 inhibitor and prognosis"
+    }
+  ],
+  "treatment_equation": {
+    "intercept": -1.5283541440652528,
+    "coefficients": {
+      "visceral_disease_status_lung_only": -1.14520851377465,
+      "visceral_disease_status_liver_only": 2.2904170275493,
+      "visceral_disease_status_multiple_viscera": 3.43562554132395,
+      "visceral_disease_status_no_viscera": -1.908680856291083
+    },
+    "interactions": [],
+    "original_intercept": -0.2
+  },
+  "outcome_equation": {
+    "intercept": -1.0,
+    "coefficients": {
+      "visceral_disease_status_lung_only": -0.12,
+      "visceral_disease_status_liver_only": -0.36,
+      "visceral_disease_status_multiple_viscera": -0.44999999999999996,
+      "visceral_disease_status_no_viscera": 0.09
+    },
+    "interactions": [],
+    "treatment_coefficient": 4.0,
+    "treatment_interactions": [
+      {
+        "term": "visceral_disease_status_lung_only",
+        "coefficient": -0.025091976230527502
+      },
+      {
+        "term": "visceral_disease_status_liver_only",
+        "coefficient": 0.09014286128198323
+      },
+      {
+        "term": "visceral_disease_status_multiple_viscera",
+        "coefficient": 0.04639878836228102
+      },
+      {
+        "term": "visceral_disease_status_no_viscera",
+        "coefficient": 0.01973169683940732
+      }
+    ]
+  },
+  "summary_statistics": {
+    "age": {
+      "type": "continuous",
+      "mean": 62.3,
+      "std": 9.8
+    },
+    "ecog_performance_status": {
+      "type": "categorical",
+      "proportions": {
+        "0": 0.22,
+        "1": 0.48,
+        "2": 0.2,
+        "3": 0.1
+      }
+    },
+    "visceral_disease_status": {
+      "type": "categorical",
+      "proportions": {
+        "bone_only": 0.14,
+        "lung_only": 0.18,
+        "liver_only": 0.26,
+        "multiple_viscera": 0.32,
+        "no_viscera": 0.1
+      }
+    },
+    "charlson_comorbidity_index": {
+      "type": "continuous",
+      "mean": 2.1,
+      "std": 1.4
+    },
+    "prior_adjuvant_endocrine_therapy": {
+      "type": "categorical",
+      "proportions": {
+        "none": 0.35,
+        "yes": 0.65
+      }
+    }
+  },
+  "dataset_statistics": {
+    "n_patients": 1000,
+    "treatment_rate": 0.507,
+    "outcome_mean": 10.93216403531404,
+    "outcome_std": 15.198403341224958,
+    "mean_treatment_prob": 0.5067493193312437,
+    "std_treatment_prob": 0.3514050733299126,
+    "mean_y0": 8.90416403531404,
+    "std_y0": 15.260744720005064,
+    "mean_y1": 12.90416403531404,
+    "std_y1": 15.260744720005064,
+    "mean_ite": 4.0,
+    "std_ite": 5.813522493914215e-16,
+    "clinical_text_stats": {
+      "non_empty_count": "1000",
+      "mean_length": 7973.255
+    }
+  }
+}
