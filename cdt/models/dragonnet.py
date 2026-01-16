@@ -17,10 +17,10 @@ class DragonNet(nn.Module):
         super().__init__()
         # Shared representation layers (can be loaded from pretrained)
         self.representation_fc1 = nn.Linear(input_dim, representation_dim)
-        self.representation_fc2 = nn.Linear(representation_dim, representation_dim)
-        self.representation_fc3 = nn.Linear(representation_dim, representation_dim)
-        self.representation_fc4 = nn.Linear(representation_dim, representation_dim)
-        self.representation_fc5 = nn.Linear(representation_dim, representation_dim)
+        #self.representation_fc2 = nn.Linear(representation_dim, representation_dim)
+        #self.representation_fc3 = nn.Linear(representation_dim, representation_dim)
+        #self.representation_fc4 = nn.Linear(representation_dim, representation_dim)
+        #self.representation_fc5 = nn.Linear(representation_dim, representation_dim)
         self.representation_fc6 = nn.Linear(representation_dim, representation_dim)
 
         # Binary treatment propensity head (matches old_cdt: single linear layer)
@@ -46,10 +46,10 @@ class DragonNet(nn.Module):
             y0_logit, y1_logit, t_logit, final_common_layer
         """
         h = F.relu(self.representation_fc1(confounder_features))
-        h = F.relu(self.representation_fc2(h))
-        h = F.relu(self.representation_fc3(h))
-        h = F.relu(self.representation_fc4(h))
-        h = F.relu(self.representation_fc5(h))
+        #h = F.relu(self.representation_fc2(h))
+        #h = F.relu(self.representation_fc3(h))
+        #h = F.relu(self.representation_fc4(h))
+        #h = F.relu(self.representation_fc5(h))
         final_common_layer = F.elu(self.representation_fc6(h))
 
         t_logit = self.propensity_fc1(final_common_layer)
