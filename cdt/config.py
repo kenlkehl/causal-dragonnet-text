@@ -48,6 +48,7 @@ class ModelArchitectureConfig:
     # DragonNet head dimensions
     dragonnet_representation_dim: int = 128
     dragonnet_hidden_outcome_dim: int = 64
+    dragonnet_dropout: float = 0.2  # Dropout in DragonNet representation and outcome layers
 
     def get_num_filters_per_kernel(self) -> int:
         """
@@ -73,6 +74,10 @@ class TrainingConfig:
     batch_size: int = 8
     alpha_propensity: float = 1.0
     beta_targreg: float = 0.1
+    # Regularization options
+    weight_decay: float = 0.01  # L2 regularization (AdamW decoupled weight decay)
+    gradient_clip_norm: float = 1.0  # Max gradient norm (0 to disable)
+    label_smoothing: float = 0.0  # Label smoothing for BCE (0 to disable)
 
 
 @dataclass
@@ -91,6 +96,22 @@ class PropensityTrimmingConfig:
     propensity_epochs: int = 20  # Training epochs for propensity model
     propensity_learning_rate: float = 1e-4  # Learning rate for propensity model
     propensity_batch_size: int = 8  # Batch size for propensity model
+
+
+@dataclass
+class OutcomeModelConfig:
+    """Configuration for standalone outcome model training.
+
+    When enabled, trains an outcome-only model using k-fold cross-validation
+    to generate out-of-sample outcome predictions. This helps assess the
+    prognostic signal in the data before DragonNet training.
+    Unlike propensity trimming, this does NOT trim the dataset.
+    """
+    enabled: bool = False  # Whether to train outcome model before DragonNet
+    cv_folds: int = 5  # Number of CV folds for outcome model training
+    outcome_epochs: int = 20  # Training epochs for outcome model
+    outcome_learning_rate: float = 1e-4  # Learning rate for outcome model
+    outcome_batch_size: int = 8  # Batch size for outcome model
 
 
 @dataclass
@@ -121,6 +142,7 @@ class AppliedInferenceConfig:
     architecture: ModelArchitectureConfig = field(default_factory=ModelArchitectureConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     propensity_trimming: PropensityTrimmingConfig = field(default_factory=PropensityTrimmingConfig)
+    outcome_model: OutcomeModelConfig = field(default_factory=OutcomeModelConfig)
     use_pretrained_weights: bool = False  # Not used for CNN, kept for API compatibility
     skip: bool = False  # Skip applied inference, go straight to plasmode
 
@@ -180,6 +202,7 @@ class ExperimentConfig:
             **{k: ModelArchitectureConfig(**v) if k == 'architecture'
                else TrainingConfig(**v) if k == 'training'
                else PropensityTrimmingConfig(**v) if k == 'propensity_trimming'
+               else OutcomeModelConfig(**v) if k == 'outcome_model'
                else v
                for k, v in data.get('applied_inference', {}).items()}
         )

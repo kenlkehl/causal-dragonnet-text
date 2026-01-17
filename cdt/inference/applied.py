@@ -103,6 +103,33 @@ def run_applied_inference(
         logger.info("CONTINUING WITH DRAGONNET TRAINING ON TRIMMED DATASET")
         logger.info("=" * 80)
 
+    # Outcome model training (if enabled) - for assessing prognostic signal
+    if hasattr(config, 'outcome_model') and config.outcome_model.enabled:
+        logger.info("=" * 80)
+        logger.info("OUTCOME MODEL TRAINING (PROGNOSTIC SIGNAL ASSESSMENT)")
+        logger.info("=" * 80)
+
+        from ..training.outcome_training import train_outcome_model_cv
+
+        # Train outcome model with CV to get out-of-sample scores
+        dataset, outcome_training_log = train_outcome_model_cv(
+            dataset, config, device, num_workers, gpu_ids
+        )
+
+        # Save outcome model training log
+        training_log_path = output_path.parent / "outcome_model_training_log.csv"
+        outcome_training_log.to_csv(training_log_path, index=False)
+        logger.info(f"Outcome model training log saved to: {training_log_path}")
+
+        # Log summary of outcome prediction performance
+        if 'val_auroc' in outcome_training_log.columns:
+            mean_auroc = outcome_training_log['val_auroc'].dropna().mean()
+            logger.info(f"Mean validation AUROC across folds: {mean_auroc:.4f}")
+
+        logger.info("=" * 80)
+        logger.info("CONTINUING WITH DRAGONNET TRAINING")
+        logger.info("=" * 80)
+
     # Determine mode
     if config.cv_folds > 1:
         _run_cv_inference(
@@ -339,6 +366,7 @@ def _train_single_model(
         # DragonNet args
         dragonnet_representation_dim=arch_config.dragonnet_representation_dim,
         dragonnet_hidden_outcome_dim=arch_config.dragonnet_hidden_outcome_dim,
+        dragonnet_dropout=getattr(arch_config, 'dragonnet_dropout', 0.2),
         device=str(device),
         model_type=arch_config.model_type
     )
@@ -407,7 +435,7 @@ def _train_single_model(
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=train_config.learning_rate,
-        weight_decay=1e-4
+        weight_decay=getattr(train_config, 'weight_decay', 0.01)
     )
 
     if train_config.lr_schedule == "linear":
@@ -508,6 +536,10 @@ def _train_epoch(
     all_y1 = []
     all_prop = []
 
+    # Get regularization options from config
+    label_smoothing = getattr(config, 'label_smoothing', 0.0)
+    gradient_clip_norm = getattr(config, 'gradient_clip_norm', 0.0)
+
     for batch in tqdm(loader, desc="Training", leave=False):
         # Move tensors to device
         batch['outcome'] = batch['outcome'].to(device)
@@ -519,10 +551,16 @@ def _train_epoch(
         losses = model.train_step(
             batch,
             alpha_propensity=config.alpha_propensity,
-            beta_targreg=config.beta_targreg
+            beta_targreg=config.beta_targreg,
+            label_smoothing=label_smoothing
         )
 
         losses['loss'].backward()
+
+        # Gradient clipping (if enabled)
+        if gradient_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+
         optimizer.step()
 
         if scheduler is not None:

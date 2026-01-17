@@ -60,6 +60,7 @@ class CausalCNNText(nn.Module):
         # DragonNet args
         dragonnet_representation_dim: int = 128,
         dragonnet_hidden_outcome_dim: int = 64,
+        dragonnet_dropout: float = 0.2,
         device: str = "cuda:0",
         model_type: str = "dragonnet"  # "dragonnet" or "uplift"
     ):
@@ -86,6 +87,7 @@ class CausalCNNText(nn.Module):
             bert_gradient_checkpointing: (BERT) Enable gradient checkpointing
             dragonnet_representation_dim: DragonNet representation dimension
             dragonnet_hidden_outcome_dim: DragonNet outcome hidden dimension
+            dragonnet_dropout: Dropout rate for DragonNet layers
             device: Device string
             model_type: Architecture type ("dragonnet" or "uplift")
         """
@@ -116,6 +118,7 @@ class CausalCNNText(nn.Module):
             'bert_gradient_checkpointing': bert_gradient_checkpointing,
             'dragonnet_representation_dim': dragonnet_representation_dim,
             'dragonnet_hidden_outcome_dim': dragonnet_hidden_outcome_dim,
+            'dragonnet_dropout': dragonnet_dropout,
             'model_type': model_type
         }
 
@@ -156,14 +159,16 @@ class CausalCNNText(nn.Module):
             self.net = UpliftNet(
                 input_dim=input_dim,
                 representation_dim=dragonnet_representation_dim,
-                hidden_outcome_dim=dragonnet_hidden_outcome_dim
+                hidden_outcome_dim=dragonnet_hidden_outcome_dim,
+                dropout=dragonnet_dropout
             )
             logger.info("Using UpliftNet architecture (Base + ITE parametrization)")
         else:
             self.net = DragonNet(
                 input_dim=input_dim,
                 representation_dim=dragonnet_representation_dim,
-                hidden_outcome_dim=dragonnet_hidden_outcome_dim
+                hidden_outcome_dim=dragonnet_hidden_outcome_dim,
+                dropout=dragonnet_dropout
             )
             logger.info("Using classic DragonNet architecture")
 
@@ -212,7 +217,8 @@ class CausalCNNText(nn.Module):
         self,
         batch: Dict[str, Any],
         alpha_propensity: float = 1.0,
-        beta_targreg: float = 0.1
+        beta_targreg: float = 0.1,
+        label_smoothing: float = 0.0
     ) -> Dict[str, torch.Tensor]:
         """
         Perform single training step.
@@ -221,6 +227,7 @@ class CausalCNNText(nn.Module):
             batch: Dictionary with 'texts', 'treatment', 'outcome' keys
             alpha_propensity: Weight for propensity loss
             beta_targreg: Weight for targeted regularization
+            label_smoothing: Label smoothing factor (0 = no smoothing)
 
         Returns:
             Dictionary with loss components and detached predictions
@@ -229,13 +236,21 @@ class CausalCNNText(nn.Module):
         treatments = batch['treatment']  # (batch,)
         outcomes = batch['outcome']  # (batch,)
 
+        # Apply label smoothing if enabled
+        if label_smoothing > 0:
+            treatments_smooth = treatments * (1 - label_smoothing) + 0.5 * label_smoothing
+            outcomes_smooth = outcomes * (1 - label_smoothing) + 0.5 * label_smoothing
+        else:
+            treatments_smooth = treatments
+            outcomes_smooth = outcomes
+
         # Forward pass
         y0_logit, y1_logit, t_logit, phi = self.forward(texts)
 
         # Propensity loss
         propensity_loss = F.binary_cross_entropy_with_logits(
             t_logit.squeeze(-1),
-            treatments
+            treatments_smooth
         )
 
         # Outcome loss - factual outcome only
@@ -247,7 +262,7 @@ class CausalCNNText(nn.Module):
 
         outcome_loss = F.binary_cross_entropy_with_logits(
             factual_logit.squeeze(-1),
-            outcomes
+            outcomes_smooth
         )
 
         # Targeted regularization (R-loss)

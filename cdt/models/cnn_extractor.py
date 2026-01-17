@@ -334,6 +334,9 @@ class CNNFeatureExtractor(nn.Module):
         ])
 
         self.dropout = nn.Dropout(dropout)
+        # Spatial dropout: drops entire channels before max pooling
+        # More effective for CNNs than standard dropout
+        self.spatial_dropout = nn.Dropout2d(dropout)
 
         # Filter metadata: tracks initialization type for each filter
         # {filter_id: {"init_type": "random"|"explicit"|"kmeans", "concept": str|None}}
@@ -755,6 +758,12 @@ class CNNFeatureExtractor(nn.Module):
 
             # Apply mask to conv output (zero out padding positions)
             h = h * attention_mask.unsqueeze(1).float()
+
+            # Apply spatial dropout before max pooling (drops entire channels)
+            # Reshape to 4D for Dropout2d: (batch, channels, 1, seq_len)
+            h = h.unsqueeze(2)
+            h = self.spatial_dropout(h)
+            h = h.squeeze(2)
 
             # Global max pool: (batch, num_filters, seq_len) -> (batch, num_filters)
             # Use masked max: set padding to large negative before max

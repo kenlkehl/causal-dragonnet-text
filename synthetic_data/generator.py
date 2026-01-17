@@ -4,6 +4,7 @@
 import logging
 import json
 import random
+import re
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 from dataclasses import asdict
@@ -23,6 +24,7 @@ from .prompts import (
     PATIENT_HISTORY_PROMPT,
     format_confounder_list,
     format_patient_characteristics,
+    validate_clinical_text,
 )
 
 
@@ -986,6 +988,11 @@ def _generate_single_patient(
         logger.error(f"Patient {patient_idx}: Failed to generate clinical_history: {e}")
         clinical_history = ""
 
+    # Validate that text doesn't contain literal category codes
+    underscore_patterns = re.findall(r'\b[a-z]+(?:_[a-z0-9]+){2,}\b', clinical_history.lower())
+    if underscore_patterns:
+        logger.warning(f"Patient {patient_idx}: Clinical text contains underscore patterns (likely category codes): {underscore_patterns[:3]}")
+
     return {
         "patient_id": patient_idx,
         "patient_prompt": patient_prompt,
@@ -1283,13 +1290,27 @@ def generate_synthetic_dataset_batch(
     )
     
     # Merge clinical texts with patient records, stripping reasoning prefix
+    # Also validate that texts don't contain literal category codes
+    validation_issues = 0
     for i, text in enumerate(clinical_texts):
         cleaned_text = VLLMBatchClient.strip_reasoning_prefix(
-            text if text else "", 
+            text if text else "",
             vllm_config.reasoning_marker
         )
         patient_records[i]["clinical_text"] = cleaned_text
-    
+
+        # Check for underscore-connected phrases (likely category codes that weren't naturalized)
+        underscore_patterns = re.findall(r'\b[a-z]+(?:_[a-z0-9]+){2,}\b', cleaned_text.lower())
+        if underscore_patterns:
+            validation_issues += 1
+            if validation_issues <= 3:  # Only log first few examples
+                logger.warning(f"Patient {i}: Clinical text contains underscore patterns: {underscore_patterns[:3]}")
+
+    if validation_issues > 0:
+        logger.warning(f"VALIDATION: {validation_issues}/{len(patient_records)} clinical texts contain underscore-connected phrases (likely literal category codes)")
+    else:
+        logger.info("VALIDATION: All clinical texts passed - no underscore-connected category codes detected")
+
     logger.info("Batch generation complete!")
     
     # Assemble dataset

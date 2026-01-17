@@ -19,9 +19,11 @@ cdt/models/cnn_extractor.py
 cdt/models/components.py
 cdt/models/dragonnet.py
 cdt/models/outcome_heads.py
+cdt/models/outcome_model.py
 cdt/models/propensity_model.py
 cdt/models/uplift.py
 cdt/training/__init__.py
+cdt/training/outcome_training.py
 cdt/training/plasmode.py
 cdt/training/propensity_trimming.py
 cdt/utils/__init__.py

@@ -6,6 +6,8 @@ CDT is a framework for **clinical causal inference using electronic health recor
 
 **Core research goal**: Extract confounders from clinical text that may not be captured in structured EHR data (e.g., functional status, symptom severity, patient preferences) and use them for causal inference.
 
+Note: For any code execution, use the python environment at ~/pcori .
+
 ## Repository Structure
 
 ```
@@ -19,12 +21,14 @@ causal-dragonnet-text/
 │   │   ├── dragonnet.py          # DragonNet causal head
 │   │   ├── uplift.py             # UpliftNet alternative architecture
 │   │   ├── causal_cnn.py         # Combined model (extractor + head)
-│   │   └── propensity_model.py   # Propensity-only model for trimming
+│   │   ├── propensity_model.py   # Propensity-only model for trimming
+│   │   └── outcome_model.py      # Outcome-only model for prognostic signal
 │   ├── inference/
 │   │   └── applied.py            # Applied inference on real data
 │   ├── training/
 │   │   ├── plasmode.py           # Plasmode simulation experiments
-│   │   └── propensity_trimming.py # Propensity-based dataset trimming
+│   │   ├── propensity_trimming.py # Propensity-based dataset trimming
+│   │   └── outcome_training.py   # Outcome model training for prognostic signal
 │   ├── data/
 │   │   └── dataset.py            # PyTorch datasets and loading
 │   ├── experiments/
@@ -132,7 +136,8 @@ ExperimentConfig                    # Top-level config
 │   │   ├── epochs, batch_size, learning_rate
 │   │   ├── alpha_propensity: float # Weight for propensity loss
 │   │   └── beta_targreg: float     # Targeted regularization weight
-│   └── propensity_trimming: PropensityTrimmingConfig
+│   ├── propensity_trimming: PropensityTrimmingConfig
+│   └── outcome_model: OutcomeModelConfig
 └── plasmode_experiments: PlasmodeExperimentConfig
     ├── enabled: bool
     ├── num_repeats: int
@@ -228,6 +233,31 @@ Optional preprocessing to enforce positivity assumption:
 1. Train propensity-only model with CV
 2. Remove patients with P(T|X) outside [min, max] bounds
 3. Proceed with DragonNet training on trimmed data
+
+## Outcome Model Training
+
+Optional preprocessing to assess prognostic signal in data before DragonNet:
+1. Train outcome-only model with CV to predict P(Y=1|X)
+2. Log training/validation loss and AUROC per epoch and fold
+3. Output: `outcome_model_training_log.csv` with columns (epoch, fold, train_loss, val_loss, train_auroc, val_auroc)
+4. No dataset trimming - continues to DragonNet with full dataset
+
+This helps understand how much predictive signal exists for the outcome independent of treatment, without the complexity of DragonNet's joint learning.
+
+**Configuration:**
+```json
+{
+  "applied_inference": {
+    "outcome_model": {
+      "enabled": true,
+      "cv_folds": 5,
+      "outcome_epochs": 20,
+      "outcome_learning_rate": 1e-4,
+      "outcome_batch_size": 8
+    }
+  }
+}
+```
 
 ## Common Modifications
 
