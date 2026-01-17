@@ -18,6 +18,7 @@ causal-dragonnet-text/
 │   ├── models/                   # Neural network architectures
 │   │   ├── cnn_extractor.py      # Word-level 1D CNN feature extractor
 │   │   ├── bert_extractor.py     # HuggingFace transformer (CLS token)
+│   │   ├── gru_extractor.py      # BiGRU with attention pooling (O(N) for long sequences)
 │   │   ├── dragonnet.py          # DragonNet causal head
 │   │   ├── uplift.py             # UpliftNet alternative architecture
 │   │   ├── causal_cnn.py         # Combined model (extractor + head)
@@ -49,14 +50,15 @@ causal-dragonnet-text/
 ### 1. Architecture: Text → Features → Causal Estimates
 
 ```
-Clinical Text → Feature Extractor (CNN/BERT) → DragonNet → [P(T|X), E[Y|T=0,X], E[Y|T=1,X]]
-                                                              ↓
-                                                        ITE = E[Y|T=1,X] - E[Y|T=0,X]
+Clinical Text → Feature Extractor (CNN/BERT/GRU) → DragonNet → [P(T|X), E[Y|T=0,X], E[Y|T=1,X]]
+                                                                  ↓
+                                                            ITE = E[Y|T=1,X] - E[Y|T=0,X]
 ```
 
 - **Feature Extractor**: Converts text to fixed-dimensional vector
   - **CNN** (`cnn_extractor.py`): Word-level tokenization, 1D convolutions with multiple kernel sizes (n-gram detection), global max pooling. Faster to train.
-  - **BERT** (`bert_extractor.py`): Any HuggingFace transformer, CLS token extraction, optional projection layer. Higher capacity.
+  - **BERT** (`bert_extractor.py`): Any HuggingFace transformer, CLS token extraction, optional projection layer. Higher capacity but O(N²) attention.
+  - **GRU** (`gru_extractor.py`): Bidirectional GRU with attention pooling. O(N) complexity, efficient for very long sequences (8K+ tokens). Attention weights provide interpretability.
 
 - **DragonNet** (`dragonnet.py`): Jointly predicts:
   - Treatment propensity: P(T=1|X)

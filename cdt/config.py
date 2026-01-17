@@ -13,7 +13,7 @@ class ModelArchitectureConfig:
     """Configuration for model architecture."""
     model_type: str = "dragonnet"  # "dragonnet" or "uplift"
 
-    # Feature extractor type: "cnn" or "bert"
+    # Feature extractor type: "cnn", "bert", or "gru"
     feature_extractor_type: str = "cnn"
 
     # CNN architecture (used when feature_extractor_type="cnn")
@@ -44,6 +44,21 @@ class ModelArchitectureConfig:
     bert_dropout: float = 0.1  # Dropout rate for projection layer
     bert_freeze_encoder: bool = False  # If True, freeze transformer (only train projection + DragonNet)
     bert_gradient_checkpointing: bool = False  # Enable gradient checkpointing for memory efficiency
+
+    # GRU architecture (used when feature_extractor_type="gru")
+    # BiGRU + attention is O(N) vs BERT's O(N^2), efficient for long sequences
+    gru_embedding_dim: int = 256  # Word embedding dimension (can be initialized from BERT)
+    gru_hidden_dim: int = 256  # Hidden state dimension per direction
+    gru_num_layers: int = 2  # Number of stacked GRU layers
+    gru_dropout: float = 0.1  # Dropout rate
+    gru_bidirectional: bool = True  # Use bidirectional GRU
+    gru_attention_dim: Optional[int] = None  # Attention hidden dimension (default: 2*hidden_dim if bidirectional)
+    gru_projection_dim: Optional[int] = 128  # Output projection dimension
+    gru_max_length: int = 8192  # Max sequence length in tokens (words)
+    gru_min_word_freq: int = 2  # Minimum word frequency for vocabulary
+    gru_max_vocab_size: int = 50000  # Maximum vocabulary size
+    gru_init_embeddings_from: Optional[str] = None  # e.g., "emilyalsentzer/Bio_ClinicalBERT"
+    gru_freeze_embeddings: bool = False  # Whether to freeze initialized embeddings
 
     # DragonNet head dimensions
     dragonnet_representation_dim: int = 128

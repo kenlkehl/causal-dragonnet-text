@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from .cnn_extractor import CNNFeatureExtractor
 from .bert_extractor import BertFeatureExtractor
+from .gru_extractor import GRUFeatureExtractor
 from .dragonnet import DragonNet
 from .uplift import UpliftNet
 
@@ -18,10 +19,10 @@ logger = logging.getLogger(__name__)
 
 class CausalCNNText(nn.Module):
     """
-    Causal inference model for text using CNN or BERT feature extraction.
+    Causal inference model for text using CNN, BERT, or GRU feature extraction.
 
     Architecture:
-    - Feature extractor (CNN or BERT) encodes text into feature vector
+    - Feature extractor (CNN, BERT, or GRU) encodes text into feature vector
     - DragonNet/UpliftNet predicts outcomes and propensity
 
     CNN mode:
@@ -33,6 +34,13 @@ class CausalCNNText(nn.Module):
     - HuggingFace transformer with CLS token extraction
     - Fine-tuning or frozen encoder options
     - No fit_tokenizer() needed (uses pretrained tokenizer)
+    - O(N^2) attention - may struggle with very long sequences
+
+    GRU mode:
+    - Bidirectional GRU with attention pooling
+    - O(N) complexity - efficient for long sequences
+    - Attention weights provide interpretability
+    - IMPORTANT: Call fit_tokenizer(texts) with training data before use
     """
 
     def __init__(
@@ -57,6 +65,13 @@ class CausalCNNText(nn.Module):
         bert_dropout: float = 0.1,
         bert_freeze_encoder: bool = False,
         bert_gradient_checkpointing: bool = False,
+        # GRU-specific args
+        gru_hidden_dim: int = 256,
+        gru_num_layers: int = 2,
+        gru_dropout: float = 0.1,
+        gru_bidirectional: bool = True,
+        gru_attention_dim: Optional[int] = None,
+        gru_projection_dim: Optional[int] = 128,
         # DragonNet args
         dragonnet_representation_dim: int = 128,
         dragonnet_hidden_outcome_dim: int = 64,
@@ -65,19 +80,19 @@ class CausalCNNText(nn.Module):
         model_type: str = "dragonnet"  # "dragonnet" or "uplift"
     ):
         """
-        Initialize causal inference model with CNN or BERT feature extractor.
+        Initialize causal inference model with CNN, BERT, or GRU feature extractor.
 
         Args:
-            feature_extractor_type: "cnn" or "bert"
-            embedding_dim: (CNN) Dimension of word embeddings
+            feature_extractor_type: "cnn", "bert", or "gru"
+            embedding_dim: (CNN/GRU) Dimension of word embeddings
             kernel_sizes: (CNN) List of kernel sizes for n-gram capture
             explicit_filter_concepts: (CNN) Dict mapping kernel_size to concept phrases
             num_kmeans_filters: (CNN) Number of k-means derived filters per kernel size
             num_random_filters: (CNN) Number of randomly initialized filters per kernel size
             cnn_dropout: (CNN) Dropout rate
-            max_length: (CNN) Maximum sequence length in tokens
-            min_word_freq: (CNN) Minimum word frequency for vocabulary inclusion
-            max_vocab_size: (CNN) Maximum vocabulary size
+            max_length: (CNN/GRU) Maximum sequence length in tokens
+            min_word_freq: (CNN/GRU) Minimum word frequency for vocabulary inclusion
+            max_vocab_size: (CNN/GRU) Maximum vocabulary size
             projection_dim: (CNN) Dimension to project CNN output to
             bert_model_name: (BERT) HuggingFace model name or path
             bert_max_length: (BERT) Maximum sequence length in subword tokens
@@ -85,6 +100,12 @@ class CausalCNNText(nn.Module):
             bert_dropout: (BERT) Dropout rate for projection layer
             bert_freeze_encoder: (BERT) Whether to freeze transformer weights
             bert_gradient_checkpointing: (BERT) Enable gradient checkpointing
+            gru_hidden_dim: (GRU) Hidden state dimension per direction
+            gru_num_layers: (GRU) Number of stacked GRU layers
+            gru_dropout: (GRU) Dropout rate
+            gru_bidirectional: (GRU) Use bidirectional GRU
+            gru_attention_dim: (GRU) Attention hidden dimension (default: 2*hidden_dim)
+            gru_projection_dim: (GRU) Output projection dimension
             dragonnet_representation_dim: DragonNet representation dimension
             dragonnet_hidden_outcome_dim: DragonNet outcome hidden dimension
             dragonnet_dropout: Dropout rate for DragonNet layers
@@ -116,6 +137,12 @@ class CausalCNNText(nn.Module):
             'bert_dropout': bert_dropout,
             'bert_freeze_encoder': bert_freeze_encoder,
             'bert_gradient_checkpointing': bert_gradient_checkpointing,
+            'gru_hidden_dim': gru_hidden_dim,
+            'gru_num_layers': gru_num_layers,
+            'gru_dropout': gru_dropout,
+            'gru_bidirectional': gru_bidirectional,
+            'gru_attention_dim': gru_attention_dim,
+            'gru_projection_dim': gru_projection_dim,
             'dragonnet_representation_dim': dragonnet_representation_dim,
             'dragonnet_hidden_outcome_dim': dragonnet_hidden_outcome_dim,
             'dragonnet_dropout': dragonnet_dropout,
@@ -135,6 +162,22 @@ class CausalCNNText(nn.Module):
             if bert_gradient_checkpointing:
                 self.feature_extractor.gradient_checkpointing_enable()
             logger.info(f"Using BERT feature extractor: {bert_model_name}")
+        elif feature_extractor_type == "gru":
+            self.feature_extractor = GRUFeatureExtractor(
+                embedding_dim=embedding_dim,
+                hidden_dim=gru_hidden_dim,
+                num_layers=gru_num_layers,
+                dropout=gru_dropout,
+                bidirectional=gru_bidirectional,
+                attention_dim=gru_attention_dim,
+                projection_dim=gru_projection_dim,
+                max_length=max_length,
+                min_word_freq=min_word_freq,
+                max_vocab_size=max_vocab_size,
+                device=self._device
+            )
+            logger.info(f"Using GRU feature extractor: {gru_num_layers} layers, "
+                       f"hidden_dim={gru_hidden_dim}, bidirectional={gru_bidirectional}")
         else:
             # CNN feature extractor (default)
             self.feature_extractor = CNNFeatureExtractor(
@@ -355,7 +398,7 @@ class CausalCNNText(nn.Module):
         """
         Fit the word tokenizer on training texts.
 
-        For CNN: This MUST be called before using the model for training or inference.
+        For CNN/GRU: This MUST be called before using the model for training or inference.
         For BERT: This is a no-op (BERT uses its pretrained tokenizer).
 
         Args:

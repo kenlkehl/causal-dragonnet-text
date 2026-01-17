@@ -342,19 +342,32 @@ def _train_single_model(
     # Get feature extractor type (default to "cnn" for backward compatibility)
     feature_extractor_type = getattr(arch_config, 'feature_extractor_type', 'cnn')
 
+    # Determine max_length and embedding_dim based on extractor type
+    if feature_extractor_type == "gru":
+        max_length = getattr(arch_config, 'gru_max_length', 8192)
+        embedding_dim = getattr(arch_config, 'gru_embedding_dim', 256)
+        min_word_freq = getattr(arch_config, 'gru_min_word_freq', 2)
+        max_vocab_size = getattr(arch_config, 'gru_max_vocab_size', 50000)
+    else:
+        max_length = arch_config.cnn_max_length
+        embedding_dim = arch_config.cnn_embedding_dim
+        min_word_freq = getattr(arch_config, 'cnn_min_word_freq', 2)
+        max_vocab_size = getattr(arch_config, 'cnn_max_vocab_size', 50000)
+
     # Create model with appropriate feature extractor
     model = CausalCNNText(
         feature_extractor_type=feature_extractor_type,
-        # CNN args
-        embedding_dim=arch_config.cnn_embedding_dim,
+        # CNN/GRU shared args
+        embedding_dim=embedding_dim,
+        max_length=max_length,
+        min_word_freq=min_word_freq,
+        max_vocab_size=max_vocab_size,
+        # CNN-specific args
         kernel_sizes=arch_config.cnn_kernel_sizes,
         explicit_filter_concepts=arch_config.cnn_explicit_filter_concepts,
         num_kmeans_filters=arch_config.cnn_num_kmeans_filters,
         num_random_filters=arch_config.cnn_num_random_filters,
         cnn_dropout=arch_config.cnn_dropout,
-        max_length=arch_config.cnn_max_length,
-        min_word_freq=getattr(arch_config, 'cnn_min_word_freq', 2),
-        max_vocab_size=getattr(arch_config, 'cnn_max_vocab_size', 50000),
         projection_dim=arch_config.dragonnet_representation_dim,
         # BERT args
         bert_model_name=getattr(arch_config, 'bert_model_name', 'bert-base-uncased'),
@@ -363,6 +376,13 @@ def _train_single_model(
         bert_dropout=getattr(arch_config, 'bert_dropout', 0.1),
         bert_freeze_encoder=getattr(arch_config, 'bert_freeze_encoder', False),
         bert_gradient_checkpointing=getattr(arch_config, 'bert_gradient_checkpointing', False),
+        # GRU args
+        gru_hidden_dim=getattr(arch_config, 'gru_hidden_dim', 256),
+        gru_num_layers=getattr(arch_config, 'gru_num_layers', 2),
+        gru_dropout=getattr(arch_config, 'gru_dropout', 0.1),
+        gru_bidirectional=getattr(arch_config, 'gru_bidirectional', True),
+        gru_attention_dim=getattr(arch_config, 'gru_attention_dim', None),
+        gru_projection_dim=getattr(arch_config, 'gru_projection_dim', 128),
         # DragonNet args
         dragonnet_representation_dim=arch_config.dragonnet_representation_dim,
         dragonnet_hidden_outcome_dim=arch_config.dragonnet_hidden_outcome_dim,
@@ -395,6 +415,18 @@ def _train_single_model(
             model.feature_extractor.init_filters(
                 texts=train_texts,
                 freeze=arch_config.cnn_freeze_filters
+            )
+    elif feature_extractor_type == "gru":
+        # GRU-specific initialization
+        # Fit word tokenizer on training texts
+        model.fit_tokenizer(train_texts)
+        logger.info(f"Fitted word tokenizer on {len(train_texts)} training texts")
+
+        # Initialize embeddings from BERT if configured
+        if getattr(arch_config, 'gru_init_embeddings_from', None):
+            model.feature_extractor.init_embeddings_from_bert(
+                arch_config.gru_init_embeddings_from,
+                freeze=getattr(arch_config, 'gru_freeze_embeddings', False)
             )
     else:
         # BERT uses pretrained tokenizer, no fit_tokenizer needed
