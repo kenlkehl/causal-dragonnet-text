@@ -33,9 +33,6 @@ cdt_causal.egg-info/dependency_links.txt
 cdt_causal.egg-info/entry_points.txt
 cdt_causal.egg-info/requires.txt
 cdt_causal.egg-info/top_level.txt
-examples/bert_config.json
-examples/modernbert_config.json
-examples/semantic_cnn_config.json
 synthetic_data/__init__.py
 synthetic_data/cli.py
 synthetic_data/config.py

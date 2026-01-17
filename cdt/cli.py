@@ -73,6 +73,11 @@ Examples:
         action='store_true',
         help='Skip plasmode experiments even if enabled in config'
     )
+    run_parser.add_argument(
+        '--validate-outcome-signal',
+        action='store_true',
+        help='Run outcome-only model validation to check text→outcome signal'
+    )
     
     args = parser.parse_args()
     
@@ -102,6 +107,8 @@ Examples:
             config.pretraining.enabled = False
         if args.skip_plasmode:
             config.plasmode_experiments.enabled = False
+        if args.validate_outcome_signal:
+            config.outcome_validation.enabled = True
         
         try:
             config.validate()
@@ -117,10 +124,13 @@ Examples:
             print("EXPERIMENT COMPLETE")
             print(f"{'='*80}")
             print(f"Results saved to: {config.output_dir}")
-            
+
+            if results.get('outcome_validation'):
+                print(f"\nOutcome validation results: {results['outcome_validation']}")
+
             if results.get('applied_inference'):
                 print(f"\nApplied inference results: {results['applied_inference']}")
-            
+
             if results.get('plasmode_experiments'):
                 print(f"Plasmode experiment results: {results['plasmode_experiments']}")
             

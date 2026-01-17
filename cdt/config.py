@@ -94,6 +94,21 @@ class PropensityTrimmingConfig:
 
 
 @dataclass
+class OutcomeValidationConfig:
+    """Configuration for outcome-only model validation.
+
+    When enabled, trains an outcome-only model using k-fold cross-validation
+    to validate whether the CNN can learn text→outcome signal before running
+    full DragonNet training. This helps diagnose model collapse issues.
+    """
+    enabled: bool = False  # Whether to run outcome validation
+    cv_folds: int = 5  # Number of CV folds for outcome model training
+    epochs: int = 10  # Training epochs for outcome model
+    batch_size: int = 8  # Batch size for outcome model
+    learning_rate: float = 1e-4  # Learning rate for outcome model
+
+
+@dataclass
 class PlasmodeConfig:
     """Configuration for plasmode simulation with continuous outcomes (survival in months)."""
     generation_mode: str = "phi_linear"
@@ -157,6 +172,7 @@ class ExperimentConfig:
     filter_interpretation_top_k: int = 10  # Number of top n-grams per filter to save
 
     applied_inference: AppliedInferenceConfig = field(default_factory=AppliedInferenceConfig)
+    outcome_validation: OutcomeValidationConfig = field(default_factory=OutcomeValidationConfig)
     plasmode_experiments: PlasmodeExperimentConfig = field(default_factory=PlasmodeExperimentConfig)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -201,6 +217,10 @@ class ExperimentConfig:
             oracle_mode=plasmode_data.get('oracle_mode', False)
         )
 
+        # Parse outcome_validation config
+        outcome_validation_data = data.get('outcome_validation', {})
+        outcome_validation = OutcomeValidationConfig(**outcome_validation_data)
+
         return cls(
             output_dir=data.get('output_dir', './cdt_results'),
             seed=data.get('seed', 42),
@@ -210,6 +230,7 @@ class ExperimentConfig:
             save_filter_interpretations=data.get('save_filter_interpretations', False),
             filter_interpretation_top_k=data.get('filter_interpretation_top_k', 10),
             applied_inference=applied,
+            outcome_validation=outcome_validation,
             plasmode_experiments=plasmode
         )
 

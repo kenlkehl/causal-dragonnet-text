@@ -58,6 +58,14 @@ class ExperimentRunner:
 
         self._save_config()
 
+        # Run outcome validation if enabled
+        if self.config.outcome_validation.enabled:
+            logger.info("\n" + "=" * 80)
+            logger.info("PHASE 0: OUTCOME SIGNAL VALIDATION")
+            logger.info("=" * 80)
+            outcome_validation_results = self._run_outcome_validation()
+            results['outcome_validation'] = outcome_validation_results
+
         if self.config.applied_inference.skip:
             logger.info("\n" + "=" * 80)
             logger.info("PHASE 1: APPLIED INFERENCE (SKIPPED)")
@@ -88,6 +96,55 @@ class ExperimentRunner:
         config_path = self.output_dir / "config.json"
         self.config.to_json(str(config_path))
         logger.info(f"Configuration saved to: {config_path}")
+
+    def _run_outcome_validation(self) -> str:
+        """
+        Run outcome-only model validation to check text→outcome signal.
+
+        Returns:
+            Path to validation results file
+        """
+        from ..training.outcome_validation import train_outcome_model_cv
+
+        applied_config = self.config.applied_inference
+        outcome_validation_config = self.config.outcome_validation
+
+        logger.info(f"Loading dataset: {applied_config.dataset_path}")
+        df = load_dataset(applied_config.dataset_path)
+
+        # Validate dataset
+        validate_dataset(
+            df,
+            text_column=applied_config.text_column,
+            outcome_column=applied_config.outcome_column,
+            treatment_column=applied_config.treatment_column,
+            split_column=None  # Outcome validation uses CV, not fixed splits
+        )
+
+        output_dir = ensure_dir(self.output_dir / "outcome_validation")
+
+        # Run outcome model CV training
+        df_with_preds, training_log = train_outcome_model_cv(
+            dataset=df,
+            config=applied_config,
+            outcome_validation_config=outcome_validation_config,
+            device=self.device,
+            num_workers=self.config.num_workers,
+            gpu_ids=self.config.gpu_ids
+        )
+
+        # Save predictions
+        predictions_path = output_dir / "predictions.parquet"
+        df_with_preds.to_parquet(predictions_path, index=False)
+        logger.info(f"Outcome validation predictions saved to: {predictions_path}")
+
+        # Save training log
+        log_path = output_dir / "training_log.csv"
+        training_log.to_csv(log_path, index=False)
+        logger.info(f"Outcome validation training log saved to: {log_path}")
+
+        logger.info(f"Outcome validation complete: {predictions_path}")
+        return str(predictions_path)
 
     def _run_applied_inference(self) -> str:
         """
