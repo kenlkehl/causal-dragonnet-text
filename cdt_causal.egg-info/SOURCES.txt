@@ -18,6 +18,7 @@ cdt/models/causal_cnn.py
 cdt/models/cnn_extractor.py
 cdt/models/components.py
 cdt/models/dragonnet.py
+cdt/models/gru_extractor.py
 cdt/models/outcome_heads.py
 cdt/models/outcome_model.py
 cdt/models/propensity_model.py
