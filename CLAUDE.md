@@ -1,295 +1,242 @@
-# CLAUDE.md - CDT (Causal DragonNet Text) Codebase Reference
+# CLAUDE.md - CDT (Causal DragonNet Text)
 
 ## Project Overview
 
-CDT is a framework for **clinical causal inference using electronic health record (EHR) text**. It estimates treatment effects from unstructured clinical narratives using neural networks with DragonNet-style causal inference heads.
+CDT is a framework for **clinical causal inference using electronic health record (EHR) text**. It estimates treatment effects from unstructured clinical narratives by combining text feature extraction with DragonNet causal inference heads.
 
-**Core research goal**: Extract confounders from clinical text that may not be captured in structured EHR data (e.g., functional status, symptom severity, patient preferences) and use them for causal inference.
-
-Note: For any code execution, use the python environment at ~/pcori .
+**Key purpose**: Extract confounders from clinical text to estimate individual treatment effects (ITEs) and average treatment effects (ATEs) in observational studies where critical confounders exist only in unstructured notes.
 
 ## Repository Structure
 
 ```
-causal-dragonnet-text/
-├── cdt/                          # Main causal inference package
-│   ├── cli.py                    # CLI entry point: `cdt init`, `cdt run`
-│   ├── config.py                 # Configuration dataclasses
-│   ├── models/                   # Neural network architectures
-│   │   ├── cnn_extractor.py      # Word-level 1D CNN feature extractor
-│   │   ├── bert_extractor.py     # HuggingFace transformer (CLS token)
-│   │   ├── gru_extractor.py      # BiGRU with attention pooling (O(N) for long sequences)
-│   │   ├── dragonnet.py          # DragonNet causal head
-│   │   ├── uplift.py             # UpliftNet alternative architecture
-│   │   ├── causal_cnn.py         # Combined model (extractor + head)
-│   │   ├── propensity_model.py   # Propensity-only model for trimming
-│   │   └── outcome_model.py      # Outcome-only model for prognostic signal
-│   ├── inference/
-│   │   └── applied.py            # Applied inference on real data
-│   ├── training/
-│   │   ├── plasmode.py           # Plasmode simulation experiments
-│   │   ├── propensity_trimming.py # Propensity-based dataset trimming
-│   │   └── outcome_training.py   # Outcome model training for prognostic signal
-│   ├── data/
-│   │   └── dataset.py            # PyTorch datasets and loading
-│   ├── experiments/
-│   │   └── runner.py             # Main experiment orchestrator
-│   └── utils/                    # Utility functions
-├── synthetic_data/               # LLM-based synthetic data generation
-│   ├── cli.py                    # CLI: `python -m synthetic_data.cli`
-│   ├── config.py                 # Generation configuration
-│   ├── generator.py              # Main generation pipeline
-│   ├── llm_client.py             # OpenAI-compatible API client
-│   ├── vllm_batch_client.py      # Direct vLLM batch inference
-│   └── prompts.py                # LLM prompts for data generation
-└── examples/                     # Example configuration files
+cdt/                          # Main package
+├── cli.py                    # CLI entry point (`cdt init`, `cdt run`)
+├── config.py                 # Dataclass configurations (ExperimentConfig, ModelArchitectureConfig, etc.)
+├── data/
+│   └── dataset.py            # ClinicalTextDataset, data loading/validation
+├── experiments/
+│   └── runner.py             # ExperimentRunner - orchestrates applied inference & plasmode
+├── inference/
+│   └── applied.py            # Run applied causal inference (CV or fixed split)
+├── models/
+│   ├── causal_cnn.py         # CausalCNNText - main model combining extractor + DragonNet
+│   ├── cnn_extractor.py      # CNNFeatureExtractor - 1D CNN with semantic filter init
+│   ├── bert_extractor.py     # BertFeatureExtractor - HuggingFace transformer CLS token
+│   ├── gru_extractor.py      # GRUFeatureExtractor - BiGRU with attention pooling
+│   ├── dragonnet.py          # DragonNet head (propensity + potential outcomes)
+│   ├── uplift.py             # UpliftNet head (alternative parametrization)
+│   ├── outcome_heads.py      # Outcome prediction heads
+│   └── propensity_model.py   # Standalone propensity model
+├── training/
+│   ├── plasmode.py           # Plasmode simulation experiments
+│   ├── propensity_trimming.py# Propensity-based dataset trimming
+│   └── outcome_training.py   # Standalone outcome model training
+└── utils/                    # Utilities (io, system, etc.)
+
+synthetic_data/               # LLM-based synthetic data generation
+├── generator.py              # Main pipeline for generating synthetic datasets
+├── config.py                 # SyntheticDataConfig
+├── prompts.py                # Clinical prompts for LLM
+├── llm_client.py             # OpenAI API client
+└── vllm_batch_client.py      # vLLM batch inference client
+
+examples/                     # Example config files
+├── semantic_cnn_config.json  # CNN with explicit clinical concepts
+├── bert_config.json          # BERT feature extractor config
+└── modernbert_config.json    # ModernBERT config
 ```
 
-## Key Concepts
+## Architecture
 
-### 1. Architecture: Text → Features → Causal Estimates
+### Core Model: CausalCNNText (`cdt/models/causal_cnn.py`)
 
-```
-Clinical Text → Feature Extractor (CNN/BERT/GRU) → DragonNet → [P(T|X), E[Y|T=0,X], E[Y|T=1,X]]
-                                                                  ↓
-                                                            ITE = E[Y|T=1,X] - E[Y|T=0,X]
-```
+The main model combines:
+1. **Feature Extractor** (one of three types):
+   - `cnn`: 1D CNN with word-level tokenization (default, fastest)
+   - `bert`: HuggingFace transformer (Bio_ClinicalBERT, ModernBERT, etc.)
+   - `gru`: Bidirectional GRU with attention (O(N) for long sequences)
 
-- **Feature Extractor**: Converts text to fixed-dimensional vector
-  - **CNN** (`cnn_extractor.py`): Word-level tokenization, 1D convolutions with multiple kernel sizes (n-gram detection), global max pooling. Faster to train.
-  - **BERT** (`bert_extractor.py`): Any HuggingFace transformer, CLS token extraction, optional projection layer. Higher capacity but O(N²) attention.
-  - **GRU** (`gru_extractor.py`): Bidirectional GRU with attention pooling. O(N) complexity, efficient for very long sequences (8K+ tokens). Attention weights provide interpretability.
+2. **Causal Inference Head** (one of two types):
+   - `dragonnet`: Classic DragonNet (propensity + Y0/Y1 potential outcomes)
+   - `uplift`: UpliftNet (base outcome + treatment effect parametrization)
 
-- **DragonNet** (`dragonnet.py`): Jointly predicts:
-  - Treatment propensity: P(T=1|X)
-  - Potential outcomes: E[Y|T=0,X] and E[Y|T=1,X]
-  - Uses shared representation layers, separate outcome heads
+### CNN Feature Extractor (`cdt/models/cnn_extractor.py`)
 
-### 2. CNN Semantic Initialization
+Key features:
+- **Semantic filter initialization**: CNN filters can be initialized from explicit clinical concepts (e.g., "stage iv cancer", "performance status poor")
+- **K-means filter initialization**: Additional filters derived from clustering training n-grams
+- **BERT embedding initialization**: Word embeddings initialized from Bio_ClinicalBERT
+- **Filter interpretability**: `interpret_filters()` method shows which n-grams activate each filter
 
-Key innovation: CNN filters can be initialized with clinical meaning:
+**Important**: Call `fit_tokenizer(texts)` before training with CNN/GRU extractors.
 
-1. **Explicit concepts**: User-specified phrases (e.g., "stage iv cancer", "performance status poor") become filter templates
-2. **K-means filters**: Cluster training n-grams and use centroids as filters
-3. **Random filters**: Standard random initialization
+### DragonNet (`cdt/models/dragonnet.py`)
 
-Embeddings can be initialized from BERT (e.g., Bio_ClinicalBERT).
+Outputs:
+- `y0_logit`: Predicted outcome under control (T=0)
+- `y1_logit`: Predicted outcome under treatment (T=1)
+- `t_logit`: Treatment propensity logit
+- Individual Treatment Effect (ITE) = sigmoid(y1_logit) - sigmoid(y0_logit)
 
-### 3. Workflow Modes
+Loss function components:
+- Outcome loss (factual only)
+- Propensity loss (binary cross-entropy)
+- Targeted regularization (R-loss)
 
-**Applied Inference** (`cdt/inference/applied.py`):
-- Run on real clinical data
-- K-Fold CV or fixed train/val/test splits
-- Outputs: predictions.parquet with ITE estimates
-
-**Plasmode Simulation** (`cdt/training/plasmode.py`):
-- Uses real text covariates, generates synthetic outcomes with known treatment effects
-- Validates method: Can the model recover the true ATE?
-- Generator model learns representations, synthetic outcomes generated, evaluator model trained on synthetic data
-
-## CLI Commands
-
-### Main CDT CLI
+## Key Commands
 
 ```bash
-# Create default config
+# Initialize default config
 cdt init --output config.json
 
 # Run experiment
-cdt run --config config.json [--device cuda:0] [--workers 4] [--skip-plasmode]
+cdt run --config config.json --device cuda:0 --workers 4
+
+# CLI options
+cdt run --config config.json \
+    --device cuda:1 \
+    --workers 4 \
+    --output-dir ./results \
+    --skip-plasmode \
+    --verbose
 ```
 
-### Synthetic Data Generation
+## Configuration (`cdt/config.py`)
 
-```bash
-# Using OpenAI-compatible API (e.g., vLLM server)
-python -m synthetic_data.cli \
-    --api-url http://localhost:8000/v1 \
-    --model openai/gpt-oss-120b \
-    --dataset-size 500 \
-    --clinical-question "Compare treatment A with treatment B for condition X"
+Main config classes:
+- `ExperimentConfig`: Top-level config
+- `AppliedInferenceConfig`: Dataset paths, column names, CV folds
+- `ModelArchitectureConfig`: Feature extractor type, CNN/BERT/GRU params, DragonNet dims
+- `TrainingConfig`: Learning rate, epochs, batch size, loss weights
+- `PropensityTrimmingConfig`: Pre-trimming by propensity scores
+- `PlasmodeConfig`: Plasmode simulation parameters
 
-# Direct vLLM batch inference (faster, no server)
-python -m synthetic_data.cli \
-    --use-vllm-batch \
-    --model path/to/model \
-    --tensor-parallel-size 2 \
-    --dataset-size 1000
-```
-
-## Configuration Reference
-
-### Key Config Classes (`cdt/config.py`)
-
+Key architecture settings:
 ```python
-ExperimentConfig                    # Top-level config
-├── applied_inference: AppliedInferenceConfig
-│   ├── dataset_path: str           # Path to parquet/csv
-│   ├── text_column: str            # Column name for text
-│   ├── outcome_column: str         # Column name for outcome
-│   ├── treatment_column: str       # Column name for treatment
-│   ├── cv_folds: int               # K-fold CV (0/1 = fixed splits)
-│   ├── architecture: ModelArchitectureConfig
-│   │   ├── feature_extractor_type: str  # "cnn" or "bert"
-│   │   ├── cnn_*                   # CNN-specific params
-│   │   ├── bert_*                  # BERT-specific params
-│   │   └── dragonnet_*             # DragonNet head params
-│   ├── training: TrainingConfig
-│   │   ├── epochs, batch_size, learning_rate
-│   │   ├── alpha_propensity: float # Weight for propensity loss
-│   │   └── beta_targreg: float     # Targeted regularization weight
-│   ├── propensity_trimming: PropensityTrimmingConfig
-│   └── outcome_model: OutcomeModelConfig
-└── plasmode_experiments: PlasmodeExperimentConfig
-    ├── enabled: bool
-    ├── num_repeats: int
-    ├── plasmode_scenarios: List[PlasmodeConfig]
-    │   ├── generation_mode: str    # e.g., "phi_linear"
-    │   └── target_ate_prob: float  # Known true ATE
-    └── generator_*/evaluator_*     # Separate configs for gen/eval
+# Feature extractor type
+feature_extractor_type: str = "cnn"  # "cnn", "bert", or "gru"
+
+# CNN-specific
+cnn_embedding_dim: int = 128
+cnn_kernel_sizes: List[int] = [3, 4, 5, 7]
+cnn_explicit_filter_concepts: Dict[str, List[str]]  # kernel_size -> concepts
+cnn_num_kmeans_filters: int = 64
+cnn_init_embeddings_from: str = "emilyalsentzer/Bio_ClinicalBERT"
+
+# BERT-specific
+bert_model_name: str = "bert-base-uncased"
+bert_max_length: int = 512
+bert_freeze_encoder: bool = False
+
+# GRU-specific
+gru_hidden_dim: int = 256
+gru_num_layers: int = 2
+gru_max_length: int = 8192  # Efficient for long sequences
 ```
 
-### Dataset Format
+## Dataset Format
 
-Parquet or CSV with columns:
-- `clinical_text`: Raw clinical narrative text
-- `treatment_indicator`: Binary (0/1)
-- `outcome_indicator`: Binary (0/1)
-- `split` (optional): "train"/"val"/"test" for fixed splits
+Expected columns in Parquet/CSV:
+| Column | Type | Description |
+|--------|------|-------------|
+| `clinical_text` | string | Clinical narrative text |
+| `treatment_indicator` | int/float | Binary treatment (0 or 1) |
+| `outcome_indicator` | int/float | Binary outcome (0 or 1) |
+| `split` | string | Optional: "train", "val", "test" |
 
-## Important Code Patterns
+## Workflow Modes
 
-### Training a Model (from applied.py)
+### 1. Applied Inference
+Estimates treatment effects on real data:
+- K-fold cross-validation (default: 5 folds)
+- Fixed train/val/test splits
+- Outputs: `predictions.parquet` with `pred_ite_prob`, `pred_propensity_prob`, etc.
 
+### 2. Plasmode Simulation
+Generates synthetic outcomes with known ground truth for method validation:
+1. Train "generator" model on real data
+2. Generate synthetic outcomes with known ATE
+3. Train "evaluator" on synthetic data
+4. Compare estimated vs. true treatment effects
+
+## Synthetic Data Generation (`synthetic_data/`)
+
+LLM-based pipeline for generating synthetic clinical datasets:
+1. Generate confounders from clinical question
+2. Generate treatment/outcome regression equations
+3. Generate summary statistics
+4. Sample patient characteristics and generate clinical histories
+
+Supports both OpenAI API and local vLLM batch inference.
+
+## Key Files for Development
+
+- **Main model**: `cdt/models/causal_cnn.py` (CausalCNNText)
+- **Training loop**: `cdt/inference/applied.py` (_train_single_model, _train_epoch)
+- **Config**: `cdt/config.py`
+- **CLI**: `cdt/cli.py`
+- **Dataset**: `cdt/data/dataset.py`
+
+## Common Patterns
+
+### Training a model manually
 ```python
-# Create model
+from cdt.models.causal_cnn import CausalCNNText
+
 model = CausalCNNText(
-    feature_extractor_type="cnn",  # or "bert"
+    feature_extractor_type="cnn",
     embedding_dim=128,
     kernel_sizes=[3, 4, 5, 7],
-    dragonnet_representation_dim=128,
+    num_kmeans_filters=64,
     device="cuda:0"
 )
 
-# For CNN: MUST fit tokenizer before training
+# IMPORTANT: Fit tokenizer before training
 model.fit_tokenizer(train_texts)
 
 # Optional: Initialize embeddings from BERT
 model.feature_extractor.init_embeddings_from_bert("emilyalsentzer/Bio_ClinicalBERT")
 
-# Optional: Initialize filters from concepts/k-means
-model.feature_extractor.init_filters(texts=train_texts)
+# Optional: Initialize semantic filters
+model.feature_extractor.init_filters(train_texts)
 
 # Training loop
-for batch in train_loader:
+for batch in dataloader:
     losses = model.train_step(batch, alpha_propensity=1.0, beta_targreg=0.1)
     losses['loss'].backward()
     optimizer.step()
-
-# Prediction
-preds = model.predict(texts)  # Returns dict with y0_prob, y1_prob, propensity, ite
 ```
 
-### Key Model Methods
-
-- `CausalCNNText.fit_tokenizer(texts)`: Required for CNN, builds vocabulary
-- `CausalCNNText.train_step(batch, alpha_propensity, beta_targreg)`: Returns loss dict
-- `CausalCNNText.predict(texts)`: Returns predictions on probability scale
-- `CausalCNNText.get_features(texts)`: Extract feature representations
-- `CNNFeatureExtractor.interpret_filters(texts)`: Post-hoc filter interpretation
-
-## Synthetic Data Generation Pipeline
-
-```
-1. Generate confounders (LLM)
-2. Generate regression equations (LLM) - treatment/outcome models
-3. Generate summary statistics (LLM) - confounder distributions
-4. Rescale coefficients for target logit std
-5. Calibrate intercepts for target treatment/outcome rates
-6. For each patient:
-   a. Sample characteristics from distributions
-   b. Compute treatment probability, sample treatment
-   c. Compute outcome probability, sample outcome
-   d. Generate clinical history text (LLM)
-7. Save dataset + metadata
-```
-
-Outputs:
-- `dataset.parquet`: Patient data with text and ground truth
-- `metadata.json`: Confounders, equations, generation config
-- `generation_config.json`: Input configuration
-
-## Loss Function Components
-
+### Getting predictions
 ```python
-total_loss = outcome_loss + alpha_propensity * propensity_loss + beta_targreg * targreg_loss
+preds = model.predict(texts)
+# preds contains: y0_prob, y1_prob, propensity, y0_logit, y1_logit, t_logit
+
+# Individual treatment effect (probability scale)
+ite = preds['y1_prob'] - preds['y0_prob']
 ```
 
-- **outcome_loss**: BCE on factual outcome (Y given actual T)
-- **propensity_loss**: BCE on treatment prediction
-- **targreg_loss**: Targeted regularization (R-loss) for debiasing
+## Dependencies
 
-## Propensity Trimming
+Core: torch, transformers, pandas, numpy, scikit-learn, tqdm, pyarrow
+Optional: openai (for synthetic data generation)
 
-Optional preprocessing to enforce positivity assumption:
-1. Train propensity-only model with CV
-2. Remove patients with P(T|X) outside [min, max] bounds
-3. Proceed with DragonNet training on trimmed data
+## Output Files
 
-## Outcome Model Training
-
-Optional preprocessing to assess prognostic signal in data before DragonNet:
-1. Train outcome-only model with CV to predict P(Y=1|X)
-2. Log training/validation loss and AUROC per epoch and fold
-3. Output: `outcome_model_training_log.csv` with columns (epoch, fold, train_loss, val_loss, train_auroc, val_auroc)
-4. No dataset trimming - continues to DragonNet with full dataset
-
-This helps understand how much predictive signal exists for the outcome independent of treatment, without the complexity of DragonNet's joint learning.
-
-**Configuration:**
-```json
-{
-  "applied_inference": {
-    "outcome_model": {
-      "enabled": true,
-      "cv_folds": 5,
-      "outcome_epochs": 20,
-      "outcome_learning_rate": 1e-4,
-      "outcome_batch_size": 8
-    }
-  }
-}
+```
+output_dir/
+├── config.json                 # Experiment configuration
+├── applied_inference/
+│   ├── predictions.parquet     # Per-sample predictions
+│   └── training_log.csv        # Training metrics
+└── plasmode_experiments/       # If enabled
+    └── results.csv             # Plasmode results
 ```
 
-## Common Modifications
+## Notes for Development
 
-### Adding a new feature extractor
-1. Create class in `cdt/models/` with `forward(texts) -> tensor`
-2. Add to `CausalCNNText.__init__` initialization logic
-3. Update config in `cdt/config.py`
-
-### Modifying the loss function
-Edit `CausalCNNText.train_step()` in `cdt/models/causal_cnn.py`
-
-### Adding a new plasmode generation mode
-Edit `_generate_plasmode_data()` in `cdt/training/plasmode.py`
-
-## Development Commands
-
-```bash
-# Install in editable mode
-uv pip install -e .
-
-# Run with specific config
-cdt run --config examples/bert_config.json --device cuda:0
-
-# Generate synthetic data
-python -m synthetic_data.cli --config my_config.json --dataset-size 500
-```
-
-## Key Files to Understand First
-
-1. `cdt/models/causal_cnn.py` - Combined model architecture
-2. `cdt/config.py` - All configuration options
-3. `cdt/inference/applied.py` - Training and prediction workflow
-4. `synthetic_data/generator.py` - Data generation pipeline
+1. **Feature extractor type**: CNN is fastest, BERT is most expressive, GRU is efficient for long sequences
+2. **Tokenizer fitting**: CNN/GRU require `fit_tokenizer()` before use; BERT uses pretrained tokenizer
+3. **Filter initialization**: Semantic filters improve interpretability; k-means captures data patterns
+4. **Propensity trimming**: Optional preprocessing to enforce positivity assumption
+5. **All predictions are on probability scale**: ITE = P(Y=1|T=1,X) - P(Y=1|T=0,X)

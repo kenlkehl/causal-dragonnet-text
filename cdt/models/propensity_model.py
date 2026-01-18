@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from .cnn_extractor import CNNFeatureExtractor
 from .bert_extractor import BertFeatureExtractor
+from .gru_extractor import GRUFeatureExtractor
 
 
 logger = logging.getLogger(__name__)
@@ -93,6 +94,17 @@ class PropensityOnlyModel(nn.Module):
         bert_dropout: float = 0.1,
         bert_freeze_encoder: bool = False,
         bert_gradient_checkpointing: bool = False,
+        # GRU-specific args
+        gru_embedding_dim: int = 256,
+        gru_hidden_dim: int = 256,
+        gru_num_layers: int = 2,
+        gru_dropout: float = 0.1,
+        gru_bidirectional: bool = True,
+        gru_attention_dim: Optional[int] = None,
+        gru_projection_dim: Optional[int] = 128,
+        gru_max_length: int = 8192,
+        gru_min_word_freq: int = 2,
+        gru_max_vocab_size: Optional[int] = 50000,
         # Propensity network args
         representation_dim: int = 128,
         device: str = "cuda:0"
@@ -145,6 +157,16 @@ class PropensityOnlyModel(nn.Module):
             'bert_dropout': bert_dropout,
             'bert_freeze_encoder': bert_freeze_encoder,
             'bert_gradient_checkpointing': bert_gradient_checkpointing,
+            'gru_embedding_dim': gru_embedding_dim,
+            'gru_hidden_dim': gru_hidden_dim,
+            'gru_num_layers': gru_num_layers,
+            'gru_dropout': gru_dropout,
+            'gru_bidirectional': gru_bidirectional,
+            'gru_attention_dim': gru_attention_dim,
+            'gru_projection_dim': gru_projection_dim,
+            'gru_max_length': gru_max_length,
+            'gru_min_word_freq': gru_min_word_freq,
+            'gru_max_vocab_size': gru_max_vocab_size,
             'representation_dim': representation_dim
         }
 
@@ -161,6 +183,21 @@ class PropensityOnlyModel(nn.Module):
             if bert_gradient_checkpointing:
                 self.feature_extractor.gradient_checkpointing_enable()
             logger.info(f"Propensity model using BERT feature extractor: {bert_model_name}")
+        elif feature_extractor_type == "gru":
+            self.feature_extractor = GRUFeatureExtractor(
+                embedding_dim=gru_embedding_dim,
+                hidden_dim=gru_hidden_dim,
+                num_layers=gru_num_layers,
+                dropout=gru_dropout,
+                bidirectional=gru_bidirectional,
+                attention_dim=gru_attention_dim,
+                projection_dim=gru_projection_dim,
+                max_length=gru_max_length,
+                min_word_freq=gru_min_word_freq,
+                max_vocab_size=gru_max_vocab_size,
+                device=self._device
+            )
+            logger.info("Propensity model using GRU feature extractor")
         else:
             # CNN feature extractor (default)
             self.feature_extractor = CNNFeatureExtractor(
@@ -312,6 +349,17 @@ def create_propensity_model_from_config(
         bert_dropout=getattr(arch_config, 'bert_dropout', 0.1),
         bert_freeze_encoder=getattr(arch_config, 'bert_freeze_encoder', False),
         bert_gradient_checkpointing=getattr(arch_config, 'bert_gradient_checkpointing', False),
+        # GRU args
+        gru_embedding_dim=getattr(arch_config, 'gru_embedding_dim', 256),
+        gru_hidden_dim=getattr(arch_config, 'gru_hidden_dim', 256),
+        gru_num_layers=getattr(arch_config, 'gru_num_layers', 2),
+        gru_dropout=getattr(arch_config, 'gru_dropout', 0.1),
+        gru_bidirectional=getattr(arch_config, 'gru_bidirectional', True),
+        gru_attention_dim=getattr(arch_config, 'gru_attention_dim', None),
+        gru_projection_dim=getattr(arch_config, 'gru_projection_dim', 128),
+        gru_max_length=getattr(arch_config, 'gru_max_length', 8192),
+        gru_min_word_freq=getattr(arch_config, 'gru_min_word_freq', 2),
+        gru_max_vocab_size=getattr(arch_config, 'gru_max_vocab_size', 50000),
         # Propensity network args
         representation_dim=representation_dim,
         device=str(device)

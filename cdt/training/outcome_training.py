@@ -241,7 +241,19 @@ def _train_outcome_model(
                 texts=train_texts,
                 freeze=arch_config.cnn_freeze_filters
             )
+    elif feature_extractor_type == "gru":
+        # GRU-specific initialization
+        model.fit_tokenizer(train_texts)
+        logger.info(f"Fitted word tokenizer on {len(train_texts)} training texts")
+
+        # Initialize embeddings from BERT if configured
+        if getattr(arch_config, 'gru_init_embeddings_from', None):
+            model.feature_extractor.init_embeddings_from_bert(
+                arch_config.gru_init_embeddings_from,
+                freeze=getattr(arch_config, 'gru_freeze_embeddings', False)
+            )
     else:
+        # BERT uses pretrained tokenizer, no fit_tokenizer needed
         logger.info(f"Using BERT feature extractor: {arch_config.bert_model_name}")
 
     # Create datasets
@@ -302,8 +314,8 @@ def _train_outcome_model(
             optimizer.step()
 
             train_loss += losses['loss'].item()
-            train_preds.append(torch.sigmoid(losses['y_logit']).squeeze().cpu().numpy())
-            train_labels.append(batch['outcome'].cpu().numpy())
+            train_preds.append(torch.sigmoid(losses['y_logit']).flatten().cpu().numpy())
+            train_labels.append(batch['outcome'].flatten().cpu().numpy())
 
         train_loss = train_loss / len(train_loader)
 
@@ -322,8 +334,8 @@ def _train_outcome_model(
                 batch['outcome'] = batch['outcome'].to(device)
                 losses = model.train_step(batch)
                 val_loss += losses['loss'].item()
-                val_preds.append(torch.sigmoid(losses['y_logit']).squeeze().cpu().numpy())
-                val_labels.append(batch['outcome'].cpu().numpy())
+                val_preds.append(torch.sigmoid(losses['y_logit']).flatten().cpu().numpy())
+                val_labels.append(batch['outcome'].flatten().cpu().numpy())
 
         val_loss = val_loss / len(val_loader)
 
