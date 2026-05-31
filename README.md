@@ -317,7 +317,7 @@ oci run --config example_configs/agentic_explicit_feature_forest_config.json
 
 Set `explicit_features.features` to a role-tagged starting list if a researcher wants to seed known confounders or effect modifiers; leave it empty to let the proposal LLM choose the first variables. The agent and extractor both use OpenAI-compatible endpoints, so the same running vLLM server can serve `agent_server_url` and `vllm_server_url`.
 
-The agent receives a few train-fold text snippets to ground its proposals, but raw snippets are omitted from `agentic_feature_search/agent_decisions.jsonl` by default. Set `architecture.agentic_feature_search.save_agent_context=true` only for non-sensitive debugging runs.
+The agent receives a few train-fold text snippets to ground its proposals, but raw snippets are omitted from `agentic_feature_search/agent_decisions.jsonl` by default. Set `architecture.agentic_feature_search.save_agent_context=true` only for non-sensitive debugging runs. Raw proposal-model output is also omitted by default; set `architecture.agentic_feature_search.save_agent_raw_output=true` to persist the exact chat completion content and any provider-exposed reasoning field on each `agent_proposals` event.
 
 ## Contrastive Learning
 

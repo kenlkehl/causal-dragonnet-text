@@ -43,6 +43,7 @@
         "clinical_text_examples_per_prompt": 3,
         "clinical_text_example_chars": 1600,
         "save_agent_context": false,
+        "save_agent_raw_output": false,
         "random_state": 42,
         "stop_after_rejected_iteration": true
       }

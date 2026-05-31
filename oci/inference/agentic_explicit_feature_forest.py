@@ -318,23 +318,48 @@ class AgenticFeatureSearchRunner:
                 current_specs=current_specs,
                 current_summary=baseline_summary,
             )
-            raw_proposals = self.proposal_agent.propose(context)
+            try:
+                raw_proposals = self.proposal_agent.propose(context)
+            except Exception as exc:
+                error_payload = {
+                    "error": repr(exc),
+                    "context": context,
+                }
+                if self.search_config.save_agent_raw_output:
+                    error_payload["agent_raw_output"] = _get_agent_response_trace(
+                        self.proposal_agent
+                    )
+                self._record_decision(
+                    outer_fold,
+                    iteration,
+                    "agent_proposal_error",
+                    error_payload,
+                )
+                self._save_decision_events()
+                raise
+            proposal_payload = {
+                "raw_count": len(raw_proposals),
+                "valid_count": None,
+                "rejected": None,
+                "context": context,
+            }
+            if self.search_config.save_agent_raw_output:
+                proposal_payload["agent_raw_output"] = _get_agent_response_trace(
+                    self.proposal_agent
+                )
             proposals, rejected = validate_agentic_proposals(
                 raw_proposals,
                 current_specs=current_specs,
                 search_config=self.search_config,
                 allow_removals=accepted_additions > 0,
             )
+            proposal_payload["valid_count"] = len(proposals)
+            proposal_payload["rejected"] = rejected
             self._record_decision(
                 outer_fold,
                 iteration,
                 "agent_proposals",
-                {
-                    "raw_count": len(raw_proposals),
-                    "valid_count": len(proposals),
-                    "rejected": rejected,
-                    "context": context,
-                },
+                proposal_payload,
             )
 
             if not proposals:
@@ -563,10 +588,13 @@ class AgenticFeatureSearchRunner:
         )
         with open(self.artifact_dir / "feature_sets.json", "w") as f:
             json.dump(self.feature_set_rows, f, indent=2, default=_json_default)
+        self._save_decision_events()
+        logger.info("Agentic search artifacts saved to: %s", self.artifact_dir)
+
+    def _save_decision_events(self) -> None:
         with open(self.artifact_dir / "agent_decisions.jsonl", "w") as f:
             for event in self.decision_events:
                 f.write(json.dumps(event, default=_json_default) + "\n")
-        logger.info("Agentic search artifacts saved to: %s", self.artifact_dir)
 
 
 class OpenAICompatibleFeatureSearchAgent:
@@ -575,6 +603,8 @@ class OpenAICompatibleFeatureSearchAgent:
     def __init__(self, search_config: AgenticFeatureSearchConfig):
         self.search_config = search_config
         self._client = None
+        self.last_raw_response: Optional[str] = None
+        self.last_response_trace: Optional[Dict[str, Any]] = None
 
     def _ensure_client(self):
         if self._client is not None:
@@ -594,6 +624,8 @@ class OpenAICompatibleFeatureSearchAgent:
 
     def propose(self, context: Dict[str, Any]) -> List[Dict[str, Any]]:
         self._ensure_client()
+        self.last_raw_response = None
+        self.last_response_trace = None
         prompt = build_agent_prompt(context, self.search_config)
         response = self._client.chat.completions.create(
             model=self.search_config.agent_model_name,
@@ -601,7 +633,16 @@ class OpenAICompatibleFeatureSearchAgent:
             temperature=self.search_config.agent_temperature,
             max_tokens=self.search_config.agent_max_tokens,
         )
-        content = response.choices[0].message.content or ""
+        choice = response.choices[0]
+        message = choice.message
+        content = message.content or ""
+        self.last_raw_response = content
+        self.last_response_trace = _chat_completion_trace(
+            response=response,
+            choice=choice,
+            message=message,
+            content=content,
+        )
         return parse_agent_response(content)
 
 
@@ -861,6 +902,85 @@ def parse_agent_response(response: str) -> List[Dict[str, Any]]:
     if not isinstance(proposals, list):
         raise ValueError("Agent response JSON must contain a proposals list")
     return proposals
+
+
+def _chat_completion_trace(
+    response: Any,
+    choice: Any,
+    message: Any,
+    content: str,
+) -> Dict[str, Any]:
+    """Build a JSON-serializable trace of the proposal agent response."""
+    trace = {
+        "raw_content": content,
+        "reasoning_content": _message_field(message, "reasoning_content"),
+        "finish_reason": getattr(choice, "finish_reason", None),
+        "model": getattr(response, "model", None),
+        "response_id": getattr(response, "id", None),
+        "created": getattr(response, "created", None),
+        "usage": _to_jsonable(getattr(response, "usage", None)),
+    }
+    return {key: value for key, value in trace.items() if value is not None}
+
+
+def _message_field(message: Any, key: str) -> Any:
+    value = getattr(message, key, None)
+    if value is not None:
+        return _to_jsonable(value)
+
+    extra = getattr(message, "model_extra", None)
+    if isinstance(extra, dict) and extra.get(key) is not None:
+        return _to_jsonable(extra[key])
+
+    dumped = _model_dump(message)
+    if isinstance(dumped, dict) and dumped.get(key) is not None:
+        return _to_jsonable(dumped[key])
+
+    return None
+
+
+def _get_agent_response_trace(agent: Any) -> Dict[str, Any]:
+    trace = getattr(agent, "last_response_trace", None)
+    if trace is not None:
+        return _to_jsonable(trace)
+
+    raw_response = getattr(agent, "last_raw_response", None)
+    if raw_response is not None:
+        return {"raw_content": str(raw_response)}
+
+    return {"available": False}
+
+
+def _model_dump(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        try:
+            return value.model_dump(mode="json")
+        except TypeError:
+            return value.model_dump()
+    if hasattr(value, "dict"):
+        return value.dict()
+    return None
+
+
+def _to_jsonable(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {str(key): _to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(item) for item in value]
+
+    dumped = _model_dump(value)
+    if dumped is not None and dumped is not value:
+        return _to_jsonable(dumped)
+
+    return str(value)
 
 
 def validate_agentic_proposals(

@@ -227,6 +227,20 @@ class FakeAgent:
         ]
 
 
+class TracedAgent(FakeAgent):
+    def propose(self, context):
+        proposals = super().propose(context)
+        self.last_response_trace = {
+            "raw_content": (
+                "I considered baseline variables first.\n"
+                '{"proposals": [{"action": "add", "name": "hidden_modifier"}]}'
+            ),
+            "reasoning_content": "Baseline hidden modifier should improve tau signal.",
+            "finish_reason": "stop",
+        }
+        return proposals
+
+
 class FakeExtractionProvider:
     def ensure_features(self, dataset, specs):
         dataset = dataset.copy()
@@ -391,6 +405,70 @@ def test_agentic_runner_accepts_inner_cv_improvement_without_true_ite_leakage(tm
         if json.loads(line)["event"] == "agent_proposals"
     ]
     assert all(context.get("clinical_text_examples") == [] for context in persisted_contexts)
+
+
+def test_agentic_runner_can_persist_raw_agent_output_when_enabled(tmp_path):
+    df = pd.DataFrame(
+        {
+            "patient_id": np.arange(12),
+            "clinical_text": [f"Patient {i}" for i in range(12)],
+            "treatment_indicator": [0, 1] * 6,
+            "outcome_indicator": [0, 0, 1, 1] * 3,
+        }
+    )
+    output_path = tmp_path / "predictions.parquet"
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        cv_folds=2,
+        architecture=ModelArchitectureConfig(
+            model_type="agentic_explicit_feature_forest",
+            explicit_feature_forest=ExplicitFeatureForestConfig(
+                n_estimators=8,
+                min_samples_leaf=2,
+                honest=False,
+                inference=False,
+            ),
+            agentic_feature_search=AgenticFeatureSearchConfig(
+                outer_folds=2,
+                inner_folds=2,
+                max_iterations=1,
+                min_r_loss_improvement=0.01,
+                min_improvement_fold_fraction=1.0,
+                save_agent_raw_output=True,
+            ),
+        ),
+        explicit_features=ExplicitFeatureExtractionConfig(
+            enabled=True,
+            features=_base_specs(),
+            cache_enabled=False,
+        ),
+    )
+
+    run_agentic_explicit_feature_forest(
+        dataset=df,
+        config=config,
+        output_path=output_path,
+        proposal_agent=TracedAgent(),
+        extraction_provider=FakeExtractionProvider(),
+        evaluator=FakeEvaluator(),
+    )
+
+    decision_lines = (
+        tmp_path / "agentic_feature_search" / "agent_decisions.jsonl"
+    ).read_text().splitlines()
+    proposal_payloads = [
+        json.loads(line)["payload"]
+        for line in decision_lines
+        if json.loads(line)["event"] == "agent_proposals"
+    ]
+
+    assert proposal_payloads
+    for payload in proposal_payloads:
+        trace = payload["agent_raw_output"]
+        assert "I considered baseline variables first." in trace["raw_content"]
+        assert trace["reasoning_content"] == (
+            "Baseline hidden modifier should improve tau signal."
+        )
 
 
 def test_agentic_runner_feeds_rejection_reasons_to_next_iteration(tmp_path):

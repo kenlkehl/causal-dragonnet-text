@@ -318,6 +318,8 @@ class AgenticFeatureSearchConfig:
     clinical_text_examples_per_prompt: int = 3
     clinical_text_example_chars: int = 1600
     save_agent_context: bool = False
+    # Raw agent output may include quoted prompt snippets or reasoning text.
+    save_agent_raw_output: bool = False
 
     random_state: int = 42
     stop_after_rejected_iteration: bool = True
