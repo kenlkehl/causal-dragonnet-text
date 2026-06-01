@@ -304,6 +304,14 @@ class AgenticFeatureSearchConfig:
     max_treatment_auroc_drop: float = 0.002
     min_improvement_fold_fraction: float = 2.0 / 3.0
 
+    # Train-fold role diagnostics for proposed variables. These regressions are
+    # advisory: they are recorded for the proposal agent and artifacts, while
+    # final acceptance still depends on nested-CV candidate performance.
+    role_diagnostics_enabled: bool = True
+    role_diagnostic_min_n: int = 20
+    role_diagnostic_min_non_missing: int = 10
+    role_diagnostic_score_delta_threshold: float = 0.001
+
     # LLM proposal agent settings. The endpoint is OpenAI-compatible so it can
     # point to vLLM, OpenAI, or another compatible local server.
     agent_server_url: Optional[str] = "http://localhost:8000/v1"
@@ -341,6 +349,16 @@ class AgenticFeatureSearchConfig:
         if not 0.0 <= self.min_improvement_fold_fraction <= 1.0:
             raise ValueError(
                 "agentic_feature_search.min_improvement_fold_fraction must be in [0, 1]"
+            )
+        if self.role_diagnostic_min_n < 2:
+            raise ValueError("agentic_feature_search.role_diagnostic_min_n must be >= 2")
+        if self.role_diagnostic_min_non_missing < 1:
+            raise ValueError(
+                "agentic_feature_search.role_diagnostic_min_non_missing must be >= 1"
+            )
+        if self.role_diagnostic_score_delta_threshold < 0.0:
+            raise ValueError(
+                "agentic_feature_search.role_diagnostic_score_delta_threshold must be >= 0"
             )
         if self.clinical_text_examples_per_prompt < 0:
             raise ValueError(

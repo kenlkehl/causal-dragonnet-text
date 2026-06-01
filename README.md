@@ -309,6 +309,8 @@ Use `model_type="explicit_feature_forest"` to fit CausalForestDML from extracted
 
 Use `model_type="agentic_explicit_feature_forest"` to let an LLM propose additional pre-treatment explicit variables after an initial explicit-feature forest fit. The agentic path uses nested CV: inner folds decide add/remove/re-role actions, and outer folds report the performance of the whole adaptive search process.
 
+For each proposed add/re-role candidate, the agentic path now records train-fold role diagnostics before inner-CV acceptance. It fits treatment and outcome regressions adjusted for the current confounder-role features, then fits an outcome model with treatment-by-candidate interactions. Candidates with both treatment and outcome association are flagged as likely confounders; candidates with interaction signal are flagged as likely effect modifiers. These diagnostics are advisory feedback to the proposal agent and artifacts; acceptance still uses nested-CV R-loss and nuisance-AUROC guardrails.
+
 For an empty-start agentic search, use the normal repo runner:
 
 ```bash

@@ -20,7 +20,9 @@ from oci.inference.agentic_explicit_feature_forest import (
     OpenAICompatibleFeatureSearchAgent,
     SplitEvaluation,
     apply_proposals,
+    build_iteration_feedback,
     compare_candidate_to_baseline,
+    evaluate_candidate_role_diagnostics,
     run_agentic_explicit_feature_forest,
     validate_agentic_proposals,
 )
@@ -178,6 +180,133 @@ def test_candidate_acceptance_uses_r_loss_and_auc_guardrails():
     assert not compare_candidate_to_baseline(baseline, bad_outcome_candidate, search_config)[
         "passes_acceptance"
     ]
+
+
+def test_candidate_role_diagnostics_detect_confounder_and_modifier_signal():
+    rng = np.random.default_rng(17)
+    n = 400
+    age = rng.normal(65, 8, size=n)
+    biomarker = rng.normal(0, 1, size=n)
+    age_z = (age - age.mean()) / age.std()
+    treatment_prob = 1.0 / (1.0 + np.exp(-(-0.1 + 1.3 * biomarker + 0.25 * age_z)))
+    treatment = rng.binomial(1, treatment_prob)
+    outcome_prob = 1.0 / (
+        1.0
+        + np.exp(
+            -(
+                -0.8
+                + 0.75 * biomarker
+                + 0.25 * age_z
+                + 0.15 * treatment
+                + 1.4 * treatment * biomarker
+            )
+        )
+    )
+    outcome = rng.binomial(1, outcome_prob)
+    df = pd.DataFrame(
+        {
+            "clinical_text": [f"Patient {i}" for i in range(n)],
+            "treatment_indicator": treatment,
+            "outcome_indicator": outcome,
+            "explicit_feat_age": age,
+            "explicit_feat_age_missing": False,
+            "explicit_feat_baseline_biomarker": biomarker,
+            "explicit_feat_baseline_biomarker_missing": False,
+        }
+    )
+    current_specs = [
+        ExplicitFeatureSpec(
+            name="age",
+            type="continuous",
+            roles=["confounder"],
+            description="Age at baseline",
+        )
+    ]
+    candidate_specs = [
+        ExplicitFeatureSpec(
+            name="baseline_biomarker",
+            type="continuous",
+            roles=["confounder"],
+            description="Baseline biomarker value",
+        )
+    ]
+
+    diagnostics = evaluate_candidate_role_diagnostics(
+        dataset=df,
+        current_specs=current_specs,
+        candidate_specs=candidate_specs,
+        config=AppliedInferenceConfig(outcome_type="binary"),
+        search_config=AgenticFeatureSearchConfig(
+            role_diagnostic_score_delta_threshold=1e-4,
+            role_diagnostic_min_n=20,
+            role_diagnostic_min_non_missing=20,
+        ),
+    )
+
+    assert len(diagnostics) == 1
+    diagnostic = diagnostics[0]
+    assert diagnostic["status"] == "ok"
+    assert diagnostic["confounder_signal"]
+    assert diagnostic["effect_modifier_signal"]
+    assert diagnostic["recommended_roles"] == ["confounder", "effect_modifier"]
+    assert diagnostic["treatment_association"]["score_delta"] > 0
+    assert diagnostic["outcome_association"]["score_delta"] > 0
+    assert diagnostic["treatment_interaction"]["score_delta"] > 0
+
+
+def test_iteration_feedback_includes_role_diagnostics():
+    recent_decisions = [
+        {
+            "outer_fold": 1,
+            "iteration": 1,
+            "event": "candidate_evaluations",
+            "payload": [
+                {
+                    "candidate_id": "baseline_biomarker",
+                    "proposals": [
+                        {
+                            "action": "add",
+                            "name": "baseline_biomarker",
+                            "type": "continuous",
+                            "roles": ["confounder"],
+                            "description": "Baseline biomarker value",
+                        }
+                    ],
+                    "summary": {
+                        "role_diagnostics": [
+                            {
+                                "name": "baseline_biomarker",
+                                "status": "ok",
+                                "proposed_roles": ["confounder"],
+                                "recommended_roles": ["confounder", "effect_modifier"],
+                                "confounder_signal": True,
+                                "effect_modifier_signal": True,
+                                "treatment_association": {"score_delta": 0.02},
+                                "outcome_association": {"score_delta": 0.03},
+                                "treatment_interaction": {"score_delta": 0.04},
+                            }
+                        ]
+                    },
+                    "comparison": {
+                        "passes_acceptance": False,
+                        "r_loss_improvement": 0.0,
+                        "outcome_auroc_delta": 0.0,
+                        "treatment_auroc_delta": 0.0,
+                        "improved_fold_fraction": 0.0,
+                    },
+                    "accepted": False,
+                }
+            ],
+        }
+    ]
+
+    feedback = build_iteration_feedback(recent_decisions, AgenticFeatureSearchConfig())
+
+    assert feedback[0]["role_diagnostics"][0]["recommended_roles"] == [
+        "confounder",
+        "effect_modifier",
+    ]
+    assert feedback[0]["role_diagnostics"][0]["interaction_score_delta"] == 0.04
 
 
 def test_extraction_cache_hash_includes_description_and_prompt_settings():

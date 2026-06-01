@@ -15,7 +15,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.metrics import roc_auc_score
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.metrics import log_loss, r2_score, roc_auc_score
 from sklearn.model_selection import KFold, StratifiedKFold
 
 from ..config import (
@@ -375,19 +376,33 @@ class AgenticFeatureSearchRunner:
                     self.dataset,
                     candidate_specs,
                 )
+                role_diagnostics = evaluate_candidate_role_diagnostics(
+                    dataset=self.dataset.iloc[outer_train_idx],
+                    current_specs=current_specs,
+                    candidate_specs=_candidate_role_diagnostic_specs(
+                        current_specs=current_specs,
+                        candidate_specs=candidate_specs,
+                        proposal_group=proposal_group,
+                    ),
+                    config=self.config,
+                    search_config=self.search_config,
+                )
                 coverage_failures = _coverage_failures(
                     self.dataset.iloc[outer_train_idx],
                     candidate_specs,
                     self.search_config.min_feature_coverage,
                 )
                 if coverage_failures:
+                    summary = {"coverage_failures": coverage_failures}
+                    if role_diagnostics:
+                        summary["role_diagnostics"] = role_diagnostics
                     candidate_results.append(
                         {
                             "candidate_id": candidate_id,
                             "proposal_group": proposal_group,
                             "specs": candidate_specs,
                             "rows": [],
-                            "summary": {"coverage_failures": coverage_failures},
+                            "summary": summary,
                             "comparison": {
                                 "passes_acceptance": False,
                                 "rejection_reason": "low_feature_coverage",
@@ -403,6 +418,9 @@ class AgenticFeatureSearchRunner:
                     train_idx=outer_train_idx,
                     specs=candidate_specs,
                 )
+                if role_diagnostics:
+                    summary = dict(summary)
+                    summary["role_diagnostics"] = role_diagnostics
                 comparison = compare_candidate_to_baseline(
                     baseline_rows=baseline_rows,
                     candidate_rows=rows,
@@ -906,6 +924,7 @@ Propose only pre-treatment patient, tumor, disease, lab, biomarker, or baseline 
 Do not propose post-treatment outcomes, treatment response, survival, toxicity after treatment, future imaging response, or variables that are descendants of treatment.
 Baseline demographics and disease descriptors are allowed when measured at or before treatment, including age, sex, race/ethnicity, smoking history, ECOG/performance status, comorbidities, histology, stage, tumor burden/size, metastatic sites, baseline labs, molecular markers, and PD-L1 expression. Do not mark those baseline variables as leaky merely because they are broadly prognostic or may modify treatment response.
 For age-like variables, define the target as age in years at baseline, diagnosis, presentation, or treatment initiation.
+Candidate feedback may include role_diagnostics from train-fold regressions adjusted for current confounders. Treat a candidate with both treatment and outcome association as a likely confounder. Treat a candidate with treatment-by-candidate interaction evidence in the outcome model as a likely effect modifier. Use those diagnostics to revise roles or extraction targets when a prior candidate was rejected.
 
 Return JSON only with this shape:
 {{
@@ -1262,6 +1281,294 @@ def compare_candidate_to_baseline(
     }
 
 
+def evaluate_candidate_role_diagnostics(
+    dataset: pd.DataFrame,
+    current_specs: List[ExplicitFeatureSpec],
+    candidate_specs: List[ExplicitFeatureSpec],
+    config: AppliedInferenceConfig,
+    search_config: AgenticFeatureSearchConfig,
+) -> List[Dict[str, Any]]:
+    """Evaluate proposed feature roles using train-fold regressions.
+
+    For each candidate feature, regress treatment and outcome on the current
+    confounder-role features plus the candidate main effect. Then regress
+    outcome on the same terms plus treatment-by-candidate interactions. These
+    diagnostics are advisory and train-only; nested CV still decides acceptance.
+    """
+    if not getattr(search_config, "role_diagnostics_enabled", True):
+        return []
+    if not candidate_specs:
+        return []
+
+    diagnostics = []
+    for candidate_spec in candidate_specs:
+        diagnostics.append(
+            _evaluate_single_candidate_role_diagnostic(
+                dataset=dataset,
+                current_specs=current_specs,
+                candidate_spec=candidate_spec,
+                config=config,
+                search_config=search_config,
+            )
+        )
+    return diagnostics
+
+
+def _evaluate_single_candidate_role_diagnostic(
+    dataset: pd.DataFrame,
+    current_specs: List[ExplicitFeatureSpec],
+    candidate_spec: ExplicitFeatureSpec,
+    config: AppliedInferenceConfig,
+    search_config: AgenticFeatureSearchConfig,
+) -> Dict[str, Any]:
+    df = dataset.reset_index(drop=True)
+    coverage = _feature_coverage(df, candidate_spec.name)
+    non_missing_n = int(round(coverage * len(df)))
+    base_payload = {
+        "name": candidate_spec.name,
+        "proposed_roles": list(candidate_spec.roles),
+        "type": candidate_spec.type,
+        "n": int(len(df)),
+        "coverage": float(coverage),
+        "non_missing_n": non_missing_n,
+        "adjustment": "current_confounders",
+    }
+
+    min_n = int(getattr(search_config, "role_diagnostic_min_n", 20))
+    min_non_missing = int(getattr(search_config, "role_diagnostic_min_non_missing", 10))
+    if len(df) < min_n:
+        return {
+            **base_payload,
+            "status": "insufficient_sample",
+            "recommended_roles": [],
+        }
+    if non_missing_n < min_non_missing:
+        return {
+            **base_payload,
+            "status": "insufficient_non_missing",
+            "recommended_roles": [],
+        }
+
+    current_confounders = [
+        spec
+        for spec in current_specs
+        if spec.name != candidate_spec.name and "confounder" in spec.roles
+    ]
+    _, w_matrix, _, w_names, _, _ = _build_features(df, current_confounders)
+    z_spec = ExplicitFeatureSpec(
+        name=candidate_spec.name,
+        type=candidate_spec.type,
+        categories=candidate_spec.categories,
+        description=candidate_spec.description,
+        roles=["confounder"],
+    )
+    _, z_matrix, _, z_names, _, _ = _build_features(df, [z_spec])
+
+    n_rows = len(df)
+    w_matrix = _feature_matrix_or_empty(w_matrix, n_rows)
+    z_matrix = _feature_matrix_or_empty(z_matrix, n_rows)
+    if z_matrix.shape[1] == 0 or not _has_any_variation(z_matrix):
+        return {
+            **base_payload,
+            "status": "constant_candidate",
+            "covariate_feature_names": w_names,
+            "candidate_feature_names": z_names,
+            "recommended_roles": [],
+        }
+
+    treatment = np.asarray(df[config.treatment_column].values).flatten()
+    outcome = np.asarray(df[config.outcome_column].values).flatten()
+    treatment_col = treatment.astype(float).reshape(-1, 1)
+
+    treatment_diag = _nested_regression_diagnostic(
+        base_x=w_matrix,
+        full_x=np.hstack([w_matrix, z_matrix]),
+        target=treatment,
+        target_kind="binary",
+        block_start=w_matrix.shape[1],
+        block_width=z_matrix.shape[1],
+    )
+
+    outcome_base_x = np.hstack([w_matrix, treatment_col])
+    outcome_main_x = np.hstack([outcome_base_x, z_matrix])
+    outcome_diag = _nested_regression_diagnostic(
+        base_x=outcome_base_x,
+        full_x=outcome_main_x,
+        target=outcome,
+        target_kind=config.outcome_type,
+        block_start=outcome_base_x.shape[1],
+        block_width=z_matrix.shape[1],
+    )
+
+    interaction_matrix = z_matrix * treatment_col
+    interaction_full_x = np.hstack([outcome_main_x, interaction_matrix])
+    interaction_diag = _nested_regression_diagnostic(
+        base_x=outcome_main_x,
+        full_x=interaction_full_x,
+        target=outcome,
+        target_kind=config.outcome_type,
+        block_start=outcome_main_x.shape[1],
+        block_width=interaction_matrix.shape[1],
+    )
+
+    threshold = float(getattr(search_config, "role_diagnostic_score_delta_threshold", 0.001))
+    treatment_signal = _score_delta_at_least(treatment_diag, threshold)
+    outcome_signal = _score_delta_at_least(outcome_diag, threshold)
+    interaction_signal = _score_delta_at_least(interaction_diag, threshold)
+    recommended_roles = []
+    if treatment_signal and outcome_signal:
+        recommended_roles.append("confounder")
+    if interaction_signal:
+        recommended_roles.append("effect_modifier")
+
+    return {
+        **base_payload,
+        "status": "ok",
+        "covariate_feature_names": w_names,
+        "candidate_feature_names": z_names,
+        "treatment_association": treatment_diag,
+        "outcome_association": outcome_diag,
+        "treatment_interaction": interaction_diag,
+        "confounder_signal": bool(treatment_signal and outcome_signal),
+        "effect_modifier_signal": bool(interaction_signal),
+        "recommended_roles": recommended_roles,
+    }
+
+
+def _nested_regression_diagnostic(
+    base_x: np.ndarray,
+    full_x: np.ndarray,
+    target: np.ndarray,
+    target_kind: str,
+    block_start: int,
+    block_width: int,
+) -> Dict[str, Any]:
+    target_kind = "continuous" if target_kind == "continuous" else "binary"
+    y = np.asarray(target).flatten()
+    base_x = np.asarray(base_x, dtype=np.float64)
+    full_x = np.asarray(full_x, dtype=np.float64)
+    finite = np.isfinite(y.astype(float, copy=False))
+    finite &= np.all(np.isfinite(base_x), axis=1)
+    finite &= np.all(np.isfinite(full_x), axis=1)
+    if finite.sum() < 2:
+        return {"status": "insufficient_finite_target", "target_kind": target_kind}
+
+    base_x = base_x[finite]
+    full_x = full_x[finite]
+    y = y[finite]
+
+    if target_kind == "binary":
+        unique = np.unique(y)
+        if len(unique) < 2:
+            return {"status": "constant_target", "target_kind": target_kind}
+        y_model = (y == unique[-1]).astype(int)
+        base_pred, base_score, base_auroc, _ = _fit_binary_regression(base_x, y_model)
+        full_pred, full_score, full_auroc, full_coef = _fit_binary_regression(full_x, y_model)
+        del base_pred, full_pred
+        result = {
+            "status": "ok",
+            "target_kind": target_kind,
+            "score_metric": "neg_log_loss",
+            "base_score": base_score,
+            "full_score": full_score,
+            "score_delta": _safe_subtract(full_score, base_score),
+            "base_auroc": base_auroc,
+            "full_auroc": full_auroc,
+            "auroc_delta": _safe_subtract(full_auroc, base_auroc),
+        }
+    else:
+        y_model = y.astype(float)
+        if np.std(y_model) == 0:
+            return {"status": "constant_target", "target_kind": target_kind}
+        base_pred, base_score, _ = _fit_continuous_regression(base_x, y_model)
+        full_pred, full_score, full_coef = _fit_continuous_regression(full_x, y_model)
+        del base_pred, full_pred
+        result = {
+            "status": "ok",
+            "target_kind": target_kind,
+            "score_metric": "r2",
+            "base_score": base_score,
+            "full_score": full_score,
+            "score_delta": _safe_subtract(full_score, base_score),
+        }
+
+    block_coef = np.asarray(full_coef[block_start : block_start + block_width], dtype=float)
+    result["coefficient_l2_norm"] = float(np.linalg.norm(block_coef))
+    result["n_model_rows"] = int(len(y))
+    return result
+
+
+def _fit_binary_regression(
+    x: np.ndarray,
+    y: np.ndarray,
+) -> Tuple[np.ndarray, float, Optional[float], np.ndarray]:
+    x = _ensure_regression_columns(x)
+    model = LogisticRegression(max_iter=1000, solver="lbfgs")
+    model.fit(x, y)
+    pred = model.predict_proba(x)[:, 1]
+    clipped = np.clip(pred, 1e-6, 1.0 - 1e-6)
+    score = -float(log_loss(y, clipped, labels=[0, 1]))
+    return pred, score, _safe_roc_auc(y, pred), model.coef_.reshape(-1)
+
+
+def _fit_continuous_regression(
+    x: np.ndarray,
+    y: np.ndarray,
+) -> Tuple[np.ndarray, float, np.ndarray]:
+    x = _ensure_regression_columns(x)
+    model = Ridge(alpha=1.0)
+    model.fit(x, y)
+    pred = model.predict(x)
+    return pred, float(r2_score(y, pred)), np.asarray(model.coef_).reshape(-1)
+
+
+def _ensure_regression_columns(x: np.ndarray) -> np.ndarray:
+    if x.shape[1] == 0:
+        return np.zeros((x.shape[0], 1), dtype=np.float64)
+    return x
+
+
+def _feature_matrix_or_empty(
+    matrix: Optional[np.ndarray],
+    n_rows: int,
+) -> np.ndarray:
+    if matrix is None:
+        return np.zeros((n_rows, 0), dtype=np.float32)
+    return np.asarray(matrix, dtype=np.float32)
+
+
+def _has_any_variation(matrix: np.ndarray) -> bool:
+    if matrix.shape[1] == 0:
+        return False
+    return bool(np.any(np.nanstd(matrix, axis=0) > 1e-12))
+
+
+def _score_delta_at_least(diagnostic: Dict[str, Any], threshold: float) -> bool:
+    delta = diagnostic.get("score_delta")
+    return _is_number(delta) and float(delta) >= threshold
+
+
+def _safe_subtract(left: Any, right: Any) -> Optional[float]:
+    if left is None or right is None:
+        return None
+    if not (_is_number(left) and _is_number(right)):
+        return None
+    return float(left) - float(right)
+
+
+def _feature_coverage(dataset: pd.DataFrame, name: str) -> float:
+    value_col = f"explicit_feat_{name}"
+    missing_col = f"{value_col}_missing"
+    if value_col not in dataset.columns:
+        return 0.0
+    missing = (
+        dataset[missing_col].astype(bool)
+        if missing_col in dataset.columns
+        else dataset[value_col].isna()
+    )
+    return float(1.0 - missing.mean())
+
+
 def build_iteration_feedback(
     recent_decisions: List[Dict[str, Any]],
     search_config: AgenticFeatureSearchConfig,
@@ -1312,6 +1619,9 @@ def build_iteration_feedback(
                     ],
                     "metrics": _candidate_feedback_metrics(comparison),
                 }
+                role_diagnostics = _candidate_feedback_role_diagnostics(item.get("summary"))
+                if role_diagnostics:
+                    entry["role_diagnostics"] = role_diagnostics
                 if accepted:
                     entry["instruction"] = (
                         "This candidate became the current baseline; build on it "
@@ -1377,6 +1687,46 @@ def _candidate_feedback_metrics(comparison: Any) -> Dict[str, Any]:
         for key in keys
         if key in comparison
     }
+
+
+def _candidate_feedback_role_diagnostics(summary: Any) -> List[Dict[str, Any]]:
+    if not isinstance(summary, dict):
+        return []
+    diagnostics = summary.get("role_diagnostics")
+    if not isinstance(diagnostics, list):
+        return []
+    compact = []
+    for diagnostic in diagnostics:
+        if not isinstance(diagnostic, dict):
+            continue
+        entry = {
+            key: diagnostic.get(key)
+            for key in [
+                "name",
+                "status",
+                "proposed_roles",
+                "recommended_roles",
+                "confounder_signal",
+                "effect_modifier_signal",
+                "coverage",
+                "non_missing_n",
+            ]
+            if diagnostic.get(key) is not None
+        }
+        treatment = diagnostic.get("treatment_association", {})
+        outcome = diagnostic.get("outcome_association", {})
+        interaction = diagnostic.get("treatment_interaction", {})
+        if isinstance(treatment, dict):
+            entry["treatment_score_delta"] = treatment.get("score_delta")
+            entry["treatment_auroc_delta"] = treatment.get("auroc_delta")
+        if isinstance(outcome, dict):
+            entry["outcome_score_delta"] = outcome.get("score_delta")
+            entry["outcome_auroc_delta"] = outcome.get("auroc_delta")
+        if isinstance(interaction, dict):
+            entry["interaction_score_delta"] = interaction.get("score_delta")
+            entry["interaction_auroc_delta"] = interaction.get("auroc_delta")
+        compact.append({key: value for key, value in entry.items() if value is not None})
+    return compact
 
 
 def _candidate_failed_checks(
@@ -1654,6 +2004,27 @@ def _candidate_groups(
         if len(bundled) > 1:
             groups.append(("bundle", bundled))
     return groups
+
+
+def _candidate_role_diagnostic_specs(
+    current_specs: List[ExplicitFeatureSpec],
+    candidate_specs: List[ExplicitFeatureSpec],
+    proposal_group: Sequence[AgenticFeatureProposal],
+) -> List[ExplicitFeatureSpec]:
+    current_by_name = {spec.name: spec for spec in current_specs}
+    candidate_by_name = {spec.name: spec for spec in candidate_specs}
+    diagnostic_specs = []
+    seen = set()
+    for proposal in proposal_group:
+        if proposal.action not in {"add", "update_role"}:
+            continue
+        if proposal.name in seen:
+            continue
+        spec = candidate_by_name.get(proposal.name) or current_by_name.get(proposal.name)
+        if spec is not None:
+            diagnostic_specs.append(spec)
+            seen.add(proposal.name)
+    return diagnostic_specs
 
 
 def _choose_accepted_candidate(candidate_results: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
