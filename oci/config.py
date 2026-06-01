@@ -311,6 +311,7 @@ class AgenticFeatureSearchConfig:
     agent_api_key: str = "EMPTY"
     agent_temperature: float = 0.0
     agent_max_tokens: int = 2048
+    agent_schema_repair_attempts: int = 1
 
     # Prompt/context controls. Clinical text examples are sent to the proposal
     # agent to ground variable suggestions, but are not written to artifacts by
@@ -348,6 +349,10 @@ class AgenticFeatureSearchConfig:
         if self.clinical_text_example_chars < 0:
             raise ValueError(
                 "agentic_feature_search.clinical_text_example_chars must be >= 0"
+            )
+        if self.agent_schema_repair_attempts < 0:
+            raise ValueError(
+                "agentic_feature_search.agent_schema_repair_attempts must be >= 0"
             )
 
 

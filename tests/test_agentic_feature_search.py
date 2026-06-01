@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -16,6 +17,7 @@ from oci.config import (
 from oci.extraction.cache import _compute_config_hash
 from oci.inference.agentic_explicit_feature_forest import (
     AgenticFeatureProposal,
+    OpenAICompatibleFeatureSearchAgent,
     SplitEvaluation,
     apply_proposals,
     compare_candidate_to_baseline,
@@ -205,6 +207,112 @@ def test_extraction_cache_hash_includes_description_and_prompt_settings():
 
     assert _compute_config_hash(base) != desc_hash
     assert _compute_config_hash(base) != prompt_hash
+
+
+class FakeOpenAICompletions:
+    def __init__(self, contents):
+        self.contents = list(contents)
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        content = self.contents.pop(0)
+        message = SimpleNamespace(content=content)
+        choice = SimpleNamespace(message=message, finish_reason="stop")
+        return SimpleNamespace(
+            choices=[choice],
+            model="fake-agent",
+            id=f"response-{len(self.calls)}",
+            created=0,
+            usage=None,
+        )
+
+
+class FakeOpenAIClient:
+    def __init__(self, contents):
+        self.completions = FakeOpenAICompletions(contents)
+        self.chat = SimpleNamespace(completions=self.completions)
+
+
+def test_openai_agent_repairs_missing_required_proposal_fields():
+    client = FakeOpenAIClient(
+        [
+            json.dumps(
+                {
+                    "proposals": [
+                        {
+                            "action": "add",
+                            "name": "baseline_age",
+                            "type": "continuous",
+                            "description": "Age in years at treatment initiation",
+                        }
+                    ]
+                }
+            ),
+            json.dumps(
+                {
+                    "proposals": [
+                        {
+                            "action": "add",
+                            "name": "baseline_age",
+                            "type": "continuous",
+                            "roles": ["confounder"],
+                            "description": "Age in years at treatment initiation",
+                            "rationale": "Age may affect treatment selection",
+                            "expected_signal": "treatment",
+                            "leakage_risk": "low",
+                        }
+                    ]
+                }
+            ),
+        ]
+    )
+    agent = OpenAICompatibleFeatureSearchAgent(
+        AgenticFeatureSearchConfig(agent_schema_repair_attempts=1)
+    )
+    agent._client = client
+
+    proposals = agent.propose({"current_features": [], "iteration_feedback": []})
+
+    assert proposals[0]["roles"] == ["confounder"]
+    assert len(client.completions.calls) == 2
+    repair_message = client.completions.calls[1]["messages"][-1]["content"]
+    assert "baseline_age" in repair_message
+    assert "missing roles" in repair_message
+    assert len(agent.last_response_trace["repair_attempts"]) == 2
+
+
+def test_openai_agent_repairs_malformed_json_response():
+    client = FakeOpenAIClient(
+        [
+            "not valid json",
+            json.dumps(
+                {
+                    "proposals": [
+                        {
+                            "action": "add",
+                            "name": "baseline_albumin",
+                            "type": "continuous",
+                            "roles": ["confounder"],
+                            "description": "Baseline serum albumin before treatment",
+                            "leakage_risk": "low",
+                        }
+                    ]
+                }
+            ),
+        ]
+    )
+    agent = OpenAICompatibleFeatureSearchAgent(
+        AgenticFeatureSearchConfig(agent_schema_repair_attempts=1)
+    )
+    agent._client = client
+
+    proposals = agent.propose({"current_features": [], "iteration_feedback": []})
+
+    assert proposals[0]["name"] == "baseline_albumin"
+    assert len(client.completions.calls) == 2
+    repair_message = client.completions.calls[1]["messages"][-1]["content"]
+    assert "malformed JSON" in repair_message
 
 
 class FakeAgent:

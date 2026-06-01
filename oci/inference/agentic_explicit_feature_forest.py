@@ -627,23 +627,71 @@ class OpenAICompatibleFeatureSearchAgent:
         self.last_raw_response = None
         self.last_response_trace = None
         prompt = build_agent_prompt(context, self.search_config)
-        response = self._client.chat.completions.create(
-            model=self.search_config.agent_model_name,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=self.search_config.agent_temperature,
-            max_tokens=self.search_config.agent_max_tokens,
+        messages = [{"role": "user", "content": prompt}]
+        attempts: List[Dict[str, Any]] = []
+        max_repair_attempts = max(
+            0,
+            int(getattr(self.search_config, "agent_schema_repair_attempts", 1)),
         )
-        choice = response.choices[0]
-        message = choice.message
-        content = message.content or ""
-        self.last_raw_response = content
-        self.last_response_trace = _chat_completion_trace(
-            response=response,
-            choice=choice,
-            message=message,
-            content=content,
-        )
-        return parse_agent_response(content)
+
+        for attempt_idx in range(max_repair_attempts + 1):
+            response = self._client.chat.completions.create(
+                model=self.search_config.agent_model_name,
+                messages=messages,
+                temperature=self.search_config.agent_temperature,
+                max_tokens=self.search_config.agent_max_tokens,
+            )
+            choice = response.choices[0]
+            message = choice.message
+            content = message.content or ""
+            self.last_raw_response = content
+            trace = _chat_completion_trace(
+                response=response,
+                choice=choice,
+                message=message,
+                content=content,
+            )
+            attempts.append(trace)
+            self.last_response_trace = _trace_with_repair_attempts(trace, attempts)
+
+            try:
+                proposals = parse_agent_response(content)
+            except Exception as exc:
+                issues = [f"malformed JSON: {exc}"]
+                if attempt_idx < max_repair_attempts:
+                    messages.extend(
+                        [
+                            {"role": "assistant", "content": content},
+                            {"role": "user", "content": build_agent_repair_prompt(issues)},
+                        ]
+                    )
+                    continue
+                raise ValueError(
+                    "Agent response could not be parsed after "
+                    f"{attempt_idx + 1} attempt(s): {issues[0]}"
+                ) from exc
+
+            issues = agent_response_schema_issues(proposals)
+            if not issues:
+                return proposals
+
+            if attempt_idx < max_repair_attempts:
+                messages.extend(
+                    [
+                        {"role": "assistant", "content": content},
+                        {"role": "user", "content": build_agent_repair_prompt(issues)},
+                    ]
+                )
+                continue
+
+            logger.warning(
+                "Agent proposal response still has schema issues after %s attempt(s): %s",
+                attempt_idx + 1,
+                "; ".join(issues),
+            )
+            return proposals
+
+        return []
 
 
 class VLLMExplicitFeatureExtractionProvider:
@@ -890,6 +938,113 @@ Current nested-CV context:
 """
 
 
+def build_agent_repair_prompt(issues: Sequence[str]) -> str:
+    """Construct a follow-up prompt asking the agent to repair proposal JSON."""
+    issue_lines = "\n".join(f"- {issue}" for issue in issues)
+    return f"""The previous response could not be used because it failed these schema checks:
+{issue_lines}
+
+Return corrected JSON only. Use this exact top-level shape:
+{{
+  "proposals": [
+    {{
+      "action": "add|remove|update_role|none",
+      "name": "snake_case_variable_name",
+      "type": "categorical|continuous",
+      "categories": ["category_a", "category_b"],
+      "roles": ["confounder", "effect_modifier"],
+      "description": "exact extraction target using pre-treatment information only",
+      "rationale": "why this may help",
+      "expected_signal": "treatment, outcome, or tau signal expected",
+      "leakage_risk": "low|medium|high"
+    }}
+  ]
+}}
+
+Repair the same candidate concepts when possible. Do not add prose, markdown,
+comments, or code fences. For every add proposal, include a non-empty roles
+array containing only "confounder" and/or "effect_modifier".
+"""
+
+
+def agent_response_schema_issues(proposals: Sequence[Any]) -> List[str]:
+    """Return schema-level issues that are worth asking the LLM to repair."""
+    issues: List[str] = []
+    for idx, raw in enumerate(proposals, start=1):
+        if not isinstance(raw, dict):
+            issues.append(f"proposal {idx}: expected an object, got {type(raw).__name__}")
+            continue
+
+        label = _proposal_schema_label(idx, raw)
+        action_raw = raw.get("action")
+        action = str(action_raw).strip().lower() if action_raw is not None else ""
+        if not action:
+            issues.append(f"{label}: missing action")
+            continue
+        if action not in VALID_ACTIONS:
+            issues.append(
+                f"{label}: invalid action {action_raw!r}; expected one of {sorted(VALID_ACTIONS)}"
+            )
+            continue
+        if action == "none":
+            continue
+
+        if _missing_or_empty(raw.get("name")):
+            issues.append(f"{label}: missing name")
+
+        if action == "add":
+            proposal_type = raw.get("type")
+            if _missing_or_empty(proposal_type):
+                issues.append(f"{label}: missing type")
+            elif proposal_type not in VALID_TYPES:
+                issues.append(
+                    f"{label}: invalid type {proposal_type!r}; expected one of {sorted(VALID_TYPES)}"
+                )
+
+            roles_issue = _roles_schema_issue(raw.get("roles"))
+            if roles_issue is not None:
+                issues.append(f"{label}: {roles_issue}")
+
+            if proposal_type == "categorical" and not raw.get("categories"):
+                issues.append(f"{label}: missing categories for categorical proposal")
+            if _missing_or_empty(raw.get("description")):
+                issues.append(f"{label}: missing description")
+        elif action == "update_role":
+            roles_issue = _roles_schema_issue(raw.get("roles"))
+            if roles_issue is not None:
+                issues.append(f"{label}: {roles_issue}")
+
+    return issues
+
+
+def _roles_schema_issue(roles: Any) -> Optional[str]:
+    if roles is None or roles == []:
+        return "missing roles"
+    role_values = [roles] if isinstance(roles, str) else roles
+    if not isinstance(role_values, list):
+        return "roles must be a string or list"
+    normalized = [str(role).strip() for role in role_values if str(role).strip()]
+    if not normalized:
+        return "missing roles"
+    invalid = sorted(set(normalized) - VALID_ROLES)
+    if invalid:
+        return f"invalid roles {invalid}; expected one or both of {sorted(VALID_ROLES)}"
+    return None
+
+
+def _proposal_schema_label(idx: int, raw: Dict[str, Any]) -> str:
+    name = raw.get("name")
+    if _missing_or_empty(name):
+        return f"proposal {idx}"
+    return f"proposal {idx} ({name})"
+
+
+def _missing_or_empty(value: Any) -> bool:
+    if value is None:
+        return True
+    return isinstance(value, str) and not value.strip()
+
+
 def parse_agent_response(response: str) -> List[Dict[str, Any]]:
     """Parse JSON proposals from an LLM response."""
     response = response.strip()
@@ -921,6 +1076,17 @@ def _chat_completion_trace(
         "usage": _to_jsonable(getattr(response, "usage", None)),
     }
     return {key: value for key, value in trace.items() if value is not None}
+
+
+def _trace_with_repair_attempts(
+    trace: Dict[str, Any],
+    attempts: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if len(attempts) <= 1:
+        return trace
+    enriched = dict(trace)
+    enriched["repair_attempts"] = list(attempts)
+    return enriched
 
 
 def _message_field(message: Any, key: str) -> Any:
