@@ -184,6 +184,7 @@ class ExperimentConfig:
     agentic_agent_context_chars: int = 4800
     agentic_agent_context_examples: int = 3
     agentic_save_agent_context: bool = False
+    agentic_save_agent_raw_output: bool = False
     agentic_vllm_server_url: Optional[str] = None
     agentic_vllm_model_name: str = "Qwen/Qwen2.5-7B-Instruct"
     agentic_vllm_mode: str = "server"
@@ -1753,6 +1754,7 @@ def run_agentic_experiment(
                 clinical_text_examples_per_prompt=agent_context_examples,
                 clinical_text_example_chars=agent_example_chars,
                 save_agent_context=config.agentic_save_agent_context,
+                save_agent_raw_output=config.agentic_save_agent_raw_output,
                 random_state=42 + config.repeat_index,
                 stop_after_rejected_iteration=config.agentic_stop_after_rejected_iteration,
             ),
@@ -1953,6 +1955,7 @@ def generate_experiment_grid(
     agentic_agent_context_chars: int = 4800,
     agentic_agent_context_examples: int = 3,
     agentic_save_agent_context: bool = False,
+    agentic_save_agent_raw_output: bool = False,
     agentic_vllm_server_url: Optional[str] = None,
     agentic_vllm_model_name: str = "Qwen/Qwen2.5-7B-Instruct",
     agentic_vllm_mode: str = "server",
@@ -2214,6 +2217,7 @@ def generate_experiment_grid(
                     agentic_agent_context_chars=agentic_agent_context_chars,
                     agentic_agent_context_examples=agentic_agent_context_examples,
                     agentic_save_agent_context=agentic_save_agent_context,
+                    agentic_save_agent_raw_output=agentic_save_agent_raw_output,
                     agentic_vllm_server_url=agentic_vllm_server_url,
                     agentic_vllm_model_name=agentic_vllm_model_name,
                     agentic_vllm_mode=agentic_vllm_mode,
@@ -2769,6 +2773,14 @@ def main():
         help="Persist full agent prompt context in artifacts. May include clinical text."
     )
     parser.add_argument(
+        "--agentic-save-agent-raw-output",
+        action="store_true",
+        help=(
+            "Persist exact feature-proposal agent completion text and provider "
+            "trace in agent_decisions.jsonl. May include reasoning or quoted prompt text."
+        )
+    )
+    parser.add_argument(
         "--agentic-vllm-server-url",
         type=str,
         default=None,
@@ -2901,6 +2913,7 @@ def main():
         agentic_agent_context_chars=args.agentic_agent_context_chars,
         agentic_agent_context_examples=args.agentic_agent_context_examples,
         agentic_save_agent_context=args.agentic_save_agent_context,
+        agentic_save_agent_raw_output=args.agentic_save_agent_raw_output,
         agentic_vllm_server_url=args.agentic_vllm_server_url,
         agentic_vllm_model_name=args.agentic_vllm_model_name,
         agentic_vllm_mode=args.agentic_vllm_mode,
@@ -3022,6 +3035,7 @@ def main():
         )
         agent_max_tokens = sorted(set(c.agentic_agent_max_tokens for c in agentic_pending))
         agent_context_chars = sorted(set(c.agentic_agent_context_chars for c in agentic_pending))
+        raw_output_flags = sorted(set(c.agentic_save_agent_raw_output for c in agentic_pending))
         vllm_modes = sorted(set(c.agentic_vllm_mode for c in agentic_pending))
         print(f"Agentic iterations: {', '.join(str(v) for v in agentic_iters)}")
         print(f"Agentic initial counts: {', '.join(str(v) for v in initial_counts)}")
@@ -3032,6 +3046,7 @@ def main():
         )
         print(f"Agentic agent max tokens: {', '.join(str(v) for v in agent_max_tokens)}")
         print(f"Agentic agent context chars: {', '.join(str(v) for v in agent_context_chars)}")
+        print(f"Agentic save raw output: {', '.join(str(v) for v in raw_output_flags)}")
         print(f"Agentic vLLM modes: {', '.join(vllm_modes)}")
     print(f"Repeats:     {args.n_repeats}")
     print(f"{'='*60}")
@@ -3274,6 +3289,7 @@ def main():
                       'agentic_agent_model_name',
                       'agentic_agent_max_tokens',
                       'agentic_agent_context_chars',
+                      'agentic_save_agent_raw_output',
                       'agentic_vllm_model_name',
                       'agentic_vllm_mode',
                       'agentic_vllm_download_dir',

@@ -343,6 +343,7 @@ class AgenticFeatureSearchRunner:
                 "valid_count": None,
                 "rejected": None,
                 "context": context,
+                "raw_proposals": raw_proposals,
             }
             if self.search_config.save_agent_raw_output:
                 proposal_payload["agent_raw_output"] = _get_agent_response_trace(
@@ -376,20 +377,21 @@ class AgenticFeatureSearchRunner:
                     self.dataset,
                     candidate_specs,
                 )
+                proposal_specs = _candidate_proposal_specs(
+                    current_specs=current_specs,
+                    candidate_specs=candidate_specs,
+                    proposal_group=proposal_group,
+                )
                 role_diagnostics = evaluate_candidate_role_diagnostics(
                     dataset=self.dataset.iloc[outer_train_idx],
                     current_specs=current_specs,
-                    candidate_specs=_candidate_role_diagnostic_specs(
-                        current_specs=current_specs,
-                        candidate_specs=candidate_specs,
-                        proposal_group=proposal_group,
-                    ),
+                    candidate_specs=proposal_specs,
                     config=self.config,
                     search_config=self.search_config,
                 )
                 coverage_failures = _coverage_failures(
                     self.dataset.iloc[outer_train_idx],
-                    candidate_specs,
+                    proposal_specs,
                     self.search_config.min_feature_coverage,
                 )
                 if coverage_failures:
@@ -2006,14 +2008,15 @@ def _candidate_groups(
     return groups
 
 
-def _candidate_role_diagnostic_specs(
+def _candidate_proposal_specs(
     current_specs: List[ExplicitFeatureSpec],
     candidate_specs: List[ExplicitFeatureSpec],
     proposal_group: Sequence[AgenticFeatureProposal],
 ) -> List[ExplicitFeatureSpec]:
+    """Return add/update specs touched by this proposal group."""
     current_by_name = {spec.name: spec for spec in current_specs}
     candidate_by_name = {spec.name: spec for spec in candidate_specs}
-    diagnostic_specs = []
+    proposal_specs = []
     seen = set()
     for proposal in proposal_group:
         if proposal.action not in {"add", "update_role"}:
@@ -2022,9 +2025,17 @@ def _candidate_role_diagnostic_specs(
             continue
         spec = candidate_by_name.get(proposal.name) or current_by_name.get(proposal.name)
         if spec is not None:
-            diagnostic_specs.append(spec)
+            proposal_specs.append(spec)
             seen.add(proposal.name)
-    return diagnostic_specs
+    return proposal_specs
+
+
+def _candidate_role_diagnostic_specs(
+    current_specs: List[ExplicitFeatureSpec],
+    candidate_specs: List[ExplicitFeatureSpec],
+    proposal_group: Sequence[AgenticFeatureProposal],
+) -> List[ExplicitFeatureSpec]:
+    return _candidate_proposal_specs(current_specs, candidate_specs, proposal_group)
 
 
 def _choose_accepted_candidate(candidate_results: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:

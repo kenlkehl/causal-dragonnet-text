@@ -644,6 +644,94 @@ def test_agentic_runner_accepts_inner_cv_improvement_without_true_ite_leakage(tm
     assert all(context.get("clinical_text_examples") == [] for context in persisted_contexts)
 
 
+def test_agentic_runner_checks_coverage_only_for_proposed_features(tmp_path):
+    df = pd.DataFrame(
+        {
+            "patient_id": np.arange(12),
+            "clinical_text": [f"Patient {i}" for i in range(12)],
+            "treatment_indicator": [0, 1] * 6,
+            "outcome_indicator": [0, 0, 1, 1] * 3,
+            "explicit_feat_baseline_ldh": np.nan,
+            "explicit_feat_baseline_ldh_missing": True,
+        }
+    )
+    agent = FakeAgent()
+    output_path = tmp_path / "predictions.parquet"
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        cv_folds=2,
+        architecture=ModelArchitectureConfig(
+            model_type="agentic_explicit_feature_forest",
+            explicit_feature_forest=ExplicitFeatureForestConfig(
+                n_estimators=8,
+                min_samples_leaf=2,
+                honest=False,
+                inference=False,
+            ),
+            agentic_feature_search=AgenticFeatureSearchConfig(
+                outer_folds=2,
+                inner_folds=2,
+                max_iterations=1,
+                min_feature_coverage=0.70,
+                min_r_loss_improvement=0.01,
+                min_improvement_fold_fraction=1.0,
+            ),
+        ),
+        explicit_features=ExplicitFeatureExtractionConfig(
+            enabled=True,
+            features=[
+                ExplicitFeatureSpec(
+                    name="baseline_ldh",
+                    type="continuous",
+                    roles=["confounder"],
+                    description="Baseline LDH",
+                )
+            ],
+            cache_enabled=False,
+        ),
+    )
+
+    run_agentic_explicit_feature_forest(
+        dataset=df,
+        config=config,
+        output_path=output_path,
+        proposal_agent=agent,
+        extraction_provider=FakeExtractionProvider(),
+        evaluator=FakeEvaluator(),
+    )
+
+    feature_sets = json.loads(
+        (tmp_path / "agentic_feature_search" / "feature_sets.json").read_text()
+    )
+    selected_names = {
+        feature["name"]
+        for row in feature_sets
+        if row["stage"] == "selected"
+        for feature in row["features"]
+    }
+    decision_lines = (
+        tmp_path / "agentic_feature_search" / "agent_decisions.jsonl"
+    ).read_text().splitlines()
+    candidate_payloads = [
+        json.loads(line)["payload"]
+        for line in decision_lines
+        if json.loads(line)["event"] == "candidate_evaluations"
+    ]
+    hidden_comparisons = [
+        item["comparison"]
+        for payload in candidate_payloads
+        for item in payload
+        if item["candidate_id"] == "hidden_modifier"
+    ]
+
+    assert "hidden_modifier" in selected_names
+    assert hidden_comparisons
+    assert all(
+        comparison.get("rejection_reason") != "low_feature_coverage"
+        for comparison in hidden_comparisons
+    )
+
+
 def test_agentic_runner_can_persist_raw_agent_output_when_enabled(tmp_path):
     df = pd.DataFrame(
         {
@@ -701,6 +789,8 @@ def test_agentic_runner_can_persist_raw_agent_output_when_enabled(tmp_path):
 
     assert proposal_payloads
     for payload in proposal_payloads:
+        assert payload["raw_proposals"]
+        assert payload["raw_proposals"][0]["name"] == "hidden_modifier"
         trace = payload["agent_raw_output"]
         assert "I considered baseline variables first." in trace["raw_content"]
         assert trace["reasoning_content"] == (
@@ -825,3 +915,23 @@ def test_experiment_config_parses_agentic_search_config(tmp_path):
                 }
             }
         ).validate()
+
+
+def test_oracle_grid_propagates_agentic_raw_output_flag():
+    from oracle_experiment_scripts.run_oracle_experiments import generate_experiment_grid
+
+    configs = generate_experiment_grid(
+        dataset_paths=[
+            "./synthetic_data/example_synthetic_datasets/one_confounder_one_effect_modifier_nsclc_with_structured/"
+        ],
+        filter_model_types=["agentic_explicit_feature_forest"],
+        filter_extractor_types=["agentic_explicit_features"],
+        agentic_iteration_options=[1],
+        agentic_initial_feature_counts=[0],
+        agentic_initial_feature_strategies=["true_first"],
+        agentic_stop_after_rejected_iteration_options=[True],
+        agentic_save_agent_raw_output=True,
+    )
+
+    assert configs
+    assert all(config.agentic_save_agent_raw_output for config in configs)

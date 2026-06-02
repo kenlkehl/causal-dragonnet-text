@@ -70,6 +70,7 @@ DEFAULT_ARGS: Dict[str, List[str]] = {
     "--agentic-agent-max-tokens": ["50000"],
     "--agentic-agent-context-chars": ["200000"],
     "--agentic-agent-context-examples": ["20"],
+    "--agentic-save-agent-raw-output": [],
     "--agentic-vllm-max-model-len": ["200000"],
     "--agentic-extraction-max-tokens": ["50000"],
     "--agentic-extraction-max-text-length": ["200000"],
