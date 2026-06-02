@@ -6,6 +6,7 @@
 
   "applied_inference": {
     "dataset_path": "./dataset.parquet",
+    "clinical_question": "What is the causal effect of treatment_indicator on outcome_indicator?",
     "text_column": "clinical_text",
     "outcome_column": "outcome_indicator",
     "treatment_column": "treatment_indicator",

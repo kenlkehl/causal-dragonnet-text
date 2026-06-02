@@ -307,7 +307,7 @@ Results are cached to `{dataset_dir}/.oci_cache/` and invalidated automatically 
 
 Use `model_type="explicit_feature_forest"` to fit CausalForestDML from extracted structured features only. In that mode, confounder-role features form `W`, effect-modifier-role features form `X`, and no text encoder is trained.
 
-Use `model_type="agentic_explicit_feature_forest"` to let an LLM propose additional pre-treatment explicit variables after an initial explicit-feature forest fit. The agentic path uses nested CV: inner folds decide add/remove/re-role actions, and outer folds report the performance of the whole adaptive search process.
+Use `model_type="agentic_explicit_feature_forest"` to let an LLM propose additional explicit variables after an initial explicit-feature forest fit. The agentic path uses nested CV: inner folds decide add/remove/re-role actions, and outer folds report the performance of the whole adaptive search process. Set `applied_inference.clinical_question` to the study question; the proposal agent receives that question plus treatment/outcome column metadata in every prompt.
 
 For an empty-start agentic search, use the normal repo runner:
 

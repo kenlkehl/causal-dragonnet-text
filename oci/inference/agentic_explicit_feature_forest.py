@@ -37,94 +37,6 @@ EXTRACTION_PROMPT_VERSION = "explicit_features_v2"
 VALID_ACTIONS = {"add", "remove", "update_role", "none"}
 VALID_ROLES = {"confounder", "effect_modifier"}
 VALID_TYPES = {"categorical", "continuous"}
-POST_TREATMENT_LEAKAGE_TERMS = (
-    "post-treatment",
-    "post treatment",
-    "after treatment",
-    "after therapy",
-    "after systemic therapy",
-    "post therapy",
-    "future imaging",
-    "follow-up imaging",
-)
-OUTCOME_TARGET_TERMS = (
-    "treatment response",
-    "response to",
-    "response category",
-    "objective response",
-    "radiographic response",
-    "complete response",
-    "partial response",
-    "stable disease",
-    "progressive disease",
-    "survival",
-    "progression-free",
-    "progression free",
-    "overall survival",
-    "mortality",
-    "death",
-    "recurrence",
-    "relapse",
-    "toxicity",
-    "adverse event",
-)
-RATIONALE_ONLY_LEAKAGE_TERMS = (
-    "post-treatment",
-    "post treatment",
-    "after treatment",
-    "after therapy",
-    "future imaging",
-    "survival after",
-    "progression after",
-    "toxicity after",
-)
-BASELINE_ALLOWED_TARGET_TERMS = (
-    "age",
-    "sex",
-    "gender",
-    "race",
-    "ethnicity",
-    "smoking",
-    "pack year",
-    "ecog",
-    "performance status",
-    "comorbidity",
-    "histology",
-    "stage",
-    "tumor",
-    "metastasis",
-    "metastatic",
-    "biomarker",
-    "pdl1",
-    "pd l1",
-    "egfr",
-    "alk",
-    "kras",
-    "ros1",
-    "braf",
-    "met",
-    "ret",
-    "ntrk",
-    "lab",
-    "laboratory",
-    "neutrophil",
-    "lymphocyte",
-    "albumin",
-    "hemoglobin",
-    "creatinine",
-    "ldh",
-)
-BASELINE_ANCHOR_TERMS = (
-    "baseline",
-    "pre-treatment",
-    "pre treatment",
-    "pretreatment",
-    "before treatment",
-    "prior to treatment",
-    "at diagnosis",
-    "at presentation",
-    "treatment initiation",
-)
 
 
 @dataclass
@@ -139,7 +51,6 @@ class AgenticFeatureProposal:
     roles: List[str] = field(default_factory=list)
     rationale: Optional[str] = None
     expected_signal: Optional[str] = None
-    leakage_risk: str = "low"
 
 
 @dataclass
@@ -549,7 +460,12 @@ class AgenticFeatureSearchRunner:
             "outer_fold": outer_fold,
             "iteration": iteration,
             "prompt_version": AGENT_PROMPT_VERSION,
-            "outcome_type": self.config.outcome_type,
+            "clinical_question": _clinical_question_text(self.config),
+            "estimand": {
+                "treatment_column": self.config.treatment_column,
+                "outcome_column": self.config.outcome_column,
+                "outcome_type": self.config.outcome_type,
+            },
             "current_features": [_spec_to_dict(spec) for spec in current_specs],
             "current_inner_cv_metrics": _non_oracle_metrics(current_summary),
             "extraction_summary": summarize_extractions(train_only_df, current_specs),
@@ -921,11 +837,8 @@ def build_agent_prompt(
     return f"""You are helping design a causal inference feature set for a causal forest.
 
 {feature_status}
-Propose only pre-treatment patient, tumor, disease, lab, biomarker, or baseline clinical variables that are plausibly extractable from the text and could improve confounding adjustment or CATE heterogeneity.
-
-Do not propose post-treatment outcomes, treatment response, survival, toxicity after treatment, future imaging response, or variables that are descendants of treatment.
-Baseline demographics and disease descriptors are allowed when measured at or before treatment, including age, sex, race/ethnicity, smoking history, ECOG/performance status, comorbidities, histology, stage, tumor burden/size, metastatic sites, baseline labs, molecular markers, and PD-L1 expression. Do not mark those baseline variables as leaky merely because they are broadly prognostic or may modify treatment response.
-For age-like variables, define the target as age in years at baseline, diagnosis, presentation, or treatment initiation.
+Propose variables that are plausibly extractable from the text and could improve confounding adjustment or CATE heterogeneity.
+Use the clinical question, estimand metadata, nested-CV context, extraction summaries, clinical text examples, and prior feedback to decide which variables are worth trying. Define each extraction target precisely enough that the downstream feature extractor can operationalize it.
 Candidate feedback may include role_diagnostics from train-fold regressions adjusted for current confounders. Treat a candidate with both treatment and outcome association as a likely confounder. Treat a candidate with treatment-by-candidate interaction evidence in the outcome model as a likely effect modifier. Use those diagnostics to revise roles or extraction targets when a prior candidate was rejected.
 
 Return JSON only with this shape:
@@ -937,10 +850,9 @@ Return JSON only with this shape:
       "type": "categorical|continuous",
       "categories": ["category_a", "category_b"],
       "roles": ["confounder", "effect_modifier"],
-      "description": "exact extraction target using pre-treatment information only",
+      "description": "exact extraction target",
       "rationale": "why this may help",
-      "expected_signal": "treatment, outcome, or tau signal expected",
-      "leakage_risk": "low|medium|high"
+      "expected_signal": "treatment, outcome, or tau signal expected"
     }}
   ]
 }}
@@ -948,7 +860,7 @@ Return JSON only with this shape:
 Limits:
 - At most {search_config.max_additions_per_iter} add proposals.
 - At most {search_config.max_removals_per_iter} remove proposals.
-- Use "none" if no defensible pre-treatment variable is available.
+- Use "none" if no defensible variable is available.
 - For categorical variables, provide 2-8 mutually exclusive categories.
 - Review iteration_feedback and recent_decisions before proposing. Do not repeat
   a rejected feature unchanged; if revisiting a rejected concept, change the
@@ -974,10 +886,9 @@ Return corrected JSON only. Use this exact top-level shape:
       "type": "categorical|continuous",
       "categories": ["category_a", "category_b"],
       "roles": ["confounder", "effect_modifier"],
-      "description": "exact extraction target using pre-treatment information only",
+      "description": "exact extraction target",
       "rationale": "why this may help",
-      "expected_signal": "treatment, outcome, or tau signal expected",
-      "leakage_risk": "low|medium|high"
+      "expected_signal": "treatment, outcome, or tau signal expected"
     }}
   ]
 }}
@@ -1594,7 +1505,7 @@ def build_iteration_feedback(
                         "proposals": [_proposal_feedback_summary(raw_proposal)],
                         "instruction": (
                             "Do not repeat this proposal unchanged; fix the validation "
-                            "failure or propose a different pre-treatment variable."
+                            "failure or propose a different variable."
                         ),
                     }
                 )
@@ -1890,7 +1801,6 @@ def _coerce_proposal(raw: Dict[str, Any]) -> AgenticFeatureProposal:
         roles=[str(role).strip() for role in roles],
         rationale=raw.get("rationale"),
         expected_signal=raw.get("expected_signal"),
-        leakage_risk=str(raw.get("leakage_risk", "low")).strip().lower(),
     )
 
 
@@ -1905,9 +1815,6 @@ def _proposal_rejection_reason(
         return None
     if not proposal.name or not re.match(r"^[a-z][a-z0-9_]*$", proposal.name):
         return "invalid_name"
-    leakage_reason = _proposal_leakage_reason(proposal)
-    if leakage_reason is not None:
-        return leakage_reason
     if proposal.action == "add":
         if proposal.name in current_names:
             return "duplicate_feature"
@@ -1931,64 +1838,6 @@ def _proposal_rejection_reason(
         ):
             return "invalid_roles"
     return None
-
-
-def _proposal_leakage_reason(proposal: AgenticFeatureProposal) -> Optional[str]:
-    """Return a leakage rejection reason, biased toward the extraction target.
-
-    The LLM often explains baseline variables by saying they may influence
-    "response to therapy." That rationale is not leakage by itself. The guard
-    therefore focuses on the proposed variable name and extraction target, while
-    still rejecting explicitly post-treatment rationale.
-    """
-    if proposal.leakage_risk == "high":
-        return "high_leakage_risk"
-
-    name_text = _normalize_leakage_text(proposal.name)
-    description_text = _normalize_leakage_text(proposal.description)
-    target_text = f"{name_text} {description_text}".strip()
-    rationale_text = _normalize_leakage_text(
-        " ".join(
-            str(part or "")
-            for part in [proposal.rationale, proposal.expected_signal]
-        )
-    )
-
-    if _contains_any(target_text, POST_TREATMENT_LEAKAGE_TERMS):
-        return "post_treatment_or_outcome_leakage"
-
-    # If the variable name itself is an outcome/response concept, reject it
-    # even if the LLM tries to prefix it with "baseline".
-    if _contains_any(name_text, OUTCOME_TARGET_TERMS):
-        return "post_treatment_or_outcome_leakage"
-
-    if (
-        _contains_any(target_text, OUTCOME_TARGET_TERMS)
-        and not _is_allowed_baseline_target(name_text, target_text)
-    ):
-        return "post_treatment_or_outcome_leakage"
-
-    if _contains_any(rationale_text, RATIONALE_ONLY_LEAKAGE_TERMS):
-        return "post_treatment_or_outcome_leakage"
-
-    return None
-
-
-def _is_allowed_baseline_target(name_text: str, target_text: str) -> bool:
-    has_baseline_anchor = _contains_any(target_text, BASELINE_ANCHOR_TERMS)
-    has_safe_concept = _contains_any(name_text, BASELINE_ALLOWED_TARGET_TERMS)
-    return has_baseline_anchor and has_safe_concept
-
-
-def _contains_any(text: str, terms: Sequence[str]) -> bool:
-    return any(_normalize_leakage_text(term) in text for term in terms)
-
-
-def _normalize_leakage_text(text: Any) -> str:
-    normalized = str(text or "").lower()
-    normalized = re.sub(r"[_\-]+", " ", normalized)
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    return normalized
 
 
 def _candidate_groups(
@@ -2198,6 +2047,16 @@ def _non_oracle_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:
         for key, value in metrics.items()
         if not str(key).startswith("oracle_") and not str(key).startswith("true_")
     }
+
+
+def _clinical_question_text(config: AppliedInferenceConfig) -> str:
+    configured = str(getattr(config, "clinical_question", "") or "").strip()
+    if configured:
+        return configured
+    return (
+        "What is the causal effect of "
+        f"{config.treatment_column} on {config.outcome_column}?"
+    )
 
 
 def _scrub_decision_payload(payload: Any, save_agent_context: bool) -> Any:

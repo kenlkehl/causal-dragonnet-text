@@ -35,7 +35,7 @@ def _base_specs():
     ]
 
 
-def test_agentic_proposal_validation_rejects_duplicate_and_leakage():
+def test_agentic_proposal_validation_rejects_duplicate_without_keyword_gate():
     search_config = AgenticFeatureSearchConfig(max_additions_per_iter=2)
     raw = [
         {
@@ -44,7 +44,6 @@ def test_agentic_proposal_validation_rejects_duplicate_and_leakage():
             "type": "continuous",
             "roles": ["confounder"],
             "description": "Patient age",
-            "leakage_risk": "low",
         },
         {
             "action": "add",
@@ -53,7 +52,6 @@ def test_agentic_proposal_validation_rejects_duplicate_and_leakage():
             "categories": ["response", "no_response"],
             "roles": ["effect_modifier"],
             "description": "Response to treatment after therapy",
-            "leakage_risk": "medium",
         },
         {
             "action": "add",
@@ -61,7 +59,6 @@ def test_agentic_proposal_validation_rejects_duplicate_and_leakage():
             "type": "continuous",
             "roles": ["effect_modifier"],
             "description": "Baseline neutrophil to lymphocyte ratio before treatment",
-            "leakage_risk": "low",
         },
     ]
 
@@ -72,14 +69,11 @@ def test_agentic_proposal_validation_rejects_duplicate_and_leakage():
         allow_removals=False,
     )
 
-    assert [proposal.name for proposal in valid] == ["baseline_nlr"]
-    assert {item["reason"] for item in rejected} == {
-        "duplicate_feature",
-        "post_treatment_or_outcome_leakage",
-    }
+    assert [proposal.name for proposal in valid] == ["response_category", "baseline_nlr"]
+    assert rejected == [{"proposal": raw[0], "reason": "duplicate_feature"}]
 
 
-def test_agentic_proposal_validation_allows_baseline_age_response_rationale():
+def test_agentic_proposal_validation_does_not_use_allowed_baseline_whitelist():
     raw = [
         {
             "action": "add",
@@ -92,7 +86,6 @@ def test_agentic_proposal_validation_allows_baseline_age_response_rationale():
                 "response to therapy."
             ),
             "expected_signal": "treatment, outcome",
-            "leakage_risk": "low",
         },
         {
             "action": "add",
@@ -101,7 +94,6 @@ def test_agentic_proposal_validation_allows_baseline_age_response_rationale():
             "categories": ["responder", "non_responder"],
             "roles": ["effect_modifier"],
             "description": "Baseline treatment response category",
-            "leakage_risk": "low",
         },
     ]
 
@@ -112,13 +104,11 @@ def test_agentic_proposal_validation_allows_baseline_age_response_rationale():
         allow_removals=False,
     )
 
-    assert [proposal.name for proposal in valid] == ["patient_age"]
-    assert rejected == [
-        {
-            "proposal": raw[1],
-            "reason": "post_treatment_or_outcome_leakage",
-        }
+    assert [proposal.name for proposal in valid] == [
+        "patient_age",
+        "baseline_treatment_response",
     ]
+    assert rejected == []
 
 
 def test_apply_proposals_add_remove_and_update_role():
@@ -222,7 +212,6 @@ class FakeAgent:
                 "description": "Baseline hidden modifier measured before treatment",
                 "rationale": "Could explain treatment effect heterogeneity",
                 "expected_signal": "tau signal",
-                "leakage_risk": "low",
             }
         ]
 
@@ -281,7 +270,12 @@ def test_agentic_runner_accepts_inner_cv_improvement_without_true_ite_leakage(tm
     )
     agent = FakeAgent()
     output_path = tmp_path / "predictions.parquet"
+    clinical_question = (
+        "Among patients with advanced NSCLC, what is the effect of immunotherapy "
+        "receipt on 6-month response?"
+    )
     config = AppliedInferenceConfig(
+        clinical_question=clinical_question,
         dataset_path=str(tmp_path / "dataset.parquet"),
         cv_folds=2,
         architecture=ModelArchitectureConfig(
@@ -329,6 +323,19 @@ def test_agentic_runner_accepts_inner_cv_improvement_without_true_ite_leakage(tm
 
     assert len(results) == len(df)
     assert "hidden_modifier" in selected_names
+    assert all(
+        context["clinical_question"] == clinical_question
+        for context in agent.contexts
+    )
+    assert all(
+        context["estimand"]
+        == {
+            "treatment_column": "treatment_indicator",
+            "outcome_column": "outcome_indicator",
+            "outcome_type": "binary",
+        }
+        for context in agent.contexts
+    )
     assert all("true_ite" not in json.dumps(context) for context in agent.contexts)
     decision_lines = (
         tmp_path / "agentic_feature_search" / "agent_decisions.jsonl"

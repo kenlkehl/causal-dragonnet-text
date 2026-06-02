@@ -307,7 +307,7 @@ Results are cached to `{dataset_dir}/.oci_cache/` and invalidated automatically 
 
 Use `model_type="explicit_feature_forest"` to fit CausalForestDML from extracted structured features only. In that mode, confounder-role features form `W`, effect-modifier-role features form `X`, and no text encoder is trained.
 
-Use `model_type="agentic_explicit_feature_forest"` to let an LLM propose additional pre-treatment explicit variables after an initial explicit-feature forest fit. The agentic path uses nested CV: inner folds decide add/remove/re-role actions, and outer folds report the performance of the whole adaptive search process.
+Use `model_type="agentic_explicit_feature_forest"` to let an LLM propose additional explicit variables after an initial explicit-feature forest fit. The agentic path uses nested CV: inner folds decide add/remove/re-role actions, and outer folds report the performance of the whole adaptive search process. Set `applied_inference.clinical_question` to the study question; the proposal agent receives that question plus treatment/outcome column metadata in every prompt.
 
 For each proposed add/re-role candidate, the agentic path now records train-fold role diagnostics before inner-CV acceptance. It fits treatment and outcome regressions adjusted for the current confounder-role features, then fits an outcome model with treatment-by-candidate interactions. Candidates with both treatment and outcome association are flagged as likely confounders; candidates with interaction signal are flagged as likely effect modifiers. These diagnostics are advisory feedback to the proposal agent and artifacts; acceptance still uses nested-CV R-loss and nuisance-AUROC guardrails.
 

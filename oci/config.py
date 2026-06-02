@@ -570,6 +570,7 @@ class OutcomeModelConfig:
 @dataclass
 class AppliedInferenceConfig:
     """Configuration for applied inference on real data."""
+    clinical_question: Optional[str] = None
     outcome_type: str = "binary"  # "binary" or "continuous"
     dataset_path: str = ""
     text_column: str = "clinical_text"
