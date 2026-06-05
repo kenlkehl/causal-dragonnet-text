@@ -52,6 +52,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from ..config import ExplicitConfounderSpec
+from .explicit_features import resolve_vllm_reasoning_parser, strip_reasoning_trace
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +138,7 @@ def parse_extraction_response(
         Categorical values are validated; invalid ones are marked as missing.
         Continuous values that fail parsing are marked as missing.
     """
-    response = response.strip()
+    response = strip_reasoning_trace(response)
 
     # Try to extract JSON from response (handle markdown code blocks)
     json_match = re.search(r'\{[^{}]*\}', response, re.DOTALL)
@@ -234,6 +235,7 @@ class VLLMConfounderExtractor:
         gpu_memory_utilization: float = 0.9,
         download_dir: Optional[str] = None,
         max_model_len: Optional[int] = None,
+        vllm_reasoning_parser: Optional[str] = "auto",
         api_key: str = "EMPTY",
         max_retries: int = 3,
         temperature: float = 0.0,
@@ -250,6 +252,7 @@ class VLLMConfounderExtractor:
             gpu_memory_utilization: GPU memory fraction to use
             download_dir: Model download directory
             max_model_len: Maximum model context length (for start_server/python_api)
+            vllm_reasoning_parser: vLLM reasoning parser name, "auto", or disabled with None/"none"
             api_key: API key (use "EMPTY" for local vLLM)
             max_retries: Maximum retries per patient before marking as missing
             temperature: LLM temperature (0 for deterministic)
@@ -266,6 +269,10 @@ class VLLMConfounderExtractor:
         self.gpu_memory_utilization = gpu_memory_utilization
         self.download_dir = download_dir
         self.max_model_len = max_model_len
+        self.vllm_reasoning_parser = resolve_vllm_reasoning_parser(
+            vllm_reasoning_parser,
+            model_name,
+        )
         self.api_key = api_key
         self.max_retries = max_retries
         self.temperature = temperature
@@ -276,7 +283,12 @@ class VLLMConfounderExtractor:
         self._llm = None
         self._server_process = None
 
-        logger.info(f"VLLMConfounderExtractor initialized: mode={mode}, model={model_name}")
+        logger.info(
+            "VLLMConfounderExtractor initialized: mode=%s, model=%s, reasoning_parser=%s",
+            mode,
+            model_name,
+            self.vllm_reasoning_parser,
+        )
         logger.info(f"Extracting {len(specs)} confounders: {[s.name for s in specs]}")
 
     def _init_server_client(self):
@@ -307,6 +319,8 @@ class VLLMConfounderExtractor:
             cmd.extend(["--download-dir", self.download_dir])
         if self.max_model_len:
             cmd.extend(["--max-model-len", str(self.max_model_len)])
+        if self.vllm_reasoning_parser:
+            cmd.extend(["--reasoning-parser", self.vllm_reasoning_parser])
 
         logger.info(f"Starting vLLM server: {' '.join(cmd)}")
         self._server_process = subprocess.Popen(
@@ -550,6 +564,7 @@ def extract_explicit_confounders(
     gpu_memory_utilization: float = 0.9,
     download_dir: Optional[str] = None,
     max_model_len: Optional[int] = None,
+    vllm_reasoning_parser: Optional[str] = "auto",
     max_retries: int = 3,
     temperature: float = 0.0,
     max_tokens: int = 1024,
@@ -567,6 +582,7 @@ def extract_explicit_confounders(
         gpu_memory_utilization: GPU memory fraction
         download_dir: Model download directory
         max_model_len: Maximum model context length (for start_server/python_api)
+        vllm_reasoning_parser: vLLM reasoning parser name, "auto", or disabled with None/"none"
         max_retries: Retries per patient before marking as missing
         temperature: LLM temperature
         max_tokens: Max response tokens
@@ -584,6 +600,7 @@ def extract_explicit_confounders(
         gpu_memory_utilization=gpu_memory_utilization,
         download_dir=download_dir,
         max_model_len=max_model_len,
+        vllm_reasoning_parser=vllm_reasoning_parser,
         max_retries=max_retries,
         temperature=temperature,
         max_tokens=max_tokens

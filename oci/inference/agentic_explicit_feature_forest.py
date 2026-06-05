@@ -25,7 +25,12 @@ from ..config import (
     ExplicitFeatureForestConfig,
     ExplicitFeatureSpec,
 )
-from ..extraction import ExtractionCache, VLLMFeatureExtractor
+from ..extraction import (
+    ExtractionCache,
+    VLLMFeatureExtractor,
+    resolve_vllm_reasoning_parser,
+    strip_reasoning_trace,
+)
 from ..models.causal_forest_head import CausalForestHead
 from .applied_explicit_feature_forest import _build_features, _hstack_present
 
@@ -1102,6 +1107,7 @@ class VLLMExplicitFeatureExtractionProvider:
             gpu_memory_utilization=self.feature_config.vllm_gpu_memory_utilization,
             download_dir=self.feature_config.vllm_download_dir,
             max_model_len=self.feature_config.vllm_max_model_len,
+            vllm_reasoning_parser=self.feature_config.vllm_reasoning_parser,
             max_retries=self.feature_config.extraction_max_retries,
             temperature=self.feature_config.extraction_temperature,
             max_tokens=self.feature_config.extraction_max_tokens,
@@ -1244,6 +1250,10 @@ class VLLMExplicitFeatureExtractionProvider:
             "prompt_template_version": EXTRACTION_PROMPT_VERSION,
             "vllm_model_name": self.feature_config.vllm_model_name,
             "vllm_max_model_len": self.feature_config.vllm_max_model_len,
+            "vllm_reasoning_parser": resolve_vllm_reasoning_parser(
+                self.feature_config.vllm_reasoning_parser,
+                self.feature_config.vllm_model_name,
+            ),
             "extraction_temperature": self.feature_config.extraction_temperature,
             "extraction_max_tokens": self.feature_config.extraction_max_tokens,
             "extraction_max_text_length": self.feature_config.extraction_max_text_length,
@@ -1570,7 +1580,7 @@ def _missing_or_empty(value: Any) -> bool:
 
 def parse_agent_response(response: str) -> List[Dict[str, Any]]:
     """Parse JSON proposals from an LLM response."""
-    response = response.strip()
+    response = strip_reasoning_trace(response)
     match = re.search(r"\{.*\}", response, re.DOTALL)
     json_str = match.group(0) if match else response
     parsed = json.loads(json_str)

@@ -27,7 +27,11 @@ from ..data import (
 )
 from ..models.hidden_state_cache import HiddenStateCache
 from ..utils import cuda_cleanup, get_memory_info
-from ..extraction import VLLMFeatureExtractor, ExtractionCache
+from ..extraction import (
+    ExtractionCache,
+    VLLMFeatureExtractor,
+    resolve_vllm_reasoning_parser,
+)
 
 # Import forest inference (lazy to avoid import errors if econml not installed)
 def _get_forest_inference():
@@ -78,6 +82,10 @@ def _run_explicit_feature_extraction(
         'prompt_template_version': 'explicit_features_v2',
         'vllm_model_name': feature_config.vllm_model_name,
         'vllm_max_model_len': feature_config.vllm_max_model_len,
+        'vllm_reasoning_parser': resolve_vllm_reasoning_parser(
+            feature_config.vllm_reasoning_parser,
+            feature_config.vllm_model_name,
+        ),
         'extraction_temperature': feature_config.extraction_temperature,
         'extraction_max_tokens': feature_config.extraction_max_tokens,
         'extraction_max_text_length': feature_config.extraction_max_text_length,
@@ -112,6 +120,7 @@ def _run_explicit_feature_extraction(
         gpu_memory_utilization=feature_config.vllm_gpu_memory_utilization,
         download_dir=feature_config.vllm_download_dir,
         max_model_len=feature_config.vllm_max_model_len,
+        vllm_reasoning_parser=feature_config.vllm_reasoning_parser,
         max_retries=feature_config.extraction_max_retries,
         temperature=feature_config.extraction_temperature,
         max_tokens=feature_config.extraction_max_tokens,

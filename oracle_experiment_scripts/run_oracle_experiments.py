@@ -193,6 +193,7 @@ class ExperimentConfig:
     agentic_vllm_mode: str = "server"
     agentic_vllm_download_dir: Optional[str] = None
     agentic_vllm_max_model_len: Optional[int] = None
+    agentic_vllm_reasoning_parser: Optional[str] = "auto"
     agentic_extraction_max_retries: int = 3
     agentic_extraction_max_tokens: int = 1024
     agentic_extraction_max_text_length: int = 8000
@@ -1798,6 +1799,7 @@ def run_agentic_experiment(
             vllm_model_name=config.agentic_vllm_model_name,
             vllm_download_dir=config.agentic_vllm_download_dir,
             vllm_max_model_len=config.agentic_vllm_max_model_len,
+            vllm_reasoning_parser=config.agentic_vllm_reasoning_parser,
             extraction_batch_size=config.agentic_extraction_batch_size,
             extraction_max_retries=config.agentic_extraction_max_retries,
             extraction_max_tokens=config.agentic_extraction_max_tokens,
@@ -1995,6 +1997,7 @@ def generate_experiment_grid(
     agentic_vllm_mode: str = "server",
     agentic_vllm_download_dir: Optional[str] = None,
     agentic_vllm_max_model_len: Optional[int] = None,
+    agentic_vllm_reasoning_parser: Optional[str] = "auto",
     agentic_extraction_max_retries: int = 3,
     agentic_extraction_max_tokens: int = 1024,
     agentic_extraction_max_text_length: int = 8000,
@@ -2274,6 +2277,7 @@ def generate_experiment_grid(
                     agentic_vllm_mode=agentic_vllm_mode,
                     agentic_vllm_download_dir=agentic_vllm_download_dir,
                     agentic_vllm_max_model_len=agentic_vllm_max_model_len,
+                    agentic_vllm_reasoning_parser=agentic_vllm_reasoning_parser,
                     agentic_extraction_max_retries=agentic_extraction_max_retries,
                     agentic_extraction_max_tokens=agentic_extraction_max_tokens,
                     agentic_extraction_max_text_length=agentic_extraction_max_text_length,
@@ -2855,25 +2859,32 @@ def main():
         )
     )
     parser.add_argument(
+        "--agentic-extraction-server-url",
         "--agentic-vllm-server-url",
+        dest="agentic_vllm_server_url",
         type=str,
         default=None,
         help="OpenAI-compatible endpoint for explicit feature extraction."
     )
     parser.add_argument(
+        "--agentic-extraction-model-name",
         "--agentic-vllm-model-name",
+        dest="agentic_vllm_model_name",
         type=str,
         default="Qwen/Qwen2.5-7B-Instruct",
         help="Model name for explicit feature extraction."
     )
     parser.add_argument(
+        "--agentic-extraction-mode",
         "--agentic-vllm-mode",
+        dest="agentic_vllm_mode",
         type=str,
         default="server",
         choices=["server", "start_server", "python_api"],
         help="vLLM mode for explicit feature extraction."
     )
     parser.add_argument(
+        "--agentic-extraction-download-dir",
         "--agentic-vllm-download-dir",
         "--download-dir",
         type=str,
@@ -2885,12 +2896,27 @@ def main():
         )
     )
     parser.add_argument(
+        "--agentic-extraction-max-model-len",
         "--agentic-vllm-max-model-len",
+        dest="agentic_vllm_max_model_len",
         type=int,
         default=None,
         help=(
             "vLLM max_model_len for explicit feature extraction when using "
             "start_server/python_api backends. Server mode must be configured separately."
+        )
+    )
+    parser.add_argument(
+        "--agentic-extraction-reasoning-parser",
+        "--agentic-vllm-reasoning-parser",
+        "--vllm-reasoning-parser",
+        type=str,
+        dest="agentic_vllm_reasoning_parser",
+        default="auto",
+        help=(
+            "vLLM reasoning parser for agentic explicit extraction. Use 'auto' "
+            "to infer qwen3 for Qwen models and gemma4 for Gemma models; use "
+            "'none' to disable."
         )
     )
     parser.add_argument(
@@ -2954,7 +2980,7 @@ def main():
         args.agentic_vllm_max_model_len is not None
         and args.agentic_vllm_max_model_len < 1
     ):
-        parser.error("--agentic-vllm-max-model-len must be >= 1")
+        parser.error("--agentic-extraction-max-model-len must be >= 1")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -3000,6 +3026,7 @@ def main():
         agentic_vllm_mode=args.agentic_vllm_mode,
         agentic_vllm_download_dir=args.agentic_vllm_download_dir,
         agentic_vllm_max_model_len=args.agentic_vllm_max_model_len,
+        agentic_vllm_reasoning_parser=args.agentic_vllm_reasoning_parser,
         agentic_extraction_max_retries=args.agentic_extraction_max_retries,
         agentic_extraction_max_tokens=args.agentic_extraction_max_tokens,
         agentic_extraction_max_text_length=args.agentic_extraction_max_text_length,
@@ -3384,6 +3411,7 @@ def main():
                       'agentic_vllm_mode',
                       'agentic_vllm_download_dir',
                       'agentic_vllm_max_model_len',
+                      'agentic_vllm_reasoning_parser',
                       'agentic_extraction_max_tokens',
                       'agentic_extraction_max_text_length']
         # Only group by columns that exist in the results

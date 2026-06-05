@@ -65,11 +65,49 @@ def main():
     parser.add_argument("--cf-min-samples-leaf", type=int, default=10)
     parser.add_argument("--cf-no-inference", action="store_true")
 
-    parser.add_argument("--vllm-mode", default="python_api", choices=["server", "start_server", "python_api"])
-    parser.add_argument("--vllm-server-url", default="http://localhost:8000/v1")
-    parser.add_argument("--vllm-model-name", default="nvidia/Gemma-4-31B-IT-NVFP4")
-    parser.add_argument("--vllm-download-dir", "--download-dir", dest="vllm_download_dir", default=None)
-    parser.add_argument("--vllm-max-model-len", type=int, default=None)
+    parser.add_argument(
+        "--extraction-mode",
+        "--vllm-mode",
+        dest="vllm_mode",
+        default="python_api",
+        choices=["server", "start_server", "python_api"],
+    )
+    parser.add_argument(
+        "--extraction-server-url",
+        "--vllm-server-url",
+        dest="vllm_server_url",
+        default="http://localhost:8000/v1",
+    )
+    parser.add_argument(
+        "--extraction-model-name",
+        "--vllm-model-name",
+        dest="vllm_model_name",
+        default="nvidia/Gemma-4-31B-IT-NVFP4",
+    )
+    parser.add_argument(
+        "--extraction-download-dir",
+        "--vllm-download-dir",
+        "--download-dir",
+        dest="vllm_download_dir",
+        default=None,
+    )
+    parser.add_argument(
+        "--extraction-max-model-len",
+        "--vllm-max-model-len",
+        dest="vllm_max_model_len",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--extraction-reasoning-parser",
+        "--vllm-reasoning-parser",
+        dest="vllm_reasoning_parser",
+        default="auto",
+        help=(
+            "vLLM reasoning parser for extraction. Use 'auto' to infer qwen3 "
+            "for Qwen models and gemma4 for Gemma models; use 'none' to disable."
+        ),
+    )
     parser.add_argument("--extraction-batch-size", type=int, default=64)
     parser.add_argument("--extraction-max-retries", type=int, default=5)
     parser.add_argument("--extraction-max-tokens", type=int, default=10000)
@@ -150,6 +188,7 @@ def main():
             vllm_model_name=args.vllm_model_name,
             vllm_download_dir=args.vllm_download_dir,
             vllm_max_model_len=args.vllm_max_model_len,
+            vllm_reasoning_parser=args.vllm_reasoning_parser,
             extraction_batch_size=args.extraction_batch_size,
             extraction_max_retries=args.extraction_max_retries,
             extraction_max_tokens=args.extraction_max_tokens,

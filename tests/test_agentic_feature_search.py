@@ -24,6 +24,7 @@ from oci.inference.agentic_explicit_feature_forest import (
     build_iteration_feedback,
     compare_candidate_to_baseline,
     evaluate_candidate_role_diagnostics,
+    parse_agent_response,
     run_agentic_explicit_feature_forest,
     validate_agentic_proposals,
 )
@@ -324,9 +325,112 @@ def test_extraction_cache_hash_includes_description_and_prompt_settings():
 
     desc_hash = _compute_config_hash({**base, "features": [spec_b]})
     prompt_hash = _compute_config_hash({**base, "prompt_template_version": "v2"})
+    parser_hash = _compute_config_hash({**base, "vllm_reasoning_parser": "qwen3"})
 
     assert _compute_config_hash(base) != desc_hash
     assert _compute_config_hash(base) != prompt_hash
+    assert _compute_config_hash(base) != parser_hash
+
+
+def test_parse_agent_response_strips_inline_reasoning_trace():
+    proposals = parse_agent_response(
+        '<think>{"proposals": [{"name": "discard_me"}]}</think>\n'
+        '{"proposals": [{"name": "age", "type": "continuous"}]}'
+    )
+
+    assert proposals == [{"name": "age", "type": "continuous"}]
+
+
+def test_agentic_vllm_wrapper_adds_autodetected_reasoning_parser():
+    from oracle_experiment_scripts.run_oracle_agentic_explicit_forest_experiments import (
+        _extract_wrapper_vllm_args,
+        _option_value,
+        _start_local_vllm_servers,
+        _with_expanded_agentic_defaults,
+        _vllm_cmd,
+    )
+
+    settings = {
+        "download_dir": None,
+        "gpu_memory_utilization": "0.95",
+        "max_num_seqs": "4",
+        "max_num_batched_tokens": None,
+        "dtype": None,
+        "kv_cache_dtype": None,
+        "reasoning_parser": "auto",
+        "extra_args": [],
+    }
+    qwen_cmd = _vllm_cmd(
+        server_url="http://localhost:8000/v1",
+        model_name="nvidia/Qwen3.6-35B-A3B-NVFP4",
+        max_model_len="200000",
+        settings=settings,
+    )
+    gemma_cmd = _vllm_cmd(
+        server_url="http://localhost:8000/v1",
+        model_name="nvidia/Gemma-4-31B-IT-NVFP4",
+        max_model_len="200000",
+        settings=settings,
+    )
+    unknown_cmd = _vllm_cmd(
+        server_url="http://localhost:8000/v1",
+        model_name="unknown/model",
+        max_model_len="200000",
+        settings=settings,
+    )
+
+    assert qwen_cmd[qwen_cmd.index("--reasoning-parser") + 1] == "qwen3"
+    assert gemma_cmd[gemma_cmd.index("--reasoning-parser") + 1] == "gemma4"
+    assert "--reasoning-parser" not in unknown_cmd
+
+    cleaned, parsed_settings = _extract_wrapper_vllm_args([
+        "runner.py",
+        "--vllm-reasoning-parser",
+        "qwen3",
+    ])
+
+    assert parsed_settings["reasoning_parser"] == "qwen3"
+    assert cleaned[-2:] == ["--agentic-extraction-reasoning-parser", "qwen3"]
+
+    expanded = _with_expanded_agentic_defaults([
+        "runner.py",
+        "--agentic-vllm-model-name",
+        "legacy/extraction-model",
+    ])
+
+    assert "--agentic-extraction-model-name" not in expanded
+    assert _option_value(
+        expanded[1:],
+        "--agentic-agent-model-name",
+    ) == "legacy/extraction-model"
+    assert _extract_wrapper_vllm_args([
+        "runner.py",
+        "--agentic-extraction-reasoning-parser",
+        "gemma4",
+    ])[1]["reasoning_parser"] == "gemma4"
+
+    expanded_from_agent = _with_expanded_agentic_defaults([
+        "runner.py",
+        "--agentic-agent-model-name",
+        "shared/model",
+    ])
+
+    assert _option_value(
+        expanded_from_agent[1:],
+        "--agentic-extraction-model-name",
+    ) == "shared/model"
+
+    with pytest.raises(ValueError, match="shared local vLLM server"):
+        _start_local_vllm_servers(
+            [
+                "runner.py",
+                "--agentic-agent-model-name",
+                "agent/model",
+                "--agentic-extraction-model-name",
+                "extraction/model",
+            ],
+            {},
+        )
 
 
 def _provider_config(tmp_path, cache_enabled=False, batch_size=32):

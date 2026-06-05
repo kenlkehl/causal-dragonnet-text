@@ -57,6 +57,49 @@ from ..config import ExplicitFeatureSpec
 
 logger = logging.getLogger(__name__)
 
+_DISABLED_REASONING_PARSER_VALUES = {"", "none", "off", "false", "disabled", "no"}
+
+
+def infer_vllm_reasoning_parser(model_name: Optional[str]) -> Optional[str]:
+    """Infer the vLLM reasoning parser name from a model name."""
+    if not model_name:
+        return None
+    model_key = str(model_name).lower()
+    if "qwen" in model_key:
+        return "qwen3"
+    if "gemma" in model_key:
+        return "gemma4"
+    return None
+
+
+def resolve_vllm_reasoning_parser(
+    reasoning_parser: Optional[str],
+    model_name: Optional[str],
+) -> Optional[str]:
+    """Resolve an explicit/auto parser setting to a vLLM parser name."""
+    if reasoning_parser is None:
+        return None
+    value = str(reasoning_parser).strip()
+    if value.lower() in _DISABLED_REASONING_PARSER_VALUES:
+        return None
+    if value.lower() == "auto":
+        return infer_vllm_reasoning_parser(model_name)
+    return value
+
+
+def strip_reasoning_trace(response: str) -> str:
+    """Remove common inline reasoning blocks before JSON parsing."""
+    text = response.strip()
+    if not text:
+        return text
+    text = re.sub(r"(?is)<think>.*?</think>", "", text).strip()
+    lower_text = text.lower()
+    end_marker = "</think>"
+    end_idx = lower_text.rfind(end_marker)
+    if end_idx >= 0:
+        text = text[end_idx + len(end_marker):].strip()
+    return text
+
 
 @dataclass
 class ExplicitFeatureValue:
@@ -140,7 +183,7 @@ def parse_extraction_response(
         Categorical values are validated; invalid ones are marked as missing.
         Continuous values that fail parsing are marked as missing.
     """
-    response = response.strip()
+    response = strip_reasoning_trace(response)
 
     # Try to extract JSON from response (handle markdown code blocks)
     json_match = re.search(r'\{[^{}]*\}', response, re.DOTALL)
@@ -237,6 +280,7 @@ class VLLMFeatureExtractor:
         gpu_memory_utilization: float = 0.9,
         download_dir: Optional[str] = None,
         max_model_len: Optional[int] = None,
+        vllm_reasoning_parser: Optional[str] = "auto",
         api_key: str = "EMPTY",
         max_retries: int = 3,
         temperature: float = 0.0,
@@ -254,6 +298,7 @@ class VLLMFeatureExtractor:
             gpu_memory_utilization: GPU memory fraction to use
             download_dir: Model download directory
             max_model_len: Maximum model context length (for start_server/python_api)
+            vllm_reasoning_parser: vLLM reasoning parser name, "auto", or disabled with None/"none"
             api_key: API key (use "EMPTY" for local vLLM)
             max_retries: Maximum retries per patient before marking as missing
             temperature: LLM temperature (0 for deterministic)
@@ -271,6 +316,10 @@ class VLLMFeatureExtractor:
         self.gpu_memory_utilization = gpu_memory_utilization
         self.download_dir = download_dir
         self.max_model_len = max_model_len
+        self.vllm_reasoning_parser = resolve_vllm_reasoning_parser(
+            vllm_reasoning_parser,
+            model_name,
+        )
         self.api_key = api_key
         self.max_retries = max_retries
         self.temperature = temperature
@@ -282,7 +331,12 @@ class VLLMFeatureExtractor:
         self._llm = None
         self._server_process = None
 
-        logger.info(f"VLLMFeatureExtractor initialized: mode={mode}, model={model_name}")
+        logger.info(
+            "VLLMFeatureExtractor initialized: mode=%s, model=%s, reasoning_parser=%s",
+            mode,
+            model_name,
+            self.vllm_reasoning_parser,
+        )
         logger.info(f"Extracting {len(specs)} features: {[s.name for s in specs]}")
 
     def _init_server_client(self):
@@ -313,6 +367,8 @@ class VLLMFeatureExtractor:
             cmd.extend(["--download-dir", self.download_dir])
         if self.max_model_len:
             cmd.extend(["--max-model-len", str(self.max_model_len)])
+        if self.vllm_reasoning_parser:
+            cmd.extend(["--reasoning-parser", self.vllm_reasoning_parser])
 
         logger.info(f"Starting vLLM server: {' '.join(cmd)}")
         self._server_process = subprocess.Popen(
@@ -560,6 +616,7 @@ def extract_explicit_features(
     gpu_memory_utilization: float = 0.9,
     download_dir: Optional[str] = None,
     max_model_len: Optional[int] = None,
+    vllm_reasoning_parser: Optional[str] = "auto",
     max_retries: int = 3,
     temperature: float = 0.0,
     max_tokens: int = 1024,
@@ -578,6 +635,7 @@ def extract_explicit_features(
         gpu_memory_utilization: GPU memory fraction
         download_dir: Model download directory
         max_model_len: Maximum model context length (for start_server/python_api)
+        vllm_reasoning_parser: vLLM reasoning parser name, "auto", or disabled with None/"none"
         max_retries: Retries per patient before marking as missing
         temperature: LLM temperature
         max_tokens: Max response tokens
@@ -596,6 +654,7 @@ def extract_explicit_features(
         gpu_memory_utilization=gpu_memory_utilization,
         download_dir=download_dir,
         max_model_len=max_model_len,
+        vllm_reasoning_parser=vllm_reasoning_parser,
         max_retries=max_retries,
         temperature=temperature,
         max_tokens=max_tokens,

@@ -8,7 +8,10 @@ from .explicit_features import (
     ExplicitFeatureValue,
     VLLMFeatureExtractor,
     build_extraction_prompt,
+    infer_vllm_reasoning_parser,
     parse_extraction_response,
+    resolve_vllm_reasoning_parser,
+    strip_reasoning_trace,
     extract_explicit_features,
 )
 from .cache import ExtractionCache
@@ -22,7 +25,10 @@ __all__ = [
     "ExplicitFeatureValue",
     "VLLMFeatureExtractor",
     "build_extraction_prompt",
+    "infer_vllm_reasoning_parser",
     "parse_extraction_response",
+    "resolve_vllm_reasoning_parser",
+    "strip_reasoning_trace",
     "extract_explicit_features",
     "ExtractionCache",
     "ExplicitConfounderValue",

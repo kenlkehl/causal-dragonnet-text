@@ -38,6 +38,7 @@ def _compute_config_hash(config: Dict[str, Any]) -> str:
         ],
         'prompt_template_version': config.get('prompt_template_version', ''),
         'vllm_model_name': config.get('vllm_model_name', ''),
+        'vllm_reasoning_parser': config.get('vllm_reasoning_parser', ''),
         'extraction_temperature': config.get('extraction_temperature', 0.0),
         'extraction_max_tokens': config.get('extraction_max_tokens', 1024),
         'extraction_max_text_length': config.get(

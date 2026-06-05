@@ -27,7 +27,8 @@ By default this wrapper starts one local vLLM OpenAI-compatible server per
 requested CUDA device, using sequential ports starting at 8000. Wrapper-only
 vLLM server options include --download-dir, --gpu-memory-utilization,
 --max-num-seqs, --max-num-batched-tokens, --dtype, --kv-cache-dtype,
---vllm-port-base, --vllm-extra-arg, --vllm-extra-args, and --no-start-vllm.
+--vllm-port-base, --vllm-reasoning-parser, --vllm-extra-arg,
+--vllm-extra-args, and --no-start-vllm.
 """
 
 import sys
@@ -68,15 +69,12 @@ DEFAULT_ARGS: Dict[str, List[str]] = {
     "--agentic-max-additions-per-iter": ["6"],
     "--agentic-max-removals-per-iter": ["2"],
     "--agentic-stop-after-rejected-iteration": ["true", "false"],
-    "--agentic-agent-model-name": ["nvidia/Gemma-4-31B-IT-NVFP4"],
     "--agentic-agent-server-url": ["http://localhost:8000/v1"],
-    "--agentic-vllm-model-name": ["nvidia/Gemma-4-31B-IT-NVFP4"],
-    "--agentic-vllm-server-url": ["http://localhost:8000/v1"],
     "--agentic-agent-max-tokens": ["50000"],
     "--agentic-agent-context-chars": ["200000"],
     "--agentic-agent-context-examples": ["20"],
     "--agentic-save-agent-raw-output": [],
-    "--agentic-vllm-max-model-len": ["200000"],
+    "--agentic-extraction-max-model-len": ["200000"],
     "--agentic-extraction-max-tokens": ["50000"],
     "--agentic-extraction-max-text-length": ["200000"],
     "--agentic-extraction-max-retries": ["5"],
@@ -96,6 +94,10 @@ WRAPPER_VLLM_VALUE_OPTIONS = {
     "--vllm-dtype": "dtype",
     "--kv-cache-dtype": "kv_cache_dtype",
     "--vllm-kv-cache-dtype": "kv_cache_dtype",
+    "--reasoning-parser": "reasoning_parser",
+    "--vllm-reasoning-parser": "reasoning_parser",
+    "--agentic-extraction-reasoning-parser": "reasoning_parser",
+    "--agentic-vllm-reasoning-parser": "reasoning_parser",
     "--port-base": "port_base",
     "--vllm-port-base": "port_base",
     "--startup-timeout": "startup_timeout",
@@ -114,32 +116,81 @@ FORCED_AGENTIC_ONLY_ARGS = [
     "agentic_explicit_features",
 ]
 
+DEFAULT_AGENTIC_LOCAL_MODEL = "nvidia/Gemma-4-31B-IT-NVFP4"
+_DISABLED_REASONING_PARSER_VALUES = {"", "none", "off", "false", "disabled", "no"}
+_OPTION_ALIAS_GROUPS = [
+    ("--agentic-extraction-server-url", "--agentic-vllm-server-url"),
+    ("--agentic-extraction-model-name", "--agentic-vllm-model-name"),
+    ("--agentic-extraction-mode", "--agentic-vllm-mode"),
+    ("--agentic-extraction-download-dir", "--agentic-vllm-download-dir"),
+    ("--agentic-extraction-max-model-len", "--agentic-vllm-max-model-len"),
+    ("--agentic-extraction-reasoning-parser", "--agentic-vllm-reasoning-parser"),
+]
+
+
+def _option_names(option: str) -> tuple[str, ...]:
+    for group in _OPTION_ALIAS_GROUPS:
+        if option in group:
+            return group
+    return (option,)
+
 
 def _option_present(args: List[str], option: str) -> bool:
-    return any(arg == option or arg.startswith(f"{option}=") for arg in args)
+    return any(
+        arg == name or arg.startswith(f"{name}=")
+        for name in _option_names(option)
+        for arg in args
+    )
 
 
 def _option_value(args: List[str], option: str, default: Optional[str] = None) -> Optional[str]:
-    for idx, arg in enumerate(args):
-        if arg.startswith(f"{option}="):
-            return arg.split("=", 1)[1]
-        if arg == option and idx + 1 < len(args):
-            return args[idx + 1]
+    for name in _option_names(option):
+        for idx, arg in enumerate(args):
+            if arg.startswith(f"{name}="):
+                return arg.split("=", 1)[1]
+            if arg == name and idx + 1 < len(args):
+                return args[idx + 1]
     return default
 
 
 def _option_values(args: List[str], option: str, default: Optional[List[str]] = None) -> List[str]:
-    for idx, arg in enumerate(args):
-        if arg.startswith(f"{option}="):
-            return [arg.split("=", 1)[1]]
-        if arg == option:
-            values = []
-            for value in args[idx + 1:]:
-                if value.startswith("--"):
-                    break
-                values.append(value)
-            return values
+    for name in _option_names(option):
+        for idx, arg in enumerate(args):
+            if arg.startswith(f"{name}="):
+                return [arg.split("=", 1)[1]]
+            if arg == name:
+                values = []
+                for value in args[idx + 1:]:
+                    if value.startswith("--"):
+                        break
+                    values.append(value)
+                return values
     return list(default or [])
+
+
+def _infer_reasoning_parser(model_name: Optional[str]) -> Optional[str]:
+    if not model_name:
+        return None
+    model_key = str(model_name).lower()
+    if "qwen" in model_key:
+        return "qwen3"
+    if "gemma" in model_key:
+        return "gemma4"
+    return None
+
+
+def _resolve_reasoning_parser(
+    reasoning_parser: Optional[str],
+    model_name: Optional[str],
+) -> Optional[str]:
+    if reasoning_parser is None:
+        return None
+    value = str(reasoning_parser).strip()
+    if value.lower() in _DISABLED_REASONING_PARSER_VALUES:
+        return None
+    if value.lower() == "auto":
+        return _infer_reasoning_parser(model_name)
+    return value
 
 
 def _extract_wrapper_vllm_args(argv: List[str]) -> tuple[List[str], Dict[str, Any]]:
@@ -153,6 +204,7 @@ def _extract_wrapper_vllm_args(argv: List[str]) -> tuple[List[str], Dict[str, An
         "max_num_batched_tokens": None,
         "dtype": None,
         "kv_cache_dtype": None,
+        "reasoning_parser": "auto",
         "port_base": None,
         "startup_timeout": 1200,
         "extra_args": [],
@@ -200,9 +252,17 @@ def _extract_wrapper_vllm_args(argv: List[str]) -> tuple[List[str], Dict[str, An
 
     if (
         settings["download_dir"]
-        and not _option_present(cleaned[1:], "--agentic-vllm-download-dir")
+        and not _option_present(cleaned[1:], "--agentic-extraction-download-dir")
     ):
-        cleaned.extend(["--agentic-vllm-download-dir", str(settings["download_dir"])])
+        cleaned.extend(["--agentic-extraction-download-dir", str(settings["download_dir"])])
+    if (
+        settings["reasoning_parser"] is not None
+        and not _option_present(cleaned[1:], "--agentic-extraction-reasoning-parser")
+    ):
+        cleaned.extend([
+            "--agentic-extraction-reasoning-parser",
+            str(settings["reasoning_parser"]),
+        ])
 
     return cleaned, settings
 
@@ -214,6 +274,28 @@ def _with_expanded_agentic_defaults(argv: List[str]) -> List[str]:
     for option, values in DEFAULT_ARGS.items():
         if not _option_present(args, option):
             expanded_args.extend([option, *values])
+
+    if not _option_present(expanded_args, "--agentic-agent-model-name"):
+        model_name = _option_value(
+            expanded_args,
+            "--agentic-extraction-model-name",
+            DEFAULT_AGENTIC_LOCAL_MODEL,
+        )
+        expanded_args.extend(["--agentic-agent-model-name", str(model_name)])
+    if not _option_present(expanded_args, "--agentic-extraction-model-name"):
+        model_name = _option_value(
+            expanded_args,
+            "--agentic-agent-model-name",
+            DEFAULT_AGENTIC_LOCAL_MODEL,
+        )
+        expanded_args.extend(["--agentic-extraction-model-name", str(model_name)])
+    if not _option_present(expanded_args, "--agentic-extraction-server-url"):
+        server_url = _option_value(
+            expanded_args,
+            "--agentic-agent-server-url",
+            "http://localhost:8000/v1",
+        )
+        expanded_args.extend(["--agentic-extraction-server-url", str(server_url)])
 
     # Keep this last so this runner cannot accidentally launch the full oracle
     # model grid if a caller passes --model-types or --filter-extractor-types.
@@ -296,6 +378,12 @@ def _vllm_cmd(
         cmd.extend(["--dtype", str(settings["dtype"])])
     if settings["kv_cache_dtype"]:
         cmd.extend(["--kv-cache-dtype", str(settings["kv_cache_dtype"])])
+    reasoning_parser = _resolve_reasoning_parser(
+        settings.get("reasoning_parser"),
+        model_name,
+    )
+    if reasoning_parser and not _option_present(settings["extra_args"], "--reasoning-parser"):
+        cmd.extend(["--reasoning-parser", reasoning_parser])
     cmd.extend(settings["extra_args"])
     return cmd
 
@@ -307,8 +395,15 @@ def _start_local_vllm_servers(argv: List[str], settings: Dict[str, Any]) -> None
         return
 
     parsed = urlparse(server_url)
-    model_name = _option_value(args, "--agentic-agent-model-name", "nvidia/Gemma-4-31B-IT-NVFP4")
-    max_model_len = _option_value(args, "--agentic-vllm-max-model-len", "200000")
+    model_name = _option_value(args, "--agentic-agent-model-name", DEFAULT_AGENTIC_LOCAL_MODEL)
+    extraction_model_name = _option_value(args, "--agentic-extraction-model-name", model_name)
+    if str(extraction_model_name) != str(model_name):
+        raise ValueError(
+            "This wrapper starts one shared local vLLM server per GPU, so "
+            "--agentic-agent-model-name and --agentic-extraction-model-name must match. "
+            "Use --no-start-vllm with separately managed server URLs for different models."
+        )
+    max_model_len = _option_value(args, "--agentic-extraction-max-model-len", "200000")
     base_port = int(settings["port_base"] or parsed.port or 8000)
     output_dir = Path(_option_value(
         args,

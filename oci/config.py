@@ -66,6 +66,7 @@ class ExplicitFeatureExtractionConfig:
     vllm_gpu_memory_utilization: float = 0.9
     vllm_download_dir: Optional[str] = None  # Model download directory
     vllm_max_model_len: Optional[int] = None  # Max context length for start_server/python_api
+    vllm_reasoning_parser: Optional[str] = "auto"  # vLLM reasoning parser, or auto/none
 
     # Extraction settings
     extraction_batch_size: int = 32

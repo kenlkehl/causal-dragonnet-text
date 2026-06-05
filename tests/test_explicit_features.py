@@ -1,6 +1,11 @@
 import pytest
 
 from oci.config import ExperimentConfig, ExplicitFeatureSpec
+from oci.extraction import (
+    infer_vllm_reasoning_parser,
+    parse_extraction_response,
+    resolve_vllm_reasoning_parser,
+)
 from oci.models.explicit_feature_featurizer import (
     filter_specs_by_role,
     get_raw_explicit_features,
@@ -105,6 +110,36 @@ def test_raw_explicit_features_populates_provided_normalization_dicts():
 
     assert means["age"] == 65.0
     assert stds["age"] == 5.0
+
+
+def test_vllm_reasoning_parser_inference_and_resolution():
+    assert infer_vllm_reasoning_parser("nvidia/Qwen3.6-35B-A3B-NVFP4") == "qwen3"
+    assert infer_vllm_reasoning_parser("nvidia/Gemma-4-31B-IT-NVFP4") == "gemma4"
+    assert infer_vllm_reasoning_parser("meta-llama/Llama-3.1-8B-Instruct") is None
+
+    assert resolve_vllm_reasoning_parser(
+        "auto",
+        "nvidia/Qwen3.6-35B-A3B-NVFP4",
+    ) == "qwen3"
+    assert resolve_vllm_reasoning_parser(
+        "deepseek_r1",
+        "unknown/model",
+    ) == "deepseek_r1"
+    assert resolve_vllm_reasoning_parser("none", "nvidia/Gemma-4-31B-IT-NVFP4") is None
+
+
+def test_parse_extraction_response_strips_inline_reasoning_trace():
+    specs = [
+        ExplicitFeatureSpec(name="age", type="continuous", roles=["confounder"]),
+    ]
+
+    parsed = parse_extraction_response(
+        '<think>{"age": "not the answer"}</think>\n{"age": 71}',
+        specs,
+    )
+
+    assert parsed["age"].value == 71.0
+    assert parsed["age"].is_missing is False
 
 
 def test_experiment_config_rejects_old_explicit_confounder_keys():
