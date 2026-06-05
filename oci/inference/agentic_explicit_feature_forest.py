@@ -62,6 +62,17 @@ class SplitEvaluation:
     metrics: Dict[str, Any]
 
 
+@dataclass
+class BroadScreenPreparedFold:
+    """Baseline and proposal state prepared before broad-screen extraction."""
+
+    outer_fold: int
+    train_idx: np.ndarray
+    baseline_rows: List[Dict[str, Any]]
+    baseline_summary: Dict[str, Any]
+    proposals: List[AgenticFeatureProposal]
+
+
 def run_agentic_explicit_feature_forest(
     dataset: pd.DataFrame,
     config: AppliedInferenceConfig,
@@ -162,16 +173,24 @@ class AgenticFeatureSearchRunner:
             random_state=self.search_config.random_state,
         )
 
+        selected_by_outer_fold: Dict[int, List[ExplicitFeatureSpec]] = {}
+        if self.search_config.search_mode == "broad_screen":
+            selected_by_outer_fold = self._search_all_outer_trains_broad_screen(
+                outer_splits
+            )
+
         outer_predictions = []
         for outer_fold, (train_idx, test_idx) in enumerate(outer_splits, start=1):
             logger.info(
-                "Outer fold %s/%s: train=%s test=%s",
+                "Outer fold %s/%s final evaluation: train=%s test=%s",
                 outer_fold,
                 len(outer_splits),
                 len(train_idx),
                 len(test_idx),
             )
-            selected_specs = self._search_outer_train(outer_fold, train_idx)
+            selected_specs = selected_by_outer_fold.get(outer_fold)
+            if selected_specs is None:
+                selected_specs = self._search_outer_train(outer_fold, train_idx)
             self.dataset = self.extraction_provider.ensure_features(self.dataset, selected_specs)
 
             train_df = self.dataset.iloc[train_idx].copy()
@@ -420,7 +439,62 @@ class AgenticFeatureSearchRunner:
         outer_fold: int,
         outer_train_idx: np.ndarray,
     ) -> List[ExplicitFeatureSpec]:
-        """Run broad initial proposal, train-fold screening, and greedy CV refinement."""
+        """Run broad-screen search for one fold.
+
+        The main run path prepares all broad-screen folds first so their proposal
+        union can be extracted once. This single-fold path is retained for direct
+        use and tests.
+        """
+        prepared = self._prepare_broad_screen_fold(outer_fold, outer_train_idx)
+        if prepared.proposals:
+            self.dataset = self.extraction_provider.ensure_features(
+                self.dataset,
+                [_proposal_to_spec(proposal) for proposal in prepared.proposals],
+            )
+        return self._screen_and_refine_broad_candidates(prepared)
+
+    def _search_all_outer_trains_broad_screen(
+        self,
+        outer_splits: Sequence[Tuple[np.ndarray, np.ndarray]],
+    ) -> Dict[int, List[ExplicitFeatureSpec]]:
+        """Prepare all broad-screen folds, union-extract, then screen/refine."""
+        prepared_folds: List[BroadScreenPreparedFold] = []
+        proposed_specs: List[ExplicitFeatureSpec] = []
+        for outer_fold, (train_idx, test_idx) in enumerate(outer_splits, start=1):
+            logger.info(
+                "Outer fold %s/%s broad-screen proposal prep: train=%s test=%s",
+                outer_fold,
+                len(outer_splits),
+                len(train_idx),
+                len(test_idx),
+            )
+            prepared = self._prepare_broad_screen_fold(outer_fold, train_idx)
+            prepared_folds.append(prepared)
+            proposed_specs.extend(_proposal_to_spec(proposal) for proposal in prepared.proposals)
+
+        union_specs = _dedupe_specs_for_union_extraction(proposed_specs)
+        if union_specs:
+            logger.info(
+                "Broad-screen union extraction across outer folds: %s feature(s)",
+                len(union_specs),
+            )
+            self.dataset = self.extraction_provider.ensure_features(
+                self.dataset,
+                union_specs,
+            )
+
+        selected_by_outer_fold = {}
+        for prepared in prepared_folds:
+            selected_by_outer_fold[prepared.outer_fold] = (
+                self._screen_and_refine_broad_candidates(prepared)
+            )
+        return selected_by_outer_fold
+
+    def _prepare_broad_screen_fold(
+        self,
+        outer_fold: int,
+        outer_train_idx: np.ndarray,
+    ) -> BroadScreenPreparedFold:
         current_specs = list(self.initial_specs)
 
         baseline_rows, baseline_summary = self._evaluate_inner_cv(
@@ -502,6 +576,26 @@ class AgenticFeatureSearchRunner:
 
         if not proposals:
             logger.info("Outer fold %s broad_screen: no valid proposals", outer_fold)
+        return BroadScreenPreparedFold(
+            outer_fold=outer_fold,
+            train_idx=outer_train_idx,
+            baseline_rows=baseline_rows,
+            baseline_summary=baseline_summary,
+            proposals=proposals,
+        )
+
+    def _screen_and_refine_broad_candidates(
+        self,
+        prepared: BroadScreenPreparedFold,
+    ) -> List[ExplicitFeatureSpec]:
+        """Screen one prepared broad proposal list and greedily accept candidates."""
+        outer_fold = prepared.outer_fold
+        outer_train_idx = prepared.train_idx
+        current_specs = list(self.initial_specs)
+        baseline_rows = prepared.baseline_rows
+        proposals = prepared.proposals
+
+        if not proposals:
             return current_specs
 
         proposed_specs = [_proposal_to_spec(proposal) for proposal in proposals]
@@ -855,7 +949,7 @@ class OpenAICompatibleFeatureSearchAgent:
 
 
 class VLLMExplicitFeatureExtractionProvider:
-    """Ensure requested explicit feature columns exist, one variable at a time."""
+    """Ensure requested explicit feature columns exist, using grouped extraction."""
 
     def __init__(self, config: AppliedInferenceConfig, output_dir: Path):
         self.config = config
@@ -864,6 +958,7 @@ class VLLMExplicitFeatureExtractionProvider:
         self.cache = ExtractionCache(
             cache_dir=self.feature_config.cache_dir or str(self.output_dir)
         )
+        self._column_fingerprints: Dict[str, str] = {}
 
     def ensure_features(
         self,
@@ -871,39 +966,95 @@ class VLLMExplicitFeatureExtractionProvider:
         specs: List[ExplicitFeatureSpec],
     ) -> pd.DataFrame:
         dataset = dataset.copy()
+        missing_specs: List[ExplicitFeatureSpec] = []
         for spec in specs:
-            value_col = f"explicit_feat_{spec.name}"
-            missing_col = f"{value_col}_missing"
-            if value_col in dataset.columns and missing_col in dataset.columns:
+            if self._columns_available(dataset, spec):
                 continue
-            extracted_df = self._extract_one_spec(dataset, spec)
-            for col in extracted_df.columns:
-                dataset[col] = extracted_df[col].values
+
+            cached = self._load_cached_spec(dataset, spec)
+            if cached is not None:
+                self._merge_extracted_columns(dataset, cached, [spec])
+                continue
+
+            missing_specs.append(spec)
+
+        if missing_specs:
+            extracted_df = self._extract_spec_group_with_fallback(dataset, missing_specs)
+            self._merge_extracted_columns(dataset, extracted_df, missing_specs)
+            self._save_per_spec_caches(extracted_df, missing_specs)
         return dataset
 
-    def _extract_one_spec(self, dataset: pd.DataFrame, spec: ExplicitFeatureSpec) -> pd.DataFrame:
-        cache_config = {
-            "features": [spec],
-            "prompt_template_version": EXTRACTION_PROMPT_VERSION,
-            "vllm_model_name": self.feature_config.vllm_model_name,
-            "vllm_max_model_len": self.feature_config.vllm_max_model_len,
-            "extraction_temperature": self.feature_config.extraction_temperature,
-            "extraction_max_tokens": self.feature_config.extraction_max_tokens,
-            "extraction_max_text_length": self.feature_config.extraction_max_text_length,
-        }
-        cached = None
-        if self.feature_config.cache_enabled:
-            cached = self.cache.load_if_valid(
-                self.config.dataset_path or "in_memory_dataset",
-                cache_config,
-                expected_rows=len(dataset),
-            )
-        if cached is not None:
-            return cached
+    def _columns_available(self, dataset: pd.DataFrame, spec: ExplicitFeatureSpec) -> bool:
+        value_col = f"explicit_feat_{spec.name}"
+        missing_col = f"{value_col}_missing"
+        if value_col not in dataset.columns or missing_col not in dataset.columns:
+            return False
 
-        logger.info("Extracting agentic feature with LLM: %s", spec.name)
+        known_fingerprint = self._column_fingerprints.get(spec.name)
+        if known_fingerprint is None:
+            return True
+        requested_fingerprint = self._spec_fingerprint(spec)
+        if known_fingerprint == requested_fingerprint:
+            return True
+
+        logger.warning(
+            "Re-extracting agentic feature %s because the requested extraction "
+            "contract differs from the in-memory columns",
+            spec.name,
+        )
+        return False
+
+    def _load_cached_spec(
+        self,
+        dataset: pd.DataFrame,
+        spec: ExplicitFeatureSpec,
+    ) -> Optional[pd.DataFrame]:
+        if not self.feature_config.cache_enabled:
+            return None
+        cached = self.cache.load_if_valid(
+            self._dataset_cache_key(),
+            self._cache_config([spec]),
+            expected_rows=len(dataset),
+        )
+        if cached is not None:
+            logger.info("Using cached agentic feature extraction: %s", spec.name)
+        return cached
+
+    def _extract_spec_group_with_fallback(
+        self,
+        dataset: pd.DataFrame,
+        specs: List[ExplicitFeatureSpec],
+    ) -> pd.DataFrame:
+        try:
+            return self._extract_spec_group(dataset, specs)
+        except Exception:
+            if len(specs) == 1:
+                raise
+            midpoint = max(1, len(specs) // 2)
+            logger.warning(
+                "Grouped agentic extraction failed for %s features; splitting into "
+                "groups of %s and %s",
+                len(specs),
+                midpoint,
+                len(specs) - midpoint,
+                exc_info=True,
+            )
+            left = self._extract_spec_group_with_fallback(dataset, specs[:midpoint])
+            right = self._extract_spec_group_with_fallback(dataset, specs[midpoint:])
+            return pd.concat([left, right], axis=1)
+
+    def _extract_spec_group(
+        self,
+        dataset: pd.DataFrame,
+        specs: List[ExplicitFeatureSpec],
+    ) -> pd.DataFrame:
+        logger.info(
+            "Extracting %s agentic feature(s) with LLM: %s",
+            len(specs),
+            [spec.name for spec in specs],
+        )
         extractor = VLLMFeatureExtractor(
-            specs=[spec],
+            specs=specs,
             mode=self.feature_config.vllm_mode,
             server_url=self.feature_config.vllm_server_url or "http://localhost:8000/v1",
             model_name=self.feature_config.vllm_model_name,
@@ -917,20 +1068,64 @@ class VLLMExplicitFeatureExtractionProvider:
             max_text_length=self.feature_config.extraction_max_text_length,
         )
         try:
-            extracted_df = extractor.extract_to_dataframe(
+            return extractor.extract_to_dataframe(
                 dataset[self.config.text_column].tolist(),
                 batch_size=self.feature_config.extraction_batch_size,
             )
         finally:
             extractor.cleanup()
 
-        if self.feature_config.cache_enabled:
+    def _merge_extracted_columns(
+        self,
+        dataset: pd.DataFrame,
+        extracted_df: pd.DataFrame,
+        specs: List[ExplicitFeatureSpec],
+    ) -> None:
+        for spec in specs:
+            value_col = f"explicit_feat_{spec.name}"
+            missing_col = f"{value_col}_missing"
+            missing = [col for col in [value_col, missing_col] if col not in extracted_df.columns]
+            if missing:
+                raise ValueError(
+                    f"Extraction result for {spec.name!r} missing expected columns: {missing}"
+                )
+            dataset[value_col] = extracted_df[value_col].values
+            dataset[missing_col] = extracted_df[missing_col].values
+            self._column_fingerprints[spec.name] = self._spec_fingerprint(spec)
+
+    def _save_per_spec_caches(
+        self,
+        extracted_df: pd.DataFrame,
+        specs: List[ExplicitFeatureSpec],
+    ) -> None:
+        if not self.feature_config.cache_enabled:
+            return
+        for spec in specs:
+            value_col = f"explicit_feat_{spec.name}"
+            missing_col = f"{value_col}_missing"
             self.cache.save(
-                self.config.dataset_path or "in_memory_dataset",
-                cache_config,
-                extracted_df,
+                self._dataset_cache_key(),
+                self._cache_config([spec]),
+                extracted_df[[value_col, missing_col]].copy(),
             )
-        return extracted_df
+
+    def _dataset_cache_key(self) -> str:
+        return self.config.dataset_path or "in_memory_dataset"
+
+    def _cache_config(self, specs: List[ExplicitFeatureSpec]) -> Dict[str, Any]:
+        cache_config = {
+            "features": [_spec_extraction_contract_dict(spec) for spec in specs],
+            "prompt_template_version": EXTRACTION_PROMPT_VERSION,
+            "vllm_model_name": self.feature_config.vllm_model_name,
+            "vllm_max_model_len": self.feature_config.vllm_max_model_len,
+            "extraction_temperature": self.feature_config.extraction_temperature,
+            "extraction_max_tokens": self.feature_config.extraction_max_tokens,
+            "extraction_max_text_length": self.feature_config.extraction_max_text_length,
+        }
+        return cache_config
+
+    def _spec_fingerprint(self, spec: ExplicitFeatureSpec) -> str:
+        return json.dumps(self._cache_config([spec]), sort_keys=True, default=_json_default)
 
 
 class CausalForestExplicitEvaluator:
@@ -2389,6 +2584,50 @@ def _dedupe_feature_specs(specs: Sequence[ExplicitFeatureSpec]) -> List[Explicit
         seen.add(spec.name)
         deduped.append(spec)
     return deduped
+
+
+def _dedupe_specs_for_union_extraction(
+    specs: Sequence[ExplicitFeatureSpec],
+) -> List[ExplicitFeatureSpec]:
+    """Dedupe broad proposals for pre-extraction while surfacing name conflicts."""
+    deduped: List[ExplicitFeatureSpec] = []
+    seen_contracts: Dict[str, str] = {}
+    for spec in specs:
+        contract = _spec_extraction_contract_key(spec)
+        previous = seen_contracts.get(spec.name)
+        if previous is None:
+            seen_contracts[spec.name] = contract
+            deduped.append(spec)
+            continue
+        if previous != contract:
+            logger.warning(
+                "Broad-screen proposal name %s appeared with multiple extraction "
+                "contracts across folds; the first contract will be pre-extracted "
+                "and later incompatible requests will be re-extracted on demand",
+                spec.name,
+            )
+    return deduped
+
+
+def _spec_extraction_contract_dict(spec: ExplicitFeatureSpec) -> Dict[str, Any]:
+    """Return only fields that affect the extraction prompt and parser."""
+    return {
+        "name": spec.name,
+        "type": spec.type,
+        "categories": spec.categories,
+        "description": spec.description,
+        # Roles are omitted from the prompt; keep a stable placeholder because
+        # ExtractionCache's generic hash currently includes this field.
+        "roles": [],
+    }
+
+
+def _spec_extraction_contract_key(spec: ExplicitFeatureSpec) -> str:
+    return json.dumps(
+        _spec_extraction_contract_dict(spec),
+        sort_keys=True,
+        default=_json_default,
+    )
 
 
 def _screening_decision_payload(item: Dict[str, Any]) -> Dict[str, Any]:

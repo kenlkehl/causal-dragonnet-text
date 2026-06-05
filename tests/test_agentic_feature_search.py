@@ -19,6 +19,7 @@ from oci.inference.agentic_explicit_feature_forest import (
     AgenticFeatureProposal,
     OpenAICompatibleFeatureSearchAgent,
     SplitEvaluation,
+    VLLMExplicitFeatureExtractionProvider,
     apply_proposals,
     build_iteration_feedback,
     compare_candidate_to_baseline,
@@ -326,6 +327,233 @@ def test_extraction_cache_hash_includes_description_and_prompt_settings():
 
     assert _compute_config_hash(base) != desc_hash
     assert _compute_config_hash(base) != prompt_hash
+
+
+def _provider_config(tmp_path, cache_enabled=False):
+    return AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        explicit_features=ExplicitFeatureExtractionConfig(
+            enabled=True,
+            features=[],
+            cache_enabled=cache_enabled,
+        ),
+    )
+
+
+def test_agentic_extraction_provider_groups_missing_specs(monkeypatch, tmp_path):
+    calls = []
+
+    class FakeVLLMFeatureExtractor:
+        def __init__(self, specs, **kwargs):
+            self.specs = specs
+            calls.append({"spec_names": [spec.name for spec in specs], "kwargs": kwargs})
+
+        def extract_to_dataframe(self, texts, batch_size=32):
+            calls[-1]["texts"] = list(texts)
+            calls[-1]["batch_size"] = batch_size
+            data = {}
+            for spec in self.specs:
+                value_col = f"explicit_feat_{spec.name}"
+                if spec.type == "categorical":
+                    data[value_col] = [spec.categories[0]] * len(texts)
+                else:
+                    data[value_col] = list(range(len(texts)))
+                data[f"{value_col}_missing"] = [False] * len(texts)
+            return pd.DataFrame(data)
+
+        def cleanup(self):
+            calls[-1]["cleanup"] = True
+
+    monkeypatch.setattr(
+        "oci.inference.agentic_explicit_feature_forest.VLLMFeatureExtractor",
+        FakeVLLMFeatureExtractor,
+    )
+    provider = VLLMExplicitFeatureExtractionProvider(
+        config=_provider_config(tmp_path, cache_enabled=False),
+        output_dir=tmp_path,
+    )
+    df = pd.DataFrame({"clinical_text": ["note a", "note b"]})
+    specs = [
+        ExplicitFeatureSpec(
+            name="age",
+            type="continuous",
+            roles=["confounder"],
+            description="Age at baseline",
+        ),
+        ExplicitFeatureSpec(
+            name="ecog",
+            type="categorical",
+            categories=["0", "1"],
+            roles=["confounder"],
+            description="Baseline ECOG",
+        ),
+    ]
+
+    extracted = provider.ensure_features(df, specs)
+    provider.ensure_features(extracted, specs)
+
+    assert len(calls) == 1
+    assert calls[0]["spec_names"] == ["age", "ecog"]
+    assert calls[0]["texts"] == ["note a", "note b"]
+    assert calls[0]["cleanup"]
+    assert extracted["explicit_feat_age"].tolist() == [0, 1]
+    assert extracted["explicit_feat_ecog"].tolist() == ["0", "0"]
+
+
+def test_agentic_extraction_provider_saves_grouped_results_as_per_spec_cache(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+
+    class FakeVLLMFeatureExtractor:
+        def __init__(self, specs, **kwargs):
+            self.specs = specs
+            calls.append([spec.name for spec in specs])
+
+        def extract_to_dataframe(self, texts, batch_size=32):
+            data = {}
+            for spec in self.specs:
+                value_col = f"explicit_feat_{spec.name}"
+                data[value_col] = [float(len(spec.name))] * len(texts)
+                data[f"{value_col}_missing"] = [False] * len(texts)
+            return pd.DataFrame(data)
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(
+        "oci.inference.agentic_explicit_feature_forest.VLLMFeatureExtractor",
+        FakeVLLMFeatureExtractor,
+    )
+    config = _provider_config(tmp_path, cache_enabled=True)
+    specs = [
+        ExplicitFeatureSpec(
+            name="age",
+            type="continuous",
+            roles=["confounder"],
+            description="Age at baseline",
+        ),
+        ExplicitFeatureSpec(
+            name="ldh",
+            type="continuous",
+            roles=["confounder"],
+            description="Baseline LDH",
+        ),
+    ]
+    df = pd.DataFrame({"clinical_text": ["note a", "note b", "note c"]})
+
+    first_provider = VLLMExplicitFeatureExtractionProvider(config=config, output_dir=tmp_path)
+    first_provider.ensure_features(df, specs)
+    second_provider = VLLMExplicitFeatureExtractionProvider(config=config, output_dir=tmp_path)
+    cached = second_provider.ensure_features(df, specs)
+
+    assert calls == [["age", "ldh"]]
+    assert cached["explicit_feat_age"].tolist() == [3.0, 3.0, 3.0]
+    assert cached["explicit_feat_ldh"].tolist() == [3.0, 3.0, 3.0]
+
+
+def test_agentic_extraction_provider_reextracts_same_name_contract_change(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+
+    class FakeVLLMFeatureExtractor:
+        def __init__(self, specs, **kwargs):
+            self.specs = specs
+            calls.append([spec.description for spec in specs])
+
+        def extract_to_dataframe(self, texts, batch_size=32):
+            data = {}
+            for spec in self.specs:
+                value_col = f"explicit_feat_{spec.name}"
+                value = 1.0 if "first" in spec.description else 2.0
+                data[value_col] = [value] * len(texts)
+                data[f"{value_col}_missing"] = [False] * len(texts)
+            return pd.DataFrame(data)
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(
+        "oci.inference.agentic_explicit_feature_forest.VLLMFeatureExtractor",
+        FakeVLLMFeatureExtractor,
+    )
+    provider = VLLMExplicitFeatureExtractionProvider(
+        config=_provider_config(tmp_path, cache_enabled=False),
+        output_dir=tmp_path,
+    )
+    df = pd.DataFrame({"clinical_text": ["note"]})
+    first_spec = ExplicitFeatureSpec(
+        name="biomarker",
+        type="continuous",
+        roles=["confounder"],
+        description="first definition",
+    )
+    second_spec = ExplicitFeatureSpec(
+        name="biomarker",
+        type="continuous",
+        roles=["confounder"],
+        description="second definition",
+    )
+
+    extracted = provider.ensure_features(df, [first_spec])
+    reextracted = provider.ensure_features(extracted, [second_spec])
+
+    assert calls == [["first definition"], ["second definition"]]
+    assert reextracted["explicit_feat_biomarker"].tolist() == [2.0]
+
+
+def test_agentic_extraction_provider_reuses_role_only_contract_change(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+
+    class FakeVLLMFeatureExtractor:
+        def __init__(self, specs, **kwargs):
+            self.specs = specs
+            calls.append([spec.roles for spec in specs])
+
+        def extract_to_dataframe(self, texts, batch_size=32):
+            data = {}
+            for spec in self.specs:
+                value_col = f"explicit_feat_{spec.name}"
+                data[value_col] = [1.0] * len(texts)
+                data[f"{value_col}_missing"] = [False] * len(texts)
+            return pd.DataFrame(data)
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(
+        "oci.inference.agentic_explicit_feature_forest.VLLMFeatureExtractor",
+        FakeVLLMFeatureExtractor,
+    )
+    provider = VLLMExplicitFeatureExtractionProvider(
+        config=_provider_config(tmp_path, cache_enabled=False),
+        output_dir=tmp_path,
+    )
+    df = pd.DataFrame({"clinical_text": ["note"]})
+    confounder_spec = ExplicitFeatureSpec(
+        name="biomarker",
+        type="continuous",
+        roles=["confounder"],
+        description="Baseline biomarker",
+    )
+    modifier_spec = ExplicitFeatureSpec(
+        name="biomarker",
+        type="continuous",
+        roles=["effect_modifier"],
+        description="Baseline biomarker",
+    )
+
+    extracted = provider.ensure_features(df, [confounder_spec])
+    reused = provider.ensure_features(extracted, [modifier_spec])
+
+    assert calls == [[["confounder"]]]
+    assert reused["explicit_feat_biomarker"].tolist() == [1.0]
 
 
 class FakeOpenAICompletions:
@@ -1054,6 +1282,111 @@ def test_broad_screen_runner_screens_then_cv_accepts_candidates(tmp_path):
     } >= {"strong_confounder", "strong_modifier"}
     assert all(context["search_mode"] == "broad_screen" for context in agent.contexts)
     assert all(context["broad_candidate_count"] == 4 for context in agent.contexts)
+
+
+def test_broad_screen_runner_union_extracts_candidates_once_across_folds(tmp_path):
+    rng = np.random.default_rng(456)
+    n = 120
+    strong_confounder = rng.normal(size=n)
+    strong_modifier = rng.normal(size=n)
+    noise = rng.normal(size=n)
+    treatment = (strong_confounder + rng.normal(scale=0.15, size=n) > 0).astype(int)
+    outcome = (
+        0.8 * strong_confounder
+        + 0.2 * treatment
+        + 1.6 * treatment * strong_modifier
+        + rng.normal(scale=0.05, size=n)
+    )
+    low_missing = np.arange(n, dtype=float)
+    low_missing_mask = np.arange(n) % 4 != 0
+    low_missing[low_missing_mask] = np.nan
+    df = pd.DataFrame(
+        {
+            "patient_id": np.arange(n),
+            "clinical_text": [f"Patient {i}" for i in range(n)],
+            "treatment_indicator": treatment,
+            "outcome_indicator": outcome,
+            "source_strong_confounder": strong_confounder,
+            "source_strong_modifier": strong_modifier,
+            "source_low_coverage_feature": low_missing,
+            "source_noise_feature": noise,
+        }
+    )
+
+    class CountingExtractionProvider:
+        def __init__(self):
+            self.calls = []
+
+        def ensure_features(self, dataset, specs):
+            dataset = dataset.copy()
+            missing_specs = [
+                spec
+                for spec in specs
+                if f"explicit_feat_{spec.name}" not in dataset.columns
+            ]
+            if missing_specs:
+                self.calls.append([spec.name for spec in missing_specs])
+            for spec in missing_specs:
+                value_col = f"explicit_feat_{spec.name}"
+                source_col = f"source_{spec.name}"
+                values = (
+                    dataset[source_col].values
+                    if source_col in dataset.columns
+                    else np.arange(len(dataset), dtype=float)
+                )
+                dataset[value_col] = values
+                dataset[f"{value_col}_missing"] = pd.isna(values)
+            return dataset
+
+    extraction_provider = CountingExtractionProvider()
+    config = AppliedInferenceConfig(
+        outcome_type="continuous",
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        cv_folds=2,
+        architecture=ModelArchitectureConfig(
+            model_type="agentic_explicit_feature_forest",
+            explicit_feature_forest=ExplicitFeatureForestConfig(
+                n_estimators=8,
+                min_samples_leaf=2,
+                honest=False,
+                inference=False,
+            ),
+            agentic_feature_search=AgenticFeatureSearchConfig(
+                outer_folds=2,
+                inner_folds=2,
+                search_mode="broad_screen",
+                broad_candidate_count=4,
+                broad_screen_top_k=2,
+                min_feature_coverage=0.70,
+                role_diagnostic_score_delta_threshold=0.01,
+                min_r_loss_improvement=0.01,
+                min_improvement_fold_fraction=1.0,
+            ),
+        ),
+        explicit_features=ExplicitFeatureExtractionConfig(
+            enabled=True,
+            features=[],
+            cache_enabled=False,
+        ),
+    )
+
+    run_agentic_explicit_feature_forest(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "predictions.parquet",
+        proposal_agent=BroadCandidateAgent(),
+        extraction_provider=extraction_provider,
+        evaluator=BroadScreenEvaluator(),
+    )
+
+    assert extraction_provider.calls == [
+        [
+            "strong_confounder",
+            "strong_modifier",
+            "low_coverage_feature",
+            "noise_feature",
+        ]
+    ]
 
 
 def test_experiment_config_parses_agentic_search_config(tmp_path):
