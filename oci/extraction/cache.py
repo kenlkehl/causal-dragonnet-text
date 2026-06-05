@@ -10,11 +10,12 @@ import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+ROW_INDEX_COLUMN = "__oci_cache_row_index"
 
 
 def _compute_config_hash(config: Dict[str, Any]) -> str:
@@ -82,6 +83,19 @@ class ExtractionCache:
 
     def _get_cache_path(self, dataset_path: str, config: Dict[str, Any]) -> Path:
         """Get cache file path for given dataset and config."""
+        return self._get_cache_path_with_prefix(dataset_path, config, "extraction")
+
+    def _get_row_cache_path(self, dataset_path: str, config: Dict[str, Any]) -> Path:
+        """Get partial row-level cache file path for given dataset and config."""
+        return self._get_cache_path_with_prefix(dataset_path, config, "extraction_rows")
+
+    def _get_cache_path_with_prefix(
+        self,
+        dataset_path: str,
+        config: Dict[str, Any],
+        prefix: str,
+    ) -> Path:
+        """Get cache file path for given dataset/config and filename prefix."""
         dataset_hash = _compute_dataset_hash(dataset_path)
         config_hash = _compute_config_hash(config)
 
@@ -93,7 +107,17 @@ class ExtractionCache:
         cache_dir = base_dir / ".oci_cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
 
-        return cache_dir / f"extraction_{dataset_hash}_{config_hash}.parquet"
+        return cache_dir / f"{prefix}_{dataset_hash}_{config_hash}.parquet"
+
+    def _expected_columns(self, config: Dict[str, Any]) -> List[str]:
+        """Return value/missing columns expected for this extraction config."""
+        features = config.get('features', config.get('confounders', []))
+        expected_cols = []
+        for c in features:
+            name = c.get('name') if isinstance(c, dict) else c.name
+            expected_cols.append(f"explicit_feat_{name}")
+            expected_cols.append(f"explicit_feat_{name}_missing")
+        return expected_cols
 
     def load_if_valid(
         self,
@@ -130,13 +154,7 @@ class ExtractionCache:
                 return None
 
             # Verify expected columns exist
-            features = config.get('features', config.get('confounders', []))
-            expected_cols = []
-            for c in features:
-                name = c.get('name') if isinstance(c, dict) else c.name
-                expected_cols.append(f"explicit_feat_{name}")
-                expected_cols.append(f"explicit_feat_{name}_missing")
-
+            expected_cols = self._expected_columns(config)
             missing_cols = set(expected_cols) - set(cached_df.columns)
             if missing_cols:
                 logger.warning(f"Cache missing columns: {missing_cols}. Invalidating cache.")
@@ -168,6 +186,132 @@ class ExtractionCache:
         extracted_df.to_parquet(cache_path, index=False)
         logger.info(f"Saved extraction cache to: {cache_path} ({len(extracted_df)} rows)")
         return cache_path
+
+    def load_rows_if_valid(
+        self,
+        dataset_path: str,
+        config: Dict[str, Any],
+        expected_rows: Optional[int] = None,
+    ) -> Optional[pd.DataFrame]:
+        """Load partial row-level extraction cache if structurally valid.
+
+        Row caches contain only processed row positions. A row with
+        ``*_missing=True`` is still considered processed because the extractor
+        completed and determined the value was unavailable.
+        """
+        cache_path = self._get_row_cache_path(dataset_path, config)
+        if not cache_path.exists():
+            logger.info(f"Row cache miss: {cache_path} does not exist")
+            return None
+
+        try:
+            cached_df = pd.read_parquet(cache_path)
+            if ROW_INDEX_COLUMN not in cached_df.columns:
+                logger.warning(
+                    f"Row cache missing {ROW_INDEX_COLUMN}. Invalidating cache."
+                )
+                return None
+
+            expected_cols = self._expected_columns(config)
+            missing_cols = set(expected_cols) - set(cached_df.columns)
+            if missing_cols:
+                logger.warning(f"Row cache missing columns: {missing_cols}. Invalidating cache.")
+                return None
+
+            row_indices = pd.to_numeric(cached_df[ROW_INDEX_COLUMN], errors="coerce")
+            if row_indices.isna().any():
+                logger.warning("Row cache has non-numeric row indices. Invalidating cache.")
+                return None
+            row_indices = row_indices.astype(int)
+            if expected_rows is not None:
+                out_of_range = (row_indices < 0) | (row_indices >= expected_rows)
+                if out_of_range.any():
+                    logger.warning(
+                        "Row cache has row indices outside expected range. Invalidating cache."
+                    )
+                    return None
+
+            cached_df = cached_df.copy()
+            cached_df[ROW_INDEX_COLUMN] = row_indices.values
+            cached_df = (
+                cached_df.drop_duplicates(subset=[ROW_INDEX_COLUMN], keep="last")
+                .sort_values(ROW_INDEX_COLUMN)
+                .reset_index(drop=True)
+            )
+            logger.info(
+                f"Loaded row cache from: {cache_path} "
+                f"({len(cached_df)} processed rows)"
+            )
+            return cached_df[[ROW_INDEX_COLUMN, *expected_cols]]
+        except Exception as e:
+            logger.warning(f"Error loading row cache: {e}. Invalidating cache.")
+            return None
+
+    def save_rows(
+        self,
+        dataset_path: str,
+        config: Dict[str, Any],
+        row_indices: Sequence[int],
+        extracted_df: pd.DataFrame,
+    ) -> Path:
+        """Merge extracted rows into a partial row-level cache.
+
+        Existing rows are kept unless the same row index is saved again, in
+        which case the newer extraction wins.
+        """
+        row_indices = [int(idx) for idx in row_indices]
+        if len(row_indices) != len(extracted_df):
+            raise ValueError(
+                "row_indices length must match extracted_df rows: "
+                f"{len(row_indices)} != {len(extracted_df)}"
+            )
+
+        expected_cols = self._expected_columns(config)
+        missing_cols = set(expected_cols) - set(extracted_df.columns)
+        if missing_cols:
+            raise ValueError(f"extracted_df missing expected columns: {sorted(missing_cols)}")
+
+        cache_path = self._get_row_cache_path(dataset_path, config)
+        row_df = extracted_df[expected_cols].copy()
+        row_df.insert(0, ROW_INDEX_COLUMN, row_indices)
+
+        existing_df = self.load_rows_if_valid(dataset_path, config)
+        if existing_df is not None:
+            row_df = pd.concat([existing_df, row_df], ignore_index=True)
+        row_df = (
+            row_df.drop_duplicates(subset=[ROW_INDEX_COLUMN], keep="last")
+            .sort_values(ROW_INDEX_COLUMN)
+            .reset_index(drop=True)
+        )
+
+        temp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        row_df.to_parquet(temp_path, index=False)
+        temp_path.replace(cache_path)
+        logger.info(
+            f"Saved extraction row cache to: {cache_path} "
+            f"({len(row_df)} processed rows)"
+        )
+        return cache_path
+
+    def rows_to_complete_dataframe(
+        self,
+        rows_df: Optional[pd.DataFrame],
+        expected_rows: int,
+    ) -> Optional[pd.DataFrame]:
+        """Convert a row cache into a complete positional DataFrame if possible."""
+        if rows_df is None:
+            return None
+        unique_rows = rows_df.drop_duplicates(subset=[ROW_INDEX_COLUMN], keep="last")
+        if len(unique_rows) != expected_rows:
+            return None
+        row_indices = set(unique_rows[ROW_INDEX_COLUMN].astype(int).tolist())
+        if row_indices != set(range(expected_rows)):
+            return None
+        return (
+            unique_rows.sort_values(ROW_INDEX_COLUMN)
+            .drop(columns=[ROW_INDEX_COLUMN])
+            .reset_index(drop=True)
+        )
 
     def invalidate(self, dataset_path: str, config: Dict[str, Any]) -> bool:
         """Invalidate (delete) cached results.

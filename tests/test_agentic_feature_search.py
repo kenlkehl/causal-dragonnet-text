@@ -329,13 +329,14 @@ def test_extraction_cache_hash_includes_description_and_prompt_settings():
     assert _compute_config_hash(base) != prompt_hash
 
 
-def _provider_config(tmp_path, cache_enabled=False):
+def _provider_config(tmp_path, cache_enabled=False, batch_size=32):
     return AppliedInferenceConfig(
         dataset_path=str(tmp_path / "dataset.parquet"),
         explicit_features=ExplicitFeatureExtractionConfig(
             enabled=True,
             features=[],
             cache_enabled=cache_enabled,
+            extraction_batch_size=batch_size,
         ),
     )
 
@@ -451,6 +452,83 @@ def test_agentic_extraction_provider_saves_grouped_results_as_per_spec_cache(
     assert calls == [["age", "ldh"]]
     assert cached["explicit_feat_age"].tolist() == [3.0, 3.0, 3.0]
     assert cached["explicit_feat_ldh"].tolist() == [3.0, 3.0, 3.0]
+
+
+def test_agentic_extraction_provider_resumes_from_row_cache(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+    fail_on_call = {"value": 2}
+
+    class FakeVLLMFeatureExtractor:
+        def __init__(self, specs, **kwargs):
+            self.specs = specs
+
+        def extract_to_dataframe(self, texts, batch_size=32):
+            calls.append(list(texts))
+            if len(calls) == fail_on_call["value"]:
+                raise RuntimeError("simulated extraction interruption")
+            data = {}
+            for spec in self.specs:
+                value_col = f"explicit_feat_{spec.name}"
+                data[value_col] = [
+                    float(str(text).replace("note ", "")) for text in texts
+                ]
+                data[f"{value_col}_missing"] = [False] * len(texts)
+            return pd.DataFrame(data)
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(
+        "oci.inference.agentic_explicit_feature_forest.VLLMFeatureExtractor",
+        FakeVLLMFeatureExtractor,
+    )
+    config = _provider_config(tmp_path, cache_enabled=True, batch_size=2)
+    provider = VLLMExplicitFeatureExtractionProvider(config=config, output_dir=tmp_path)
+    df = pd.DataFrame({"clinical_text": [f"note {idx}" for idx in range(5)]})
+    specs = [
+        ExplicitFeatureSpec(
+            name="age",
+            type="continuous",
+            roles=["confounder"],
+            description="Age at baseline",
+        )
+    ]
+
+    with pytest.raises(RuntimeError, match="simulated extraction interruption"):
+        provider.ensure_features(df, specs)
+
+    row_cache = provider.cache.load_rows_if_valid(
+        config.dataset_path,
+        provider._cache_config(specs),
+        expected_rows=len(df),
+    )
+    assert row_cache is not None
+    assert row_cache["__oci_cache_row_index"].tolist() == [0, 1]
+
+    fail_on_call["value"] = -1
+    resumed_provider = VLLMExplicitFeatureExtractionProvider(
+        config=config,
+        output_dir=tmp_path,
+    )
+    resumed = resumed_provider.ensure_features(df, specs)
+
+    assert calls == [
+        ["note 0", "note 1"],
+        ["note 2", "note 3"],
+        ["note 2", "note 3"],
+        ["note 4"],
+    ]
+    assert resumed["explicit_feat_age"].tolist() == [0.0, 1.0, 2.0, 3.0, 4.0]
+    full_cache = resumed_provider.cache.load_if_valid(
+        config.dataset_path,
+        resumed_provider._cache_config(specs),
+        expected_rows=len(df),
+    )
+    assert full_cache is not None
+    assert full_cache["explicit_feat_age"].tolist() == [0.0, 1.0, 2.0, 3.0, 4.0]
 
 
 def test_agentic_extraction_provider_reextracts_same_name_contract_change(

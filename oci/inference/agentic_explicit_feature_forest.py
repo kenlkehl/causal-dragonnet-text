@@ -967,6 +967,7 @@ class VLLMExplicitFeatureExtractionProvider:
     ) -> pd.DataFrame:
         dataset = dataset.copy()
         missing_specs: List[ExplicitFeatureSpec] = []
+        row_caches: Dict[str, pd.DataFrame] = {}
         for spec in specs:
             if self._columns_available(dataset, spec):
                 continue
@@ -976,10 +977,36 @@ class VLLMExplicitFeatureExtractionProvider:
                 self._merge_extracted_columns(dataset, cached, [spec])
                 continue
 
+            row_cached = self._load_cached_spec_rows(dataset, spec)
+            if row_cached is not None:
+                complete = self.cache.rows_to_complete_dataframe(
+                    row_cached,
+                    expected_rows=len(dataset),
+                )
+                if complete is not None:
+                    logger.info(
+                        "Using complete row cache for agentic feature extraction: %s",
+                        spec.name,
+                    )
+                    self._merge_extracted_columns(dataset, complete, [spec])
+                    self._save_per_spec_caches(complete, [spec])
+                    continue
+                row_caches[spec.name] = row_cached
+
             missing_specs.append(spec)
 
         if missing_specs:
-            extracted_df = self._extract_spec_group_with_fallback(dataset, missing_specs)
+            if self.feature_config.cache_enabled:
+                extracted_df = self._extract_spec_group_resumable(
+                    dataset,
+                    missing_specs,
+                    row_caches,
+                )
+            else:
+                extracted_df = self._extract_spec_group_with_fallback(
+                    dataset,
+                    missing_specs,
+                )
             self._merge_extracted_columns(dataset, extracted_df, missing_specs)
             self._save_per_spec_caches(extracted_df, missing_specs)
         return dataset
@@ -1019,6 +1046,19 @@ class VLLMExplicitFeatureExtractionProvider:
         if cached is not None:
             logger.info("Using cached agentic feature extraction: %s", spec.name)
         return cached
+
+    def _load_cached_spec_rows(
+        self,
+        dataset: pd.DataFrame,
+        spec: ExplicitFeatureSpec,
+    ) -> Optional[pd.DataFrame]:
+        if not self.feature_config.cache_enabled:
+            return None
+        return self.cache.load_rows_if_valid(
+            self._dataset_cache_key(),
+            self._cache_config([spec]),
+            expected_rows=len(dataset),
+        )
 
     def _extract_spec_group_with_fallback(
         self,
@@ -1074,6 +1114,92 @@ class VLLMExplicitFeatureExtractionProvider:
             )
         finally:
             extractor.cleanup()
+
+    def _extract_spec_group_resumable(
+        self,
+        dataset: pd.DataFrame,
+        specs: List[ExplicitFeatureSpec],
+        row_caches: Dict[str, pd.DataFrame],
+    ) -> pd.DataFrame:
+        """Extract missing rows and flush row-level progress after each batch."""
+        expected_rows = len(dataset)
+        missing_by_spec = {
+            spec.name: self._missing_row_indices_for_spec(
+                expected_rows,
+                row_caches.get(spec.name),
+            )
+            for spec in specs
+        }
+        rows_to_extract = sorted(
+            {
+                row_idx
+                for missing_rows in missing_by_spec.values()
+                for row_idx in missing_rows
+            }
+        )
+
+        if rows_to_extract:
+            logger.info(
+                "Resumable agentic extraction will process %s/%s row(s) for %s feature(s)",
+                len(rows_to_extract),
+                expected_rows,
+                len(specs),
+            )
+        batch_size = max(1, int(self.feature_config.extraction_batch_size))
+        for start in range(0, len(rows_to_extract), batch_size):
+            batch_indices = rows_to_extract[start : start + batch_size]
+            batch_df = dataset.iloc[batch_indices]
+            logger.info(
+                "Extracting resumable agentic batch rows %s-%s (%s rows)",
+                batch_indices[0],
+                batch_indices[-1],
+                len(batch_indices),
+            )
+            batch_extracted = self._extract_spec_group_with_fallback(batch_df, specs)
+            for spec in specs:
+                value_col = f"explicit_feat_{spec.name}"
+                missing_col = f"{value_col}_missing"
+                self.cache.save_rows(
+                    self._dataset_cache_key(),
+                    self._cache_config([spec]),
+                    batch_indices,
+                    batch_extracted[[value_col, missing_col]].copy(),
+                )
+
+        return self._load_complete_rows_for_specs(dataset, specs)
+
+    def _missing_row_indices_for_spec(
+        self,
+        expected_rows: int,
+        rows_df: Optional[pd.DataFrame],
+    ) -> List[int]:
+        if rows_df is None:
+            return list(range(expected_rows))
+        processed = set(rows_df["__oci_cache_row_index"].astype(int).tolist())
+        return [idx for idx in range(expected_rows) if idx not in processed]
+
+    def _load_complete_rows_for_specs(
+        self,
+        dataset: pd.DataFrame,
+        specs: List[ExplicitFeatureSpec],
+    ) -> pd.DataFrame:
+        frames = []
+        for spec in specs:
+            rows_df = self.cache.load_rows_if_valid(
+                self._dataset_cache_key(),
+                self._cache_config([spec]),
+                expected_rows=len(dataset),
+            )
+            complete = self.cache.rows_to_complete_dataframe(
+                rows_df,
+                expected_rows=len(dataset),
+            )
+            if complete is None:
+                raise ValueError(
+                    f"Row-level extraction cache for {spec.name!r} is incomplete after extraction"
+                )
+            frames.append(complete)
+        return pd.concat(frames, axis=1)
 
     def _merge_extracted_columns(
         self,
