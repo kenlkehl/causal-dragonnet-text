@@ -297,6 +297,9 @@ class AgenticFeatureSearchConfig:
     max_additions_per_iter: int = 6
     max_removals_per_iter: int = 3
     min_feature_coverage: float = 0.70
+    search_mode: str = "broad_screen"
+    broad_candidate_count: int = 80
+    broad_screen_top_k: int = 20
 
     # Acceptance thresholds for inner-CV candidate feature sets.
     min_r_loss_improvement: float = 0.01
@@ -318,7 +321,7 @@ class AgenticFeatureSearchConfig:
     agent_model_name: str = "Qwen/Qwen2.5-7B-Instruct"
     agent_api_key: str = "EMPTY"
     agent_temperature: float = 0.0
-    agent_max_tokens: int = 2048
+    agent_max_tokens: int = 8000
     agent_schema_repair_attempts: int = 1
 
     # Prompt/context controls. Clinical text examples are sent to the proposal
@@ -346,6 +349,15 @@ class AgenticFeatureSearchConfig:
             raise ValueError("agentic_feature_search.max_removals_per_iter must be >= 0")
         if not 0.0 <= self.min_feature_coverage <= 1.0:
             raise ValueError("agentic_feature_search.min_feature_coverage must be in [0, 1]")
+        if self.search_mode not in {"iterative", "broad_screen"}:
+            raise ValueError(
+                "agentic_feature_search.search_mode must be one of "
+                "['iterative', 'broad_screen']"
+            )
+        if self.broad_candidate_count < 1:
+            raise ValueError("agentic_feature_search.broad_candidate_count must be >= 1")
+        if self.broad_screen_top_k < 1:
+            raise ValueError("agentic_feature_search.broad_screen_top_k must be >= 1")
         if not 0.0 <= self.min_improvement_fold_fraction <= 1.0:
             raise ValueError(
                 "agentic_feature_search.min_improvement_fold_fraction must be in [0, 1]"

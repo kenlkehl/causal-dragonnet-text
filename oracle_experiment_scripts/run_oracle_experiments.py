@@ -175,12 +175,15 @@ class ExperimentConfig:
     agentic_max_removals_per_iter: int = 0
     agentic_stop_after_rejected_iteration: bool = True
     agentic_min_feature_coverage: float = 0.70
+    agentic_search_mode: str = "broad_screen"
+    agentic_broad_candidate_count: int = 80
+    agentic_broad_screen_top_k: int = 20
     agentic_min_r_loss_improvement: float = 0.01
     agentic_min_improvement_fold_fraction: float = 2.0 / 3.0
     agentic_agent_server_url: Optional[str] = None
     agentic_agent_model_name: str = "Qwen/Qwen2.5-7B-Instruct"
     agentic_agent_api_key: str = "EMPTY"
-    agentic_agent_max_tokens: int = 2048
+    agentic_agent_max_tokens: int = 8000
     agentic_agent_context_chars: int = 4800
     agentic_agent_context_examples: int = 3
     agentic_save_agent_context: bool = False
@@ -1583,6 +1586,7 @@ def _load_agentic_iteration_variables_tried(
                 "outer_fold": outer_fold,
                 "iteration": iteration,
                 "validation_rejected_variables": [],
+                "screened_candidates": [],
                 "candidates": [],
             }
         return by_iteration[key]
@@ -1637,12 +1641,36 @@ def _load_agentic_iteration_variables_tried(
                             ),
                         }
                     )
+            elif event.get("event") == "broad_screening" and isinstance(payload, list):
+                row = row_for(event)
+                for item in payload:
+                    if not isinstance(item, dict):
+                        continue
+                    row["screened_candidates"].append(
+                        {
+                            "candidate_id": item.get("candidate_id"),
+                            "rank": item.get("rank"),
+                            "variables": [
+                                _summarize_agentic_proposal(proposal)
+                                for proposal in item.get("variables", []) or []
+                            ],
+                            "screening_score": item.get("screening_score"),
+                            "confounder_score": item.get("confounder_score"),
+                            "modifier_score": item.get("modifier_score"),
+                            "kept_for_cv": bool(item.get("kept_for_cv", False)),
+                            "cv_accepted": bool(item.get("cv_accepted", False)),
+                            "screening_rejection_reason": item.get(
+                                "screening_rejection_reason"
+                            ),
+                        }
+                    )
 
     return [
         by_iteration[key]
         for key in sorted(by_iteration)
         if (
             by_iteration[key]["validation_rejected_variables"]
+            or by_iteration[key]["screened_candidates"]
             or by_iteration[key]["candidates"]
         )
     ]
@@ -1745,6 +1773,9 @@ def run_agentic_experiment(
                 max_additions_per_iter=config.agentic_max_additions_per_iter,
                 max_removals_per_iter=config.agentic_max_removals_per_iter,
                 min_feature_coverage=config.agentic_min_feature_coverage,
+                search_mode=config.agentic_search_mode,
+                broad_candidate_count=config.agentic_broad_candidate_count,
+                broad_screen_top_k=config.agentic_broad_screen_top_k,
                 min_r_loss_improvement=config.agentic_min_r_loss_improvement,
                 min_improvement_fold_fraction=config.agentic_min_improvement_fold_fraction,
                 agent_server_url=agent_server_url,
@@ -1946,12 +1977,15 @@ def generate_experiment_grid(
     agentic_max_removals_per_iter: int = 0,
     agentic_stop_after_rejected_iteration_options: Optional[List[bool]] = None,
     agentic_min_feature_coverage: float = 0.70,
+    agentic_search_modes: Optional[List[str]] = None,
+    agentic_broad_candidate_count: int = 80,
+    agentic_broad_screen_top_k: int = 20,
     agentic_min_r_loss_improvement: float = 0.01,
     agentic_min_improvement_fold_fraction: float = 2.0 / 3.0,
     agentic_agent_server_url: Optional[str] = None,
     agentic_agent_model_name: str = "nvidia/Gemma-4-31B-IT-NVFP4",
     agentic_agent_api_key: str = "EMPTY",
-    agentic_agent_max_tokens: int = 2048,
+    agentic_agent_max_tokens: int = 8000,
     agentic_agent_context_chars: int = 4800,
     agentic_agent_context_examples: int = 3,
     agentic_save_agent_context: bool = False,
@@ -2163,6 +2197,8 @@ def generate_experiment_grid(
             ]
         if agentic_stop_after_rejected_iteration_options is None:
             agentic_stop_after_rejected_iteration_options = [True]
+        if agentic_search_modes is None:
+            agentic_search_modes = ["broad_screen"]
 
         invalid_strategies = (
             set(agentic_initial_feature_strategies)
@@ -2174,15 +2210,27 @@ def generate_experiment_grid(
                 f"{sorted(invalid_strategies)}. "
                 f"Valid strategies: {sorted(AGENTIC_INITIAL_FEATURE_STRATEGIES)}"
             )
+        invalid_search_modes = set(agentic_search_modes) - {"iterative", "broad_screen"}
+        if invalid_search_modes:
+            raise ValueError(
+                "Invalid agentic search modes: "
+                f"{sorted(invalid_search_modes)}. "
+                "Valid modes: ['broad_screen', 'iterative']"
+            )
+
+        agentic_mode_iterations = []
+        for search_mode in agentic_search_modes:
+            iterations = [1] if search_mode == "broad_screen" else agentic_iteration_options
+            agentic_mode_iterations.extend((search_mode, n_iter) for n_iter in iterations)
 
         for (
             (dataset_path, dataset_name),
-            n_iter,
+            (search_mode, n_iter),
             n_initial,
             stop_after_rejected_iteration,
         ) in itertools.product(
             datasets,
-            agentic_iteration_options,
+            agentic_mode_iterations,
             agentic_initial_feature_counts,
             agentic_stop_after_rejected_iteration_options,
         ):
@@ -2208,6 +2256,9 @@ def generate_experiment_grid(
                     agentic_max_removals_per_iter=agentic_max_removals_per_iter,
                     agentic_stop_after_rejected_iteration=stop_after_rejected_iteration,
                     agentic_min_feature_coverage=agentic_min_feature_coverage,
+                    agentic_search_mode=search_mode,
+                    agentic_broad_candidate_count=agentic_broad_candidate_count,
+                    agentic_broad_screen_top_k=agentic_broad_screen_top_k,
                     agentic_min_r_loss_improvement=agentic_min_r_loss_improvement,
                     agentic_min_improvement_fold_fraction=agentic_min_improvement_fold_fraction,
                     agentic_agent_server_url=agentic_agent_server_url,
@@ -2700,6 +2751,29 @@ def main():
         help="Maximum removal proposals accepted for evaluation per agentic iteration."
     )
     parser.add_argument(
+        "--agentic-search-modes",
+        type=str,
+        nargs="+",
+        default=["broad_screen"],
+        choices=["iterative", "broad_screen"],
+        help=(
+            "Agentic feature-search modes to grid over. broad_screen is the "
+            "default and uses one high-recall proposal pass plus screening."
+        )
+    )
+    parser.add_argument(
+        "--agentic-broad-candidate-count",
+        type=int,
+        default=80,
+        help="Maximum initial candidate proposals requested in broad_screen mode."
+    )
+    parser.add_argument(
+        "--agentic-broad-screen-top-k",
+        type=int,
+        default=20,
+        help="Number of screened candidates retained for inner-CV refinement."
+    )
+    parser.add_argument(
         "--agentic-stop-after-rejected-iteration",
         type=_parse_bool,
         nargs="+",
@@ -2749,7 +2823,7 @@ def main():
     parser.add_argument(
         "--agentic-agent-max-tokens",
         type=int,
-        default=2048,
+        default=8000,
         help="Maximum generation tokens for the feature proposal agent."
     )
     parser.add_argument(
@@ -2866,6 +2940,10 @@ def main():
         parser.error("--agentic-iterations must be >= 1")
     if args.agentic_inner_folds < 2:
         parser.error("--agentic-inner-folds must be >= 2")
+    if args.agentic_broad_candidate_count < 1:
+        parser.error("--agentic-broad-candidate-count must be >= 1")
+    if args.agentic_broad_screen_top_k < 1:
+        parser.error("--agentic-broad-screen-top-k must be >= 1")
     if args.agentic_agent_max_tokens < 1:
         parser.error("--agentic-agent-max-tokens must be >= 1")
     if args.agentic_agent_context_chars < 0:
@@ -2904,6 +2982,9 @@ def main():
             args.agentic_stop_after_rejected_iteration
         ),
         agentic_min_feature_coverage=args.agentic_min_feature_coverage,
+        agentic_search_modes=args.agentic_search_modes,
+        agentic_broad_candidate_count=args.agentic_broad_candidate_count,
+        agentic_broad_screen_top_k=args.agentic_broad_screen_top_k,
         agentic_min_r_loss_improvement=args.agentic_min_r_loss_improvement,
         agentic_min_improvement_fold_fraction=args.agentic_min_improvement_fold_fraction,
         agentic_agent_server_url=args.agentic_agent_server_url,
@@ -3027,16 +3108,20 @@ def main():
         print(f"LR values:   {', '.join(str(v) for v in lr_values)}")
         print(f"Epoch counts:{', '.join(str(v) for v in epoch_values)}")
     if agentic_pending:
+        agentic_search_modes = sorted(set(c.agentic_search_mode for c in agentic_pending))
         agentic_iters = sorted(set(c.agentic_max_iterations for c in agentic_pending))
         initial_counts = sorted(set(c.agentic_initial_feature_count for c in agentic_pending))
         initial_strategies = sorted(set(c.agentic_initial_feature_strategy for c in agentic_pending))
         stop_after_rejected = sorted(
             set(c.agentic_stop_after_rejected_iteration for c in agentic_pending)
         )
+        broad_candidate_counts = sorted(set(c.agentic_broad_candidate_count for c in agentic_pending))
+        broad_screen_top_ks = sorted(set(c.agentic_broad_screen_top_k for c in agentic_pending))
         agent_max_tokens = sorted(set(c.agentic_agent_max_tokens for c in agentic_pending))
         agent_context_chars = sorted(set(c.agentic_agent_context_chars for c in agentic_pending))
         raw_output_flags = sorted(set(c.agentic_save_agent_raw_output for c in agentic_pending))
         vllm_modes = sorted(set(c.agentic_vllm_mode for c in agentic_pending))
+        print(f"Agentic search modes: {', '.join(agentic_search_modes)}")
         print(f"Agentic iterations: {', '.join(str(v) for v in agentic_iters)}")
         print(f"Agentic initial counts: {', '.join(str(v) for v in initial_counts)}")
         print(f"Agentic initial strategies: {', '.join(initial_strategies)}")
@@ -3044,6 +3129,8 @@ def main():
             "Agentic stop after rejected: "
             f"{', '.join(str(v) for v in stop_after_rejected)}"
         )
+        print(f"Agentic broad candidate counts: {', '.join(str(v) for v in broad_candidate_counts)}")
+        print(f"Agentic broad screen top-k: {', '.join(str(v) for v in broad_screen_top_ks)}")
         print(f"Agentic agent max tokens: {', '.join(str(v) for v in agent_max_tokens)}")
         print(f"Agentic agent context chars: {', '.join(str(v) for v in agent_context_chars)}")
         print(f"Agentic save raw output: {', '.join(str(v) for v in raw_output_flags)}")
@@ -3282,6 +3369,9 @@ def main():
                       'flp_max_length', 'flp_downprojection_dim',
                       'use_explicit_confounders', 'learning_rate', 'epochs',
                       'agentic_max_iterations',
+                      'agentic_search_mode',
+                      'agentic_broad_candidate_count',
+                      'agentic_broad_screen_top_k',
                       'agentic_initial_feature_count',
                       'agentic_initial_feature_strategy',
                       'agentic_initial_feature_names',

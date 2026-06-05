@@ -57,6 +57,9 @@ def main():
     parser.add_argument("--max-iterations", type=int, default=3)
     parser.add_argument("--max-additions-per-iter", type=int, default=6)
     parser.add_argument("--max-removals-per-iter", type=int, default=3)
+    parser.add_argument("--search-mode", default="broad_screen", choices=["iterative", "broad_screen"])
+    parser.add_argument("--broad-candidate-count", type=int, default=80)
+    parser.add_argument("--broad-screen-top-k", type=int, default=20)
 
     parser.add_argument("--cf-n-estimators", type=int, default=200)
     parser.add_argument("--cf-min-samples-leaf", type=int, default=10)
@@ -77,12 +80,16 @@ def main():
     parser.add_argument("--agent-server-url", default="http://localhost:8000/v1")
     parser.add_argument("--agent-model-name", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--agent-api-key", default="EMPTY")
-    parser.add_argument("--agent-max-tokens", type=int, default=2048)
+    parser.add_argument("--agent-max-tokens", type=int, default=8000)
     parser.add_argument("--agent-context-chars", type=int, default=4800)
     parser.add_argument("--agent-context-examples", type=int, default=3)
     parser.add_argument("--save-agent-context", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+    if args.broad_candidate_count < 1:
+        parser.error("--broad-candidate-count must be >= 1")
+    if args.broad_screen_top_k < 1:
+        parser.error("--broad-screen-top-k must be >= 1")
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -123,6 +130,9 @@ def main():
                 max_iterations=args.max_iterations,
                 max_additions_per_iter=args.max_additions_per_iter,
                 max_removals_per_iter=args.max_removals_per_iter,
+                search_mode=args.search_mode,
+                broad_candidate_count=args.broad_candidate_count,
+                broad_screen_top_k=args.broad_screen_top_k,
                 agent_server_url=args.agent_server_url,
                 agent_model_name=args.agent_model_name,
                 agent_api_key=args.agent_api_key,

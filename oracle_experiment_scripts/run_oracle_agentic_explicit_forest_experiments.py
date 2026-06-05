@@ -6,14 +6,16 @@ only the agentic_explicit_feature_forest method, but uses a broader default
 grid and more repeats:
 
     base conditions per dataset:
-      agentic_iterations: 1, 2, 3
+      agentic_search_modes: broad_screen
+      agentic_iterations: 1 (broad_screen ignores iterative round counts)
       initial_feature_counts: 0, 2, 5
       initial_feature_strategies: true_first, modifiers_first, mixed, distractors
       stop_after_rejected_iteration: true, false
 
 The count=0 condition uses the "none" strategy internally, so this produces
-54 base conditions per dataset. With the default 30 repeats, that is 1620
-experiments per dataset before --max-experiments or --resume filtering.
+18 base conditions per dataset in broad_screen mode. With the default 30
+repeats, that is 540 experiments per dataset before --max-experiments or
+--resume filtering.
 
 The default LLM budgets are intentionally large:
     agent proposal context chars: 200000
@@ -51,7 +53,10 @@ import run_oracle_experiments as oracle_runner
 DEFAULT_ARGS: Dict[str, List[str]] = {
     "--output-dir": ["../pcori_experiments/oracle_agentic_explicit_forest_expanded"],
     "--n-repeats": ["30"],
-    "--agentic-iterations": ["1", "2", "3"],
+    "--agentic-iterations": ["1"],
+    "--agentic-search-modes": ["broad_screen"],
+    "--agentic-broad-candidate-count": ["80"],
+    "--agentic-broad-screen-top-k": ["20"],
     "--agentic-initial-feature-counts": ["0", "2", "5"],
     "--agentic-initial-feature-strategies": [
         "true_first",

@@ -558,6 +558,72 @@ class RejectThenAcceptEvaluator:
         return SplitEvaluation(predictions=predictions, metrics=metrics)
 
 
+class BroadCandidateAgent:
+    def __init__(self):
+        self.contexts = []
+
+    def propose(self, context):
+        self.contexts.append(context)
+        return [
+            {
+                "action": "add",
+                "name": "strong_confounder",
+                "type": "continuous",
+                "roles": ["confounder", "effect_modifier"],
+                "description": "Strong baseline confounder",
+            },
+            {
+                "action": "add",
+                "name": "strong_modifier",
+                "type": "continuous",
+                "roles": ["confounder", "effect_modifier"],
+                "description": "Strong baseline effect modifier",
+            },
+            {
+                "action": "add",
+                "name": "low_coverage_feature",
+                "type": "continuous",
+                "roles": ["confounder"],
+                "description": "Low coverage baseline variable",
+            },
+            {
+                "action": "add",
+                "name": "noise_feature",
+                "type": "continuous",
+                "roles": ["confounder", "effect_modifier"],
+                "description": "Noise baseline variable",
+            },
+        ]
+
+
+class BroadScreenEvaluator:
+    def evaluate_split(self, train_df, test_df, specs, fold_id):
+        names = {spec.name for spec in specs}
+        selected_signal_count = int("strong_confounder" in names) + int(
+            "strong_modifier" in names
+        )
+        r_loss = 1.0 - 0.30 * selected_signal_count
+        predictions = test_df.copy()
+        predictions["pred_ite_prob"] = 0.0
+        predictions["pred_y0_prob"] = 0.40
+        predictions["pred_y1_prob"] = 0.50
+        predictions["pred_propensity_prob"] = 0.50
+        predictions["cv_fold"] = fold_id
+        metrics = {
+            "fold": fold_id,
+            "n_train": len(train_df),
+            "n_test": len(test_df),
+            "n_explicit_features": len(specs),
+            "n_x_features": int("strong_modifier" in names),
+            "n_w_features": int("strong_confounder" in names),
+            "ate_estimate": 0.0,
+            "r_loss": r_loss,
+            "outcome_auroc": 0.70,
+            "treatment_auroc": 0.75,
+        }
+        return SplitEvaluation(predictions=predictions, metrics=metrics)
+
+
 def test_agentic_runner_accepts_inner_cv_improvement_without_true_ite_leakage(tmp_path):
     df = pd.DataFrame(
         {
@@ -589,6 +655,7 @@ def test_agentic_runner_accepts_inner_cv_improvement_without_true_ite_leakage(tm
             agentic_feature_search=AgenticFeatureSearchConfig(
                 outer_folds=2,
                 inner_folds=2,
+                search_mode="iterative",
                 max_iterations=1,
                 min_r_loss_improvement=0.01,
                 min_improvement_fold_fraction=1.0,
@@ -675,6 +742,7 @@ def test_agentic_runner_checks_coverage_only_for_proposed_features(tmp_path):
             agentic_feature_search=AgenticFeatureSearchConfig(
                 outer_folds=2,
                 inner_folds=2,
+                search_mode="iterative",
                 max_iterations=1,
                 min_feature_coverage=0.70,
                 min_r_loss_improvement=0.01,
@@ -760,6 +828,7 @@ def test_agentic_runner_can_persist_raw_agent_output_when_enabled(tmp_path):
             agentic_feature_search=AgenticFeatureSearchConfig(
                 outer_folds=2,
                 inner_folds=2,
+                search_mode="iterative",
                 max_iterations=1,
                 min_r_loss_improvement=0.01,
                 min_improvement_fold_fraction=1.0,
@@ -827,6 +896,7 @@ def test_agentic_runner_feeds_rejection_reasons_to_next_iteration(tmp_path):
             agentic_feature_search=AgenticFeatureSearchConfig(
                 outer_folds=2,
                 inner_folds=2,
+                search_mode="iterative",
                 max_iterations=2,
                 min_r_loss_improvement=0.01,
                 min_improvement_fold_fraction=1.0,
@@ -867,6 +937,125 @@ def test_agentic_runner_feeds_rejection_reasons_to_next_iteration(tmp_path):
         )
 
 
+def test_broad_screen_runner_screens_then_cv_accepts_candidates(tmp_path):
+    rng = np.random.default_rng(123)
+    n = 120
+    strong_confounder = rng.normal(size=n)
+    strong_modifier = rng.normal(size=n)
+    noise = rng.normal(size=n)
+    treatment = (strong_confounder + rng.normal(scale=0.15, size=n) > 0).astype(int)
+    outcome = (
+        0.8 * strong_confounder
+        + 0.2 * treatment
+        + 1.6 * treatment * strong_modifier
+        + rng.normal(scale=0.05, size=n)
+    )
+    low_missing = np.arange(n, dtype=float)
+    low_missing_mask = np.arange(n) % 4 != 0
+    low_missing[low_missing_mask] = np.nan
+    df = pd.DataFrame(
+        {
+            "patient_id": np.arange(n),
+            "clinical_text": [f"Patient {i}" for i in range(n)],
+            "treatment_indicator": treatment,
+            "outcome_indicator": outcome,
+            "explicit_feat_strong_confounder": strong_confounder,
+            "explicit_feat_strong_confounder_missing": False,
+            "explicit_feat_strong_modifier": strong_modifier,
+            "explicit_feat_strong_modifier_missing": False,
+            "explicit_feat_low_coverage_feature": low_missing,
+            "explicit_feat_low_coverage_feature_missing": low_missing_mask,
+            "explicit_feat_noise_feature": noise,
+            "explicit_feat_noise_feature_missing": False,
+        }
+    )
+    agent = BroadCandidateAgent()
+    output_path = tmp_path / "predictions.parquet"
+    config = AppliedInferenceConfig(
+        outcome_type="continuous",
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        cv_folds=2,
+        architecture=ModelArchitectureConfig(
+            model_type="agentic_explicit_feature_forest",
+            explicit_feature_forest=ExplicitFeatureForestConfig(
+                n_estimators=8,
+                min_samples_leaf=2,
+                honest=False,
+                inference=False,
+            ),
+            agentic_feature_search=AgenticFeatureSearchConfig(
+                outer_folds=2,
+                inner_folds=2,
+                search_mode="broad_screen",
+                broad_candidate_count=4,
+                broad_screen_top_k=2,
+                min_feature_coverage=0.70,
+                role_diagnostic_score_delta_threshold=0.01,
+                min_r_loss_improvement=0.01,
+                min_improvement_fold_fraction=1.0,
+            ),
+        ),
+        explicit_features=ExplicitFeatureExtractionConfig(
+            enabled=True,
+            features=[],
+            cache_enabled=False,
+        ),
+    )
+
+    run_agentic_explicit_feature_forest(
+        dataset=df,
+        config=config,
+        output_path=output_path,
+        proposal_agent=agent,
+        extraction_provider=FakeExtractionProvider(),
+        evaluator=BroadScreenEvaluator(),
+    )
+
+    feature_sets = json.loads(
+        (tmp_path / "agentic_feature_search" / "feature_sets.json").read_text()
+    )
+    selected_names = {
+        feature["name"]
+        for row in feature_sets
+        if row["stage"] == "selected"
+        for feature in row["features"]
+    }
+    assert {"strong_confounder", "strong_modifier"} <= selected_names
+    assert "low_coverage_feature" not in selected_names
+
+    screening = pd.read_csv(tmp_path / "agentic_feature_search" / "screening_metrics.csv")
+    kept = set(screening.loc[screening["kept_for_cv"], "candidate_id"])
+    accepted = set(screening.loc[screening["cv_accepted"], "candidate_id"])
+    assert {"strong_confounder", "strong_modifier"} <= kept
+    assert {"strong_confounder", "strong_modifier"} <= accepted
+    low_coverage_reasons = set(
+        screening.loc[
+            screening["candidate_id"] == "low_coverage_feature",
+            "screening_rejection_reason",
+        ]
+    )
+    assert "low_feature_coverage" in low_coverage_reasons
+
+    decision_lines = (
+        tmp_path / "agentic_feature_search" / "agent_decisions.jsonl"
+    ).read_text().splitlines()
+    decisions = [json.loads(line) for line in decision_lines]
+    events = [decision["event"] for decision in decisions]
+    assert "broad_screening" in events
+    broad_payload = next(
+        decision["payload"]
+        for decision in decisions
+        if decision["event"] == "broad_screening"
+    )
+    assert {
+        item["candidate_id"]
+        for item in broad_payload
+        if item["cv_accepted"]
+    } >= {"strong_confounder", "strong_modifier"}
+    assert all(context["search_mode"] == "broad_screen" for context in agent.contexts)
+    assert all(context["broad_candidate_count"] == 4 for context in agent.contexts)
+
+
 def test_experiment_config_parses_agentic_search_config(tmp_path):
     dataset_path = tmp_path / "dataset.parquet"
     pd.DataFrame(
@@ -897,7 +1086,12 @@ def test_experiment_config_parses_agentic_search_config(tmp_path):
         }
     )
 
-    assert config.applied_inference.architecture.agentic_feature_search.outer_folds == 3
+    search_config = config.applied_inference.architecture.agentic_feature_search
+    assert search_config.outer_folds == 3
+    assert search_config.search_mode == "broad_screen"
+    assert search_config.broad_candidate_count == 80
+    assert search_config.broad_screen_top_k == 20
+    assert search_config.agent_max_tokens == 8000
     empty_start = ExperimentConfig.from_dict(
         {
             "applied_inference": {
@@ -930,7 +1124,7 @@ def test_oracle_grid_propagates_agentic_raw_output_flag():
         ],
         filter_model_types=["agentic_explicit_feature_forest"],
         filter_extractor_types=["agentic_explicit_features"],
-        agentic_iteration_options=[1],
+        agentic_iteration_options=[1, 2],
         agentic_initial_feature_counts=[0],
         agentic_initial_feature_strategies=["true_first"],
         agentic_stop_after_rejected_iteration_options=[True],
@@ -939,3 +1133,7 @@ def test_oracle_grid_propagates_agentic_raw_output_flag():
 
     assert configs
     assert all(config.agentic_save_agent_raw_output for config in configs)
+    assert all(config.agentic_search_mode == "broad_screen" for config in configs)
+    assert {config.agentic_max_iterations for config in configs} == {1}
+    assert all(config.agentic_broad_candidate_count == 80 for config in configs)
+    assert all(config.agentic_broad_screen_top_k == 20 for config in configs)
