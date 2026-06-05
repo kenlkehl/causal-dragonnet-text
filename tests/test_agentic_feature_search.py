@@ -357,6 +357,7 @@ def test_agentic_vllm_wrapper_adds_autodetected_reasoning_parser():
         "max_num_batched_tokens": None,
         "dtype": None,
         "kv_cache_dtype": None,
+        "quantization": None,
         "reasoning_parser": "auto",
         "extra_args": [],
     }
@@ -391,6 +392,20 @@ def test_agentic_vllm_wrapper_adds_autodetected_reasoning_parser():
 
     assert parsed_settings["reasoning_parser"] == "qwen3"
     assert cleaned[-2:] == ["--agentic-extraction-reasoning-parser", "qwen3"]
+
+    parsed_settings = _extract_wrapper_vllm_args([
+        "runner.py",
+        "--vllm-quantization",
+        "modelopt",
+    ])[1]
+    quantized_cmd = _vllm_cmd(
+        server_url="http://localhost:8000/v1",
+        model_name="nvidia/Qwen3.6-35B-A3B-NVFP4",
+        max_model_len="200000",
+        settings=parsed_settings,
+    )
+
+    assert quantized_cmd[quantized_cmd.index("--quantization") + 1] == "modelopt"
 
     expanded = _with_expanded_agentic_defaults([
         "runner.py",

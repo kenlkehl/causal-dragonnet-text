@@ -27,6 +27,7 @@ By default this wrapper starts one local vLLM OpenAI-compatible server per
 requested CUDA device, using sequential ports starting at 8000. Wrapper-only
 vLLM server options include --download-dir, --gpu-memory-utilization,
 --max-num-seqs, --max-num-batched-tokens, --dtype, --kv-cache-dtype,
+--quantization,
 --vllm-port-base, --vllm-reasoning-parser, --vllm-extra-arg,
 --vllm-extra-args, and --no-start-vllm.
 """
@@ -94,6 +95,8 @@ WRAPPER_VLLM_VALUE_OPTIONS = {
     "--vllm-dtype": "dtype",
     "--kv-cache-dtype": "kv_cache_dtype",
     "--vllm-kv-cache-dtype": "kv_cache_dtype",
+    "--quantization": "quantization",
+    "--vllm-quantization": "quantization",
     "--reasoning-parser": "reasoning_parser",
     "--vllm-reasoning-parser": "reasoning_parser",
     "--agentic-extraction-reasoning-parser": "reasoning_parser",
@@ -204,6 +207,7 @@ def _extract_wrapper_vllm_args(argv: List[str]) -> tuple[List[str], Dict[str, An
         "max_num_batched_tokens": None,
         "dtype": None,
         "kv_cache_dtype": None,
+        "quantization": None,
         "reasoning_parser": "auto",
         "port_base": None,
         "startup_timeout": 1200,
@@ -378,6 +382,8 @@ def _vllm_cmd(
         cmd.extend(["--dtype", str(settings["dtype"])])
     if settings["kv_cache_dtype"]:
         cmd.extend(["--kv-cache-dtype", str(settings["kv_cache_dtype"])])
+    if settings["quantization"]:
+        cmd.extend(["--quantization", str(settings["quantization"])])
     reasoning_parser = _resolve_reasoning_parser(
         settings.get("reasoning_parser"),
         model_name,
