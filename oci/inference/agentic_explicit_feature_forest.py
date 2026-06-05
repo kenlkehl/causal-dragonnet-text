@@ -38,7 +38,7 @@ from .applied_explicit_feature_forest import _build_features, _hstack_present
 logger = logging.getLogger(__name__)
 
 AGENT_PROMPT_VERSION = "agentic_explicit_feature_search_v1"
-BROAD_AGENT_PROMPT_VERSION = "agentic_explicit_feature_broad_screen_v1"
+BROAD_AGENT_PROMPT_VERSION = "agentic_explicit_feature_broad_screen_v2"
 EXTRACTION_PROMPT_VERSION = "explicit_features_v2"
 VALID_ACTIONS = {"add", "remove", "update_role", "none"}
 VALID_ROLES = {"confounder", "effect_modifier"}
@@ -69,12 +69,10 @@ class SplitEvaluation:
 
 @dataclass
 class BroadScreenPreparedFold:
-    """Baseline and proposal state prepared before broad-screen extraction."""
+    """Inventory proposal state prepared before broad-screen extraction."""
 
     outer_fold: int
     train_idx: np.ndarray
-    baseline_rows: List[Dict[str, Any]]
-    baseline_summary: Dict[str, Any]
     proposals: List[AgenticFeatureProposal]
 
 
@@ -168,8 +166,14 @@ class AgenticFeatureSearchRunner:
         logger.info("AGENTIC EXPLICIT FEATURE CAUSAL FOREST")
         logger.info("=" * 80)
 
-        # Ensure initial variables are available before the first inner search.
-        self.dataset = self.extraction_provider.ensure_features(self.dataset, self.initial_specs)
+        # Iterative mode needs the starting variables before the first prompt
+        # because the agent sees extraction summaries. Broad-screen mode
+        # extracts initial variables together with the broad inventory union.
+        if self.search_config.search_mode != "broad_screen":
+            self.dataset = self.extraction_provider.ensure_features(
+                self.dataset,
+                self.initial_specs,
+            )
 
         outer_splits = _make_splits(
             self.dataset,
@@ -451,10 +455,14 @@ class AgenticFeatureSearchRunner:
         use and tests.
         """
         prepared = self._prepare_broad_screen_fold(outer_fold, outer_train_idx)
-        if prepared.proposals:
+        union_specs = _canonicalize_broad_screen_prepared_folds(
+            self.initial_specs,
+            [prepared],
+        )
+        if union_specs:
             self.dataset = self.extraction_provider.ensure_features(
                 self.dataset,
-                [_proposal_to_spec(proposal) for proposal in prepared.proposals],
+                union_specs,
             )
         return self._screen_and_refine_broad_candidates(prepared)
 
@@ -464,7 +472,6 @@ class AgenticFeatureSearchRunner:
     ) -> Dict[int, List[ExplicitFeatureSpec]]:
         """Prepare all broad-screen folds, union-extract, then screen/refine."""
         prepared_folds: List[BroadScreenPreparedFold] = []
-        proposed_specs: List[ExplicitFeatureSpec] = []
         for outer_fold, (train_idx, test_idx) in enumerate(outer_splits, start=1):
             logger.info(
                 "Outer fold %s/%s broad-screen proposal prep: train=%s test=%s",
@@ -475,9 +482,11 @@ class AgenticFeatureSearchRunner:
             )
             prepared = self._prepare_broad_screen_fold(outer_fold, train_idx)
             prepared_folds.append(prepared)
-            proposed_specs.extend(_proposal_to_spec(proposal) for proposal in prepared.proposals)
 
-        union_specs = _dedupe_specs_for_union_extraction(proposed_specs)
+        union_specs = _canonicalize_broad_screen_prepared_folds(
+            self.initial_specs,
+            prepared_folds,
+        )
         if union_specs:
             logger.info(
                 "Broad-screen union extraction across outer folds: %s feature(s)",
@@ -500,17 +509,6 @@ class AgenticFeatureSearchRunner:
         outer_fold: int,
         outer_train_idx: np.ndarray,
     ) -> BroadScreenPreparedFold:
-        current_specs = list(self.initial_specs)
-
-        baseline_rows, baseline_summary = self._evaluate_inner_cv(
-            outer_fold=outer_fold,
-            iteration=0,
-            candidate_name="initial",
-            train_idx=outer_train_idx,
-            specs=current_specs,
-        )
-        self._record_inner_rows(baseline_rows, accepted=True)
-
         if self.search_config.agent_max_tokens < 8000:
             logger.warning(
                 "broad_screen mode asks for up to %s proposals but agent_max_tokens=%s; "
@@ -519,16 +517,10 @@ class AgenticFeatureSearchRunner:
                 self.search_config.agent_max_tokens,
             )
 
-        context = self._build_agent_context(
+        context = self._build_broad_inventory_context(
             outer_fold=outer_fold,
-            iteration=1,
             train_idx=outer_train_idx,
-            current_specs=current_specs,
-            current_summary=baseline_summary,
         )
-        context["search_mode"] = "broad_screen"
-        context["prompt_version"] = BROAD_AGENT_PROMPT_VERSION
-        context["broad_candidate_count"] = self.search_config.broad_candidate_count
 
         try:
             raw_proposals = self.proposal_agent.propose(context)
@@ -543,7 +535,7 @@ class AgenticFeatureSearchRunner:
                 )
             self._record_decision(
                 outer_fold,
-                1,
+                0,
                 "agent_proposal_error",
                 error_payload,
             )
@@ -563,18 +555,17 @@ class AgenticFeatureSearchRunner:
             )
         proposals, rejected = validate_agentic_proposals(
             raw_proposals,
-            current_specs=current_specs,
+            current_specs=list(self.initial_specs),
             search_config=self.search_config,
             allow_removals=False,
             max_additions=self.search_config.broad_candidate_count,
+            allow_duplicate_additions=True,
         )
-        proposals, duplicate_rejected = _dedupe_proposals_by_name(proposals)
-        rejected.extend(duplicate_rejected)
         proposal_payload["valid_count"] = len(proposals)
         proposal_payload["rejected"] = rejected
         self._record_decision(
             outer_fold,
-            1,
+            0,
             "agent_proposals",
             proposal_payload,
         )
@@ -584,8 +575,6 @@ class AgenticFeatureSearchRunner:
         return BroadScreenPreparedFold(
             outer_fold=outer_fold,
             train_idx=outer_train_idx,
-            baseline_rows=baseline_rows,
-            baseline_summary=baseline_summary,
             proposals=proposals,
         )
 
@@ -593,134 +582,298 @@ class AgenticFeatureSearchRunner:
         self,
         prepared: BroadScreenPreparedFold,
     ) -> List[ExplicitFeatureSpec]:
-        """Screen one prepared broad proposal list and greedily accept candidates."""
+        """Adaptively select from pre-extracted broad candidates plus new proposals."""
         outer_fold = prepared.outer_fold
         outer_train_idx = prepared.train_idx
         current_specs = list(self.initial_specs)
-        baseline_rows = prepared.baseline_rows
         proposals = prepared.proposals
 
-        if not proposals:
-            return current_specs
+        baseline_rows, baseline_summary = self._evaluate_inner_cv(
+            outer_fold=outer_fold,
+            iteration=0,
+            candidate_name="initial",
+            train_idx=outer_train_idx,
+            specs=current_specs,
+        )
+        self._record_inner_rows(baseline_rows, accepted=True)
+        accepted_additions = 0
 
-        proposed_specs = [_proposal_to_spec(proposal) for proposal in proposals]
-        self.dataset = self.extraction_provider.ensure_features(self.dataset, proposed_specs)
-        screened = screen_agentic_candidate_specs(
+        for iteration in range(1, self.search_config.max_iterations + 1):
+            current_names = set(_spec_names(current_specs))
+            screened = self._screen_broad_candidates_for_context(
+                outer_train_idx=outer_train_idx,
+                current_specs=current_specs,
+                proposals=proposals,
+            )
+            available_items = select_screened_candidates(
+                [
+                    item
+                    for item in screened
+                    if item["candidate_id"] not in current_names
+                ],
+                top_k=self.search_config.broad_screen_top_k,
+            )
+            available_ids = {item["candidate_id"] for item in available_items}
+            for item in screened:
+                item["kept_for_cv"] = item["candidate_id"] in available_ids
+
+            available_by_name = {
+                item["candidate_id"]: item["screened_spec"]
+                for item in available_items
+                if item.get("screened_spec") is not None
+            }
+            context = self._build_broad_selection_context(
+                outer_fold=outer_fold,
+                iteration=iteration,
+                train_idx=outer_train_idx,
+                current_specs=current_specs,
+                current_summary=baseline_summary,
+                available_items=available_items,
+            )
+
+            try:
+                raw_proposals = self.proposal_agent.propose(context)
+            except Exception as exc:
+                error_payload = {
+                    "error": repr(exc),
+                    "context": context,
+                }
+                if self.search_config.save_agent_raw_output:
+                    error_payload["agent_raw_output"] = _get_agent_response_trace(
+                        self.proposal_agent
+                    )
+                self._record_decision(
+                    outer_fold,
+                    iteration,
+                    "agent_proposal_error",
+                    error_payload,
+                )
+                self._save_decision_events()
+                raise
+
+            effective_raw_proposals = _enrich_broad_selection_proposals(
+                raw_proposals,
+                available_by_name,
+            )
+            proposal_payload = {
+                "raw_count": len(raw_proposals),
+                "valid_count": None,
+                "rejected": None,
+                "context": context,
+                "raw_proposals": raw_proposals,
+                "effective_proposals": effective_raw_proposals,
+            }
+            if self.search_config.save_agent_raw_output:
+                proposal_payload["agent_raw_output"] = _get_agent_response_trace(
+                    self.proposal_agent
+                )
+            selected_proposals, rejected = validate_agentic_proposals(
+                effective_raw_proposals,
+                current_specs=current_specs,
+                search_config=self.search_config,
+                allow_removals=accepted_additions > 0,
+                max_additions=self.search_config.max_additions_per_iter,
+            )
+            proposal_payload["valid_count"] = len(selected_proposals)
+            proposal_payload["rejected"] = rejected
+            self._record_decision(
+                outer_fold,
+                iteration,
+                "agent_proposals",
+                proposal_payload,
+            )
+
+            if not selected_proposals:
+                self._record_broad_screening(outer_fold, iteration, screened)
+                logger.info(
+                    "Outer fold %s broad_screen iteration %s: no valid proposals",
+                    outer_fold,
+                    iteration,
+                )
+                break
+
+            candidate_results = []
+            screened_by_name = {item["candidate_id"]: item for item in screened}
+            for candidate_id, proposal_group in _candidate_groups(selected_proposals):
+                candidate_specs = apply_proposals(current_specs, proposal_group)
+                if _spec_signature(candidate_specs) == _spec_signature(current_specs):
+                    continue
+                self.dataset = self.extraction_provider.ensure_features(
+                    self.dataset,
+                    candidate_specs,
+                )
+                proposal_specs = _candidate_proposal_specs(
+                    current_specs=current_specs,
+                    candidate_specs=candidate_specs,
+                    proposal_group=proposal_group,
+                )
+                role_diagnostics = evaluate_candidate_role_diagnostics(
+                    dataset=self.dataset.iloc[outer_train_idx],
+                    current_specs=current_specs,
+                    candidate_specs=proposal_specs,
+                    config=self.config,
+                    search_config=self.search_config,
+                )
+                coverage_failures = _coverage_failures(
+                    self.dataset.iloc[outer_train_idx],
+                    proposal_specs,
+                    self.search_config.min_feature_coverage,
+                )
+                if coverage_failures:
+                    summary = {"coverage_failures": coverage_failures}
+                    if role_diagnostics:
+                        summary["role_diagnostics"] = role_diagnostics
+                    candidate_results.append(
+                        {
+                            "candidate_id": candidate_id,
+                            "proposal_group": proposal_group,
+                            "specs": candidate_specs,
+                            "rows": [],
+                            "summary": summary,
+                            "comparison": {
+                                "passes_acceptance": False,
+                                "rejection_reason": "low_feature_coverage",
+                                "coverage_failures": coverage_failures,
+                            },
+                        }
+                    )
+                    continue
+
+                rows, summary = self._evaluate_inner_cv(
+                    outer_fold=outer_fold,
+                    iteration=iteration,
+                    candidate_name=candidate_id,
+                    train_idx=outer_train_idx,
+                    specs=candidate_specs,
+                )
+                if role_diagnostics:
+                    summary = dict(summary)
+                    summary["role_diagnostics"] = role_diagnostics
+                comparison = compare_candidate_to_baseline(
+                    baseline_rows=baseline_rows,
+                    candidate_rows=rows,
+                    search_config=self.search_config,
+                )
+                candidate_results.append(
+                    {
+                        "candidate_id": candidate_id,
+                        "proposal_group": proposal_group,
+                        "specs": candidate_specs,
+                        "rows": rows,
+                        "summary": summary,
+                        "comparison": comparison,
+                    }
+                )
+                self._record_inner_rows(rows, accepted=False)
+
+            accepted = _choose_accepted_candidate(candidate_results)
+            candidate_payloads = []
+            for item in candidate_results:
+                accepted_item = accepted is item
+                for proposal in item["proposal_group"]:
+                    if proposal.action != "add":
+                        continue
+                    screened_item = screened_by_name.get(proposal.name)
+                    if screened_item is None:
+                        continue
+                    if item["candidate_id"] != proposal.name and not accepted_item:
+                        continue
+                    screened_item["cv_comparison"] = item["comparison"]
+                    screened_item["cv_accepted"] = bool(
+                        accepted_item or screened_item.get("cv_accepted", False)
+                    )
+                candidate_payloads.append(
+                    {
+                        "candidate_id": item["candidate_id"],
+                        "proposals": [asdict(p) for p in item["proposal_group"]],
+                        "summary": item["summary"],
+                        "comparison": item["comparison"],
+                        "accepted": accepted_item,
+                    }
+                )
+
+            self._record_broad_screening(outer_fold, iteration, screened)
+            self._record_decision(
+                outer_fold,
+                iteration,
+                "candidate_evaluations",
+                candidate_payloads,
+            )
+
+            if accepted is None:
+                logger.info(
+                    "Outer fold %s broad_screen iteration %s: no candidate passed acceptance thresholds",
+                    outer_fold,
+                    iteration,
+                )
+                if self.search_config.stop_after_rejected_iteration:
+                    break
+                continue
+
+            current_specs = accepted["specs"]
+            baseline_rows = accepted["rows"]
+            baseline_summary = accepted["summary"]
+            accepted_additions += sum(
+                1 for proposal in accepted["proposal_group"] if proposal.action == "add"
+            )
+            self._record_inner_rows(accepted["rows"], accepted=True)
+            self.feature_set_rows.append(
+                {
+                    "outer_fold": outer_fold,
+                    "iteration": iteration,
+                    "stage": "accepted_inner",
+                    "candidate_id": accepted["candidate_id"],
+                    "features": [_spec_to_dict(spec) for spec in current_specs],
+                }
+            )
+            logger.info(
+                "Outer fold %s broad_screen iteration %s: accepted %s",
+                outer_fold,
+                iteration,
+                accepted["candidate_id"],
+            )
+
+        return current_specs
+
+    def _screen_broad_candidates_for_context(
+        self,
+        outer_train_idx: np.ndarray,
+        current_specs: List[ExplicitFeatureSpec],
+        proposals: Sequence[AgenticFeatureProposal],
+    ) -> List[Dict[str, Any]]:
+        if not proposals:
+            return []
+        return screen_agentic_candidate_specs(
             dataset=self.dataset.iloc[outer_train_idx],
             current_specs=current_specs,
             proposals=proposals,
             config=self.config,
             search_config=self.search_config,
         )
-        kept = select_screened_candidates(
-            screened,
-            top_k=self.search_config.broad_screen_top_k,
-        )
-        kept_ids = {item["candidate_id"] for item in kept}
+
+    def _record_broad_screening(
+        self,
+        outer_fold: int,
+        iteration: int,
+        screened: Sequence[Dict[str, Any]],
+    ) -> None:
         for item in screened:
-            item["kept_for_cv"] = item["candidate_id"] in kept_ids
-            if not item["kept_for_cv"]:
-                self.screening_metric_rows.append(
-                    _screening_metric_row(outer_fold=outer_fold, iteration=1, item=item)
-                )
-
-        if not kept:
-            self._record_decision(
-                outer_fold,
-                1,
-                "broad_screening",
-                [
-                    _screening_decision_payload(item)
-                    for item in sorted(screened, key=lambda row: row["rank"])
-                ],
-            )
-            logger.info(
-                "Outer fold %s broad_screen: no candidates passed screening",
-                outer_fold,
-            )
-            return current_specs
-
-        candidate_payloads = []
-        for item in kept:
-            screened_spec = item["screened_spec"]
-            if screened_spec.name in _spec_names(current_specs):
-                continue
-            candidate_specs = _dedupe_feature_specs([*current_specs, screened_spec])
-            self.dataset = self.extraction_provider.ensure_features(
-                self.dataset,
-                candidate_specs,
-            )
-            rows, summary = self._evaluate_inner_cv(
-                outer_fold=outer_fold,
-                iteration=1,
-                candidate_name=screened_spec.name,
-                train_idx=outer_train_idx,
-                specs=candidate_specs,
-            )
-            summary = dict(summary)
-            if item.get("role_diagnostics"):
-                summary["role_diagnostics"] = item["role_diagnostics"]
-            comparison = compare_candidate_to_baseline(
-                baseline_rows=baseline_rows,
-                candidate_rows=rows,
-                search_config=self.search_config,
-            )
-            accepted = bool(comparison.get("passes_acceptance", False))
-            self._record_inner_rows(rows, accepted=False)
-            item["cv_comparison"] = comparison
-            item["cv_accepted"] = accepted
-            candidate_payloads.append(
-                {
-                    "candidate_id": item["candidate_id"],
-                    "proposals": [
-                        asdict(_screened_spec_to_proposal(screened_spec, item["proposal"]))
-                    ],
-                    "summary": summary,
-                    "comparison": comparison,
-                    "accepted": accepted,
-                    "screening": _screening_decision_payload(item),
-                }
-            )
             self.screening_metric_rows.append(
-                _screening_metric_row(outer_fold=outer_fold, iteration=1, item=item)
+                _screening_metric_row(
+                    outer_fold=outer_fold,
+                    iteration=iteration,
+                    item=item,
+                )
             )
-            if not accepted:
-                continue
-
-            current_specs = candidate_specs
-            baseline_rows = rows
-            self._record_inner_rows(rows, accepted=True)
-            self.feature_set_rows.append(
-                {
-                    "outer_fold": outer_fold,
-                    "iteration": 1,
-                    "stage": "accepted_inner",
-                    "candidate_id": item["candidate_id"],
-                    "features": [_spec_to_dict(spec) for spec in current_specs],
-                }
-            )
-            logger.info(
-                "Outer fold %s broad_screen: accepted %s",
-                outer_fold,
-                item["candidate_id"],
-            )
-
         self._record_decision(
             outer_fold,
-            1,
+            iteration,
             "broad_screening",
             [
                 _screening_decision_payload(item)
                 for item in sorted(screened, key=lambda row: row["rank"])
             ],
         )
-        self._record_decision(
-            outer_fold,
-            1,
-            "candidate_evaluations",
-            candidate_payloads,
-        )
-        return current_specs
 
     def _evaluate_inner_cv(
         self,
@@ -788,6 +941,92 @@ class AgenticFeatureSearchRunner:
             "current_features": [_spec_to_dict(spec) for spec in current_specs],
             "current_inner_cv_metrics": _non_oracle_metrics(current_summary),
             "extraction_summary": summarize_extractions(train_only_df, current_specs),
+            "clinical_text_examples": _clinical_text_examples(
+                train_only_df,
+                self.config.text_column,
+                n_examples=self.search_config.clinical_text_examples_per_prompt,
+                max_chars=self.search_config.clinical_text_example_chars,
+            ),
+            "iteration_feedback": build_iteration_feedback(
+                recent_decisions,
+                self.search_config,
+            ),
+            "recent_decisions": recent_decisions,
+        }
+
+    def _build_broad_inventory_context(
+        self,
+        outer_fold: int,
+        train_idx: np.ndarray,
+    ) -> Dict[str, Any]:
+        """Build the train-only inventory context before broad extraction."""
+        train_only_df = self.dataset.iloc[train_idx]
+        required_features = [_spec_to_dict(spec) for spec in self.initial_specs]
+        return {
+            "outer_fold": outer_fold,
+            "iteration": 0,
+            "search_mode": "broad_screen",
+            "broad_screen_stage": "inventory",
+            "prompt_version": BROAD_AGENT_PROMPT_VERSION,
+            "broad_candidate_count": self.search_config.broad_candidate_count,
+            "broad_screen_top_k": self.search_config.broad_screen_top_k,
+            "clinical_question": _clinical_question_text(self.config),
+            "estimand": {
+                "treatment_column": self.config.treatment_column,
+                "outcome_column": self.config.outcome_column,
+                "outcome_type": self.config.outcome_type,
+            },
+            "required_features": required_features,
+            "current_features": required_features,
+            "clinical_text_examples": _clinical_text_examples(
+                train_only_df,
+                self.config.text_column,
+                n_examples=self.search_config.clinical_text_examples_per_prompt,
+                max_chars=self.search_config.clinical_text_example_chars,
+            ),
+        }
+
+    def _build_broad_selection_context(
+        self,
+        outer_fold: int,
+        iteration: int,
+        train_idx: np.ndarray,
+        current_specs: List[ExplicitFeatureSpec],
+        current_summary: Dict[str, Any],
+        available_items: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Build the post-extraction broad-screen adaptive selection context."""
+        train_only_df = self.dataset.iloc[train_idx]
+        recent_decisions = [
+            event for event in self.decision_events if event.get("outer_fold") == outer_fold
+        ][-8:]
+        return {
+            "outer_fold": outer_fold,
+            "iteration": iteration,
+            "search_mode": "broad_screen",
+            "broad_screen_stage": "selection",
+            "prompt_version": BROAD_AGENT_PROMPT_VERSION,
+            "broad_candidate_count": self.search_config.broad_candidate_count,
+            "broad_screen_top_k": self.search_config.broad_screen_top_k,
+            "clinical_question": _clinical_question_text(self.config),
+            "estimand": {
+                "treatment_column": self.config.treatment_column,
+                "outcome_column": self.config.outcome_column,
+                "outcome_type": self.config.outcome_type,
+            },
+            "required_features": [_spec_to_dict(spec) for spec in self.initial_specs],
+            "current_features": [_spec_to_dict(spec) for spec in current_specs],
+            "current_inner_cv_metrics": _non_oracle_metrics(current_summary),
+            "extraction_summary": summarize_extractions(train_only_df, current_specs),
+            "available_extracted_features": _available_extracted_feature_payloads(
+                train_only_df,
+                available_items,
+            ),
+            "broad_screen_instructions": [
+                "To select an already-extracted feature, return an add proposal with its name from available_extracted_features.",
+                "To escape the extracted shortlist, return a new add proposal with a complete extraction contract.",
+                "Inner CV acceptance is required before any selected or newly proposed feature becomes part of the current feature set.",
+            ],
             "clinical_text_examples": _clinical_text_examples(
                 train_only_df,
                 self.config.text_column,
@@ -930,7 +1169,7 @@ class OpenAICompatibleFeatureSearchAgent:
                     f"{attempt_idx + 1} attempt(s): {issues[0]}"
                 ) from exc
 
-            issues = agent_response_schema_issues(proposals)
+            issues = agent_response_schema_issues(proposals, context=context)
             if not issues:
                 return proposals
 
@@ -1379,6 +1618,8 @@ def build_agent_prompt(
 ) -> str:
     """Construct the proposal prompt sent to the LLM agent."""
     if context.get("search_mode") == "broad_screen":
+        if context.get("broad_screen_stage") == "selection":
+            return build_broad_selection_agent_prompt(context, search_config)
         return build_broad_agent_prompt(context, search_config)
 
     context_json = json.dumps(context, indent=2, default=_json_default)
@@ -1441,7 +1682,7 @@ def build_broad_agent_prompt(
     return f"""You are helping design a high-recall baseline variable inventory for causal inference.
 
 Propose a broad list of variables that are plausibly extractable from the text and could act as pre-treatment confounders or treatment effect modifiers.
-The next stage will statistically screen every candidate for treatment association, outcome association, and treatment-by-candidate interaction, so prioritize recall and precise extraction definitions over narrow confidence.
+This is only the first-pass extractable inventory. The next stage will statistically screen candidates and then an agent will adaptively select from the extracted shortlist or define new features if needed, so prioritize recall and precise extraction definitions over narrow confidence.
 
 Return JSON only with this shape:
 {{
@@ -1462,12 +1703,53 @@ Return JSON only with this shape:
 Limits:
 - Return up to {candidate_count} add proposals.
 - Do not return remove, update_role, or none actions in this mode.
+- Do not duplicate any feature listed in required_features.
 - Each variable must be measurable before or at treatment initiation.
 - Do not propose treatment, post-treatment response, survival, toxicity, or outcome-derived variables.
 - For categorical variables, provide 2-8 mutually exclusive categories.
 - Use distinct variable names; avoid near-duplicate aliases for the same concept.
 
 Current train-fold context:
+{context_json}
+"""
+
+
+def build_broad_selection_agent_prompt(
+    context: Dict[str, Any],
+    search_config: AgenticFeatureSearchConfig,
+) -> str:
+    """Construct the adaptive selection prompt after broad-screen extraction."""
+    context_json = json.dumps(context, indent=2, default=_json_default)
+    return f"""You are helping adaptively select explicit variables for a causal forest.
+
+Broad-screen extraction has already produced the ranked available_extracted_features in the context. You may select from that shortlist by returning an add proposal with the existing feature name, or you may define a new pre-treatment extractable feature when the current metrics and feedback suggest the extracted shortlist is missing an important concept.
+
+Return JSON only with this shape:
+{{
+  "proposals": [
+    {{
+      "action": "add|remove|update_role|none",
+      "name": "snake_case_variable_name",
+      "type": "categorical|continuous",
+      "categories": ["category_a", "category_b"],
+      "roles": ["confounder", "effect_modifier"],
+      "description": "exact extraction target",
+      "rationale": "why this may help",
+      "expected_signal": "treatment, outcome, or tau signal expected"
+    }}
+  ]
+}}
+
+Limits:
+- At most {search_config.max_additions_per_iter} add proposals.
+- At most {search_config.max_removals_per_iter} remove proposals.
+- To select an available_extracted_features item, use its exact name; its already-extracted contract will be used.
+- For a new add proposal not in available_extracted_features, provide type, roles, description, and categories when categorical.
+- Do not duplicate current_features or required_features.
+- Use "none" if no defensible add, remove, or role update is available.
+- Review iteration_feedback and recent_decisions before proposing.
+
+Current broad-screen selection context:
 {context_json}
 """
 
@@ -1500,9 +1782,13 @@ array containing only "confounder" and/or "effect_modifier".
 """
 
 
-def agent_response_schema_issues(proposals: Sequence[Any]) -> List[str]:
+def agent_response_schema_issues(
+    proposals: Sequence[Any],
+    context: Optional[Dict[str, Any]] = None,
+) -> List[str]:
     """Return schema-level issues that are worth asking the LLM to repair."""
     issues: List[str] = []
+    available_names = _context_available_extracted_names(context)
     for idx, raw in enumerate(proposals, start=1):
         if not isinstance(raw, dict):
             issues.append(f"proposal {idx}: expected an object, got {type(raw).__name__}")
@@ -1526,6 +1812,8 @@ def agent_response_schema_issues(proposals: Sequence[Any]) -> List[str]:
             issues.append(f"{label}: missing name")
 
         if action == "add":
+            if _normalize_feature_name(raw.get("name", "")) in available_names:
+                continue
             proposal_type = raw.get("type")
             if _missing_or_empty(proposal_type):
                 issues.append(f"{label}: missing type")
@@ -1548,6 +1836,25 @@ def agent_response_schema_issues(proposals: Sequence[Any]) -> List[str]:
                 issues.append(f"{label}: {roles_issue}")
 
     return issues
+
+
+def _context_available_extracted_names(
+    context: Optional[Dict[str, Any]],
+) -> set:
+    if not isinstance(context, dict):
+        return set()
+    if context.get("search_mode") != "broad_screen":
+        return set()
+    if context.get("broad_screen_stage") != "selection":
+        return set()
+    available = context.get("available_extracted_features", [])
+    if not isinstance(available, list):
+        return set()
+    names = set()
+    for item in available:
+        if isinstance(item, dict) and item.get("name"):
+            names.add(_normalize_feature_name(item["name"]))
+    return names
 
 
 def _roles_schema_issue(roles: Any) -> Optional[str]:
@@ -1688,6 +1995,7 @@ def validate_agentic_proposals(
     search_config: AgenticFeatureSearchConfig,
     allow_removals: bool,
     max_additions: Optional[int] = None,
+    allow_duplicate_additions: bool = False,
 ) -> Tuple[List[AgenticFeatureProposal], List[Dict[str, Any]]]:
     """Validate raw LLM proposals against schema, role, and leakage guards."""
     current_names = {spec.name for spec in current_specs}
@@ -1715,7 +2023,7 @@ def validate_agentic_proposals(
                     reason = "too_many_removals"
             if reason is None and proposal.action != "none":
                 valid.append(proposal)
-                if proposal.action == "add":
+                if proposal.action == "add" and not allow_duplicate_additions:
                     current_names.add(proposal.name)
             elif reason is not None:
                 rejected.append({"proposal": raw, "reason": reason})
@@ -1723,21 +2031,6 @@ def validate_agentic_proposals(
             rejected.append({"proposal": raw, "reason": str(exc)})
 
     return valid, rejected
-
-
-def _dedupe_proposals_by_name(
-    proposals: Sequence[AgenticFeatureProposal],
-) -> Tuple[List[AgenticFeatureProposal], List[Dict[str, Any]]]:
-    seen = set()
-    deduped = []
-    rejected = []
-    for proposal in proposals:
-        if proposal.name in seen:
-            rejected.append({"proposal": asdict(proposal), "reason": "duplicate_feature"})
-            continue
-        seen.add(proposal.name)
-        deduped.append(proposal)
-    return deduped, rejected
 
 
 def apply_proposals(
@@ -1788,6 +2081,22 @@ def _proposal_to_spec(proposal: AgenticFeatureProposal) -> ExplicitFeatureSpec:
     )
 
 
+def _proposal_from_spec(
+    spec: ExplicitFeatureSpec,
+    source: Optional[AgenticFeatureProposal] = None,
+) -> AgenticFeatureProposal:
+    return AgenticFeatureProposal(
+        action="add",
+        name=spec.name,
+        type=spec.type,
+        categories=spec.categories,
+        description=spec.description,
+        roles=list(spec.roles or []),
+        rationale=None if source is None else source.rationale,
+        expected_signal=None if source is None else source.expected_signal,
+    )
+
+
 def _screened_spec_to_proposal(
     spec: ExplicitFeatureSpec,
     original: AgenticFeatureProposal,
@@ -1802,6 +2111,143 @@ def _screened_spec_to_proposal(
         rationale=original.rationale,
         expected_signal=original.expected_signal,
     )
+
+
+def _canonicalize_broad_screen_prepared_folds(
+    initial_specs: Sequence[ExplicitFeatureSpec],
+    prepared_folds: Sequence[BroadScreenPreparedFold],
+) -> List[ExplicitFeatureSpec]:
+    """Canonicalize the broad extraction universe and rewrite fold proposals."""
+    initial_by_name = {spec.name: spec for spec in initial_specs}
+    canonical_by_name: Dict[str, ExplicitFeatureSpec] = dict(initial_by_name)
+    broad_order: List[str] = []
+    merged_roles: Dict[str, List[str]] = {
+        spec.name: list(spec.roles or []) for spec in initial_specs
+    }
+
+    for prepared in prepared_folds:
+        for proposal in prepared.proposals:
+            name = proposal.name
+            if name in initial_by_name:
+                continue
+            proposed_spec = _proposal_to_spec(proposal)
+            canonical = canonical_by_name.get(name)
+            if canonical is None:
+                canonical_by_name[name] = proposed_spec
+                broad_order.append(name)
+                merged_roles[name] = list(proposed_spec.roles or [])
+                continue
+
+            merged_roles[name] = _merge_roles(
+                merged_roles.get(name, []),
+                proposed_spec.roles or [],
+            )
+            if _spec_extraction_contract_key(canonical) != _spec_extraction_contract_key(
+                proposed_spec
+            ):
+                logger.warning(
+                    "Broad-screen proposal name %s appeared with multiple extraction "
+                    "contracts; the first contract will be reused for all folds",
+                    name,
+                )
+
+    for name in broad_order:
+        canonical = canonical_by_name[name]
+        canonical_by_name[name] = ExplicitFeatureSpec(
+            name=canonical.name,
+            type=canonical.type,
+            categories=canonical.categories,
+            description=canonical.description,
+            roles=merged_roles.get(name, canonical.roles or []),
+        )
+
+    for prepared in prepared_folds:
+        rewritten: List[AgenticFeatureProposal] = []
+        seen_names = set()
+        for proposal in prepared.proposals:
+            name = proposal.name
+            if name in initial_by_name or name in seen_names:
+                continue
+            canonical = canonical_by_name.get(name)
+            if canonical is None:
+                continue
+            rewritten.append(_proposal_from_spec(canonical, proposal))
+            seen_names.add(name)
+        prepared.proposals = rewritten
+
+    return _dedupe_feature_specs(
+        [
+            *initial_specs,
+            *[canonical_by_name[name] for name in broad_order],
+        ]
+    )
+
+
+def _merge_roles(left: Sequence[str], right: Sequence[str]) -> List[str]:
+    merged: List[str] = []
+    for role in [*left, *right]:
+        if role not in VALID_ROLES or role in merged:
+            continue
+        merged.append(role)
+    return merged
+
+
+def _enrich_broad_selection_proposals(
+    raw_proposals: Sequence[Dict[str, Any]],
+    available_by_name: Dict[str, ExplicitFeatureSpec],
+) -> List[Dict[str, Any]]:
+    """Fill contracts for add-by-name selections from the extracted shortlist."""
+    enriched: List[Dict[str, Any]] = []
+    for raw in raw_proposals:
+        if not isinstance(raw, dict):
+            enriched.append(raw)
+            continue
+        action = str(raw.get("action", "")).strip().lower()
+        name = _normalize_feature_name(raw.get("name", ""))
+        spec = available_by_name.get(name)
+        if action != "add" or spec is None:
+            enriched.append(dict(raw))
+            continue
+        filled = dict(raw)
+        filled["action"] = "add"
+        filled["name"] = spec.name
+        filled["type"] = spec.type
+        filled["categories"] = spec.categories
+        filled["roles"] = list(spec.roles or [])
+        filled["description"] = spec.description
+        enriched.append(filled)
+    return enriched
+
+
+def _available_extracted_feature_payloads(
+    train_df: pd.DataFrame,
+    available_items: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    payloads: List[Dict[str, Any]] = []
+    for item in available_items:
+        spec = item.get("screened_spec")
+        if not isinstance(spec, ExplicitFeatureSpec):
+            continue
+        extraction_summary = summarize_extractions(train_df, [spec])[0]
+        payloads.append(
+            {
+                "rank": item.get("rank"),
+                "name": spec.name,
+                "type": spec.type,
+                "categories": spec.categories,
+                "roles": spec.roles,
+                "description": spec.description,
+                "coverage": extraction_summary.get("coverage"),
+                "top_values": extraction_summary.get("top_values", {}),
+                "screening_score": item.get("screening_score"),
+                "confounder_score": item.get("confounder_score"),
+                "modifier_score": item.get("modifier_score"),
+                "role_diagnostics": _candidate_feedback_role_diagnostics(
+                    {"role_diagnostics": item.get("role_diagnostics", [])}
+                ),
+            }
+        )
+    return payloads
 
 
 def compare_candidate_to_baseline(
@@ -2722,29 +3168,6 @@ def _dedupe_feature_specs(specs: Sequence[ExplicitFeatureSpec]) -> List[Explicit
     return deduped
 
 
-def _dedupe_specs_for_union_extraction(
-    specs: Sequence[ExplicitFeatureSpec],
-) -> List[ExplicitFeatureSpec]:
-    """Dedupe broad proposals for pre-extraction while surfacing name conflicts."""
-    deduped: List[ExplicitFeatureSpec] = []
-    seen_contracts: Dict[str, str] = {}
-    for spec in specs:
-        contract = _spec_extraction_contract_key(spec)
-        previous = seen_contracts.get(spec.name)
-        if previous is None:
-            seen_contracts[spec.name] = contract
-            deduped.append(spec)
-            continue
-        if previous != contract:
-            logger.warning(
-                "Broad-screen proposal name %s appeared with multiple extraction "
-                "contracts across folds; the first contract will be pre-extracted "
-                "and later incompatible requests will be re-extracted on demand",
-                spec.name,
-            )
-    return deduped
-
-
 def _spec_extraction_contract_dict(spec: ExplicitFeatureSpec) -> Dict[str, Any]:
     """Return only fields that affect the extraction prompt and parser."""
     return {
@@ -3051,6 +3474,19 @@ def _spec_to_dict(spec: ExplicitFeatureSpec) -> Dict[str, Any]:
 
 def _spec_names(specs: List[ExplicitFeatureSpec]) -> List[str]:
     return [spec.name for spec in specs]
+
+
+def _spec_signature(specs: Sequence[ExplicitFeatureSpec]) -> List[Tuple[Any, ...]]:
+    return [
+        (
+            spec.name,
+            spec.type,
+            tuple(spec.categories or []),
+            spec.description,
+            tuple(spec.roles or []),
+        )
+        for spec in specs
+    ]
 
 
 def _normalize_feature_name(name: Any) -> str:

@@ -7,7 +7,7 @@ grid and more repeats:
 
     base conditions per dataset:
       agentic_search_modes: broad_screen
-      agentic_iterations: 1 (broad_screen ignores iterative round counts)
+      agentic_iterations: 1 post-inventory adaptive round by default
       initial_feature_counts: 0, 2, 5
       initial_feature_strategies: true_first, modifiers_first, mixed, distractors
       stop_after_rejected_iteration: true, false

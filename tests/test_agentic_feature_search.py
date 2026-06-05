@@ -1049,6 +1049,240 @@ class BroadScreenEvaluator:
         return SplitEvaluation(predictions=predictions, metrics=metrics)
 
 
+class CountingSourceExtractionProvider:
+    def __init__(self):
+        self.calls = []
+        self.call_descriptions = []
+
+    def ensure_features(self, dataset, specs):
+        dataset = dataset.copy()
+        missing_specs = [
+            spec
+            for spec in specs
+            if f"explicit_feat_{spec.name}" not in dataset.columns
+        ]
+        if missing_specs:
+            self.calls.append([spec.name for spec in missing_specs])
+            self.call_descriptions.append([spec.description for spec in missing_specs])
+        for spec in missing_specs:
+            value_col = f"explicit_feat_{spec.name}"
+            source_col = f"source_{spec.name}"
+            values = (
+                dataset[source_col].values
+                if source_col in dataset.columns
+                else np.arange(len(dataset), dtype=float)
+            )
+            dataset[value_col] = values
+            dataset[f"{value_col}_missing"] = pd.isna(values)
+        return dataset
+
+
+class InventoryThenNoneAgent:
+    def __init__(self, provider=None, proposals=None):
+        self.contexts = []
+        self.provider = provider
+        self.provider_call_counts = []
+        self.proposals = proposals or [
+            {
+                "action": "add",
+                "name": "hidden_modifier",
+                "type": "continuous",
+                "roles": ["effect_modifier"],
+                "description": "Baseline hidden modifier measured before treatment",
+            }
+        ]
+
+    def propose(self, context):
+        self.contexts.append(context)
+        if self.provider is not None:
+            self.provider_call_counts.append(len(self.provider.calls))
+        if context.get("broad_screen_stage") == "inventory":
+            return self.proposals
+        return [{"action": "none"}]
+
+
+class FoldSpecificDuplicateAgent:
+    def __init__(self):
+        self.contexts = []
+
+    def propose(self, context):
+        self.contexts.append(context)
+        if context.get("broad_screen_stage") != "inventory":
+            return [{"action": "none"}]
+        if context["outer_fold"] == 1:
+            return [
+                {
+                    "action": "add",
+                    "name": "shared_feature",
+                    "type": "continuous",
+                    "roles": ["confounder"],
+                    "description": "First extraction contract",
+                }
+            ]
+        return [
+            {
+                "action": "add",
+                "name": "shared_feature",
+                "type": "continuous",
+                "roles": ["effect_modifier"],
+                "description": "Second extraction contract",
+            }
+        ]
+
+
+class SelectByNameAgent:
+    def __init__(self, inventory_name="strong_confounder"):
+        self.contexts = []
+        self.inventory_name = inventory_name
+
+    def propose(self, context):
+        self.contexts.append(context)
+        if context.get("broad_screen_stage") == "inventory":
+            return [
+                {
+                    "action": "add",
+                    "name": self.inventory_name,
+                    "type": "continuous",
+                    "roles": ["confounder", "effect_modifier"],
+                    "description": f"Baseline {self.inventory_name}",
+                }
+            ]
+        return [{"action": "add", "name": self.inventory_name}]
+
+
+class NewFeatureAfterInventoryAgent:
+    def __init__(self):
+        self.contexts = []
+
+    def propose(self, context):
+        self.contexts.append(context)
+        if context.get("broad_screen_stage") == "inventory":
+            return [
+                {
+                    "action": "add",
+                    "name": "noise_feature",
+                    "type": "continuous",
+                    "roles": ["confounder"],
+                    "description": "Noise baseline variable",
+                }
+            ]
+        return [
+            {
+                "action": "add",
+                "name": "new_signal",
+                "type": "continuous",
+                "roles": ["effect_modifier"],
+                "description": "New baseline signal not in the extracted shortlist",
+            }
+        ]
+
+
+class SequentialBroadSelectionAgent:
+    def __init__(self):
+        self.contexts = []
+
+    def propose(self, context):
+        self.contexts.append(context)
+        if context.get("broad_screen_stage") == "inventory":
+            return [
+                {
+                    "action": "add",
+                    "name": "strong_confounder",
+                    "type": "continuous",
+                    "roles": ["confounder", "effect_modifier"],
+                    "description": "Strong baseline confounder",
+                },
+                {
+                    "action": "add",
+                    "name": "strong_modifier",
+                    "type": "continuous",
+                    "roles": ["confounder", "effect_modifier"],
+                    "description": "Strong baseline effect modifier",
+                },
+            ]
+        name = "strong_confounder" if context["iteration"] == 1 else "strong_modifier"
+        return [{"action": "add", "name": name}]
+
+
+class NewSignalEvaluator(BroadScreenEvaluator):
+    def evaluate_split(self, train_df, test_df, specs, fold_id):
+        result = super().evaluate_split(train_df, test_df, specs, fold_id)
+        if any(spec.name == "new_signal" for spec in specs):
+            result.metrics["r_loss"] = 0.40
+        return result
+
+
+def _broad_signal_df(n=120):
+    rng = np.random.default_rng(456)
+    strong_confounder = rng.normal(size=n)
+    strong_modifier = rng.normal(size=n)
+    noise = rng.normal(size=n)
+    new_signal = rng.normal(size=n)
+    treatment = (strong_confounder + rng.normal(scale=0.15, size=n) > 0).astype(int)
+    outcome = (
+        0.8 * strong_confounder
+        + 0.2 * treatment
+        + 1.6 * treatment * strong_modifier
+        + rng.normal(scale=0.05, size=n)
+    )
+    low_missing = np.arange(n, dtype=float)
+    low_missing_mask = np.arange(n) % 4 != 0
+    low_missing[low_missing_mask] = np.nan
+    df = pd.DataFrame(
+        {
+            "patient_id": np.arange(n),
+            "clinical_text": [f"Patient {i}" for i in range(n)],
+            "treatment_indicator": treatment,
+            "outcome_indicator": outcome,
+            "source_age": np.linspace(50, 80, n),
+            "source_hidden_modifier": np.arange(n, dtype=float),
+            "source_shared_feature": strong_confounder,
+            "source_strong_confounder": strong_confounder,
+            "source_strong_modifier": strong_modifier,
+            "source_low_coverage_feature": low_missing,
+            "source_noise_feature": noise,
+            "source_new_signal": new_signal,
+        }
+    )
+    return df
+
+
+def _broad_config(tmp_path, **overrides):
+    search_kwargs = {
+        "outer_folds": 2,
+        "inner_folds": 2,
+        "search_mode": "broad_screen",
+        "broad_candidate_count": 4,
+        "broad_screen_top_k": 2,
+        "min_feature_coverage": 0.70,
+        "role_diagnostic_score_delta_threshold": 0.01,
+        "min_r_loss_improvement": 0.01,
+        "min_improvement_fold_fraction": 1.0,
+    }
+    search_kwargs.update(overrides.pop("search_overrides", {}))
+    initial_specs = overrides.pop("initial_specs", [])
+    return AppliedInferenceConfig(
+        outcome_type="continuous",
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        cv_folds=2,
+        architecture=ModelArchitectureConfig(
+            model_type="agentic_explicit_feature_forest",
+            explicit_feature_forest=ExplicitFeatureForestConfig(
+                n_estimators=8,
+                min_samples_leaf=2,
+                honest=False,
+                inference=False,
+            ),
+            agentic_feature_search=AgenticFeatureSearchConfig(**search_kwargs),
+        ),
+        explicit_features=ExplicitFeatureExtractionConfig(
+            enabled=True,
+            features=initial_specs,
+            cache_enabled=False,
+        ),
+    )
+
+
 def test_agentic_runner_accepts_inner_cv_improvement_without_true_ite_leakage(tmp_path):
     df = pd.DataFrame(
         {
@@ -1467,11 +1701,12 @@ def test_broad_screen_runner_screens_then_cv_accepts_candidates(tmp_path):
     decisions = [json.loads(line) for line in decision_lines]
     events = [decision["event"] for decision in decisions]
     assert "broad_screening" in events
-    broad_payload = next(
-        decision["payload"]
+    broad_payload = [
+        item
         for decision in decisions
         if decision["event"] == "broad_screening"
-    )
+        for item in decision["payload"]
+    ]
     assert {
         item["candidate_id"]
         for item in broad_payload
@@ -1586,6 +1821,166 @@ def test_broad_screen_runner_union_extracts_candidates_once_across_folds(tmp_pat
     ]
 
 
+def test_broad_screen_extracts_initial_and_inventory_once_with_initial_first(tmp_path):
+    df = _broad_signal_df()
+    provider = CountingSourceExtractionProvider()
+    agent = InventoryThenNoneAgent(provider=provider)
+    initial_specs = [
+        ExplicitFeatureSpec(
+            name="age",
+            type="continuous",
+            roles=["confounder"],
+            description="Age at treatment initiation",
+        )
+    ]
+
+    run_agentic_explicit_feature_forest(
+        dataset=df,
+        config=_broad_config(
+            tmp_path,
+            initial_specs=initial_specs,
+            search_overrides={"max_iterations": 1},
+        ),
+        output_path=tmp_path / "predictions.parquet",
+        proposal_agent=agent,
+        extraction_provider=provider,
+        evaluator=BroadScreenEvaluator(),
+    )
+
+    assert provider.calls[0] == ["age", "hidden_modifier"]
+    assert provider.calls == [["age", "hidden_modifier"]]
+
+    inventory_contexts = [
+        context
+        for context in agent.contexts
+        if context["broad_screen_stage"] == "inventory"
+    ]
+    assert inventory_contexts
+    assert all(count == 0 for count in agent.provider_call_counts[: len(inventory_contexts)])
+    assert all(context["required_features"][0]["name"] == "age" for context in inventory_contexts)
+    assert all("current_inner_cv_metrics" not in context for context in inventory_contexts)
+    assert all("extraction_summary" not in context for context in inventory_contexts)
+
+
+def test_broad_screen_canonicalizes_duplicate_name_contracts_across_folds(tmp_path):
+    df = _broad_signal_df()
+    provider = CountingSourceExtractionProvider()
+    agent = FoldSpecificDuplicateAgent()
+
+    run_agentic_explicit_feature_forest(
+        dataset=df,
+        config=_broad_config(
+            tmp_path,
+            search_overrides={"max_iterations": 1, "broad_candidate_count": 2},
+        ),
+        output_path=tmp_path / "predictions.parquet",
+        proposal_agent=agent,
+        extraction_provider=provider,
+        evaluator=BroadScreenEvaluator(),
+    )
+
+    assert provider.calls == [["shared_feature"]]
+    assert provider.call_descriptions == [["First extraction contract"]]
+
+
+def test_broad_screen_agent_selects_extracted_candidate_without_reextraction(tmp_path):
+    df = _broad_signal_df()
+    provider = CountingSourceExtractionProvider()
+    agent = SelectByNameAgent()
+
+    run_agentic_explicit_feature_forest(
+        dataset=df,
+        config=_broad_config(
+            tmp_path,
+            search_overrides={
+                "max_iterations": 1,
+                "broad_candidate_count": 1,
+                "broad_screen_top_k": 1,
+            },
+        ),
+        output_path=tmp_path / "predictions.parquet",
+        proposal_agent=agent,
+        extraction_provider=provider,
+        evaluator=BroadScreenEvaluator(),
+    )
+
+    assert provider.calls == [["strong_confounder"]]
+    selection_contexts = [
+        context
+        for context in agent.contexts
+        if context["broad_screen_stage"] == "selection"
+    ]
+    assert selection_contexts
+    assert selection_contexts[0]["available_extracted_features"][0]["name"] == (
+        "strong_confounder"
+    )
+
+
+def test_broad_screen_agent_new_feature_triggers_one_on_demand_extraction(tmp_path):
+    df = _broad_signal_df()
+    provider = CountingSourceExtractionProvider()
+
+    run_agentic_explicit_feature_forest(
+        dataset=df,
+        config=_broad_config(
+            tmp_path,
+            search_overrides={
+                "max_iterations": 1,
+                "broad_candidate_count": 1,
+                "broad_screen_top_k": 1,
+            },
+        ),
+        output_path=tmp_path / "predictions.parquet",
+        proposal_agent=NewFeatureAfterInventoryAgent(),
+        extraction_provider=provider,
+        evaluator=NewSignalEvaluator(),
+    )
+
+    assert provider.calls == [["noise_feature"], ["new_signal"]]
+
+
+def test_broad_screen_respects_max_iterations_for_adaptive_rounds(tmp_path):
+    df = _broad_signal_df()
+    provider = CountingSourceExtractionProvider()
+    agent = SequentialBroadSelectionAgent()
+
+    run_agentic_explicit_feature_forest(
+        dataset=df,
+        config=_broad_config(
+            tmp_path,
+            search_overrides={
+                "max_iterations": 1,
+                "broad_candidate_count": 2,
+                "broad_screen_top_k": 2,
+            },
+        ),
+        output_path=tmp_path / "predictions.parquet",
+        proposal_agent=agent,
+        extraction_provider=provider,
+        evaluator=BroadScreenEvaluator(),
+    )
+
+    feature_sets = json.loads(
+        (tmp_path / "agentic_feature_search" / "feature_sets.json").read_text()
+    )
+    selected_names = {
+        feature["name"]
+        for row in feature_sets
+        if row["stage"] == "selected"
+        for feature in row["features"]
+    }
+    selection_iterations = {
+        context["iteration"]
+        for context in agent.contexts
+        if context["broad_screen_stage"] == "selection"
+    }
+
+    assert provider.calls == [["strong_confounder", "strong_modifier"]]
+    assert "strong_confounder" in selected_names
+    assert "strong_modifier" not in selected_names
+    assert selection_iterations == {1}
+
+
 def test_experiment_config_parses_agentic_search_config(tmp_path):
     dataset_path = tmp_path / "dataset.parquet"
     pd.DataFrame(
@@ -1664,6 +2059,6 @@ def test_oracle_grid_propagates_agentic_raw_output_flag():
     assert configs
     assert all(config.agentic_save_agent_raw_output for config in configs)
     assert all(config.agentic_search_mode == "broad_screen" for config in configs)
-    assert {config.agentic_max_iterations for config in configs} == {1}
+    assert {config.agentic_max_iterations for config in configs} == {1, 2}
     assert all(config.agentic_broad_candidate_count == 80 for config in configs)
     assert all(config.agentic_broad_screen_top_k == 20 for config in configs)

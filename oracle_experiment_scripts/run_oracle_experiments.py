@@ -2223,7 +2223,7 @@ def generate_experiment_grid(
 
         agentic_mode_iterations = []
         for search_mode in agentic_search_modes:
-            iterations = [1] if search_mode == "broad_screen" else agentic_iteration_options
+            iterations = agentic_iteration_options
             agentic_mode_iterations.extend((search_mode, n_iter) for n_iter in iterations)
 
         for (
@@ -2762,7 +2762,7 @@ def main():
         choices=["iterative", "broad_screen"],
         help=(
             "Agentic feature-search modes to grid over. broad_screen is the "
-            "default and uses one high-recall proposal pass plus screening."
+            "default and uses one high-recall proposal pass plus adaptive selection."
         )
     )
     parser.add_argument(
@@ -2775,7 +2775,7 @@ def main():
         "--agentic-broad-screen-top-k",
         type=int,
         default=20,
-        help="Number of screened candidates retained for inner-CV refinement."
+        help="Number of ranked extracted candidates shown to the agent per adaptive round."
     )
     parser.add_argument(
         "--agentic-stop-after-rejected-iteration",
