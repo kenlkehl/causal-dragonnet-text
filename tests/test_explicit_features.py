@@ -2,6 +2,7 @@ import pytest
 
 from oci.config import ExperimentConfig, ExplicitFeatureSpec
 from oci.extraction import (
+    VLLMFeatureExtractor,
     infer_vllm_reasoning_parser,
     parse_extraction_response,
     resolve_vllm_reasoning_parser,
@@ -140,6 +141,67 @@ def test_parse_extraction_response_strips_inline_reasoning_trace():
 
     assert parsed["age"].value == 71.0
     assert parsed["age"].is_missing is False
+
+
+def test_vllm_feature_extractor_server_client_has_no_timeout(monkeypatch):
+    calls = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            calls.update(kwargs)
+
+    monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
+    extractor = VLLMFeatureExtractor(
+        specs=[
+            ExplicitFeatureSpec(name="age", type="continuous", roles=["confounder"]),
+        ],
+        mode="server",
+    )
+
+    extractor._init_server_client()
+
+    assert calls["timeout"] is None
+    assert calls["max_retries"] == 0
+
+
+def test_vllm_feature_extractor_request_does_not_set_timeout():
+    calls = {}
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.update(kwargs)
+
+            class Message:
+                content = '{"age": 41}'
+
+            class Choice:
+                message = Message()
+
+            class Response:
+                choices = [Choice()]
+
+            return Response()
+
+    class FakeClient:
+        class Chat:
+            completions = FakeCompletions()
+
+        chat = Chat()
+
+    extractor = VLLMFeatureExtractor(
+        specs=[
+            ExplicitFeatureSpec(name="age", type="continuous", roles=["confounder"]),
+        ],
+        mode="server",
+        max_retries=1,
+    )
+    extractor._client = FakeClient()
+
+    result = extractor._extract_single_server("Age: 41")
+
+    assert "timeout" not in calls
+    assert result["age"].value == 41.0
+    assert result["age"].is_missing is False
 
 
 def test_experiment_config_rejects_old_explicit_confounder_keys():

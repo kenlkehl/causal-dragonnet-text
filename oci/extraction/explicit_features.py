@@ -349,7 +349,7 @@ class VLLMFeatureExtractor:
         self._client = OpenAI(
             base_url=self.server_url,
             api_key=self.api_key,
-            timeout=30.0,    # 30s per request (default is 10 min)
+            timeout=None,
             max_retries=0,   # No internal retries (we have our own outer retry loop)
         )
         logger.info(f"Connected to vLLM server at: {self.server_url}")
@@ -443,7 +443,6 @@ class VLLMFeatureExtractor:
                     messages=[{"role": "user", "content": prompt}],
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
-                    timeout=30.0,  # Hard per-request cap
                 )
                 content = response.choices[0].message.content
                 if content:
