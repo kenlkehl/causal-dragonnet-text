@@ -37,6 +37,9 @@ Requires-Dist: mypy>=1.0.0; extra == "dev"
 Provides-Extra: extraction
 Requires-Dist: openai>=1.0.0; extra == "extraction"
 Requires-Dist: openai-harmony>=0.0.8; extra == "extraction"
+Provides-Extra: gemini
+Requires-Dist: google-genai>=1.0.0; extra == "gemini"
+Requires-Dist: google-cloud-storage>=2.0.0; extra == "gemini"
 Dynamic: license-file
 
 # Oncology Causal Inference (OCI)

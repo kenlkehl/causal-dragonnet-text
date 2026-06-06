@@ -966,9 +966,14 @@ def _parse_event_timeline(timeline_text: str) -> List[Dict[str, str]]:
     """
     Parse event timeline text into structured events.
 
-    Each event is a line starting with <event_type> tag.
+    The primary prompt asks for lines starting with <event_type> tags, but
+    some hosted models return JSON arrays with event_type/event_text fields.
     Returns list of dicts with 'event_type' and 'event_text' keys.
     """
+    json_events = _parse_event_timeline_json(timeline_text)
+    if json_events:
+        return json_events
+
     pattern = re.compile(r'<(\w+)>\s*(.*?)(?=\n\s*<\w+>|\Z)', re.DOTALL)
     events = []
     for event_type, event_text in pattern.findall(timeline_text):
@@ -977,6 +982,84 @@ def _parse_event_timeline(timeline_text: str) -> List[Dict[str, str]]:
             events.append({
                 "event_type": event_type.strip(),
                 "event_text": text,
+            })
+    return events
+
+
+def _strip_json_code_fence(text: str) -> str:
+    """Strip a Markdown JSON code fence if the model wrapped its response."""
+    stripped = text.strip()
+    fence_match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", stripped, re.DOTALL | re.IGNORECASE)
+    if fence_match:
+        return fence_match.group(1).strip()
+    return stripped
+
+
+def _load_timeline_json(text: str) -> Optional[Any]:
+    """Load a JSON timeline from a possibly fenced or prefixed model response."""
+    stripped = _strip_json_code_fence(text)
+    decoder = json.JSONDecoder()
+
+    candidates = [stripped]
+    for delimiter in ("[", "{"):
+        idx = stripped.find(delimiter)
+        if idx > 0:
+            candidates.append(stripped[idx:])
+
+    for candidate in candidates:
+        try:
+            value, _ = decoder.raw_decode(candidate)
+            return value
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _event_type_from_json(value: Any) -> str:
+    event_type = str(value or "").strip()
+    event_type = event_type.strip("<>").strip()
+    return event_type
+
+
+def _event_text_from_json(event: Dict[str, Any]) -> str:
+    for key in ("event_text", "text", "description", "note", "summary", "findings", "impression"):
+        value = event.get(key)
+        if value:
+            return str(value).strip()
+
+    payload = {
+        key: value
+        for key, value in event.items()
+        if key not in {"event_type", "type"}
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _parse_event_timeline_json(timeline_text: str) -> List[Dict[str, str]]:
+    """Parse Gemini-style JSON event arrays into the internal event format."""
+    loaded = _load_timeline_json(timeline_text)
+    if loaded is None:
+        return []
+
+    if isinstance(loaded, dict):
+        for key in ("events", "timeline", "event_timeline"):
+            if isinstance(loaded.get(key), list):
+                loaded = loaded[key]
+                break
+
+    if not isinstance(loaded, list):
+        return []
+
+    events = []
+    for item in loaded:
+        if not isinstance(item, dict):
+            continue
+        event_type = _event_type_from_json(item.get("event_type", item.get("type", "")))
+        event_text = _event_text_from_json(item)
+        if event_type and event_text:
+            events.append({
+                "event_type": event_type,
+                "event_text": event_text,
             })
     return events
 

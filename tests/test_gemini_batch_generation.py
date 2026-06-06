@@ -11,6 +11,7 @@ from synthetic_data.gemini_batch_client import (
 )
 from synthetic_data.generator import (
     _assemble_gemini_dataset_from_partitions,
+    _parse_event_timeline,
     _parse_timelines_and_build_note_requests,
 )
 
@@ -82,6 +83,39 @@ def test_parse_timelines_builds_partitioned_events_and_note_requests(tmp_path):
     assert [record["event_type"] for record in event_records] == ["clinical_note", "lab_result"]
     note_records = list(iter_jsonl_records([tmp_path / "notes" / "inputs" / "note_expansion-00000.jsonl"]))
     assert [extract_request_id(record) for record in note_records] == ["note:0:0"]
+
+
+def test_parse_event_timeline_accepts_gemini_json_array():
+    timeline = """```json
+[
+  {
+    "event_type": "<demographics>",
+    "age": 70,
+    "text": "The patient is a 70-year-old woman."
+  },
+  {
+    "event_type": "<clinical_note>",
+    "event_age": 70,
+    "event_text": "Medical oncology follow-up after vinorelbine initiation."
+  },
+  {
+    "event_type": "<lab_result>",
+    "panel": "CBC",
+    "components": [{"name": "Hgb", "value": 10.2}]
+  }
+]
+```"""
+
+    events = _parse_event_timeline(timeline)
+
+    assert [event["event_type"] for event in events] == [
+        "demographics",
+        "clinical_note",
+        "lab_result",
+    ]
+    assert events[0]["event_text"] == "The patient is a 70-year-old woman."
+    assert events[1]["event_text"] == "Medical oncology follow-up after vinorelbine initiation."
+    assert '"panel": "CBC"' in events[2]["event_text"]
 
 
 def test_assemble_gemini_dataset_from_partitions_writes_final_parquet(tmp_path):

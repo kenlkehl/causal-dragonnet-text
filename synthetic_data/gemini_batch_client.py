@@ -122,6 +122,25 @@ def iter_jsonl_records(paths: Iterable[Path]) -> Iterator[Dict[str, Any]]:
                     logger.warning("Skipping invalid JSONL line %s:%d: %s", path, line_number, exc)
 
 
+def manifest_matches_shards(manifest: Dict[str, Any], shards: List[Dict[str, Any]]) -> bool:
+    """Return True if a saved manifest describes the request shards just written."""
+    previous_shards = manifest.get("shards") or []
+    if len(previous_shards) != len(shards):
+        return False
+
+    for previous, current in zip(previous_shards, shards):
+        for key in ("stage", "shard_index", "request_count", "input_bytes"):
+            if previous.get(key) != current.get(key):
+                return False
+
+        previous_name = Path(str(previous.get("local_input_path", ""))).name
+        current_name = Path(str(current.get("local_input_path", ""))).name
+        if previous_name != current_name:
+            return False
+
+    return True
+
+
 class GeminiRequestShardWriter:
     """Write Gemini batch request JSONL shards under request-count and byte limits."""
 
@@ -405,28 +424,36 @@ class GeminiBatchClient:
         manifest: Dict[str, Any] = {
             "config": asdict(self.config),
             "stage": stage,
+            "remote_stage": stage,
             "shards": shards,
         }
         if manifest_path.exists():
             try:
                 with open(manifest_path, "r", encoding="utf-8") as f:
                     previous = json.load(f)
-                if previous.get("stage") == stage and previous.get("shards"):
+                if previous.get("stage") == stage and manifest_matches_shards(previous, shards):
                     manifest = previous
                     shards = manifest["shards"]
                     logger.info("Loaded existing Gemini stage manifest: %s", manifest_path)
+                elif previous.get("stage") == stage:
+                    logger.info(
+                        "Ignoring stale Gemini stage manifest with mismatched shards: %s",
+                        manifest_path,
+                    )
+                    manifest["remote_stage"] = f"{stage}-repair-{int(time.time())}"
             except (json.JSONDecodeError, OSError) as exc:
                 logger.warning("Could not load existing Gemini manifest %s: %s", manifest_path, exc)
 
         staging_root = self.config.staging_uri.rstrip("/")
+        remote_stage = manifest.get("remote_stage", stage)
         for shard in shards:
             shard_index = shard["shard_index"]
             local_input_path = Path(shard["local_input_path"])
             input_uri = shard.get("gcs_input_uri") or self._join_gcs(
-                staging_root, "inputs", stage, local_input_path.name
+                staging_root, "inputs", remote_stage, local_input_path.name
             )
             output_uri_prefix = shard.get("gcs_output_uri_prefix") or self._join_gcs(
-                staging_root, "outputs", stage, f"shard-{shard_index:05d}"
+                staging_root, "outputs", remote_stage, f"shard-{shard_index:05d}"
             )
             shard["gcs_input_uri"] = input_uri
             shard["gcs_output_uri_prefix"] = output_uri_prefix
@@ -459,6 +486,14 @@ class GeminiBatchClient:
                 self._write_manifest(manifest_path, manifest)
 
             output_dir = stage_dir / "outputs" / f"shard-{shard['shard_index']:05d}"
+            local_output_paths = [
+                path
+                for path in shard.get("local_output_paths", []) or []
+                if Path(path).exists()
+            ]
+            if len(local_output_paths) != len(shard.get("local_output_paths", []) or []):
+                shard["local_output_paths"] = local_output_paths
+
             if not shard.get("local_output_paths"):
                 downloaded = self.download_prefix(shard["gcs_output_uri_prefix"], output_dir)
                 shard["local_output_paths"] = [str(path) for path in downloaded]

@@ -7,6 +7,7 @@ from synthetic_data.gemini_batch_client import (
     extract_request_id,
     extract_response_text,
     iter_jsonl_records,
+    manifest_matches_shards,
 )
 
 
@@ -118,3 +119,29 @@ def test_parse_gcs_uri_and_model_normalization():
         GeminiBatchClient._model_for_sdk("publishers/google/models/gemini-2.5-flash-lite")
         == "gemini-2.5-flash-lite"
     )
+
+
+def test_manifest_matches_shards_rejects_stale_request_counts():
+    current_shards = [
+        {
+            "stage": "note_expansion",
+            "shard_index": 0,
+            "local_input_path": "/new/note_expansion-00000.jsonl",
+            "request_count": 100000,
+            "input_bytes": 1000,
+        }
+    ]
+    stale_manifest = {
+        "stage": "note_expansion",
+        "shards": [
+            {
+                "stage": "note_expansion",
+                "shard_index": 0,
+                "local_input_path": "/old/note_expansion-00000.jsonl",
+                "request_count": 3,
+                "input_bytes": 1000,
+            }
+        ],
+    }
+
+    assert not manifest_matches_shards(stale_manifest, current_shards)
