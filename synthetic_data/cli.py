@@ -4,6 +4,7 @@
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 from pathlib import Path
@@ -14,7 +15,11 @@ import pandas as pd
 from tqdm import tqdm
 
 from .config import SyntheticDataConfig, LLMConfig, StructuredDataConfig, DEFAULT_CLINICAL_QUESTION
-from .generator import generate_synthetic_dataset, generate_synthetic_dataset_batch
+from .generator import (
+    generate_synthetic_dataset,
+    generate_synthetic_dataset_batch,
+    generate_synthetic_dataset_gemini_batch,
+)
 from oci.extraction import resolve_vllm_reasoning_parser
 
 logger = logging.getLogger(__name__)
@@ -962,6 +967,70 @@ Examples:
         help="Use direct vLLM batch inference (faster, no server needed)",
     )
     parser.add_argument(
+        "--use-gemini-batch",
+        action="store_true",
+        help="Use Gemini batch inference on Google Agent Platform / Vertex AI",
+    )
+    parser.add_argument(
+        "--dgp-metadata",
+        type=str,
+        default=None,
+        help="Metadata JSON containing feature definitions, equations, and summary stats for Gemini batch generation",
+    )
+    parser.add_argument(
+        "--gcp-project",
+        type=str,
+        default=None,
+        help="GCP project for Gemini batch jobs (defaults to GOOGLE_CLOUD_PROJECT)",
+    )
+    parser.add_argument(
+        "--gcp-location",
+        type=str,
+        default="us-central1",
+        help="GCP location for Gemini batch jobs (default: us-central1)",
+    )
+    parser.add_argument(
+        "--gcs-staging-uri",
+        type=str,
+        default=None,
+        help="GCS prefix for Gemini batch inputs and outputs, e.g. gs://bucket/path/run",
+    )
+    parser.add_argument(
+        "--gemini-model",
+        type=str,
+        default="gemini-2.5-flash-lite",
+        help="Gemini model ID for batch generation (default: gemini-2.5-flash-lite)",
+    )
+    parser.add_argument(
+        "--batch-max-requests",
+        type=int,
+        default=100000,
+        help="Maximum requests per Gemini batch input shard (default: 100000)",
+    )
+    parser.add_argument(
+        "--batch-max-input-bytes",
+        type=int,
+        default=800000000,
+        help="Maximum bytes per Gemini batch input shard (default: 800000000)",
+    )
+    parser.add_argument(
+        "--batch-poll-interval",
+        type=int,
+        default=30,
+        help="Seconds between Gemini batch job status polls (default: 30)",
+    )
+    parser.add_argument(
+        "--gemini-submit-only",
+        action="store_true",
+        help="Submit the next Gemini batch stage and stop before collecting/assembling outputs",
+    )
+    parser.add_argument(
+        "--gemini-local-partitions",
+        type=int,
+        default=256,
+        help="Number of local patient partitions for Gemini output assembly (default: 256)",
+    )
+    parser.add_argument(
         "--tensor-parallel-size",
         type=int,
         default=2,
@@ -1020,8 +1089,14 @@ Examples:
         "--extract-confounders",
         dest="extract_features",
         action="store_true",
-        default=True,
+        default=False,
         help="After generation, extract explicit features from clinical text using the same LLM and evaluate accuracy",
+    )
+    parser.add_argument(
+        "--no-extract-features",
+        dest="extract_features",
+        action="store_false",
+        help="Skip post-generation explicit feature extraction",
     )
     parser.add_argument(
         "--extraction-max-text-tokens",
@@ -1043,6 +1118,16 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    if args.use_vllm_batch and args.use_gemini_batch:
+        parser.error("--use-vllm-batch and --use-gemini-batch are mutually exclusive")
+    if args.use_gemini_batch:
+        if not args.dgp_metadata:
+            parser.error("--use-gemini-batch requires --dgp-metadata")
+        if not args.gcs_staging_uri:
+            parser.error("--use-gemini-batch requires --gcs-staging-uri")
+        if not (args.gcp_project or os.environ.get("GOOGLE_CLOUD_PROJECT")):
+            parser.error("--use-gemini-batch requires --gcp-project or GOOGLE_CLOUD_PROJECT")
 
     if args.num_features is None and (
         args.num_confounders is not None or args.num_effect_modifiers is not None
@@ -1167,6 +1252,9 @@ Examples:
             ),
         )
 
+    if args.use_gemini_batch:
+        config.llm.model_name = args.gemini_model
+
     # Save config to output directory before generation
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1216,12 +1304,42 @@ Examples:
                 show_progress=True,
                 gpu_device_ids=gpu_device_ids,
             )
+        elif args.use_gemini_batch:
+            from .gemini_batch_client import GeminiBatchConfig
+
+            gemini_config = GeminiBatchConfig(
+                project=args.gcp_project or os.environ["GOOGLE_CLOUD_PROJECT"],
+                location=args.gcp_location,
+                staging_uri=args.gcs_staging_uri,
+                model_name=args.gemini_model,
+                batch_max_requests=args.batch_max_requests,
+                batch_max_input_bytes=args.batch_max_input_bytes,
+                poll_interval_seconds=args.batch_poll_interval,
+                submit_only=args.gemini_submit_only,
+            )
+            df, metadata = generate_synthetic_dataset_gemini_batch(
+                config=config,
+                gemini_config=gemini_config,
+                dgp_metadata_path=args.dgp_metadata,
+                show_progress=True,
+                local_partitions=args.gemini_local_partitions,
+            )
         else:
             df, metadata = generate_synthetic_dataset(
                 config=config,
                 num_workers=args.num_workers,
                 show_progress=True,
             )
+
+        gemini_batch_metadata = metadata.get("gemini_batch", {})
+        if gemini_batch_metadata.get("submit_only"):
+            print("\nSubmitted Gemini batch jobs")
+            if gemini_batch_metadata.get("timeline_manifest"):
+                print(f"  - Timeline manifest: {gemini_batch_metadata['timeline_manifest']}")
+            if gemini_batch_metadata.get("note_manifest"):
+                print(f"  - Note manifest: {gemini_batch_metadata['note_manifest']}")
+            print(f"  - Metadata: {config.output_dir}/metadata.json")
+            return
 
         print(f"\n✓ Generated {len(df)} patients")
         print(f"  - Treatment rate: {df['treatment_indicator'].mean():.1%}")

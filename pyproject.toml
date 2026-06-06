@@ -48,6 +48,10 @@ extraction = [
     "openai>=1.0.0",
     "openai-harmony>=0.0.8",
 ]
+gemini = [
+    "google-genai>=1.0.0",
+    "google-cloud-storage>=2.0.0",
+]
 
 [project.scripts]
 oci = "oci.cli:main"

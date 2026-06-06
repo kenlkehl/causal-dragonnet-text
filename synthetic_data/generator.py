@@ -5,8 +5,9 @@ import logging
 import json
 import random
 import re
+from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Iterable
 from dataclasses import asdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -1682,6 +1683,740 @@ def _run_parallel_vllm_workers(
 
     logger.info(f"Merged {len(clinical_texts)} clinical texts from {num_workers} workers")
     return clinical_texts
+
+
+# ============================================================================
+# Gemini batch generation
+# ============================================================================
+
+class _PartitionedJsonlWriter:
+    """Write patient-keyed JSONL records to partition files with bounded handles."""
+
+    def __init__(
+        self,
+        directory: Path,
+        prefix: str,
+        num_partitions: int,
+        max_open_files: int = 64,
+    ):
+        self.directory = directory
+        self.prefix = prefix
+        self.num_partitions = num_partitions
+        self.max_open_files = max_open_files
+        self.directory.mkdir(parents=True, exist_ok=True)
+        for path in self.directory.glob(f"{self.prefix}-*.jsonl"):
+            path.unlink()
+        self._handles: "OrderedDict[int, Any]" = OrderedDict()
+
+    def _path_for_partition(self, partition: int) -> Path:
+        return self.directory / f"{self.prefix}-{partition:05d}.jsonl"
+
+    def _handle_for_partition(self, partition: int):
+        handle = self._handles.get(partition)
+        if handle is not None:
+            self._handles.move_to_end(partition)
+            return handle
+
+        handle = open(self._path_for_partition(partition), "a", encoding="utf-8")
+        self._handles[partition] = handle
+        if len(self._handles) > self.max_open_files:
+            _, old_handle = self._handles.popitem(last=False)
+            old_handle.close()
+        return handle
+
+    def write(self, patient_id: int, record: Dict[str, Any]) -> None:
+        partition = patient_id % self.num_partitions
+        handle = self._handle_for_partition(partition)
+        handle.write(json.dumps(record, ensure_ascii=False, default=str))
+        handle.write("\n")
+
+    def close(self) -> None:
+        for handle in self._handles.values():
+            handle.close()
+        self._handles.clear()
+
+    def __enter__(self) -> "_PartitionedJsonlWriter":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+
+def _load_dgp_metadata(metadata_path: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """Load feature definitions, equations, and summary stats from a seed metadata file."""
+    with open(metadata_path, "r", encoding="utf-8") as f:
+        metadata = json.load(f)
+
+    features = _validate_feature_roles(metadata.get("features", []))
+    treatment_eq = json.loads(json.dumps(metadata.get("treatment_equation", {})))
+    outcome_eq = json.loads(json.dumps(metadata.get("outcome_equation", {})))
+    summary_stats = json.loads(json.dumps(metadata.get("summary_statistics", {})))
+    source_config = metadata.get("config", {})
+
+    if not features:
+        raise ValueError(f"DGP metadata file has no features: {metadata_path}")
+    if not treatment_eq or not outcome_eq:
+        raise ValueError(f"DGP metadata file is missing treatment/outcome equations: {metadata_path}")
+    if not summary_stats:
+        raise ValueError(f"DGP metadata file is missing summary_statistics: {metadata_path}")
+
+    return features, treatment_eq, outcome_eq, summary_stats, source_config
+
+
+def _enabled_structured_event_types(config: SyntheticDataConfig) -> set:
+    structured_config = getattr(config, "structured_data", None)
+    enabled_types = set()
+    if structured_config is not None and structured_config.enabled:
+        if structured_config.include_encounters:
+            enabled_types.add("encounter")
+        if structured_config.include_hospitalizations:
+            enabled_types.add("hospitalization")
+        if structured_config.include_labs:
+            enabled_types.add("lab_result")
+        if structured_config.include_pros:
+            enabled_types.add("pro_assessment")
+    return enabled_types
+
+
+def _build_patient_scaffold_record(
+    patient_idx: int,
+    config: SyntheticDataConfig,
+    confounders: List[Dict[str, Any]],
+    summary_stats: Dict[str, Any],
+    treatment_eq: Dict[str, Any],
+    outcome_eq: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Sample one patient and compute deterministic causal scaffold fields."""
+    characteristics = _sample_patient_characteristics(confounders, summary_stats)
+
+    treatment_logit = _compute_logit(
+        characteristics, confounders, summary_stats, treatment_eq
+    )
+    treatment_prob = 1.0 / (1.0 + np.exp(-treatment_logit))
+
+    if getattr(config, "enforce_positivity", False):
+        treatment_prob = _enforce_positivity(
+            treatment_prob,
+            min_rate=getattr(config, "min_treatment_rate_per_stratum", 0.1),
+            max_rate=getattr(config, "max_treatment_rate_per_stratum", 0.9),
+        )
+
+    treatment = int(np.random.random() < treatment_prob)
+
+    outcome_logit = _compute_logit(
+        characteristics, confounders, summary_stats, outcome_eq, treatment=treatment
+    )
+    outcome_type = getattr(config, "outcome_type", "binary")
+    if outcome_type == "continuous":
+        noise_std = getattr(config, "outcome_noise_std", 1.0)
+        outcome = outcome_logit + np.random.normal(0, noise_std)
+    else:
+        outcome_prob_for_sample = 1.0 / (1.0 + np.exp(-outcome_logit))
+        outcome = int(np.random.random() < outcome_prob_for_sample)
+
+    outcome_logit_0 = _compute_logit(
+        characteristics, confounders, summary_stats, outcome_eq, treatment=0
+    )
+    outcome_logit_1 = _compute_logit(
+        characteristics, confounders, summary_stats, outcome_eq, treatment=1
+    )
+    outcome_prob_0 = 1.0 / (1.0 + np.exp(-outcome_logit_0))
+    outcome_prob_1 = 1.0 / (1.0 + np.exp(-outcome_logit_1))
+    outcome_prob = 1.0 / (1.0 + np.exp(-outcome_logit))
+
+    patient_prompt = format_patient_characteristics(characteristics, confounders)
+    record = {
+        "patient_id": patient_idx,
+        "patient_prompt": patient_prompt,
+        "treatment_indicator": treatment,
+        "outcome_indicator": outcome,
+        "true_treatment_prob": treatment_prob,
+        "true_outcome_prob": outcome_prob,
+        "true_y0_prob": outcome_prob_0,
+        "true_y1_prob": outcome_prob_1,
+        "true_ite_prob": outcome_prob_1 - outcome_prob_0,
+    }
+    for name, value in characteristics.items():
+        record[f"true_{name}"] = value
+    return record
+
+
+def _build_or_load_patient_scaffold(
+    config: SyntheticDataConfig,
+    confounders: List[Dict[str, Any]],
+    summary_stats: Dict[str, Any],
+    treatment_eq: Dict[str, Any],
+    outcome_eq: Dict[str, Any],
+    output_dir: Path,
+    show_progress: bool,
+) -> pd.DataFrame:
+    scaffold_path = output_dir / "patient_scaffold.parquet"
+    if scaffold_path.exists():
+        scaffold_df = pd.read_parquet(scaffold_path)
+        if len(scaffold_df) == config.dataset_size:
+            logger.info("Loaded existing patient scaffold: %s", scaffold_path)
+            return scaffold_df
+        logger.warning(
+            "Ignoring existing scaffold with %d rows; expected %d",
+            len(scaffold_df),
+            config.dataset_size,
+        )
+
+    patient_records = []
+    iterator: Iterable[int] = range(config.dataset_size)
+    if show_progress:
+        iterator = tqdm(iterator, desc="Building Gemini patient scaffold")
+    for patient_idx in iterator:
+        patient_records.append(
+            _build_patient_scaffold_record(
+                patient_idx,
+                config,
+                confounders,
+                summary_stats,
+                treatment_eq,
+                outcome_eq,
+            )
+        )
+
+    scaffold_df = pd.DataFrame(patient_records)
+    scaffold_df.to_parquet(scaffold_path, index=False)
+    logger.info("Saved patient scaffold to %s", scaffold_path)
+    return scaffold_df
+
+
+def _manifest_output_paths(manifest: Dict[str, Any]) -> List[Path]:
+    paths: List[Path] = []
+    for shard in manifest.get("shards", []):
+        for path in shard.get("local_output_paths", []) or []:
+            paths.append(Path(path))
+    return paths
+
+
+def _parse_timeline_request_id(request_id: str) -> Optional[int]:
+    parts = request_id.split(":")
+    if len(parts) == 2 and parts[0] == "timeline":
+        try:
+            return int(parts[1])
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_note_request_id(request_id: str) -> Optional[Tuple[int, int]]:
+    parts = request_id.split(":")
+    if len(parts) == 3 and parts[0] == "note":
+        try:
+            return int(parts[1]), int(parts[2])
+        except ValueError:
+            return None
+    return None
+
+
+def _drug_perturbation_for_event(seed: int, patient_id: int, event_idx: int, probability: float) -> bool:
+    if probability <= 0:
+        return False
+    return random.Random(f"{seed}:{patient_id}:{event_idx}").random() < probability
+
+
+def _parse_timelines_and_build_note_requests(
+    *,
+    config: SyntheticDataConfig,
+    gemini_client: Any,
+    timeline_manifest: Dict[str, Any],
+    events_dir: Path,
+    note_stage_dir: Path,
+    num_partitions: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Parse timeline outputs, partition events locally, and write note request shards."""
+    from .gemini_batch_client import (
+        extract_request_id,
+        extract_response_text,
+        iter_jsonl_records,
+    )
+
+    note_types = set(getattr(config, "note_types_to_expand", [
+        "clinical_note",
+        "imaging_report",
+        "pathology_report",
+        "ngs_report",
+    ]))
+    note_input_dir = note_stage_dir / "inputs"
+    failed_rows: List[Dict[str, Any]] = []
+
+    with _PartitionedJsonlWriter(events_dir, "events", num_partitions) as events_writer:
+        with gemini_client.open_request_writer(
+            stage="note_expansion",
+            input_dir=note_input_dir,
+            system_prompt=CLINICAL_SYSTEM_PROMPT,
+            temperature=0.5,
+            max_output_tokens=config.llm.max_tokens,
+        ) as note_writer:
+            for output_record in iter_jsonl_records(_manifest_output_paths(timeline_manifest)):
+                request_id = extract_request_id(output_record)
+                patient_id = _parse_timeline_request_id(request_id or "")
+                status = output_record.get("status")
+                if patient_id is None or status:
+                    failed_rows.append({
+                        "request_id": request_id,
+                        "status": status,
+                    })
+                    continue
+
+                timeline_text = extract_response_text(output_record)
+                events = _parse_event_timeline(timeline_text)
+                if not events:
+                    failed_rows.append({
+                        "request_id": request_id,
+                        "status": "No events parsed from timeline",
+                    })
+                    continue
+
+                for event_idx, event in enumerate(events):
+                    event_record = {
+                        "patient_id": patient_id,
+                        "event_idx": event_idx,
+                        "event_type": event["event_type"],
+                        "event_text": event["event_text"],
+                    }
+                    events_writer.write(patient_id, event_record)
+
+                for event_idx, event in enumerate(events):
+                    if event["event_type"] not in note_types:
+                        continue
+                    masked_timeline = _create_masked_timeline(events, event_idx)
+                    note_type = _event_type_to_note_type(event["event_type"])
+                    expansion_prompt = NOTE_EXPANSION_PROMPT.format(
+                        note_type=note_type,
+                        clinical_question=config.clinical_question,
+                        masked_event_timeline=masked_timeline,
+                    )
+                    note_writer.add(f"note:{patient_id}:{event_idx}", expansion_prompt)
+
+            note_shards = note_writer.close()
+
+    note_stage_dir.mkdir(parents=True, exist_ok=True)
+    with open(note_stage_dir / "timeline_failures.json", "w", encoding="utf-8") as f:
+        json.dump(failed_rows, f, indent=2, ensure_ascii=False)
+
+    logger.info(
+        "Parsed timeline output into %d note request shards; timeline failures: %d",
+        len(note_shards),
+        len(failed_rows),
+    )
+    return note_shards, {"timeline_failures": failed_rows}
+
+
+def _partition_note_outputs(
+    *,
+    note_manifest: Dict[str, Any],
+    notes_dir: Path,
+    num_partitions: int,
+) -> Dict[str, Any]:
+    """Parse note expansion outputs into patient partitions."""
+    from .gemini_batch_client import (
+        extract_request_id,
+        extract_response_text,
+        iter_jsonl_records,
+    )
+
+    failed_rows: List[Dict[str, Any]] = []
+    note_count = 0
+    with _PartitionedJsonlWriter(notes_dir, "notes", num_partitions) as notes_writer:
+        for output_record in iter_jsonl_records(_manifest_output_paths(note_manifest)):
+            request_id = extract_request_id(output_record)
+            parsed = _parse_note_request_id(request_id or "")
+            status = output_record.get("status")
+            if parsed is None or status:
+                failed_rows.append({
+                    "request_id": request_id,
+                    "status": status,
+                })
+                continue
+
+            patient_id, event_idx = parsed
+            notes_writer.write(
+                patient_id,
+                {
+                    "patient_id": patient_id,
+                    "event_idx": event_idx,
+                    "text": extract_response_text(output_record),
+                },
+            )
+            note_count += 1
+
+    with open(notes_dir / "note_failures.json", "w", encoding="utf-8") as f:
+        json.dump(failed_rows, f, indent=2, ensure_ascii=False)
+
+    logger.info("Partitioned %d expanded notes; note failures: %d", note_count, len(failed_rows))
+    return {
+        "note_count": note_count,
+        "note_failures": failed_rows,
+    }
+
+
+def _read_partition_jsonl(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    records = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
+
+
+def _assemble_gemini_dataset_from_partitions(
+    *,
+    config: SyntheticDataConfig,
+    scaffold_df: pd.DataFrame,
+    output_dir: Path,
+    events_dir: Path,
+    notes_dir: Path,
+    num_partitions: int,
+    enabled_structured_types: set,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Assemble partitioned Gemini outputs into final Parquet and streaming stats."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    dataset_path = output_dir / "dataset.parquet"
+    if dataset_path.exists():
+        dataset_path.unlink()
+
+    writer = None
+    return_rows: List[Dict[str, Any]] = []
+    keep_return_rows = len(scaffold_df) <= 10_000
+
+    non_empty_text = 0
+    total_text_length = 0
+    total_notes = 0
+    min_notes: Optional[int] = None
+    max_notes = 0
+    structured_stats = {
+        etype: {"total": 0, "min": None, "max": 0}
+        for etype in enabled_structured_types
+    }
+    note_separator = getattr(config, "note_separator", "\n\n---\n\n")
+    drug_prob = getattr(config, "drug_perturbation_prob", 0.3)
+    scaffold_with_partition = scaffold_df.copy()
+    scaffold_with_partition["_gemini_partition"] = (
+        scaffold_with_partition["patient_id"].astype(int) % num_partitions
+    )
+
+    try:
+        for partition, partition_df in scaffold_with_partition.groupby("_gemini_partition", sort=True):
+            events_path = events_dir / f"events-{int(partition):05d}.jsonl"
+            notes_path = notes_dir / f"notes-{int(partition):05d}.jsonl"
+
+            events_by_patient: Dict[int, List[Dict[str, Any]]] = {}
+            for event in _read_partition_jsonl(events_path):
+                events_by_patient.setdefault(int(event["patient_id"]), []).append(event)
+            for events in events_by_patient.values():
+                events.sort(key=lambda event: int(event["event_idx"]))
+
+            notes_by_event: Dict[Tuple[int, int], str] = {}
+            for note in _read_partition_jsonl(notes_path):
+                notes_by_event[(int(note["patient_id"]), int(note["event_idx"]))] = note.get("text", "")
+
+            output_rows: List[Dict[str, Any]] = []
+            for _, base_row in partition_df.drop(columns=["_gemini_partition"]).iterrows():
+                patient_id = int(base_row["patient_id"])
+                events = events_by_patient.get(patient_id, [])
+                text_blocks: List[Tuple[int, str]] = []
+                structured_counts = {etype: 0 for etype in enabled_structured_types}
+
+                for event in events:
+                    event_idx = int(event["event_idx"])
+                    event_type = event["event_type"]
+                    note_key = (patient_id, event_idx)
+                    if note_key in notes_by_event:
+                        note_text = notes_by_event[note_key]
+                        if _drug_perturbation_for_event(config.seed, patient_id, event_idx, drug_prob):
+                            note_text = _apply_drug_perturbation(note_text)
+                        if note_text:
+                            text_blocks.append((event_idx, note_text))
+                    elif event_type in enabled_structured_types:
+                        structured_text = convert_structured_event_to_text(
+                            event_type, event["event_text"]
+                        )
+                        structured_counts[event_type] += 1
+                        if structured_text:
+                            text_blocks.append((event_idx, structured_text))
+
+                for etype, count in structured_counts.items():
+                    stats = structured_stats[etype]
+                    stats["total"] += count
+                    stats["min"] = count if stats["min"] is None else min(stats["min"], count)
+                    stats["max"] = max(stats["max"], count)
+
+                text_blocks.sort(key=lambda item: item[0])
+                clinical_text = note_separator.join(text for _, text in text_blocks)
+                num_notes = len(text_blocks)
+                text_length = len(clinical_text)
+                total_text_length += text_length
+                non_empty_text += int(text_length > 0)
+                total_notes += num_notes
+                min_notes = num_notes if min_notes is None else min(min_notes, num_notes)
+                max_notes = max(max_notes, num_notes)
+
+                output_row = base_row.to_dict()
+                output_row["event_timeline"] = "\n".join(
+                    f"<{event['event_type']}> {event['event_text']}" for event in events
+                )
+                output_row["clinical_text"] = clinical_text
+                output_row["num_notes"] = num_notes
+                output_rows.append(output_row)
+                if keep_return_rows:
+                    return_rows.append(output_row)
+
+            if not output_rows:
+                continue
+            partition_out_df = pd.DataFrame(output_rows)
+            table = pa.Table.from_pandas(partition_out_df, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(dataset_path, table.schema)
+            writer.write_table(table)
+    finally:
+        if writer is not None:
+            writer.close()
+
+    n_patients = len(scaffold_df)
+    if writer is None:
+        empty_df = scaffold_df.copy()
+        empty_df["event_timeline"] = ""
+        empty_df["clinical_text"] = ""
+        empty_df["num_notes"] = 0
+        empty_df.to_parquet(dataset_path, index=False)
+        return_df = empty_df if keep_return_rows else scaffold_df
+    else:
+        return_df = pd.DataFrame(return_rows) if keep_return_rows else scaffold_df
+
+    stats: Dict[str, Any] = {
+        "clinical_text_stats": {
+            "non_empty_count": int(non_empty_text),
+            "mean_length": float(total_text_length / max(1, n_patients)),
+        },
+        "two_stage_stats": {
+            "mean_notes_per_patient": float(total_notes / max(1, n_patients)),
+            "min_notes_per_patient": int(min_notes or 0),
+            "max_notes_per_patient": int(max_notes),
+        },
+    }
+    if enabled_structured_types:
+        stats["structured_data_stats"] = {
+            etype: {
+                "mean_per_patient": float(values["total"] / max(1, n_patients)),
+                "min_per_patient": int(values["min"] or 0),
+                "max_per_patient": int(values["max"]),
+                "total": int(values["total"]),
+            }
+            for etype, values in structured_stats.items()
+        }
+
+    return return_df, stats
+
+
+def generate_synthetic_dataset_gemini_batch(
+    config: SyntheticDataConfig,
+    gemini_config: "GeminiBatchConfig",
+    dgp_metadata_path: str,
+    show_progress: bool = True,
+    local_partitions: int = 256,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Generate a synthetic dataset using Gemini batch inference for clinical text.
+
+    The DGP is loaded from an existing metadata file, while patient covariates,
+    treatment, outcomes, structured event rendering, and final Parquet assembly
+    are handled locally.
+    """
+    from .gemini_batch_client import GeminiBatchClient
+
+    config.validate()
+    if config.generation_mode != "two_stage":
+        raise ValueError("Gemini batch generation currently requires generation_mode='two_stage'")
+    if not dgp_metadata_path:
+        raise ValueError("Gemini batch generation requires --dgp-metadata")
+    if local_partitions < 1:
+        raise ValueError("local_partitions must be at least 1")
+
+    random.seed(config.seed)
+    np.random.seed(config.seed)
+
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    batch_dir = output_dir / "gemini_batch"
+    batch_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Loading DGP metadata from %s", dgp_metadata_path)
+    confounders, treatment_eq, outcome_eq, summary_stats, source_config = _load_dgp_metadata(
+        dgp_metadata_path
+    )
+    if source_config.get("clinical_question") and source_config["clinical_question"] != config.clinical_question:
+        logger.warning(
+            "DGP source clinical question differs from run question: %s",
+            source_config["clinical_question"],
+        )
+
+    scaffold_df = _build_or_load_patient_scaffold(
+        config,
+        confounders,
+        summary_stats,
+        treatment_eq,
+        outcome_eq,
+        output_dir,
+        show_progress,
+    )
+
+    gemini_client = GeminiBatchClient(gemini_config)
+    display_prefix = re.sub(r"[^a-zA-Z0-9-]+", "-", output_dir.name).strip("-") or "synthetic-data"
+
+    timeline_stage_dir = batch_dir / "timeline"
+    event_timeline_prompt_template = build_event_timeline_prompt(config.structured_data)
+
+    def timeline_requests():
+        for row in scaffold_df.itertuples(index=False):
+            prompt = event_timeline_prompt_template.format(
+                patient_characteristics=getattr(row, "patient_prompt"),
+                clinical_question=config.clinical_question,
+                min_events=config.min_events_per_patient,
+                max_events=config.max_events_per_patient,
+            )
+            yield f"timeline:{int(getattr(row, 'patient_id'))}", prompt
+
+    logger.info("Writing Gemini timeline request shards...")
+    timeline_shards = gemini_client.write_request_shards(
+        stage="timeline",
+        input_dir=timeline_stage_dir / "inputs",
+        requests=timeline_requests(),
+        system_prompt=CLINICAL_SYSTEM_PROMPT,
+        temperature=0.7,
+        max_output_tokens=config.llm.max_tokens,
+    )
+    logger.info("Submitting/collecting %d Gemini timeline shards", len(timeline_shards))
+    timeline_manifest = gemini_client.run_shards(
+        stage="timeline",
+        shards=timeline_shards,
+        stage_dir=timeline_stage_dir,
+        display_name_prefix=display_prefix,
+    )
+
+    if gemini_config.submit_only:
+        metadata = {
+            "config": asdict(config),
+            "features": confounders,
+            "confounders": _filter_features_by_role(confounders, "confounder"),
+            "effect_modifiers": _filter_features_by_role(confounders, "effect_modifier"),
+            "treatment_equation": treatment_eq,
+            "outcome_equation": outcome_eq,
+            "summary_statistics": summary_stats,
+            "dgp_metadata_path": dgp_metadata_path,
+            "gemini_batch": {
+                "timeline_manifest": str(timeline_stage_dir / "manifest.json"),
+                "submit_only": True,
+            },
+        }
+        with open(output_dir / "metadata.json", "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2, default=str, ensure_ascii=False)
+        return scaffold_df, metadata
+
+    events_dir = batch_dir / "events_by_partition"
+    note_stage_dir = batch_dir / "note_expansion"
+    note_shards, timeline_parse_stats = _parse_timelines_and_build_note_requests(
+        config=config,
+        gemini_client=gemini_client,
+        timeline_manifest=timeline_manifest,
+        events_dir=events_dir,
+        note_stage_dir=note_stage_dir,
+        num_partitions=local_partitions,
+    )
+
+    logger.info("Submitting/collecting %d Gemini note-expansion shards", len(note_shards))
+    note_manifest = gemini_client.run_shards(
+        stage="note_expansion",
+        shards=note_shards,
+        stage_dir=note_stage_dir,
+        display_name_prefix=display_prefix,
+    )
+
+    if gemini_config.submit_only:
+        metadata = {
+            "config": asdict(config),
+            "features": confounders,
+            "confounders": _filter_features_by_role(confounders, "confounder"),
+            "effect_modifiers": _filter_features_by_role(confounders, "effect_modifier"),
+            "treatment_equation": treatment_eq,
+            "outcome_equation": outcome_eq,
+            "summary_statistics": summary_stats,
+            "dgp_metadata_path": dgp_metadata_path,
+            "gemini_batch": {
+                "timeline_manifest": str(timeline_stage_dir / "manifest.json"),
+                "note_manifest": str(note_stage_dir / "manifest.json"),
+                "submit_only": True,
+            },
+        }
+        with open(output_dir / "metadata.json", "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2, default=str, ensure_ascii=False)
+        return scaffold_df, metadata
+
+    notes_dir = batch_dir / "notes_by_partition"
+    note_parse_stats = _partition_note_outputs(
+        note_manifest=note_manifest,
+        notes_dir=notes_dir,
+        num_partitions=local_partitions,
+    )
+
+    enabled_structured_types = _enabled_structured_event_types(config)
+    return_df, assembly_stats = _assemble_gemini_dataset_from_partitions(
+        config=config,
+        scaffold_df=scaffold_df,
+        output_dir=output_dir,
+        events_dir=events_dir,
+        notes_dir=notes_dir,
+        num_partitions=local_partitions,
+        enabled_structured_types=enabled_structured_types,
+    )
+
+    metadata = {
+        "config": asdict(config),
+        "features": confounders,
+        "confounders": _filter_features_by_role(confounders, "confounder"),
+        "effect_modifiers": _filter_features_by_role(confounders, "effect_modifier"),
+        "treatment_equation": treatment_eq,
+        "outcome_equation": outcome_eq,
+        "summary_statistics": summary_stats,
+        "dgp_metadata_path": dgp_metadata_path,
+        "dataset_statistics": {
+            "n_patients": len(scaffold_df),
+            "treatment_rate": scaffold_df["treatment_indicator"].mean(),
+            "outcome_rate": scaffold_df["outcome_indicator"].mean(),
+            "mean_treatment_prob": scaffold_df["true_treatment_prob"].mean(),
+            "std_treatment_prob": scaffold_df["true_treatment_prob"].std(),
+            "mean_outcome_prob": scaffold_df["true_outcome_prob"].mean(),
+            "std_outcome_prob": scaffold_df["true_outcome_prob"].std(),
+            "mean_ite_prob": scaffold_df["true_ite_prob"].mean(),
+            "std_ite_prob": scaffold_df["true_ite_prob"].std(),
+            "generation_mode": config.generation_mode,
+            **assembly_stats,
+        },
+        "gemini_batch": {
+            "timeline_manifest": str(timeline_stage_dir / "manifest.json"),
+            "note_manifest": str(note_stage_dir / "manifest.json"),
+            "local_partitions": local_partitions,
+            **timeline_parse_stats,
+            **note_parse_stats,
+        },
+    }
+
+    metadata_path = output_dir / "metadata.json"
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, default=str, ensure_ascii=False)
+
+    logger.info("Gemini batch generation complete")
+    logger.info("Dataset saved to %s", output_dir / "dataset.parquet")
+    logger.info("Metadata saved to %s", metadata_path)
+    return return_df, metadata
 
 
 def generate_synthetic_dataset_batch(
