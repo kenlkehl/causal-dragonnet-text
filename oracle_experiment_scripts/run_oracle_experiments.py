@@ -986,9 +986,14 @@ def run_causal_forest_experiment(
                 hidden_state_cache, gpu_store,
             )
 
-        if confounder_specs and train_dataset.explicit_confounder_values:
-            model.fit_explicit_confounders(train_dataset.explicit_confounder_values)
-            model.fit_explicit_confounder_featurizer(train_dataset.explicit_confounder_values)
+        explicit_values = getattr(
+            train_dataset,
+            "explicit_feature_values",
+            getattr(train_dataset, "explicit_confounder_values", None),
+        )
+        if confounder_specs and explicit_values:
+            model.fit_explicit_confounders(explicit_values)
+            model.fit_explicit_confounder_featurizer(explicit_values)
 
         optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, model.parameters()),
@@ -1194,8 +1199,13 @@ def run_neural_experiment(
                 hidden_state_cache, gpu_store,
             )
 
-        if confounder_specs and train_dataset.explicit_confounder_values:
-            model.fit_explicit_confounder_featurizer(train_dataset.explicit_confounder_values)
+        explicit_values = getattr(
+            train_dataset,
+            "explicit_feature_values",
+            getattr(train_dataset, "explicit_confounder_values", None),
+        )
+        if confounder_specs and explicit_values:
+            model.fit_explicit_confounder_featurizer(explicit_values)
 
         optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, model.parameters()),
