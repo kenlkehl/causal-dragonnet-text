@@ -116,6 +116,7 @@ def test_raw_explicit_features_populates_provided_normalization_dicts():
 def test_vllm_reasoning_parser_inference_and_resolution():
     assert infer_vllm_reasoning_parser("nvidia/Qwen3.6-35B-A3B-NVFP4") == "qwen3"
     assert infer_vllm_reasoning_parser("nvidia/Gemma-4-31B-IT-NVFP4") == "gemma4"
+    assert infer_vllm_reasoning_parser("openai/gpt-oss-120b") == "openai_gptoss"
     assert infer_vllm_reasoning_parser("meta-llama/Llama-3.1-8B-Instruct") is None
 
     assert resolve_vllm_reasoning_parser(

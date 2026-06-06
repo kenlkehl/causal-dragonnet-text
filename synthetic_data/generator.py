@@ -1522,6 +1522,7 @@ def _generate_clinical_texts_worker(
             max_tokens=vllm_config_dict["max_tokens"],
             download_dir=vllm_config_dict.get("download_dir", "./"),
             reasoning_marker=reasoning_marker,
+            vllm_reasoning_parser=vllm_config_dict.get("vllm_reasoning_parser", "auto"),
             device_ids=None,  # Already set via env var
         )
 
@@ -1765,6 +1766,7 @@ def generate_synthetic_dataset_batch(
             max_tokens=vllm_config.max_tokens,
             download_dir=vllm_config.download_dir,
             reasoning_marker=vllm_config.reasoning_marker,
+            vllm_reasoning_parser=vllm_config.vllm_reasoning_parser,
             device_ids=first_gpu_group,
         )
         vllm_client = VLLMBatchClient(init_config)
@@ -1904,6 +1906,7 @@ def generate_synthetic_dataset_batch(
         "temperature": vllm_config.temperature,
         "max_tokens": vllm_config.max_tokens,
         "download_dir": vllm_config.download_dir,
+        "vllm_reasoning_parser": vllm_config.vllm_reasoning_parser,
     }
 
     def _batch_generate_texts(prompts, temperature=0.4, description="texts"):

@@ -2,12 +2,30 @@
 """Direct vLLM batch inference client for faster generation."""
 
 import logging
+import re
 from typing import List, Optional
 from dataclasses import dataclass
 
-from vllm import LLM, SamplingParams
+from oci.extraction import resolve_vllm_reasoning_parser
 
 logger = logging.getLogger(__name__)
+
+LLM = None
+SamplingParams = None
+
+
+def _ensure_llm_imported():
+    global LLM
+    if LLM is None:
+        from vllm import LLM as _LLM
+        LLM = _LLM
+
+
+def _ensure_sampling_params_imported():
+    global SamplingParams
+    if SamplingParams is None:
+        from vllm import SamplingParams as _SamplingParams
+        SamplingParams = _SamplingParams
 
 
 @dataclass
@@ -20,7 +38,8 @@ class VLLMConfig:
     temperature: float = 0.8
     max_tokens: int = 10000
     download_dir: str = "./"
-    reasoning_marker: Optional[str] = "assistantfinal"  # Text after this marker is the real output
+    reasoning_marker: Optional[str] = None  # Optional legacy marker-stripping fallback
+    vllm_reasoning_parser: Optional[str] = "auto"  # Native vLLM parser, or auto/none
     device_ids: Optional[List[int]] = None  # GPU IDs to use (sets CUDA_VISIBLE_DEVICES before loading model)
 
 
@@ -44,18 +63,51 @@ class VLLMBatchClient:
             os.environ["CUDA_VISIBLE_DEVICES"] = device_str
             logger.info(f"Set CUDA_VISIBLE_DEVICES={device_str}")
 
-        logger.info(f"Loading vLLM model: {config.model_name} with TP={config.tensor_parallel_size}")
-        
-        self.llm = LLM(
-            model=config.model_name,
-            tensor_parallel_size=config.tensor_parallel_size,
-            gpu_memory_utilization=config.gpu_memory_utilization,
-            max_model_len=config.max_model_len,
-            download_dir = config.download_dir,
-            trust_remote_code=True,
+        _ensure_llm_imported()
+
+        reasoning_parser = resolve_vllm_reasoning_parser(
+            config.vllm_reasoning_parser,
+            config.model_name,
         )
+        self.vllm_reasoning_parser = reasoning_parser
+
+        logger.info(
+            "Loading vLLM model: %s with TP=%s, reasoning_parser=%s",
+            config.model_name,
+            config.tensor_parallel_size,
+            reasoning_parser,
+        )
+
+        llm_kwargs = {
+            "model": config.model_name,
+            "tensor_parallel_size": config.tensor_parallel_size,
+            "gpu_memory_utilization": config.gpu_memory_utilization,
+            "max_model_len": config.max_model_len,
+            "download_dir": config.download_dir,
+            "trust_remote_code": True,
+        }
+        if reasoning_parser:
+            llm_kwargs["reasoning_parser"] = reasoning_parser
+
+        self.llm = LLM(**llm_kwargs)
         logger.info("vLLM model loaded successfully")
     
+    @staticmethod
+    def _parse_harmony_response(text: str) -> str:
+        final_match = re.search(
+            r'<\|channel\|>final[^<]*<\|message\|>(.+?)(?:<\||$)',
+            text,
+            re.DOTALL,
+        )
+        if final_match:
+            return final_match.group(1).strip()
+
+        message_match = re.search(r'<\|message\|>(.+?)(?:<\||$)', text, re.DOTALL)
+        if message_match:
+            return message_match.group(1).strip()
+
+        return text
+
     @staticmethod
     def strip_reasoning_prefix(text: str, reasoning_marker: Optional[str] = None) -> str:
         """
@@ -72,7 +124,13 @@ class VLLMBatchClient:
         Returns:
             Text with reasoning prefix removed
         """
-        if not reasoning_marker or not text:
+        if not text:
+            return text
+
+        if '<|channel|>' in text or '<|message|>' in text:
+            return VLLMBatchClient._parse_harmony_response(text)
+
+        if not reasoning_marker:
             return text
         
         # Case-insensitive search for marker
@@ -119,6 +177,7 @@ class VLLMBatchClient:
         else:
             full_prompts = [f"User: {prompt}\n\nAssistant:" for prompt in prompts]
         
+        _ensure_sampling_params_imported()
         sampling_params = SamplingParams(
             temperature=temp,
             max_tokens=max_tok,

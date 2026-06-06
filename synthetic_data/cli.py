@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 from .config import SyntheticDataConfig, LLMConfig, StructuredDataConfig, DEFAULT_CLINICAL_QUESTION
 from .generator import generate_synthetic_dataset, generate_synthetic_dataset_batch
+from oci.extraction import resolve_vllm_reasoning_parser
 
 logger = logging.getLogger(__name__)
 
@@ -89,13 +90,16 @@ def parse_harmony_response(text: str) -> str:
     return text
 
 
-def strip_reasoning_prefix(text: str, marker: str = "assistantfinal") -> str:
+def strip_reasoning_prefix(text: str, marker: Optional[str] = None) -> str:
     """Strip reasoning prefix from model output."""
-    if not text or not marker:
+    if not text:
         return text
 
     if '<|channel|>' in text or '<|message|>' in text:
         return parse_harmony_response(text)
+
+    if not marker:
+        return text
 
     marker_lower = marker.lower()
     text_lower = text.lower()
@@ -110,7 +114,7 @@ def strip_reasoning_prefix(text: str, marker: str = "assistantfinal") -> str:
 def parse_extraction_response(
     response: str,
     confounders: List[Dict[str, Any]],
-    reasoning_marker: str = "assistantfinal",
+    reasoning_marker: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Parse the LLM JSON response to extract all confounder values."""
     response = strip_reasoning_prefix(response, reasoning_marker)
@@ -238,7 +242,7 @@ class _OpenAIExtractionClient:
         api_key: str = "EMPTY",
         confounders: Optional[List[Dict[str, Any]]] = None,
         max_text_tokens: int = 100000,
-        reasoning_marker: str = "assistantfinal",
+        reasoning_marker: Optional[str] = None,
     ):
         try:
             from openai import OpenAI
@@ -332,26 +336,41 @@ class _VLLMExtractionClient:
         gpu_memory_utilization: float = 0.90,
         confounders: Optional[List[Dict[str, Any]]] = None,
         max_text_tokens: int = 100000,
-        reasoning_marker: str = "assistantfinal",
+        reasoning_marker: Optional[str] = None,
+        vllm_reasoning_parser: Optional[str] = "auto",
     ):
         try:
             from vllm import LLM, SamplingParams  # noqa: F401
         except ImportError:
             raise ImportError("vllm package required. Install with: pip install vllm")
 
-        logger.info(f"Loading vLLM model: {model_name} with TP={tensor_parallel_size}")
-
-        self.llm = LLM(
-            model=model_name,
-            tensor_parallel_size=tensor_parallel_size,
-            gpu_memory_utilization=gpu_memory_utilization,
-            trust_remote_code=True,
-            download_dir=download_dir,
+        reasoning_parser = resolve_vllm_reasoning_parser(
+            vllm_reasoning_parser,
+            model_name,
         )
+        logger.info(
+            "Loading vLLM model: %s with TP=%s, reasoning_parser=%s",
+            model_name,
+            tensor_parallel_size,
+            reasoning_parser,
+        )
+
+        llm_kwargs = {
+            "model": model_name,
+            "tensor_parallel_size": tensor_parallel_size,
+            "gpu_memory_utilization": gpu_memory_utilization,
+            "trust_remote_code": True,
+            "download_dir": download_dir,
+        }
+        if reasoning_parser:
+            llm_kwargs["reasoning_parser"] = reasoning_parser
+
+        self.llm = LLM(**llm_kwargs)
         self.model_name = model_name
         self.confounders = confounders or []
         self.max_text_tokens = max_text_tokens
         self.reasoning_marker = reasoning_marker
+        self.vllm_reasoning_parser = reasoning_parser
         self.tokenizer = self.llm.get_tokenizer()
         logger.info("vLLM model loaded successfully")
 
@@ -540,7 +559,8 @@ def run_confounder_extraction(
     batch_size: int = 10,
     max_text_tokens: int = 100000,
     max_completion_tokens: int = 5000,
-    reasoning_marker: str = "assistantfinal",
+    reasoning_marker: Optional[str] = None,
+    vllm_reasoning_parser: Optional[str] = "auto",
 ) -> Tuple[pd.DataFrame, Optional[Dict[str, Any]]]:
     """Run confounder extraction and evaluation on a generated dataset.
 
@@ -557,7 +577,8 @@ def run_confounder_extraction(
         batch_size: Batch size for extraction
         max_text_tokens: Max tokens to keep from end of each clinical text
         max_completion_tokens: Max tokens for model response
-        reasoning_marker: Marker to strip reasoning prefix
+        reasoning_marker: Optional marker to strip legacy reasoning prefix
+        vllm_reasoning_parser: Native vLLM reasoning parser name, "auto", or disabled with "none"
 
     Returns:
         Tuple of (augmented DataFrame, metrics dict or None)
@@ -578,6 +599,7 @@ def run_confounder_extraction(
             confounders=confounders,
             max_text_tokens=max_text_tokens,
             reasoning_marker=reasoning_marker,
+            vllm_reasoning_parser=vllm_reasoning_parser,
         )
     else:
         client = _OpenAIExtractionClient(
@@ -957,8 +979,19 @@ Examples:
     parser.add_argument(
         "--reasoning-marker",
         type=str,
-        default="assistantfinal",
-        help="Marker to strip reasoning prefix from clinical text (default: 'assistantfinal'). Set to empty string to disable.",
+        default=None,
+        help="Optional legacy marker to strip reasoning prefix from model output, e.g. 'assistantfinal'.",
+    )
+    parser.add_argument(
+        "--vllm-reasoning-parser",
+        "--reasoning-parser",
+        type=str,
+        default="auto",
+        help=(
+            "Native vLLM reasoning parser for direct batch generation/extraction. "
+            "Use 'auto' to infer qwen3, gemma4, or openai_gptoss from the model name; "
+            "use 'none' to disable."
+        ),
     )
 
     parser.add_argument(
@@ -1174,7 +1207,8 @@ Examples:
                 temperature=args.temperature,
                 max_tokens=args.max_tokens,
                 download_dir=args.vllm_download_dir,
-                reasoning_marker=args.reasoning_marker if args.reasoning_marker else None,
+                reasoning_marker=args.reasoning_marker,
+                vllm_reasoning_parser=args.vllm_reasoning_parser,
             )
             df, metadata = generate_synthetic_dataset_batch(
                 config=config,
@@ -1232,6 +1266,7 @@ Examples:
                     max_text_tokens=args.extraction_max_text_tokens,
                     max_completion_tokens=args.extraction_max_completion_tokens,
                     reasoning_marker=args.reasoning_marker,
+                    vllm_reasoning_parser=args.vllm_reasoning_parser,
                 )
 
                 if metrics:

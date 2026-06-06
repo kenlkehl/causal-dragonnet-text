@@ -7,10 +7,12 @@ openai_stub.OpenAI = object
 sys.modules.setdefault("openai", openai_stub)
 
 from synthetic_data.config import SyntheticDataConfig
+from synthetic_data.cli import _VLLMExtractionClient
 from synthetic_data.generator import (
     _build_feature_count_instruction,
     _enforce_feature_count_request,
 )
+from synthetic_data.vllm_batch_client import VLLMBatchClient, VLLMConfig
 
 
 def _feature(name, roles):
@@ -93,3 +95,76 @@ def test_config_rejects_impossible_role_counts():
 
     with pytest.raises(ValueError, match="num_features cannot exceed"):
         config.validate()
+
+
+def test_synthetic_vllm_batch_client_uses_native_reasoning_parser(monkeypatch):
+    calls = {}
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            calls.update(kwargs)
+
+    monkeypatch.setattr("synthetic_data.vllm_batch_client.LLM", FakeLLM)
+
+    VLLMBatchClient(
+        VLLMConfig(
+            model_name="openai/gpt-oss-120b",
+            tensor_parallel_size=1,
+            vllm_reasoning_parser="auto",
+        )
+    )
+
+    assert calls["reasoning_parser"] == "openai_gptoss"
+
+
+def test_synthetic_vllm_batch_client_can_disable_reasoning_parser(monkeypatch):
+    calls = {}
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            calls.update(kwargs)
+
+    monkeypatch.setattr("synthetic_data.vllm_batch_client.LLM", FakeLLM)
+
+    VLLMBatchClient(
+        VLLMConfig(
+            model_name="openai/gpt-oss-120b",
+            tensor_parallel_size=1,
+            vllm_reasoning_parser="none",
+        )
+    )
+
+    assert "reasoning_parser" not in calls
+
+
+def test_synthetic_vllm_batch_client_strips_harmony_without_marker():
+    cleaned = VLLMBatchClient.strip_reasoning_prefix(
+        "<|channel|>analysis<|message|>hidden<|end|>"
+        "<|channel|>final<|message|>final note"
+    )
+
+    assert cleaned == "final note"
+
+
+def test_synthetic_direct_extraction_client_uses_native_reasoning_parser(monkeypatch):
+    calls = {}
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            calls.update(kwargs)
+
+        def get_tokenizer(self):
+            return object()
+
+    fake_vllm = types.ModuleType("vllm")
+    fake_vllm.LLM = FakeLLM
+    fake_vllm.SamplingParams = object
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+
+    _VLLMExtractionClient(
+        model_name="nvidia/Qwen3.6-35B-A3B-NVFP4",
+        tensor_parallel_size=1,
+        vllm_reasoning_parser="auto",
+    )
+
+    assert calls["reasoning_parser"] == "qwen3"

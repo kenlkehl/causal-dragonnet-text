@@ -69,6 +69,8 @@ def infer_vllm_reasoning_parser(model_name: Optional[str]) -> Optional[str]:
         return "qwen3"
     if "gemma" in model_key:
         return "gemma4"
+    if "gpt-oss" in model_key or "gptoss" in model_key:
+        return "openai_gptoss"
     return None
 
 
