@@ -1148,6 +1148,183 @@ def run_causal_forest_experiment(
     return {'metrics': metrics, 'n_samples': len(results_df)}
 
 
+def _run_neural_fold(
+    config: ExperimentConfig,
+    device: torch.device,
+    df: pd.DataFrame,
+    confounder_specs,
+    confounder_cols,
+    gpu_store,
+    hidden_state_cache,
+    fold: int,
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+) -> tuple:
+    """Train and evaluate a single CV fold of an rlearner/dragonnet experiment.
+
+    Each fold builds its own model, tokenizer, optimizer, and data loaders, so
+    folds are fully independent and may be run concurrently across devices.
+    Returns ``(fold_preds_df, history)``.
+    """
+    text_column = 'clinical_text'
+    batch_size = config.batch_size
+
+    train_df = df.iloc[train_idx]
+    test_df = df.iloc[test_idx]
+
+    model_kwargs = _common_model_kwargs(config, gpu_store, hidden_state_cache, confounder_specs, device)
+    model_kwargs.update(dict(
+        model_type=config.model_type,
+        causal_head_representation_dim=128,
+        causal_head_hidden_outcome_dim=64,
+        causal_head_dropout=0.2,
+        explicit_confounder_specs=confounder_specs,
+    ))
+
+    model = CausalText(**model_kwargs)
+
+    from oci.config import TRAINABLE_EXTRACTOR_TYPES
+    if config.feature_extractor_type in TRAINABLE_EXTRACTOR_TYPES:
+        model.fit_tokenizer(train_df[text_column].tolist())
+
+    # Verify all parameters are float32 (diagnose dtype leakage)
+    for name, param in model.named_parameters():
+        if param.dtype != torch.float32:
+            logger.warning(f"Parameter {name} has unexpected dtype {param.dtype}, casting to float32")
+            param.data = param.data.float()
+
+    train_dataset, test_dataset, train_loader, test_loader, collate_fn, dl_kwargs = \
+        _create_datasets_and_loaders(
+            train_df, test_df, train_idx, test_idx,
+            text_column, confounder_cols, batch_size,
+            hidden_state_cache, gpu_store,
+        )
+
+    explicit_values = getattr(
+        train_dataset,
+        "explicit_feature_values",
+        getattr(train_dataset, "explicit_confounder_values", None),
+    )
+    if confounder_specs and explicit_values:
+        model.fit_explicit_confounder_featurizer(explicit_values)
+
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=config.learning_rate, weight_decay=0.01
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
+
+    use_cached = gpu_store is not None or hidden_state_cache is not None
+
+    best_val_loss = float('inf')
+    best_state = None
+    history = []
+
+    for epoch in range(config.epochs):
+        model.train()
+        train_loss = 0.0
+
+        for batch in train_loader:
+            batch['treatment'] = batch['treatment'].to(device)
+            batch['outcome'] = batch['outcome'].to(device)
+            if use_cached:
+                prepare_cached_batch(batch, device, gpu_store=gpu_store)
+
+            optimizer.zero_grad()
+            if config.model_type == "rlearner":
+                losses = model.train_step(
+                    batch,
+                    alpha_propensity=1.0,
+                    gamma_rlearner=config.gamma_rlearner,
+                )
+            else:  # dragonnet
+                losses = model.train_step(
+                    batch,
+                    alpha_propensity=1.0,
+                    beta_targreg=config.beta_targreg,
+                )
+            losses['loss'].backward()
+            torch.nn.utils.clip_grad_norm_(
+                filter(lambda p: p.requires_grad, model.parameters()), 1.0
+            )
+            optimizer.step()
+            train_loss += losses['loss'].item()
+
+        scheduler.step()
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch in test_loader:
+                batch['treatment'] = batch['treatment'].to(device)
+                batch['outcome'] = batch['outcome'].to(device)
+                if use_cached:
+                    prepare_cached_batch(batch, device, gpu_store=gpu_store)
+                if config.model_type == "rlearner":
+                    losses = model.train_step(
+                        batch,
+                        alpha_propensity=1.0,
+                        gamma_rlearner=config.gamma_rlearner,
+                    )
+                else:
+                    losses = model.train_step(
+                        batch,
+                        alpha_propensity=1.0,
+                        beta_targreg=config.beta_targreg,
+                    )
+                val_loss += losses['loss'].item()
+
+        train_loss /= len(train_loader)
+        val_loss /= len(test_loader)
+        history.append({'epoch': epoch + 1, 'train_loss': train_loss, 'val_loss': val_loss})
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+    if best_state:
+        model.load_state_dict(best_state)
+        model.to(device)
+
+    # Predict using DataLoader batches (supports cached hidden states)
+    model.eval()
+    all_y0 = []
+    all_y1 = []
+    all_prop = []
+    all_ite = []
+
+    with torch.no_grad():
+        for batch in test_loader:
+            batch['treatment'] = batch['treatment'].to(device)
+            batch['outcome'] = batch['outcome'].to(device)
+            if use_cached:
+                prepare_cached_batch(batch, device, gpu_store=gpu_store)
+
+            preds = model.predict(batch)
+            all_y0.append(preds['y0_prob'].cpu().numpy())
+            all_y1.append(preds['y1_prob'].cpu().numpy())
+            all_prop.append(preds['propensity'].cpu().numpy())
+
+    pred_y0 = np.concatenate(all_y0)
+    pred_y1 = np.concatenate(all_y1)
+    pred_prop = np.concatenate(all_prop)
+    pred_ite = pred_y1 - pred_y0
+
+    fold_preds = test_df.copy()
+    fold_preds['pred_y0_prob'] = pred_y0
+    fold_preds['pred_y1_prob'] = pred_y1
+    fold_preds['pred_ite_prob'] = pred_ite
+    fold_preds['pred_propensity'] = pred_prop
+    fold_preds['cv_fold'] = fold + 1
+
+    del model
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    return fold_preds, history
+
+
 def run_neural_experiment(
     config: ExperimentConfig,
     device: torch.device,
@@ -1158,9 +1335,6 @@ def run_neural_experiment(
     hidden_state_cache,
 ) -> Dict[str, Any]:
     """Run an rlearner or dragonnet experiment with K-fold CV."""
-    text_column = 'clinical_text'
-    batch_size = config.batch_size
-
     df = df.reset_index(drop=True)
     kf = KFold(n_splits=config.n_folds, shuffle=True, random_state=42 + config.repeat_index)
 
@@ -1168,162 +1342,12 @@ def run_neural_experiment(
     fold_histories = []
 
     for fold, (train_idx, test_idx) in enumerate(kf.split(df)):
-        train_df = df.iloc[train_idx]
-        test_df = df.iloc[test_idx]
-
-        model_kwargs = _common_model_kwargs(config, gpu_store, hidden_state_cache, confounder_specs, device)
-        model_kwargs.update(dict(
-            model_type=config.model_type,
-            causal_head_representation_dim=128,
-            causal_head_hidden_outcome_dim=64,
-            causal_head_dropout=0.2,
-            explicit_confounder_specs=confounder_specs,
-        ))
-
-        model = CausalText(**model_kwargs)
-
-        from oci.config import TRAINABLE_EXTRACTOR_TYPES
-        if config.feature_extractor_type in TRAINABLE_EXTRACTOR_TYPES:
-            model.fit_tokenizer(train_df[text_column].tolist())
-
-        # Verify all parameters are float32 (diagnose dtype leakage)
-        for name, param in model.named_parameters():
-            if param.dtype != torch.float32:
-                logger.warning(f"Parameter {name} has unexpected dtype {param.dtype}, casting to float32")
-                param.data = param.data.float()
-
-        train_dataset, test_dataset, train_loader, test_loader, collate_fn, dl_kwargs = \
-            _create_datasets_and_loaders(
-                train_df, test_df, train_idx, test_idx,
-                text_column, confounder_cols, batch_size,
-                hidden_state_cache, gpu_store,
-            )
-
-        explicit_values = getattr(
-            train_dataset,
-            "explicit_feature_values",
-            getattr(train_dataset, "explicit_confounder_values", None),
+        fold_preds, history = _run_neural_fold(
+            config, device, df, confounder_specs, confounder_cols,
+            gpu_store, hidden_state_cache, fold, train_idx, test_idx,
         )
-        if confounder_specs and explicit_values:
-            model.fit_explicit_confounder_featurizer(explicit_values)
-
-        optimizer = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, model.parameters()),
-            lr=config.learning_rate, weight_decay=0.01
-        )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
-
-        use_cached = gpu_store is not None or hidden_state_cache is not None
-
-        best_val_loss = float('inf')
-        best_state = None
-        history = []
-
-        for epoch in range(config.epochs):
-            model.train()
-            train_loss = 0.0
-
-            for batch in train_loader:
-                batch['treatment'] = batch['treatment'].to(device)
-                batch['outcome'] = batch['outcome'].to(device)
-                if use_cached:
-                    prepare_cached_batch(batch, device, gpu_store=gpu_store)
-
-                optimizer.zero_grad()
-                if config.model_type == "rlearner":
-                    losses = model.train_step(
-                        batch,
-                        alpha_propensity=1.0,
-                        gamma_rlearner=config.gamma_rlearner,
-                    )
-                else:  # dragonnet
-                    losses = model.train_step(
-                        batch,
-                        alpha_propensity=1.0,
-                        beta_targreg=config.beta_targreg,
-                    )
-                losses['loss'].backward()
-                torch.nn.utils.clip_grad_norm_(
-                    filter(lambda p: p.requires_grad, model.parameters()), 1.0
-                )
-                optimizer.step()
-                train_loss += losses['loss'].item()
-
-            scheduler.step()
-
-            model.eval()
-            val_loss = 0.0
-            with torch.no_grad():
-                for batch in test_loader:
-                    batch['treatment'] = batch['treatment'].to(device)
-                    batch['outcome'] = batch['outcome'].to(device)
-                    if use_cached:
-                        prepare_cached_batch(batch, device, gpu_store=gpu_store)
-                    if config.model_type == "rlearner":
-                        losses = model.train_step(
-                            batch,
-                            alpha_propensity=1.0,
-                            gamma_rlearner=config.gamma_rlearner,
-                        )
-                    else:
-                        losses = model.train_step(
-                            batch,
-                            alpha_propensity=1.0,
-                            beta_targreg=config.beta_targreg,
-                        )
-                    val_loss += losses['loss'].item()
-
-            train_loss /= len(train_loader)
-            val_loss /= len(test_loader)
-            history.append({'epoch': epoch + 1, 'train_loss': train_loss, 'val_loss': val_loss})
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-
-        if best_state:
-            model.load_state_dict(best_state)
-            model.to(device)
-
-        fold_histories.append(history)
-
-        # Predict using DataLoader batches (supports cached hidden states)
-        model.eval()
-        all_y0 = []
-        all_y1 = []
-        all_prop = []
-        all_ite = []
-
-        with torch.no_grad():
-            for batch in test_loader:
-                batch['treatment'] = batch['treatment'].to(device)
-                batch['outcome'] = batch['outcome'].to(device)
-                if use_cached:
-                    prepare_cached_batch(batch, device, gpu_store=gpu_store)
-
-                preds = model.predict(batch)
-                all_y0.append(preds['y0_prob'].cpu().numpy())
-                all_y1.append(preds['y1_prob'].cpu().numpy())
-                all_prop.append(preds['propensity'].cpu().numpy())
-
-        pred_y0 = np.concatenate(all_y0)
-        pred_y1 = np.concatenate(all_y1)
-        pred_prop = np.concatenate(all_prop)
-        pred_ite = pred_y1 - pred_y0
-
-        fold_preds = test_df.copy()
-        fold_preds['pred_y0_prob'] = pred_y0
-        fold_preds['pred_y1_prob'] = pred_y1
-        fold_preds['pred_ite_prob'] = pred_ite
-        fold_preds['pred_propensity'] = pred_prop
-        fold_preds['cv_fold'] = fold + 1
-
         all_predictions.append(fold_preds)
-
-        del model
-        gc.collect()
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+        fold_histories.append(history)
 
     results_df = pd.concat(all_predictions).sort_index()
 
