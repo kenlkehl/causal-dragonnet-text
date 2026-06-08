@@ -297,7 +297,11 @@ class OutcomeOnlyModel(nn.Module):
     @staticmethod
     def _get_extractor_input(batch, texts):
         """Return preprocessed batch if available, otherwise raw texts."""
-        if 'chunk_input_ids' in batch or 'chunk_token_ids' in batch:
+        if (
+            'input_ids' in batch
+            or 'chunk_input_ids' in batch
+            or 'chunk_token_ids' in batch
+        ):
             return batch
         return texts
 

@@ -137,45 +137,80 @@ class HierarchicalCNNExtractor(nn.Module):
         """Extract features from raw texts with hierarchical chunking.
 
         Args:
-            texts_or_batch: List[str] of document texts.
+            texts_or_batch: List[str] of document texts, or dict with either
+                ``texts`` or collate-time ``input_ids``/``attention_mask``/
+                ``chunk_mask`` tensors.
 
         Returns:
             Feature tensor of shape (batch_size, output_dim)
         """
-        if isinstance(texts_or_batch, dict):
-            texts = texts_or_batch.get('texts', [])
+        if isinstance(texts_or_batch, dict) and 'input_ids' in texts_or_batch:
+            input_ids = texts_or_batch['input_ids'].to(self._device, non_blocking=True)
+            attn_mask = texts_or_batch.get('attention_mask')
+            chunk_mask = texts_or_batch.get('chunk_mask')
+            if attn_mask is None:
+                attn_mask = (input_ids != self._tokenizer.pad_token_id).float()
+            else:
+                attn_mask = attn_mask.to(self._device, non_blocking=True).float()
+            if chunk_mask is None:
+                chunk_mask = (attn_mask.sum(dim=-1) > 0).float()
+            else:
+                chunk_mask = chunk_mask.to(self._device, non_blocking=True).float()
         else:
-            texts = texts_or_batch
+            if isinstance(texts_or_batch, dict):
+                texts = texts_or_batch.get('texts', [])
+            else:
+                texts = texts_or_batch
 
-        if not self._tokenizer.is_fitted:
-            raise RuntimeError(
-                "Tokenizer not fitted. Call fit_tokenizer() before forward()."
+            if not self._tokenizer.is_fitted:
+                raise RuntimeError(
+                    "Tokenizer not fitted. Call fit_tokenizer() before forward()."
+                )
+
+            # Tokenize and chunk.
+            max_token_length = self._chunk_size + (
+                max(0, self._max_chunks - 1) * (self._chunk_size - self._chunk_overlap)
+            )
+            batch_chunk_ids = []
+            for text in texts:
+                token_ids = self._tokenizer.encode(text, max_length=max_token_length)
+                chunks = chunk_token_ids(
+                    token_ids, self._chunk_size, self._chunk_overlap, self._max_chunks
+                )
+                batch_chunk_ids.append(chunks)
+
+            # Pad to uniform (B, max_chunks, max_chunk_len)
+            input_ids, attn_mask, chunk_mask = pad_and_batch_chunks(
+                batch_chunk_ids, self._tokenizer.pad_token_id
+            )
+            input_ids = input_ids.to(self._device)
+            attn_mask = attn_mask.to(self._device)
+            chunk_mask = chunk_mask.to(self._device)
+
+        if input_ids.dim() != 3:
+            raise ValueError(
+                f"HierarchicalCNNExtractor expected input_ids with shape "
+                f"(batch, chunks, chunk_len), got {tuple(input_ids.shape)}"
             )
 
-        # Tokenize and chunk
-        # max_token_length = chunk_size * max_chunks is a reasonable upper bound
-        max_token_length = self._chunk_size * self._max_chunks
-        batch_chunk_ids = []
-        for text in texts:
-            token_ids = self._tokenizer.encode(text, max_length=max_token_length)
-            chunks = chunk_token_ids(
-                token_ids, self._chunk_size, self._chunk_overlap, self._max_chunks
+        if attn_mask.shape != input_ids.shape:
+            raise ValueError(
+                "HierarchicalCNNExtractor expected attention_mask shape to match "
+                f"input_ids; got {tuple(attn_mask.shape)} vs {tuple(input_ids.shape)}"
             )
-            batch_chunk_ids.append(chunks)
 
-        # Pad to uniform (B, max_chunks, max_chunk_len)
-        input_ids, attn_mask, chunk_mask = pad_and_batch_chunks(
-            batch_chunk_ids, self._tokenizer.pad_token_id
-        )
-        input_ids = input_ids.to(self._device)
-        attn_mask = attn_mask.to(self._device)
-        chunk_mask = chunk_mask.to(self._device)
+        if chunk_mask.shape != input_ids.shape[:2]:
+            raise ValueError(
+                "HierarchicalCNNExtractor expected chunk_mask with shape "
+                f"(batch, chunks), got {tuple(chunk_mask.shape)} for "
+                f"input_ids {tuple(input_ids.shape)}"
+            )
 
         B, C, L = input_ids.shape
 
         # Flatten chunks for batch processing: (B*C, L)
-        flat_ids = input_ids.view(B * C, L)
-        flat_mask = attn_mask.view(B * C, L)
+        flat_ids = input_ids.reshape(B * C, L)
+        flat_mask = attn_mask.reshape(B * C, L)
 
         # Embed -> CNN: (B*C, L, conv_dim)
         embedded = self._embedding(flat_ids)

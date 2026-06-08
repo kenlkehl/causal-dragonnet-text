@@ -105,7 +105,7 @@ from oci.config import (
     ExplicitFeatureSpec,
     ModelArchitectureConfig,
 )
-from oci.data import ClinicalTextDataset, collate_batch
+from oci.data import ClinicalTextDataset, collate_batch, create_trainable_cnn_collator
 from oci.data import CachedHiddenStateDataset, collate_cached_batch, prepare_cached_batch
 from oci.models.causal_text import CausalText
 from oci.models.causal_text_forest import CausalTextForest
@@ -718,6 +718,8 @@ def _create_datasets_and_loaders(
     train_df, test_df, train_idx, test_idx,
     text_column, confounder_cols, batch_size,
     hidden_state_cache, gpu_store,
+    feature_extractor_type=None,
+    feature_extractor=None,
 ):
     """Create train/test datasets and DataLoaders with appropriate caching."""
     use_cache = hidden_state_cache is not None
@@ -775,12 +777,20 @@ def _create_datasets_and_loaders(
             outcome_column='outcome_indicator', treatment_column='treatment_indicator',
             explicit_confounder_columns=confounder_cols,
         )
-        collate_fn = collate_batch
+        collate_fn = (
+            create_trainable_cnn_collator(feature_extractor_type, feature_extractor)
+            if feature_extractor_type in {"simple_cnn", "hierarchical_cnn"}
+            else None
+        )
+        if collate_fn is None:
+            collate_fn = collate_batch
 
     if gpu_store is not None:
         dl_kwargs = dict(num_workers=0)
     elif use_cache:
         dl_kwargs = dict(num_workers=2, persistent_workers=True, pin_memory=True)
+    elif feature_extractor_type in {"simple_cnn", "hierarchical_cnn"}:
+        dl_kwargs = dict(num_workers=0)
     else:
         # Live FLP mode: prefetch batches to keep GPU fed during LLM forward passes
         dl_kwargs = dict(num_workers=2, persistent_workers=True, pin_memory=True, prefetch_factor=2)
@@ -984,6 +994,8 @@ def run_causal_forest_experiment(
                 train_df, test_df, train_idx, test_idx,
                 text_column, confounder_cols, batch_size,
                 hidden_state_cache, gpu_store,
+                feature_extractor_type=config.feature_extractor_type,
+                feature_extractor=model.feature_extractor,
             )
 
         explicit_values = getattr(
@@ -1100,7 +1112,7 @@ def run_causal_forest_experiment(
                 outcome_column='outcome_indicator', treatment_column='treatment_indicator',
                 explicit_confounder_columns=confounder_cols,
             )
-            combined_collate = collate_batch
+            combined_collate = collate_fn
 
         combined_loader = DataLoader(
             combined_dataset, batch_size=batch_size, shuffle=False,
@@ -1198,6 +1210,8 @@ def _run_neural_fold(
             train_df, test_df, train_idx, test_idx,
             text_column, confounder_cols, batch_size,
             hidden_state_cache, gpu_store,
+            feature_extractor_type=config.feature_extractor_type,
+            feature_extractor=model.feature_extractor,
         )
 
     explicit_values = getattr(

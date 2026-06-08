@@ -5,6 +5,7 @@ LLM-based extractors are tested separately with @pytest.mark.slow.
 """
 
 import pytest
+import pandas as pd
 import torch
 
 # Sample texts for testing
@@ -60,6 +61,33 @@ class TestSimpleCNN:
         out = ext({'texts': SAMPLE_TEXTS})
         assert out.shape == (4, 24)
 
+    def test_tokenized_dict_input(self):
+        from oci.data.collators import SimpleCNNTokenizingCollator
+        from oci.data.dataset import ClinicalTextDataset
+        from oci.models.simple_cnn_extractor import SimpleCNNExtractor
+        ext = SimpleCNNExtractor(
+            embedding_dim=32, conv_dim=32, kernel_size=3, num_conv_blocks=2,
+            max_length=100, vocab_size=500, projection_dim=24, dropout=0.0,
+        )
+        ext.fit_tokenizer(SAMPLE_TEXTS)
+        df = pd.DataFrame({
+            'clinical_text': SAMPLE_TEXTS,
+            'outcome_indicator': [0, 1, 0, 1],
+            'treatment_indicator': [1, 0, 1, 0],
+        })
+        dataset = ClinicalTextDataset(
+            df,
+            text_column='clinical_text',
+            outcome_column='outcome_indicator',
+            treatment_column='treatment_indicator',
+        )
+        collator = SimpleCNNTokenizingCollator(ext._tokenizer, max_length=100)
+        batch = collator([dataset[i] for i in range(len(dataset))])
+        out = ext(batch)
+        assert out.shape == (4, 24)
+        assert batch['input_ids'].dim() == 2
+        assert batch['attention_mask'].shape == batch['input_ids'].shape
+
 
 class TestHierarchicalCNN:
     def test_forward_shape(self):
@@ -86,6 +114,40 @@ class TestHierarchicalCNN:
         state = ext.get_state()
         assert state['extractor_type'] == 'hierarchical_cnn'
         assert 'chunk_size' in state
+
+    def test_tokenized_dict_input(self):
+        from oci.data.collators import HierarchicalCNNTokenizingCollator
+        from oci.data.dataset import ClinicalTextDataset
+        from oci.models.hierarchical_cnn_extractor import HierarchicalCNNExtractor
+
+        ext = HierarchicalCNNExtractor(
+            embedding_dim=32, conv_dim=32, kernel_size=3, num_conv_blocks=2,
+            chunk_size=20, chunk_overlap=4, max_chunks=8,
+            vocab_size=500, gated_attention_dim=16, projection_dim=24,
+        )
+        ext.fit_tokenizer(SAMPLE_TEXTS)
+        df = pd.DataFrame({
+            'clinical_text': SAMPLE_TEXTS,
+            'outcome_indicator': [0, 1, 0, 1],
+            'treatment_indicator': [1, 0, 1, 0],
+        })
+        dataset = ClinicalTextDataset(
+            df,
+            text_column='clinical_text',
+            outcome_column='outcome_indicator',
+            treatment_column='treatment_indicator',
+        )
+        collator = HierarchicalCNNTokenizingCollator(
+            ext._tokenizer,
+            chunk_size=20,
+            chunk_overlap=4,
+            max_chunks=8,
+        )
+        batch = collator([dataset[i] for i in range(len(dataset))])
+        out = ext(batch)
+        assert out.shape == (4, 24)
+        assert batch['input_ids'].dim() == 3
+        assert batch['chunk_mask'].shape == batch['input_ids'].shape[:2]
 
 
 class TestHierarchicalGRU:

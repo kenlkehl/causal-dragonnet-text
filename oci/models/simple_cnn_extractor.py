@@ -183,26 +183,53 @@ class SimpleCNNExtractor(nn.Module):
         """Extract features from raw texts.
 
         Args:
-            texts_or_batch: List[str] of document texts, or dict (ignored, uses texts).
+            texts_or_batch: List[str] of document texts, or dict with either
+                ``texts`` or collate-time ``input_ids``/``attention_mask``.
 
         Returns:
             Feature tensor of shape (batch_size, output_dim)
         """
-        if isinstance(texts_or_batch, dict):
-            texts = texts_or_batch.get('texts', [])
+        if isinstance(texts_or_batch, dict) and 'input_ids' in texts_or_batch:
+            input_ids = texts_or_batch['input_ids'].to(self._device, non_blocking=True)
+            attention_mask = texts_or_batch.get('attention_mask')
+            if attention_mask is None:
+                attention_mask = (input_ids != self._tokenizer.pad_token_id).float()
+            else:
+                attention_mask = attention_mask.to(self._device, non_blocking=True).float()
         else:
-            texts = texts_or_batch
+            if isinstance(texts_or_batch, dict):
+                texts = texts_or_batch.get('texts', [])
+            else:
+                texts = texts_or_batch
 
-        if not self._tokenizer.is_fitted:
-            raise RuntimeError(
-                "Tokenizer not fitted. Call fit_tokenizer() before forward()."
+            if not self._tokenizer.is_fitted:
+                raise RuntimeError(
+                    "Tokenizer not fitted. Call fit_tokenizer() before forward()."
+                )
+
+            input_ids, attention_mask = self._tokenizer.encode_batch(
+                texts, max_length=self._max_length
+            )
+            input_ids = input_ids.to(self._device)
+            attention_mask = attention_mask.to(self._device)
+
+        if input_ids.dim() != 2:
+            raise ValueError(
+                f"SimpleCNNExtractor expected input_ids with shape (batch, seq_len), "
+                f"got {tuple(input_ids.shape)}"
             )
 
-        input_ids, attention_mask = self._tokenizer.encode_batch(
-            texts, max_length=self._max_length
-        )
-        input_ids = input_ids.to(self._device)
-        attention_mask = attention_mask.to(self._device)
+        if attention_mask.dim() != 2:
+            raise ValueError(
+                "SimpleCNNExtractor expected attention_mask with shape "
+                f"(batch, seq_len), got {tuple(attention_mask.shape)}"
+            )
+
+        if attention_mask.shape != input_ids.shape:
+            raise ValueError(
+                "SimpleCNNExtractor expected attention_mask shape to match "
+                f"input_ids; got {tuple(attention_mask.shape)} vs {tuple(input_ids.shape)}"
+            )
 
         # Embed -> CNN -> pool -> project
         embedded = self._embedding(input_ids)  # (B, seq_len, embedding_dim)
