@@ -839,6 +839,21 @@ def _get_cache_info(config, parquet_file, cache_registry, gpu_store_registry):
 
     ext_type = config.feature_extractor_type
 
+    if ext_type == "concept_embedding_cnn" and getattr(
+        config, "cecnn_cache_chunk_embeddings", False
+    ):
+        cache_hash = ConceptEmbeddingCache.compute_cache_hash(
+            sentence_model_name=config.cecnn_sentence_model_name,
+            dataset_path=str(parquet_file),
+            chunk_size_words=config.cecnn_chunk_size_words,
+            chunk_overlap_words=config.cecnn_chunk_overlap_words,
+            max_chunks=config.cecnn_max_chunks,
+            normalize_embeddings=config.cecnn_normalize_embeddings,
+        )
+        if cache_registry is not None:
+            hidden_state_cache = cache_registry.get(cache_hash)
+        return gpu_store, hidden_state_cache
+
     if ext_type not in CACHEABLE_EXTRACTOR_TYPES:
         return gpu_store, hidden_state_cache
 
@@ -865,19 +880,6 @@ def _get_cache_info(config, parquet_file, cache_registry, gpu_store_registry):
         if gpu_store_registry is not None:
             gpu_store = gpu_store_registry.get(cache_hash)
         if gpu_store is None and cache_registry is not None:
-            hidden_state_cache = cache_registry.get(cache_hash)
-    elif ext_type == "concept_embedding_cnn" and getattr(
-        config, "cecnn_cache_chunk_embeddings", False
-    ):
-        cache_hash = ConceptEmbeddingCache.compute_cache_hash(
-            sentence_model_name=config.cecnn_sentence_model_name,
-            dataset_path=str(parquet_file),
-            chunk_size_words=config.cecnn_chunk_size_words,
-            chunk_overlap_words=config.cecnn_chunk_overlap_words,
-            max_chunks=config.cecnn_max_chunks,
-            normalize_embeddings=config.cecnn_normalize_embeddings,
-        )
-        if cache_registry is not None:
             hidden_state_cache = cache_registry.get(cache_hash)
 
     return gpu_store, hidden_state_cache
