@@ -119,6 +119,22 @@ class CausalTextForest(nn.Module):
         scnn_gated_attention_dim: int = 128,
         scnn_projection_dim: int = 128,
         scnn_dropout: float = 0.1,
+        # Concept embedding CNN args
+        cecnn_sentence_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        cecnn_chunk_size_words: int = 64,
+        cecnn_chunk_overlap_words: int = 16,
+        cecnn_max_chunks: int = 128,
+        cecnn_confounder_concepts: Optional[List[str]] = None,
+        cecnn_effect_modifier_concepts: Optional[List[str]] = None,
+        cecnn_random_features: int = 0,
+        cecnn_random_confounder_features: Optional[int] = None,
+        cecnn_random_modifier_features: Optional[int] = None,
+        cecnn_projection_dim: int = 128,
+        cecnn_dropout: float = 0.1,
+        cecnn_anchor_weight: float = 0.01,
+        cecnn_cached_embedding_dim: int = 0,
+        cecnn_normalize_embeddings: bool = True,
+        cecnn_random_state: int = 42,
         # Simple heads args
         representation_dim: int = 128,
         hidden_dim: int = 64,
@@ -224,6 +240,21 @@ class CausalTextForest(nn.Module):
             'scnn_gated_attention_dim': scnn_gated_attention_dim,
             'scnn_projection_dim': scnn_projection_dim,
             'scnn_dropout': scnn_dropout,
+            'cecnn_sentence_model_name': cecnn_sentence_model_name,
+            'cecnn_chunk_size_words': cecnn_chunk_size_words,
+            'cecnn_chunk_overlap_words': cecnn_chunk_overlap_words,
+            'cecnn_max_chunks': cecnn_max_chunks,
+            'cecnn_confounder_concepts': cecnn_confounder_concepts,
+            'cecnn_effect_modifier_concepts': cecnn_effect_modifier_concepts,
+            'cecnn_random_features': cecnn_random_features,
+            'cecnn_random_confounder_features': cecnn_random_confounder_features,
+            'cecnn_random_modifier_features': cecnn_random_modifier_features,
+            'cecnn_projection_dim': cecnn_projection_dim,
+            'cecnn_dropout': cecnn_dropout,
+            'cecnn_anchor_weight': cecnn_anchor_weight,
+            'cecnn_cached_embedding_dim': cecnn_cached_embedding_dim,
+            'cecnn_normalize_embeddings': cecnn_normalize_embeddings,
+            'cecnn_random_state': cecnn_random_state,
             'representation_dim': representation_dim,
             'hidden_dim': hidden_dim,
             'dropout': dropout,
@@ -352,6 +383,24 @@ class CausalTextForest(nn.Module):
             scnn_gated_attention_dim=scnn_gated_attention_dim,
             scnn_projection_dim=scnn_projection_dim,
             scnn_dropout=scnn_dropout,
+            cecnn_sentence_model_name=cecnn_sentence_model_name,
+            cecnn_chunk_size_words=cecnn_chunk_size_words,
+            cecnn_chunk_overlap_words=cecnn_chunk_overlap_words,
+            cecnn_max_chunks=cecnn_max_chunks,
+            cecnn_confounder_concepts=cecnn_confounder_concepts or [],
+            cecnn_effect_modifier_concepts=cecnn_effect_modifier_concepts or [],
+            cecnn_random_features=cecnn_random_features,
+            cecnn_random_confounder_features=cecnn_random_confounder_features,
+            cecnn_random_modifier_features=cecnn_random_modifier_features,
+            cecnn_kernel_role=(
+                "confounder" if cf_use_rlearner_representation else "combined"
+            ),
+            cecnn_projection_dim=cecnn_projection_dim,
+            cecnn_dropout=cecnn_dropout,
+            cecnn_anchor_weight=cecnn_anchor_weight,
+            cecnn_cached_embedding_dim=cecnn_cached_embedding_dim,
+            cecnn_normalize_embeddings=cecnn_normalize_embeddings,
+            cecnn_random_state=cecnn_random_state,
         )
 
         logger.info(f"Using {self.feature_extractor_type.upper()} feature extractor")
@@ -454,6 +503,22 @@ class CausalTextForest(nn.Module):
                 scnn_gated_attention_dim=scnn_gated_attention_dim,
                 scnn_projection_dim=scnn_projection_dim,
                 scnn_dropout=scnn_dropout,
+                cecnn_sentence_model_name=cecnn_sentence_model_name,
+                cecnn_chunk_size_words=cecnn_chunk_size_words,
+                cecnn_chunk_overlap_words=cecnn_chunk_overlap_words,
+                cecnn_max_chunks=cecnn_max_chunks,
+                cecnn_confounder_concepts=cecnn_confounder_concepts or [],
+                cecnn_effect_modifier_concepts=cecnn_effect_modifier_concepts or [],
+                cecnn_random_features=cecnn_random_features,
+                cecnn_random_confounder_features=cecnn_random_confounder_features,
+                cecnn_random_modifier_features=cecnn_random_modifier_features,
+                cecnn_kernel_role="effect_modifier",
+                cecnn_projection_dim=cecnn_projection_dim,
+                cecnn_dropout=cecnn_dropout,
+                cecnn_anchor_weight=cecnn_anchor_weight,
+                cecnn_cached_embedding_dim=cecnn_cached_embedding_dim,
+                cecnn_normalize_embeddings=cecnn_normalize_embeddings,
+                cecnn_random_state=cecnn_random_state,
             )
             self.effect_head = None
             logger.info("  R-learner representation training: ENABLED (staged separate nets)")
@@ -620,6 +685,11 @@ class CausalTextForest(nn.Module):
             return logit
         return torch.sigmoid(logit)
 
+    def _extractor_anchor_loss(self, extractor: nn.Module) -> torch.Tensor:
+        if hasattr(extractor, "compute_anchor_loss"):
+            return extractor.compute_anchor_loss()
+        return torch.tensor(0.0, device=self._device)
+
     def train_representation_step(
         self,
         batch: Dict[str, Any],
@@ -700,11 +770,14 @@ class CausalTextForest(nn.Module):
         )
         outcome_loss = self._outcome_loss(outcome_logit.squeeze(-1), outcomes_smooth)
         total_loss = outcome_loss + alpha_propensity * propensity_loss
+        anchor_loss = self._extractor_anchor_loss(self.feature_extractor)
+        total_loss = total_loss + anchor_loss
 
         return {
             'loss': total_loss,
             'outcome_loss': outcome_loss.detach(),
             'propensity_loss': propensity_loss.detach(),
+            'anchor_loss': anchor_loss.detach(),
             'propensity_logit': propensity_logit.detach(),
             'outcome_logit': outcome_logit.detach(),
             'w_hidden': w_hidden.detach(),
@@ -733,11 +806,13 @@ class CausalTextForest(nn.Module):
         y_residual = outcomes - m_hat
         t_residual = treatments - e_hat
         r_loss = ((y_residual - tau.squeeze(-1) * t_residual) ** 2).mean()
-        total_loss = gamma_rlearner * r_loss
+        anchor_loss = self._extractor_anchor_loss(extractor)
+        total_loss = gamma_rlearner * r_loss + anchor_loss
 
         return {
             'loss': total_loss,
             'r_loss': r_loss.detach(),
+            'anchor_loss': anchor_loss.detach(),
             'tau': tau.detach(),
             'x_hidden': x_hidden.detach(),
         }

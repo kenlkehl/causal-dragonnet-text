@@ -94,6 +94,22 @@ class CausalText(nn.Module):
         scnn_gated_attention_dim: int = 128,
         scnn_projection_dim: int = 128,
         scnn_dropout: float = 0.1,
+        # Concept embedding CNN args
+        cecnn_sentence_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        cecnn_chunk_size_words: int = 64,
+        cecnn_chunk_overlap_words: int = 16,
+        cecnn_max_chunks: int = 128,
+        cecnn_confounder_concepts: Optional[List[str]] = None,
+        cecnn_effect_modifier_concepts: Optional[List[str]] = None,
+        cecnn_random_features: int = 0,
+        cecnn_random_confounder_features: Optional[int] = None,
+        cecnn_random_modifier_features: Optional[int] = None,
+        cecnn_projection_dim: int = 128,
+        cecnn_dropout: float = 0.1,
+        cecnn_anchor_weight: float = 0.01,
+        cecnn_cached_embedding_dim: int = 0,
+        cecnn_normalize_embeddings: bool = True,
+        cecnn_random_state: int = 42,
         # Causal head args (applies to all causal heads: DragonNet, RLearner)
         causal_head_representation_dim: int = 128,
         causal_head_hidden_outcome_dim: int = 64,
@@ -207,6 +223,21 @@ class CausalText(nn.Module):
             'scnn_gated_attention_dim': scnn_gated_attention_dim,
             'scnn_projection_dim': scnn_projection_dim,
             'scnn_dropout': scnn_dropout,
+            'cecnn_sentence_model_name': cecnn_sentence_model_name,
+            'cecnn_chunk_size_words': cecnn_chunk_size_words,
+            'cecnn_chunk_overlap_words': cecnn_chunk_overlap_words,
+            'cecnn_max_chunks': cecnn_max_chunks,
+            'cecnn_confounder_concepts': cecnn_confounder_concepts,
+            'cecnn_effect_modifier_concepts': cecnn_effect_modifier_concepts,
+            'cecnn_random_features': cecnn_random_features,
+            'cecnn_random_confounder_features': cecnn_random_confounder_features,
+            'cecnn_random_modifier_features': cecnn_random_modifier_features,
+            'cecnn_projection_dim': cecnn_projection_dim,
+            'cecnn_dropout': cecnn_dropout,
+            'cecnn_anchor_weight': cecnn_anchor_weight,
+            'cecnn_cached_embedding_dim': cecnn_cached_embedding_dim,
+            'cecnn_normalize_embeddings': cecnn_normalize_embeddings,
+            'cecnn_random_state': cecnn_random_state,
             'causal_head_representation_dim': causal_head_representation_dim,
             'causal_head_hidden_outcome_dim': causal_head_hidden_outcome_dim,
             'causal_head_dropout': causal_head_dropout,
@@ -286,6 +317,22 @@ class CausalText(nn.Module):
             scnn_gated_attention_dim=scnn_gated_attention_dim,
             scnn_projection_dim=scnn_projection_dim,
             scnn_dropout=scnn_dropout,
+            cecnn_sentence_model_name=cecnn_sentence_model_name,
+            cecnn_chunk_size_words=cecnn_chunk_size_words,
+            cecnn_chunk_overlap_words=cecnn_chunk_overlap_words,
+            cecnn_max_chunks=cecnn_max_chunks,
+            cecnn_confounder_concepts=cecnn_confounder_concepts or [],
+            cecnn_effect_modifier_concepts=cecnn_effect_modifier_concepts or [],
+            cecnn_random_features=cecnn_random_features,
+            cecnn_random_confounder_features=cecnn_random_confounder_features,
+            cecnn_random_modifier_features=cecnn_random_modifier_features,
+            cecnn_kernel_role="combined",
+            cecnn_projection_dim=cecnn_projection_dim,
+            cecnn_dropout=cecnn_dropout,
+            cecnn_anchor_weight=cecnn_anchor_weight,
+            cecnn_cached_embedding_dim=cecnn_cached_embedding_dim,
+            cecnn_normalize_embeddings=cecnn_normalize_embeddings,
+            cecnn_random_state=cecnn_random_state,
         )
 
         # Auxiliary feature projection (if enabled)
@@ -451,6 +498,11 @@ class CausalText(nn.Module):
             return logit
         return torch.sigmoid(logit)
 
+    def _feature_extractor_anchor_loss(self) -> torch.Tensor:
+        if hasattr(self.feature_extractor, "compute_anchor_loss"):
+            return self.feature_extractor.compute_anchor_loss()
+        return torch.tensor(0.0, device=self._device)
+
     def train_step(
         self,
         batch: Dict[str, Any],
@@ -573,12 +625,15 @@ class CausalText(nn.Module):
             alpha_propensity * propensity_loss +
             beta_targreg * targreg_loss
         )
+        anchor_loss = self._feature_extractor_anchor_loss()
+        total_loss = total_loss + anchor_loss
 
         result = {
             'loss': total_loss,
             'outcome_loss': outcome_loss.detach(),
             'propensity_loss': propensity_loss.detach(),
             'targreg_loss': targreg_loss.detach() if isinstance(targreg_loss, torch.Tensor) else targreg_loss,
+            'anchor_loss': anchor_loss.detach(),
             'y0_logit': y0_logit.detach(),
             'y1_logit': y1_logit.detach(),
             't_logit': t_logit.detach()
@@ -684,6 +739,8 @@ class CausalText(nn.Module):
             gamma_rlearner * r_loss +
             attention_entropy_weight * entropy_loss
         )
+        anchor_loss = self._feature_extractor_anchor_loss()
+        total_loss = total_loss + anchor_loss
 
         # Derive y0/y1 for backward-compatible metrics
         # From: m = e*y1 + (1-e)*y0 and tau = y1 - y0
@@ -701,6 +758,7 @@ class CausalText(nn.Module):
             'propensity_loss': propensity_loss.detach(),
             'r_loss': r_loss.detach(),
             'targreg_loss': r_loss.detach(),  # Alias for compatibility
+            'anchor_loss': anchor_loss.detach(),
             'm_logit': m_logit.detach(),
             'tau': tau.detach(),
             't_logit': t_logit.detach(),

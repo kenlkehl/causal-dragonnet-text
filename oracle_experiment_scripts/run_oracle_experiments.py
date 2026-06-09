@@ -110,6 +110,7 @@ from oci.data import CachedHiddenStateDataset, collate_cached_batch, prepare_cac
 from oci.models.causal_text import CausalText
 from oci.models.causal_text_forest import CausalTextForest
 from oci.models.hidden_state_cache import HiddenStateCache
+from oci.models.concept_embedding_cache import ConceptEmbeddingCache
 from oci.models.gpu_hidden_state_store import GPUHiddenStateStore
 from oci.inference.agentic_explicit_feature_forest import run_agentic_explicit_feature_forest
 
@@ -242,6 +243,24 @@ class ExperimentConfig:
     scnn_projection_dim: int = 128
     scnn_dropout: float = 0.1
 
+    # Concept embedding CNN hyperparameters
+    cecnn_sentence_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    cecnn_chunk_size_words: int = 64
+    cecnn_chunk_overlap_words: int = 16
+    cecnn_max_chunks: int = 128
+    cecnn_confounder_concepts: List[str] = field(default_factory=list)
+    cecnn_effect_modifier_concepts: List[str] = field(default_factory=list)
+    cecnn_random_features: int = 0
+    cecnn_random_confounder_features: Optional[int] = None
+    cecnn_random_modifier_features: Optional[int] = None
+    cecnn_projection_dim: int = 128
+    cecnn_dropout: float = 0.1
+    cecnn_anchor_weight: float = 0.01
+    cecnn_cache_chunk_embeddings: bool = False
+    cecnn_cached_embedding_dim: int = 0
+    cecnn_normalize_embeddings: bool = True
+    cecnn_random_state: int = 42
+
     # Extractor-specific field prefixes -- used by config_hash() to exclude
     # parameters that belong to *other* extractors so adding a new extractor
     # type never invalidates existing result hashes.
@@ -251,6 +270,7 @@ class ExperimentConfig:
         "hierarchical_cnn": {"hcnn_"},
         "hierarchical_gru": {"hgru_"},
         "simple_cnn": {"scnn_"},
+        "concept_embedding_cnn": {"cecnn_"},
     }
     _ALL_EXTRACTOR_PREFIXES = set().union(*_EXTRACTOR_PREFIXES.values())
     _AGENTIC_PREFIX = "agentic_"
@@ -836,6 +856,19 @@ def _get_cache_info(config, parquet_file, cache_registry, gpu_store_registry):
             gpu_store = gpu_store_registry.get(cache_hash)
         if gpu_store is None and cache_registry is not None:
             hidden_state_cache = cache_registry.get(cache_hash)
+    elif ext_type == "concept_embedding_cnn" and getattr(
+        config, "cecnn_cache_chunk_embeddings", False
+    ):
+        cache_hash = ConceptEmbeddingCache.compute_cache_hash(
+            sentence_model_name=config.cecnn_sentence_model_name,
+            dataset_path=str(parquet_file),
+            chunk_size_words=config.cecnn_chunk_size_words,
+            chunk_overlap_words=config.cecnn_chunk_overlap_words,
+            max_chunks=config.cecnn_max_chunks,
+            normalize_embeddings=config.cecnn_normalize_embeddings,
+        )
+        if cache_registry is not None:
+            hidden_state_cache = cache_registry.get(cache_hash)
 
     return gpu_store, hidden_state_cache
 
@@ -923,6 +956,27 @@ def _common_model_kwargs(config, gpu_store, hidden_state_cache, confounder_specs
             scnn_vocab_size=config.scnn_vocab_size,
             scnn_projection_dim=config.scnn_projection_dim,
             scnn_dropout=config.scnn_dropout,
+        )
+    elif ext_type == "concept_embedding_cnn":
+        kwargs.update(
+            cecnn_sentence_model_name=config.cecnn_sentence_model_name,
+            cecnn_chunk_size_words=config.cecnn_chunk_size_words,
+            cecnn_chunk_overlap_words=config.cecnn_chunk_overlap_words,
+            cecnn_max_chunks=config.cecnn_max_chunks,
+            cecnn_confounder_concepts=config.cecnn_confounder_concepts,
+            cecnn_effect_modifier_concepts=config.cecnn_effect_modifier_concepts,
+            cecnn_random_features=config.cecnn_random_features,
+            cecnn_random_confounder_features=config.cecnn_random_confounder_features,
+            cecnn_random_modifier_features=config.cecnn_random_modifier_features,
+            cecnn_projection_dim=config.cecnn_projection_dim,
+            cecnn_dropout=config.cecnn_dropout,
+            cecnn_anchor_weight=config.cecnn_anchor_weight,
+            cecnn_cached_embedding_dim=(
+                hidden_state_cache.hidden_size if hidden_state_cache is not None
+                else config.cecnn_cached_embedding_dim
+            ),
+            cecnn_normalize_embeddings=config.cecnn_normalize_embeddings,
+            cecnn_random_state=config.cecnn_random_state + config.repeat_index,
         )
 
     return kwargs

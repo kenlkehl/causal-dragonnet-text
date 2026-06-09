@@ -29,7 +29,7 @@ import random
 import threading
 import traceback
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -183,12 +183,31 @@ class XWRLearnerForestConfig:
     scnn_projection_dim: int = 128
     scnn_dropout: float = 0.1
 
+    # Concept embedding CNN hyperparameters.
+    cecnn_sentence_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    cecnn_chunk_size_words: int = 64
+    cecnn_chunk_overlap_words: int = 16
+    cecnn_max_chunks: int = 128
+    cecnn_confounder_concepts: List[str] = field(default_factory=list)
+    cecnn_effect_modifier_concepts: List[str] = field(default_factory=list)
+    cecnn_random_features: int = 0
+    cecnn_random_confounder_features: Optional[int] = None
+    cecnn_random_modifier_features: Optional[int] = None
+    cecnn_projection_dim: int = 128
+    cecnn_dropout: float = 0.1
+    cecnn_anchor_weight: float = 0.01
+    cecnn_cache_chunk_embeddings: bool = False
+    cecnn_cached_embedding_dim: int = 0
+    cecnn_normalize_embeddings: bool = True
+    cecnn_random_state: int = 42
+
     _EXTRACTOR_PREFIXES = {
         "frozen_llm_pooler": {"flp_"},
         "hierarchical_llm": {"hlm_"},
         "hierarchical_cnn": {"hcnn_"},
         "hierarchical_gru": {"hgru_"},
         "simple_cnn": {"scnn_"},
+        "concept_embedding_cnn": {"cecnn_"},
     }
     _ALL_EXTRACTOR_PREFIXES = set().union(*_EXTRACTOR_PREFIXES.values())
 

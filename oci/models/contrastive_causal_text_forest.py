@@ -214,6 +214,9 @@ class ContrastiveCausalTextForest(CausalTextForest):
             + adversary_loss
             + cfg.lambda_z_l2 * z_l2_loss
         )
+        extractor = self.effect_feature_extractor or self.feature_extractor
+        anchor_loss = self._extractor_anchor_loss(extractor)
+        total_loss = total_loss + anchor_loss
 
         return {
             'loss': total_loss,
@@ -221,6 +224,7 @@ class ContrastiveCausalTextForest(CausalTextForest):
             'contrast_loss': contrast_loss.detach(),
             'adversary_loss': adversary_loss.detach(),
             'z_l2_loss': z_l2_loss.detach(),
+            'anchor_loss': anchor_loss.detach(),
             'r_loss': contrast_loss.detach(),
             'tau': tau.detach(),
             'x_hidden': z.detach(),

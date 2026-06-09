@@ -393,6 +393,12 @@ EXTRACTOR_ALIASES = {
     "hierarchical_cnn": {"hierarchical_cnn", "hier_cnn", "hcnn"},
     "hierarchical_gru": {"hierarchical_gru", "hier_gru", "hgru"},
     "simple_cnn": {"simple_cnn", "scnn"},
+    "concept_embedding_cnn": {
+        "concept_embedding_cnn",
+        "concept_cnn",
+        "cecnn",
+        "concept_embeddings",
+    },
 }
 
 VALID_EXTRACTOR_TYPES = set(EXTRACTOR_ALIASES.keys())

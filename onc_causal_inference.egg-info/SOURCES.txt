@@ -31,6 +31,9 @@ oci/models/__init__.py
 oci/models/causal_forest_head.py
 oci/models/causal_text.py
 oci/models/causal_text_forest.py
+oci/models/concept_embedding_cache.py
+oci/models/concept_embedding_cnn_extractor.py
+oci/models/concept_embedding_utils.py
 oci/models/contrastive_causal_text_forest.py
 oci/models/dragonnet.py
 oci/models/explicit_confounder_featurizer.py
@@ -64,6 +67,7 @@ onc_causal_inference.egg-info/requires.txt
 onc_causal_inference.egg-info/top_level.txt
 tests/test_agentic_feature_search.py
 tests/test_causal_forest_tuning.py
+tests/test_concept_embedding_cnn.py
 tests/test_contrastive_effect.py
 tests/test_e2e_workflows.py
 tests/test_explicit_confounders_e2e.py

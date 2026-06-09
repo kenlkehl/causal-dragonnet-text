@@ -78,6 +78,23 @@ def create_feature_extractor(
     scnn_gated_attention_dim: int = 128,
     scnn_projection_dim: int = 128,
     scnn_dropout: float = 0.1,
+    # Concept embedding CNN args
+    cecnn_sentence_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    cecnn_chunk_size_words: int = 64,
+    cecnn_chunk_overlap_words: int = 16,
+    cecnn_max_chunks: int = 128,
+    cecnn_confounder_concepts: Optional[List[str]] = None,
+    cecnn_effect_modifier_concepts: Optional[List[str]] = None,
+    cecnn_random_features: int = 0,
+    cecnn_random_confounder_features: Optional[int] = None,
+    cecnn_random_modifier_features: Optional[int] = None,
+    cecnn_kernel_role: str = "combined",
+    cecnn_projection_dim: int = 128,
+    cecnn_dropout: float = 0.1,
+    cecnn_anchor_weight: float = 0.01,
+    cecnn_cached_embedding_dim: int = 0,
+    cecnn_normalize_embeddings: bool = True,
+    cecnn_random_state: int = 42,
     # Model type
     model_type: str = "dragonnet",
 ) -> nn.Module:
@@ -202,6 +219,38 @@ def create_feature_extractor(
                     f"max_length={scnn_max_length}, projection_dim={scnn_projection_dim}")
         return extractor
 
+    elif normalized_type == "concept_embedding_cnn":
+        from .concept_embedding_cnn_extractor import ConceptEmbeddingCNNExtractor
+        extractor = ConceptEmbeddingCNNExtractor(
+            sentence_model_name=cecnn_sentence_model_name,
+            chunk_size_words=cecnn_chunk_size_words,
+            chunk_overlap_words=cecnn_chunk_overlap_words,
+            max_chunks=cecnn_max_chunks,
+            confounder_concepts=cecnn_confounder_concepts or [],
+            effect_modifier_concepts=cecnn_effect_modifier_concepts or [],
+            random_features=cecnn_random_features,
+            random_confounder_features=cecnn_random_confounder_features,
+            random_modifier_features=cecnn_random_modifier_features,
+            kernel_role=cecnn_kernel_role,
+            projection_dim=cecnn_projection_dim,
+            dropout=cecnn_dropout,
+            anchor_weight=cecnn_anchor_weight,
+            cached_embedding_dim=cecnn_cached_embedding_dim,
+            normalize_embeddings=cecnn_normalize_embeddings,
+            random_state=cecnn_random_state,
+            device=device,
+        )
+        logger.info(
+            "Created Concept Embedding CNN extractor: role=%s, chunks=%d/%d/%d, "
+            "projection_dim=%d",
+            cecnn_kernel_role,
+            cecnn_chunk_size_words,
+            cecnn_chunk_overlap_words,
+            cecnn_max_chunks,
+            cecnn_projection_dim,
+        )
+        return extractor
+
     else:
         from ..config import VALID_EXTRACTOR_TYPES
         raise ValueError(
@@ -289,4 +338,28 @@ def create_feature_extractor_from_config(
         scnn_gated_attention_dim=config.get('scnn_gated_attention_dim', 128),
         scnn_projection_dim=config.get('scnn_projection_dim', 128),
         scnn_dropout=config.get('scnn_dropout', 0.1),
+        # Concept embedding CNN args
+        cecnn_sentence_model_name=config.get(
+            'cecnn_sentence_model_name',
+            'sentence-transformers/all-MiniLM-L6-v2',
+        ),
+        cecnn_chunk_size_words=config.get('cecnn_chunk_size_words', 64),
+        cecnn_chunk_overlap_words=config.get('cecnn_chunk_overlap_words', 16),
+        cecnn_max_chunks=config.get('cecnn_max_chunks', 128),
+        cecnn_confounder_concepts=config.get('cecnn_confounder_concepts', []),
+        cecnn_effect_modifier_concepts=config.get('cecnn_effect_modifier_concepts', []),
+        cecnn_random_features=config.get('cecnn_random_features', 0),
+        cecnn_random_confounder_features=config.get(
+            'cecnn_random_confounder_features', None
+        ),
+        cecnn_random_modifier_features=config.get(
+            'cecnn_random_modifier_features', None
+        ),
+        cecnn_kernel_role=config.get('cecnn_kernel_role', 'combined'),
+        cecnn_projection_dim=config.get('cecnn_projection_dim', 128),
+        cecnn_dropout=config.get('cecnn_dropout', 0.1),
+        cecnn_anchor_weight=config.get('cecnn_anchor_weight', 0.01),
+        cecnn_cached_embedding_dim=config.get('cecnn_cached_embedding_dim', 0),
+        cecnn_normalize_embeddings=config.get('cecnn_normalize_embeddings', True),
+        cecnn_random_state=config.get('cecnn_random_state', 42),
     )

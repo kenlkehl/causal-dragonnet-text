@@ -8,6 +8,8 @@ from .hierarchical_llm_extractor import HierarchicalLLMExtractor
 from .hierarchical_cnn_extractor import HierarchicalCNNExtractor
 from .hierarchical_gru_extractor import HierarchicalGRUExtractor
 from .simple_cnn_extractor import SimpleCNNExtractor
+from .concept_embedding_cnn_extractor import ConceptEmbeddingCNNExtractor
+from .concept_embedding_cache import ConceptEmbeddingCache
 from .gated_attention_pooling import GatedAttentionPooling
 from .learned_tokenizer import LearnedTokenizer
 from .text_chunking import chunk_token_ids, pad_and_batch_chunks
@@ -40,6 +42,8 @@ __all__ = [
     'HierarchicalCNNExtractor',
     'HierarchicalGRUExtractor',
     'SimpleCNNExtractor',
+    'ConceptEmbeddingCNNExtractor',
+    'ConceptEmbeddingCache',
     'GatedAttentionPooling',
     'LearnedTokenizer',
     'chunk_token_ids',
