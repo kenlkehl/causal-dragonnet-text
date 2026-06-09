@@ -152,6 +152,25 @@ class CausalTextForest(nn.Module):
         ctcnn_downprojection_dim: Optional[int] = None,
         ctcnn_normalize_embeddings: bool = True,
         ctcnn_random_state: int = 42,
+        # Slot-value discovery args
+        svx_sentence_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        svx_chunk_size_words: int = 64,
+        svx_chunk_overlap_words: int = 16,
+        svx_max_chunks: int = 128,
+        svx_confounder_concepts: Optional[List[str]] = None,
+        svx_effect_modifier_concepts: Optional[List[str]] = None,
+        svx_num_free_slots: int = 16,
+        svx_slot_dim: int = 128,
+        svx_num_value_prototypes: int = 4,
+        svx_dropout: float = 0.1,
+        svx_anchor_weight: float = 0.01,
+        svx_cached_embedding_dim: int = 0,
+        svx_normalize_embeddings: bool = True,
+        svx_attention_temperature: float = 0.1,
+        svx_attention_entropy_weight: float = 0.0,
+        svx_query_diversity_weight: float = 0.0,
+        svx_gate_l1_weight: float = 0.0,
+        svx_random_state: int = 42,
         # Simple heads args
         representation_dim: int = 128,
         hidden_dim: int = 64,
@@ -288,6 +307,24 @@ class CausalTextForest(nn.Module):
             'ctcnn_downprojection_dim': ctcnn_downprojection_dim,
             'ctcnn_normalize_embeddings': ctcnn_normalize_embeddings,
             'ctcnn_random_state': ctcnn_random_state,
+            'svx_sentence_model_name': svx_sentence_model_name,
+            'svx_chunk_size_words': svx_chunk_size_words,
+            'svx_chunk_overlap_words': svx_chunk_overlap_words,
+            'svx_max_chunks': svx_max_chunks,
+            'svx_confounder_concepts': svx_confounder_concepts,
+            'svx_effect_modifier_concepts': svx_effect_modifier_concepts,
+            'svx_num_free_slots': svx_num_free_slots,
+            'svx_slot_dim': svx_slot_dim,
+            'svx_num_value_prototypes': svx_num_value_prototypes,
+            'svx_dropout': svx_dropout,
+            'svx_anchor_weight': svx_anchor_weight,
+            'svx_cached_embedding_dim': svx_cached_embedding_dim,
+            'svx_normalize_embeddings': svx_normalize_embeddings,
+            'svx_attention_temperature': svx_attention_temperature,
+            'svx_attention_entropy_weight': svx_attention_entropy_weight,
+            'svx_query_diversity_weight': svx_query_diversity_weight,
+            'svx_gate_l1_weight': svx_gate_l1_weight,
+            'svx_random_state': svx_random_state,
             'representation_dim': representation_dim,
             'hidden_dim': hidden_dim,
             'dropout': dropout,
@@ -453,6 +490,23 @@ class CausalTextForest(nn.Module):
             ctcnn_downprojection_dim=ctcnn_downprojection_dim,
             ctcnn_normalize_embeddings=ctcnn_normalize_embeddings,
             ctcnn_random_state=ctcnn_random_state,
+            svx_sentence_model_name=svx_sentence_model_name,
+            svx_chunk_size_words=svx_chunk_size_words,
+            svx_chunk_overlap_words=svx_chunk_overlap_words,
+            svx_max_chunks=svx_max_chunks,
+            svx_confounder_concepts=svx_confounder_concepts or [],
+            svx_effect_modifier_concepts=svx_effect_modifier_concepts or [],
+            svx_num_free_slots=svx_num_free_slots,
+            svx_slot_dim=svx_slot_dim,
+            svx_num_value_prototypes=svx_num_value_prototypes,
+            svx_dropout=svx_dropout,
+            svx_anchor_weight=svx_anchor_weight,
+            svx_cached_embedding_dim=svx_cached_embedding_dim,
+            svx_normalize_embeddings=svx_normalize_embeddings,
+            svx_attention_temperature=svx_attention_temperature,
+            svx_attention_entropy_weight=svx_attention_entropy_weight,
+            svx_query_diversity_weight=svx_query_diversity_weight,
+            svx_random_state=svx_random_state,
         )
 
         logger.info(f"Using {self.feature_extractor_type.upper()} feature extractor")
@@ -588,6 +642,23 @@ class CausalTextForest(nn.Module):
                 ctcnn_downprojection_dim=ctcnn_downprojection_dim,
                 ctcnn_normalize_embeddings=ctcnn_normalize_embeddings,
                 ctcnn_random_state=ctcnn_random_state,
+                svx_sentence_model_name=svx_sentence_model_name,
+                svx_chunk_size_words=svx_chunk_size_words,
+                svx_chunk_overlap_words=svx_chunk_overlap_words,
+                svx_max_chunks=svx_max_chunks,
+                svx_confounder_concepts=svx_confounder_concepts or [],
+                svx_effect_modifier_concepts=svx_effect_modifier_concepts or [],
+                svx_num_free_slots=svx_num_free_slots,
+                svx_slot_dim=svx_slot_dim,
+                svx_num_value_prototypes=svx_num_value_prototypes,
+                svx_dropout=svx_dropout,
+                svx_anchor_weight=svx_anchor_weight,
+                svx_cached_embedding_dim=svx_cached_embedding_dim,
+                svx_normalize_embeddings=svx_normalize_embeddings,
+                svx_attention_temperature=svx_attention_temperature,
+                svx_attention_entropy_weight=svx_attention_entropy_weight,
+                svx_query_diversity_weight=svx_query_diversity_weight,
+                svx_random_state=svx_random_state,
             )
             self.effect_head = None
             logger.info("  R-learner representation training: ENABLED (staged separate nets)")
@@ -763,6 +834,11 @@ class CausalTextForest(nn.Module):
             return extractor.compute_anchor_loss()
         return torch.tensor(0.0, device=self._device)
 
+    def _extractor_regularization_losses(self, extractor: nn.Module) -> Dict[str, torch.Tensor]:
+        if hasattr(extractor, "compute_regularization_losses"):
+            return extractor.compute_regularization_losses()
+        return {}
+
     def train_representation_step(
         self,
         batch: Dict[str, Any],
@@ -845,16 +921,27 @@ class CausalTextForest(nn.Module):
         total_loss = outcome_loss + alpha_propensity * propensity_loss
         anchor_loss = self._extractor_anchor_loss(self.feature_extractor)
         total_loss = total_loss + anchor_loss
+        regularization_losses = self._extractor_regularization_losses(self.feature_extractor)
+        regularization_loss = (
+            sum(regularization_losses.values())
+            if regularization_losses
+            else torch.tensor(0.0, device=self._device)
+        )
+        total_loss = total_loss + regularization_loss
 
-        return {
+        result = {
             'loss': total_loss,
             'outcome_loss': outcome_loss.detach(),
             'propensity_loss': propensity_loss.detach(),
             'anchor_loss': anchor_loss.detach(),
+            'regularization_loss': regularization_loss.detach(),
             'propensity_logit': propensity_logit.detach(),
             'outcome_logit': outcome_logit.detach(),
             'w_hidden': w_hidden.detach(),
         }
+        for name, value in regularization_losses.items():
+            result[name] = value.detach()
+        return result
 
     def train_effect_r_step(
         self,
@@ -862,6 +949,7 @@ class CausalTextForest(nn.Module):
         e_hat: torch.Tensor,
         m_hat: torch.Tensor,
         gamma_rlearner: float = 1.0,
+        e_clip: float = 0.01,
     ) -> Dict[str, torch.Tensor]:
         """Train tau(X) from fixed nuisance predictions using the R-loss."""
         texts = batch['texts']
@@ -874,21 +962,33 @@ class CausalTextForest(nn.Module):
         effect_text_features = extractor(extractor_input)
         x_hidden, tau = self._effect_forward(effect_text_features, explicit_feature_values)
 
-        e_hat = e_hat.to(self._device).float().clamp(0.01, 0.99)
+        e_clip = float(e_clip)
+        e_hat = e_hat.to(self._device).float().clamp(e_clip, 1.0 - e_clip)
         m_hat = m_hat.to(self._device).float()
         y_residual = outcomes - m_hat
         t_residual = treatments - e_hat
         r_loss = ((y_residual - tau.squeeze(-1) * t_residual) ** 2).mean()
         anchor_loss = self._extractor_anchor_loss(extractor)
         total_loss = gamma_rlearner * r_loss + anchor_loss
+        regularization_losses = self._extractor_regularization_losses(extractor)
+        regularization_loss = (
+            sum(regularization_losses.values())
+            if regularization_losses
+            else torch.tensor(0.0, device=self._device)
+        )
+        total_loss = total_loss + regularization_loss
 
-        return {
+        result = {
             'loss': total_loss,
             'r_loss': r_loss.detach(),
             'anchor_loss': anchor_loss.detach(),
+            'regularization_loss': regularization_loss.detach(),
             'tau': tau.detach(),
             'x_hidden': x_hidden.detach(),
         }
+        for name, value in regularization_losses.items():
+            result[name] = value.detach()
+        return result
 
     def predict_nuisance(
         self,

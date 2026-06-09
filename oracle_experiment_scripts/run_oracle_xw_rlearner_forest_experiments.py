@@ -119,6 +119,10 @@ class XWRLearnerForestConfig:
     n_folds: int = 5
     rlearner_nuisance_folds: int = 5
     gamma_rlearner: float = 1.0
+    rlearner_effect_batch_size: Optional[int] = None
+    rlearner_effect_accumulation_steps: int = 1
+    rlearner_effect_e_clip: float = 0.01
+    rlearner_effect_grad_clip: float = 1.0
 
     # Optional matched-contrastive X-stage replacement for per-patient R-loss.
     contrastive_effect_enabled: bool = False
@@ -220,6 +224,27 @@ class XWRLearnerForestConfig:
     ctcnn_normalize_embeddings: bool = True
     ctcnn_random_state: int = 42
 
+    # Slot-value discovery hyperparameters.
+    svx_sentence_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    svx_chunk_size_words: int = 64
+    svx_chunk_overlap_words: int = 16
+    svx_max_chunks: int = 128
+    svx_confounder_concepts: List[str] = field(default_factory=list)
+    svx_effect_modifier_concepts: List[str] = field(default_factory=list)
+    svx_num_free_slots: int = 16
+    svx_slot_dim: int = 128
+    svx_num_value_prototypes: int = 4
+    svx_dropout: float = 0.1
+    svx_anchor_weight: float = 0.01
+    svx_cache_chunk_embeddings: bool = False
+    svx_cached_embedding_dim: int = 0
+    svx_normalize_embeddings: bool = True
+    svx_attention_temperature: float = 0.1
+    svx_attention_entropy_weight: float = 0.0
+    svx_query_diversity_weight: float = 0.0
+    svx_gate_l1_weight: float = 0.0
+    svx_random_state: int = 42
+
     _EXTRACTOR_PREFIXES = {
         "frozen_llm_pooler": {"flp_"},
         "hierarchical_llm": {"hlm_"},
@@ -228,6 +253,7 @@ class XWRLearnerForestConfig:
         "simple_cnn": {"scnn_"},
         "concept_embedding_cnn": {"cecnn_"},
         "concept_token_cnn": {"ctcnn_"},
+        "slot_value_discovery": {"svx_"},
     }
     _ALL_EXTRACTOR_PREFIXES = set().union(*_EXTRACTOR_PREFIXES.values())
 
@@ -675,6 +701,144 @@ def _train_nuisance_stage(
         model.to(device)
 
 
+def _loader_worker_kwargs(source_loader: DataLoader) -> Dict[str, Any]:
+    """Reuse DataLoader worker settings without copying sampler/batch settings."""
+    loader_kwargs: Dict[str, Any] = {}
+    if getattr(source_loader, "num_workers", 0) > 0:
+        loader_kwargs["num_workers"] = source_loader.num_workers
+        loader_kwargs["persistent_workers"] = getattr(
+            source_loader, "persistent_workers", False
+        )
+        loader_kwargs["pin_memory"] = getattr(source_loader, "pin_memory", False)
+        prefetch_factor = getattr(source_loader, "prefetch_factor", None)
+        if prefetch_factor is not None:
+            loader_kwargs["prefetch_factor"] = prefetch_factor
+    return loader_kwargs
+
+
+def _make_effect_loader(
+    train_loader: DataLoader,
+    config: XWRLearnerForestConfig,
+) -> Tuple[DataLoader, int]:
+    """Build the canonical R-loss effect DataLoader."""
+    effect_batch_size = config.rlearner_effect_batch_size or config.batch_size
+    if effect_batch_size < 1:
+        raise ValueError("rlearner_effect_batch_size must be >= 1 when set")
+    if effect_batch_size == config.batch_size:
+        return train_loader, effect_batch_size
+    return (
+        DataLoader(
+            train_loader.dataset,
+            batch_size=effect_batch_size,
+            shuffle=True,
+            collate_fn=train_loader.collate_fn,
+            **_loader_worker_kwargs(train_loader),
+        ),
+        effect_batch_size,
+    )
+
+
+def _binary_cross_entropy_np(pred: np.ndarray, target: np.ndarray) -> float:
+    pred = np.asarray(pred, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    pred = np.clip(pred, 1e-6, 1.0 - 1e-6)
+    return float(np.mean(-(target * np.log(pred) + (1.0 - target) * np.log(1.0 - pred))))
+
+
+def _nuisance_oof_summary(
+    propensity: np.ndarray,
+    outcome: np.ndarray,
+    treatment: np.ndarray,
+    observed_outcome: np.ndarray,
+) -> Dict[str, float]:
+    return {
+        "propensity_bce": _binary_cross_entropy_np(propensity, treatment),
+        "outcome_bce": _binary_cross_entropy_np(outcome, observed_outcome),
+        "propensity_mean": float(np.mean(propensity)),
+        "outcome_mean": float(np.mean(outcome)),
+    }
+
+
+def _is_high_pdl1_value(value: Any) -> bool:
+    if pd.isna(value):
+        return False
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        value_float = float(value)
+        return value_float >= (0.5 if value_float <= 1.0 else 50.0)
+    text = str(value).strip().lower()
+    text = (
+        text.replace("\u2265", ">=")
+        .replace("\u2011", "-")
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+    )
+    if not text or text in {"nan", "none", "unknown"}:
+        return False
+    if text.startswith("<") or "1-49" in text or "low" in text:
+        return False
+    return ">=50" in text or ">50" in text or "50%" in text or text == "50"
+
+
+def _high_pdl1_mask_from_dataset(dataset) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    data = getattr(dataset, "data", None)
+    if data is None or not hasattr(data, "columns"):
+        return None, None
+    preferred = [
+        "true_pdl1_expression",
+        "explicit_feat_pdl1_expression",
+        "llm_extracted_pdl1_expression",
+    ]
+    pdl1_columns = [
+        col for col in preferred if col in data.columns
+    ] or [
+        col for col in data.columns
+        if "pdl1" in col.lower() or "pd_l1" in col.lower() or "pd-l1" in col.lower()
+    ]
+    if not pdl1_columns:
+        return None, None
+    column = pdl1_columns[0]
+    return data[column].map(_is_high_pdl1_value).to_numpy(dtype=bool), column
+
+
+def _summarize_pdl1_cell_counts(counts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not counts:
+        return {}
+    min_counts = [
+        min(
+            item["high_treated"],
+            item["high_control"],
+            item["low_treated"],
+            item["low_control"],
+        )
+        for item in counts
+    ]
+    return {
+        "num_batches": len(counts),
+        "num_batches_all_cells_present": int(
+            sum(1 for item in counts if item["all_cells_present"])
+        ),
+        "fraction_batches_all_cells_present": float(
+            np.mean([item["all_cells_present"] for item in counts])
+        ),
+        "mean_min_cell_count": float(np.mean(min_counts)),
+    }
+
+
+def _slot_extractor_summary(extractor) -> Dict[str, Any]:
+    if extractor is None or not hasattr(extractor, "get_state"):
+        return {}
+    state = extractor.get_state()
+    keys = [
+        "extractor_type",
+        "num_seed_slots",
+        "num_free_slots",
+        "num_slots",
+        "slot_dim",
+        "output_dim",
+    ]
+    return {key: state[key] for key in keys if key in state}
+
+
 def _train_effect_stage(
     model: CausalTextForest,
     train_loader: DataLoader,
@@ -684,15 +848,20 @@ def _train_effect_stage(
     device: torch.device,
     use_cached: bool,
     gpu_store,
-) -> None:
+) -> Dict[str, Any]:
     """Train tau(X) from fixed outer-train OOF nuisance predictions."""
+    accumulation_steps = max(1, int(config.rlearner_effect_accumulation_steps or 1))
+    if not (0.0 < float(config.rlearner_effect_e_clip) < 0.5):
+        raise ValueError("rlearner_effect_e_clip must be in (0, 0.5)")
+
     use_contrastive = (
         config.contrastive_effect_enabled
         and hasattr(model, "train_effect_contrastive_step")
     )
-    effect_loader = train_loader
+    effect_loader, physical_batch_size = _make_effect_loader(train_loader, config)
     propensity_bin_ids = None
     if use_contrastive:
+        physical_batch_size = config.contrastive_batch_size
         dataset_treatment = train_loader.dataset.treatments
         if hasattr(dataset_treatment, "detach"):
             dataset_treatment = dataset_treatment.detach().cpu().numpy()
@@ -713,16 +882,11 @@ def _train_effect_stage(
             min_arm_per_bin=config.contrastive_min_arm_per_bin,
             seed=42 + config.repeat_index,
         )
-        loader_kwargs = {}
-        if getattr(train_loader, "num_workers", 0) > 0:
-            loader_kwargs["num_workers"] = train_loader.num_workers
-            loader_kwargs["persistent_workers"] = getattr(train_loader, "persistent_workers", False)
-            loader_kwargs["pin_memory"] = getattr(train_loader, "pin_memory", False)
         effect_loader = DataLoader(
             train_loader.dataset,
             batch_sampler=sampler,
             collate_fn=train_loader.collate_fn,
-            **loader_kwargs,
+            **_loader_worker_kwargs(train_loader),
         )
         logger.info(
             "Contrastive effect bins: %d bins, %d/%d samples in overlap",
@@ -735,9 +899,18 @@ def _train_effect_stage(
     optimizer = torch.optim.AdamW(params, lr=config.learning_rate, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
 
-    for _epoch in range(config.epochs):
+    pdl1_high_mask, pdl1_column = _high_pdl1_mask_from_dataset(train_loader.dataset)
+    epoch_history: List[Dict[str, Any]] = []
+    pdl1_cell_counts: List[Dict[str, Any]] = []
+    optimizer_steps = 0
+
+    optimizer.zero_grad(set_to_none=True)
+    for epoch in range(config.epochs):
         model.train()
-        for batch in effect_loader:
+        epoch_r_losses: List[float] = []
+        epoch_losses: List[float] = []
+        pending_accumulation = 0
+        for batch_index, batch in enumerate(effect_loader, start=1):
             batch["treatment"] = batch["treatment"].to(device)
             batch["outcome"] = batch["outcome"].to(device)
             if use_cached:
@@ -755,7 +928,6 @@ def _train_effect_stage(
                 device=device,
             )
 
-            optimizer.zero_grad()
             if use_contrastive:
                 bin_ids = torch.as_tensor(
                     propensity_bin_ids[batch_ids],
@@ -774,12 +946,78 @@ def _train_effect_stage(
                     e_hat=e_hat,
                     m_hat=m_hat,
                     gamma_rlearner=config.gamma_rlearner,
+                    e_clip=config.rlearner_effect_e_clip,
                 )
-            losses["loss"].backward()
-            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            (losses["loss"] / accumulation_steps).backward()
+            pending_accumulation += 1
+
+            epoch_losses.append(float(losses["loss"].detach().cpu()))
+            if "r_loss" in losses:
+                epoch_r_losses.append(float(losses["r_loss"].detach().cpu()))
+
+            if pdl1_high_mask is not None:
+                high = pdl1_high_mask[batch_ids]
+                treatment = batch["treatment"].detach().cpu().numpy() > 0.5
+                count = {
+                    "epoch": epoch + 1,
+                    "batch": batch_index,
+                    "high_treated": int(np.sum(high & treatment)),
+                    "high_control": int(np.sum(high & ~treatment)),
+                    "low_treated": int(np.sum(~high & treatment)),
+                    "low_control": int(np.sum(~high & ~treatment)),
+                }
+                count["all_cells_present"] = all(
+                    count[key] > 0
+                    for key in (
+                        "high_treated",
+                        "high_control",
+                        "low_treated",
+                        "low_control",
+                    )
+                )
+                pdl1_cell_counts.append(count)
+
+            if pending_accumulation >= accumulation_steps:
+                torch.nn.utils.clip_grad_norm_(params, config.rlearner_effect_grad_clip)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                optimizer_steps += 1
+                pending_accumulation = 0
+
+        if pending_accumulation > 0:
+            torch.nn.utils.clip_grad_norm_(params, config.rlearner_effect_grad_clip)
             optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            optimizer_steps += 1
+
+        epoch_history.append(
+            {
+                "epoch": epoch + 1,
+                "mean_loss": float(np.mean(epoch_losses)) if epoch_losses else float("nan"),
+                "mean_r_loss": float(np.mean(epoch_r_losses)) if epoch_r_losses else float("nan"),
+                "num_batches": len(epoch_losses),
+            }
+        )
 
         scheduler.step()
+
+    effective_batch_size = physical_batch_size * accumulation_steps
+    return {
+        "effect_physical_batch_size": int(physical_batch_size),
+        "effect_accumulation_steps": int(accumulation_steps),
+        "effect_effective_batch_size": int(effective_batch_size),
+        "effect_optimizer_steps": int(optimizer_steps),
+        "effect_r_loss_history": epoch_history,
+        "effect_pdl1_column": pdl1_column,
+        "effect_pdl1_cell_counts": pdl1_cell_counts,
+        "effect_pdl1_cell_summary": _summarize_pdl1_cell_counts(pdl1_cell_counts),
+        "nuisance_extractor": _slot_extractor_summary(
+            getattr(model, "feature_extractor", None)
+        ),
+        "effect_extractor": _slot_extractor_summary(
+            getattr(model, "effect_feature_extractor", None)
+        ),
+    }
 
 
 def run_xw_rlearner_forest_experiment(
@@ -798,6 +1036,7 @@ def run_xw_rlearner_forest_experiment(
     kf = KFold(n_splits=config.n_folds, shuffle=True, random_state=42 + config.repeat_index)
 
     all_predictions = []
+    diagnostics: Dict[str, Any] = {"folds": []}
     use_cached = gpu_store is not None or hidden_state_cache is not None
 
     for fold, (train_idx, test_idx) in enumerate(kf.split(df)):
@@ -872,6 +1111,12 @@ def run_xw_rlearner_forest_experiment(
 
         if np.isnan(oof_propensity).any() or np.isnan(oof_outcome).any():
             raise RuntimeError("Incomplete out-of-fold nuisance predictions")
+        nuisance_summary = _nuisance_oof_summary(
+            propensity=oof_propensity,
+            outcome=oof_outcome,
+            treatment=train_df["treatment_indicator"].values,
+            observed_outcome=train_df["outcome_indicator"].values,
+        )
 
         model = _make_xw_model(
             config,
@@ -910,7 +1155,7 @@ def run_xw_rlearner_forest_experiment(
             use_cached,
             gpu_store,
         )
-        _train_effect_stage(
+        effect_diagnostics = _train_effect_stage(
             model,
             train_loader,
             oof_propensity,
@@ -919,6 +1164,15 @@ def run_xw_rlearner_forest_experiment(
             device,
             use_cached,
             gpu_store,
+        )
+        diagnostics["folds"].append(
+            {
+                "fold": fold + 1,
+                "n_train": int(len(train_df)),
+                "n_test": int(len(test_df)),
+                "nuisance_oof": nuisance_summary,
+                "effect_stage": effect_diagnostics,
+            }
         )
 
         train_eval_loader = _make_combined_loader(
@@ -978,7 +1232,11 @@ def run_xw_rlearner_forest_experiment(
             else None
         ),
     )
-    return {"metrics": metrics, "n_samples": len(results_df)}
+    return {
+        "metrics": metrics,
+        "n_samples": len(results_df),
+        "diagnostics": diagnostics,
+    }
 
 
 def run_single_experiment(
@@ -1059,6 +1317,7 @@ def run_single_experiment(
         "config": asdict(config),
         "metrics": result["metrics"],
         "n_samples": result["n_samples"],
+        "diagnostics": result.get("diagnostics", {}),
         "skipped": False,
         "error": None,
     }
@@ -1073,6 +1332,10 @@ def generate_experiment_grid(
     learning_rates: Optional[List[float]] = None,
     epoch_counts: Optional[List[int]] = None,
     include_explicit_feature_options: Optional[List[bool]] = None,
+    rlearner_effect_batch_size: Optional[int] = None,
+    rlearner_effect_accumulation_steps: int = 1,
+    rlearner_effect_e_clip: float = 0.01,
+    rlearner_effect_grad_clip: float = 1.0,
     contrastive_effect_enabled: bool = False,
     contrastive_bottleneck_dim: int = 8,
     contrastive_hidden_dim: int = 64,
@@ -1261,6 +1524,10 @@ def generate_experiment_grid(
 
     for cfg in configs:
         cfg.contrastive_effect_enabled = contrastive_effect_enabled
+        cfg.rlearner_effect_batch_size = rlearner_effect_batch_size
+        cfg.rlearner_effect_accumulation_steps = rlearner_effect_accumulation_steps
+        cfg.rlearner_effect_e_clip = rlearner_effect_e_clip
+        cfg.rlearner_effect_grad_clip = rlearner_effect_grad_clip
         cfg.contrastive_bottleneck_dim = contrastive_bottleneck_dim
         cfg.contrastive_hidden_dim = contrastive_hidden_dim
         cfg.contrastive_batch_size = contrastive_batch_size
@@ -1483,6 +1750,12 @@ def print_grid_summary(
     epoch_values = sorted(set(config.epochs for config in pending_configs))
     explicit_values = sorted(set(config.use_explicit_features for config in pending_configs))
     contrastive_values = sorted(set(config.contrastive_effect_enabled for config in pending_configs))
+    effect_batch_values = sorted(
+        set(config.rlearner_effect_batch_size or config.batch_size for config in pending_configs)
+    )
+    accumulation_values = sorted(
+        set(config.rlearner_effect_accumulation_steps for config in pending_configs)
+    )
 
     print(f"\n{'=' * 60}")
     print("X/W R-Learner -> Causal Forest Grid Summary")
@@ -1495,6 +1768,8 @@ def print_grid_summary(
     print("Model path: causal_forest with cf_use_rlearner_representation=True")
     print("X/W split: enabled")
     print(f"Contrastive X stage: {', '.join(str(v) for v in contrastive_values)}")
+    print(f"Effect physical batch sizes: {', '.join(str(v) for v in effect_batch_values)}")
+    print(f"Effect accumulation steps: {', '.join(str(v) for v in accumulation_values)}")
     print("LLM hidden-state downprojection: disabled")
     print(f"Model types: {', '.join(f'{k}({v})' for k, v in sorted(model_type_summary.items()))}")
     print(f"Extractors:  {', '.join(f'{k}({v})' for k, v in sorted(extractor_summary.items()))}")
@@ -1674,6 +1949,30 @@ def main():
         help="Epoch-count grid",
     )
     parser.add_argument(
+        "--rlearner-effect-batch-size",
+        type=int,
+        default=None,
+        help="Physical batch size for the fixed-nuisance R-loss effect stage",
+    )
+    parser.add_argument(
+        "--rlearner-effect-accumulation-steps",
+        type=int,
+        default=1,
+        help="Gradient accumulation steps for the fixed-nuisance R-loss effect stage",
+    )
+    parser.add_argument(
+        "--rlearner-effect-e-clip",
+        type=float,
+        default=0.01,
+        help="Propensity clipping value for fixed-nuisance R-loss",
+    )
+    parser.add_argument(
+        "--rlearner-effect-grad-clip",
+        type=float,
+        default=1.0,
+        help="Gradient clipping norm for the fixed-nuisance R-loss effect stage",
+    )
+    parser.add_argument(
         "--explicit-feature-options",
         type=str,
         nargs="+",
@@ -1730,6 +2029,10 @@ def main():
         learning_rates=args.learning_rates,
         epoch_counts=args.epoch_counts,
         include_explicit_feature_options=explicit_feature_options,
+        rlearner_effect_batch_size=args.rlearner_effect_batch_size,
+        rlearner_effect_accumulation_steps=args.rlearner_effect_accumulation_steps,
+        rlearner_effect_e_clip=args.rlearner_effect_e_clip,
+        rlearner_effect_grad_clip=args.rlearner_effect_grad_clip,
         contrastive_effect_enabled=args.contrastive_effect,
         contrastive_bottleneck_dim=args.contrastive_bottleneck_dim,
         contrastive_hidden_dim=args.contrastive_hidden_dim,
