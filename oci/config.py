@@ -399,6 +399,12 @@ EXTRACTOR_ALIASES = {
         "cecnn",
         "concept_embeddings",
     },
+    "concept_token_cnn": {
+        "concept_token_cnn",
+        "concept_token_embeddings",
+        "token_concept_cnn",
+        "ctcnn",
+    },
 }
 
 VALID_EXTRACTOR_TYPES = set(EXTRACTOR_ALIASES.keys())
@@ -407,7 +413,11 @@ VALID_EXTRACTOR_TYPES = set(EXTRACTOR_ALIASES.keys())
 TRAINABLE_EXTRACTOR_TYPES = {"hierarchical_cnn", "hierarchical_gru", "simple_cnn"}
 
 # Extractors that support hidden state caching
-CACHEABLE_EXTRACTOR_TYPES = {"frozen_llm_pooler", "hierarchical_llm"}
+CACHEABLE_EXTRACTOR_TYPES = {
+    "frozen_llm_pooler",
+    "hierarchical_llm",
+    "concept_token_cnn",
+}
 
 
 def normalize_feature_extractor_type(feature_type: str) -> str:
@@ -512,6 +522,25 @@ class ModelArchitectureConfig:
     scnn_gated_attention_dim: int = 128
     scnn_projection_dim: int = 128
     scnn_dropout: float = 0.1
+
+    # Concept token CNN extractor (cached token-level LLM hidden states + concept kernels)
+    ctcnn_model_name: str = "Qwen/Qwen3-0.6B-Base"
+    ctcnn_chunk_size: int = 2048
+    ctcnn_chunk_overlap: int = 256
+    ctcnn_max_chunks: int = 16
+    ctcnn_confounder_concepts: List[str] = field(default_factory=list)
+    ctcnn_effect_modifier_concepts: List[str] = field(default_factory=list)
+    ctcnn_random_features: int = 0
+    ctcnn_random_confounder_features: Optional[int] = None
+    ctcnn_random_modifier_features: Optional[int] = None
+    ctcnn_projection_dim: int = 128
+    ctcnn_dropout: float = 0.1
+    ctcnn_anchor_weight: float = 0.01
+    ctcnn_cache_hidden_states: bool = False
+    ctcnn_cached_hidden_size: int = 0
+    ctcnn_downprojection_dim: Optional[int] = None
+    ctcnn_normalize_embeddings: bool = True
+    ctcnn_random_state: int = 42
 
     # Causal head dimensions (applies to all causal heads: DragonNet, RLearner, etc.)
     causal_head_representation_dim: int = 128

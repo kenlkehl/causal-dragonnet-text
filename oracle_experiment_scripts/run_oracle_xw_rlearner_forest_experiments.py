@@ -201,6 +201,25 @@ class XWRLearnerForestConfig:
     cecnn_normalize_embeddings: bool = True
     cecnn_random_state: int = 42
 
+    # Concept token CNN hyperparameters.
+    ctcnn_model_name: str = "Qwen/Qwen3-0.6B-Base"
+    ctcnn_chunk_size: int = 2048
+    ctcnn_chunk_overlap: int = 256
+    ctcnn_max_chunks: int = 16
+    ctcnn_confounder_concepts: List[str] = field(default_factory=list)
+    ctcnn_effect_modifier_concepts: List[str] = field(default_factory=list)
+    ctcnn_random_features: int = 0
+    ctcnn_random_confounder_features: Optional[int] = None
+    ctcnn_random_modifier_features: Optional[int] = None
+    ctcnn_projection_dim: int = 128
+    ctcnn_dropout: float = 0.1
+    ctcnn_anchor_weight: float = 0.01
+    ctcnn_cache_hidden_states: bool = False
+    ctcnn_cached_hidden_size: int = 0
+    ctcnn_downprojection_dim: Optional[int] = None
+    ctcnn_normalize_embeddings: bool = True
+    ctcnn_random_state: int = 42
+
     _EXTRACTOR_PREFIXES = {
         "frozen_llm_pooler": {"flp_"},
         "hierarchical_llm": {"hlm_"},
@@ -208,6 +227,7 @@ class XWRLearnerForestConfig:
         "hierarchical_gru": {"hgru_"},
         "simple_cnn": {"scnn_"},
         "concept_embedding_cnn": {"cecnn_"},
+        "concept_token_cnn": {"ctcnn_"},
     }
     _ALL_EXTRACTOR_PREFIXES = set().union(*_EXTRACTOR_PREFIXES.values())
 
@@ -1453,6 +1473,10 @@ def print_grid_summary(
             llm_model_summary[config.hlm_model_name] = (
                 llm_model_summary.get(config.hlm_model_name, 0) + 1
             )
+        elif config.feature_extractor_type == "concept_token_cnn":
+            llm_model_summary[config.ctcnn_model_name] = (
+                llm_model_summary.get(config.ctcnn_model_name, 0) + 1
+            )
 
     dataset_names = sorted(set(config.dataset_name for config in pending_configs))
     lr_values = sorted(set(config.learning_rate for config in pending_configs))
@@ -1731,6 +1755,7 @@ def main():
             config.n_folds = args.n_folds
             config.flp_cache_hidden_states = use_cache
             config.hlm_cache_hidden_states = use_cache
+            config.ctcnn_cache_hidden_states = use_cache
             config.flp_downprojection_dim = None
             config.hlm_downprojection_dim = None
             config.use_explicit_confounders = config.use_explicit_features

@@ -95,6 +95,24 @@ def create_feature_extractor(
     cecnn_cached_embedding_dim: int = 0,
     cecnn_normalize_embeddings: bool = True,
     cecnn_random_state: int = 42,
+    # Concept token CNN args
+    ctcnn_model_name: str = "Qwen/Qwen3-0.6B-Base",
+    ctcnn_chunk_size: int = 2048,
+    ctcnn_chunk_overlap: int = 256,
+    ctcnn_max_chunks: int = 16,
+    ctcnn_confounder_concepts: Optional[List[str]] = None,
+    ctcnn_effect_modifier_concepts: Optional[List[str]] = None,
+    ctcnn_random_features: int = 0,
+    ctcnn_random_confounder_features: Optional[int] = None,
+    ctcnn_random_modifier_features: Optional[int] = None,
+    ctcnn_kernel_role: str = "combined",
+    ctcnn_projection_dim: int = 128,
+    ctcnn_dropout: float = 0.1,
+    ctcnn_anchor_weight: float = 0.01,
+    ctcnn_cached_hidden_size: int = 0,
+    ctcnn_downprojection_dim: Optional[int] = None,
+    ctcnn_normalize_embeddings: bool = True,
+    ctcnn_random_state: int = 42,
     # Model type
     model_type: str = "dragonnet",
 ) -> nn.Module:
@@ -251,6 +269,39 @@ def create_feature_extractor(
         )
         return extractor
 
+    elif normalized_type == "concept_token_cnn":
+        from .concept_token_cnn_extractor import ConceptTokenCNNExtractor
+        extractor = ConceptTokenCNNExtractor(
+            model_name=ctcnn_model_name,
+            chunk_size=ctcnn_chunk_size,
+            chunk_overlap=ctcnn_chunk_overlap,
+            max_chunks=ctcnn_max_chunks,
+            confounder_concepts=ctcnn_confounder_concepts or [],
+            effect_modifier_concepts=ctcnn_effect_modifier_concepts or [],
+            random_features=ctcnn_random_features,
+            random_confounder_features=ctcnn_random_confounder_features,
+            random_modifier_features=ctcnn_random_modifier_features,
+            kernel_role=ctcnn_kernel_role,
+            projection_dim=ctcnn_projection_dim,
+            dropout=ctcnn_dropout,
+            anchor_weight=ctcnn_anchor_weight,
+            cached_hidden_size=ctcnn_cached_hidden_size,
+            downprojection_dim=ctcnn_downprojection_dim,
+            normalize_embeddings=ctcnn_normalize_embeddings,
+            random_state=ctcnn_random_state,
+            device=device,
+        )
+        logger.info(
+            "Created Concept Token CNN extractor: role=%s, chunks=%d/%d/%d, "
+            "projection_dim=%d",
+            ctcnn_kernel_role,
+            ctcnn_chunk_size,
+            ctcnn_chunk_overlap,
+            ctcnn_max_chunks,
+            ctcnn_projection_dim,
+        )
+        return extractor
+
     else:
         from ..config import VALID_EXTRACTOR_TYPES
         raise ValueError(
@@ -362,4 +413,26 @@ def create_feature_extractor_from_config(
         cecnn_cached_embedding_dim=config.get('cecnn_cached_embedding_dim', 0),
         cecnn_normalize_embeddings=config.get('cecnn_normalize_embeddings', True),
         cecnn_random_state=config.get('cecnn_random_state', 42),
+        # Concept token CNN args
+        ctcnn_model_name=config.get('ctcnn_model_name', 'Qwen/Qwen3-0.6B-Base'),
+        ctcnn_chunk_size=config.get('ctcnn_chunk_size', 2048),
+        ctcnn_chunk_overlap=config.get('ctcnn_chunk_overlap', 256),
+        ctcnn_max_chunks=config.get('ctcnn_max_chunks', 16),
+        ctcnn_confounder_concepts=config.get('ctcnn_confounder_concepts', []),
+        ctcnn_effect_modifier_concepts=config.get('ctcnn_effect_modifier_concepts', []),
+        ctcnn_random_features=config.get('ctcnn_random_features', 0),
+        ctcnn_random_confounder_features=config.get(
+            'ctcnn_random_confounder_features', None
+        ),
+        ctcnn_random_modifier_features=config.get(
+            'ctcnn_random_modifier_features', None
+        ),
+        ctcnn_kernel_role=config.get('ctcnn_kernel_role', 'combined'),
+        ctcnn_projection_dim=config.get('ctcnn_projection_dim', 128),
+        ctcnn_dropout=config.get('ctcnn_dropout', 0.1),
+        ctcnn_anchor_weight=config.get('ctcnn_anchor_weight', 0.01),
+        ctcnn_cached_hidden_size=config.get('ctcnn_cached_hidden_size', 0),
+        ctcnn_downprojection_dim=config.get('ctcnn_downprojection_dim', None),
+        ctcnn_normalize_embeddings=config.get('ctcnn_normalize_embeddings', True),
+        ctcnn_random_state=config.get('ctcnn_random_state', 42),
     )

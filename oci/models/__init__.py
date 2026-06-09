@@ -9,6 +9,7 @@ from .hierarchical_cnn_extractor import HierarchicalCNNExtractor
 from .hierarchical_gru_extractor import HierarchicalGRUExtractor
 from .simple_cnn_extractor import SimpleCNNExtractor
 from .concept_embedding_cnn_extractor import ConceptEmbeddingCNNExtractor
+from .concept_token_cnn_extractor import ConceptTokenCNNExtractor
 from .concept_embedding_cache import ConceptEmbeddingCache
 from .gated_attention_pooling import GatedAttentionPooling
 from .learned_tokenizer import LearnedTokenizer
@@ -43,6 +44,7 @@ __all__ = [
     'HierarchicalGRUExtractor',
     'SimpleCNNExtractor',
     'ConceptEmbeddingCNNExtractor',
+    'ConceptTokenCNNExtractor',
     'ConceptEmbeddingCache',
     'GatedAttentionPooling',
     'LearnedTokenizer',

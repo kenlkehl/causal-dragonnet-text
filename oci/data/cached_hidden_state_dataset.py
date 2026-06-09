@@ -168,7 +168,16 @@ def collate_cached_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         for i, item in enumerate(batch):
             l = lengths[i]
             hs[i, :l] = np.asarray(item['hidden_states'], dtype=np.float32)
-            mask[i, :l] = 1.0
+            if 'attention_mask' in item:
+                item_mask = np.asarray(item['attention_mask'], dtype=np.float32)
+                if item_mask.shape[0] != l:
+                    raise ValueError(
+                        "Cached attention mask length does not match hidden "
+                        f"state length: {item_mask.shape[0]} != {l}"
+                    )
+                mask[i, :l] = item_mask
+            else:
+                mask[i, :l] = 1.0
         result['cached_hidden_states'] = torch.from_numpy(hs).float()  # enforce float32
         result['cached_attention_mask'] = torch.from_numpy(mask)
     elif 'cache_index' in batch[0]:

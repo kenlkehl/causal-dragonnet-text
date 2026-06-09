@@ -1488,8 +1488,9 @@ class HiddenStateCache:
         if self._hs_mmap is None:
             self.open()
 
-        # Gather variable-length sequences
+        # Gather variable-length sequences and their explicit masks when present.
         sequences = [self._hs_mmap[i] for i in indices]
+        masks = [self._mask_mmap[i] for i in indices]
         lengths = [seq.shape[0] for seq in sequences]
         max_len = max(lengths)
         hidden_size = sequences[0].shape[-1]
@@ -1497,9 +1498,14 @@ class HiddenStateCache:
         # Pad to batch max
         hs = np.zeros((len(indices), max_len, hidden_size), dtype=np.float16)
         mask = np.zeros((len(indices), max_len), dtype=np.float32)
-        for i, (seq, length) in enumerate(zip(sequences, lengths)):
+        for i, (seq, seq_mask, length) in enumerate(zip(sequences, masks, lengths)):
             hs[i, :length] = seq
-            mask[i, :length] = 1.0
+            if seq_mask.shape[0] != length:
+                raise ValueError(
+                    "Cached attention mask length does not match hidden state "
+                    f"length: {seq_mask.shape[0]} != {length}"
+                )
+            mask[i, :length] = np.asarray(seq_mask, dtype=np.float32)
 
         # Transfer float16 to GPU, then cast to float32 on GPU
         hs_tensor = torch.from_numpy(hs).to(device).float()

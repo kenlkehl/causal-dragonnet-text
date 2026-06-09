@@ -261,6 +261,25 @@ class ExperimentConfig:
     cecnn_normalize_embeddings: bool = True
     cecnn_random_state: int = 42
 
+    # Concept token CNN hyperparameters
+    ctcnn_model_name: str = "Qwen/Qwen3-0.6B-Base"
+    ctcnn_chunk_size: int = 2048
+    ctcnn_chunk_overlap: int = 256
+    ctcnn_max_chunks: int = 16
+    ctcnn_confounder_concepts: List[str] = field(default_factory=list)
+    ctcnn_effect_modifier_concepts: List[str] = field(default_factory=list)
+    ctcnn_random_features: int = 0
+    ctcnn_random_confounder_features: Optional[int] = None
+    ctcnn_random_modifier_features: Optional[int] = None
+    ctcnn_projection_dim: int = 128
+    ctcnn_dropout: float = 0.1
+    ctcnn_anchor_weight: float = 0.01
+    ctcnn_cache_hidden_states: bool = False
+    ctcnn_cached_hidden_size: int = 0
+    ctcnn_downprojection_dim: Optional[int] = None
+    ctcnn_normalize_embeddings: bool = True
+    ctcnn_random_state: int = 42
+
     # Extractor-specific field prefixes -- used by config_hash() to exclude
     # parameters that belong to *other* extractors so adding a new extractor
     # type never invalidates existing result hashes.
@@ -271,6 +290,7 @@ class ExperimentConfig:
         "hierarchical_gru": {"hgru_"},
         "simple_cnn": {"scnn_"},
         "concept_embedding_cnn": {"cecnn_"},
+        "concept_token_cnn": {"ctcnn_"},
     }
     _ALL_EXTRACTOR_PREFIXES = set().union(*_EXTRACTOR_PREFIXES.values())
     _AGENTIC_PREFIX = "agentic_"
@@ -592,15 +612,25 @@ def group_configs_by_cache_key(
             _max_length = config.hlm_chunk_size * config.hlm_max_chunks
             _dp_dim = config.hlm_downprojection_dim
             _ctp = config.hlm_chat_template_prompt
+            _cs = config.hlm_chunk_size
+            _co = config.hlm_chunk_overlap
+            _mc = config.hlm_max_chunks
+        elif config.feature_extractor_type == "concept_token_cnn":
+            _model_name = config.ctcnn_model_name
+            _max_length = config.ctcnn_chunk_size * config.ctcnn_max_chunks
+            _dp_dim = config.ctcnn_downprojection_dim
+            _ctp = None
+            _cs = config.ctcnn_chunk_size
+            _co = config.ctcnn_chunk_overlap
+            _mc = config.ctcnn_max_chunks
         else:  # frozen_llm_pooler
             _model_name = config.flp_model_name
             _max_length = config.flp_max_length
             _dp_dim = config.flp_downprojection_dim
             _ctp = config.flp_chat_template_prompt
-
-        _cs = config.hlm_chunk_size if config.feature_extractor_type == "hierarchical_llm" else None
-        _co = config.hlm_chunk_overlap if config.feature_extractor_type == "hierarchical_llm" else None
-        _mc = config.hlm_max_chunks if config.feature_extractor_type == "hierarchical_llm" else None
+            _cs = None
+            _co = None
+            _mc = None
 
         cache_hash = HiddenStateCache.compute_cache_hash(
             _model_name, _max_length, str(parquet_file), None,
@@ -620,6 +650,7 @@ def group_configs_by_cache_key(
                 chunk_size=_cs,
                 chunk_overlap=_co,
                 max_chunks=_mc,
+                allow_gpu_store=config.feature_extractor_type != "concept_token_cnn",
             )
             groups[cache_hash] = (cache_info, [])
         groups[cache_hash][1].append(config)
@@ -881,6 +912,18 @@ def _get_cache_info(config, parquet_file, cache_registry, gpu_store_registry):
             gpu_store = gpu_store_registry.get(cache_hash)
         if gpu_store is None and cache_registry is not None:
             hidden_state_cache = cache_registry.get(cache_hash)
+    elif ext_type == "concept_token_cnn" and config.ctcnn_cache_hidden_states:
+        _max_length = config.ctcnn_chunk_size * config.ctcnn_max_chunks
+        cache_hash = HiddenStateCache.compute_cache_hash(
+            config.ctcnn_model_name, _max_length, str(parquet_file),
+            None, downprojection_dim=config.ctcnn_downprojection_dim,
+            chat_template_prompt=None,
+            chunk_size=config.ctcnn_chunk_size,
+            chunk_overlap=config.ctcnn_chunk_overlap,
+            max_chunks=config.ctcnn_max_chunks,
+        )
+        if cache_registry is not None:
+            hidden_state_cache = cache_registry.get(cache_hash)
 
     return gpu_store, hidden_state_cache
 
@@ -989,6 +1032,28 @@ def _common_model_kwargs(config, gpu_store, hidden_state_cache, confounder_specs
             ),
             cecnn_normalize_embeddings=config.cecnn_normalize_embeddings,
             cecnn_random_state=config.cecnn_random_state + config.repeat_index,
+        )
+    elif ext_type == "concept_token_cnn":
+        kwargs.update(
+            ctcnn_model_name=config.ctcnn_model_name,
+            ctcnn_chunk_size=config.ctcnn_chunk_size,
+            ctcnn_chunk_overlap=config.ctcnn_chunk_overlap,
+            ctcnn_max_chunks=config.ctcnn_max_chunks,
+            ctcnn_confounder_concepts=config.ctcnn_confounder_concepts,
+            ctcnn_effect_modifier_concepts=config.ctcnn_effect_modifier_concepts,
+            ctcnn_random_features=config.ctcnn_random_features,
+            ctcnn_random_confounder_features=config.ctcnn_random_confounder_features,
+            ctcnn_random_modifier_features=config.ctcnn_random_modifier_features,
+            ctcnn_projection_dim=config.ctcnn_projection_dim,
+            ctcnn_dropout=config.ctcnn_dropout,
+            ctcnn_anchor_weight=config.ctcnn_anchor_weight,
+            ctcnn_cached_hidden_size=(
+                hidden_state_cache.hidden_size if hidden_state_cache is not None
+                else config.ctcnn_cached_hidden_size
+            ),
+            ctcnn_downprojection_dim=config.ctcnn_downprojection_dim,
+            ctcnn_normalize_embeddings=config.ctcnn_normalize_embeddings,
+            ctcnn_random_state=config.ctcnn_random_state + config.repeat_index,
         )
 
     return kwargs
@@ -2496,7 +2561,7 @@ def worker_process_fn(
         cache = _open_cache_for_worker(cache_hash, cache_info, cache_base_dir=cache_base_dir)
         cache_registry[cache_hash] = cache
 
-        if use_gpu_cache:
+        if use_gpu_cache and cache_info.get('allow_gpu_store', True):
             store = load_single_gpu_store(cache, cache_info, device)
             if store is not None:
                 gpu_store_registry = {cache_hash: store}
@@ -3149,6 +3214,7 @@ def main():
             config.n_folds = args.n_folds
             config.flp_cache_hidden_states = use_cache
             config.hlm_cache_hidden_states = use_cache
+            config.ctcnn_cache_hidden_states = use_cache
             configs.append(config)
 
     # Re-shuffle with repeats included
@@ -3204,6 +3270,8 @@ def main():
             llm_model_summary[c.flp_model_name] = llm_model_summary.get(c.flp_model_name, 0) + 1
         elif c.feature_extractor_type in ('hierarchical_llm',):
             llm_model_summary[c.hlm_model_name] = llm_model_summary.get(c.hlm_model_name, 0) + 1
+        elif c.feature_extractor_type in ('concept_token_cnn',):
+            llm_model_summary[c.ctcnn_model_name] = llm_model_summary.get(c.ctcnn_model_name, 0) + 1
         elif c.model_type == "agentic_explicit_feature_forest":
             key = f"agent={c.agentic_agent_model_name}, extract={c.agentic_vllm_model_name}"
             agentic_model_summary[key] = agentic_model_summary.get(key, 0) + 1
