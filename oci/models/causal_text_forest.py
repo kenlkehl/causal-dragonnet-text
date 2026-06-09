@@ -589,7 +589,11 @@ class CausalTextForest(nn.Module):
             if 'sample_chunk_counts' in batch:
                 result['sample_chunk_counts'] = batch['sample_chunk_counts']
             return result
-        if 'chunk_input_ids' in batch or 'chunk_token_ids' in batch:
+        if (
+            'input_ids' in batch
+            or 'chunk_input_ids' in batch
+            or 'chunk_token_ids' in batch
+        ):
             return batch
         return texts
 

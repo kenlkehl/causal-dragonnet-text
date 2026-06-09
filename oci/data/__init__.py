@@ -11,6 +11,9 @@ from .dataset import (
 
 from .collators import (
     create_collator,
+    create_trainable_cnn_collator,
+    HierarchicalCNNTokenizingCollator,
+    SimpleCNNTokenizingCollator,
 )
 
 from .cached_hidden_state_dataset import (
@@ -25,6 +28,9 @@ __all__ = [
     'load_dataset',
     'validate_dataset',
     'create_collator',
+    'create_trainable_cnn_collator',
+    'HierarchicalCNNTokenizingCollator',
+    'SimpleCNNTokenizingCollator',
     'CachedHiddenStateDataset',
     'collate_cached_batch',
     'prepare_cached_batch',

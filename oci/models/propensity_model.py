@@ -297,7 +297,11 @@ class PropensityOnlyModel(nn.Module):
                 'cached_attention_mask': batch['cached_attention_mask'],
                 'texts': texts,
             }
-        if 'chunk_input_ids' in batch or 'chunk_token_ids' in batch:
+        if (
+            'input_ids' in batch
+            or 'chunk_input_ids' in batch
+            or 'chunk_token_ids' in batch
+        ):
             return batch
         return texts
 

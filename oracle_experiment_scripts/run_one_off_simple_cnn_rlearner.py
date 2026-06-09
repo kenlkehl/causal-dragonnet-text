@@ -6,30 +6,55 @@ common "just run one analysis" case. It reuses the oracle runner's training,
 cross-validation, metrics, result JSON, and aggregate output schema without
 constructing the full oracle grid.
 
+Cross-validation folds are independent, so they are distributed across the
+requested devices round-robin and trained concurrently. With 5 folds and 4 GPUs,
+for example, three GPUs each train one fold while the remaining folds double up so
+that all folds run at once. Pooled predictions and metrics are identical to a
+sequential single-device run (same KFold seed).
+
 Usage:
+    # Single device (folds run concurrently on that device)
     python oracle_experiment_scripts/run_one_off_simple_cnn_rlearner.py \
         --dataset synthetic_data/example_synthetic_datasets/one_confounder_one_effect_modifier_nsclc_with_structured \
         --output-dir ../pcori_experiments/simple_cnn_rlearner_oneoff \
         --device cuda:0 \
         --epochs 25 \
         --n-folds 5
+
+    # Multiple devices (folds parallelized across GPUs)
+    python oracle_experiment_scripts/run_one_off_simple_cnn_rlearner.py \
+        --dataset synthetic_data/example_synthetic_datasets/one_confounder_one_effect_modifier_nsclc_with_structured \
+        --output-dir ../pcori_experiments/simple_cnn_rlearner_oneoff \
+        --devices cuda:0 cuda:1 cuda:2 cuda:3 \
+        --epochs 25 \
+        --n-folds 5
 """
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import sys
 import traceback
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import pandas as pd
+import torch
+from sklearn.model_selection import KFold
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from run_oracle_experiments import ExperimentConfig, run_single_experiment
+from run_oracle_experiments import (
+    ExperimentConfig,
+    _rename_confounder_columns,
+    _resolve_parquet_file,
+    _run_neural_fold,
+    compute_metrics,
+    load_confounder_specs_from_metadata,
+)
 
 
 logging.basicConfig(
@@ -68,6 +93,123 @@ def build_config(args: argparse.Namespace) -> ExperimentConfig:
         scnn_projection_dim=args.scnn_projection_dim,
         scnn_dropout=args.scnn_dropout,
     )
+
+
+def run_parallel_fold_experiment(
+    config: ExperimentConfig,
+    devices: List[str],
+    max_parallel_folds: int = None,
+) -> Dict[str, Any]:
+    """Run the rlearner CV experiment with folds parallelized across devices.
+
+    Folds are independent, so each fold trains its own model on an assigned device.
+    Folds are mapped to devices round-robin (fold i -> devices[i % n_devices]) and
+    trained concurrently: with 5 folds and 4 devices, three devices each train one
+    fold while the remaining folds double up on the others, so every fold runs at
+    once. Predictions are pooled across folds and metrics computed exactly as in
+    the sequential runner (identical KFold seed), so results match a single-device
+    run. ``max_parallel_folds`` caps how many folds train at the same time (default:
+    all folds).
+
+    Returns a result dict matching ``run_single_experiment``'s schema.
+    """
+    parquet_file = _resolve_parquet_file(config.dataset_path)
+    if parquet_file is None:
+        return {
+            "config": asdict(config),
+            "error": f"Dataset not found in {config.dataset_path}",
+            "skipped": True,
+        }
+
+    df = pd.read_parquet(parquet_file)
+    text_column = "clinical_text"
+    if text_column not in df.columns:
+        return {
+            "config": asdict(config),
+            "error": f"Text column '{text_column}' not found",
+            "skipped": True,
+        }
+
+    # Optional explicit confounders (mirrors run_single_experiment preprocessing).
+    confounder_specs = None
+    confounder_cols = None
+    if config.use_explicit_confounders:
+        confounder_specs = load_confounder_specs_from_metadata(config.dataset_path)
+        if not confounder_specs:
+            return {
+                "config": asdict(config),
+                "error": f"No confounder specs found in {config.dataset_path}",
+                "skipped": True,
+            }
+        logger.info(
+            "Using %d explicit confounders: %s",
+            len(confounder_specs),
+            [s.name for s in confounder_specs],
+        )
+        df = _rename_confounder_columns(df, confounder_specs)
+        confounder_cols = [f"explicit_conf_{s.name}" for s in confounder_specs]
+        missing_cols = [c for c in confounder_cols if c not in df.columns]
+        if missing_cols:
+            return {
+                "config": asdict(config),
+                "error": (
+                    f"Confounder columns missing from dataset: {missing_cols}. "
+                    f"Run LLM extraction first to create llm_extracted_* columns."
+                ),
+                "skipped": True,
+            }
+
+    # simple_cnn is a trainable extractor: no cached/frozen hidden states.
+    gpu_store = None
+    hidden_state_cache = None
+
+    df = df.reset_index(drop=True)
+    kf = KFold(n_splits=config.n_folds, shuffle=True, random_state=42 + config.repeat_index)
+    folds = list(enumerate(kf.split(df)))
+
+    devices_t = [torch.device(d) for d in devices]
+    n_workers = len(folds) if max_parallel_folds is None else min(max_parallel_folds, len(folds))
+
+    def _run_fold(fold_item):
+        fold, (train_idx, test_idx) = fold_item
+        device = devices_t[fold % len(devices_t)]
+        logger.info("Fold %d/%d training on %s", fold + 1, config.n_folds, device)
+        fold_preds, _history = _run_neural_fold(
+            config, device, df, confounder_specs, confounder_cols,
+            gpu_store, hidden_state_cache, fold, train_idx, test_idx,
+        )
+        logger.info("Fold %d/%d finished on %s", fold + 1, config.n_folds, device)
+        return fold_preds
+
+    all_predictions = [None] * len(folds)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
+        future_to_fold = {executor.submit(_run_fold, item): item[0] for item in folds}
+        for future in concurrent.futures.as_completed(future_to_fold):
+            fold = future_to_fold[future]
+            all_predictions[fold] = future.result()
+
+    results_df = pd.concat(all_predictions).sort_index()
+
+    metrics = compute_metrics(
+        pred_ite=results_df["pred_ite_prob"].values,
+        true_ite=results_df["true_ite_prob"].values,
+        pred_propensity=results_df["pred_propensity"].values,
+        true_treatment=results_df["treatment_indicator"].values,
+        pred_y0=results_df["pred_y0_prob"].values,
+        pred_y1=results_df["pred_y1_prob"].values,
+        true_y0=results_df["true_y0_prob"].values,
+        true_y1=results_df["true_y1_prob"].values,
+        true_outcome=results_df["outcome_indicator"].values,
+    )
+
+    return {
+        "config": asdict(config),
+        "metrics": metrics,
+        "n_samples": len(results_df),
+        "skipped": False,
+        "error": None,
+        "artifacts": {},
+    }
 
 
 def write_aggregate_outputs(output_dir: Path, result: Dict[str, Any]) -> None:
@@ -138,10 +280,26 @@ def parse_args() -> argparse.Namespace:
         help="Output directory for result JSON and aggregate files",
     )
     parser.add_argument(
+        "--devices",
         "--device",
+        dest="devices",
         type=_parse_device,
-        default="cuda:0",
-        help="Device for training, e.g. cuda:0 or cpu",
+        nargs="+",
+        default=["cuda:0"],
+        help=(
+            "One or more training devices, e.g. --devices cuda:0 cuda:1 cuda:2 cuda:3 "
+            "(or cpu). CV folds are distributed across devices round-robin and trained "
+            "concurrently. '--device' is accepted as an alias."
+        ),
+    )
+    parser.add_argument(
+        "--max-parallel-folds",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of folds to train concurrently (default: all folds at once). "
+            "Lower this if a single GPU runs out of memory when folds double up on it."
+        ),
     )
     parser.add_argument("--resume", action="store_true", help="Skip if result JSON already exists")
     parser.add_argument("--dry-run", action="store_true", help="Print config and exit")
@@ -171,6 +329,8 @@ def parse_args() -> argparse.Namespace:
 
     if args.n_folds < 2:
         parser.error("--n-folds must be >= 2")
+    if args.max_parallel_folds is not None and args.max_parallel_folds < 1:
+        parser.error("--max-parallel-folds must be >= 1")
     if args.epochs < 1:
         parser.error("--epochs must be >= 1")
     if args.batch_size < 1:
@@ -213,18 +373,17 @@ def main() -> None:
 
     try:
         logger.info(
-            "Running one-off simple_cnn rlearner: dataset=%s, folds=%d, epochs=%d, lr=%s",
+            "Running one-off simple_cnn rlearner: dataset=%s, folds=%d, epochs=%d, lr=%s, devices=%s",
             config.dataset_name,
             config.n_folds,
             config.epochs,
             config.learning_rate,
+            ", ".join(args.devices),
         )
-        result = run_single_experiment(
+        result = run_parallel_fold_experiment(
             config,
-            args.device,
-            output_dir,
-            cache_registry={},
-            gpu_store_registry={},
+            args.devices,
+            max_parallel_folds=args.max_parallel_folds,
         )
     except Exception as exc:
         logger.error("Experiment %s failed: %s\n%s", config_hash, exc, traceback.format_exc())
