@@ -175,6 +175,49 @@ def test_concept_embedding_cache_reduces_batch_size_on_cuda_oom(tmp_path, monkey
     assert max(length for length in encoder.batch_lengths[2:]) == 1
 
 
+def test_concept_embedding_cache_multi_gpu_shards_chunks(tmp_path, monkeypatch):
+    import oci.models.concept_embedding_cache as cache_mod
+
+    encoders = {}
+
+    def load_encoder(model_name, device=None):
+        del model_name
+        key = str(device)
+        if key not in encoders:
+            encoders[key] = RecordingSentenceEncoder(dim=5)
+        return encoders[key]
+
+    monkeypatch.setattr(cache_mod, "load_sentence_transformer", load_encoder)
+    cache = cache_mod.ConceptEmbeddingCache(
+        cache_dir=str(tmp_path),
+        sentence_model_name="fake-model",
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        chunk_size_words=2,
+        chunk_overlap_words=0,
+        max_chunks=3,
+    )
+    texts = [
+        "alpha beta gamma delta",
+        "epsilon zeta eta theta",
+        "iota kappa",
+    ]
+    cache.precompute_multi_gpu(
+        texts,
+        devices=[torch.device("cuda:0"), torch.device("cuda:1")],
+        batch_size=2,
+    )
+
+    assert cache.is_valid(expected_num_samples=3)
+    assert set(encoders) == {"cuda:0", "cuda:1"}
+    assert sum(sum(encoder.batch_lengths) for encoder in encoders.values()) == 5
+    cache.open()
+    assert cache.hidden_states_array[0].shape == (2, 5)
+    assert cache.hidden_states_array[1].shape == (2, 5)
+    assert cache.hidden_states_array[2].shape == (1, 5)
+    assert cache.chunk_counts == [2, 2, 1]
+    assert cache._metadata["num_gpus_used"] == 2
+
+
 def test_factory_normalizes_concept_embedding_alias(monkeypatch):
     import oci.models.concept_embedding_cnn_extractor as extractor_mod
     from oci.config import normalize_feature_extractor_type

@@ -24,7 +24,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from oci.config import ExplicitFeatureSpec
-from oci.models.concept_embedding_cache import ConceptEmbeddingCache
+from oci.models.concept_embedding_cache import (
+    ConceptEmbeddingCache,
+    clear_sentence_transformer_cache,
+)
 
 from run_oracle_experiments import (
     ExperimentConfig,
@@ -177,7 +180,7 @@ def _make_config(
 def _precompute_cache_for_config(
     config: Any,
     output_dir: Path,
-    device: torch.device,
+    devices: List[torch.device],
     registry: Dict[str, ConceptEmbeddingCache],
     batch_size: int,
 ) -> None:
@@ -201,11 +204,12 @@ def _precompute_cache_for_config(
     if cache.is_valid(len(df)):
         logger.info("Reusing concept embedding cache %s", cache.cache_path)
     else:
-        cache.precompute(
-            df["clinical_text"].tolist(),
-            device=device,
-            batch_size=batch_size,
-        )
+        texts = df["clinical_text"].tolist()
+        if len(devices) > 1:
+            cache.precompute_multi_gpu(texts, devices=devices, batch_size=batch_size)
+        else:
+            device = devices[0] if devices else None
+            cache.precompute(texts, device=device, batch_size=batch_size)
     cache.open()
     cache.preload_to_ram()
     registry[cache.cache_hash] = cache
@@ -400,6 +404,23 @@ def _run_parallel(
     return results
 
 
+def _resolve_cache_devices(args: argparse.Namespace, run_devices: List[str]) -> List[str]:
+    if args.cache_devices is not None:
+        return args.cache_devices
+    if args.devices is not None:
+        return run_devices
+    if not str(args.device).startswith("cuda"):
+        return run_devices
+    if args.device != "cuda:0":
+        return run_devices
+    if not torch.cuda.is_available():
+        return run_devices
+    device_count = torch.cuda.device_count()
+    if device_count <= 1:
+        return run_devices
+    return [f"cuda:{idx}" for idx in range(device_count)]
+
+
 def _aggregate(output_dir: Path, results: List[Dict[str, Any]]) -> None:
     rows = []
     for result in results:
@@ -456,6 +477,16 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=None,
         help="Devices to use in parallel, e.g. --devices cuda:0 cuda:1",
+    )
+    parser.add_argument(
+        "--cache-devices",
+        nargs="+",
+        default=None,
+        help=(
+            "Devices for pre-experiment concept embedding cache warmup. Defaults "
+            "to --devices when set, otherwise all visible CUDA GPUs for the "
+            "default cuda:0 run device."
+        ),
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -563,7 +594,12 @@ def main() -> None:
         )
 
         precompute_registry: Dict[str, ConceptEmbeddingCache] = {}
-        precompute_device = torch.device(devices[0])
+        cache_device_names = _resolve_cache_devices(args, devices)
+        precompute_devices = [torch.device(device) for device in cache_device_names]
+        logger.info(
+            "Precomputing concept embedding caches on device(s): %s",
+            ", ".join(cache_device_names),
+        )
         runnable_configs = []
         for config in pending_configs:
             config_hash = config.config_hash()
@@ -571,7 +607,7 @@ def main() -> None:
                 _precompute_cache_for_config(
                     config,
                     output_dir,
-                    precompute_device,
+                    precompute_devices,
                     precompute_registry,
                     batch_size=args.cache_batch_size,
                 )
@@ -592,6 +628,11 @@ def main() -> None:
                 with open(results_dir / f"{config_hash}.json", "w") as f:
                     json.dump(result, f, indent=2, default=str)
                 results.append(result)
+
+        clear_sentence_transformer_cache(
+            model_name=args.sentence_model_name,
+            devices=precompute_devices,
+        )
 
         if args.devices is not None and len(devices) > 1:
             del precompute_registry

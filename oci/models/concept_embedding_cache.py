@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import concurrent.futures
+import gc
 import hashlib
 import json
 import logging
 import os
+import threading
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -46,6 +49,52 @@ def load_sentence_transformer(model_name: str, device: Optional[torch.device] = 
             device=model_device,
         )
     return _SENTENCE_TRANSFORMER_CACHE[key]
+
+
+def clear_sentence_transformer_cache(
+    model_name: Optional[str] = None,
+    devices: Optional[List[torch.device]] = None,
+) -> None:
+    """Drop cached sentence-transformer instances so GPU memory can be reused."""
+    device_names = {str(device) for device in devices} if devices is not None else None
+    for key in list(_SENTENCE_TRANSFORMER_CACHE):
+        cached_model_name, cached_device = key
+        if model_name is not None and cached_model_name != model_name:
+            continue
+        if device_names is not None and cached_device not in device_names:
+            continue
+        del _SENTENCE_TRANSFORMER_CACHE[key]
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _coerce_embedding_matrix(
+    batch_embeddings,
+    expected_rows: int,
+    expected_dim: Optional[int] = None,
+) -> Tuple[np.ndarray, int]:
+    batch_embeddings = np.asarray(batch_embeddings, dtype=np.float32)
+    if batch_embeddings.ndim == 1:
+        batch_embeddings = batch_embeddings.reshape(1, -1)
+    if batch_embeddings.ndim != 2:
+        raise RuntimeError(
+            "Sentence transformer returned unexpected shape "
+            f"{batch_embeddings.shape}"
+        )
+    if batch_embeddings.shape[0] != expected_rows:
+        raise RuntimeError(
+            "Sentence transformer returned "
+            f"{batch_embeddings.shape[0]} embeddings for "
+            f"{expected_rows} chunks"
+        )
+    embedding_dim = int(batch_embeddings.shape[1])
+    if expected_dim is not None and embedding_dim != expected_dim:
+        raise RuntimeError(
+            "Sentence transformer embedding dimension changed from "
+            f"{expected_dim} to {embedding_dim}"
+        )
+    return batch_embeddings, embedding_dim
 
 
 class ConceptEmbeddingCache:
@@ -270,33 +319,19 @@ class ConceptEmbeddingCache:
                     continue
                 raise
 
-            batch_embeddings = np.asarray(batch_embeddings, dtype=np.float32)
-            if batch_embeddings.ndim == 1:
-                batch_embeddings = batch_embeddings.reshape(1, -1)
-            if batch_embeddings.ndim != 2:
-                raise RuntimeError(
-                    "Sentence transformer returned unexpected shape "
-                    f"{batch_embeddings.shape}"
-                )
-            if batch_embeddings.shape[0] != len(batch_chunks):
-                raise RuntimeError(
-                    "Sentence transformer returned "
-                    f"{batch_embeddings.shape[0]} embeddings for "
-                    f"{len(batch_chunks)} chunks"
-                )
+            batch_embeddings, batch_embedding_dim = _coerce_embedding_matrix(
+                batch_embeddings,
+                expected_rows=len(batch_chunks),
+                expected_dim=embedding_dim,
+            )
 
             if emb_mmap is None:
-                embedding_dim = int(batch_embeddings.shape[1])
+                embedding_dim = batch_embedding_dim
                 emb_mmap = np.lib.format.open_memmap(
                     str(emb_path),
                     mode="w+",
                     dtype=np.float16,
                     shape=(total_chunks, embedding_dim),
-                )
-            elif batch_embeddings.shape[1] != embedding_dim:
-                raise RuntimeError(
-                    "Sentence transformer embedding dimension changed from "
-                    f"{embedding_dim} to {batch_embeddings.shape[1]}"
                 )
 
             emb_mmap[cursor:end] = batch_embeddings.astype(np.float16)
@@ -347,9 +382,218 @@ class ConceptEmbeddingCache:
         devices: List[torch.device],
         batch_size: int = 128,
     ) -> None:
-        """Compatibility wrapper; sentence-transformer handles one device here."""
-        device = devices[0] if devices else None
-        self.precompute(texts, device=device, batch_size=batch_size)
+        """Precompute sentence-transformer chunk embeddings across devices.
+
+        Chunks are flattened in sample order, split into contiguous non-overlapping
+        ranges, and encoded by one sentence-transformer copy per device. Each
+        worker writes its range directly into the shared memmap.
+        """
+        unique_devices: List[torch.device] = []
+        seen_devices = set()
+        for device in devices:
+            device_name = str(device)
+            if device_name in seen_devices:
+                continue
+            seen_devices.add(device_name)
+            unique_devices.append(device)
+
+        if len(unique_devices) <= 1:
+            device = unique_devices[0] if unique_devices else None
+            self.precompute(texts, device=device, batch_size=batch_size)
+            return
+
+        num_samples = len(texts)
+        logger.info(
+            "Precomputing concept chunk embeddings: samples=%d, model=%s, devices=%s",
+            num_samples,
+            self._sentence_model_name,
+            [str(device) for device in unique_devices],
+        )
+
+        sample_chunks = [
+            chunk_text_words(
+                text,
+                self._chunk_size_words,
+                self._chunk_overlap_words,
+                self._max_chunks,
+            )
+            for text in texts
+        ]
+        chunk_counts = [len(chunks) for chunks in sample_chunks]
+        total_chunks = int(sum(chunk_counts))
+        offsets = np.zeros(num_samples + 1, dtype=np.int64)
+        for i, count in enumerate(chunk_counts):
+            offsets[i + 1] = offsets[i] + count
+
+        flat_chunks = [chunk for chunks in sample_chunks for chunk in chunks]
+        if total_chunks == 0:
+            raise RuntimeError("No text chunks were generated")
+
+        probe_encoder = load_sentence_transformer(
+            self._sentence_model_name,
+            device=unique_devices[0],
+        )
+        embedding_dim = int(
+            getattr(probe_encoder, "get_sentence_embedding_dimension", lambda: 0)()
+            or 0
+        )
+        if embedding_dim <= 0:
+            probe_embeddings = probe_encoder.encode(
+                [flat_chunks[0]],
+                batch_size=1,
+                convert_to_numpy=True,
+                normalize_embeddings=self._normalize_embeddings,
+                show_progress_bar=False,
+            )
+            _, embedding_dim = _coerce_embedding_matrix(
+                probe_embeddings,
+                expected_rows=1,
+            )
+
+        self._cache_path.mkdir(parents=True, exist_ok=True)
+        emb_path = self._cache_path / "chunk_embeddings.npy"
+        offsets_path = self._cache_path / "offsets.npy"
+        np.save(str(offsets_path), offsets)
+        emb_mmap = np.lib.format.open_memmap(
+            str(emb_path),
+            mode="w+",
+            dtype=np.float16,
+            shape=(total_chunks, embedding_dim),
+        )
+
+        num_workers = min(len(unique_devices), total_chunks)
+        shard_size = (total_chunks + num_workers - 1) // num_workers
+        shards = []
+        for idx in range(num_workers):
+            start = idx * shard_size
+            end = min(start + shard_size, total_chunks)
+            if start >= end:
+                continue
+            shards.append((unique_devices[idx], start, end))
+
+        logger.info(
+            "  Total chunks: %d across %d samples (mean %.1f, max %d)",
+            total_chunks,
+            num_samples,
+            total_chunks / max(num_samples, 1),
+            max(chunk_counts) if chunk_counts else 0,
+        )
+        logger.info(
+            "  Encoding chunks across %d device(s) with batch_size=%d per device",
+            len(shards),
+            max(1, int(batch_size)),
+        )
+
+        progress_lock = threading.Lock()
+        progress = [0, 0]
+        log_stride = max(1000, total_chunks // 10)
+
+        def _encode_shard(device: torch.device, shard_start: int, shard_end: int) -> int:
+            encoder = load_sentence_transformer(self._sentence_model_name, device=device)
+            effective_batch_size = max(1, int(batch_size))
+            cursor = shard_start
+            while cursor < shard_end:
+                end = min(cursor + effective_batch_size, shard_end)
+                batch_chunks = flat_chunks[cursor:end]
+                try:
+                    batch_embeddings = encoder.encode(
+                        batch_chunks,
+                        batch_size=len(batch_chunks),
+                        convert_to_numpy=True,
+                        normalize_embeddings=self._normalize_embeddings,
+                        show_progress_bar=False,
+                    )
+                except Exception as exc:
+                    if _is_cuda_oom(exc) and effective_batch_size > 1:
+                        new_batch_size = max(1, effective_batch_size // 2)
+                        logger.warning(
+                            "CUDA OOM while encoding concept chunks on %s; reducing "
+                            "batch_size from %d to %d and retrying",
+                            device,
+                            effective_batch_size,
+                            new_batch_size,
+                        )
+                        effective_batch_size = new_batch_size
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
+                    raise
+
+                batch_embeddings, _ = _coerce_embedding_matrix(
+                    batch_embeddings,
+                    expected_rows=len(batch_chunks),
+                    expected_dim=embedding_dim,
+                )
+                emb_mmap[cursor:end] = batch_embeddings.astype(np.float16)
+                cursor = end
+
+                with progress_lock:
+                    progress[0] += len(batch_chunks)
+                    if (
+                        progress[0] == total_chunks
+                        or progress[0] - progress[1] >= log_stride
+                    ):
+                        progress[1] = progress[0]
+                        logger.info(
+                            "  Encoded %d/%d concept chunks",
+                            progress[0],
+                            total_chunks,
+                        )
+
+                if device.type == "cuda" and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            return effective_batch_size
+
+        final_batch_sizes = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(shards)) as executor:
+            futures = [
+                executor.submit(_encode_shard, device, start, end)
+                for device, start, end in shards
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                final_batch_sizes.append(future.result())
+
+        emb_mmap.flush()
+        del emb_mmap
+        logger.info(
+            "  Encoded %d chunks; final batch_size range=%d-%d",
+            total_chunks,
+            min(final_batch_sizes) if final_batch_sizes else max(1, int(batch_size)),
+            max(final_batch_sizes) if final_batch_sizes else max(1, int(batch_size)),
+        )
+
+        metadata = {
+            "sentence_model_name": self._sentence_model_name,
+            "hidden_size": embedding_dim,
+            "num_samples": num_samples,
+            "total_chunks": total_chunks,
+            "chunk_counts": chunk_counts,
+            "chunk_size_words": self._chunk_size_words,
+            "chunk_overlap_words": self._chunk_overlap_words,
+            "max_chunks": self._max_chunks,
+            "normalize_embeddings": self._normalize_embeddings,
+            "actual_max_len": max(chunk_counts) if chunk_counts else 0,
+            "storage_format": "variable_length_chunks",
+            "dataset_path": os.path.abspath(self._dataset_path),
+            "cache_hash": self._cache_hash,
+            "created_at": datetime.now().isoformat(),
+            "dtype": "float16",
+            "precompute_batch_size": max(final_batch_sizes)
+            if final_batch_sizes
+            else max(1, int(batch_size)),
+            "num_gpus_used": sum(1 for device, _, _ in shards if device.type == "cuda"),
+            "precompute_devices": [str(device) for device, _, _ in shards],
+        }
+        with open(self._cache_path / "metadata.json", "w") as f:
+            json.dump(metadata, f, indent=2)
+        self._metadata = metadata
+        logger.info(
+            "Concept embedding cache created (%d device(s)): %.3f GB, %d chunks",
+            len(shards),
+            self.cache_size_gb,
+            total_chunks,
+        )
 
     def open(self) -> None:
         if self._metadata is None:
