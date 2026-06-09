@@ -140,3 +140,143 @@ class RLearnerNet(nn.Module):
         w_hidden = F.relu(self.nuisance_fc(phi))
         w_hidden = self.outcome_dropout(w_hidden)
         return self.propensity_fc(w_hidden)
+
+
+class RoleGatedSlotRLearner(nn.Module):
+    """R-learner head with separate nuisance and effect gates over slots."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        num_slots: int,
+        slot_feature_dim: int,
+        representation_dim: int = 200,
+        hidden_outcome_dim: int = 100,
+        dropout: float = 0.2,
+        gate_l1_weight: float = 0.0,
+    ):
+        super().__init__()
+        if num_slots < 1:
+            raise ValueError("num_slots must be >= 1")
+        if slot_feature_dim < 1:
+            raise ValueError("slot_feature_dim must be >= 1")
+
+        self.num_slots = int(num_slots)
+        self.slot_feature_dim = int(slot_feature_dim)
+        self.slot_flat_dim = self.num_slots * self.slot_feature_dim
+        if input_dim < self.slot_flat_dim:
+            raise ValueError(
+                f"input_dim {input_dim} is smaller than slot flat dim {self.slot_flat_dim}"
+            )
+        self.extra_dim = int(input_dim - self.slot_flat_dim)
+        self.gate_l1_weight = float(gate_l1_weight)
+
+        role_input_dim = self.slot_feature_dim + self.extra_dim
+        self.nuisance_gate_logits = nn.Parameter(torch.zeros(self.num_slots))
+        self.effect_gate_logits = nn.Parameter(torch.zeros(self.num_slots))
+
+        self.nuisance_rep = nn.Sequential(
+            nn.Linear(role_input_dim, representation_dim),
+            nn.LayerNorm(representation_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.effect_rep = nn.Sequential(
+            nn.Linear(role_input_dim, representation_dim),
+            nn.LayerNorm(representation_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+        self.nuisance_fc = nn.Sequential(
+            nn.Linear(representation_dim, hidden_outcome_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.propensity_fc = nn.Linear(hidden_outcome_dim, 1)
+        self.outcome_fc = nn.Linear(hidden_outcome_dim, 1)
+
+        self.effect_fc = nn.Sequential(
+            nn.Linear(representation_dim, hidden_outcome_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_outcome_dim, hidden_outcome_dim),
+            nn.ELU(),
+            nn.Dropout(dropout),
+        )
+        self.effect_out = nn.Linear(hidden_outcome_dim, 1)
+
+    def _split_features(self, features: torch.Tensor):
+        slot_features = features[:, : self.slot_flat_dim].reshape(
+            features.shape[0],
+            self.num_slots,
+            self.slot_feature_dim,
+        )
+        extra = features[:, self.slot_flat_dim:] if self.extra_dim > 0 else None
+        return slot_features, extra
+
+    def _weighted_slots(self, slot_features: torch.Tensor, gate_logits: torch.Tensor):
+        weights = torch.sigmoid(gate_logits)
+        pooled = torch.einsum("bsf,s->bf", slot_features, weights)
+        return pooled / weights.sum().clamp_min(1e-6)
+
+    def _role_inputs(self, features: torch.Tensor):
+        slot_features, extra = self._split_features(features)
+        nuisance_input = self._weighted_slots(slot_features, self.nuisance_gate_logits)
+        effect_input = self._weighted_slots(slot_features, self.effect_gate_logits)
+        if extra is not None:
+            nuisance_input = torch.cat([nuisance_input, extra], dim=-1)
+            effect_input = torch.cat([effect_input, extra], dim=-1)
+        return nuisance_input, effect_input
+
+    def get_representation(self, features: torch.Tensor):
+        nuisance_input, _ = self._role_inputs(features)
+        return self.nuisance_rep(nuisance_input)
+
+    def propensity_from_representation(self, phi: torch.Tensor):
+        hidden = self.nuisance_fc(phi)
+        return self.propensity_fc(hidden)
+
+    def forward(self, features: torch.Tensor):
+        nuisance_input, effect_input = self._role_inputs(features)
+        nuisance_phi = self.nuisance_rep(nuisance_input)
+        effect_phi = self.effect_rep(effect_input)
+
+        nuisance_hidden = self.nuisance_fc(nuisance_phi)
+        t_logit = self.propensity_fc(nuisance_hidden)
+        m_logit = self.outcome_fc(nuisance_hidden)
+
+        effect_hidden = self.effect_fc(effect_phi)
+        tau = self.effect_out(effect_hidden)
+        phi = torch.cat([nuisance_phi, effect_phi], dim=-1)
+        return m_logit, tau, t_logit, phi
+
+    def forward_with_activations(self, features: torch.Tensor):
+        nuisance_input, effect_input = self._role_inputs(features)
+        nuisance_phi = self.nuisance_rep(nuisance_input)
+        effect_phi = self.effect_rep(effect_input)
+
+        nuisance_hidden = self.nuisance_fc(nuisance_phi)
+        t_logit = self.propensity_fc(nuisance_hidden)
+        m_logit = self.outcome_fc(nuisance_hidden)
+
+        effect_hidden = self.effect_fc(effect_phi)
+        tau = self.effect_out(effect_hidden)
+        phi = torch.cat([nuisance_phi, effect_phi], dim=-1)
+        return m_logit, tau, t_logit, phi, nuisance_hidden, effect_hidden
+
+    def compute_regularization_losses(self):
+        if self.gate_l1_weight <= 0:
+            device = self.nuisance_gate_logits.device
+            return {"slot_gate_l1_loss": torch.tensor(0.0, device=device)}
+        nuisance = torch.sigmoid(self.nuisance_gate_logits)
+        effect = torch.sigmoid(self.effect_gate_logits)
+        return {
+            "slot_gate_l1_loss": self.gate_l1_weight * (nuisance.mean() + effect.mean())
+        }
+
+    def get_gate_values(self):
+        return {
+            "nuisance": torch.sigmoid(self.nuisance_gate_logits).detach(),
+            "effect": torch.sigmoid(self.effect_gate_logits).detach(),
+        }

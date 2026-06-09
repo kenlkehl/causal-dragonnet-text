@@ -280,6 +280,27 @@ class ExperimentConfig:
     ctcnn_normalize_embeddings: bool = True
     ctcnn_random_state: int = 42
 
+    # Slot-value discovery hyperparameters
+    svx_sentence_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    svx_chunk_size_words: int = 64
+    svx_chunk_overlap_words: int = 16
+    svx_max_chunks: int = 128
+    svx_confounder_concepts: List[str] = field(default_factory=list)
+    svx_effect_modifier_concepts: List[str] = field(default_factory=list)
+    svx_num_free_slots: int = 16
+    svx_slot_dim: int = 128
+    svx_num_value_prototypes: int = 4
+    svx_dropout: float = 0.1
+    svx_anchor_weight: float = 0.01
+    svx_cache_chunk_embeddings: bool = False
+    svx_cached_embedding_dim: int = 0
+    svx_normalize_embeddings: bool = True
+    svx_attention_temperature: float = 0.1
+    svx_attention_entropy_weight: float = 0.0
+    svx_query_diversity_weight: float = 0.0
+    svx_gate_l1_weight: float = 0.0
+    svx_random_state: int = 42
+
     # Extractor-specific field prefixes -- used by config_hash() to exclude
     # parameters that belong to *other* extractors so adding a new extractor
     # type never invalidates existing result hashes.
@@ -291,6 +312,7 @@ class ExperimentConfig:
         "simple_cnn": {"scnn_"},
         "concept_embedding_cnn": {"cecnn_"},
         "concept_token_cnn": {"ctcnn_"},
+        "slot_value_discovery": {"svx_"},
     }
     _ALL_EXTRACTOR_PREFIXES = set().union(*_EXTRACTOR_PREFIXES.values())
     _AGENTIC_PREFIX = "agentic_"
@@ -885,6 +907,21 @@ def _get_cache_info(config, parquet_file, cache_registry, gpu_store_registry):
             hidden_state_cache = cache_registry.get(cache_hash)
         return gpu_store, hidden_state_cache
 
+    if ext_type == "slot_value_discovery" and getattr(
+        config, "svx_cache_chunk_embeddings", False
+    ):
+        cache_hash = ConceptEmbeddingCache.compute_cache_hash(
+            sentence_model_name=config.svx_sentence_model_name,
+            dataset_path=str(parquet_file),
+            chunk_size_words=config.svx_chunk_size_words,
+            chunk_overlap_words=config.svx_chunk_overlap_words,
+            max_chunks=config.svx_max_chunks,
+            normalize_embeddings=config.svx_normalize_embeddings,
+        )
+        if cache_registry is not None:
+            hidden_state_cache = cache_registry.get(cache_hash)
+        return gpu_store, hidden_state_cache
+
     if ext_type not in CACHEABLE_EXTRACTOR_TYPES:
         return gpu_store, hidden_state_cache
 
@@ -1054,6 +1091,30 @@ def _common_model_kwargs(config, gpu_store, hidden_state_cache, confounder_specs
             ctcnn_downprojection_dim=config.ctcnn_downprojection_dim,
             ctcnn_normalize_embeddings=config.ctcnn_normalize_embeddings,
             ctcnn_random_state=config.ctcnn_random_state + config.repeat_index,
+        )
+    elif ext_type == "slot_value_discovery":
+        kwargs.update(
+            svx_sentence_model_name=config.svx_sentence_model_name,
+            svx_chunk_size_words=config.svx_chunk_size_words,
+            svx_chunk_overlap_words=config.svx_chunk_overlap_words,
+            svx_max_chunks=config.svx_max_chunks,
+            svx_confounder_concepts=config.svx_confounder_concepts,
+            svx_effect_modifier_concepts=config.svx_effect_modifier_concepts,
+            svx_num_free_slots=config.svx_num_free_slots,
+            svx_slot_dim=config.svx_slot_dim,
+            svx_num_value_prototypes=config.svx_num_value_prototypes,
+            svx_dropout=config.svx_dropout,
+            svx_anchor_weight=config.svx_anchor_weight,
+            svx_cached_embedding_dim=(
+                hidden_state_cache.hidden_size if hidden_state_cache is not None
+                else config.svx_cached_embedding_dim
+            ),
+            svx_normalize_embeddings=config.svx_normalize_embeddings,
+            svx_attention_temperature=config.svx_attention_temperature,
+            svx_attention_entropy_weight=config.svx_attention_entropy_weight,
+            svx_query_diversity_weight=config.svx_query_diversity_weight,
+            svx_gate_l1_weight=config.svx_gate_l1_weight,
+            svx_random_state=config.svx_random_state + config.repeat_index,
         )
 
     return kwargs

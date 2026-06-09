@@ -405,6 +405,12 @@ EXTRACTOR_ALIASES = {
         "token_concept_cnn",
         "ctcnn",
     },
+    "slot_value_discovery": {
+        "slot_value_discovery",
+        "slot_value",
+        "slot_discovery",
+        "svx",
+    },
 }
 
 VALID_EXTRACTOR_TYPES = set(EXTRACTOR_ALIASES.keys())
@@ -541,6 +547,27 @@ class ModelArchitectureConfig:
     ctcnn_downprojection_dim: Optional[int] = None
     ctcnn_normalize_embeddings: bool = True
     ctcnn_random_state: int = 42
+
+    # Slot-value discovery extractor (cached sentence chunks + seeded/free slots)
+    svx_sentence_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    svx_chunk_size_words: int = 64
+    svx_chunk_overlap_words: int = 16
+    svx_max_chunks: int = 128
+    svx_confounder_concepts: List[str] = field(default_factory=list)
+    svx_effect_modifier_concepts: List[str] = field(default_factory=list)
+    svx_num_free_slots: int = 16
+    svx_slot_dim: int = 128
+    svx_num_value_prototypes: int = 4
+    svx_dropout: float = 0.1
+    svx_anchor_weight: float = 0.01
+    svx_cache_chunk_embeddings: bool = False
+    svx_cached_embedding_dim: int = 0
+    svx_normalize_embeddings: bool = True
+    svx_attention_temperature: float = 0.1
+    svx_attention_entropy_weight: float = 0.0
+    svx_query_diversity_weight: float = 0.0
+    svx_gate_l1_weight: float = 0.0
+    svx_random_state: int = 42
 
     # Causal head dimensions (applies to all causal heads: DragonNet, RLearner, etc.)
     causal_head_representation_dim: int = 128

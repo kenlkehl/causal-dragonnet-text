@@ -2,7 +2,7 @@
 """Model components for causal inference from text."""
 
 from .dragonnet import DragonNet
-from .rlearner import RLearnerNet
+from .rlearner import RLearnerNet, RoleGatedSlotRLearner
 from .frozen_llm_pooler_extractor import FrozenLLMPoolerExtractor
 from .hierarchical_llm_extractor import HierarchicalLLMExtractor
 from .hierarchical_cnn_extractor import HierarchicalCNNExtractor
@@ -10,6 +10,7 @@ from .hierarchical_gru_extractor import HierarchicalGRUExtractor
 from .simple_cnn_extractor import SimpleCNNExtractor
 from .concept_embedding_cnn_extractor import ConceptEmbeddingCNNExtractor
 from .concept_token_cnn_extractor import ConceptTokenCNNExtractor
+from .slot_value_discovery_extractor import SlotValueDiscoveryExtractor
 from .concept_embedding_cache import ConceptEmbeddingCache
 from .gated_attention_pooling import GatedAttentionPooling
 from .learned_tokenizer import LearnedTokenizer
@@ -38,6 +39,7 @@ from .contrastive_causal_text_forest import (
 __all__ = [
     'DragonNet',
     'RLearnerNet',
+    'RoleGatedSlotRLearner',
     'FrozenLLMPoolerExtractor',
     'HierarchicalLLMExtractor',
     'HierarchicalCNNExtractor',
@@ -45,6 +47,7 @@ __all__ = [
     'SimpleCNNExtractor',
     'ConceptEmbeddingCNNExtractor',
     'ConceptTokenCNNExtractor',
+    'SlotValueDiscoveryExtractor',
     'ConceptEmbeddingCache',
     'GatedAttentionPooling',
     'LearnedTokenizer',

@@ -113,6 +113,24 @@ def create_feature_extractor(
     ctcnn_downprojection_dim: Optional[int] = None,
     ctcnn_normalize_embeddings: bool = True,
     ctcnn_random_state: int = 42,
+    # Slot-value discovery args
+    svx_sentence_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    svx_chunk_size_words: int = 64,
+    svx_chunk_overlap_words: int = 16,
+    svx_max_chunks: int = 128,
+    svx_confounder_concepts: Optional[List[str]] = None,
+    svx_effect_modifier_concepts: Optional[List[str]] = None,
+    svx_num_free_slots: int = 16,
+    svx_slot_dim: int = 128,
+    svx_num_value_prototypes: int = 4,
+    svx_dropout: float = 0.1,
+    svx_anchor_weight: float = 0.01,
+    svx_cached_embedding_dim: int = 0,
+    svx_normalize_embeddings: bool = True,
+    svx_attention_temperature: float = 0.1,
+    svx_attention_entropy_weight: float = 0.0,
+    svx_query_diversity_weight: float = 0.0,
+    svx_random_state: int = 42,
     # Model type
     model_type: str = "dragonnet",
 ) -> nn.Module:
@@ -302,6 +320,40 @@ def create_feature_extractor(
         )
         return extractor
 
+    elif normalized_type == "slot_value_discovery":
+        from .slot_value_discovery_extractor import SlotValueDiscoveryExtractor
+        extractor = SlotValueDiscoveryExtractor(
+            sentence_model_name=svx_sentence_model_name,
+            chunk_size_words=svx_chunk_size_words,
+            chunk_overlap_words=svx_chunk_overlap_words,
+            max_chunks=svx_max_chunks,
+            confounder_concepts=svx_confounder_concepts or [],
+            effect_modifier_concepts=svx_effect_modifier_concepts or [],
+            num_free_slots=svx_num_free_slots,
+            slot_dim=svx_slot_dim,
+            num_value_prototypes=svx_num_value_prototypes,
+            dropout=svx_dropout,
+            anchor_weight=svx_anchor_weight,
+            cached_embedding_dim=svx_cached_embedding_dim,
+            normalize_embeddings=svx_normalize_embeddings,
+            attention_temperature=svx_attention_temperature,
+            attention_entropy_weight=svx_attention_entropy_weight,
+            query_diversity_weight=svx_query_diversity_weight,
+            random_state=svx_random_state,
+            device=device,
+        )
+        logger.info(
+            "Created Slot-Value Discovery extractor: chunks=%d/%d/%d, "
+            "seed_slots=%d, free_slots=%d, slot_dim=%d",
+            svx_chunk_size_words,
+            svx_chunk_overlap_words,
+            svx_max_chunks,
+            len((svx_confounder_concepts or []) + (svx_effect_modifier_concepts or [])),
+            svx_num_free_slots,
+            svx_slot_dim,
+        )
+        return extractor
+
     else:
         from ..config import VALID_EXTRACTOR_TYPES
         raise ValueError(
@@ -435,4 +487,25 @@ def create_feature_extractor_from_config(
         ctcnn_downprojection_dim=config.get('ctcnn_downprojection_dim', None),
         ctcnn_normalize_embeddings=config.get('ctcnn_normalize_embeddings', True),
         ctcnn_random_state=config.get('ctcnn_random_state', 42),
+        # Slot-value discovery args
+        svx_sentence_model_name=config.get(
+            'svx_sentence_model_name',
+            'sentence-transformers/all-MiniLM-L6-v2',
+        ),
+        svx_chunk_size_words=config.get('svx_chunk_size_words', 64),
+        svx_chunk_overlap_words=config.get('svx_chunk_overlap_words', 16),
+        svx_max_chunks=config.get('svx_max_chunks', 128),
+        svx_confounder_concepts=config.get('svx_confounder_concepts', []),
+        svx_effect_modifier_concepts=config.get('svx_effect_modifier_concepts', []),
+        svx_num_free_slots=config.get('svx_num_free_slots', 16),
+        svx_slot_dim=config.get('svx_slot_dim', 128),
+        svx_num_value_prototypes=config.get('svx_num_value_prototypes', 4),
+        svx_dropout=config.get('svx_dropout', 0.1),
+        svx_anchor_weight=config.get('svx_anchor_weight', 0.01),
+        svx_cached_embedding_dim=config.get('svx_cached_embedding_dim', 0),
+        svx_normalize_embeddings=config.get('svx_normalize_embeddings', True),
+        svx_attention_temperature=config.get('svx_attention_temperature', 0.1),
+        svx_attention_entropy_weight=config.get('svx_attention_entropy_weight', 0.0),
+        svx_query_diversity_weight=config.get('svx_query_diversity_weight', 0.0),
+        svx_random_state=config.get('svx_random_state', 42),
     )

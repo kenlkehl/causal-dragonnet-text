@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .dragonnet import DragonNet
-from .rlearner import RLearnerNet
+from .rlearner import RLearnerNet, RoleGatedSlotRLearner
 from .explicit_feature_featurizer import ExplicitFeatureFeaturizer
 from .extractor_factory import create_feature_extractor
 from ..config import normalize_feature_extractor_type, ExplicitFeatureSpec
@@ -127,6 +127,25 @@ class CausalText(nn.Module):
         ctcnn_downprojection_dim: Optional[int] = None,
         ctcnn_normalize_embeddings: bool = True,
         ctcnn_random_state: int = 42,
+        # Slot-value discovery args
+        svx_sentence_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        svx_chunk_size_words: int = 64,
+        svx_chunk_overlap_words: int = 16,
+        svx_max_chunks: int = 128,
+        svx_confounder_concepts: Optional[List[str]] = None,
+        svx_effect_modifier_concepts: Optional[List[str]] = None,
+        svx_num_free_slots: int = 16,
+        svx_slot_dim: int = 128,
+        svx_num_value_prototypes: int = 4,
+        svx_dropout: float = 0.1,
+        svx_anchor_weight: float = 0.01,
+        svx_cached_embedding_dim: int = 0,
+        svx_normalize_embeddings: bool = True,
+        svx_attention_temperature: float = 0.1,
+        svx_attention_entropy_weight: float = 0.0,
+        svx_query_diversity_weight: float = 0.0,
+        svx_gate_l1_weight: float = 0.0,
+        svx_random_state: int = 42,
         # Causal head args (applies to all causal heads: DragonNet, RLearner)
         causal_head_representation_dim: int = 128,
         causal_head_hidden_outcome_dim: int = 64,
@@ -271,6 +290,24 @@ class CausalText(nn.Module):
             'ctcnn_downprojection_dim': ctcnn_downprojection_dim,
             'ctcnn_normalize_embeddings': ctcnn_normalize_embeddings,
             'ctcnn_random_state': ctcnn_random_state,
+            'svx_sentence_model_name': svx_sentence_model_name,
+            'svx_chunk_size_words': svx_chunk_size_words,
+            'svx_chunk_overlap_words': svx_chunk_overlap_words,
+            'svx_max_chunks': svx_max_chunks,
+            'svx_confounder_concepts': svx_confounder_concepts,
+            'svx_effect_modifier_concepts': svx_effect_modifier_concepts,
+            'svx_num_free_slots': svx_num_free_slots,
+            'svx_slot_dim': svx_slot_dim,
+            'svx_num_value_prototypes': svx_num_value_prototypes,
+            'svx_dropout': svx_dropout,
+            'svx_anchor_weight': svx_anchor_weight,
+            'svx_cached_embedding_dim': svx_cached_embedding_dim,
+            'svx_normalize_embeddings': svx_normalize_embeddings,
+            'svx_attention_temperature': svx_attention_temperature,
+            'svx_attention_entropy_weight': svx_attention_entropy_weight,
+            'svx_query_diversity_weight': svx_query_diversity_weight,
+            'svx_gate_l1_weight': svx_gate_l1_weight,
+            'svx_random_state': svx_random_state,
             'causal_head_representation_dim': causal_head_representation_dim,
             'causal_head_hidden_outcome_dim': causal_head_hidden_outcome_dim,
             'causal_head_dropout': causal_head_dropout,
@@ -383,6 +420,23 @@ class CausalText(nn.Module):
             ctcnn_downprojection_dim=ctcnn_downprojection_dim,
             ctcnn_normalize_embeddings=ctcnn_normalize_embeddings,
             ctcnn_random_state=ctcnn_random_state,
+            svx_sentence_model_name=svx_sentence_model_name,
+            svx_chunk_size_words=svx_chunk_size_words,
+            svx_chunk_overlap_words=svx_chunk_overlap_words,
+            svx_max_chunks=svx_max_chunks,
+            svx_confounder_concepts=svx_confounder_concepts or [],
+            svx_effect_modifier_concepts=svx_effect_modifier_concepts or [],
+            svx_num_free_slots=svx_num_free_slots,
+            svx_slot_dim=svx_slot_dim,
+            svx_num_value_prototypes=svx_num_value_prototypes,
+            svx_dropout=svx_dropout,
+            svx_anchor_weight=svx_anchor_weight,
+            svx_cached_embedding_dim=svx_cached_embedding_dim,
+            svx_normalize_embeddings=svx_normalize_embeddings,
+            svx_attention_temperature=svx_attention_temperature,
+            svx_attention_entropy_weight=svx_attention_entropy_weight,
+            svx_query_diversity_weight=svx_query_diversity_weight,
+            svx_random_state=svx_random_state,
         )
 
         # Auxiliary feature projection (if enabled)
@@ -425,13 +479,32 @@ class CausalText(nn.Module):
             input_dim += explicit_feature_output_dim
 
         if model_type == "rlearner":
-            self.net = RLearnerNet(
-                input_dim=input_dim,
-                representation_dim=causal_head_representation_dim,
-                hidden_outcome_dim=causal_head_hidden_outcome_dim,
-                dropout=causal_head_dropout
-            )
-            logger.info("Using R-Learner architecture (direct tau optimization)")
+            slot_feature_dim = getattr(self.feature_extractor, "slot_feature_dim", None)
+            num_slots = getattr(self.feature_extractor, "num_slots", None)
+            if self.feature_extractor_type == "slot_value_discovery" and slot_feature_dim and num_slots:
+                self.net = RoleGatedSlotRLearner(
+                    input_dim=input_dim,
+                    num_slots=int(num_slots),
+                    slot_feature_dim=int(slot_feature_dim),
+                    representation_dim=causal_head_representation_dim,
+                    hidden_outcome_dim=causal_head_hidden_outcome_dim,
+                    dropout=causal_head_dropout,
+                    gate_l1_weight=svx_gate_l1_weight,
+                )
+                logger.info(
+                    "Using role-gated slot R-Learner architecture "
+                    "(slots=%d, slot_dim=%d)",
+                    int(num_slots),
+                    int(slot_feature_dim),
+                )
+            else:
+                self.net = RLearnerNet(
+                    input_dim=input_dim,
+                    representation_dim=causal_head_representation_dim,
+                    hidden_outcome_dim=causal_head_hidden_outcome_dim,
+                    dropout=causal_head_dropout
+                )
+                logger.info("Using R-Learner architecture (direct tau optimization)")
         else:
             self.net = DragonNet(
                 input_dim=input_dim,
@@ -557,6 +630,14 @@ class CausalText(nn.Module):
             return self.feature_extractor.compute_anchor_loss()
         return torch.tensor(0.0, device=self._device)
 
+    def _regularization_losses(self) -> Dict[str, torch.Tensor]:
+        losses: Dict[str, torch.Tensor] = {}
+        if hasattr(self.feature_extractor, "compute_regularization_losses"):
+            losses.update(self.feature_extractor.compute_regularization_losses())
+        if hasattr(self.net, "compute_regularization_losses"):
+            losses.update(self.net.compute_regularization_losses())
+        return losses
+
     def train_step(
         self,
         batch: Dict[str, Any],
@@ -681,6 +762,13 @@ class CausalText(nn.Module):
         )
         anchor_loss = self._feature_extractor_anchor_loss()
         total_loss = total_loss + anchor_loss
+        regularization_losses = self._regularization_losses()
+        regularization_loss = (
+            sum(regularization_losses.values())
+            if regularization_losses
+            else torch.tensor(0.0, device=self._device)
+        )
+        total_loss = total_loss + regularization_loss
 
         result = {
             'loss': total_loss,
@@ -688,10 +776,13 @@ class CausalText(nn.Module):
             'propensity_loss': propensity_loss.detach(),
             'targreg_loss': targreg_loss.detach() if isinstance(targreg_loss, torch.Tensor) else targreg_loss,
             'anchor_loss': anchor_loss.detach(),
+            'regularization_loss': regularization_loss.detach(),
             'y0_logit': y0_logit.detach(),
             'y1_logit': y1_logit.detach(),
             't_logit': t_logit.detach()
         }
+        for name, value in regularization_losses.items():
+            result[name] = value.detach()
 
         return result
 
@@ -795,6 +886,13 @@ class CausalText(nn.Module):
         )
         anchor_loss = self._feature_extractor_anchor_loss()
         total_loss = total_loss + anchor_loss
+        regularization_losses = self._regularization_losses()
+        regularization_loss = (
+            sum(regularization_losses.values())
+            if regularization_losses
+            else torch.tensor(0.0, device=self._device)
+        )
+        total_loss = total_loss + regularization_loss
 
         # Derive y0/y1 for backward-compatible metrics
         # From: m = e*y1 + (1-e)*y0 and tau = y1 - y0
@@ -813,6 +911,7 @@ class CausalText(nn.Module):
             'r_loss': r_loss.detach(),
             'targreg_loss': r_loss.detach(),  # Alias for compatibility
             'anchor_loss': anchor_loss.detach(),
+            'regularization_loss': regularization_loss.detach(),
             'm_logit': m_logit.detach(),
             'tau': tau.detach(),
             't_logit': t_logit.detach(),
@@ -824,6 +923,8 @@ class CausalText(nn.Module):
         # Add entropy loss if computed
         if attention_entropy_weight > 0:
             result['entropy_loss'] = entropy_loss.detach() if isinstance(entropy_loss, torch.Tensor) else entropy_loss
+        for name, value in regularization_losses.items():
+            result[name] = value.detach()
 
         return result
 

@@ -341,35 +341,47 @@ def analyze(df: pd.DataFrame) -> list[str]:
     lines.append(f"Explicit confounders: {sorted_unique_present(df['use_explicit_confounders'])}")
     if has_present_values(df, 'outcome_type'):
         lines.append(f"Outcome types: {sorted_unique_present(df['outcome_type'])}")
-    lines += [
-        "",
-        "ITE correlation:    "
-        f"mean={fmt(df['ite_corr'].mean())}  "
-        f"std={fmt(df['ite_corr'].std())}  "
-        f"min={fmt(df['ite_corr'].min())}  "
-        f"max={fmt(df['ite_corr'].max())}",
-        "ITE Spearman corr:  "
-        f"mean={fmt(df['ite_spearman_corr'].mean())}  "
-        f"std={fmt(df['ite_spearman_corr'].std())}  "
-        f"min={fmt(df['ite_spearman_corr'].min())}  "
-        f"max={fmt(df['ite_spearman_corr'].max())}"
-        if 'ite_spearman_corr' in df.columns else "",
-        "ATE bias:           "
-        f"mean={fmt(df['ate_bias'].mean())}  "
-        f"std={fmt(df['ate_bias'].std())}  "
-        f"min={fmt(df['ate_bias'].min())}  "
-        f"max={fmt(df['ate_bias'].max())}",
-        "Propensity AUROC:   "
-        f"mean={fmt(df['propensity_auroc'].mean())}  "
-        f"std={fmt(df['propensity_auroc'].std())}  "
-        f"min={fmt(df['propensity_auroc'].min())}  "
-        f"max={fmt(df['propensity_auroc'].max())}",
-        "CI coverage:        "
-        f"mean={fmt(df['ci_coverage'].mean())}  "
-        f"std={fmt(df['ci_coverage'].std())}  "
-        f"min={fmt(df['ci_coverage'].min())}  "
-        f"max={fmt(df['ci_coverage'].max())}",
-    ]
+    lines.append("")
+    if "ite_corr" in df.columns:
+        lines.append(
+            "ITE correlation:    "
+            f"mean={fmt(df['ite_corr'].mean())}  "
+            f"std={fmt(df['ite_corr'].std())}  "
+            f"min={fmt(df['ite_corr'].min())}  "
+            f"max={fmt(df['ite_corr'].max())}"
+        )
+    if "ite_spearman_corr" in df.columns:
+        lines.append(
+            "ITE Spearman corr:  "
+            f"mean={fmt(df['ite_spearman_corr'].mean())}  "
+            f"std={fmt(df['ite_spearman_corr'].std())}  "
+            f"min={fmt(df['ite_spearman_corr'].min())}  "
+            f"max={fmt(df['ite_spearman_corr'].max())}"
+        )
+    if "ate_bias" in df.columns:
+        lines.append(
+            "ATE bias:           "
+            f"mean={fmt(df['ate_bias'].mean())}  "
+            f"std={fmt(df['ate_bias'].std())}  "
+            f"min={fmt(df['ate_bias'].min())}  "
+            f"max={fmt(df['ate_bias'].max())}"
+        )
+    if "propensity_auroc" in df.columns:
+        lines.append(
+            "Propensity AUROC:   "
+            f"mean={fmt(df['propensity_auroc'].mean())}  "
+            f"std={fmt(df['propensity_auroc'].std())}  "
+            f"min={fmt(df['propensity_auroc'].min())}  "
+            f"max={fmt(df['propensity_auroc'].max())}"
+        )
+    if "ci_coverage" in df.columns:
+        lines.append(
+            "CI coverage:        "
+            f"mean={fmt(df['ci_coverage'].mean())}  "
+            f"std={fmt(df['ci_coverage'].std())}  "
+            f"min={fmt(df['ci_coverage'].min())}  "
+            f"max={fmt(df['ci_coverage'].max())}"
+        )
     output.extend(section("0. OVERALL SUMMARY", lines))
 
     # ---------------------------------------------------------------
