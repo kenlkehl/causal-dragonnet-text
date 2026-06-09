@@ -73,6 +73,7 @@ import hashlib
 import itertools
 import json
 import logging
+import math
 import multiprocessing as mp
 import os
 import queue
@@ -160,6 +161,10 @@ class ExperimentConfig:
     learning_rate: float = 1e-4
     n_folds: int = 5
     gamma_rlearner: float = 1.0
+    gamma_rlearner_start: Optional[float] = None
+    gamma_rlearner_warmup_epochs: int = 0
+    gamma_rlearner_ramp_epochs: int = 0
+    gamma_rlearner_schedule: str = "constant"
     beta_targreg: float = 0.1
 
     # Causal forest specific
@@ -357,6 +362,44 @@ class ExperimentConfig:
 
         config_str = json.dumps(d, sort_keys=True)
         return hashlib.md5(config_str.encode()).hexdigest()[:12]
+
+
+def scheduled_gamma_rlearner(config: ExperimentConfig, epoch: int) -> float:
+    """Return epoch-specific R-loss weight for warmup/ramp schedules.
+
+    ``gamma_rlearner`` is the final value. With the default constant schedule,
+    existing experiment behavior is unchanged. For non-constant schedules, a
+    missing start value means ramp from zero.
+    """
+    final_gamma = float(getattr(config, "gamma_rlearner", 1.0))
+    schedule = str(
+        getattr(config, "gamma_rlearner_schedule", "constant") or "constant"
+    ).lower()
+    start_raw = getattr(config, "gamma_rlearner_start", None)
+    warmup_epochs = max(0, int(getattr(config, "gamma_rlearner_warmup_epochs", 0) or 0))
+    ramp_epochs = max(0, int(getattr(config, "gamma_rlearner_ramp_epochs", 0) or 0))
+
+    if schedule == "constant" or (
+        start_raw is None and warmup_epochs == 0 and ramp_epochs == 0
+    ):
+        return final_gamma
+    if schedule not in {"linear", "cosine"}:
+        raise ValueError(
+            "gamma_rlearner_schedule must be one of constant, linear, cosine; "
+            f"got {schedule!r}"
+        )
+
+    start_gamma = 0.0 if start_raw is None else float(start_raw)
+    if epoch < warmup_epochs:
+        return start_gamma
+    if ramp_epochs <= 0:
+        return final_gamma
+
+    progress = (epoch - warmup_epochs + 1) / ramp_epochs
+    progress = min(1.0, max(0.0, progress))
+    if schedule == "cosine":
+        progress = 0.5 - 0.5 * math.cos(math.pi * progress)
+    return start_gamma + (final_gamma - start_gamma) * progress
 
 
 def _feature_spec_from_metadata_item(
@@ -1202,6 +1245,7 @@ def run_causal_forest_experiment(
         use_cached = gpu_store is not None or hidden_state_cache is not None
 
         for epoch in range(config.epochs):
+            gamma_rlearner_epoch = scheduled_gamma_rlearner(config, epoch)
             model.train()
             train_loss = 0.0
 
@@ -1215,7 +1259,7 @@ def run_causal_forest_experiment(
                 losses = model.train_representation_step(
                     batch,
                     alpha_propensity=1.0,
-                    gamma_rlearner=config.gamma_rlearner,
+                    gamma_rlearner=gamma_rlearner_epoch,
                 )
                 losses['loss'].backward()
                 torch.nn.utils.clip_grad_norm_(
@@ -1237,13 +1281,18 @@ def run_causal_forest_experiment(
                     losses = model.train_representation_step(
                         batch,
                         alpha_propensity=1.0,
-                        gamma_rlearner=config.gamma_rlearner,
+                        gamma_rlearner=gamma_rlearner_epoch,
                     )
                     val_loss += losses['loss'].item()
 
             train_loss /= len(train_loader)
             val_loss /= len(test_loader)
-            history.append({'epoch': epoch + 1, 'train_loss': train_loss, 'val_loss': val_loss})
+            history.append({
+                'epoch': epoch + 1,
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'gamma_rlearner': gamma_rlearner_epoch,
+            })
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -1417,6 +1466,7 @@ def _run_neural_fold(
     history = []
 
     for epoch in range(config.epochs):
+        gamma_rlearner_epoch = scheduled_gamma_rlearner(config, epoch)
         model.train()
         train_loss = 0.0
 
@@ -1431,7 +1481,7 @@ def _run_neural_fold(
                 losses = model.train_step(
                     batch,
                     alpha_propensity=1.0,
-                    gamma_rlearner=config.gamma_rlearner,
+                    gamma_rlearner=gamma_rlearner_epoch,
                 )
             else:  # dragonnet
                 losses = model.train_step(
@@ -1460,7 +1510,7 @@ def _run_neural_fold(
                     losses = model.train_step(
                         batch,
                         alpha_propensity=1.0,
-                        gamma_rlearner=config.gamma_rlearner,
+                        gamma_rlearner=gamma_rlearner_epoch,
                     )
                 else:
                     losses = model.train_step(
@@ -1472,7 +1522,12 @@ def _run_neural_fold(
 
         train_loss /= len(train_loader)
         val_loss /= len(test_loader)
-        history.append({'epoch': epoch + 1, 'train_loss': train_loss, 'val_loss': val_loss})
+        history.append({
+            'epoch': epoch + 1,
+            'train_loss': train_loss,
+            'val_loss': val_loss,
+            'gamma_rlearner': gamma_rlearner_epoch,
+        })
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss

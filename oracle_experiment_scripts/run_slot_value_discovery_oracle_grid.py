@@ -145,6 +145,10 @@ def _make_config(
         learning_rate=args.learning_rate,
         n_folds=args.n_folds,
         gamma_rlearner=args.gamma_rlearner,
+        gamma_rlearner_start=args.gamma_rlearner_start,
+        gamma_rlearner_warmup_epochs=args.gamma_rlearner_warmup_epochs,
+        gamma_rlearner_ramp_epochs=args.gamma_rlearner_ramp_epochs,
+        gamma_rlearner_schedule=args.gamma_rlearner_schedule,
     )
 
 
@@ -394,6 +398,11 @@ def _aggregate(output_dir: Path, results: List[Dict[str, Any]]) -> None:
         "svx_num_free_slots",
         "svx_slot_dim",
         "svx_anchor_weight",
+        "gamma_rlearner",
+        "gamma_rlearner_start",
+        "gamma_rlearner_warmup_epochs",
+        "gamma_rlearner_ramp_epochs",
+        "gamma_rlearner_schedule",
         "epochs",
     ]
     group_cols = [col for col in group_cols if col in df.columns]
@@ -444,6 +453,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-batch-size", type=int, default=256)
     parser.add_argument("--n-folds", type=int, default=3)
     parser.add_argument("--gamma-rlearner", type=float, default=1.0)
+    parser.add_argument(
+        "--gamma-rlearner-start",
+        type=float,
+        default=None,
+        help="Initial R-loss weight before warmup/ramp. Defaults to 0 for scheduled runs.",
+    )
+    parser.add_argument(
+        "--gamma-rlearner-warmup-epochs",
+        type=int,
+        default=0,
+        help="Epochs to hold gamma_rlearner_start before ramping.",
+    )
+    parser.add_argument(
+        "--gamma-rlearner-ramp-epochs",
+        type=int,
+        default=0,
+        help="Epochs over which to ramp gamma to --gamma-rlearner.",
+    )
+    parser.add_argument(
+        "--gamma-rlearner-schedule",
+        choices=["constant", "linear", "cosine"],
+        default="constant",
+        help="Schedule shape for gamma warmup/ramp.",
+    )
     parser.add_argument("--free-slots", type=int, default=16)
     parser.add_argument("--slot-dim", type=int, default=128)
     parser.add_argument("--value-prototypes", type=int, default=4)
