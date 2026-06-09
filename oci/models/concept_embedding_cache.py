@@ -22,6 +22,13 @@ logger = logging.getLogger(__name__)
 _SENTENCE_TRANSFORMER_CACHE = {}
 
 
+def _is_cuda_oom(exc: BaseException) -> bool:
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    message = str(exc).lower()
+    return "cuda" in message and "out of memory" in message
+
+
 def load_sentence_transformer(model_name: str, device: Optional[torch.device] = None):
     """Load a sentence-transformer model lazily."""
     try:
@@ -218,32 +225,94 @@ class ConceptEmbeddingCache:
 
         flat_chunks = [chunk for chunks in sample_chunks for chunk in chunks]
         encoder = load_sentence_transformer(self._sentence_model_name, device=device)
-        embeddings = encoder.encode(
-            flat_chunks,
-            batch_size=batch_size,
-            convert_to_numpy=True,
-            normalize_embeddings=self._normalize_embeddings,
-            show_progress_bar=False,
-        )
-        embeddings = np.asarray(embeddings, dtype=np.float32)
-        if embeddings.ndim != 2:
-            raise RuntimeError(
-                f"Sentence transformer returned unexpected shape {embeddings.shape}"
-            )
-        embedding_dim = int(embeddings.shape[1])
 
         self._cache_path.mkdir(parents=True, exist_ok=True)
         emb_path = self._cache_path / "chunk_embeddings.npy"
         offsets_path = self._cache_path / "offsets.npy"
-        emb_mmap = np.lib.format.open_memmap(
-            str(emb_path),
-            mode="w+",
-            dtype=np.float16,
-            shape=(total_chunks, embedding_dim),
-        )
-        emb_mmap[:] = embeddings.astype(np.float16)
-        emb_mmap.flush()
         np.save(str(offsets_path), offsets)
+
+        effective_batch_size = max(1, int(batch_size))
+        logger.info(
+            "  Total chunks: %d across %d samples (mean %.1f, max %d)",
+            total_chunks,
+            num_samples,
+            total_chunks / max(num_samples, 1),
+            max(chunk_counts) if chunk_counts else 0,
+        )
+        logger.info("  Encoding chunks with batch_size=%d", effective_batch_size)
+
+        emb_mmap = None
+        embedding_dim = None
+        cursor = 0
+        while cursor < total_chunks:
+            end = min(cursor + effective_batch_size, total_chunks)
+            batch_chunks = flat_chunks[cursor:end]
+            try:
+                batch_embeddings = encoder.encode(
+                    batch_chunks,
+                    batch_size=len(batch_chunks),
+                    convert_to_numpy=True,
+                    normalize_embeddings=self._normalize_embeddings,
+                    show_progress_bar=False,
+                )
+            except Exception as exc:
+                if _is_cuda_oom(exc) and effective_batch_size > 1:
+                    new_batch_size = max(1, effective_batch_size // 2)
+                    logger.warning(
+                        "CUDA OOM while encoding concept chunks; reducing "
+                        "batch_size from %d to %d and retrying",
+                        effective_batch_size,
+                        new_batch_size,
+                    )
+                    effective_batch_size = new_batch_size
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
+                raise
+
+            batch_embeddings = np.asarray(batch_embeddings, dtype=np.float32)
+            if batch_embeddings.ndim == 1:
+                batch_embeddings = batch_embeddings.reshape(1, -1)
+            if batch_embeddings.ndim != 2:
+                raise RuntimeError(
+                    "Sentence transformer returned unexpected shape "
+                    f"{batch_embeddings.shape}"
+                )
+            if batch_embeddings.shape[0] != len(batch_chunks):
+                raise RuntimeError(
+                    "Sentence transformer returned "
+                    f"{batch_embeddings.shape[0]} embeddings for "
+                    f"{len(batch_chunks)} chunks"
+                )
+
+            if emb_mmap is None:
+                embedding_dim = int(batch_embeddings.shape[1])
+                emb_mmap = np.lib.format.open_memmap(
+                    str(emb_path),
+                    mode="w+",
+                    dtype=np.float16,
+                    shape=(total_chunks, embedding_dim),
+                )
+            elif batch_embeddings.shape[1] != embedding_dim:
+                raise RuntimeError(
+                    "Sentence transformer embedding dimension changed from "
+                    f"{embedding_dim} to {batch_embeddings.shape[1]}"
+                )
+
+            emb_mmap[cursor:end] = batch_embeddings.astype(np.float16)
+            cursor = end
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        if emb_mmap is None or embedding_dim is None:
+            raise RuntimeError("No chunk embeddings were generated")
+        emb_mmap.flush()
+        logger.info(
+            "  Encoded %d chunks; final batch_size=%d",
+            total_chunks,
+            effective_batch_size,
+        )
 
         metadata = {
             "sentence_model_name": self._sentence_model_name,
@@ -261,6 +330,7 @@ class ConceptEmbeddingCache:
             "cache_hash": self._cache_hash,
             "created_at": datetime.now().isoformat(),
             "dtype": "float16",
+            "precompute_batch_size": effective_batch_size,
         }
         with open(self._cache_path / "metadata.json", "w") as f:
             json.dump(metadata, f, indent=2)

@@ -34,6 +34,28 @@ class FakeSentenceEncoder:
         return np.vstack(rows)
 
 
+class RecordingSentenceEncoder(FakeSentenceEncoder):
+    def __init__(self, dim=6):
+        super().__init__(dim=dim)
+        self.batch_lengths = []
+
+    def encode(self, texts, **kwargs):
+        self.batch_lengths.append(len(texts))
+        return super().encode(texts, **kwargs)
+
+
+class OOMThenSingleSentenceEncoder(FakeSentenceEncoder):
+    def __init__(self, dim=6):
+        super().__init__(dim=dim)
+        self.batch_lengths = []
+
+    def encode(self, texts, **kwargs):
+        self.batch_lengths.append(len(texts))
+        if len(texts) > 1:
+            raise RuntimeError("CUDA out of memory while testing")
+        return super().encode(texts, **kwargs)
+
+
 def test_chunk_text_words_overlap():
     chunks = chunk_text_words(
         "one two three four five six",
@@ -105,10 +127,11 @@ def test_concept_embedding_cnn_role_specific_counts():
 def test_concept_embedding_cache_roundtrip(tmp_path, monkeypatch):
     import oci.models.concept_embedding_cache as cache_mod
 
+    encoder = RecordingSentenceEncoder(dim=5)
     monkeypatch.setattr(
         cache_mod,
         "load_sentence_transformer",
-        lambda model_name, device=None: FakeSentenceEncoder(dim=5),
+        lambda model_name, device=None: encoder,
     )
     cache = cache_mod.ConceptEmbeddingCache(
         cache_dir=str(tmp_path),
@@ -125,6 +148,31 @@ def test_concept_embedding_cache_roundtrip(tmp_path, monkeypatch):
     assert cache.hidden_size == 5
     assert cache.hidden_states_array[0].shape == (3, 5)
     assert cache.attention_mask_array[1].shape == (2,)
+    assert encoder.batch_lengths == [2, 2, 1]
+
+
+def test_concept_embedding_cache_reduces_batch_size_on_cuda_oom(tmp_path, monkeypatch):
+    import oci.models.concept_embedding_cache as cache_mod
+
+    encoder = OOMThenSingleSentenceEncoder(dim=4)
+    monkeypatch.setattr(
+        cache_mod,
+        "load_sentence_transformer",
+        lambda model_name, device=None: encoder,
+    )
+    cache = cache_mod.ConceptEmbeddingCache(
+        cache_dir=str(tmp_path),
+        sentence_model_name="fake-model",
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        chunk_size_words=2,
+        chunk_overlap_words=1,
+        max_chunks=4,
+    )
+    cache.precompute(["alpha beta gamma", "delta epsilon"], device=None, batch_size=4)
+
+    assert cache.is_valid(expected_num_samples=2)
+    assert encoder.batch_lengths[:3] == [4, 2, 1]
+    assert max(length for length in encoder.batch_lengths[2:]) == 1
 
 
 def test_factory_normalizes_concept_embedding_alias(monkeypatch):
