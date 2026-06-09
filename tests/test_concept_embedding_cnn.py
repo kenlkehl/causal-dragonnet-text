@@ -218,6 +218,46 @@ def test_concept_embedding_cache_multi_gpu_shards_chunks(tmp_path, monkeypatch):
     assert cache._metadata["num_gpus_used"] == 2
 
 
+def test_load_sentence_transformer_forces_float32(monkeypatch):
+    import sentence_transformers
+    import oci.models.concept_embedding_cache as cache_mod
+
+    calls = []
+
+    class DummySentenceTransformer:
+        def __init__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            self.float_called = False
+            self.eval_called = False
+
+        def float(self):
+            self.float_called = True
+            return self
+
+        def eval(self):
+            self.eval_called = True
+            return self
+
+    cache_mod.clear_sentence_transformer_cache()
+    monkeypatch.setattr(
+        sentence_transformers,
+        "SentenceTransformer",
+        DummySentenceTransformer,
+    )
+
+    encoder = cache_mod.load_sentence_transformer(
+        "fake-model",
+        device=torch.device("cuda:0"),
+    )
+
+    assert calls[0][0] == ("fake-model",)
+    assert calls[0][1]["device"] == "cuda:0"
+    assert calls[0][1]["model_kwargs"]["torch_dtype"] is torch.float32
+    assert encoder.float_called
+    assert encoder.eval_called
+    cache_mod.clear_sentence_transformer_cache()
+
+
 def test_factory_normalizes_concept_embedding_alias(monkeypatch):
     import oci.models.concept_embedding_cnn_extractor as extractor_mod
     from oci.config import normalize_feature_extractor_type

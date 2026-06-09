@@ -44,10 +44,14 @@ def load_sentence_transformer(model_name: str, device: Optional[torch.device] = 
     model_device = str(device) if device is not None else None
     key = (model_name, model_device)
     if key not in _SENTENCE_TRANSFORMER_CACHE:
-        _SENTENCE_TRANSFORMER_CACHE[key] = SentenceTransformer(
+        encoder = SentenceTransformer(
             model_name,
             device=model_device,
+            model_kwargs={"torch_dtype": torch.float32},
         )
+        encoder.float()
+        encoder.eval()
+        _SENTENCE_TRANSFORMER_CACHE[key] = encoder
     return _SENTENCE_TRANSFORMER_CACHE[key]
 
 
