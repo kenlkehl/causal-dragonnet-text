@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import itertools
 import json
 import logging
+import multiprocessing as mp
+import os
 import sys
 import traceback
 from copy import deepcopy
@@ -208,6 +211,195 @@ def _precompute_cache_for_config(
     registry[cache.cache_hash] = cache
 
 
+def _open_cache_for_config(
+    config: Any,
+    output_dir: Path,
+    registry: Dict[str, ConceptEmbeddingCache],
+) -> None:
+    parquet_file = _resolve_parquet_file(config.dataset_path)
+    if parquet_file is None:
+        raise FileNotFoundError(f"Dataset not found in {config.dataset_path}")
+
+    cache = ConceptEmbeddingCache(
+        cache_dir=str(output_dir / ".cecnn_cache"),
+        sentence_model_name=config.cecnn_sentence_model_name,
+        dataset_path=str(parquet_file),
+        chunk_size_words=config.cecnn_chunk_size_words,
+        chunk_overlap_words=config.cecnn_chunk_overlap_words,
+        max_chunks=config.cecnn_max_chunks,
+        normalize_embeddings=config.cecnn_normalize_embeddings,
+    )
+    if cache.cache_hash in registry:
+        return
+
+    cache.open()
+    cache.preload_to_ram()
+    registry[cache.cache_hash] = cache
+
+
+def _run_config(
+    config: Any,
+    device: str,
+    output_dir: Path,
+    cache_registry: Dict[str, ConceptEmbeddingCache],
+) -> Dict[str, Any]:
+    config_hash = config.config_hash()
+    result_file = output_dir / "results" / f"{config_hash}.json"
+
+    try:
+        _open_cache_for_config(config, output_dir, cache_registry)
+        if isinstance(config, XWRLearnerForestConfig):
+            result = run_xw_experiment(
+                config,
+                device,
+                output_dir,
+                cache_registry=cache_registry,
+                gpu_store_registry={},
+            )
+        else:
+            result = run_general_experiment(
+                config,
+                device,
+                output_dir,
+                cache_registry=cache_registry,
+                gpu_store_registry={},
+            )
+    except Exception as exc:
+        logger.error(
+            "Experiment %s failed on %s: %s\n%s",
+            config_hash,
+            device,
+            exc,
+            traceback.format_exc(),
+        )
+        result = {
+            "config": asdict(config),
+            "metrics": {},
+            "skipped": True,
+            "error": str(exc),
+        }
+
+    result_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(result_file, "w") as f:
+        json.dump(result, f, indent=2, default=str)
+    return result
+
+
+def _worker_process(
+    device: str,
+    job_queue: mp.Queue,
+    progress_queue: mp.Queue,
+    output_dir: str,
+) -> None:
+    output_dir_path = Path(output_dir)
+    cache_registry: Dict[str, ConceptEmbeddingCache] = {}
+    logger.info("Worker process started on %s (pid=%s)", device, os.getpid())
+
+    while True:
+        config = job_queue.get()
+        if config is None:
+            break
+
+        config_hash = config.config_hash()
+        result = _run_config(config, device, output_dir_path, cache_registry)
+        progress_queue.put((config_hash, result))
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    logger.info("Worker process on %s (pid=%s) finished", device, os.getpid())
+
+
+def _run_parallel(
+    configs: List[Any],
+    devices: List[str],
+    output_dir: Path,
+) -> List[Dict[str, Any]]:
+    if not configs:
+        return []
+
+    ctx = mp.get_context("spawn")
+    job_queue = ctx.Queue()
+    progress_queue = ctx.Queue()
+
+    pending_hashes = {config.config_hash() for config in configs}
+    for config in configs:
+        job_queue.put(config)
+    for _device in devices:
+        job_queue.put(None)
+
+    processes = []
+    for device in devices:
+        process = ctx.Process(
+            target=_worker_process,
+            args=(device, job_queue, progress_queue, str(output_dir)),
+            name=f"cecnn-worker-{device}",
+        )
+        process.start()
+        processes.append(process)
+
+    logger.info(
+        "Spawned %d worker process(es) across %d device(s): %s",
+        len(processes),
+        len(devices),
+        ", ".join(devices),
+    )
+
+    results = []
+    while pending_hashes:
+        alive = [process for process in processes if process.is_alive()]
+        if not alive:
+            logger.error(
+                "All worker processes exited with %d experiment(s) unreported",
+                len(pending_hashes),
+            )
+            break
+
+        try:
+            config_hash, result = progress_queue.get(timeout=5)
+        except Exception:
+            continue
+
+        pending_hashes.discard(config_hash)
+        results.append(result)
+        logger.info(
+            "Completed %d/%d experiments",
+            len(configs) - len(pending_hashes),
+            len(configs),
+        )
+
+    for process in processes:
+        process.join(timeout=30)
+        if process.is_alive():
+            logger.warning("Worker %s did not exit cleanly; terminating", process.name)
+            process.terminate()
+            process.join(timeout=5)
+
+    if pending_hashes:
+        results_dir = output_dir / "results"
+        for config in configs:
+            config_hash = config.config_hash()
+            if config_hash not in pending_hashes:
+                continue
+            result_file = results_dir / f"{config_hash}.json"
+            if result_file.exists():
+                with open(result_file) as f:
+                    result = json.load(f)
+            else:
+                result = {
+                    "config": asdict(config),
+                    "metrics": {},
+                    "skipped": True,
+                    "error": "Worker process exited before reporting result",
+                }
+                with open(result_file, "w") as f:
+                    json.dump(result, f, indent=2, default=str)
+            results.append(result)
+
+    return results
+
+
 def _aggregate(output_dir: Path, results: List[Dict[str, Any]]) -> None:
     rows = []
     for result in results:
@@ -254,14 +446,24 @@ def parse_args() -> argparse.Namespace:
         "-o",
         default="../pcori_experiments/concept_embedding_cnn_oracle_grid",
     )
-    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--device",
+        default="cuda:0",
+        help="Single device to use when --devices is not specified",
+    )
+    parser.add_argument(
+        "--devices",
+        nargs="+",
+        default=None,
+        help="Devices to use in parallel, e.g. --devices cuda:0 cuda:1",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--max-experiments", type=int, default=None)
 
     parser.add_argument(
         "--sentence-model-name",
-        default="sentence-transformers/all-MiniLM-L6-v2",
+        default="Qwen/Qwen3-Embedding-0.6B",
     )
     parser.add_argument("--concepts-json", default=None)
     parser.add_argument("--concept-confounder", action="append", default=[])
@@ -337,9 +539,8 @@ def main() -> None:
             print(f"config_hash: {config.config_hash()}")
         return
 
-    device = torch.device(args.device)
-    cache_registry: Dict[str, ConceptEmbeddingCache] = {}
     results = []
+    pending_configs = []
     results_dir = output_dir / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
 
@@ -351,48 +552,58 @@ def main() -> None:
                 result = json.load(f)
             results.append(result)
             continue
+        pending_configs.append(config)
 
-        try:
-            _precompute_cache_for_config(
-                config,
-                output_dir,
-                device,
-                cache_registry,
-                batch_size=args.cache_batch_size,
-            )
-            if isinstance(config, XWRLearnerForestConfig):
-                result = run_xw_experiment(
-                    config,
-                    args.device,
-                    output_dir,
-                    cache_registry=cache_registry,
-                    gpu_store_registry={},
-                )
-            else:
-                result = run_general_experiment(
-                    config,
-                    args.device,
-                    output_dir,
-                    cache_registry=cache_registry,
-                    gpu_store_registry={},
-                )
-        except Exception as exc:
-            logger.error(
-                "Experiment %s failed: %s\n%s",
-                config_hash,
-                exc,
-                traceback.format_exc(),
-            )
-            result = {
-                "config": asdict(config),
-                "metrics": {},
-                "skipped": True,
-                "error": str(exc),
-            }
+    if pending_configs:
+        devices = args.devices if args.devices is not None else [args.device]
+        logger.info(
+            "Running %d pending experiment(s) on device(s): %s",
+            len(pending_configs),
+            ", ".join(devices),
+        )
 
-        with open(result_file, "w") as f:
-            json.dump(result, f, indent=2, default=str)
-        results.append(result)
+        precompute_registry: Dict[str, ConceptEmbeddingCache] = {}
+        precompute_device = torch.device(devices[0])
+        runnable_configs = []
+        for config in pending_configs:
+            config_hash = config.config_hash()
+            try:
+                _precompute_cache_for_config(
+                    config,
+                    output_dir,
+                    precompute_device,
+                    precompute_registry,
+                    batch_size=args.cache_batch_size,
+                )
+                runnable_configs.append(config)
+            except Exception as exc:
+                logger.error(
+                    "Cache precompute for experiment %s failed: %s\n%s",
+                    config_hash,
+                    exc,
+                    traceback.format_exc(),
+                )
+                result = {
+                    "config": asdict(config),
+                    "metrics": {},
+                    "skipped": True,
+                    "error": str(exc),
+                }
+                with open(results_dir / f"{config_hash}.json", "w") as f:
+                    json.dump(result, f, indent=2, default=str)
+                results.append(result)
+
+        if args.devices is not None and len(devices) > 1:
+            del precompute_registry
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            results.extend(_run_parallel(runnable_configs, devices, output_dir))
+        else:
+            cache_registry = precompute_registry
+            for config in runnable_configs:
+                result = _run_config(config, devices[0], output_dir, cache_registry)
+                results.append(result)
 
     _aggregate(output_dir, results)
 
