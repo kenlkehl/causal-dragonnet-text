@@ -284,6 +284,22 @@ class AgenticAttentionVariableForestRunner:
                 "htr_sentence_encoder_batch_size",
                 128,
             ),
+            htr_sentence_encoder_backend=getattr(
+                arch,
+                "htr_sentence_encoder_backend",
+                "auto",
+            ),
+            htr_sentence_pooling=getattr(arch, "htr_sentence_pooling", "auto"),
+            htr_normalize_sentence_embeddings=getattr(
+                arch,
+                "htr_normalize_sentence_embeddings",
+                True,
+            ),
+            htr_trainable_sentence_encoder_layers=getattr(
+                arch,
+                "htr_trainable_sentence_encoder_layers",
+                0,
+            ),
         )
 
     def _crossfit_nuisance(self, df: pd.DataFrame, outer_fold: int) -> Dict[str, Any]:
@@ -598,6 +614,9 @@ class AgenticAttentionVariableForestRunner:
         total_folds: int,
     ):
         train_config = self.config.training
+        model.extractor.fit_tokenizer(
+            df.iloc[positions][self.config.text_column].astype(str).tolist()
+        )
         optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
             lr=train_config.learning_rate,
@@ -700,6 +719,9 @@ class AgenticAttentionVariableForestRunner:
         total_folds: int,
     ):
         train_config = self.config.training
+        model.extractor.fit_tokenizer(
+            df.iloc[positions][self.config.text_column].astype(str).tolist()
+        )
         optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
             lr=train_config.learning_rate,

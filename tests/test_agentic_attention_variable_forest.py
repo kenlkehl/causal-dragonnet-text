@@ -169,6 +169,12 @@ def test_oracle_agentic_attention_script_builds_configs(tmp_path):
             "hash",
             "--htr-sentence-encoder-batch-size",
             "32",
+            "--htr-sentence-encoder-backend",
+            "transformers",
+            "--htr-sentence-pooling",
+            "mean",
+            "--htr-trainable-sentence-encoder-layers",
+            "1",
             "--max-experiments",
             "1",
         ]
@@ -180,6 +186,9 @@ def test_oracle_agentic_attention_script_builds_configs(tmp_path):
     assert config.model_type == "agentic_attention_variable_forest"
     assert config.htr_sentence_model == "hash"
     assert config.htr_sentence_encoder_batch_size == 32
+    assert config.htr_sentence_encoder_backend == "transformers"
+    assert config.htr_sentence_pooling == "mean"
+    assert config.htr_trainable_sentence_encoder_layers == 1
 
     applied = _make_applied_config(
         config,
@@ -189,6 +198,9 @@ def test_oracle_agentic_attention_script_builds_configs(tmp_path):
     assert applied.architecture.model_type == "agentic_attention_variable_forest"
     assert applied.architecture.feature_extractor_type == "hierarchical_transformer"
     assert applied.architecture.htr_sentence_encoder_batch_size == 32
+    assert applied.architecture.htr_sentence_encoder_backend == "transformers"
+    assert applied.architecture.htr_sentence_pooling == "mean"
+    assert applied.architecture.htr_trainable_sentence_encoder_layers == 1
     assert applied.architecture.agentic_attention_variable_forest.nuisance_folds == 2
 
 

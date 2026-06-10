@@ -59,6 +59,10 @@ def create_feature_extractor(
     htr_projection_dim: int = 128,
     htr_hash_embedding_dim: int = 256,
     htr_sentence_encoder_batch_size: int = 128,
+    htr_sentence_encoder_backend: str = "auto",
+    htr_sentence_pooling: str = "auto",
+    htr_normalize_sentence_embeddings: bool = True,
+    htr_trainable_sentence_encoder_layers: int = 0,
     # Hierarchical CNN args
     hcnn_embedding_dim: int = 256,
     hcnn_conv_dim: int = 256,
@@ -223,17 +227,22 @@ def create_feature_extractor(
             projection_dim=htr_projection_dim,
             hash_embedding_dim=htr_hash_embedding_dim,
             sentence_encoder_batch_size=htr_sentence_encoder_batch_size,
+            sentence_encoder_backend=htr_sentence_encoder_backend,
+            sentence_pooling=htr_sentence_pooling,
+            normalize_sentence_embeddings=htr_normalize_sentence_embeddings,
+            trainable_sentence_encoder_layers=htr_trainable_sentence_encoder_layers,
             device=device,
         )
         logger.info(
             "Created Hierarchical Transformer extractor: model=%s, chunks=%d/%d/%d, "
-            "projection_dim=%d, sentence_encoder_batch_size=%d",
+            "projection_dim=%d, sentence_encoder_batch_size=%d, backend=%s",
             htr_sentence_model,
             htr_chunk_size_words,
             htr_chunk_overlap_words,
             htr_max_chunks,
             htr_projection_dim,
             htr_sentence_encoder_batch_size,
+            htr_sentence_encoder_backend,
         )
         return extractor
 
@@ -466,6 +475,13 @@ def create_feature_extractor_from_config(
         htr_projection_dim=config.get('htr_projection_dim', 128),
         htr_hash_embedding_dim=config.get('htr_hash_embedding_dim', 256),
         htr_sentence_encoder_batch_size=config.get('htr_sentence_encoder_batch_size', 128),
+        htr_sentence_encoder_backend=config.get('htr_sentence_encoder_backend', 'auto'),
+        htr_sentence_pooling=config.get('htr_sentence_pooling', 'auto'),
+        htr_normalize_sentence_embeddings=config.get('htr_normalize_sentence_embeddings', True),
+        htr_trainable_sentence_encoder_layers=config.get(
+            'htr_trainable_sentence_encoder_layers',
+            0,
+        ),
         # Hierarchical CNN args
         hcnn_embedding_dim=config.get('hcnn_embedding_dim', 256),
         hcnn_conv_dim=config.get('hcnn_conv_dim', 256),

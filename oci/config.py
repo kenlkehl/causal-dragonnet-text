@@ -564,6 +564,10 @@ class ModelArchitectureConfig:
     htr_projection_dim: int = 128
     htr_hash_embedding_dim: int = 256
     htr_sentence_encoder_batch_size: int = 128
+    htr_sentence_encoder_backend: str = "auto"
+    htr_sentence_pooling: str = "auto"
+    htr_normalize_sentence_embeddings: bool = True
+    htr_trainable_sentence_encoder_layers: int = 0
 
     # Hierarchical CNN extractor (dilated CNN on chunks + two-level pooling, trains from scratch)
     hcnn_embedding_dim: int = 256

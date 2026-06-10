@@ -97,6 +97,7 @@ class AgenticAttentionOracleConfig:
     text_max_chars: Optional[int] = None
 
     htr_sentence_model: str = "prajjwal1/bert-tiny"
+    htr_freeze_sentence_encoder: bool = True
     htr_chunk_size_words: int = 96
     htr_chunk_overlap_words: int = 24
     htr_max_chunks: int = 128
@@ -107,6 +108,10 @@ class AgenticAttentionOracleConfig:
     htr_projection_dim: int = 128
     htr_hash_embedding_dim: int = 256
     htr_sentence_encoder_batch_size: int = 128
+    htr_sentence_encoder_backend: str = "auto"
+    htr_sentence_pooling: str = "auto"
+    htr_normalize_sentence_embeddings: bool = True
+    htr_trainable_sentence_encoder_layers: int = 0
     htr_dropout: float = 0.1
 
     epochs: int = 3
@@ -207,6 +212,7 @@ def _make_applied_config(
             model_type="agentic_attention_variable_forest",
             feature_extractor_type="hierarchical_transformer",
             htr_sentence_model=config.htr_sentence_model,
+            htr_freeze_sentence_encoder=config.htr_freeze_sentence_encoder,
             htr_chunk_size_words=config.htr_chunk_size_words,
             htr_chunk_overlap_words=config.htr_chunk_overlap_words,
             htr_max_chunks=config.htr_max_chunks,
@@ -217,6 +223,10 @@ def _make_applied_config(
             htr_projection_dim=config.htr_projection_dim,
             htr_hash_embedding_dim=config.htr_hash_embedding_dim,
             htr_sentence_encoder_batch_size=config.htr_sentence_encoder_batch_size,
+            htr_sentence_encoder_backend=config.htr_sentence_encoder_backend,
+            htr_sentence_pooling=config.htr_sentence_pooling,
+            htr_normalize_sentence_embeddings=config.htr_normalize_sentence_embeddings,
+            htr_trainable_sentence_encoder_layers=config.htr_trainable_sentence_encoder_layers,
             htr_dropout=config.htr_dropout,
             explicit_feature_forest=ExplicitFeatureForestConfig(
                 n_estimators=config.cf_n_estimators,
@@ -434,7 +444,11 @@ def _result_row(config_hash: str, result: Dict[str, Any]) -> Dict[str, Any]:
         "model_type",
         "feature_extractor_type",
         "htr_sentence_model",
+        "htr_freeze_sentence_encoder",
         "htr_sentence_encoder_batch_size",
+        "htr_sentence_encoder_backend",
+        "htr_sentence_pooling",
+        "htr_trainable_sentence_encoder_layers",
         "n_folds",
         "nuisance_folds",
         "effect_folds",
@@ -495,6 +509,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text-max-chars", type=int, default=None)
 
     parser.add_argument("--htr-sentence-model", default="prajjwal1/bert-tiny")
+    parser.add_argument("--htr-freeze-sentence-encoder", type=_parse_bool, default=True)
     parser.add_argument("--htr-chunk-size-words", type=int, default=96)
     parser.add_argument("--htr-chunk-overlap-words", type=int, default=24)
     parser.add_argument("--htr-max-chunks", type=int, default=128)
@@ -505,6 +520,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--htr-projection-dim", type=int, default=128)
     parser.add_argument("--htr-hash-embedding-dim", type=int, default=256)
     parser.add_argument("--htr-sentence-encoder-batch-size", type=int, default=128)
+    parser.add_argument(
+        "--htr-sentence-encoder-backend",
+        default="auto",
+        choices=["auto", "sentence_transformers", "transformers"],
+    )
+    parser.add_argument(
+        "--htr-sentence-pooling",
+        default="auto",
+        choices=["auto", "cls", "last", "mean"],
+    )
+    parser.add_argument("--htr-normalize-sentence-embeddings", type=_parse_bool, default=True)
+    parser.add_argument("--htr-trainable-sentence-encoder-layers", type=int, default=0)
     parser.add_argument("--htr-dropout", type=float, default=0.1)
 
     parser.add_argument("--epochs", type=int, default=3)
@@ -579,6 +606,7 @@ def _make_configs(args: argparse.Namespace) -> List[AgenticAttentionOracleConfig
                     sample_size=args.sample_size,
                     text_max_chars=args.text_max_chars,
                     htr_sentence_model=args.htr_sentence_model,
+                    htr_freeze_sentence_encoder=args.htr_freeze_sentence_encoder,
                     htr_chunk_size_words=args.htr_chunk_size_words,
                     htr_chunk_overlap_words=args.htr_chunk_overlap_words,
                     htr_max_chunks=args.htr_max_chunks,
@@ -589,6 +617,12 @@ def _make_configs(args: argparse.Namespace) -> List[AgenticAttentionOracleConfig
                     htr_projection_dim=args.htr_projection_dim,
                     htr_hash_embedding_dim=args.htr_hash_embedding_dim,
                     htr_sentence_encoder_batch_size=args.htr_sentence_encoder_batch_size,
+                    htr_sentence_encoder_backend=args.htr_sentence_encoder_backend,
+                    htr_sentence_pooling=args.htr_sentence_pooling,
+                    htr_normalize_sentence_embeddings=args.htr_normalize_sentence_embeddings,
+                    htr_trainable_sentence_encoder_layers=(
+                        args.htr_trainable_sentence_encoder_layers
+                    ),
                     htr_dropout=args.htr_dropout,
                     epochs=args.epochs,
                     batch_size=args.batch_size,
@@ -650,6 +684,8 @@ def main() -> None:
         parser.error("--nuisance-folds and --effect-folds must be >= 2")
     if args.htr_sentence_encoder_batch_size < 1:
         parser.error("--htr-sentence-encoder-batch-size must be >= 1")
+    if args.htr_trainable_sentence_encoder_layers < 0:
+        parser.error("--htr-trainable-sentence-encoder-layers must be >= 0")
     if any(count < 0 for count in args.initial_feature_counts):
         parser.error("--initial-feature-counts must be >= 0")
 
