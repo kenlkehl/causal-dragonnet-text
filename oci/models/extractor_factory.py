@@ -58,6 +58,7 @@ def create_feature_extractor(
     htr_dropout: float = 0.1,
     htr_projection_dim: int = 128,
     htr_hash_embedding_dim: int = 256,
+    htr_sentence_encoder_batch_size: int = 128,
     # Hierarchical CNN args
     hcnn_embedding_dim: int = 256,
     hcnn_conv_dim: int = 256,
@@ -221,16 +222,18 @@ def create_feature_extractor(
             transformer_dropout=htr_dropout,
             projection_dim=htr_projection_dim,
             hash_embedding_dim=htr_hash_embedding_dim,
+            sentence_encoder_batch_size=htr_sentence_encoder_batch_size,
             device=device,
         )
         logger.info(
             "Created Hierarchical Transformer extractor: model=%s, chunks=%d/%d/%d, "
-            "projection_dim=%d",
+            "projection_dim=%d, sentence_encoder_batch_size=%d",
             htr_sentence_model,
             htr_chunk_size_words,
             htr_chunk_overlap_words,
             htr_max_chunks,
             htr_projection_dim,
+            htr_sentence_encoder_batch_size,
         )
         return extractor
 
@@ -462,6 +465,7 @@ def create_feature_extractor_from_config(
         htr_dropout=config.get('htr_dropout', 0.1),
         htr_projection_dim=config.get('htr_projection_dim', 128),
         htr_hash_embedding_dim=config.get('htr_hash_embedding_dim', 256),
+        htr_sentence_encoder_batch_size=config.get('htr_sentence_encoder_batch_size', 128),
         # Hierarchical CNN args
         hcnn_embedding_dim=config.get('hcnn_embedding_dim', 256),
         hcnn_conv_dim=config.get('hcnn_conv_dim', 256),

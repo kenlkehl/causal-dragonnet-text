@@ -563,6 +563,7 @@ class ModelArchitectureConfig:
     htr_dropout: float = 0.1
     htr_projection_dim: int = 128
     htr_hash_embedding_dim: int = 256
+    htr_sentence_encoder_batch_size: int = 128
 
     # Hierarchical CNN extractor (dilated CNN on chunks + two-level pooling, trains from scratch)
     hcnn_embedding_dim: int = 256

@@ -243,6 +243,22 @@ class TestHierarchicalTransformer:
             "seven eight nine",
         ]
 
+    def test_split_text_into_word_chunks_keeps_tail_when_truncated(self):
+        from oci.models.hierarchical_transformer_extractor import split_text_into_word_chunks
+
+        text = " ".join(f"w{i}" for i in range(1, 21))
+        chunks = split_text_into_word_chunks(
+            text,
+            chunk_size_words=4,
+            chunk_overlap_words=1,
+            max_chunks=3,
+        )
+        assert chunks == [
+            "w11 w12 w13 w14",
+            "w14 w15 w16 w17",
+            "w17 w18 w19 w20",
+        ]
+
 
 class TestLearnedTokenizer:
     def test_fit_and_encode(self):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import re
@@ -278,6 +279,11 @@ class AgenticAttentionVariableForestRunner:
             htr_dropout=getattr(arch, "htr_dropout", 0.1),
             htr_projection_dim=getattr(arch, "htr_projection_dim", 128),
             htr_hash_embedding_dim=getattr(arch, "htr_hash_embedding_dim", 256),
+            htr_sentence_encoder_batch_size=getattr(
+                arch,
+                "htr_sentence_encoder_batch_size",
+                128,
+            ),
         )
 
     def _crossfit_nuisance(self, df: pd.DataFrame, outer_fold: int) -> Dict[str, Any]:
@@ -304,41 +310,107 @@ class AgenticAttentionVariableForestRunner:
         )
 
         def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
-            model = _NuisanceNet(
-                extractor=self._create_extractor(),
-                hidden_dim=getattr(self.config.architecture, "causal_head_hidden_outcome_dim", 64),
-                outcome_type=self.config.outcome_type,
-            ).to(self.device)
-            self._train_nuisance_model(model, df, fit_pos)
-            heldout = df.iloc[heldout_pos]
-            e_hat, m_hat = self._predict_nuisance_model(model, heldout)
-            y = heldout[self.config.outcome_column].to_numpy(dtype=float)
-            t = heldout[self.config.treatment_column].to_numpy(dtype=float)
-            y_resid = y - m_hat
-            t_resid = t - e_hat
-            fold_attention = self._attention_evidence(
-                model.extractor,
-                heldout,
-                fold=fold,
-                outer_fold=outer_fold,
-                stage="nuisance",
-                extra={
+            model = None
+            logger.info(
+                "Outer fold %s nuisance fold %s/%s: train=%s heldout=%s%s",
+                outer_fold,
+                fold,
+                folds,
+                len(fit_pos),
+                len(heldout_pos),
+                self._cuda_memory_summary(),
+            )
+            try:
+                model = _NuisanceNet(
+                    extractor=self._create_extractor(),
+                    hidden_dim=getattr(
+                        self.config.architecture,
+                        "causal_head_hidden_outcome_dim",
+                        64,
+                    ),
+                    outcome_type=self.config.outcome_type,
+                ).to(self.device)
+                self._train_nuisance_model(
+                    model,
+                    df,
+                    fit_pos,
+                    outer_fold=outer_fold,
+                    fold=fold,
+                    total_folds=folds,
+                )
+                heldout = df.iloc[heldout_pos]
+                logger.info(
+                    "Outer fold %s nuisance fold %s/%s: predicting heldout%s",
+                    outer_fold,
+                    fold,
+                    folds,
+                    self._cuda_memory_summary(),
+                )
+                e_hat, m_hat = self._predict_nuisance_model(model, heldout)
+                y = heldout[self.config.outcome_column].to_numpy(dtype=float)
+                t = heldout[self.config.treatment_column].to_numpy(dtype=float)
+                y_resid = y - m_hat
+                t_resid = t - e_hat
+                logger.info(
+                    "Outer fold %s nuisance fold %s/%s: collecting attention evidence",
+                    outer_fold,
+                    fold,
+                    folds,
+                )
+                fold_attention = self._attention_evidence(
+                    model.extractor,
+                    heldout,
+                    fold=fold,
+                    outer_fold=outer_fold,
+                    stage="nuisance",
+                    extra={
+                        "e_hat": e_hat,
+                        "m_hat": m_hat,
+                        "y_residual": y_resid,
+                        "t_residual": t_resid,
+                    },
+                )
+                logger.info(
+                    "Outer fold %s nuisance fold %s/%s complete: attention_rows=%s "
+                    "e_hat_mean=%.4f m_hat_mean=%.4f%s",
+                    outer_fold,
+                    fold,
+                    folds,
+                    len(fold_attention),
+                    float(np.mean(e_hat)),
+                    float(np.mean(m_hat)),
+                    self._cuda_memory_summary(),
+                )
+                return {
+                    "fold": fold,
+                    "heldout_pos": heldout_pos,
                     "e_hat": e_hat,
                     "m_hat": m_hat,
-                    "y_residual": y_resid,
-                    "t_residual": t_resid,
-                },
-            )
-            self._cleanup_model(model)
-            return {
-                "fold": fold,
-                "heldout_pos": heldout_pos,
-                "e_hat": e_hat,
-                "m_hat": m_hat,
-                "y_resid": y_resid,
-                "t_resid": t_resid,
-                "attention": fold_attention,
-            }
+                    "y_resid": y_resid,
+                    "t_resid": t_resid,
+                    "attention": fold_attention,
+                }
+            except RuntimeError as exc:
+                if _is_cuda_oom(exc):
+                    logger.error(
+                        "CUDA OOM in outer fold %s nuisance fold %s/%s%s",
+                        outer_fold,
+                        fold,
+                        folds,
+                        self._cuda_memory_summary(),
+                    )
+                raise
+            finally:
+                if model is not None:
+                    self._cleanup_model(model)
+                    model = None
+                    logger.info(
+                        "Outer fold %s nuisance fold %s/%s: model cleanup complete%s",
+                        outer_fold,
+                        fold,
+                        folds,
+                        self._cuda_memory_summary(),
+                    )
 
         n_jobs = self._fold_n_jobs(folds)
         if n_jobs > 1:
@@ -400,30 +472,98 @@ class AgenticAttentionVariableForestRunner:
         )
 
         def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
-            model = _EffectNet(
-                extractor=self._create_extractor(),
-                hidden_dim=getattr(self.config.architecture, "causal_head_hidden_outcome_dim", 64),
-            ).to(self.device)
-            self._train_effect_model(model, df, fit_pos, targets, weights)
-            heldout = df.iloc[heldout_pos]
-            tau_hat = self._predict_effect_model(model, heldout)
-            heldout_r_loss = (y_resid[heldout_pos] - tau_hat * t_resid[heldout_pos]) ** 2
-            fold_attention = self._attention_evidence(
-                model.extractor,
-                heldout,
-                fold=fold,
-                outer_fold=outer_fold,
-                stage="effect_modifier",
-                extra={"tau_hat_r_stage": tau_hat, "r_loss": heldout_r_loss},
+            model = None
+            logger.info(
+                "Outer fold %s effect fold %s/%s: train=%s heldout=%s%s",
+                outer_fold,
+                fold,
+                folds,
+                len(fit_pos),
+                len(heldout_pos),
+                self._cuda_memory_summary(),
             )
-            self._cleanup_model(model)
-            return {
-                "fold": fold,
-                "heldout_pos": heldout_pos,
-                "tau_hat": tau_hat,
-                "r_loss": heldout_r_loss,
-                "attention": fold_attention,
-            }
+            try:
+                model = _EffectNet(
+                    extractor=self._create_extractor(),
+                    hidden_dim=getattr(
+                        self.config.architecture,
+                        "causal_head_hidden_outcome_dim",
+                        64,
+                    ),
+                ).to(self.device)
+                self._train_effect_model(
+                    model,
+                    df,
+                    fit_pos,
+                    targets,
+                    weights,
+                    outer_fold=outer_fold,
+                    fold=fold,
+                    total_folds=folds,
+                )
+                heldout = df.iloc[heldout_pos]
+                logger.info(
+                    "Outer fold %s effect fold %s/%s: predicting heldout%s",
+                    outer_fold,
+                    fold,
+                    folds,
+                    self._cuda_memory_summary(),
+                )
+                tau_hat = self._predict_effect_model(model, heldout)
+                heldout_r_loss = (y_resid[heldout_pos] - tau_hat * t_resid[heldout_pos]) ** 2
+                logger.info(
+                    "Outer fold %s effect fold %s/%s: collecting attention evidence",
+                    outer_fold,
+                    fold,
+                    folds,
+                )
+                fold_attention = self._attention_evidence(
+                    model.extractor,
+                    heldout,
+                    fold=fold,
+                    outer_fold=outer_fold,
+                    stage="effect_modifier",
+                    extra={"tau_hat_r_stage": tau_hat, "r_loss": heldout_r_loss},
+                )
+                logger.info(
+                    "Outer fold %s effect fold %s/%s complete: attention_rows=%s "
+                    "tau_mean=%.4f r_loss_mean=%.4f%s",
+                    outer_fold,
+                    fold,
+                    folds,
+                    len(fold_attention),
+                    float(np.mean(tau_hat)),
+                    float(np.mean(heldout_r_loss)),
+                    self._cuda_memory_summary(),
+                )
+                return {
+                    "fold": fold,
+                    "heldout_pos": heldout_pos,
+                    "tau_hat": tau_hat,
+                    "r_loss": heldout_r_loss,
+                    "attention": fold_attention,
+                }
+            except RuntimeError as exc:
+                if _is_cuda_oom(exc):
+                    logger.error(
+                        "CUDA OOM in outer fold %s effect fold %s/%s%s",
+                        outer_fold,
+                        fold,
+                        folds,
+                        self._cuda_memory_summary(),
+                    )
+                raise
+            finally:
+                if model is not None:
+                    self._cleanup_model(model)
+                    model = None
+                    logger.info(
+                        "Outer fold %s effect fold %s/%s: model cleanup complete%s",
+                        outer_fold,
+                        fold,
+                        folds,
+                        self._cuda_memory_summary(),
+                    )
 
         n_jobs = self._fold_n_jobs(folds)
         if n_jobs > 1:
@@ -448,16 +588,44 @@ class AgenticAttentionVariableForestRunner:
         self.effect_attention_rows.extend(attention_rows)
         return {"predictions": r_df, "attention": attention_rows}
 
-    def _train_nuisance_model(self, model: _NuisanceNet, df: pd.DataFrame, positions):
+    def _train_nuisance_model(
+        self,
+        model: _NuisanceNet,
+        df: pd.DataFrame,
+        positions,
+        outer_fold: int,
+        fold: int,
+        total_folds: int,
+    ):
         train_config = self.config.training
         optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
             lr=train_config.learning_rate,
             weight_decay=getattr(train_config, "weight_decay", 0.01),
         )
-        for _ in range(train_config.epochs):
+        num_batches = max(1, int(np.ceil(len(positions) / train_config.batch_size)))
+        progress_every = max(1, num_batches // 5)
+        logger.info(
+            "Outer fold %s nuisance fold %s/%s: training for %s epoch(s), "
+            "batch_size=%s, batches/epoch=%s%s",
+            outer_fold,
+            fold,
+            total_folds,
+            train_config.epochs,
+            train_config.batch_size,
+            num_batches,
+            self._cuda_memory_summary(),
+        )
+        for epoch in range(1, train_config.epochs + 1):
             model.train()
-            for batch_pos in _batch_positions(positions, train_config.batch_size, shuffle=True):
+            loss_sum = 0.0
+            prop_sum = 0.0
+            outcome_sum = 0.0
+            batch_count = 0
+            for batch_idx, batch_pos in enumerate(
+                _batch_positions(positions, train_config.batch_size, shuffle=True),
+                start=1,
+            ):
                 batch = df.iloc[batch_pos]
                 texts = batch[self.config.text_column].tolist()
                 t = torch.as_tensor(
@@ -478,6 +646,47 @@ class AgenticAttentionVariableForestRunner:
                 loss = outcome_loss + self.config.training.alpha_propensity * prop_loss
                 loss.backward()
                 self._clip_and_step(model, optimizer)
+                batch_count += 1
+                loss_value = float(loss.detach().cpu())
+                prop_value = float(prop_loss.detach().cpu())
+                outcome_value = float(outcome_loss.detach().cpu())
+                loss_sum += loss_value
+                prop_sum += prop_value
+                outcome_sum += outcome_value
+                if (
+                    batch_idx == 1
+                    or batch_idx == num_batches
+                    or batch_idx % progress_every == 0
+                ):
+                    logger.info(
+                        "Outer fold %s nuisance fold %s/%s epoch %s/%s "
+                        "batch %s/%s loss=%.4f outcome=%.4f propensity=%.4f%s",
+                        outer_fold,
+                        fold,
+                        total_folds,
+                        epoch,
+                        train_config.epochs,
+                        batch_idx,
+                        num_batches,
+                        loss_value,
+                        outcome_value,
+                        prop_value,
+                        self._cuda_memory_summary(),
+                    )
+            denom = max(1, batch_count)
+            logger.info(
+                "Outer fold %s nuisance fold %s/%s epoch %s/%s complete: "
+                "loss=%.4f outcome=%.4f propensity=%.4f%s",
+                outer_fold,
+                fold,
+                total_folds,
+                epoch,
+                train_config.epochs,
+                loss_sum / denom,
+                outcome_sum / denom,
+                prop_sum / denom,
+                self._cuda_memory_summary(),
+            )
 
     def _train_effect_model(
         self,
@@ -486,6 +695,9 @@ class AgenticAttentionVariableForestRunner:
         positions,
         targets: np.ndarray,
         weights: np.ndarray,
+        outer_fold: int,
+        fold: int,
+        total_folds: int,
     ):
         train_config = self.config.training
         optimizer = torch.optim.AdamW(
@@ -493,9 +705,27 @@ class AgenticAttentionVariableForestRunner:
             lr=train_config.learning_rate,
             weight_decay=getattr(train_config, "weight_decay", 0.01),
         )
-        for _ in range(train_config.epochs):
+        num_batches = max(1, int(np.ceil(len(positions) / train_config.batch_size)))
+        progress_every = max(1, num_batches // 5)
+        logger.info(
+            "Outer fold %s effect fold %s/%s: training for %s epoch(s), "
+            "batch_size=%s, batches/epoch=%s%s",
+            outer_fold,
+            fold,
+            total_folds,
+            train_config.epochs,
+            train_config.batch_size,
+            num_batches,
+            self._cuda_memory_summary(),
+        )
+        for epoch in range(1, train_config.epochs + 1):
             model.train()
-            for batch_pos in _batch_positions(positions, train_config.batch_size, shuffle=True):
+            loss_sum = 0.0
+            batch_count = 0
+            for batch_idx, batch_pos in enumerate(
+                _batch_positions(positions, train_config.batch_size, shuffle=True),
+                start=1,
+            ):
                 batch = df.iloc[batch_pos]
                 texts = batch[self.config.text_column].tolist()
                 target = torch.as_tensor(targets[batch_pos], device=self.device)
@@ -505,6 +735,38 @@ class AgenticAttentionVariableForestRunner:
                 loss = torch.mean(weight * torch.square(target - tau))
                 loss.backward()
                 self._clip_and_step(model, optimizer)
+                batch_count += 1
+                loss_value = float(loss.detach().cpu())
+                loss_sum += loss_value
+                if (
+                    batch_idx == 1
+                    or batch_idx == num_batches
+                    or batch_idx % progress_every == 0
+                ):
+                    logger.info(
+                        "Outer fold %s effect fold %s/%s epoch %s/%s "
+                        "batch %s/%s r_loss=%.4f%s",
+                        outer_fold,
+                        fold,
+                        total_folds,
+                        epoch,
+                        train_config.epochs,
+                        batch_idx,
+                        num_batches,
+                        loss_value,
+                        self._cuda_memory_summary(),
+                    )
+            logger.info(
+                "Outer fold %s effect fold %s/%s epoch %s/%s complete: "
+                "r_loss=%.4f%s",
+                outer_fold,
+                fold,
+                total_folds,
+                epoch,
+                train_config.epochs,
+                loss_sum / max(1, batch_count),
+                self._cuda_memory_summary(),
+            )
 
     def _clip_and_step(self, model: nn.Module, optimizer) -> None:
         clip_norm = getattr(self.config.training, "gradient_clip_norm", 0.0)
@@ -553,14 +815,39 @@ class AgenticAttentionVariableForestRunner:
             for key, values in extra.items():
                 item[key] = float(np.asarray(values)[offset])
             metadata.append(item)
-        return extractor.get_attention_evidence(
-            texts,
-            row_ids=row_ids,
-            fold=fold,
-            stage=stage,
-            top_k=self.avf_config.attention_top_k_chunks,
-            metadata=metadata,
-        )
+        batch_size = max(1, int(self.config.training.batch_size))
+        total_batches = max(1, int(np.ceil(len(texts) / batch_size)))
+        progress_every = max(1, total_batches // 5)
+        records: List[Dict[str, Any]] = []
+        for batch_idx, start in enumerate(range(0, len(texts), batch_size), start=1):
+            end = min(start + batch_size, len(texts))
+            records.extend(
+                extractor.get_attention_evidence(
+                    texts[start:end],
+                    row_ids=row_ids[start:end],
+                    fold=fold,
+                    stage=stage,
+                    top_k=self.avf_config.attention_top_k_chunks,
+                    metadata=metadata[start:end],
+                )
+            )
+            if (
+                batch_idx == 1
+                or batch_idx == total_batches
+                or batch_idx % progress_every == 0
+            ):
+                logger.info(
+                    "Outer fold %s %s fold %s: attention batch %s/%s rows=%s/%s%s",
+                    outer_fold,
+                    stage,
+                    fold,
+                    batch_idx,
+                    total_batches,
+                    end,
+                    len(texts),
+                    self._cuda_memory_summary(),
+                )
+        return records
 
     def _discover_variables_from_attention(
         self,
@@ -795,9 +1082,27 @@ class AgenticAttentionVariableForestRunner:
 
     def _cleanup_model(self, model: nn.Module) -> None:
         model.cpu()
-        del model
+        gc.collect()
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
+
+    def _cuda_memory_summary(self) -> str:
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            return ""
+        try:
+            device_index = self.device.index
+            if device_index is None:
+                device_index = torch.cuda.current_device()
+            allocated = torch.cuda.memory_allocated(device_index) / 1e9
+            reserved = torch.cuda.memory_reserved(device_index) / 1e9
+            peak = torch.cuda.max_memory_allocated(device_index) / 1e9
+            return (
+                f" cuda_alloc={allocated:.2f}GB"
+                f" cuda_reserved={reserved:.2f}GB"
+                f" cuda_peak={peak:.2f}GB"
+            )
+        except Exception:
+            return ""
 
     def _fold_n_jobs(self, folds: int) -> int:
         if self.device.type != "cpu":
@@ -1032,6 +1337,11 @@ def _bounded_fold_count(requested: int, n: int) -> int:
     if n < 2:
         raise ValueError("At least two rows are required for cross-fitting")
     return max(2, min(int(requested), int(n)))
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "cuda" in message and "out of memory" in message
 
 
 def _normalize_feature_name(name: Any) -> str:

@@ -106,6 +106,7 @@ class AgenticAttentionOracleConfig:
     htr_transformer_dim: int = 256
     htr_projection_dim: int = 128
     htr_hash_embedding_dim: int = 256
+    htr_sentence_encoder_batch_size: int = 128
     htr_dropout: float = 0.1
 
     epochs: int = 3
@@ -215,6 +216,7 @@ def _make_applied_config(
             htr_transformer_dim=config.htr_transformer_dim,
             htr_projection_dim=config.htr_projection_dim,
             htr_hash_embedding_dim=config.htr_hash_embedding_dim,
+            htr_sentence_encoder_batch_size=config.htr_sentence_encoder_batch_size,
             htr_dropout=config.htr_dropout,
             explicit_feature_forest=ExplicitFeatureForestConfig(
                 n_estimators=config.cf_n_estimators,
@@ -432,6 +434,7 @@ def _result_row(config_hash: str, result: Dict[str, Any]) -> Dict[str, Any]:
         "model_type",
         "feature_extractor_type",
         "htr_sentence_model",
+        "htr_sentence_encoder_batch_size",
         "n_folds",
         "nuisance_folds",
         "effect_folds",
@@ -501,6 +504,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--htr-transformer-dim", type=int, default=256)
     parser.add_argument("--htr-projection-dim", type=int, default=128)
     parser.add_argument("--htr-hash-embedding-dim", type=int, default=256)
+    parser.add_argument("--htr-sentence-encoder-batch-size", type=int, default=128)
     parser.add_argument("--htr-dropout", type=float, default=0.1)
 
     parser.add_argument("--epochs", type=int, default=3)
@@ -584,6 +588,7 @@ def _make_configs(args: argparse.Namespace) -> List[AgenticAttentionOracleConfig
                     htr_transformer_dim=args.htr_transformer_dim,
                     htr_projection_dim=args.htr_projection_dim,
                     htr_hash_embedding_dim=args.htr_hash_embedding_dim,
+                    htr_sentence_encoder_batch_size=args.htr_sentence_encoder_batch_size,
                     htr_dropout=args.htr_dropout,
                     epochs=args.epochs,
                     batch_size=args.batch_size,
@@ -643,6 +648,8 @@ def main() -> None:
         parser.error("--n-folds must be >= 2")
     if args.nuisance_folds < 2 or args.effect_folds < 2:
         parser.error("--nuisance-folds and --effect-folds must be >= 2")
+    if args.htr_sentence_encoder_batch_size < 1:
+        parser.error("--htr-sentence-encoder-batch-size must be >= 1")
     if any(count < 0 for count in args.initial_feature_counts):
         parser.error("--initial-feature-counts must be >= 0")
 

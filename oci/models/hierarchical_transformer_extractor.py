@@ -9,6 +9,7 @@ attention from the pool token is exported as chunk-level evidence.
 import hashlib
 import logging
 import math
+import os
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -24,7 +25,16 @@ def split_text_into_word_chunks(
     chunk_overlap_words: int,
     max_chunks: int,
 ) -> List[str]:
-    """Split text into short overlapping word chunks."""
+    """Split text into short overlapping word chunks.
+
+    If the text is too long for ``max_chunks``, keep the tail of the note. In
+    longitudinal clinical notes, the most recent information is usually at the
+    end of the concatenated history.
+    """
+    if chunk_size_words <= 0:
+        raise ValueError("chunk_size_words must be positive")
+    if max_chunks <= 0:
+        raise ValueError("max_chunks must be positive")
     if chunk_overlap_words >= chunk_size_words:
         raise ValueError("chunk_overlap_words must be smaller than chunk_size_words")
     words = re.findall(r"\S+", str(text or ""))
@@ -32,6 +42,10 @@ def split_text_into_word_chunks(
         return [""]
 
     stride = chunk_size_words - chunk_overlap_words
+    max_window_words = chunk_size_words + (max_chunks - 1) * stride
+    if len(words) > max_window_words:
+        words = words[-max_window_words:]
+
     chunks = []
     start = 0
     while start < len(words) and len(chunks) < max_chunks:
@@ -39,7 +53,7 @@ def split_text_into_word_chunks(
         if chunk_words:
             chunks.append(" ".join(chunk_words))
         start += stride
-    return chunks or [" ".join(words[:chunk_size_words])]
+    return chunks or [" ".join(words[-chunk_size_words:])]
 
 
 class _InterpretableTransformerLayer(nn.Module):
@@ -113,6 +127,7 @@ class HierarchicalTransformerExtractor(nn.Module):
         transformer_dropout: float = 0.1,
         projection_dim: int = 128,
         hash_embedding_dim: int = 256,
+        sentence_encoder_batch_size: int = 128,
         device: Optional[torch.device] = None,
     ):
         super().__init__()
@@ -134,6 +149,12 @@ class HierarchicalTransformerExtractor(nn.Module):
         self._dropout = float(transformer_dropout)
         self._projection_dim = int(projection_dim)
         self._hash_embedding_dim = int(hash_embedding_dim)
+        env_batch_size = os.environ.get("OCI_HTR_ENCODER_BATCH_SIZE")
+        if env_batch_size:
+            sentence_encoder_batch_size = int(env_batch_size)
+        if sentence_encoder_batch_size <= 0:
+            raise ValueError("sentence_encoder_batch_size must be positive")
+        self._sentence_encoder_batch_size = int(sentence_encoder_batch_size)
         self._hash_backend = str(sentence_encoder_model).lower() in {
             "hash",
             "hashed",
@@ -239,28 +260,33 @@ class HierarchicalTransformerExtractor(nn.Module):
         if self._hash_backend:
             return torch.stack([self._hash_chunk_embedding(chunk) for chunk in chunks])
 
-        encoded = self._tokenizer(
-            list(chunks),
-            padding=True,
-            truncation=True,
-            max_length=self._max_chunk_length,
-            return_tensors="pt",
-        )
-        input_ids = encoded["input_ids"].to(self._device)
-        attention_mask = encoded["attention_mask"].to(self._device)
-        with torch.set_grad_enabled(not self._freeze):
-            if self._freeze:
-                with torch.no_grad():
+        chunk_list = list(chunks)
+        outputs_by_batch = []
+        for start in range(0, len(chunk_list), self._sentence_encoder_batch_size):
+            batch_chunks = chunk_list[start:start + self._sentence_encoder_batch_size]
+            encoded = self._tokenizer(
+                batch_chunks,
+                padding=True,
+                truncation=True,
+                max_length=self._max_chunk_length,
+                return_tensors="pt",
+            )
+            input_ids = encoded["input_ids"].to(self._device)
+            attention_mask = encoded["attention_mask"].to(self._device)
+            with torch.set_grad_enabled(not self._freeze):
+                if self._freeze:
+                    with torch.no_grad():
+                        outputs = self._sentence_encoder(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                        )
+                else:
                     outputs = self._sentence_encoder(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                     )
-            else:
-                outputs = self._sentence_encoder(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                )
-        return outputs.last_hidden_state[:, 0, :].float()
+            outputs_by_batch.append(outputs.last_hidden_state[:, 0, :].float())
+        return torch.cat(outputs_by_batch, dim=0)
 
     def _chunks_for_texts(self, texts: Sequence[str]) -> List[List[str]]:
         return [
@@ -420,6 +446,7 @@ class HierarchicalTransformerExtractor(nn.Module):
             "chunk_overlap_words": self._chunk_overlap_words,
             "max_chunks": self._max_chunks,
             "max_chunk_length": self._max_chunk_length,
+            "sentence_encoder_batch_size": self._sentence_encoder_batch_size,
             "num_transformer_layers": self._num_layers,
             "num_attention_heads": self._num_heads,
             "transformer_dim": self._transformer_dim,
