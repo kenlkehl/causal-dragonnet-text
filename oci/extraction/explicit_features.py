@@ -47,6 +47,7 @@ import logging
 import re
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -463,6 +464,10 @@ class VLLMFeatureExtractor:
         # Return best partial result, or all-missing if no successful parse
         if best_result is not None:
             return best_result
+        return self._missing_result()
+
+    def _missing_result(self) -> Dict[str, ExplicitFeatureValue]:
+        """Return a missing-value result for every requested feature."""
         return {
             spec.name: ExplicitFeatureValue(
                 name=spec.name, type=spec.type, value=None, is_missing=True
@@ -517,12 +522,7 @@ class VLLMFeatureExtractor:
                 content = output.outputs[0].text.strip()
                 result = parse_extraction_response(content, self.specs)
             else:
-                result = {
-                    spec.name: ExplicitFeatureValue(
-                        name=spec.name, type=spec.type, value=None, is_missing=True
-                    )
-                    for spec in self.specs
-                }
+                result = self._missing_result()
             results.append(result)
 
         return results
@@ -548,14 +548,36 @@ class VLLMFeatureExtractor:
         if self.mode == "python_api":
             # Process all at once (vLLM handles batching internally)
             return self._extract_batch_python_api(texts)
-        else:
-            # Server mode: process with progress bar
+
+        max_workers = max(1, min(len(texts), int(batch_size or 1)))
+        if max_workers == 1:
             results = []
             iterator = tqdm(texts, desc="Extracting features") if show_progress else texts
             for text in iterator:
-                result = self._extract_single_server(text)
-                results.append(result)
+                results.append(self._extract_single_server(text))
             return results
+
+        logger.info(
+            "Running vLLM server extraction with %s concurrent request(s)",
+            max_workers,
+        )
+        results: List[Optional[Dict[str, ExplicitFeatureValue]]] = [None] * len(texts)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx = {
+                executor.submit(self._extract_single_server, text): idx
+                for idx, text in enumerate(texts)
+            }
+            futures = as_completed(future_to_idx)
+            iterator = (
+                tqdm(futures, total=len(future_to_idx), desc="Extracting features")
+                if show_progress
+                else futures
+            )
+            for future in iterator:
+                idx = future_to_idx[future]
+                results[idx] = future.result()
+
+        return [result if result is not None else self._missing_result() for result in results]
 
     def extract_to_dataframe(
         self,

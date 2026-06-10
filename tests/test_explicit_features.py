@@ -2,6 +2,7 @@ import pytest
 
 from oci.config import ExperimentConfig, ExplicitFeatureSpec
 from oci.extraction import (
+    ExplicitFeatureValue,
     VLLMFeatureExtractor,
     infer_vllm_reasoning_parser,
     parse_extraction_response,
@@ -203,6 +204,63 @@ def test_vllm_feature_extractor_request_does_not_set_timeout():
     assert "timeout" not in calls
     assert result["age"].value == 41.0
     assert result["age"].is_missing is False
+
+
+def test_vllm_feature_extractor_server_uses_batch_size_for_concurrency(monkeypatch):
+    calls = {"submitted": []}
+
+    class FakeFuture:
+        def __init__(self, result):
+            self._result = result
+
+        def result(self):
+            return self._result
+
+    class FakeExecutor:
+        def __init__(self, max_workers):
+            calls["max_workers"] = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def submit(self, fn, text):
+            calls["submitted"].append(text)
+            return FakeFuture(fn(text))
+
+    monkeypatch.setattr("oci.extraction.explicit_features.ThreadPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(
+        "oci.extraction.explicit_features.as_completed",
+        lambda futures: list(futures)[::-1],
+    )
+
+    extractor = VLLMFeatureExtractor(
+        specs=[
+            ExplicitFeatureSpec(name="age", type="continuous", roles=["confounder"]),
+        ],
+        mode="server",
+    )
+    monkeypatch.setattr(extractor, "_ensure_initialized", lambda: None)
+
+    def fake_extract(text):
+        return {
+            "age": ExplicitFeatureValue(
+                name="age",
+                type="continuous",
+                value=float(text),
+                is_missing=False,
+            )
+        }
+
+    monkeypatch.setattr(extractor, "_extract_single_server", fake_extract)
+
+    results = extractor.extract(["1", "2", "3"], batch_size=2, show_progress=False)
+
+    assert calls["max_workers"] == 2
+    assert calls["submitted"] == ["1", "2", "3"]
+    assert [row["age"].value for row in results] == [1.0, 2.0, 3.0]
 
 
 def test_experiment_config_rejects_old_explicit_confounder_keys():
