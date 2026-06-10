@@ -186,6 +186,7 @@ class CausalTextForest(nn.Module):
         # R-learner representation training args
         cf_use_rlearner_representation: bool = False,
         cf_gamma_rlearner: float = 1.0,
+        cf_rlearner_representation_mode: Optional[str] = None,
         # Explicit confounder args (raw features for causal forest, MLP for Stage 1 training)
         explicit_feature_specs: Optional[List[ExplicitFeatureSpec]] = None,
         explicit_feature_output_dim: int = 64,
@@ -213,6 +214,16 @@ class CausalTextForest(nn.Module):
         self._device = torch.device(device)
         self.outcome_type = outcome_type
         self.feature_extractor_type = normalize_feature_extractor_type(feature_extractor_type)
+        self.rlearner_representation_mode = self._resolve_rlearner_representation_mode(
+            cf_use_rlearner_representation,
+            cf_rlearner_representation_mode,
+        )
+        self._use_staged_separate_nets = (
+            self.rlearner_representation_mode == "staged_separate_nets"
+        )
+        self._use_shared_rlearner_features = (
+            self.rlearner_representation_mode == "shared_features"
+        )
         if explicit_feature_specs is None:
             explicit_feature_specs = explicit_confounder_specs
             explicit_feature_output_dim = explicit_confounder_output_dim
@@ -337,6 +348,7 @@ class CausalTextForest(nn.Module):
             'cf_random_state': cf_random_state,
             'cf_use_rlearner_representation': cf_use_rlearner_representation,
             'cf_gamma_rlearner': cf_gamma_rlearner,
+            'cf_rlearner_representation_mode': self.rlearner_representation_mode,
             'explicit_feature_specs': explicit_feature_specs,
             'explicit_feature_output_dim': explicit_feature_output_dim,
             'explicit_feature_hidden_dim': explicit_feature_hidden_dim,
@@ -368,8 +380,16 @@ class CausalTextForest(nn.Module):
         else:
             self._explicit_feature_raw_dim = 0
 
-        self.explicit_nuisance_specs = filter_specs_by_role(self.explicit_feature_specs, "confounder")
-        self.explicit_effect_specs = filter_specs_by_role(self.explicit_feature_specs, "effect_modifier")
+        if self._use_shared_rlearner_features:
+            self.explicit_nuisance_specs = list(self.explicit_feature_specs)
+            self.explicit_effect_specs = list(self.explicit_feature_specs)
+        else:
+            self.explicit_nuisance_specs = filter_specs_by_role(
+                self.explicit_feature_specs, "confounder"
+            )
+            self.explicit_effect_specs = filter_specs_by_role(
+                self.explicit_feature_specs, "effect_modifier"
+            )
 
         def make_role_featurizer(specs: List[ExplicitFeatureSpec], role: str):
             if not specs:
@@ -386,12 +406,19 @@ class CausalTextForest(nn.Module):
                 device=str(self._device),
             )
 
-        self.explicit_nuisance_featurizer = make_role_featurizer(
-            self.explicit_nuisance_specs, "confounder/W"
-        )
-        self.explicit_effect_featurizer = make_role_featurizer(
-            self.explicit_effect_specs, "effect_modifier/X"
-        )
+        if self._use_shared_rlearner_features:
+            shared_featurizer = make_role_featurizer(
+                self.explicit_feature_specs, "shared/X"
+            )
+            self.explicit_nuisance_featurizer = shared_featurizer
+            self.explicit_effect_featurizer = shared_featurizer
+        else:
+            self.explicit_nuisance_featurizer = make_role_featurizer(
+                self.explicit_nuisance_specs, "confounder/W"
+            )
+            self.explicit_effect_featurizer = make_role_featurizer(
+                self.explicit_effect_specs, "effect_modifier/X"
+            )
         self.explicit_feature_featurizer = self.explicit_nuisance_featurizer
 
         # Initialize feature extractor using factory
@@ -463,7 +490,7 @@ class CausalTextForest(nn.Module):
             cecnn_random_confounder_features=cecnn_random_confounder_features,
             cecnn_random_modifier_features=cecnn_random_modifier_features,
             cecnn_kernel_role=(
-                "confounder" if cf_use_rlearner_representation else "combined"
+                "confounder" if self._use_staged_separate_nets else "combined"
             ),
             cecnn_projection_dim=cecnn_projection_dim,
             cecnn_dropout=cecnn_dropout,
@@ -481,7 +508,7 @@ class CausalTextForest(nn.Module):
             ctcnn_random_confounder_features=ctcnn_random_confounder_features,
             ctcnn_random_modifier_features=ctcnn_random_modifier_features,
             ctcnn_kernel_role=(
-                "confounder" if cf_use_rlearner_representation else "combined"
+                "confounder" if self._use_staged_separate_nets else "combined"
             ),
             ctcnn_projection_dim=ctcnn_projection_dim,
             ctcnn_dropout=ctcnn_dropout,
@@ -546,11 +573,11 @@ class CausalTextForest(nn.Module):
         # When enabled, the nuisance extractor/branch learns W for e(W), m(W),
         # while a separate effect extractor/branch learns X for tau(X) from
         # fixed out-of-fold nuisance predictions.
-        self.use_rlearner_representation = cf_use_rlearner_representation
+        self.use_rlearner_representation = self.rlearner_representation_mode != "none"
         self.cf_gamma_rlearner = cf_gamma_rlearner
         self.effect_feature_extractor = None
 
-        if cf_use_rlearner_representation:
+        if self._use_staged_separate_nets:
             self.effect_feature_extractor = create_feature_extractor(
                 extractor_type=self.feature_extractor_type,
                 device=self._device,
@@ -664,6 +691,10 @@ class CausalTextForest(nn.Module):
             logger.info("  R-learner representation training: ENABLED (staged separate nets)")
             logger.info(f"    Nuisance extractor: {self.feature_extractor_type} -> W, e(W), m(W)")
             logger.info(f"    Effect extractor: {self.feature_extractor_type} -> X, tau(X)")
+        elif self._use_shared_rlearner_features:
+            self.effect_head = None
+            logger.info("  R-learner representation training: ENABLED (shared features)")
+            logger.info("    Single extractor -> X, e(X), m(X), tau(X); no W controls")
         else:
             self.effect_head = None
 
@@ -685,6 +716,35 @@ class CausalTextForest(nn.Module):
         logger.info(f"  Feature extractor: {self.feature_extractor_type}")
         logger.info(f"  Feature dim: {input_dim}")
         logger.info(f"  Causal forest: {cf_n_estimators} trees, honest={cf_honest}")
+
+    @staticmethod
+    def _resolve_rlearner_representation_mode(
+        cf_use_rlearner_representation: bool,
+        cf_rlearner_representation_mode: Optional[str],
+    ) -> str:
+        """Resolve legacy boolean and explicit representation mode."""
+        if cf_rlearner_representation_mode is None:
+            return "staged_separate_nets" if cf_use_rlearner_representation else "none"
+
+        normalized = str(cf_rlearner_representation_mode).strip().lower()
+        aliases = {
+            "false": "none",
+            "off": "none",
+            "disabled": "none",
+            "none": "none",
+            "shared": "shared_features",
+            "shared_features": "shared_features",
+            "shared_rlearner": "shared_features",
+            "staged": "staged_separate_nets",
+            "xw": "staged_separate_nets",
+            "staged_separate_nets": "staged_separate_nets",
+        }
+        if normalized not in aliases:
+            raise ValueError(
+                "cf_rlearner_representation_mode must be one of "
+                "'none', 'shared_features', or 'staged_separate_nets'"
+            )
+        return aliases[normalized]
 
     def fit_tokenizer(self, texts):
         """Fit tokenizer for trainable-from-scratch extractors. No-op for LLM-based."""
@@ -848,11 +908,12 @@ class CausalTextForest(nn.Module):
         stop_grad_propensity: bool = False
     ) -> Dict[str, torch.Tensor]:
         """
-        Compatibility wrapper for nuisance representation training.
+        Compatibility wrapper for representation training.
 
-        Staged R-learner representation training now uses train_nuisance_step()
-        followed by train_effect_r_step() with out-of-fold nuisance predictions.
-        This method intentionally trains only e(W) and m(W).
+        In shared R-learner mode this trains the single extractor with
+        propensity, outcome, and R-loss objectives. In staged mode this keeps
+        the legacy nuisance-only behavior; the effect extractor is trained
+        separately by train_effect_r_step().
 
         Args:
             batch: Dictionary with 'texts', 'treatment', 'outcome' keys.
@@ -865,7 +926,15 @@ class CausalTextForest(nn.Module):
         Returns:
             Dictionary with loss components
         """
-        del gamma_rlearner
+        if self._use_shared_rlearner_features:
+            return self.train_shared_rlearner_step(
+                batch=batch,
+                alpha_propensity=alpha_propensity,
+                gamma_rlearner=gamma_rlearner,
+                label_smoothing=label_smoothing,
+                stop_grad_propensity=stop_grad_propensity,
+            )
+
         result = self.train_nuisance_step(
             batch=batch,
             alpha_propensity=alpha_propensity,
@@ -873,6 +942,105 @@ class CausalTextForest(nn.Module):
             stop_grad_propensity=stop_grad_propensity,
         )
         result['r_loss'] = torch.tensor(0.0, device=self._device)
+        return result
+
+    def train_shared_rlearner_step(
+        self,
+        batch: Dict[str, Any],
+        alpha_propensity: float = 1.0,
+        gamma_rlearner: float = 1.0,
+        label_smoothing: float = 0.0,
+        stop_grad_propensity: bool = False,
+        e_clip: float = 0.01,
+    ) -> Dict[str, torch.Tensor]:
+        """Train one shared extractor with e(X), m(X), and tau(X) losses."""
+        texts = batch['texts']
+        treatments = batch['treatment']
+        outcomes = batch['outcome']
+        explicit_feature_values = batch.get('explicit_feature_values', None)
+        extractor_input = self._get_extractor_input(batch, texts)
+
+        if label_smoothing > 0:
+            treatments_smooth = treatments * (1 - label_smoothing) + 0.5 * label_smoothing
+            outcomes_smooth = (
+                outcomes * (1 - label_smoothing) + 0.5 * label_smoothing
+                if self.outcome_type == "binary"
+                else outcomes
+            )
+        else:
+            treatments_smooth = treatments
+            outcomes_smooth = outcomes
+
+        text_features = self.feature_extractor(extractor_input)
+        w_hidden, propensity_logit, outcome_logit = self._nuisance_forward(
+            text_features, explicit_feature_values
+        )
+        x_hidden, tau = self._effect_forward(text_features, explicit_feature_values)
+
+        if stop_grad_propensity:
+            _, detached_propensity_logit, _ = self._nuisance_forward(
+                text_features.detach(), explicit_feature_values
+            )
+            propensity_logit_for_loss = detached_propensity_logit
+        else:
+            propensity_logit_for_loss = propensity_logit
+
+        propensity_loss = F.binary_cross_entropy_with_logits(
+            propensity_logit_for_loss.squeeze(-1),
+            treatments_smooth,
+        )
+        outcome_loss = self._outcome_loss(outcome_logit.squeeze(-1), outcomes_smooth)
+
+        e_clip = float(e_clip)
+        if not 0.0 < e_clip < 0.5:
+            raise ValueError("e_clip must be in (0, 0.5)")
+        e_hat = torch.sigmoid(propensity_logit).detach().clamp(e_clip, 1.0 - e_clip)
+        m_hat = self._outcome_activation(outcome_logit).detach()
+        y_residual = outcomes - m_hat.squeeze(-1)
+        t_residual = treatments - e_hat.squeeze(-1)
+        r_loss = ((y_residual - tau.squeeze(-1) * t_residual) ** 2).mean()
+
+        total_loss = (
+            outcome_loss
+            + alpha_propensity * propensity_loss
+            + gamma_rlearner * r_loss
+        )
+        anchor_loss = self._extractor_anchor_loss(self.feature_extractor)
+        total_loss = total_loss + anchor_loss
+        regularization_losses = self._extractor_regularization_losses(self.feature_extractor)
+        regularization_loss = (
+            sum(regularization_losses.values())
+            if regularization_losses
+            else torch.tensor(0.0, device=self._device)
+        )
+        total_loss = total_loss + regularization_loss
+
+        with torch.no_grad():
+            m_pred = self._outcome_activation(outcome_logit)
+            prop = torch.sigmoid(propensity_logit)
+            y0_pred = m_pred - prop * tau
+            y1_pred = m_pred + (1.0 - prop) * tau
+            if self.outcome_type == "binary":
+                y0_pred = y0_pred.clamp(0.0, 1.0)
+                y1_pred = y1_pred.clamp(0.0, 1.0)
+
+        result = {
+            'loss': total_loss,
+            'outcome_loss': outcome_loss.detach(),
+            'propensity_loss': propensity_loss.detach(),
+            'r_loss': r_loss.detach(),
+            'anchor_loss': anchor_loss.detach(),
+            'regularization_loss': regularization_loss.detach(),
+            'propensity_logit': propensity_logit.detach(),
+            'outcome_logit': outcome_logit.detach(),
+            'tau': tau.detach(),
+            'w_hidden': w_hidden.detach(),
+            'x_hidden': x_hidden.detach(),
+            'pred_y0': y0_pred.detach(),
+            'pred_y1': y1_pred.detach(),
+        }
+        for name, value in regularization_losses.items():
+            result[name] = value.detach()
         return result
 
     def train_nuisance_step(
@@ -1086,10 +1254,9 @@ class CausalTextForest(nn.Module):
         """
         Extract EconML X/W feature matrices plus nuisance predictions.
 
-        X receives effect-modifier information: learned X activations and raw
-        explicit features with role="effect_modifier". W receives confounder
-        information: learned W activations and raw explicit features with
-        role="confounder". Both-role explicit features appear in both matrices.
+        In staged mode, X receives effect-modifier information and W receives
+        confounder information. In shared R-learner mode, the extractor output
+        and all raw explicit features are treated as X, with W left as None.
         """
         from torch.utils.data import DataLoader
 
@@ -1103,7 +1270,7 @@ class CausalTextForest(nn.Module):
         all_outcome = []
         all_feature_values = []
 
-        use_wx_activations = self.use_rlearner_representation
+        use_wx_activations = self._use_staged_separate_nets
 
         is_batch_iterable = isinstance(texts_or_loader, DataLoader) or (
             hasattr(texts_or_loader, '__iter__') and not isinstance(texts_or_loader, (list, str))
@@ -1169,10 +1336,14 @@ class CausalTextForest(nn.Module):
 
         feature_values_for_raw = all_feature_values if all_feature_values else explicit_feature_values
         if feature_values_for_raw is not None and self.explicit_feature_specs:
-            raw_w = self._get_raw_explicit_features(feature_values_for_raw, role="confounder")
-            raw_x = self._get_raw_explicit_features(feature_values_for_raw, role="effect_modifier")
-            x_features = self._hstack_optional(x_features, raw_x)
-            w_features = self._hstack_optional(w_features, raw_w)
+            if self._use_shared_rlearner_features:
+                raw_x = self._get_raw_explicit_features(feature_values_for_raw, role=None)
+                x_features = self._hstack_optional(x_features, raw_x)
+            else:
+                raw_w = self._get_raw_explicit_features(feature_values_for_raw, role="confounder")
+                raw_x = self._get_raw_explicit_features(feature_values_for_raw, role="effect_modifier")
+                x_features = self._hstack_optional(x_features, raw_x)
+                w_features = self._hstack_optional(w_features, raw_w)
 
         return (
             x_features,

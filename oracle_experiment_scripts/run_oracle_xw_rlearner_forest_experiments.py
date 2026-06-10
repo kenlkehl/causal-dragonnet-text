@@ -93,6 +93,7 @@ class XWRLearnerForestConfig:
     model_type: str = "causal_forest"
     rlearner_mode: str = "staged_separate_nets"
     xw_feature_split: bool = True
+    cf_rlearner_representation_mode: Optional[str] = None
     use_explicit_features: bool = False
     # Compatibility alias for older analysis scripts.
     use_explicit_confounders: bool = False
@@ -259,18 +260,30 @@ class XWRLearnerForestConfig:
 
     def __post_init__(self):
         self.model_type = "causal_forest"
-        self.rlearner_mode = (
-            "matched_contrastive_effect"
-            if self.contrastive_effect_enabled
-            else "staged_separate_nets"
-        )
-        self.xw_feature_split = True
+        requested_mode = str(
+            self.cf_rlearner_representation_mode
+            or self.rlearner_mode
+            or "staged_separate_nets"
+        ).strip().lower()
+        if self.contrastive_effect_enabled:
+            self.rlearner_mode = "matched_contrastive_effect"
+            self.xw_feature_split = True
+            self.cf_rlearner_representation_mode = "staged_separate_nets"
+        elif requested_mode in {"shared", "shared_features", "shared_rlearner"} or not self.xw_feature_split:
+            self.rlearner_mode = "shared_features"
+            self.xw_feature_split = False
+            self.cf_rlearner_representation_mode = "shared_features"
+        else:
+            self.rlearner_mode = "staged_separate_nets"
+            self.xw_feature_split = True
+            self.cf_rlearner_representation_mode = "staged_separate_nets"
         self.use_explicit_confounders = self.use_explicit_features
         self.flp_downprojection_dim = None
         self.hlm_downprojection_dim = None
 
     def config_hash(self) -> str:
         d = asdict(self)
+        d.pop("cf_rlearner_representation_mode", None)
         keep_prefixes = self._EXTRACTOR_PREFIXES.get(
             self.feature_extractor_type, set()
         )
@@ -612,7 +625,10 @@ def _make_xw_model(
             cf_min_samples_leaf=config.cf_min_samples_leaf,
             cf_honest=True,
             cf_inference=True,
-            cf_use_rlearner_representation=True,
+            cf_use_rlearner_representation=(
+                config.cf_rlearner_representation_mode != "none"
+            ),
+            cf_rlearner_representation_mode=config.cf_rlearner_representation_mode,
             cf_gamma_rlearner=config.gamma_rlearner,
             explicit_feature_specs=explicit_feature_specs,
         )
@@ -1020,6 +1036,212 @@ def _train_effect_stage(
     }
 
 
+def _train_shared_representation_stage(
+    model: CausalTextForest,
+    train_loader: DataLoader,
+    config: XWRLearnerForestConfig,
+    device: torch.device,
+    use_cached: bool,
+    gpu_store,
+) -> Dict[str, Any]:
+    """Train a single extractor with propensity, outcome, and shared R-loss."""
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=config.learning_rate, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
+    history: List[Dict[str, Any]] = []
+
+    for epoch in range(config.epochs):
+        model.train()
+        epoch_losses: List[float] = []
+        epoch_outcome_losses: List[float] = []
+        epoch_propensity_losses: List[float] = []
+        epoch_r_losses: List[float] = []
+
+        for batch in train_loader:
+            batch["treatment"] = batch["treatment"].to(device)
+            batch["outcome"] = batch["outcome"].to(device)
+            if use_cached:
+                prepare_cached_batch(batch, device, gpu_store=gpu_store)
+
+            optimizer.zero_grad(set_to_none=True)
+            losses = model.train_shared_rlearner_step(
+                batch,
+                alpha_propensity=1.0,
+                gamma_rlearner=config.gamma_rlearner,
+                e_clip=config.rlearner_effect_e_clip,
+            )
+            losses["loss"].backward()
+            torch.nn.utils.clip_grad_norm_(params, config.rlearner_effect_grad_clip)
+            optimizer.step()
+
+            epoch_losses.append(float(losses["loss"].detach().cpu()))
+            epoch_outcome_losses.append(float(losses["outcome_loss"].detach().cpu()))
+            epoch_propensity_losses.append(float(losses["propensity_loss"].detach().cpu()))
+            epoch_r_losses.append(float(losses["r_loss"].detach().cpu()))
+
+        scheduler.step()
+        history.append(
+            {
+                "epoch": epoch + 1,
+                "mean_loss": float(np.mean(epoch_losses)) if epoch_losses else float("nan"),
+                "mean_outcome_loss": (
+                    float(np.mean(epoch_outcome_losses))
+                    if epoch_outcome_losses
+                    else float("nan")
+                ),
+                "mean_propensity_loss": (
+                    float(np.mean(epoch_propensity_losses))
+                    if epoch_propensity_losses
+                    else float("nan")
+                ),
+                "mean_r_loss": float(np.mean(epoch_r_losses)) if epoch_r_losses else float("nan"),
+                "num_batches": len(epoch_losses),
+            }
+        )
+
+    return {
+        "shared_r_loss_history": history,
+        "shared_extractor": _slot_extractor_summary(
+            getattr(model, "feature_extractor", None)
+        ),
+        "forest_x_representation": "extractor_output",
+        "forest_w_representation": None,
+    }
+
+
+def run_shared_rlearner_forest_experiment(
+    config: XWRLearnerForestConfig,
+    device: torch.device,
+    df: pd.DataFrame,
+    explicit_feature_specs: List[ExplicitFeatureSpec],
+    explicit_feature_cols: Optional[List[str]],
+    gpu_store,
+    hidden_state_cache,
+) -> Dict[str, Any]:
+    """Run K-fold CV for shared slot/text features -> CausalForestDML."""
+    text_column = "clinical_text"
+    batch_size = config.batch_size
+    df = df.reset_index(drop=True)
+    kf = KFold(n_splits=config.n_folds, shuffle=True, random_state=42 + config.repeat_index)
+
+    all_predictions = []
+    diagnostics: Dict[str, Any] = {"folds": []}
+    use_cached = gpu_store is not None or hidden_state_cache is not None
+
+    for fold, (train_idx, test_idx) in enumerate(kf.split(df)):
+        train_df = df.iloc[train_idx]
+        test_df = df.iloc[test_idx]
+
+        model = _make_xw_model(
+            config,
+            device,
+            explicit_feature_specs,
+            gpu_store,
+            hidden_state_cache,
+            tokenizer_texts=train_df[text_column].tolist(),
+        )
+        (
+            train_dataset,
+            _test_dataset,
+            train_loader,
+            test_loader,
+            _collate_fn,
+            dl_kwargs,
+        ) = _create_datasets_and_loaders(
+            train_df,
+            test_df,
+            train_idx,
+            test_idx,
+            text_column,
+            explicit_feature_cols,
+            batch_size,
+            hidden_state_cache,
+            gpu_store,
+        )
+
+        _fit_explicit_feature_state(model, train_dataset)
+        shared_diagnostics = _train_shared_representation_stage(
+            model,
+            train_loader,
+            config,
+            device,
+            use_cached,
+            gpu_store,
+        )
+
+        train_eval_loader = _make_combined_loader(
+            train_df,
+            np.asarray(train_idx),
+            text_column,
+            explicit_feature_cols,
+            batch_size,
+            hidden_state_cache,
+            gpu_store,
+            dl_kwargs,
+        )
+
+        train_T = train_df["treatment_indicator"].values
+        train_Y = train_df["outcome_indicator"].values
+        cf_kwargs = dict(gpu_store=gpu_store) if use_cached else {}
+        model.train_causal_forest(train_eval_loader, train_T, train_Y, **cf_kwargs)
+        preds = model.predict(test_loader, return_ci=True, **cf_kwargs)
+
+        diagnostics["folds"].append(
+            {
+                "fold": fold + 1,
+                "n_train": int(len(train_df)),
+                "n_test": int(len(test_df)),
+                "shared_stage": shared_diagnostics,
+            }
+        )
+
+        fold_preds = test_df.copy()
+        fold_preds["pred_y0_prob"] = preds["pred_y0_prob"]
+        fold_preds["pred_y1_prob"] = preds["pred_y1_prob"]
+        fold_preds["pred_ite_prob"] = preds["pred_ite_prob"]
+        fold_preds["pred_propensity"] = preds["propensity_prob"]
+        fold_preds["pred_tau"] = preds["tau_pred"]
+        fold_preds["cv_fold"] = fold + 1
+        if "tau_lower" in preds:
+            fold_preds["pred_tau_lower"] = preds["tau_lower"]
+            fold_preds["pred_tau_upper"] = preds["tau_upper"]
+
+        all_predictions.append(fold_preds)
+
+        del model
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    results_df = pd.concat(all_predictions).sort_index()
+    metrics = compute_metrics(
+        pred_ite=results_df["pred_ite_prob"].values,
+        true_ite=results_df["true_ite_prob"].values,
+        pred_propensity=results_df["pred_propensity"].values,
+        true_treatment=results_df["treatment_indicator"].values,
+        pred_y0=results_df["pred_y0_prob"].values,
+        pred_y1=results_df["pred_y1_prob"].values,
+        true_y0=results_df["true_y0_prob"].values,
+        true_y1=results_df["true_y1_prob"].values,
+        true_outcome=results_df["outcome_indicator"].values,
+        tau_lower=(
+            results_df["pred_tau_lower"].values
+            if "pred_tau_lower" in results_df.columns
+            else None
+        ),
+        tau_upper=(
+            results_df["pred_tau_upper"].values
+            if "pred_tau_upper" in results_df.columns
+            else None
+        ),
+    )
+    return {
+        "metrics": metrics,
+        "n_samples": len(results_df),
+        "diagnostics": diagnostics,
+    }
+
+
 def run_xw_rlearner_forest_experiment(
     config: XWRLearnerForestConfig,
     device: torch.device,
@@ -1303,15 +1525,26 @@ def run_single_experiment(
         gpu_store_registry,
     )
 
-    result = run_xw_rlearner_forest_experiment(
-        config,
-        device_obj,
-        df,
-        explicit_feature_specs,
-        explicit_feature_cols,
-        gpu_store,
-        hidden_state_cache,
-    )
+    if config.rlearner_mode == "shared_features":
+        result = run_shared_rlearner_forest_experiment(
+            config,
+            device_obj,
+            df,
+            explicit_feature_specs,
+            explicit_feature_cols,
+            gpu_store,
+            hidden_state_cache,
+        )
+    else:
+        result = run_xw_rlearner_forest_experiment(
+            config,
+            device_obj,
+            df,
+            explicit_feature_specs,
+            explicit_feature_cols,
+            gpu_store,
+            hidden_state_cache,
+        )
 
     return {
         "config": asdict(config),
