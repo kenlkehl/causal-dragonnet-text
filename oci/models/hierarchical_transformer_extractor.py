@@ -300,6 +300,15 @@ class HierarchicalTransformerExtractor(nn.Module):
         self._input_projection = nn.Linear(self._sentence_dim, self._transformer_dim).to(
             self._device
         )
+        logger.info(
+            "Chunk encoder initialized with backend=%s pooling=%s hidden_dim=%s "
+            "trainable_encoder_params=%s/%s",
+            self._effective_sentence_encoder_backend(),
+            self._effective_sentence_pooling(),
+            self._sentence_dim,
+            self._trainable_sentence_encoder_parameter_count(),
+            self._total_sentence_encoder_parameter_count(),
+        )
 
     def _effective_sentence_encoder_backend(self) -> str:
         if self._sentence_encoder_backend != "auto":
@@ -381,6 +390,20 @@ class HierarchicalTransformerExtractor(nn.Module):
             if isinstance(module, (nn.ModuleList, list, tuple)) and len(module) > 0:
                 return list(module)
         return []
+
+    def _total_sentence_encoder_parameter_count(self) -> int:
+        if self._sentence_encoder is None:
+            return 0
+        return sum(param.numel() for param in self._sentence_encoder.parameters())
+
+    def _trainable_sentence_encoder_parameter_count(self) -> int:
+        if self._sentence_encoder is None:
+            return 0
+        return sum(
+            param.numel()
+            for param in self._sentence_encoder.parameters()
+            if param.requires_grad
+        )
 
     def _hash_chunk_embedding(self, chunk: str) -> torch.Tensor:
         vec = torch.zeros(self._hash_embedding_dim, dtype=torch.float32, device=self._device)
@@ -565,6 +588,13 @@ class HierarchicalTransformerExtractor(nn.Module):
     def fit_tokenizer(self, texts: List[str]) -> None:
         del texts
         self._ensure_encoder_initialized()
+        logger.info(
+            "HierarchicalTransformerExtractor ready: backend=%s pooling=%s "
+            "trainable_params=%s",
+            self._effective_sentence_encoder_backend(),
+            self._effective_sentence_pooling(),
+            self.get_num_parameters(),
+        )
 
     def interpret_attention(self, texts: List[str], top_k: int = 5) -> List[Dict[str, Any]]:
         self.eval()
@@ -649,6 +679,9 @@ class HierarchicalTransformerExtractor(nn.Module):
             "effective_sentence_pooling": self._effective_sentence_pooling(),
             "normalize_sentence_embeddings": self._normalize_sentence_embeddings,
             "trainable_sentence_encoder_layers": self._trainable_sentence_encoder_layers,
+            "trainable_sentence_encoder_params": (
+                self._trainable_sentence_encoder_parameter_count()
+            ),
             "num_transformer_layers": self._num_layers,
             "num_attention_heads": self._num_heads,
             "transformer_dim": self._transformer_dim,

@@ -259,6 +259,27 @@ class TestHierarchicalTransformer:
             "w17 w18 w19 w20",
         ]
 
+    def test_sentence_encoder_backend_and_pooling_defaults(self):
+        from oci.models.hierarchical_transformer_extractor import (
+            HierarchicalTransformerExtractor,
+        )
+
+        bert = HierarchicalTransformerExtractor(sentence_encoder_model="prajjwal1/bert-tiny")
+        assert bert._effective_sentence_encoder_backend() == "transformers"
+        assert bert._effective_sentence_pooling() == "cls"
+
+        qwen = HierarchicalTransformerExtractor(
+            sentence_encoder_model="Qwen/Qwen3-Embedding-0.6B"
+        )
+        assert qwen._effective_sentence_encoder_backend() == "sentence_transformers"
+        assert qwen._effective_sentence_pooling() == "last"
+
+        trainable_qwen = HierarchicalTransformerExtractor(
+            sentence_encoder_model="Qwen/Qwen3-Embedding-0.6B",
+            trainable_sentence_encoder_layers=1,
+        )
+        assert trainable_qwen._effective_sentence_encoder_backend() == "transformers"
+
 
 class TestLearnedTokenizer:
     def test_fit_and_encode(self):
