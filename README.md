@@ -437,6 +437,29 @@ python oracle_experiment_scripts/run_oracle_experiments.py \
     --n-repeats 5
 ```
 
+Agentic attention-variable forest smoke test, assuming a Qwen vLLM server is
+already running with `--reasoning-parser qwen3`:
+
+```bash
+.venv/bin/python oracle_experiment_scripts/run_oracle_agentic_attention_variable_forest_experiments.py \
+  --datasets synthetic_data/example_synthetic_datasets/one_confounder_one_effect_modifier_nsclc_with_structured \
+  --output-dir ../pcori_experiments/oracle_agentic_attention_variable_forest_smoke \
+  --htr-sentence-model hash \
+  --sample-size 50 \
+  --text-max-chars 2500 \
+  --n-folds 2 \
+  --nuisance-folds 2 \
+  --effect-folds 2 \
+  --epochs 1 \
+  --extraction-batch-size 16 \
+  --agent-model-name Qwen/Qwen3.6-27B \
+  --extraction-model-name Qwen/Qwen3.6-27B \
+  --extraction-reasoning-parser qwen3
+```
+
+Omit `--sample-size` and `--text-max-chars` to run on the full dataset with
+untruncated clinical text.
+
 Options:
 
 | Flag | Description |

@@ -146,6 +146,48 @@ def test_config_parses_agentic_attention_variable_forest_block(tmp_path):
     )
 
 
+def test_oracle_agentic_attention_script_builds_configs(tmp_path):
+    from oracle_experiment_scripts.run_oracle_agentic_attention_variable_forest_experiments import (
+        _make_applied_config,
+        _make_configs,
+        build_arg_parser,
+    )
+
+    args = build_arg_parser().parse_args(
+        [
+            "--datasets",
+            "synthetic_data/example_synthetic_datasets/one_confounder_one_effect_modifier_nsclc_with_structured",
+            "--n-repeats",
+            "1",
+            "--n-folds",
+            "2",
+            "--nuisance-folds",
+            "2",
+            "--effect-folds",
+            "2",
+            "--htr-sentence-model",
+            "hash",
+            "--max-experiments",
+            "1",
+        ]
+    )
+
+    configs = _make_configs(args)
+    assert len(configs) == 1
+    config = configs[0]
+    assert config.model_type == "agentic_attention_variable_forest"
+    assert config.htr_sentence_model == "hash"
+
+    applied = _make_applied_config(
+        config,
+        parquet_file=tmp_path / "dataset.parquet",
+        initial_specs=[],
+    )
+    assert applied.architecture.model_type == "agentic_attention_variable_forest"
+    assert applied.architecture.feature_extractor_type == "hierarchical_transformer"
+    assert applied.architecture.agentic_attention_variable_forest.nuisance_folds == 2
+
+
 def test_applied_router_dispatches_agentic_attention_variable_forest(monkeypatch, tmp_path):
     from oci.inference.applied import run_applied_inference
     import oci.inference.agentic_attention_variable_forest as module

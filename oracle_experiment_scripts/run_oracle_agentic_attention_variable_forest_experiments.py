@@ -1,0 +1,697 @@
+#!/usr/bin/env python
+"""Oracle runner for agentic attention-variable causal forests.
+
+This script evaluates the ``agentic_attention_variable_forest`` pipeline on
+synthetic oracle datasets.  It trains cross-fitted hierarchical-transformer
+nuisance/R-loss models, asks an OpenAI-compatible agent to propose variables
+from high-attention chunks, extracts those variables with vLLM, and fits the
+final explicit-feature causal forest.
+
+The script expects an OpenAI-compatible LLM server to already be running.  For
+Qwen thinking models, start vLLM with an appropriate reasoning parser, e.g.:
+
+    vllm serve Qwen/Qwen3.6-27B --reasoning-parser qwen3 ...
+
+Outputs follow the oracle-script convention:
+
+    <output-dir>/results/<config-hash>.json
+    <output-dir>/all_results.csv
+    <output-dir>/all_results.parquet
+    <output-dir>/agentic_attention_predictions/<config-hash>/predictions.parquet
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import itertools
+import json
+import logging
+import random
+import sys
+import traceback
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
+
+import numpy as np
+import pandas as pd
+import torch
+
+sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from oci.config import (
+    AgenticAttentionVariableForestConfig,
+    AgenticFeatureSearchConfig,
+    AppliedInferenceConfig,
+    ExplicitFeatureExtractionConfig,
+    ExplicitFeatureForestConfig,
+    ExplicitFeatureSpec,
+    ModelArchitectureConfig,
+    TrainingConfig,
+)
+from oci.inference.agentic_attention_variable_forest import (
+    run_agentic_attention_variable_forest,
+)
+from run_oracle_experiments import (
+    _resolve_parquet_file,
+    compute_metrics,
+    load_feature_specs_from_metadata,
+    select_agentic_initial_feature_specs,
+)
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+DEFAULT_DATASETS = [
+    "synthetic_data/example_synthetic_datasets/one_confounder_one_effect_modifier_nsclc_with_structured",
+    "synthetic_data/example_synthetic_datasets/five_confounders_five_effect_modifiers_nsclc_with_structured",
+]
+
+
+@dataclass
+class AgenticAttentionOracleConfig:
+    """Configuration for one agentic attention-variable oracle experiment."""
+
+    dataset_path: str
+    dataset_name: str
+    repeat_index: int = 0
+    model_type: str = "agentic_attention_variable_forest"
+    feature_extractor_type: str = "hierarchical_transformer"
+
+    n_folds: int = 5
+    seed: int = 42
+    sample_size: Optional[int] = None
+    text_max_chars: Optional[int] = None
+
+    htr_sentence_model: str = "prajjwal1/bert-tiny"
+    htr_chunk_size_words: int = 96
+    htr_chunk_overlap_words: int = 24
+    htr_max_chunks: int = 128
+    htr_max_chunk_length: int = 128
+    htr_num_layers: int = 2
+    htr_num_heads: int = 4
+    htr_transformer_dim: int = 256
+    htr_projection_dim: int = 128
+    htr_hash_embedding_dim: int = 256
+    htr_dropout: float = 0.1
+
+    epochs: int = 3
+    batch_size: int = 8
+    learning_rate: float = 1e-4
+    weight_decay: float = 0.01
+    gradient_clip_norm: float = 1.0
+
+    nuisance_folds: int = 5
+    effect_folds: int = 5
+    fold_parallelism: str = "auto"
+    attention_top_k_chunks: int = 5
+    consensus_min_fold_fraction: float = 2.0 / 3.0
+    min_extraction_coverage: float = 0.70
+    e_clip: float = 0.01
+
+    cf_n_estimators: int = 200
+    cf_min_samples_leaf: int = 10
+    cf_max_depth: Optional[int] = None
+    cf_max_features: str = "sqrt"
+    cf_honest: bool = True
+    cf_inference: bool = True
+
+    initial_feature_count: int = 0
+    initial_feature_strategy: str = "none"
+    initial_feature_names: List[str] = field(default_factory=list)
+
+    agent_server_url: str = "http://localhost:8000/v1"
+    agent_model_name: str = "Qwen/Qwen3.6-27B"
+    agent_api_key: str = "EMPTY"
+    agent_temperature: float = 0.0
+    agent_max_tokens: int = 8192
+    agent_schema_repair_attempts: int = 1
+    agent_save_context: bool = False
+    agent_save_raw_output: bool = False
+
+    extraction_server_url: str = "http://localhost:8000/v1"
+    extraction_model_name: str = "Qwen/Qwen3.6-27B"
+    extraction_mode: str = "server"
+    extraction_reasoning_parser: Optional[str] = "qwen3"
+    extraction_batch_size: int = 16
+    extraction_max_retries: int = 3
+    extraction_temperature: float = 0.0
+    extraction_max_tokens: int = 4096
+    extraction_max_text_length: int = 8000
+    extraction_cache_enabled: bool = True
+    extraction_cache_dir: Optional[str] = None
+
+    def config_hash(self) -> str:
+        payload = json.dumps(asdict(self), sort_keys=True)
+        return hashlib.md5(payload.encode()).hexdigest()[:12]
+
+
+def _dataset_dir(dataset_path: str, parquet_file: Path) -> str:
+    path = Path(dataset_path)
+    if path.is_dir():
+        return str(path)
+    return str(parquet_file.parent)
+
+
+def _load_initial_specs(config: AgenticAttentionOracleConfig, parquet_file: Path) -> List[ExplicitFeatureSpec]:
+    dataset_dir = _dataset_dir(config.dataset_path, parquet_file)
+    if config.initial_feature_names:
+        specs = load_feature_specs_from_metadata(dataset_dir, section="features")
+        by_name = {spec.name: spec for spec in specs}
+        missing = [name for name in config.initial_feature_names if name not in by_name]
+        if missing:
+            raise ValueError(f"Initial feature names not found in metadata: {missing}")
+        return [by_name[name] for name in config.initial_feature_names]
+
+    if config.initial_feature_count <= 0:
+        return []
+
+    return select_agentic_initial_feature_specs(
+        dataset_dir,
+        count=config.initial_feature_count,
+        strategy=config.initial_feature_strategy,
+    )
+
+
+def _make_applied_config(
+    config: AgenticAttentionOracleConfig,
+    parquet_file: Path,
+    initial_specs: Sequence[ExplicitFeatureSpec],
+) -> AppliedInferenceConfig:
+    return AppliedInferenceConfig(
+        clinical_question=(
+            "Estimate heterogeneous treatment effects from clinical text and "
+            "identify text-derived confounders and effect modifiers."
+        ),
+        outcome_type="binary",
+        dataset_path=str(parquet_file),
+        text_column="clinical_text",
+        outcome_column="outcome_indicator",
+        treatment_column="treatment_indicator",
+        cv_folds=config.n_folds,
+        architecture=ModelArchitectureConfig(
+            model_type="agentic_attention_variable_forest",
+            feature_extractor_type="hierarchical_transformer",
+            htr_sentence_model=config.htr_sentence_model,
+            htr_chunk_size_words=config.htr_chunk_size_words,
+            htr_chunk_overlap_words=config.htr_chunk_overlap_words,
+            htr_max_chunks=config.htr_max_chunks,
+            htr_max_chunk_length=config.htr_max_chunk_length,
+            htr_num_layers=config.htr_num_layers,
+            htr_num_heads=config.htr_num_heads,
+            htr_transformer_dim=config.htr_transformer_dim,
+            htr_projection_dim=config.htr_projection_dim,
+            htr_hash_embedding_dim=config.htr_hash_embedding_dim,
+            htr_dropout=config.htr_dropout,
+            explicit_feature_forest=ExplicitFeatureForestConfig(
+                n_estimators=config.cf_n_estimators,
+                max_depth=config.cf_max_depth,
+                min_samples_leaf=config.cf_min_samples_leaf,
+                max_features=config.cf_max_features,
+                honest=config.cf_honest,
+                inference=config.cf_inference,
+            ),
+            agentic_feature_search=AgenticFeatureSearchConfig(
+                outer_folds=max(2, config.n_folds),
+                inner_folds=max(2, config.nuisance_folds),
+                max_iterations=1,
+                max_additions_per_iter=6,
+                max_removals_per_iter=0,
+                agent_server_url=config.agent_server_url,
+                agent_model_name=config.agent_model_name,
+                agent_api_key=config.agent_api_key,
+                agent_temperature=config.agent_temperature,
+                agent_max_tokens=config.agent_max_tokens,
+                agent_schema_repair_attempts=config.agent_schema_repair_attempts,
+                save_agent_context=config.agent_save_context,
+                save_agent_raw_output=config.agent_save_raw_output,
+                random_state=config.seed + config.repeat_index,
+            ),
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=config.nuisance_folds,
+                effect_folds=config.effect_folds,
+                fold_parallelism=config.fold_parallelism,
+                attention_top_k_chunks=config.attention_top_k_chunks,
+                consensus_min_fold_fraction=config.consensus_min_fold_fraction,
+                min_extraction_coverage=config.min_extraction_coverage,
+                e_clip=config.e_clip,
+            ),
+        ),
+        training=TrainingConfig(
+            epochs=config.epochs,
+            batch_size=config.batch_size,
+            learning_rate=config.learning_rate,
+            weight_decay=config.weight_decay,
+            gradient_clip_norm=config.gradient_clip_norm,
+        ),
+        explicit_features=ExplicitFeatureExtractionConfig(
+            enabled=bool(initial_specs),
+            features=list(initial_specs),
+            vllm_mode=config.extraction_mode,
+            vllm_server_url=config.extraction_server_url,
+            vllm_model_name=config.extraction_model_name,
+            vllm_reasoning_parser=config.extraction_reasoning_parser,
+            extraction_batch_size=config.extraction_batch_size,
+            extraction_max_retries=config.extraction_max_retries,
+            extraction_temperature=config.extraction_temperature,
+            extraction_max_tokens=config.extraction_max_tokens,
+            extraction_max_text_length=config.extraction_max_text_length,
+            cache_enabled=config.extraction_cache_enabled,
+            cache_dir=config.extraction_cache_dir,
+        ),
+    )
+
+
+def _prepare_dataset(config: AgenticAttentionOracleConfig, parquet_file: Path) -> pd.DataFrame:
+    df = pd.read_parquet(parquet_file)
+    if config.sample_size is not None and config.sample_size < len(df):
+        df = df.sample(n=config.sample_size, random_state=config.seed + config.repeat_index)
+        df = df.reset_index(drop=True)
+    if config.text_max_chars is not None:
+        df = df.copy()
+        df["clinical_text_full_chars"] = df["clinical_text"].astype(str).str.len()
+        df["clinical_text"] = df["clinical_text"].astype(str).str.slice(0, config.text_max_chars)
+    return df
+
+
+def _safe_metrics(results_df: pd.DataFrame) -> Dict[str, Any]:
+    required = {
+        "pred_ite_prob",
+        "true_ite_prob",
+        "pred_propensity_prob",
+        "treatment_indicator",
+        "pred_y0_prob",
+        "pred_y1_prob",
+        "true_y0_prob",
+        "true_y1_prob",
+        "outcome_indicator",
+    }
+    if not required.issubset(results_df.columns):
+        return {}
+    return compute_metrics(
+        pred_ite=results_df["pred_ite_prob"].values,
+        true_ite=results_df["true_ite_prob"].values,
+        pred_propensity=results_df["pred_propensity_prob"].values,
+        true_treatment=results_df["treatment_indicator"].values,
+        pred_y0=results_df["pred_y0_prob"].values,
+        pred_y1=results_df["pred_y1_prob"].values,
+        true_y0=results_df["true_y0_prob"].values,
+        true_y1=results_df["true_y1_prob"].values,
+        true_outcome=results_df["outcome_indicator"].values,
+        tau_lower=(
+            results_df["pred_ite_lower"].values
+            if "pred_ite_lower" in results_df.columns
+            else None
+        ),
+        tau_upper=(
+            results_df["pred_ite_upper"].values
+            if "pred_ite_upper" in results_df.columns
+            else None
+        ),
+    )
+
+
+def _selected_feature_summary(results_df: pd.DataFrame) -> Dict[str, float]:
+    if "selected_feature_names" not in results_df.columns:
+        return {}
+    selected = [str(v) for v in results_df["selected_feature_names"].fillna("").tolist()]
+    counts = [0 if not value else len([name for name in value.split(",") if name]) for value in selected]
+    return {
+        "agentic_attention_n_selected_features_mean": float(np.mean(counts)),
+        "agentic_attention_n_selected_feature_sets": float(len(set(selected))),
+    }
+
+
+def _load_candidate_names(path: Path) -> List[str]:
+    names: List[str] = []
+    if not path.exists():
+        return names
+    with open(path) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            for proposal in row.get("proposals", []):
+                name = proposal.get("name")
+                if name and name not in names:
+                    names.append(name)
+    return names
+
+
+def run_experiment(
+    config: AgenticAttentionOracleConfig,
+    output_dir: Path,
+    device: torch.device,
+    num_workers: int,
+) -> Dict[str, Any]:
+    parquet_file = _resolve_parquet_file(config.dataset_path)
+    if parquet_file is None:
+        return {
+            "config": asdict(config),
+            "skipped": True,
+            "error": f"Dataset not found: {config.dataset_path}",
+            "metrics": {},
+            "n_samples": 0,
+        }
+
+    random.seed(config.seed + config.repeat_index)
+    np.random.seed(config.seed + config.repeat_index)
+    torch.manual_seed(config.seed + config.repeat_index)
+
+    initial_specs = _load_initial_specs(config, parquet_file)
+    applied_config = _make_applied_config(config, parquet_file, initial_specs)
+    df = _prepare_dataset(config, parquet_file)
+
+    config_hash = config.config_hash()
+    prediction_path = (
+        output_dir
+        / "agentic_attention_predictions"
+        / config_hash
+        / "predictions.parquet"
+    )
+    run_agentic_attention_variable_forest(
+        dataset=df,
+        config=applied_config,
+        output_path=prediction_path,
+        device=device,
+        num_workers=num_workers,
+    )
+
+    results_df = pd.read_parquet(prediction_path)
+    artifact_dir = prediction_path.parent / "agentic_attention_variable_forest"
+    metrics = _safe_metrics(results_df)
+    metrics.update(_selected_feature_summary(results_df))
+    metrics["agentic_attention_n_initial_features"] = float(len(initial_specs))
+
+    return {
+        "config": asdict(config),
+        "metrics": metrics,
+        "n_samples": len(results_df),
+        "skipped": False,
+        "error": None,
+        "artifacts": {
+            "predictions_path": str(prediction_path),
+            "artifact_dir": str(artifact_dir),
+        },
+        "agentic_attention_variables_tried": {
+            "confounders": _load_candidate_names(
+                artifact_dir / "confounder_candidates_by_fold.jsonl"
+            ),
+            "effect_modifiers": _load_candidate_names(
+                artifact_dir / "effect_modifier_candidates_by_fold.jsonl"
+            ),
+        },
+    }
+
+
+def _result_row(config_hash: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    config = result.get("config", {})
+    row: Dict[str, Any] = {
+        "config_hash": config_hash,
+        "skipped": result.get("skipped", False),
+        "error": result.get("error"),
+        "n_samples": result.get("n_samples", 0),
+    }
+    for key in [
+        "dataset_name",
+        "dataset_path",
+        "repeat_index",
+        "model_type",
+        "feature_extractor_type",
+        "htr_sentence_model",
+        "n_folds",
+        "nuisance_folds",
+        "effect_folds",
+        "initial_feature_count",
+        "initial_feature_strategy",
+    ]:
+        row[key] = config.get(key)
+    for key, value in result.get("metrics", {}).items():
+        row[key] = value
+    artifacts = result.get("artifacts", {})
+    row["predictions_path"] = artifacts.get("predictions_path")
+    row["artifact_dir"] = artifacts.get("artifact_dir")
+    return row
+
+
+def _write_aggregate_outputs(output_dir: Path) -> None:
+    rows = []
+    results_dir = output_dir / "results"
+    if not results_dir.exists():
+        return
+    for path in sorted(results_dir.glob("*.json")):
+        with open(path) as f:
+            result = json.load(f)
+        rows.append(_result_row(path.stem, result))
+    if not rows:
+        return
+    results_df = pd.DataFrame(rows)
+    results_df.to_csv(output_dir / "all_results.csv", index=False)
+    results_df.to_parquet(output_dir / "all_results.parquet", index=False)
+    with open(output_dir / "all_results.jsonl", "w") as f:
+        for row in rows:
+            f.write(json.dumps(row, default=str) + "\n")
+
+
+def _parse_bool(value: str) -> bool:
+    lowered = value.lower()
+    if lowered in {"1", "true", "yes", "y"}:
+        return True
+    if lowered in {"0", "false", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected boolean value, got {value!r}")
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--datasets", nargs="+", default=DEFAULT_DATASETS)
+    parser.add_argument(
+        "--output-dir",
+        default="../pcori_experiments/oracle_agentic_attention_variable_forest",
+    )
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument("--n-repeats", type=int, default=1)
+    parser.add_argument("--n-folds", type=int, default=5)
+    parser.add_argument("--max-experiments", type=int, default=None)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--sample-size", type=int, default=None)
+    parser.add_argument("--text-max-chars", type=int, default=None)
+
+    parser.add_argument("--htr-sentence-model", default="prajjwal1/bert-tiny")
+    parser.add_argument("--htr-chunk-size-words", type=int, default=96)
+    parser.add_argument("--htr-chunk-overlap-words", type=int, default=24)
+    parser.add_argument("--htr-max-chunks", type=int, default=128)
+    parser.add_argument("--htr-max-chunk-length", type=int, default=128)
+    parser.add_argument("--htr-num-layers", type=int, default=2)
+    parser.add_argument("--htr-num-heads", type=int, default=4)
+    parser.add_argument("--htr-transformer-dim", type=int, default=256)
+    parser.add_argument("--htr-projection-dim", type=int, default=128)
+    parser.add_argument("--htr-hash-embedding-dim", type=int, default=256)
+    parser.add_argument("--htr-dropout", type=float, default=0.1)
+
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
+
+    parser.add_argument("--nuisance-folds", type=int, default=5)
+    parser.add_argument("--effect-folds", type=int, default=5)
+    parser.add_argument("--fold-parallelism", default="auto")
+    parser.add_argument("--attention-top-k-chunks", type=int, default=5)
+    parser.add_argument("--consensus-min-fold-fraction", type=float, default=2.0 / 3.0)
+    parser.add_argument("--min-extraction-coverage", type=float, default=0.70)
+    parser.add_argument("--e-clip", type=float, default=0.01)
+
+    parser.add_argument("--cf-n-estimators", type=int, default=200)
+    parser.add_argument("--cf-min-samples-leaf", type=int, default=10)
+    parser.add_argument("--cf-max-depth", type=int, default=None)
+    parser.add_argument("--cf-max-features", default="sqrt")
+    parser.add_argument("--cf-honest", type=_parse_bool, default=True)
+    parser.add_argument("--cf-inference", type=_parse_bool, default=True)
+
+    parser.add_argument("--initial-feature-counts", nargs="+", type=int, default=[0])
+    parser.add_argument(
+        "--initial-feature-strategies",
+        nargs="+",
+        default=["true_first"],
+        choices=["none", "true_first", "modifiers_first", "mixed", "distractors"],
+    )
+    parser.add_argument("--initial-feature-names", nargs="*", default=[])
+
+    parser.add_argument("--agent-server-url", default="http://localhost:8000/v1")
+    parser.add_argument("--agent-model-name", default="Qwen/Qwen3.6-27B")
+    parser.add_argument("--agent-api-key", default="EMPTY")
+    parser.add_argument("--agent-temperature", type=float, default=0.0)
+    parser.add_argument("--agent-max-tokens", type=int, default=8192)
+    parser.add_argument("--agent-schema-repair-attempts", type=int, default=1)
+    parser.add_argument("--save-agent-context", action="store_true")
+    parser.add_argument("--save-agent-raw-output", action="store_true")
+
+    parser.add_argument("--extraction-server-url", default="http://localhost:8000/v1")
+    parser.add_argument("--extraction-model-name", default="Qwen/Qwen3.6-27B")
+    parser.add_argument("--extraction-mode", default="server")
+    parser.add_argument("--extraction-reasoning-parser", default="qwen3")
+    parser.add_argument("--extraction-batch-size", type=int, default=16)
+    parser.add_argument("--extraction-max-retries", type=int, default=3)
+    parser.add_argument("--extraction-temperature", type=float, default=0.0)
+    parser.add_argument("--extraction-max-tokens", type=int, default=4096)
+    parser.add_argument("--extraction-max-text-length", type=int, default=8000)
+    parser.add_argument("--extraction-cache-dir", default=None)
+    parser.add_argument("--no-extraction-cache", action="store_true")
+    return parser
+
+
+def _make_configs(args: argparse.Namespace) -> List[AgenticAttentionOracleConfig]:
+    configs: List[AgenticAttentionOracleConfig] = []
+    datasets = [(path, Path(path).name) for path in args.datasets]
+    for (dataset_path, dataset_name), repeat_idx, initial_count in itertools.product(
+        datasets,
+        range(args.n_repeats),
+        args.initial_feature_counts,
+    ):
+        strategies = ["none"] if initial_count <= 0 or args.initial_feature_names else args.initial_feature_strategies
+        for strategy in strategies:
+            configs.append(
+                AgenticAttentionOracleConfig(
+                    dataset_path=dataset_path,
+                    dataset_name=dataset_name,
+                    repeat_index=repeat_idx,
+                    n_folds=args.n_folds,
+                    sample_size=args.sample_size,
+                    text_max_chars=args.text_max_chars,
+                    htr_sentence_model=args.htr_sentence_model,
+                    htr_chunk_size_words=args.htr_chunk_size_words,
+                    htr_chunk_overlap_words=args.htr_chunk_overlap_words,
+                    htr_max_chunks=args.htr_max_chunks,
+                    htr_max_chunk_length=args.htr_max_chunk_length,
+                    htr_num_layers=args.htr_num_layers,
+                    htr_num_heads=args.htr_num_heads,
+                    htr_transformer_dim=args.htr_transformer_dim,
+                    htr_projection_dim=args.htr_projection_dim,
+                    htr_hash_embedding_dim=args.htr_hash_embedding_dim,
+                    htr_dropout=args.htr_dropout,
+                    epochs=args.epochs,
+                    batch_size=args.batch_size,
+                    learning_rate=args.learning_rate,
+                    weight_decay=args.weight_decay,
+                    gradient_clip_norm=args.gradient_clip_norm,
+                    nuisance_folds=args.nuisance_folds,
+                    effect_folds=args.effect_folds,
+                    fold_parallelism=args.fold_parallelism,
+                    attention_top_k_chunks=args.attention_top_k_chunks,
+                    consensus_min_fold_fraction=args.consensus_min_fold_fraction,
+                    min_extraction_coverage=args.min_extraction_coverage,
+                    e_clip=args.e_clip,
+                    cf_n_estimators=args.cf_n_estimators,
+                    cf_min_samples_leaf=args.cf_min_samples_leaf,
+                    cf_max_depth=args.cf_max_depth,
+                    cf_max_features=args.cf_max_features,
+                    cf_honest=args.cf_honest,
+                    cf_inference=args.cf_inference,
+                    initial_feature_count=initial_count,
+                    initial_feature_strategy=strategy,
+                    initial_feature_names=list(args.initial_feature_names),
+                    agent_server_url=args.agent_server_url,
+                    agent_model_name=args.agent_model_name,
+                    agent_api_key=args.agent_api_key,
+                    agent_temperature=args.agent_temperature,
+                    agent_max_tokens=args.agent_max_tokens,
+                    agent_schema_repair_attempts=args.agent_schema_repair_attempts,
+                    agent_save_context=args.save_agent_context,
+                    agent_save_raw_output=args.save_agent_raw_output,
+                    extraction_server_url=args.extraction_server_url,
+                    extraction_model_name=args.extraction_model_name,
+                    extraction_mode=args.extraction_mode,
+                    extraction_reasoning_parser=args.extraction_reasoning_parser,
+                    extraction_batch_size=args.extraction_batch_size,
+                    extraction_max_retries=args.extraction_max_retries,
+                    extraction_temperature=args.extraction_temperature,
+                    extraction_max_tokens=args.extraction_max_tokens,
+                    extraction_max_text_length=args.extraction_max_text_length,
+                    extraction_cache_enabled=not args.no_extraction_cache,
+                    extraction_cache_dir=args.extraction_cache_dir,
+                )
+            )
+    random.Random(42).shuffle(configs)
+    if args.max_experiments:
+        configs = configs[: args.max_experiments]
+    return configs
+
+
+def main() -> None:
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    if args.n_repeats < 1:
+        parser.error("--n-repeats must be >= 1")
+    if args.n_folds < 2:
+        parser.error("--n-folds must be >= 2")
+    if args.nuisance_folds < 2 or args.effect_folds < 2:
+        parser.error("--nuisance-folds and --effect-folds must be >= 2")
+    if any(count < 0 for count in args.initial_feature_counts):
+        parser.error("--initial-feature-counts must be >= 0")
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "command_line.txt").write_text(" ".join(sys.argv) + "\n")
+
+    device_name = args.device
+    if device_name == "auto":
+        device_name = "cuda:0" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device_name)
+
+    configs = _make_configs(args)
+    pending = []
+    for config in configs:
+        result_path = output_dir / "results" / f"{config.config_hash()}.json"
+        if args.resume and result_path.exists():
+            continue
+        pending.append(config)
+
+    print(f"Agentic attention oracle experiments: {len(pending)} pending / {len(configs)} total")
+    print(f"Datasets: {', '.join(sorted({c.dataset_name for c in configs}))}")
+    print(f"Device: {device}")
+    print(f"Output: {output_dir}")
+
+    for idx, config in enumerate(pending, start=1):
+        config_hash = config.config_hash()
+        result_path = output_dir / "results" / f"{config_hash}.json"
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "[%s/%s] Running %s repeat=%s hash=%s",
+            idx,
+            len(pending),
+            config.dataset_name,
+            config.repeat_index,
+            config_hash,
+        )
+        try:
+            result = run_experiment(config, output_dir, device, args.num_workers)
+        except Exception as exc:
+            logger.error("Experiment %s failed: %s\n%s", config_hash, exc, traceback.format_exc())
+            result = {
+                "config": asdict(config),
+                "metrics": {},
+                "n_samples": 0,
+                "skipped": True,
+                "error": str(exc),
+            }
+        with open(result_path, "w") as f:
+            json.dump(result, f, indent=2, default=str)
+        _write_aggregate_outputs(output_dir)
+
+    _write_aggregate_outputs(output_dir)
+    logger.info("Done. Aggregate results written under %s", output_dir)
+
+
+if __name__ == "__main__":
+    main()
