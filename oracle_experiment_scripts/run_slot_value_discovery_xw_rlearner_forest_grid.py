@@ -410,6 +410,7 @@ def _aggregate(output_dir: Path, results: List[Dict[str, Any]]) -> None:
         "dataset_name",
         "feature_extractor_type",
         "rlearner_mode",
+        "shared_rlearner_nuisance_source",
         "svx_chunk_size_words",
         "svx_num_free_slots",
         "svx_slot_dim",

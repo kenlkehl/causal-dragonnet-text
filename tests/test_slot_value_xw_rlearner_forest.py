@@ -138,6 +138,60 @@ def test_causal_text_forest_slot_value_shared_rlearner_features(monkeypatch):
     assert outcome.shape == (2,)
 
 
+def test_shared_rlearner_step_uses_fixed_nuisance_predictions(monkeypatch):
+    import oci.models.slot_value_discovery_extractor as extractor_mod
+    from oci.models.causal_text_forest import CausalTextForest
+
+    monkeypatch.setattr(
+        extractor_mod,
+        "load_sentence_transformer",
+        lambda model_name, device=None: FakeSentenceEncoder(dim=6),
+    )
+
+    model = CausalTextForest(
+        feature_extractor_type="slot_value_discovery",
+        svx_cached_embedding_dim=6,
+        svx_confounder_concepts=["patient age"],
+        svx_effect_modifier_concepts=["PD-L1 expression"],
+        svx_num_free_slots=1,
+        svx_slot_dim=4,
+        svx_num_value_prototypes=1,
+        svx_anchor_weight=0.0,
+        cf_rlearner_representation_mode="shared_features",
+        cf_n_estimators=4,
+        cf_inference=False,
+        device="cpu",
+    )
+
+    batch = {
+        "texts": ["Age 72. PD-L1 >=50%.", "Age 55. PD-L1 <1%."],
+        "cached_hidden_states": torch.randn(2, 4, 6),
+        "cached_attention_mask": torch.ones(2, 4),
+        "treatment": torch.tensor([1.0, 0.0]),
+        "outcome": torch.tensor([1.0, 0.0]),
+    }
+    e_hat = torch.tensor([[0.25], [0.75]])
+    m_hat = torch.tensor([[0.40], [0.20]])
+
+    losses = model.train_shared_rlearner_step(
+        batch,
+        gamma_rlearner=1.0,
+        e_hat=e_hat,
+        m_hat=m_hat,
+        e_clip=0.05,
+    )
+    expected = (
+        (
+            batch["outcome"]
+            - m_hat.squeeze(-1)
+            - losses["tau"].squeeze(-1) * (batch["treatment"] - e_hat.squeeze(-1))
+        )
+        ** 2
+    ).mean()
+
+    assert torch.allclose(losses["r_loss"], expected)
+
+
 def test_causal_text_forest_shared_mode_fits_forest_without_w(monkeypatch):
     import oci.models.slot_value_discovery_extractor as extractor_mod
     from oci.models.causal_text_forest import CausalTextForest
@@ -258,6 +312,7 @@ def test_xw_config_accepts_shared_mode_without_explicit_forest_mode():
     assert config.rlearner_mode == "shared_features"
     assert config.xw_feature_split is False
     assert config.cf_rlearner_representation_mode == "shared_features"
+    assert config.shared_rlearner_nuisance_source == "inner_oof"
 
 
 def test_shared_grid_uses_all_visible_gpus_by_default(monkeypatch):

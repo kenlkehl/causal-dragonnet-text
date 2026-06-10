@@ -119,3 +119,66 @@ In short:
 semantic attention chooses chunks;
 generic regex/lexical features summarize values inside those chunks.
 ```
+
+## Shared R-Learner Forest Cross-Fitting
+
+The shared slot-value forest variant is meant to avoid hand-separating
+confounders from effect modifiers. All learned slot features and all raw
+explicit features are treated as `X`; the causal forest receives `W=None`.
+
+The honest evaluation structure is nested:
+
+```text
+outer CV fold
+  outer train rows
+    |
+    | inner K-fold nuisance cross-fitting
+    | - fit nuisance model on inner-train rows
+    | - predict e_hat and m_hat on inner-validation rows
+    | - repeat until every outer-train row has OOF nuisance predictions
+    v
+  fixed OOF residuals for outer-train rows
+    |
+    | train final shared slot model from fresh initialization
+    | - propensity head: e_final(X) -> T
+    | - outcome head:    m_final(X) -> Y
+    | - tau head:        tau_final(X) using fixed OOF e_hat/m_hat
+    v
+  extract final shared X features
+    |
+    | fit CausalForestDML(X=X, W=None, T, Y)
+    v
+  predict on untouched outer-test rows
+```
+
+The inner nuisance models are temporary residual generators. They are discarded
+after producing out-of-fold `e_hat` and `m_hat` for the outer-train rows. The
+final tau model is not copied from an inner nuisance model.
+
+The final shared model starts from the normal slot seed/random initialization.
+It then trains one extractor with three heads:
+
+```text
+single slot extractor -> X
+  |
+  +-- propensity head: e_final(X)
+  +-- outcome head:    m_final(X)
+  +-- tau head:        tau_final(X)
+```
+
+The R-loss for `tau_final` uses the fixed OOF nuisance predictions:
+
+```text
+(Y - m_oof(X) - tau_final(X) * (T - e_oof(X)))^2
+```
+
+This differs from the staged X/W model. In staged mode the final estimator has a
+nuisance extractor for `W`, a separate effect extractor for `X`, and the forest
+receives both matrices. In shared mode there is one final extractor and the
+forest receives only `X`.
+
+The purpose of the inner OOF residuals is to avoid in-sample nuisance/tau
+collusion. If `m_hat` and `e_hat` are learned on the same row whose R-loss is
+being optimized, they can overfit `Y` and `T`, leaving an easy residual for
+`tau` to explain. OOF nuisance predictions make the residual target harder and
+more honest while preserving the "everything is X" feature strategy.

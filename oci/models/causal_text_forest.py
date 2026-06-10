@@ -952,6 +952,8 @@ class CausalTextForest(nn.Module):
         label_smoothing: float = 0.0,
         stop_grad_propensity: bool = False,
         e_clip: float = 0.01,
+        e_hat: Optional[torch.Tensor] = None,
+        m_hat: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Train one shared extractor with e(X), m(X), and tau(X) losses."""
         texts = batch['texts']
@@ -994,10 +996,18 @@ class CausalTextForest(nn.Module):
         e_clip = float(e_clip)
         if not 0.0 < e_clip < 0.5:
             raise ValueError("e_clip must be in (0, 0.5)")
-        e_hat = torch.sigmoid(propensity_logit).detach().clamp(e_clip, 1.0 - e_clip)
-        m_hat = self._outcome_activation(outcome_logit).detach()
-        y_residual = outcomes - m_hat.squeeze(-1)
-        t_residual = treatments - e_hat.squeeze(-1)
+        if e_hat is None:
+            r_e_hat = torch.sigmoid(propensity_logit).detach().squeeze(-1)
+        else:
+            r_e_hat = e_hat.to(self._device).float().detach().squeeze(-1)
+        if m_hat is None:
+            r_m_hat = self._outcome_activation(outcome_logit).detach().squeeze(-1)
+        else:
+            r_m_hat = m_hat.to(self._device).float().detach().squeeze(-1)
+
+        r_e_hat = r_e_hat.clamp(e_clip, 1.0 - e_clip)
+        y_residual = outcomes - r_m_hat
+        t_residual = treatments - r_e_hat
         r_loss = ((y_residual - tau.squeeze(-1) * t_residual) ** 2).mean()
 
         total_loss = (

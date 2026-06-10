@@ -94,6 +94,7 @@ class XWRLearnerForestConfig:
     rlearner_mode: str = "staged_separate_nets"
     xw_feature_split: bool = True
     cf_rlearner_representation_mode: Optional[str] = None
+    shared_rlearner_nuisance_source: str = "inner_oof"
     use_explicit_features: bool = False
     # Compatibility alias for older analysis scripts.
     use_explicit_confounders: bool = False
@@ -273,6 +274,15 @@ class XWRLearnerForestConfig:
             self.rlearner_mode = "shared_features"
             self.xw_feature_split = False
             self.cf_rlearner_representation_mode = "shared_features"
+            source = str(self.shared_rlearner_nuisance_source).strip().lower()
+            if source in {"oof", "crossfit", "cross_fit", "inner_oof"}:
+                self.shared_rlearner_nuisance_source = "inner_oof"
+            elif source in {"in_sample", "insample", "same_model"}:
+                self.shared_rlearner_nuisance_source = "in_sample"
+            else:
+                raise ValueError(
+                    "shared_rlearner_nuisance_source must be 'inner_oof' or 'in_sample'"
+                )
         else:
             self.rlearner_mode = "staged_separate_nets"
             self.xw_feature_split = True
@@ -284,6 +294,8 @@ class XWRLearnerForestConfig:
     def config_hash(self) -> str:
         d = asdict(self)
         d.pop("cf_rlearner_representation_mode", None)
+        if d.get("rlearner_mode") != "shared_features":
+            d.pop("shared_rlearner_nuisance_source", None)
         keep_prefixes = self._EXTRACTOR_PREFIXES.get(
             self.feature_extractor_type, set()
         )
@@ -1043,8 +1055,21 @@ def _train_shared_representation_stage(
     device: torch.device,
     use_cached: bool,
     gpu_store,
+    nuisance_propensity: Optional[np.ndarray] = None,
+    nuisance_outcome: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """Train a single extractor with propensity, outcome, and shared R-loss."""
+    if (nuisance_propensity is None) != (nuisance_outcome is None):
+        raise ValueError("nuisance_propensity and nuisance_outcome must be provided together")
+    use_oof_nuisance = nuisance_propensity is not None
+    if use_oof_nuisance:
+        nuisance_propensity = np.asarray(nuisance_propensity, dtype=np.float32)
+        nuisance_outcome = np.asarray(nuisance_outcome, dtype=np.float32)
+        if len(nuisance_propensity) != len(train_loader.dataset) or len(nuisance_outcome) != len(train_loader.dataset):
+            raise ValueError(
+                "OOF nuisance arrays must have one value per training dataset sample"
+            )
+
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=config.learning_rate, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
@@ -1063,12 +1088,29 @@ def _train_shared_representation_stage(
             if use_cached:
                 prepare_cached_batch(batch, device, gpu_store=gpu_store)
 
+            e_hat = None
+            m_hat = None
+            if use_oof_nuisance:
+                batch_ids = np.asarray(batch["text_id"], dtype=int)
+                e_hat = torch.as_tensor(
+                    nuisance_propensity[batch_ids],
+                    dtype=torch.float32,
+                    device=device,
+                )
+                m_hat = torch.as_tensor(
+                    nuisance_outcome[batch_ids],
+                    dtype=torch.float32,
+                    device=device,
+                )
+
             optimizer.zero_grad(set_to_none=True)
             losses = model.train_shared_rlearner_step(
                 batch,
                 alpha_propensity=1.0,
                 gamma_rlearner=config.gamma_rlearner,
                 e_clip=config.rlearner_effect_e_clip,
+                e_hat=e_hat,
+                m_hat=m_hat,
             )
             losses["loss"].backward()
             torch.nn.utils.clip_grad_norm_(params, config.rlearner_effect_grad_clip)
@@ -1101,6 +1143,9 @@ def _train_shared_representation_stage(
 
     return {
         "shared_r_loss_history": history,
+        "shared_r_loss_nuisance_source": (
+            "inner_oof" if use_oof_nuisance else "in_sample"
+        ),
         "shared_extractor": _slot_extractor_summary(
             getattr(model, "feature_extractor", None)
         ),
@@ -1131,6 +1176,87 @@ def run_shared_rlearner_forest_experiment(
     for fold, (train_idx, test_idx) in enumerate(kf.split(df)):
         train_df = df.iloc[train_idx]
         test_df = df.iloc[test_idx]
+
+        oof_propensity = None
+        oof_outcome = None
+        nuisance_summary = {}
+        if config.shared_rlearner_nuisance_source == "inner_oof":
+            n_inner = min(config.rlearner_nuisance_folds, len(train_df))
+            if n_inner < 2:
+                raise ValueError(
+                    "rlearner_nuisance_folds requires at least 2 outer-train samples"
+                )
+            inner_kf = KFold(
+                n_splits=n_inner,
+                shuffle=True,
+                random_state=20_000 + 42 + config.repeat_index + fold,
+            )
+            oof_propensity = np.full(len(train_df), np.nan, dtype=np.float32)
+            oof_outcome = np.full(len(train_df), np.nan, dtype=np.float32)
+
+            for inner_train_pos, inner_val_pos in inner_kf.split(train_df):
+                inner_train_df = train_df.iloc[inner_train_pos]
+                inner_val_df = train_df.iloc[inner_val_pos]
+                inner_train_idx = np.asarray(train_idx)[inner_train_pos]
+                inner_val_idx = np.asarray(train_idx)[inner_val_pos]
+
+                inner_model = _make_xw_model(
+                    config,
+                    device,
+                    explicit_feature_specs,
+                    gpu_store,
+                    hidden_state_cache,
+                    tokenizer_texts=inner_train_df[text_column].tolist(),
+                )
+                (
+                    inner_train_dataset,
+                    _inner_val_dataset,
+                    inner_train_loader,
+                    inner_val_loader,
+                    _inner_collate_fn,
+                    _inner_dl_kwargs,
+                ) = _create_datasets_and_loaders(
+                    inner_train_df,
+                    inner_val_df,
+                    inner_train_idx,
+                    inner_val_idx,
+                    text_column,
+                    explicit_feature_cols,
+                    batch_size,
+                    hidden_state_cache,
+                    gpu_store,
+                )
+                _fit_explicit_feature_state(inner_model, inner_train_dataset)
+                _train_nuisance_stage(
+                    inner_model,
+                    inner_train_loader,
+                    inner_val_loader,
+                    config,
+                    device,
+                    use_cached,
+                    gpu_store,
+                )
+                cf_kwargs = dict(gpu_store=gpu_store) if use_cached else {}
+                prop_hat, outcome_hat = inner_model.predict_nuisance(
+                    inner_val_loader,
+                    **cf_kwargs,
+                )
+                oof_propensity[inner_val_pos] = prop_hat
+                oof_outcome[inner_val_pos] = outcome_hat
+
+                del inner_model
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+            if np.isnan(oof_propensity).any() or np.isnan(oof_outcome).any():
+                raise RuntimeError("Incomplete out-of-fold nuisance predictions")
+            nuisance_summary = _nuisance_oof_summary(
+                propensity=oof_propensity,
+                outcome=oof_outcome,
+                treatment=train_df["treatment_indicator"].values,
+                observed_outcome=train_df["outcome_indicator"].values,
+            )
 
         model = _make_xw_model(
             config,
@@ -1167,6 +1293,8 @@ def run_shared_rlearner_forest_experiment(
             device,
             use_cached,
             gpu_store,
+            nuisance_propensity=oof_propensity,
+            nuisance_outcome=oof_outcome,
         )
 
         train_eval_loader = _make_combined_loader(
@@ -1191,6 +1319,7 @@ def run_shared_rlearner_forest_experiment(
                 "fold": fold + 1,
                 "n_train": int(len(train_df)),
                 "n_test": int(len(test_df)),
+                "nuisance_oof": nuisance_summary,
                 "shared_stage": shared_diagnostics,
             }
         )
