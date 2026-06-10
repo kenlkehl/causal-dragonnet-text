@@ -390,6 +390,12 @@ class AgenticFeatureSearchConfig:
 EXTRACTOR_ALIASES = {
     "frozen_llm_pooler": {"frozen_llm_pooler", "frozen_llm", "llm_pooler", "llm_pool", "flp"},
     "hierarchical_llm": {"hierarchical_llm", "hier_llm", "hlm"},
+    "hierarchical_transformer": {
+        "hierarchical_transformer",
+        "hier_transformer",
+        "htr",
+        "short_chunk_transformer",
+    },
     "hierarchical_cnn": {"hierarchical_cnn", "hier_cnn", "hcnn"},
     "hierarchical_gru": {"hierarchical_gru", "hier_gru", "hgru"},
     "simple_cnn": {"simple_cnn", "scnn"},
@@ -424,6 +430,56 @@ CACHEABLE_EXTRACTOR_TYPES = {
     "hierarchical_llm",
     "concept_token_cnn",
 }
+
+
+@dataclass
+class AgenticAttentionVariableForestConfig:
+    """Configuration for attention-evidence agentic variable discovery.
+
+    This model discovers explicit variables from cross-fitted neural attention
+    evidence, extracts their values, then fits a programmatic causal forest.
+    Agent and extraction endpoints are configured through
+    ``architecture.agentic_feature_search`` and ``explicit_features``.
+    """
+
+    nuisance_folds: int = 5
+    effect_folds: int = 5
+    fold_parallelism: str = "auto"
+    attention_top_k_chunks: int = 5
+    consensus_min_fold_fraction: float = 2.0 / 3.0
+    min_extraction_coverage: float = 0.70
+    e_clip: float = 0.01
+    manual_features_locked: bool = True
+
+    def __post_init__(self):
+        if self.nuisance_folds < 2:
+            raise ValueError("agentic_attention_variable_forest.nuisance_folds must be >= 2")
+        if self.effect_folds < 2:
+            raise ValueError("agentic_attention_variable_forest.effect_folds must be >= 2")
+        if self.fold_parallelism != "auto":
+            try:
+                if int(self.fold_parallelism) < 1:
+                    raise ValueError
+            except ValueError as exc:
+                raise ValueError(
+                    "agentic_attention_variable_forest.fold_parallelism must be 'auto' "
+                    "or a positive integer"
+                ) from exc
+        if self.attention_top_k_chunks < 1:
+            raise ValueError(
+                "agentic_attention_variable_forest.attention_top_k_chunks must be >= 1"
+            )
+        if not 0.0 < self.consensus_min_fold_fraction <= 1.0:
+            raise ValueError(
+                "agentic_attention_variable_forest.consensus_min_fold_fraction "
+                "must be in (0, 1]"
+            )
+        if not 0.0 <= self.min_extraction_coverage <= 1.0:
+            raise ValueError(
+                "agentic_attention_variable_forest.min_extraction_coverage must be in [0, 1]"
+            )
+        if not 0.0 < self.e_clip < 0.5:
+            raise ValueError("agentic_attention_variable_forest.e_clip must be in (0, 0.5)")
 
 
 def normalize_feature_extractor_type(feature_type: str) -> str:
@@ -492,6 +548,21 @@ class ModelArchitectureConfig:
     hlm_cache_hidden_states: bool = False
     hlm_gpu_cache: bool = False
     hlm_chat_template_prompt: Optional[str] = None
+
+    # Historical hierarchical transformer extractor, revived as short chunks.
+    # Used by model_type="agentic_attention_variable_forest" by default.
+    htr_sentence_model: str = "prajjwal1/bert-tiny"
+    htr_freeze_sentence_encoder: bool = True
+    htr_chunk_size_words: int = 96
+    htr_chunk_overlap_words: int = 24
+    htr_max_chunks: int = 128
+    htr_max_chunk_length: int = 128
+    htr_num_layers: int = 2
+    htr_num_heads: int = 4
+    htr_transformer_dim: int = 256
+    htr_dropout: float = 0.1
+    htr_projection_dim: int = 128
+    htr_hash_embedding_dim: int = 256
 
     # Hierarchical CNN extractor (dilated CNN on chunks + two-level pooling, trains from scratch)
     hcnn_embedding_dim: int = 256
@@ -585,6 +656,11 @@ class ModelArchitectureConfig:
 
     # Agentic explicit feature search config (used when model_type="agentic_explicit_feature_forest")
     agentic_feature_search: AgenticFeatureSearchConfig = field(default_factory=AgenticFeatureSearchConfig)
+
+    # Agentic attention-evidence variable discovery + explicit-feature causal forest
+    agentic_attention_variable_forest: AgenticAttentionVariableForestConfig = field(
+        default_factory=AgenticAttentionVariableForestConfig
+    )
 
 
 @dataclass
@@ -736,6 +812,15 @@ class ExperimentConfig:
                 arch_data['agentic_feature_search'] = AgenticFeatureSearchConfig(
                     **arch_data['agentic_feature_search']
                 )
+            if (
+                'agentic_attention_variable_forest' in arch_data
+                and isinstance(arch_data['agentic_attention_variable_forest'], dict)
+            ):
+                arch_data['agentic_attention_variable_forest'] = (
+                    AgenticAttentionVariableForestConfig(
+                        **arch_data['agentic_attention_variable_forest']
+                    )
+                )
             return ModelArchitectureConfig(**arch_data)
 
         def parse_explicit_features_config(feat_data: Dict[str, Any]) -> ExplicitFeatureExtractionConfig:
@@ -805,7 +890,10 @@ class ExperimentConfig:
         if (
             self.applied_inference.explicit_features.enabled
             and not self.applied_inference.explicit_features.features
-            and self.applied_inference.architecture.model_type != "agentic_explicit_feature_forest"
+            and self.applied_inference.architecture.model_type not in {
+                "agentic_explicit_feature_forest",
+                "agentic_attention_variable_forest",
+            }
         ):
             raise ValueError(
                 "applied_inference.explicit_features.enabled=True requires at least one "

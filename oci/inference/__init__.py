@@ -15,8 +15,16 @@ def run_agentic_explicit_feature_forest(*args, **kwargs):
     return _run_agentic(*args, **kwargs)
 
 
+def run_agentic_attention_variable_forest(*args, **kwargs):
+    from .agentic_attention_variable_forest import (
+        run_agentic_attention_variable_forest as _run_attention_forest,
+    )
+    return _run_attention_forest(*args, **kwargs)
+
+
 __all__ = [
     'run_applied_inference',
     'run_applied_inference_forest',
     'run_agentic_explicit_feature_forest',
+    'run_agentic_attention_variable_forest',
 ]

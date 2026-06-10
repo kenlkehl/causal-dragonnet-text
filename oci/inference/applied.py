@@ -199,6 +199,18 @@ def run_applied_inference(
         )
         return
 
+    if hasattr(config, 'architecture') and config.architecture.model_type == "agentic_attention_variable_forest":
+        logger.info("Routing to Agentic Attention Variable Causal Forest pipeline")
+        from .agentic_attention_variable_forest import run_agentic_attention_variable_forest
+        run_agentic_attention_variable_forest(
+            dataset=dataset,
+            config=config,
+            output_path=output_path,
+            device=device,
+            num_workers=num_workers,
+        )
+        return
+
     # Explicit feature extraction (if enabled)
     explicit_feature_columns = None
     if hasattr(config, 'explicit_features') and config.explicit_features.enabled:

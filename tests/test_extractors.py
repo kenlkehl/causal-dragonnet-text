@@ -177,6 +177,73 @@ class TestHierarchicalGRU:
         assert 'gru_hidden_dim' in state
 
 
+class TestHierarchicalTransformer:
+    def test_forward_shape_with_hash_backend(self):
+        from oci.models.hierarchical_transformer_extractor import (
+            HierarchicalTransformerExtractor,
+        )
+
+        ext = HierarchicalTransformerExtractor(
+            sentence_encoder_model="hash",
+            chunk_size_words=8,
+            chunk_overlap_words=2,
+            max_chunks=6,
+            num_transformer_layers=1,
+            num_attention_heads=2,
+            transformer_dim=32,
+            projection_dim=24,
+            hash_embedding_dim=32,
+            transformer_dropout=0.0,
+        )
+        out = ext(SAMPLE_TEXTS)
+        assert out.shape == (4, 24)
+
+    def test_attention_evidence_includes_chunk_text(self):
+        from oci.models.hierarchical_transformer_extractor import (
+            HierarchicalTransformerExtractor,
+        )
+
+        ext = HierarchicalTransformerExtractor(
+            sentence_encoder_model="hash",
+            chunk_size_words=6,
+            chunk_overlap_words=1,
+            max_chunks=6,
+            num_transformer_layers=1,
+            num_attention_heads=2,
+            transformer_dim=32,
+            projection_dim=16,
+            hash_embedding_dim=32,
+            transformer_dropout=0.0,
+        )
+        evidence = ext.get_attention_evidence(
+            SAMPLE_TEXTS[:2],
+            row_ids=[10, 11],
+            fold=2,
+            stage="nuisance",
+            top_k=2,
+        )
+        assert evidence
+        assert {row["row_id"] for row in evidence} == {10, 11}
+        assert all(row["stage"] == "nuisance" for row in evidence)
+        assert all(isinstance(row["chunk_text"], str) for row in evidence)
+        assert all(0.0 <= row["attention"] <= 1.0 for row in evidence)
+
+    def test_split_text_into_word_chunks(self):
+        from oci.models.hierarchical_transformer_extractor import split_text_into_word_chunks
+
+        chunks = split_text_into_word_chunks(
+            "one two three four five six seven eight nine",
+            chunk_size_words=4,
+            chunk_overlap_words=1,
+            max_chunks=3,
+        )
+        assert chunks == [
+            "one two three four",
+            "four five six seven",
+            "seven eight nine",
+        ]
+
+
 class TestLearnedTokenizer:
     def test_fit_and_encode(self):
         from oci.models.learned_tokenizer import LearnedTokenizer

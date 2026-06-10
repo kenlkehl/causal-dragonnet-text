@@ -5,6 +5,10 @@ from .dragonnet import DragonNet
 from .rlearner import RLearnerNet, RoleGatedSlotRLearner
 from .frozen_llm_pooler_extractor import FrozenLLMPoolerExtractor
 from .hierarchical_llm_extractor import HierarchicalLLMExtractor
+from .hierarchical_transformer_extractor import (
+    HierarchicalTransformerExtractor,
+    split_text_into_word_chunks,
+)
 from .hierarchical_cnn_extractor import HierarchicalCNNExtractor
 from .hierarchical_gru_extractor import HierarchicalGRUExtractor
 from .simple_cnn_extractor import SimpleCNNExtractor
@@ -42,6 +46,8 @@ __all__ = [
     'RoleGatedSlotRLearner',
     'FrozenLLMPoolerExtractor',
     'HierarchicalLLMExtractor',
+    'HierarchicalTransformerExtractor',
+    'split_text_into_word_chunks',
     'HierarchicalCNNExtractor',
     'HierarchicalGRUExtractor',
     'SimpleCNNExtractor',

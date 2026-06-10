@@ -45,6 +45,19 @@ def create_feature_extractor(
     hlm_skip_llm: bool = False,
     hlm_cached_hidden_size: int = 0,
     hlm_chat_template_prompt: Optional[str] = None,
+    # Hierarchical Transformer args
+    htr_sentence_model: str = "prajjwal1/bert-tiny",
+    htr_freeze_sentence_encoder: bool = True,
+    htr_chunk_size_words: int = 96,
+    htr_chunk_overlap_words: int = 24,
+    htr_max_chunks: int = 128,
+    htr_max_chunk_length: int = 128,
+    htr_num_layers: int = 2,
+    htr_num_heads: int = 4,
+    htr_transformer_dim: int = 256,
+    htr_dropout: float = 0.1,
+    htr_projection_dim: int = 128,
+    htr_hash_embedding_dim: int = 256,
     # Hierarchical CNN args
     hcnn_embedding_dim: int = 256,
     hcnn_conv_dim: int = 256,
@@ -191,6 +204,34 @@ def create_feature_extractor(
         logger.info(f"Created Hierarchical LLM extractor: {hlm_model_name} "
                     f"({mode}), chunk_size={hlm_chunk_size}, max_chunks={hlm_max_chunks}, "
                     f"projection_dim={hlm_projection_dim}")
+        return extractor
+
+    elif normalized_type == "hierarchical_transformer":
+        from .hierarchical_transformer_extractor import HierarchicalTransformerExtractor
+        extractor = HierarchicalTransformerExtractor(
+            sentence_encoder_model=htr_sentence_model,
+            freeze_sentence_encoder=htr_freeze_sentence_encoder,
+            chunk_size_words=htr_chunk_size_words,
+            chunk_overlap_words=htr_chunk_overlap_words,
+            max_chunks=htr_max_chunks,
+            max_chunk_length=htr_max_chunk_length,
+            num_transformer_layers=htr_num_layers,
+            num_attention_heads=htr_num_heads,
+            transformer_dim=htr_transformer_dim,
+            transformer_dropout=htr_dropout,
+            projection_dim=htr_projection_dim,
+            hash_embedding_dim=htr_hash_embedding_dim,
+            device=device,
+        )
+        logger.info(
+            "Created Hierarchical Transformer extractor: model=%s, chunks=%d/%d/%d, "
+            "projection_dim=%d",
+            htr_sentence_model,
+            htr_chunk_size_words,
+            htr_chunk_overlap_words,
+            htr_max_chunks,
+            htr_projection_dim,
+        )
         return extractor
 
     elif normalized_type == "hierarchical_cnn":
@@ -408,6 +449,19 @@ def create_feature_extractor_from_config(
         hlm_skip_llm=config.get('hlm_skip_llm', False),
         hlm_cached_hidden_size=config.get('hlm_cached_hidden_size', 0),
         hlm_chat_template_prompt=config.get('hlm_chat_template_prompt', None),
+        # Hierarchical Transformer args
+        htr_sentence_model=config.get('htr_sentence_model', 'prajjwal1/bert-tiny'),
+        htr_freeze_sentence_encoder=config.get('htr_freeze_sentence_encoder', True),
+        htr_chunk_size_words=config.get('htr_chunk_size_words', 96),
+        htr_chunk_overlap_words=config.get('htr_chunk_overlap_words', 24),
+        htr_max_chunks=config.get('htr_max_chunks', 128),
+        htr_max_chunk_length=config.get('htr_max_chunk_length', 128),
+        htr_num_layers=config.get('htr_num_layers', 2),
+        htr_num_heads=config.get('htr_num_heads', 4),
+        htr_transformer_dim=config.get('htr_transformer_dim', 256),
+        htr_dropout=config.get('htr_dropout', 0.1),
+        htr_projection_dim=config.get('htr_projection_dim', 128),
+        htr_hash_embedding_dim=config.get('htr_hash_embedding_dim', 256),
         # Hierarchical CNN args
         hcnn_embedding_dim=config.get('hcnn_embedding_dim', 256),
         hcnn_conv_dim=config.get('hcnn_conv_dim', 256),
