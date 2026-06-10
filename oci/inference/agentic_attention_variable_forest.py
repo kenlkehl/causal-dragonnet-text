@@ -365,6 +365,21 @@ class AgenticAttentionVariableForestRunner:
                 e_hat, m_hat = self._predict_nuisance_model(model, heldout)
                 y = heldout[self.config.outcome_column].to_numpy(dtype=float)
                 t = heldout[self.config.treatment_column].to_numpy(dtype=float)
+                propensity_auroc = _safe_roc_auc(t, e_hat)
+                outcome_auroc = (
+                    _safe_roc_auc(y, m_hat)
+                    if self.config.outcome_type != "continuous"
+                    else None
+                )
+                logger.info(
+                    "Outer fold %s nuisance fold %s/%s heldout metrics: "
+                    "propensity_auroc=%s outcome_auroc=%s",
+                    outer_fold,
+                    fold,
+                    folds,
+                    _format_optional_metric(propensity_auroc),
+                    _format_optional_metric(outcome_auroc),
+                )
                 y_resid = y - m_hat
                 t_resid = t - e_hat
                 logger.info(
@@ -623,16 +638,19 @@ class AgenticAttentionVariableForestRunner:
             weight_decay=getattr(train_config, "weight_decay", 0.01),
         )
         num_batches = max(1, int(np.ceil(len(positions) / train_config.batch_size)))
+        scheduler = _make_linear_lr_scheduler(optimizer, train_config, num_batches)
         progress_every = max(1, num_batches // 5)
         logger.info(
             "Outer fold %s nuisance fold %s/%s: training for %s epoch(s), "
-            "batch_size=%s, batches/epoch=%s%s",
+            "batch_size=%s, batches/epoch=%s, lr=%.3g, lr_schedule=%s%s",
             outer_fold,
             fold,
             total_folds,
             train_config.epochs,
             train_config.batch_size,
             num_batches,
+            _current_lr(optimizer),
+            "linear" if scheduler is not None else "none",
             self._cuda_memory_summary(),
         )
         for epoch in range(1, train_config.epochs + 1):
@@ -664,7 +682,7 @@ class AgenticAttentionVariableForestRunner:
                     outcome_loss = F.binary_cross_entropy_with_logits(y_pred, y)
                 loss = outcome_loss + self.config.training.alpha_propensity * prop_loss
                 loss.backward()
-                self._clip_and_step(model, optimizer)
+                self._clip_and_step(model, optimizer, scheduler)
                 batch_count += 1
                 loss_value = float(loss.detach().cpu())
                 prop_value = float(prop_loss.detach().cpu())
@@ -679,7 +697,7 @@ class AgenticAttentionVariableForestRunner:
                 ):
                     logger.info(
                         "Outer fold %s nuisance fold %s/%s epoch %s/%s "
-                        "batch %s/%s loss=%.4f outcome=%.4f propensity=%.4f%s",
+                        "batch %s/%s loss=%.4f outcome=%.4f propensity=%.4f lr=%.3g%s",
                         outer_fold,
                         fold,
                         total_folds,
@@ -690,12 +708,13 @@ class AgenticAttentionVariableForestRunner:
                         loss_value,
                         outcome_value,
                         prop_value,
+                        _current_lr(optimizer),
                         self._cuda_memory_summary(),
                     )
             denom = max(1, batch_count)
             logger.info(
                 "Outer fold %s nuisance fold %s/%s epoch %s/%s complete: "
-                "loss=%.4f outcome=%.4f propensity=%.4f%s",
+                "loss=%.4f outcome=%.4f propensity=%.4f lr=%.3g%s",
                 outer_fold,
                 fold,
                 total_folds,
@@ -704,6 +723,7 @@ class AgenticAttentionVariableForestRunner:
                 loss_sum / denom,
                 outcome_sum / denom,
                 prop_sum / denom,
+                _current_lr(optimizer),
                 self._cuda_memory_summary(),
             )
 
@@ -728,16 +748,19 @@ class AgenticAttentionVariableForestRunner:
             weight_decay=getattr(train_config, "weight_decay", 0.01),
         )
         num_batches = max(1, int(np.ceil(len(positions) / train_config.batch_size)))
+        scheduler = _make_linear_lr_scheduler(optimizer, train_config, num_batches)
         progress_every = max(1, num_batches // 5)
         logger.info(
             "Outer fold %s effect fold %s/%s: training for %s epoch(s), "
-            "batch_size=%s, batches/epoch=%s%s",
+            "batch_size=%s, batches/epoch=%s, lr=%.3g, lr_schedule=%s%s",
             outer_fold,
             fold,
             total_folds,
             train_config.epochs,
             train_config.batch_size,
             num_batches,
+            _current_lr(optimizer),
+            "linear" if scheduler is not None else "none",
             self._cuda_memory_summary(),
         )
         for epoch in range(1, train_config.epochs + 1):
@@ -756,7 +779,7 @@ class AgenticAttentionVariableForestRunner:
                 tau = model(texts)
                 loss = torch.mean(weight * torch.square(target - tau))
                 loss.backward()
-                self._clip_and_step(model, optimizer)
+                self._clip_and_step(model, optimizer, scheduler)
                 batch_count += 1
                 loss_value = float(loss.detach().cpu())
                 loss_sum += loss_value
@@ -767,7 +790,7 @@ class AgenticAttentionVariableForestRunner:
                 ):
                     logger.info(
                         "Outer fold %s effect fold %s/%s epoch %s/%s "
-                        "batch %s/%s r_loss=%.4f%s",
+                        "batch %s/%s r_loss=%.4f lr=%.3g%s",
                         outer_fold,
                         fold,
                         total_folds,
@@ -776,25 +799,29 @@ class AgenticAttentionVariableForestRunner:
                         batch_idx,
                         num_batches,
                         loss_value,
+                        _current_lr(optimizer),
                         self._cuda_memory_summary(),
                     )
             logger.info(
                 "Outer fold %s effect fold %s/%s epoch %s/%s complete: "
-                "r_loss=%.4f%s",
+                "r_loss=%.4f lr=%.3g%s",
                 outer_fold,
                 fold,
                 total_folds,
                 epoch,
                 train_config.epochs,
                 loss_sum / max(1, batch_count),
+                _current_lr(optimizer),
                 self._cuda_memory_summary(),
             )
 
-    def _clip_and_step(self, model: nn.Module, optimizer) -> None:
+    def _clip_and_step(self, model: nn.Module, optimizer, scheduler=None) -> None:
         clip_norm = getattr(self.config.training, "gradient_clip_norm", 0.0)
         if clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
     def _predict_nuisance_model(self, model: _NuisanceNet, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         model.eval()
@@ -1355,6 +1382,25 @@ def _batch_positions(positions, batch_size: int, shuffle: bool) -> List[np.ndarr
     return [positions[start:start + batch_size] for start in range(0, len(positions), batch_size)]
 
 
+def _make_linear_lr_scheduler(optimizer, train_config, steps_per_epoch: int):
+    lr_schedule = str(getattr(train_config, "lr_schedule", "linear") or "").lower()
+    if lr_schedule != "linear":
+        return None
+    total_steps = max(1, int(steps_per_epoch) * int(getattr(train_config, "epochs", 1)))
+    return torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=1.0,
+        end_factor=0.1,
+        total_iters=total_steps,
+    )
+
+
+def _current_lr(optimizer) -> float:
+    if not optimizer.param_groups:
+        return 0.0
+    return float(optimizer.param_groups[0].get("lr", 0.0))
+
+
 def _bounded_fold_count(requested: int, n: int) -> int:
     if n < 2:
         raise ValueError("At least two rows are required for cross-fitting")
@@ -1402,6 +1448,12 @@ def _safe_roc_auc(y_true: np.ndarray, y_score: np.ndarray) -> Optional[float]:
         return float(roc_auc_score(y_true, y_score))
     except ValueError:
         return None
+
+
+def _format_optional_metric(value: Optional[float]) -> str:
+    if value is None or not np.isfinite(value):
+        return "n/a"
+    return f"{float(value):.4f}"
 
 
 def _safe_corr(a: np.ndarray, b: np.ndarray) -> Optional[float]:

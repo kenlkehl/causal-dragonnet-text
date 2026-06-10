@@ -1,4 +1,5 @@
 import json
+import logging
 
 import numpy as np
 import pandas as pd
@@ -16,7 +17,9 @@ from oci.config import (
     TrainingConfig,
 )
 from oci.inference.agentic_attention_variable_forest import (
+    AgenticAttentionVariableForestRunner,
     consensus_feature_specs,
+    _make_linear_lr_scheduler,
     run_agentic_attention_variable_forest,
 )
 from oci.models import ECONML_AVAILABLE
@@ -144,6 +147,82 @@ def test_config_parses_agentic_attention_variable_forest_block(tmp_path):
         .nuisance_folds
         == 2
     )
+
+
+def test_linear_lr_scheduler_spans_fold_training_steps():
+    param = torch.nn.Parameter(torch.ones(1))
+    optimizer = torch.optim.AdamW([param], lr=1.0)
+    train_config = TrainingConfig(epochs=2, lr_schedule="linear")
+    scheduler = _make_linear_lr_scheduler(optimizer, train_config, steps_per_epoch=3)
+
+    assert scheduler is not None
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(1.0)
+
+    for _ in range(6):
+        optimizer.step()
+        scheduler.step()
+
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
+
+
+def test_nuisance_crossfit_logs_heldout_aurocs(tmp_path, monkeypatch, caplog):
+    df = pd.DataFrame(
+        {
+            "clinical_text": [f"patient {i}" for i in range(8)],
+            "treatment_indicator": [0, 1, 0, 1, 0, 1, 0, 1],
+            "outcome_indicator": [1, 0, 1, 0, 1, 0, 1, 0],
+        }
+    )
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        cv_folds=0,
+        clinical_question="Compare treatment A versus B.",
+        architecture=ModelArchitectureConfig(
+            model_type="agentic_attention_variable_forest",
+            feature_extractor_type="hierarchical_transformer",
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=2,
+                effect_folds=2,
+                fold_parallelism="1",
+            ),
+        ),
+        training=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-3),
+        explicit_features=ExplicitFeatureExtractionConfig(enabled=False, features=[]),
+    )
+    runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "predictions.parquet",
+        device=torch.device("cpu"),
+        num_workers=1,
+        proposal_agent=FakeAttentionAgent(),
+        extraction_provider=FakeExtractionProvider(),
+    )
+
+    class TinyExtractor(torch.nn.Module):
+        output_dim = 2
+
+        def forward(self, texts):
+            return torch.zeros(len(texts), self.output_dim)
+
+    def predict_nuisance(model, heldout):
+        del model
+        t = heldout[config.treatment_column].to_numpy(dtype=float)
+        y = heldout[config.outcome_column].to_numpy(dtype=float)
+        return 0.1 + 0.8 * t, 0.1 + 0.8 * y
+
+    monkeypatch.setattr(runner, "_create_extractor", lambda: TinyExtractor())
+    monkeypatch.setattr(runner, "_train_nuisance_model", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runner, "_predict_nuisance_model", predict_nuisance)
+    monkeypatch.setattr(runner, "_attention_evidence", lambda *args, **kwargs: [])
+
+    caplog.set_level(
+        logging.INFO,
+        logger="oci.inference.agentic_attention_variable_forest",
+    )
+    runner._crossfit_nuisance(runner.dataset, outer_fold=1)
+
+    assert "heldout metrics: propensity_auroc=1.0000 outcome_auroc=1.0000" in caplog.text
 
 
 def test_oracle_agentic_attention_script_builds_configs(tmp_path):
