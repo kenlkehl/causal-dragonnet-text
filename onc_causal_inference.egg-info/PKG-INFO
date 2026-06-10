@@ -26,6 +26,8 @@ Requires-Dist: pyarrow
 Requires-Dist: joblib>=1.2.0
 Requires-Dist: accelerate>=0.20.0
 Requires-Dist: sentence-transformers>=3.0.0
+Requires-Dist: sentencepiece>=0.2.0
+Requires-Dist: tiktoken>=0.5.0
 Requires-Dist: econml>=0.14.0
 Requires-Dist: llvmlite>=0.46.0
 Requires-Dist: numba>=0.60.0

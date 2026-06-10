@@ -301,6 +301,65 @@ class TestHierarchicalTransformer:
         assert tokenizer == "slow-tokenizer"
         assert calls == [("some-bert", True), ("some-bert", False)]
 
+    def test_tokenizer_loader_uses_legacy_bert_snapshot(self, tmp_path):
+        from oci.models.hierarchical_transformer_extractor import (
+            HierarchicalTransformerExtractor,
+        )
+
+        (tmp_path / "vocab.txt").write_text(
+            "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\npatient\n",
+            encoding="utf-8",
+        )
+
+        class BrokenAutoTokenizer:
+            @staticmethod
+            def from_pretrained(model_name, use_fast=True):
+                raise ValueError(f"auto tokenizer failed: {model_name} {use_fast}")
+
+        ext = HierarchicalTransformerExtractor(sentence_encoder_model="prajjwal1/bert-tiny")
+        ext._resolved_sentence_encoder_path = str(tmp_path)
+        tokenizer = ext._load_tokenizer(BrokenAutoTokenizer)
+
+        assert tokenizer.__class__.__name__ == "BertTokenizer"
+        assert tokenizer.cls_token == "[CLS]"
+
+    def test_model_loader_uses_legacy_bert_snapshot(self, tmp_path):
+        import json
+        from transformers import BertConfig, BertModel
+
+        from oci.models.hierarchical_transformer_extractor import (
+            HierarchicalTransformerExtractor,
+        )
+
+        calls = []
+
+        class BrokenAutoModel:
+            @staticmethod
+            def from_pretrained(model_name):
+                calls.append(("auto", model_name))
+                raise ValueError("missing model_type")
+
+        config = BertConfig(
+            vocab_size=6,
+            hidden_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            intermediate_size=16,
+        )
+        BertModel(config).save_pretrained(tmp_path)
+        config_path = tmp_path / "config.json"
+        config_data = json.loads(config_path.read_text(encoding="utf-8"))
+        config_data.pop("model_type", None)
+        config_path.write_text(json.dumps(config_data), encoding="utf-8")
+
+        ext = HierarchicalTransformerExtractor(sentence_encoder_model="prajjwal1/bert-tiny")
+        ext._resolved_sentence_encoder_path = str(tmp_path)
+        model = ext._load_transformers_model(BrokenAutoModel)
+
+        assert isinstance(model, BertModel)
+        assert model.config.hidden_size == 8
+        assert calls == [("auto", "prajjwal1/bert-tiny")]
+
 
 class TestLearnedTokenizer:
     def test_fit_and_encode(self):

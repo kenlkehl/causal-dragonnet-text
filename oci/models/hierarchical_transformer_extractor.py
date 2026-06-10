@@ -11,6 +11,7 @@ import logging
 import math
 import os
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -186,6 +187,7 @@ class HierarchicalTransformerExtractor(nn.Module):
         self._tokenizer = None
         self._sentence_encoder = None
         self._sentence_transformer_encoder = None
+        self._resolved_sentence_encoder_path: Optional[str] = None
         self._sentence_dim = self._hash_embedding_dim if self._hash_backend else None
         self._encoder_initialized = self._hash_backend
 
@@ -293,7 +295,7 @@ class HierarchicalTransformerExtractor(nn.Module):
         self._tokenizer = self._load_tokenizer(AutoTokenizer)
         if self._effective_sentence_pooling() == "last":
             self._tokenizer.padding_side = "left"
-        self._sentence_encoder = AutoModel.from_pretrained(self._sentence_encoder_model)
+        self._sentence_encoder = self._load_transformers_model(AutoModel)
         self._sentence_encoder = self._sentence_encoder.to(self._device)
         self._sentence_dim = int(self._sentence_encoder.config.hidden_size)
         self._configure_sentence_encoder_training()
@@ -328,6 +330,19 @@ class HierarchicalTransformerExtractor(nn.Module):
                     use_fast=False,
                 )
             except Exception as slow_exc:
+                try:
+                    tokenizer = self._load_legacy_bert_tokenizer()
+                except Exception as legacy_exc:
+                    raise RuntimeError(
+                        "Could not load tokenizer for "
+                        f"{self._sentence_encoder_model!r}. Install tokenizer conversion "
+                        "dependencies with `pip install sentencepiece tiktoken`, or use a "
+                        "BERT/WordPiece model with tokenizer files available locally. "
+                        f"Fast tokenizer error: {fast_exc}. Slow tokenizer error: {slow_exc}. "
+                        f"Legacy BERT tokenizer error: {legacy_exc}."
+                    ) from legacy_exc
+                if tokenizer is not None:
+                    return tokenizer
                 raise RuntimeError(
                     "Could not load tokenizer for "
                     f"{self._sentence_encoder_model!r}. Install tokenizer conversion "
@@ -335,6 +350,91 @@ class HierarchicalTransformerExtractor(nn.Module):
                     "BERT/WordPiece model with tokenizer files available locally. "
                     f"Fast tokenizer error: {fast_exc}. Slow tokenizer error: {slow_exc}."
                 ) from slow_exc
+
+    def _load_transformers_model(self, auto_model_cls):
+        try:
+            return auto_model_cls.from_pretrained(self._sentence_encoder_model)
+        except Exception as auto_exc:
+            try:
+                model = self._load_legacy_bert_model()
+            except Exception as legacy_exc:
+                raise RuntimeError(
+                    "Could not load transformer chunk encoder for "
+                    f"{self._sentence_encoder_model!r}. AutoModel error: {auto_exc}. "
+                    f"Legacy BERT model error: {legacy_exc}."
+                ) from legacy_exc
+            if model is not None:
+                return model
+            raise
+
+    def _load_legacy_bert_tokenizer(self):
+        if not self._should_try_legacy_bert_loader():
+            return None
+        try:
+            from transformers import BertTokenizer
+        except ImportError as exc:
+            raise ImportError("transformers is required for BertTokenizer fallback") from exc
+
+        resolved_model = self._resolve_sentence_encoder_path()
+        vocab_file = Path(resolved_model) / "vocab.txt"
+        if not vocab_file.exists():
+            raise FileNotFoundError(f"legacy BERT tokenizer fallback expected {vocab_file}")
+        logger.info("Loading legacy BERT tokenizer from local snapshot: %s", resolved_model)
+        return BertTokenizer.from_pretrained(resolved_model, local_files_only=True)
+
+    def _load_legacy_bert_model(self):
+        if not self._should_try_legacy_bert_loader():
+            return None
+        try:
+            from transformers import BertConfig, BertModel
+        except ImportError as exc:
+            raise ImportError("transformers is required for BertModel fallback") from exc
+
+        resolved_model = self._resolve_sentence_encoder_path()
+        logger.info("Loading legacy BERT model from local snapshot: %s", resolved_model)
+        config = BertConfig.from_pretrained(resolved_model, local_files_only=True)
+        return BertModel.from_pretrained(
+            resolved_model,
+            config=config,
+            local_files_only=True,
+        )
+
+    def _should_try_legacy_bert_loader(self) -> bool:
+        model_name = str(self._sentence_encoder_model).lower()
+        if "bert" in model_name:
+            return True
+        model_path = Path(str(self._sentence_encoder_model)).expanduser()
+        return model_path.exists() and (model_path / "vocab.txt").exists()
+
+    @staticmethod
+    def _huggingface_offline() -> bool:
+        for name in ("TRANSFORMERS_OFFLINE", "HF_HUB_OFFLINE"):
+            value = os.environ.get(name)
+            if value and value.lower() in {"1", "true", "yes", "on"}:
+                return True
+        return False
+
+    def _resolve_sentence_encoder_path(self) -> str:
+        if self._resolved_sentence_encoder_path is not None:
+            return self._resolved_sentence_encoder_path
+
+        model_path = Path(str(self._sentence_encoder_model)).expanduser()
+        if model_path.exists():
+            self._resolved_sentence_encoder_path = str(model_path)
+            return self._resolved_sentence_encoder_path
+
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError as exc:
+            raise ImportError(
+                "huggingface_hub is required to resolve legacy BERT checkpoints"
+            ) from exc
+
+        self._resolved_sentence_encoder_path = snapshot_download(
+            str(self._sentence_encoder_model),
+            local_files_only=self._huggingface_offline(),
+        )
+        return self._resolved_sentence_encoder_path
 
     def _effective_sentence_encoder_backend(self) -> str:
         if self._sentence_encoder_backend != "auto":
