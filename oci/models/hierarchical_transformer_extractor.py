@@ -290,7 +290,7 @@ class HierarchicalTransformerExtractor(nn.Module):
             raise ImportError("transformers is required for hierarchical_transformer") from exc
 
         logger.info("Loading chunk encoder: %s", self._sentence_encoder_model)
-        self._tokenizer = AutoTokenizer.from_pretrained(self._sentence_encoder_model)
+        self._tokenizer = self._load_tokenizer(AutoTokenizer)
         if self._effective_sentence_pooling() == "last":
             self._tokenizer.padding_side = "left"
         self._sentence_encoder = AutoModel.from_pretrained(self._sentence_encoder_model)
@@ -309,6 +309,32 @@ class HierarchicalTransformerExtractor(nn.Module):
             self._trainable_sentence_encoder_parameter_count(),
             self._total_sentence_encoder_parameter_count(),
         )
+
+    def _load_tokenizer(self, auto_tokenizer_cls):
+        try:
+            return auto_tokenizer_cls.from_pretrained(
+                self._sentence_encoder_model,
+                use_fast=True,
+            )
+        except Exception as fast_exc:
+            logger.warning(
+                "Fast tokenizer load failed for %s (%s). Retrying with use_fast=False.",
+                self._sentence_encoder_model,
+                fast_exc,
+            )
+            try:
+                return auto_tokenizer_cls.from_pretrained(
+                    self._sentence_encoder_model,
+                    use_fast=False,
+                )
+            except Exception as slow_exc:
+                raise RuntimeError(
+                    "Could not load tokenizer for "
+                    f"{self._sentence_encoder_model!r}. Install tokenizer conversion "
+                    "dependencies with `pip install sentencepiece tiktoken`, or use a "
+                    "BERT/WordPiece model with tokenizer files available locally. "
+                    f"Fast tokenizer error: {fast_exc}. Slow tokenizer error: {slow_exc}."
+                ) from slow_exc
 
     def _effective_sentence_encoder_backend(self) -> str:
         if self._sentence_encoder_backend != "auto":

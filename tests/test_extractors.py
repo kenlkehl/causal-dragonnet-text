@@ -280,6 +280,27 @@ class TestHierarchicalTransformer:
         )
         assert trainable_qwen._effective_sentence_encoder_backend() == "transformers"
 
+    def test_tokenizer_loader_falls_back_to_slow_tokenizer(self):
+        from oci.models.hierarchical_transformer_extractor import (
+            HierarchicalTransformerExtractor,
+        )
+
+        calls = []
+
+        class FakeAutoTokenizer:
+            @staticmethod
+            def from_pretrained(model_name, use_fast=True):
+                calls.append((model_name, use_fast))
+                if use_fast:
+                    raise ValueError("fast tokenizer conversion failed")
+                return "slow-tokenizer"
+
+        ext = HierarchicalTransformerExtractor(sentence_encoder_model="some-bert")
+        tokenizer = ext._load_tokenizer(FakeAutoTokenizer)
+
+        assert tokenizer == "slow-tokenizer"
+        assert calls == [("some-bert", True), ("some-bert", False)]
+
 
 class TestLearnedTokenizer:
     def test_fit_and_encode(self):
