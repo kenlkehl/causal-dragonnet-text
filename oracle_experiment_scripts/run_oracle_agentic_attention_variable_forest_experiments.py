@@ -8,9 +8,15 @@ from high-attention chunks, extracts those variables with vLLM, and fits the
 final explicit-feature causal forest.
 
 The script expects an OpenAI-compatible LLM server to already be running.  For
-Qwen thinking models, start vLLM with an appropriate reasoning parser, e.g.:
+thinking models, start vLLM with the reasoning parser matching your model, e.g.:
 
     vllm serve Qwen/Qwen3.6-27B --reasoning-parser qwen3 ...
+    vllm serve google/gemma-4-27b-it --reasoning-parser gemma4 ...
+
+The defaults serve a Qwen model, but the pipeline is model-agnostic: pass
+``--agent-model-name`` / ``--extraction-model-name`` to switch models.  The
+extraction reasoning parser defaults to ``auto``, which infers the parser from
+the model name (qwen->qwen3, gemma->gemma4, gpt-oss->openai_gptoss).
 
 Outputs follow the oracle-script convention:
 
@@ -139,7 +145,7 @@ class AgenticAttentionOracleConfig:
     extraction_server_url: str = "http://localhost:8000/v1"
     extraction_model_name: str = "Qwen/Qwen3.6-27B"
     extraction_mode: str = "server"
-    extraction_reasoning_parser: Optional[str] = "qwen3"
+    extraction_reasoning_parser: Optional[str] = "auto"
     extraction_batch_size: int = 16
     extraction_max_retries: int = 3
     extraction_temperature: float = 0.0
@@ -539,7 +545,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--extraction-server-url", default="http://localhost:8000/v1")
     parser.add_argument("--extraction-model-name", default="Qwen/Qwen3.6-27B")
     parser.add_argument("--extraction-mode", default="server")
-    parser.add_argument("--extraction-reasoning-parser", default="qwen3")
+    parser.add_argument("--extraction-reasoning-parser", default="auto")
     parser.add_argument("--extraction-batch-size", type=int, default=16)
     parser.add_argument("--extraction-max-retries", type=int, default=3)
     parser.add_argument("--extraction-temperature", type=float, default=0.0)

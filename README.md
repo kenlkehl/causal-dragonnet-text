@@ -444,16 +444,14 @@ already running with `--reasoning-parser qwen3`:
 .venv/bin/python oracle_experiment_scripts/run_oracle_agentic_attention_variable_forest_experiments.py \
   --datasets synthetic_data/example_synthetic_datasets/one_confounder_one_effect_modifier_nsclc_with_structured \
   --output-dir ../pcori_experiments/oracle_agentic_attention_variable_forest_smoke \
-  --htr-sentence-model hash \
-  --sample-size 50 \
-  --text-max-chars 2500 \
-  --n-folds 2 \
-  --nuisance-folds 2 \
-  --effect-folds 2 \
-  --epochs 1 \
+  --htr-sentence-model Qwen/Qwen3-Embedding-0.6B \
+  --n-folds 5 \
+  --nuisance-folds 5 \
+  --effect-folds 5 \
+  --epochs 25 \
   --extraction-batch-size 16 \
-  --agent-model-name Qwen/Qwen3.6-27B \
-  --extraction-model-name Qwen/Qwen3.6-27B \
+  --agent-model-name Qwen/Qwen3.5-35B-A3B \
+  --extraction-model-name Qwen/Qwen3.5-35B-A3B \
   --extraction-reasoning-parser qwen3
 ```
 
