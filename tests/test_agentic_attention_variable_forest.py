@@ -454,6 +454,93 @@ def test_r_stage_crossfit_resumes_from_fold_checkpoints(tmp_path, monkeypatch):
     assert first["attention"] == second["attention"]
 
 
+def test_agent_candidate_output_is_saved_during_discovery(tmp_path):
+    class TraceAgent:
+        last_raw_response = "{\"proposals\": []}"
+        last_response_trace = {"raw_content": "{\"proposals\": []}"}
+
+        def propose(self, context):
+            assert context["attention_evidence"][0]["chunk_text"] == "important note"
+            return [
+                {
+                    "action": "add",
+                    "name": "baseline_marker",
+                    "type": "continuous",
+                    "roles": ["confounder"],
+                    "description": "Baseline marker before treatment",
+                }
+            ]
+
+    df = pd.DataFrame(
+        {
+            "clinical_text": ["note a", "note b"],
+            "treatment_indicator": [0, 1],
+            "outcome_indicator": [0, 1],
+        }
+    )
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        architecture=ModelArchitectureConfig(
+            agentic_feature_search=AgenticFeatureSearchConfig(
+                save_agent_context=True,
+                save_agent_raw_output=True,
+            ),
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=2,
+                effect_folds=2,
+                consensus_min_fold_fraction=1.0,
+            ),
+        ),
+    )
+    runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "predictions.parquet",
+        device=torch.device("cpu"),
+        num_workers=1,
+        proposal_agent=TraceAgent(),
+        extraction_provider=FakeExtractionProvider(),
+    )
+    attention_rows = [
+        {
+            "row_id": int(runner.dataset.loc[0, "_oci_row_id"]),
+            "fold": 1,
+            "stage": "nuisance",
+            "chunk_text": "important note",
+            "attention": 0.9,
+            "e_hat": 0.2,
+            "m_hat": 0.3,
+        }
+    ]
+
+    selected = runner._discover_variables_from_attention(
+        stage="confounder",
+        outer_fold=1,
+        discovery_df=runner.dataset,
+        attention_rows=attention_rows,
+        existing_specs=[],
+    )
+
+    assert [spec.name for spec in selected] == ["baseline_marker"]
+    checkpoint = (
+        tmp_path
+        / "agentic_attention_variable_forest"
+        / "agent_candidate_checkpoints"
+        / "confounder"
+        / "outer_001_fold_001.json"
+    )
+    payload = json.loads(checkpoint.read_text())
+    assert payload["status"] == "complete"
+    assert payload["context"]["attention_evidence"][0]["chunk_text"] == "important note"
+    assert payload["agent_raw_output"]["raw_content"] == "{\"proposals\": []}"
+    jsonl_path = (
+        tmp_path
+        / "agentic_attention_variable_forest"
+        / "confounder_candidates_by_fold.jsonl"
+    )
+    assert "baseline_marker" in jsonl_path.read_text()
+
+
 def test_fold_parallelism_auto_is_conservative_on_cuda(tmp_path):
     df = pd.DataFrame(
         {

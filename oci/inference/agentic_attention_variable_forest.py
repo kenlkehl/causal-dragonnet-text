@@ -33,6 +33,7 @@ from ..models.extractor_factory import create_feature_extractor
 from .agentic_explicit_feature_forest import (
     OpenAICompatibleFeatureSearchAgent,
     VLLMExplicitFeatureExtractionProvider,
+    _get_agent_response_trace,
 )
 from .applied_explicit_feature_forest import _build_features, _hstack_present
 
@@ -962,20 +963,63 @@ class AgenticAttentionVariableForestRunner:
                 attention_rows=fold_rows,
                 existing_specs=existing_specs,
             )
-            raw = self.proposal_agent.propose(context)
+            self._save_agent_candidate_checkpoint(
+                {
+                    "outer_fold": outer_fold,
+                    "fold": fold,
+                    "stage": stage,
+                    "status": "started",
+                    "context": self._stored_agent_context(context),
+                },
+                stage=stage,
+                outer_fold=outer_fold,
+                fold=fold,
+            )
+            try:
+                raw = self.proposal_agent.propose(context)
+            except Exception as exc:
+                error_row = {
+                    "outer_fold": outer_fold,
+                    "fold": fold,
+                    "stage": stage,
+                    "status": "error",
+                    "context": self._stored_agent_context(context),
+                    "error": str(exc),
+                }
+                if getattr(self.agent_search_config, "save_agent_raw_output", False):
+                    error_row["agent_raw_output"] = _get_agent_response_trace(
+                        self.proposal_agent
+                    )
+                self._save_agent_candidate_checkpoint(
+                    error_row,
+                    stage=stage,
+                    outer_fold=outer_fold,
+                    fold=fold,
+                )
+                raise
             specs = _proposal_dicts_to_specs(raw, required_role=stage)
             proposals_by_fold[fold] = specs
             row = {
                 "outer_fold": outer_fold,
                 "fold": fold,
                 "stage": stage,
-                "context": _scrub_context(context),
+                "status": "complete",
+                "context": self._stored_agent_context(context),
                 "proposals": [_spec_to_dict(spec) for spec in specs],
             }
+            if getattr(self.agent_search_config, "save_agent_raw_output", False):
+                row["agent_raw_output"] = _get_agent_response_trace(self.proposal_agent)
             if stage == "confounder":
                 self.confounder_candidate_rows.append(row)
             else:
                 self.modifier_candidate_rows.append(row)
+            self._save_agent_candidate_checkpoint(
+                row,
+                stage=stage,
+                outer_fold=outer_fold,
+                fold=fold,
+            )
+            self._flush_agent_candidate_rows()
 
         selected = consensus_feature_specs(
             proposals_by_fold,
@@ -990,6 +1034,11 @@ class AgenticAttentionVariableForestRunner:
             [spec.name for spec in selected],
         )
         return selected
+
+    def _stored_agent_context(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        if getattr(self.agent_search_config, "save_agent_context", False):
+            return context
+        return _scrub_context(context)
 
     def _build_agent_context(
         self,
@@ -1392,6 +1441,44 @@ class AgenticAttentionVariableForestRunner:
             fold,
             len(predictions),
             len(attention_df),
+        )
+
+    def _agent_candidate_checkpoint_path(
+        self,
+        stage: str,
+        outer_fold: int,
+        fold: int,
+    ) -> Path:
+        stage_dir = self.artifact_dir / "agent_candidate_checkpoints" / stage
+        return stage_dir / f"outer_{int(outer_fold):03d}_fold_{int(fold):03d}.json"
+
+    def _save_agent_candidate_checkpoint(
+        self,
+        row: Dict[str, Any],
+        stage: str,
+        outer_fold: int,
+        fold: int,
+    ) -> None:
+        path = self._agent_candidate_checkpoint_path(stage, outer_fold, fold)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(row, path)
+        logger.info(
+            "Outer fold %s %s fold %s: saved agent checkpoint status=%s path=%s",
+            outer_fold,
+            stage,
+            fold,
+            row.get("status", "unknown"),
+            path,
+        )
+
+    def _flush_agent_candidate_rows(self) -> None:
+        _write_jsonl(
+            self.artifact_dir / "confounder_candidates_by_fold.jsonl",
+            self.confounder_candidate_rows,
+        )
+        _write_jsonl(
+            self.artifact_dir / "effect_modifier_candidates_by_fold.jsonl",
+            self.modifier_candidate_rows,
         )
 
     def _load_nuisance_fold_checkpoint(
