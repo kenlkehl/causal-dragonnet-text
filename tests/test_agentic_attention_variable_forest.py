@@ -225,6 +225,208 @@ def test_nuisance_crossfit_logs_heldout_aurocs(tmp_path, monkeypatch, caplog):
     assert "heldout metrics: propensity_auroc=1.0000 outcome_auroc=1.0000" in caplog.text
 
 
+def test_nuisance_crossfit_resumes_from_fold_checkpoints(tmp_path, monkeypatch):
+    df = pd.DataFrame(
+        {
+            "clinical_text": [f"patient {i}" for i in range(8)],
+            "treatment_indicator": [0, 1, 0, 1, 0, 1, 0, 1],
+            "outcome_indicator": [1, 0, 1, 0, 1, 0, 1, 0],
+        }
+    )
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        cv_folds=0,
+        architecture=ModelArchitectureConfig(
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=2,
+                effect_folds=2,
+                fold_parallelism="1",
+            ),
+        ),
+        training=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-3),
+        explicit_features=ExplicitFeatureExtractionConfig(enabled=False, features=[]),
+    )
+    output_path = tmp_path / "predictions.parquet"
+    runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=output_path,
+        device=torch.device("cpu"),
+        num_workers=1,
+        proposal_agent=FakeAttentionAgent(),
+        extraction_provider=FakeExtractionProvider(),
+    )
+
+    class TinyExtractor(torch.nn.Module):
+        output_dim = 2
+
+        def forward(self, texts):
+            return torch.zeros(len(texts), self.output_dim)
+
+    train_calls = []
+
+    def predict_nuisance(model, heldout):
+        del model
+        t = heldout[config.treatment_column].to_numpy(dtype=float)
+        y = heldout[config.outcome_column].to_numpy(dtype=float)
+        return 0.1 + 0.8 * t, 0.2 + 0.6 * y
+
+    def attention_rows(extractor, heldout, fold, outer_fold, stage, extra):
+        del extractor, extra
+        return [
+            {
+                "row_id": int(row_id),
+                "fold": int(fold),
+                "outer_fold": int(outer_fold),
+                "stage": stage,
+                "chunk_text": "cached",
+                "attention": 1.0,
+            }
+            for row_id in heldout["_oci_row_id"].tolist()
+        ]
+
+    monkeypatch.setattr(runner, "_create_extractor", lambda: TinyExtractor())
+    monkeypatch.setattr(runner, "_train_nuisance_model", lambda *args, **kwargs: train_calls.append(1))
+    monkeypatch.setattr(runner, "_predict_nuisance_model", predict_nuisance)
+    monkeypatch.setattr(runner, "_attention_evidence", attention_rows)
+
+    first = runner._crossfit_nuisance(runner.dataset, outer_fold=1)
+    assert len(train_calls) == 2
+    assert (
+        output_path.parent
+        / "agentic_attention_variable_forest"
+        / "crossfit_fold_checkpoints"
+        / "nuisance"
+        / "outer_001_fold_001.done.json"
+    ).exists()
+
+    resumed = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=output_path,
+        device=torch.device("cpu"),
+        num_workers=1,
+        proposal_agent=FakeAttentionAgent(),
+        extraction_provider=FakeExtractionProvider(),
+    )
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("cached nuisance fold should not retrain")
+
+    monkeypatch.setattr(resumed, "_create_extractor", fail_if_called)
+    monkeypatch.setattr(resumed, "_train_nuisance_model", fail_if_called)
+    second = resumed._crossfit_nuisance(resumed.dataset, outer_fold=1)
+
+    pd.testing.assert_frame_equal(first["predictions"], second["predictions"])
+    assert first["attention"] == second["attention"]
+
+
+def test_r_stage_crossfit_resumes_from_fold_checkpoints(tmp_path, monkeypatch):
+    df = pd.DataFrame(
+        {
+            "clinical_text": [f"patient {i}" for i in range(8)],
+            "treatment_indicator": [0, 1, 0, 1, 0, 1, 0, 1],
+            "outcome_indicator": [1, 0, 1, 0, 1, 0, 1, 0],
+        }
+    )
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        cv_folds=0,
+        architecture=ModelArchitectureConfig(
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=2,
+                effect_folds=2,
+                fold_parallelism="1",
+            ),
+        ),
+        training=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-3),
+        explicit_features=ExplicitFeatureExtractionConfig(enabled=False, features=[]),
+    )
+    output_path = tmp_path / "predictions.parquet"
+    runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=output_path,
+        device=torch.device("cpu"),
+        num_workers=1,
+        proposal_agent=FakeAttentionAgent(),
+        extraction_provider=FakeExtractionProvider(),
+    )
+    nuisance_predictions = pd.DataFrame(
+        {
+            "_oci_row_id": runner.dataset["_oci_row_id"].to_numpy(),
+            "outer_fold": 1,
+            "e_hat": np.full(len(runner.dataset), 0.5),
+            "m_hat": np.full(len(runner.dataset), 0.4),
+            "y_residual": np.nan,
+            "t_residual": np.nan,
+            "r_loss_at_zero_tau": np.nan,
+            "nuisance_fold": 1,
+        }
+    )
+
+    class TinyExtractor(torch.nn.Module):
+        output_dim = 2
+
+        def forward(self, texts):
+            return torch.zeros(len(texts), self.output_dim)
+
+    train_calls = []
+
+    def predict_effect(model, heldout):
+        del model
+        return np.linspace(0.1, 0.2, len(heldout))
+
+    def attention_rows(extractor, heldout, fold, outer_fold, stage, extra):
+        del extractor, extra
+        return [
+            {
+                "row_id": int(row_id),
+                "fold": int(fold),
+                "outer_fold": int(outer_fold),
+                "stage": stage,
+                "chunk_text": "cached",
+                "attention": 1.0,
+            }
+            for row_id in heldout["_oci_row_id"].tolist()
+        ]
+
+    monkeypatch.setattr(runner, "_create_extractor", lambda: TinyExtractor())
+    monkeypatch.setattr(runner, "_train_effect_model", lambda *args, **kwargs: train_calls.append(1))
+    monkeypatch.setattr(runner, "_predict_effect_model", predict_effect)
+    monkeypatch.setattr(runner, "_attention_evidence", attention_rows)
+
+    first = runner._crossfit_effect(runner.dataset, nuisance_predictions, outer_fold=1)
+    assert len(train_calls) == 2
+    assert (
+        output_path.parent
+        / "agentic_attention_variable_forest"
+        / "crossfit_fold_checkpoints"
+        / "r_stage"
+        / "outer_001_fold_001.done.json"
+    ).exists()
+
+    resumed = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=output_path,
+        device=torch.device("cpu"),
+        num_workers=1,
+        proposal_agent=FakeAttentionAgent(),
+        extraction_provider=FakeExtractionProvider(),
+    )
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("cached R-stage fold should not retrain")
+
+    monkeypatch.setattr(resumed, "_create_extractor", fail_if_called)
+    monkeypatch.setattr(resumed, "_train_effect_model", fail_if_called)
+    second = resumed._crossfit_effect(resumed.dataset, nuisance_predictions, outer_fold=1)
+
+    pd.testing.assert_frame_equal(first["predictions"], second["predictions"])
+    assert first["attention"] == second["attention"]
+
+
 def test_fold_parallelism_auto_is_conservative_on_cuda(tmp_path):
     df = pd.DataFrame(
         {

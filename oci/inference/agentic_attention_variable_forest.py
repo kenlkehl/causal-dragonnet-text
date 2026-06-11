@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import logging
+import os
 import re
 from dataclasses import asdict
 from pathlib import Path
@@ -324,8 +326,19 @@ class AgenticAttentionVariableForestRunner:
                 start=1,
             )
         )
+        checkpoint_fingerprint = self._crossfit_checkpoint_fingerprint("nuisance", folds)
 
         def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
+            cached = self._load_nuisance_fold_checkpoint(
+                df=df,
+                outer_fold=outer_fold,
+                fold=fold,
+                heldout_pos=heldout_pos,
+                fingerprint=checkpoint_fingerprint,
+            )
+            if cached is not None:
+                return cached
+
             model = None
             logger.info(
                 "Outer fold %s nuisance fold %s/%s: train=%s heldout=%s%s",
@@ -412,7 +425,7 @@ class AgenticAttentionVariableForestRunner:
                     float(np.mean(m_hat)),
                     self._cuda_memory_summary(),
                 )
-                return {
+                result = {
                     "fold": fold,
                     "heldout_pos": heldout_pos,
                     "e_hat": e_hat,
@@ -421,6 +434,13 @@ class AgenticAttentionVariableForestRunner:
                     "t_resid": t_resid,
                     "attention": fold_attention,
                 }
+                self._save_nuisance_fold_checkpoint(
+                    df=df,
+                    result=result,
+                    outer_fold=outer_fold,
+                    fingerprint=checkpoint_fingerprint,
+                )
+                return result
             except RuntimeError as exc:
                 if _is_cuda_oom(exc):
                     logger.error(
@@ -510,8 +530,26 @@ class AgenticAttentionVariableForestRunner:
                 start=1,
             )
         )
+        checkpoint_fingerprint = self._crossfit_checkpoint_fingerprint(
+            "r_stage",
+            folds,
+            extra_payload={
+                "e_hat_hash": _hash_numeric_array(e),
+                "m_hat_hash": _hash_numeric_array(m),
+            },
+        )
 
         def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
+            cached = self._load_effect_fold_checkpoint(
+                df=df,
+                outer_fold=outer_fold,
+                fold=fold,
+                heldout_pos=heldout_pos,
+                fingerprint=checkpoint_fingerprint,
+            )
+            if cached is not None:
+                return cached
+
             model = None
             logger.info(
                 "Outer fold %s effect fold %s/%s: train=%s heldout=%s%s",
@@ -576,13 +614,20 @@ class AgenticAttentionVariableForestRunner:
                     float(np.mean(heldout_r_loss)),
                     self._cuda_memory_summary(),
                 )
-                return {
+                result = {
                     "fold": fold,
                     "heldout_pos": heldout_pos,
                     "tau_hat": tau_hat,
                     "r_loss": heldout_r_loss,
                     "attention": fold_attention,
                 }
+                self._save_effect_fold_checkpoint(
+                    df=df,
+                    result=result,
+                    outer_fold=outer_fold,
+                    fingerprint=checkpoint_fingerprint,
+                )
+                return result
             except RuntimeError as exc:
                 if _is_cuda_oom(exc):
                     logger.error(
@@ -1179,6 +1224,307 @@ class AgenticAttentionVariableForestRunner:
             return max(1, min(int(self.num_workers), int(folds)))
         return max(1, min(int(setting), int(folds)))
 
+    def _crossfit_checkpoint_fingerprint(
+        self,
+        stage: str,
+        folds: int,
+        extra_payload: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        arch = self.config.architecture
+        train = self.config.training
+        arch_keys = [
+            "feature_extractor_type",
+            "htr_sentence_model",
+            "htr_freeze_sentence_encoder",
+            "htr_chunk_size_words",
+            "htr_chunk_overlap_words",
+            "htr_max_chunks",
+            "htr_max_chunk_length",
+            "htr_num_layers",
+            "htr_num_heads",
+            "htr_transformer_dim",
+            "htr_dropout",
+            "htr_projection_dim",
+            "htr_hash_embedding_dim",
+            "htr_sentence_encoder_batch_size",
+            "htr_sentence_encoder_backend",
+            "htr_sentence_pooling",
+            "htr_normalize_sentence_embeddings",
+            "htr_trainable_sentence_encoder_layers",
+            "causal_head_hidden_outcome_dim",
+        ]
+        train_keys = [
+            "epochs",
+            "batch_size",
+            "learning_rate",
+            "weight_decay",
+            "gradient_clip_norm",
+            "alpha_propensity",
+            "lr_schedule",
+        ]
+        payload = {
+            "stage": stage,
+            "folds": int(folds),
+            "outcome_type": self.config.outcome_type,
+            "text_column": self.config.text_column,
+            "outcome_column": self.config.outcome_column,
+            "treatment_column": self.config.treatment_column,
+            "attention_top_k_chunks": self.avf_config.attention_top_k_chunks,
+            "e_clip": self.avf_config.e_clip,
+            "architecture": {key: getattr(arch, key, None) for key in arch_keys},
+            "training": {key: getattr(train, key, None) for key in train_keys},
+        }
+        if extra_payload:
+            payload["extra"] = extra_payload
+        encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _fold_checkpoint_paths(
+        self,
+        stage: str,
+        outer_fold: int,
+        fold: int,
+    ) -> Dict[str, Path]:
+        stage_dir = self.artifact_dir / "crossfit_fold_checkpoints" / stage
+        stem = f"outer_{int(outer_fold):03d}_fold_{int(fold):03d}"
+        return {
+            "predictions": stage_dir / f"{stem}_predictions.parquet",
+            "attention": stage_dir / f"{stem}_attention.parquet",
+            "done": stage_dir / f"{stem}.done.json",
+        }
+
+    def _load_fold_checkpoint(
+        self,
+        stage: str,
+        df: pd.DataFrame,
+        outer_fold: int,
+        fold: int,
+        heldout_pos: np.ndarray,
+        fingerprint: str,
+    ) -> Optional[Tuple[pd.DataFrame, List[Dict[str, Any]]]]:
+        paths = self._fold_checkpoint_paths(stage, outer_fold, fold)
+        if not (
+            paths["done"].exists()
+            and paths["predictions"].exists()
+            and paths["attention"].exists()
+        ):
+            return None
+        try:
+            with open(paths["done"]) as f:
+                marker = json.load(f)
+            if marker.get("fingerprint") != fingerprint:
+                logger.info(
+                    "Ignoring stale %s checkpoint for outer fold %s fold %s: "
+                    "fingerprint mismatch",
+                    stage,
+                    outer_fold,
+                    fold,
+                )
+                return None
+
+            pred_df = pd.read_parquet(paths["predictions"])
+            attention_df = pd.read_parquet(paths["attention"])
+            expected_ids = df.iloc[heldout_pos]["_oci_row_id"].to_numpy()
+            if "_oci_row_id" not in pred_df.columns or pred_df["_oci_row_id"].duplicated().any():
+                logger.warning(
+                    "Ignoring invalid %s checkpoint for outer fold %s fold %s: "
+                    "missing or duplicate _oci_row_id",
+                    stage,
+                    outer_fold,
+                    fold,
+                )
+                return None
+            pred_by_id = pred_df.set_index("_oci_row_id", drop=False)
+            if not set(expected_ids).issubset(set(pred_by_id.index)):
+                logger.info(
+                    "Ignoring stale %s checkpoint for outer fold %s fold %s: "
+                    "heldout row IDs changed",
+                    stage,
+                    outer_fold,
+                    fold,
+                )
+                return None
+            pred_df = pred_by_id.loc[expected_ids].reset_index(drop=True)
+            if len(pred_df) != len(expected_ids):
+                logger.info(
+                    "Ignoring stale %s checkpoint for outer fold %s fold %s: "
+                    "heldout row count changed",
+                    stage,
+                    outer_fold,
+                    fold,
+                )
+                return None
+            attention_rows = attention_df.to_dict("records")
+            logger.info(
+                "Outer fold %s %s fold %s: loaded cached checkpoint "
+                "predictions=%s attention_rows=%s",
+                outer_fold,
+                stage,
+                fold,
+                len(pred_df),
+                len(attention_rows),
+            )
+            return pred_df, attention_rows
+        except Exception as exc:
+            logger.warning(
+                "Ignoring unreadable %s checkpoint for outer fold %s fold %s: %s",
+                stage,
+                outer_fold,
+                fold,
+                exc,
+            )
+            return None
+
+    def _save_fold_checkpoint(
+        self,
+        stage: str,
+        outer_fold: int,
+        fold: int,
+        predictions: pd.DataFrame,
+        attention_rows: Sequence[Dict[str, Any]],
+        fingerprint: str,
+    ) -> None:
+        paths = self._fold_checkpoint_paths(stage, outer_fold, fold)
+        paths["predictions"].parent.mkdir(parents=True, exist_ok=True)
+        attention_df = pd.DataFrame(attention_rows)
+        if attention_df.empty:
+            attention_df = pd.DataFrame(columns=["row_id", "fold", "stage", "outer_fold"])
+        _write_parquet_atomic(predictions, paths["predictions"])
+        _write_parquet_atomic(attention_df, paths["attention"])
+        _write_json_atomic(
+            {
+                "stage": stage,
+                "outer_fold": int(outer_fold),
+                "fold": int(fold),
+                "n_predictions": int(len(predictions)),
+                "n_attention_rows": int(len(attention_df)),
+                "fingerprint": fingerprint,
+            },
+            paths["done"],
+        )
+        logger.info(
+            "Outer fold %s %s fold %s: saved checkpoint predictions=%s "
+            "attention_rows=%s",
+            outer_fold,
+            stage,
+            fold,
+            len(predictions),
+            len(attention_df),
+        )
+
+    def _load_nuisance_fold_checkpoint(
+        self,
+        df: pd.DataFrame,
+        outer_fold: int,
+        fold: int,
+        heldout_pos: np.ndarray,
+        fingerprint: str,
+    ) -> Optional[Dict[str, Any]]:
+        loaded = self._load_fold_checkpoint(
+            "nuisance",
+            df,
+            outer_fold,
+            fold,
+            heldout_pos,
+            fingerprint,
+        )
+        if loaded is None:
+            return None
+        pred_df, attention_rows = loaded
+        return {
+            "fold": fold,
+            "heldout_pos": np.asarray(heldout_pos),
+            "e_hat": pred_df["e_hat"].to_numpy(dtype=float),
+            "m_hat": pred_df["m_hat"].to_numpy(dtype=float),
+            "y_resid": pred_df["y_residual"].to_numpy(dtype=float),
+            "t_resid": pred_df["t_residual"].to_numpy(dtype=float),
+            "attention": attention_rows,
+        }
+
+    def _save_nuisance_fold_checkpoint(
+        self,
+        df: pd.DataFrame,
+        result: Dict[str, Any],
+        outer_fold: int,
+        fingerprint: str,
+    ) -> None:
+        heldout_pos = np.asarray(result["heldout_pos"], dtype=int)
+        predictions = pd.DataFrame(
+            {
+                "heldout_pos": heldout_pos,
+                "_oci_row_id": df.iloc[heldout_pos]["_oci_row_id"].to_numpy(),
+                "outer_fold": int(outer_fold),
+                "nuisance_fold": int(result["fold"]),
+                "e_hat": np.asarray(result["e_hat"], dtype=float),
+                "m_hat": np.asarray(result["m_hat"], dtype=float),
+                "y_residual": np.asarray(result["y_resid"], dtype=float),
+                "t_residual": np.asarray(result["t_resid"], dtype=float),
+            }
+        )
+        predictions["r_loss_at_zero_tau"] = predictions["y_residual"] ** 2
+        self._save_fold_checkpoint(
+            "nuisance",
+            outer_fold,
+            int(result["fold"]),
+            predictions,
+            result["attention"],
+            fingerprint,
+        )
+
+    def _load_effect_fold_checkpoint(
+        self,
+        df: pd.DataFrame,
+        outer_fold: int,
+        fold: int,
+        heldout_pos: np.ndarray,
+        fingerprint: str,
+    ) -> Optional[Dict[str, Any]]:
+        loaded = self._load_fold_checkpoint(
+            "r_stage",
+            df,
+            outer_fold,
+            fold,
+            heldout_pos,
+            fingerprint,
+        )
+        if loaded is None:
+            return None
+        pred_df, attention_rows = loaded
+        return {
+            "fold": fold,
+            "heldout_pos": np.asarray(heldout_pos),
+            "tau_hat": pred_df["tau_hat_r_stage"].to_numpy(dtype=float),
+            "r_loss": pred_df["r_loss"].to_numpy(dtype=float),
+            "attention": attention_rows,
+        }
+
+    def _save_effect_fold_checkpoint(
+        self,
+        df: pd.DataFrame,
+        result: Dict[str, Any],
+        outer_fold: int,
+        fingerprint: str,
+    ) -> None:
+        heldout_pos = np.asarray(result["heldout_pos"], dtype=int)
+        predictions = pd.DataFrame(
+            {
+                "heldout_pos": heldout_pos,
+                "_oci_row_id": df.iloc[heldout_pos]["_oci_row_id"].to_numpy(),
+                "outer_fold": int(outer_fold),
+                "effect_fold": int(result["fold"]),
+                "tau_hat_r_stage": np.asarray(result["tau_hat"], dtype=float),
+                "r_loss": np.asarray(result["r_loss"], dtype=float),
+            }
+        )
+        self._save_fold_checkpoint(
+            "r_stage",
+            outer_fold,
+            int(result["fold"]),
+            predictions,
+            result["attention"],
+            fingerprint,
+        )
+
     def _filter_specs_by_extraction_coverage(
         self,
         df: pd.DataFrame,
@@ -1506,6 +1852,35 @@ def _write_jsonl(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
     with open(path, "w") as f:
         for row in rows:
             f.write(json.dumps(row, default=_json_default) + "\n")
+
+
+def _write_parquet_atomic(df: pd.DataFrame, path: Path) -> None:
+    tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    try:
+        df.to_parquet(tmp_path, index=False)
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _write_json_atomic(data: Dict[str, Any], path: Path) -> None:
+    tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(data, f, indent=2, default=_json_default)
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _hash_numeric_array(values: np.ndarray) -> str:
+    arr = np.ascontiguousarray(np.asarray(values, dtype=np.float64))
+    digest = hashlib.sha256()
+    digest.update(str(arr.shape).encode("utf-8"))
+    digest.update(arr.tobytes())
+    return digest.hexdigest()
 
 
 def _json_default(value: Any) -> Any:
