@@ -225,6 +225,79 @@ def test_nuisance_crossfit_logs_heldout_aurocs(tmp_path, monkeypatch, caplog):
     assert "heldout metrics: propensity_auroc=1.0000 outcome_auroc=1.0000" in caplog.text
 
 
+def test_fold_parallelism_auto_is_conservative_on_cuda(tmp_path):
+    df = pd.DataFrame(
+        {
+            "clinical_text": ["a", "b", "c", "d"],
+            "treatment_indicator": [0, 1, 0, 1],
+            "outcome_indicator": [0, 1, 0, 1],
+        }
+    )
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        architecture=ModelArchitectureConfig(
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=4,
+                effect_folds=4,
+                fold_parallelism="auto",
+            ),
+        ),
+    )
+
+    cpu_runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "cpu.parquet",
+        device=torch.device("cpu"),
+        num_workers=3,
+        proposal_agent=FakeAttentionAgent(),
+        extraction_provider=FakeExtractionProvider(),
+    )
+    cuda_runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "cuda.parquet",
+        device=torch.device("cuda:0"),
+        num_workers=3,
+        proposal_agent=FakeAttentionAgent(),
+        extraction_provider=FakeExtractionProvider(),
+    )
+
+    assert cpu_runner._fold_n_jobs(4) == 3
+    assert cuda_runner._fold_n_jobs(4) == 1
+
+
+def test_explicit_fold_parallelism_overrides_cuda_serial_default(tmp_path):
+    df = pd.DataFrame(
+        {
+            "clinical_text": ["a", "b", "c", "d", "e"],
+            "treatment_indicator": [0, 1, 0, 1, 0],
+            "outcome_indicator": [0, 1, 0, 1, 0],
+        }
+    )
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        architecture=ModelArchitectureConfig(
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=5,
+                effect_folds=5,
+                fold_parallelism="2",
+            ),
+        ),
+    )
+    runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "cuda.parquet",
+        device=torch.device("cuda:0"),
+        num_workers=1,
+        proposal_agent=FakeAttentionAgent(),
+        extraction_provider=FakeExtractionProvider(),
+    )
+
+    assert runner._fold_n_jobs(5) == 2
+
+
 def test_oracle_agentic_attention_script_builds_configs(tmp_path):
     from oracle_experiment_scripts.run_oracle_agentic_attention_variable_forest_experiments import (
         _make_applied_config,

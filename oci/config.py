@@ -444,6 +444,8 @@ class AgenticAttentionVariableForestConfig:
 
     nuisance_folds: int = 5
     effect_folds: int = 5
+    # "auto" parallelizes folds on CPU via num_workers and stays serial on CUDA.
+    # Set a positive integer to opt into that many concurrent folds on any device.
     fold_parallelism: str = "auto"
     attention_top_k_chunks: int = 5
     consensus_min_fold_fraction: float = 2.0 / 3.0

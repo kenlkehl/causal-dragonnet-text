@@ -542,7 +542,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--nuisance-folds", type=int, default=5)
     parser.add_argument("--effect-folds", type=int, default=5)
-    parser.add_argument("--fold-parallelism", default="auto")
+    parser.add_argument(
+        "--fold-parallelism",
+        default="auto",
+        help=(
+            "Number of cross-fit nuisance/effect folds to train concurrently. "
+            "'auto' uses num_workers on CPU and stays serial on CUDA; an explicit "
+            "integer opts into that many concurrent folds, including on CUDA."
+        ),
+    )
     parser.add_argument("--attention-top-k-chunks", type=int, default=5)
     parser.add_argument("--consensus-min-fold-fraction", type=float, default=2.0 / 3.0)
     parser.add_argument("--min-extraction-coverage", type=float, default=0.70)

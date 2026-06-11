@@ -444,6 +444,15 @@ class AgenticAttentionVariableForestRunner:
                     )
 
         n_jobs = self._fold_n_jobs(folds)
+        logger.info(
+            "Outer fold %s nuisance cross-fit parallelism: folds=%s n_jobs=%s "
+            "setting=%s device=%s",
+            outer_fold,
+            folds,
+            n_jobs,
+            self.avf_config.fold_parallelism,
+            self.device,
+        )
         if n_jobs > 1:
             fold_results = Parallel(n_jobs=n_jobs, prefer="threads")(
                 delayed(run_fold)(fold, fit_pos, heldout_pos)
@@ -597,6 +606,15 @@ class AgenticAttentionVariableForestRunner:
                     )
 
         n_jobs = self._fold_n_jobs(folds)
+        logger.info(
+            "Outer fold %s effect cross-fit parallelism: folds=%s n_jobs=%s "
+            "setting=%s device=%s",
+            outer_fold,
+            folds,
+            n_jobs,
+            self.avf_config.fold_parallelism,
+            self.device,
+        )
         if n_jobs > 1:
             fold_results = Parallel(n_jobs=n_jobs, prefer="threads")(
                 delayed(run_fold)(fold, fit_pos, heldout_pos)
@@ -1154,10 +1172,10 @@ class AgenticAttentionVariableForestRunner:
             return ""
 
     def _fold_n_jobs(self, folds: int) -> int:
-        if self.device.type != "cpu":
-            return 1
-        setting = str(self.avf_config.fold_parallelism)
+        setting = str(self.avf_config.fold_parallelism).strip().lower()
         if setting == "auto":
+            if self.device.type != "cpu":
+                return 1
             return max(1, min(int(self.num_workers), int(folds)))
         return max(1, min(int(setting), int(folds)))
 
