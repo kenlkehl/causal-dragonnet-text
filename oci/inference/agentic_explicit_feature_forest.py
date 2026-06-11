@@ -43,6 +43,58 @@ EXTRACTION_PROMPT_VERSION = "explicit_features_v2"
 VALID_ACTIONS = {"add", "remove", "update_role", "none"}
 VALID_ROLES = {"confounder", "effect_modifier"}
 VALID_TYPES = {"categorical", "continuous"}
+_AUTO_MODEL_NAME_VALUES = {"", "auto", "discover", "server"}
+_MODEL_NAME_AUTODISCOVERY_ALIASES = {"Qwen/Qwen3.6-27B"}
+
+
+def _is_auto_model_name(model_name: Optional[str]) -> bool:
+    return model_name is None or str(model_name).strip().lower() in _AUTO_MODEL_NAME_VALUES
+
+
+def _should_autodiscover_model_name(model_name: Optional[str]) -> bool:
+    if _is_auto_model_name(model_name):
+        return True
+    return str(model_name).strip() in _MODEL_NAME_AUTODISCOVERY_ALIASES
+
+
+def _model_id_from_openai_model(model: Any) -> Optional[str]:
+    if isinstance(model, str):
+        return model
+    if isinstance(model, dict):
+        value = model.get("id")
+        return str(value) if value else None
+    value = getattr(model, "id", None)
+    return str(value) if value else None
+
+
+def _discover_openai_compatible_model_name(
+    client: Any,
+    server_url: Optional[str],
+    purpose: str,
+) -> str:
+    try:
+        response = client.models.list()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not autodiscover {purpose} model from {server_url or 'configured server'} "
+            "via /models. Provide an explicit model name instead."
+        ) from exc
+
+    models = getattr(response, "data", response)
+    for model in models or []:
+        model_id = _model_id_from_openai_model(model)
+        if model_id:
+            logger.info(
+                "Autodiscovered %s model from %s: %s",
+                purpose,
+                server_url or "configured server",
+                model_id,
+            )
+            return model_id
+    raise RuntimeError(
+        f"Could not autodiscover {purpose} model from {server_url or 'configured server'}: "
+        "/models returned no model ids. Provide an explicit model name instead."
+    )
 
 
 @dataclass
@@ -1101,6 +1153,7 @@ class OpenAICompatibleFeatureSearchAgent:
     def __init__(self, search_config: AgenticFeatureSearchConfig):
         self.search_config = search_config
         self._client = None
+        self._resolved_agent_model_name: Optional[str] = None
         self.last_raw_response: Optional[str] = None
         self.last_response_trace: Optional[Dict[str, Any]] = None
 
@@ -1120,12 +1173,26 @@ class OpenAICompatibleFeatureSearchAgent:
             max_retries=0,
         )
 
+    def _resolve_agent_model_name(self) -> str:
+        configured = self.search_config.agent_model_name
+        if not _should_autodiscover_model_name(configured):
+            return str(configured)
+        if self._resolved_agent_model_name is None:
+            self._ensure_client()
+            self._resolved_agent_model_name = _discover_openai_compatible_model_name(
+                self._client,
+                server_url=self.search_config.agent_server_url,
+                purpose="agent proposal",
+            )
+        return self._resolved_agent_model_name
+
     def propose(self, context: Dict[str, Any]) -> List[Dict[str, Any]]:
         self._ensure_client()
         self.last_raw_response = None
         self.last_response_trace = None
         prompt = build_agent_prompt(context, self.search_config)
         messages = [{"role": "user", "content": prompt}]
+        model_name = self._resolve_agent_model_name()
         attempts: List[Dict[str, Any]] = []
         max_repair_attempts = max(
             0,
@@ -1134,7 +1201,7 @@ class OpenAICompatibleFeatureSearchAgent:
 
         for attempt_idx in range(max_repair_attempts + 1):
             response = self._client.chat.completions.create(
-                model=self.search_config.agent_model_name,
+                model=model_name,
                 messages=messages,
                 temperature=self.search_config.agent_temperature,
                 max_tokens=self.search_config.agent_max_tokens,
@@ -1203,6 +1270,7 @@ class VLLMExplicitFeatureExtractionProvider:
             cache_dir=self.feature_config.cache_dir or str(self.output_dir)
         )
         self._column_fingerprints: Dict[str, str] = {}
+        self._resolved_vllm_model_name: Optional[str] = None
 
     def ensure_features(
         self,
@@ -1337,11 +1405,12 @@ class VLLMExplicitFeatureExtractionProvider:
             len(specs),
             [spec.name for spec in specs],
         )
+        model_name = self._resolve_vllm_model_name()
         extractor = VLLMFeatureExtractor(
             specs=specs,
             mode=self.feature_config.vllm_mode,
             server_url=self.feature_config.vllm_server_url or "http://localhost:8000/v1",
-            model_name=self.feature_config.vllm_model_name,
+            model_name=model_name,
             tensor_parallel_size=self.feature_config.vllm_tensor_parallel_size,
             gpu_memory_utilization=self.feature_config.vllm_gpu_memory_utilization,
             download_dir=self.feature_config.vllm_download_dir,
@@ -1484,14 +1553,15 @@ class VLLMExplicitFeatureExtractionProvider:
         return self.config.dataset_path or "in_memory_dataset"
 
     def _cache_config(self, specs: List[ExplicitFeatureSpec]) -> Dict[str, Any]:
+        model_name = self._resolve_vllm_model_name()
         cache_config = {
             "features": [_spec_extraction_contract_dict(spec) for spec in specs],
             "prompt_template_version": EXTRACTION_PROMPT_VERSION,
-            "vllm_model_name": self.feature_config.vllm_model_name,
+            "vllm_model_name": model_name,
             "vllm_max_model_len": self.feature_config.vllm_max_model_len,
             "vllm_reasoning_parser": resolve_vllm_reasoning_parser(
                 self.feature_config.vllm_reasoning_parser,
-                self.feature_config.vllm_model_name,
+                model_name,
             ),
             "extraction_temperature": self.feature_config.extraction_temperature,
             "extraction_max_tokens": self.feature_config.extraction_max_tokens,
@@ -1501,6 +1571,36 @@ class VLLMExplicitFeatureExtractionProvider:
 
     def _spec_fingerprint(self, spec: ExplicitFeatureSpec) -> str:
         return json.dumps(self._cache_config([spec]), sort_keys=True, default=_json_default)
+
+    def _resolve_vllm_model_name(self) -> str:
+        configured = self.feature_config.vllm_model_name
+        if not _should_autodiscover_model_name(configured):
+            return str(configured)
+        if self._resolved_vllm_model_name is not None:
+            return self._resolved_vllm_model_name
+        mode = str(self.feature_config.vllm_mode or "server")
+        if mode != "server":
+            raise ValueError(
+                "vllm_model_name='auto' is only supported for vllm_mode='server'; "
+                f"got vllm_mode={mode!r}. Provide an explicit model name for this mode."
+            )
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise ImportError(
+                "openai package is required to autodiscover the vLLM server model"
+            ) from exc
+        client = OpenAI(
+            base_url=self.feature_config.vllm_server_url or "http://localhost:8000/v1",
+            api_key="EMPTY",
+            max_retries=0,
+        )
+        self._resolved_vllm_model_name = _discover_openai_compatible_model_name(
+            client,
+            server_url=self.feature_config.vllm_server_url,
+            purpose="explicit feature extraction",
+        )
+        return self._resolved_vllm_model_name
 
 
 class CausalForestExplicitEvaluator:

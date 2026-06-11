@@ -573,7 +573,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--initial-feature-names", nargs="*", default=[])
 
     parser.add_argument("--agent-server-url", default="http://localhost:8000/v1")
-    parser.add_argument("--agent-model-name", default="Qwen/Qwen3.6-27B")
+    parser.add_argument(
+        "--agent-model-name",
+        default="Qwen/Qwen3.6-27B",
+        help=(
+            "Agent model id. Use 'auto' to read the first model id from the "
+            "OpenAI-compatible server /v1/models endpoint. The legacy default "
+            "Qwen/Qwen3.6-27B is also autodiscovered at runtime."
+        ),
+    )
     parser.add_argument("--agent-api-key", default="EMPTY")
     parser.add_argument("--agent-temperature", type=float, default=0.0)
     parser.add_argument("--agent-max-tokens", type=int, default=8192)
@@ -582,7 +590,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-agent-raw-output", action="store_true")
 
     parser.add_argument("--extraction-server-url", default="http://localhost:8000/v1")
-    parser.add_argument("--extraction-model-name", default="Qwen/Qwen3.6-27B")
+    parser.add_argument(
+        "--extraction-model-name",
+        default="Qwen/Qwen3.6-27B",
+        help=(
+            "Extraction model id. Use 'auto' to read the first model id from the "
+            "OpenAI-compatible server /v1/models endpoint. The legacy default "
+            "Qwen/Qwen3.6-27B is also autodiscovered at runtime."
+        ),
+    )
     parser.add_argument("--extraction-mode", default="server")
     parser.add_argument("--extraction-reasoning-parser", default="auto")
     parser.add_argument("--extraction-batch-size", type=int, default=16)

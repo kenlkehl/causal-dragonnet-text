@@ -61,6 +61,7 @@ class ExplicitFeatureExtractionConfig:
     # - "python_api": Use vLLM Python API directly (no server, in-process)
     vllm_mode: str = "server"
     vllm_server_url: Optional[str] = "http://localhost:8000/v1"
+    # Set to "auto" in server mode to use the first id returned by /v1/models.
     vllm_model_name: str = "Qwen/Qwen2.5-7B-Instruct"
     vllm_tensor_parallel_size: int = 1
     vllm_gpu_memory_utilization: float = 0.9
@@ -319,6 +320,7 @@ class AgenticFeatureSearchConfig:
     # LLM proposal agent settings. The endpoint is OpenAI-compatible so it can
     # point to vLLM, OpenAI, or another compatible local server.
     agent_server_url: Optional[str] = "http://localhost:8000/v1"
+    # Set to "auto" to use the first id returned by the server's /v1/models.
     agent_model_name: str = "Qwen/Qwen2.5-7B-Instruct"
     agent_api_key: str = "EMPTY"
     agent_temperature: float = 0.0

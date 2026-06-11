@@ -11,6 +11,7 @@ import logging
 import math
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -20,6 +21,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
+_TRANSFORMERS_ENCODER_INIT_LOCK = threading.Lock()
+_SENTENCE_TRANSFORMER_INIT_LOCK = threading.Lock()
 
 
 def split_text_into_word_chunks(
@@ -249,10 +252,17 @@ class HierarchicalTransformerExtractor(nn.Module):
         if self._encoder_initialized:
             return
         if self._effective_sentence_encoder_backend() == "sentence_transformers":
-            self._ensure_sentence_transformer_initialized()
+            with _SENTENCE_TRANSFORMER_INIT_LOCK:
+                if self._encoder_initialized:
+                    return
+                self._ensure_sentence_transformer_initialized()
+                self._encoder_initialized = True
         else:
-            self._ensure_transformers_initialized()
-        self._encoder_initialized = True
+            with _TRANSFORMERS_ENCODER_INIT_LOCK:
+                if self._encoder_initialized:
+                    return
+                self._ensure_transformers_initialized()
+                self._encoder_initialized = True
 
     def _ensure_sentence_transformer_initialized(self) -> None:
         try:
@@ -289,7 +299,10 @@ class HierarchicalTransformerExtractor(nn.Module):
         try:
             from transformers import AutoModel, AutoTokenizer
         except ImportError as exc:
-            raise ImportError("transformers is required for hierarchical_transformer") from exc
+            raise ImportError(
+                "transformers is required for hierarchical_transformer. "
+                f"Failed to import AutoModel/AutoTokenizer from transformers: {exc}"
+            ) from exc
 
         logger.info("Loading chunk encoder: %s", self._sentence_encoder_model)
         self._tokenizer = self._load_tokenizer(AutoTokenizer)

@@ -520,6 +520,55 @@ def test_agentic_extraction_provider_groups_missing_specs(monkeypatch, tmp_path)
     assert extracted["explicit_feat_ecog"].tolist() == ["0", "0"]
 
 
+def test_agentic_extraction_provider_autodiscovers_server_model(monkeypatch, tmp_path):
+    calls = []
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.models = FakeOpenAIModels(["served-extraction-model"])
+
+    class FakeVLLMFeatureExtractor:
+        def __init__(self, specs, **kwargs):
+            self.specs = specs
+            calls.append({"spec_names": [spec.name for spec in specs], "kwargs": kwargs})
+
+        def extract_to_dataframe(self, texts, batch_size=32):
+            calls[-1]["texts"] = list(texts)
+            return pd.DataFrame(
+                {
+                    "explicit_feat_age": [72] * len(texts),
+                    "explicit_feat_age_missing": [False] * len(texts),
+                }
+            )
+
+        def cleanup(self):
+            calls[-1]["cleanup"] = True
+
+    monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
+    monkeypatch.setattr(
+        "oci.inference.agentic_explicit_feature_forest.VLLMFeatureExtractor",
+        FakeVLLMFeatureExtractor,
+    )
+    config = _provider_config(tmp_path, cache_enabled=False)
+    config.explicit_features.vllm_model_name = "auto"
+    provider = VLLMExplicitFeatureExtractionProvider(config=config, output_dir=tmp_path)
+    df = pd.DataFrame({"clinical_text": ["note a", "note b"]})
+    specs = [
+        ExplicitFeatureSpec(
+            name="age",
+            type="continuous",
+            roles=["confounder"],
+            description="Age at baseline",
+        )
+    ]
+
+    extracted = provider.ensure_features(df, specs)
+
+    assert calls[0]["kwargs"]["model_name"] == "served-extraction-model"
+    assert extracted["explicit_feat_age"].tolist() == [72, 72]
+
+
 def test_agentic_extraction_provider_saves_grouped_results_as_per_spec_cache(
     monkeypatch,
     tmp_path,
@@ -772,10 +821,62 @@ class FakeOpenAICompletions:
         )
 
 
+class FakeOpenAIModels:
+    def __init__(self, model_ids):
+        self.model_ids = list(model_ids)
+        self.calls = 0
+
+    def list(self):
+        self.calls += 1
+        return SimpleNamespace(
+            data=[SimpleNamespace(id=model_id) for model_id in self.model_ids]
+        )
+
+
 class FakeOpenAIClient:
-    def __init__(self, contents):
+    def __init__(self, contents, model_ids=None):
         self.completions = FakeOpenAICompletions(contents)
         self.chat = SimpleNamespace(completions=self.completions)
+        self.models = FakeOpenAIModels(model_ids or ["fake-agent"])
+
+
+def test_openai_agent_autodiscovers_model_name():
+    client = FakeOpenAIClient(
+        [json.dumps({"proposals": []})],
+        model_ids=["served-agent-model"],
+    )
+    agent = OpenAICompatibleFeatureSearchAgent(
+        AgenticFeatureSearchConfig(
+            agent_model_name="auto",
+            agent_schema_repair_attempts=0,
+        )
+    )
+    agent._client = client
+
+    proposals = agent.propose({"current_features": [], "iteration_feedback": []})
+
+    assert proposals == []
+    assert client.models.calls == 1
+    assert client.completions.calls[0]["model"] == "served-agent-model"
+
+
+def test_openai_agent_autodiscovers_legacy_oracle_default_model_name():
+    client = FakeOpenAIClient(
+        [json.dumps({"proposals": []})],
+        model_ids=["served-agent-model"],
+    )
+    agent = OpenAICompatibleFeatureSearchAgent(
+        AgenticFeatureSearchConfig(
+            agent_model_name="Qwen/Qwen3.6-27B",
+            agent_schema_repair_attempts=0,
+        )
+    )
+    agent._client = client
+
+    agent.propose({"current_features": [], "iteration_feedback": []})
+
+    assert client.models.calls == 1
+    assert client.completions.calls[0]["model"] == "served-agent-model"
 
 
 def test_openai_agent_repairs_missing_required_proposal_fields():

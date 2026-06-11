@@ -7,6 +7,8 @@ LLM-based extractors are tested separately with @pytest.mark.slow.
 import pytest
 import pandas as pd
 import torch
+import threading
+import time
 
 # Sample texts for testing
 SAMPLE_TEXTS = [
@@ -359,6 +361,54 @@ class TestHierarchicalTransformer:
         assert isinstance(model, BertModel)
         assert model.config.hidden_size == 8
         assert calls == [("auto", "prajjwal1/bert-tiny")]
+
+    def test_transformer_encoder_initialization_is_thread_serialized(self, monkeypatch):
+        from oci.models.hierarchical_transformer_extractor import (
+            HierarchicalTransformerExtractor,
+        )
+
+        active = 0
+        max_active = 0
+        calls = 0
+        lock = threading.Lock()
+
+        def fake_init(self):
+            nonlocal active, max_active, calls
+            with lock:
+                active += 1
+                calls += 1
+                max_active = max(max_active, active)
+            time.sleep(0.02)
+            self._sentence_dim = self._hash_embedding_dim
+            self._input_projection = torch.nn.Linear(
+                self._sentence_dim,
+                self._transformer_dim,
+            )
+            with lock:
+                active -= 1
+
+        monkeypatch.setattr(
+            HierarchicalTransformerExtractor,
+            "_ensure_transformers_initialized",
+            fake_init,
+        )
+        extractors = [
+            HierarchicalTransformerExtractor(sentence_encoder_model="some-bert")
+            for _ in range(3)
+        ]
+        threads = [
+            threading.Thread(target=extractor._ensure_encoder_initialized)
+            for extractor in extractors
+        ]
+
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert calls == 3
+        assert max_active == 1
+        assert all(extractor._encoder_initialized for extractor in extractors)
 
 
 class TestLearnedTokenizer:

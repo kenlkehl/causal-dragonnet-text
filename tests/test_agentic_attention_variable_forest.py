@@ -1,5 +1,7 @@
 import json
 import logging
+import os
+import threading
 
 import numpy as np
 import pandas as pd
@@ -20,6 +22,7 @@ from oci.inference.agentic_attention_variable_forest import (
     AgenticAttentionVariableForestRunner,
     consensus_feature_specs,
     _make_linear_lr_scheduler,
+    _run_crossfit_fold_tasks,
     run_agentic_attention_variable_forest,
 )
 from oci.models import ECONML_AVAILABLE
@@ -163,6 +166,30 @@ def test_linear_lr_scheduler_spans_fold_training_steps():
         scheduler.step()
 
     assert optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
+
+
+def test_crossfit_fold_tasks_use_in_process_threads():
+    split_items = [
+        (1, (np.array([0, 1]), np.array([2]))),
+        (2, (np.array([2, 3]), np.array([0]))),
+    ]
+    parent_pid = os.getpid()
+    main_thread = threading.get_ident()
+
+    def run_fold(fold, fit_pos, heldout_pos):
+        return {
+            "fold": fold,
+            "pid": os.getpid(),
+            "thread": threading.get_ident(),
+            "fit": fit_pos.tolist(),
+            "heldout": heldout_pos.tolist(),
+        }
+
+    results = _run_crossfit_fold_tasks(run_fold, split_items, n_jobs=2)
+
+    assert [row["fold"] for row in results] == [1, 2]
+    assert {row["pid"] for row in results} == {parent_pid}
+    assert all(row["thread"] != main_thread for row in results)
 
 
 def test_nuisance_crossfit_logs_heldout_aurocs(tmp_path, monkeypatch, caplog):

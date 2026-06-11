@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import gc
 import hashlib
 import json
@@ -17,7 +18,6 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from joblib import Parallel, delayed
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, roc_auc_score
 from sklearn.model_selection import KFold
@@ -473,16 +473,7 @@ class AgenticAttentionVariableForestRunner:
             self.avf_config.fold_parallelism,
             self.device,
         )
-        if n_jobs > 1:
-            fold_results = Parallel(n_jobs=n_jobs, prefer="threads")(
-                delayed(run_fold)(fold, fit_pos, heldout_pos)
-                for fold, (fit_pos, heldout_pos) in split_items
-            )
-        else:
-            fold_results = [
-                run_fold(fold, fit_pos, heldout_pos)
-                for fold, (fit_pos, heldout_pos) in split_items
-            ]
+        fold_results = _run_crossfit_fold_tasks(run_fold, split_items, n_jobs)
 
         for result in fold_results:
             heldout_pos = result["heldout_pos"]
@@ -660,16 +651,7 @@ class AgenticAttentionVariableForestRunner:
             self.avf_config.fold_parallelism,
             self.device,
         )
-        if n_jobs > 1:
-            fold_results = Parallel(n_jobs=n_jobs, prefer="threads")(
-                delayed(run_fold)(fold, fit_pos, heldout_pos)
-                for fold, (fit_pos, heldout_pos) in split_items
-            )
-        else:
-            fold_results = [
-                run_fold(fold, fit_pos, heldout_pos)
-                for fold, (fit_pos, heldout_pos) in split_items
-            ]
+        fold_results = _run_crossfit_fold_tasks(run_fold, split_items, n_jobs)
 
         for result in fold_results:
             heldout_pos = result["heldout_pos"]
@@ -1744,6 +1726,23 @@ def _batch_positions(positions, batch_size: int, shuffle: bool) -> List[np.ndarr
         positions = positions.copy()
         np.random.shuffle(positions)
     return [positions[start:start + batch_size] for start in range(0, len(positions), batch_size)]
+
+
+def _run_crossfit_fold_tasks(run_fold, split_items, n_jobs: int) -> List[Dict[str, Any]]:
+    if n_jobs <= 1:
+        return [
+            run_fold(fold, fit_pos, heldout_pos)
+            for fold, (fit_pos, heldout_pos) in split_items
+        ]
+    with ThreadPoolExecutor(
+        max_workers=int(n_jobs),
+        thread_name_prefix="avf-fold",
+    ) as executor:
+        futures = [
+            executor.submit(run_fold, fold, fit_pos, heldout_pos)
+            for fold, (fit_pos, heldout_pos) in split_items
+        ]
+        return [future.result() for future in futures]
 
 
 def _make_linear_lr_scheduler(optimizer, train_config, steps_per_epoch: int):
