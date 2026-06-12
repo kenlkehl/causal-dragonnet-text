@@ -500,7 +500,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="../pcori_experiments/oracle_agentic_attention_variable_forest",
     )
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help=(
+            "Worker count for CPU-side batching/tokenization; also used by fold "
+            "parallelism on CPU when --fold-parallelism=auto."
+        ),
+    )
     parser.add_argument("--n-repeats", type=int, default=1)
     parser.add_argument("--n-folds", type=int, default=5)
     parser.add_argument("--max-experiments", type=int, default=None)

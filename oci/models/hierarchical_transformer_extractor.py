@@ -62,6 +62,128 @@ def split_text_into_word_chunks(
     return chunks or [" ".join(words[-chunk_size_words:])]
 
 
+class HierarchicalTransformerBatchPreprocessor:
+    """CPU-only chunking/tokenization helper for DataLoader collators."""
+
+    def __init__(
+        self,
+        *,
+        tokenizer: Optional[Any],
+        chunk_size_words: int,
+        chunk_overlap_words: int,
+        max_chunks: int,
+        max_chunk_length: int,
+        tokenize_for_transformers: bool,
+        chunk_cache_max_entries: int,
+        tokenization_cache_max_entries: int,
+    ):
+        self._tokenizer = tokenizer
+        self._chunk_size_words = int(chunk_size_words)
+        self._chunk_overlap_words = int(chunk_overlap_words)
+        self._max_chunks = int(max_chunks)
+        self._max_chunk_length = int(max_chunk_length)
+        self._tokenize_for_transformers = bool(tokenize_for_transformers)
+        self._chunk_cache_max_entries = int(chunk_cache_max_entries)
+        self._tokenization_cache_max_entries = int(tokenization_cache_max_entries)
+        self._chunk_cache: Dict[str, List[str]] = {}
+        self._tokenization_cache: Dict[str, Tuple[Tuple[int, ...], Tuple[int, ...]]] = {}
+
+    def __call__(self, texts: Sequence[str]) -> Dict[str, Any]:
+        texts = [str(text or "") for text in texts]
+        chunks = self._chunks_for_texts(texts)
+        batch: Dict[str, Any] = {
+            "texts": texts,
+            "chunks": chunks,
+        }
+        if self._tokenize_for_transformers:
+            flat_chunks = [chunk for row in chunks for chunk in row]
+            encoded = self._tokenize_chunks(flat_chunks)
+            batch["chunk_input_ids"] = encoded["input_ids"]
+            batch["chunk_attention_mask"] = encoded["attention_mask"]
+        return batch
+
+    def _chunks_for_texts(self, texts: Sequence[str]) -> List[List[str]]:
+        chunks_by_text: List[List[str]] = []
+        for text in texts:
+            key = str(text or "")
+            chunks = self._chunk_cache.get(key)
+            if chunks is None:
+                chunks = split_text_into_word_chunks(
+                    key,
+                    self._chunk_size_words,
+                    self._chunk_overlap_words,
+                    self._max_chunks,
+                )
+                if len(self._chunk_cache) < self._chunk_cache_max_entries:
+                    self._chunk_cache[key] = chunks
+            chunks_by_text.append(chunks)
+        return chunks_by_text
+
+    def _tokenize_chunks(self, chunks: Sequence[str]) -> Dict[str, torch.Tensor]:
+        entries = [self._tokenize_one_chunk(chunk) for chunk in chunks]
+        return _collate_tokenized_chunks(self._tokenizer, entries)
+
+    def _tokenize_one_chunk(self, chunk: str) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+        if self._tokenizer is None:
+            raise RuntimeError("Cannot tokenize chunks without a tokenizer")
+        key = str(chunk or "")
+        cached = self._tokenization_cache.get(key)
+        if cached is not None:
+            return cached
+
+        encoded = self._tokenizer(
+            key,
+            padding=False,
+            truncation=True,
+            max_length=self._max_chunk_length,
+        )
+        input_ids = tuple(int(token_id) for token_id in encoded["input_ids"])
+        attention_mask = tuple(int(mask_value) for mask_value in encoded["attention_mask"])
+        if len(self._tokenization_cache) < self._tokenization_cache_max_entries:
+            self._tokenization_cache[key] = (input_ids, attention_mask)
+        return input_ids, attention_mask
+
+
+def _collate_tokenized_chunks(
+    tokenizer: Any,
+    entries: Sequence[Tuple[Tuple[int, ...], Tuple[int, ...]]],
+) -> Dict[str, torch.Tensor]:
+    if not entries:
+        return {
+            "input_ids": torch.zeros(0, 0, dtype=torch.long),
+            "attention_mask": torch.zeros(0, 0, dtype=torch.long),
+        }
+    max_length = max(len(input_ids) for input_ids, _ in entries)
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = getattr(tokenizer, "eos_token_id", 0) or 0
+    input_ids_tensor = torch.full(
+        (len(entries), max_length),
+        int(pad_token_id),
+        dtype=torch.long,
+    )
+    attention_mask_tensor = torch.zeros(
+        len(entries),
+        max_length,
+        dtype=torch.long,
+    )
+    left_pad = getattr(tokenizer, "padding_side", "right") == "left"
+    for row, (input_ids, attention_mask) in enumerate(entries):
+        offset = max_length - len(input_ids) if left_pad else 0
+        input_ids_tensor[row, offset:offset + len(input_ids)] = torch.as_tensor(
+            input_ids,
+            dtype=torch.long,
+        )
+        attention_mask_tensor[row, offset:offset + len(attention_mask)] = torch.as_tensor(
+            attention_mask,
+            dtype=torch.long,
+        )
+    return {
+        "input_ids": input_ids_tensor,
+        "attention_mask": attention_mask_tensor,
+    }
+
+
 class _InterpretableTransformerLayer(nn.Module):
     """Transformer encoder layer that can return self-attention weights."""
 
@@ -193,6 +315,14 @@ class HierarchicalTransformerExtractor(nn.Module):
         self._resolved_sentence_encoder_path: Optional[str] = None
         self._sentence_dim = self._hash_embedding_dim if self._hash_backend else None
         self._encoder_initialized = self._hash_backend
+        self._chunk_cache: Dict[str, List[str]] = {}
+        self._tokenization_cache: Dict[str, Tuple[Tuple[int, ...], Tuple[int, ...]]] = {}
+        self._chunk_cache_max_entries = int(
+            os.environ.get("OCI_HTR_CHUNK_CACHE_MAX_ENTRIES", "100000")
+        )
+        self._tokenization_cache_max_entries = int(
+            os.environ.get("OCI_HTR_TOKEN_CACHE_MAX_ENTRIES", "200000")
+        )
 
         self._input_projection = nn.Linear(
             self._hash_embedding_dim if self._hash_backend else transformer_dim,
@@ -317,10 +447,11 @@ class HierarchicalTransformerExtractor(nn.Module):
         )
         logger.info(
             "Chunk encoder initialized with backend=%s pooling=%s hidden_dim=%s "
-            "trainable_encoder_params=%s/%s",
+            "device=%s trainable_encoder_params=%s/%s",
             self._effective_sentence_encoder_backend(),
             self._effective_sentence_pooling(),
             self._sentence_dim,
+            self._device,
             self._trainable_sentence_encoder_parameter_count(),
             self._total_sentence_encoder_parameter_count(),
         )
@@ -618,13 +749,7 @@ class HierarchicalTransformerExtractor(nn.Module):
         outputs_by_batch = []
         for start in range(0, len(chunk_list), self._sentence_encoder_batch_size):
             batch_chunks = chunk_list[start:start + self._sentence_encoder_batch_size]
-            encoded = self._tokenizer(
-                batch_chunks,
-                padding=True,
-                truncation=True,
-                max_length=self._max_chunk_length,
-                return_tensors="pt",
-            )
+            encoded = self._tokenize_chunks_for_transformers(batch_chunks)
             input_ids = encoded["input_ids"].to(self._device)
             attention_mask = encoded["attention_mask"].to(self._device)
             if self._sentence_encoder is not None and not self._encoder_has_trainable_params:
@@ -646,33 +771,149 @@ class HierarchicalTransformerExtractor(nn.Module):
             )
         return torch.cat(outputs_by_batch, dim=0)
 
-    def _chunks_for_texts(self, texts: Sequence[str]) -> List[List[str]]:
-        return [
-            split_text_into_word_chunks(
-                text,
-                self._chunk_size_words,
-                self._chunk_overlap_words,
-                self._max_chunks,
+    def _encode_prepared_transformer_chunks(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        input_ids = input_ids.to(self._device, non_blocking=True)
+        attention_mask = attention_mask.to(self._device, non_blocking=True)
+        if self._sentence_encoder is not None and not self._encoder_has_trainable_params:
+            self._sentence_encoder.eval()
+        outputs_by_batch = []
+        for start in range(0, input_ids.shape[0], self._sentence_encoder_batch_size):
+            batch_input_ids = input_ids[start:start + self._sentence_encoder_batch_size]
+            batch_attention_mask = attention_mask[start:start + self._sentence_encoder_batch_size]
+            with torch.set_grad_enabled(self._encoder_has_trainable_params):
+                if not self._encoder_has_trainable_params:
+                    with torch.no_grad():
+                        outputs = self._sentence_encoder(
+                            input_ids=batch_input_ids,
+                            attention_mask=batch_attention_mask,
+                        )
+                else:
+                    outputs = self._sentence_encoder(
+                        input_ids=batch_input_ids,
+                        attention_mask=batch_attention_mask,
+                    )
+            outputs_by_batch.append(
+                self._pool_sentence_output(
+                    outputs.last_hidden_state,
+                    batch_attention_mask,
+                ).float()
             )
-            for text in texts
-        ]
+        return torch.cat(outputs_by_batch, dim=0)
+
+    def _tokenize_chunks_for_transformers(self, chunks: Sequence[str]) -> Dict[str, torch.Tensor]:
+        entries = [self._tokenize_one_chunk_for_transformers(chunk) for chunk in chunks]
+        return self._collate_tokenized_chunks(entries)
+
+    def _tokenize_one_chunk_for_transformers(
+        self,
+        chunk: str,
+    ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+        key = str(chunk or "")
+        cached = self._tokenization_cache.get(key)
+        if cached is not None:
+            return cached
+
+        encoded = self._tokenizer(
+            key,
+            padding=False,
+            truncation=True,
+            max_length=self._max_chunk_length,
+        )
+        input_ids = tuple(int(token_id) for token_id in encoded["input_ids"])
+        attention_mask = tuple(int(mask_value) for mask_value in encoded["attention_mask"])
+        if len(self._tokenization_cache) < self._tokenization_cache_max_entries:
+            self._tokenization_cache[key] = (input_ids, attention_mask)
+        return input_ids, attention_mask
+
+    def _collate_tokenized_chunks(
+        self,
+        entries: Sequence[Tuple[Tuple[int, ...], Tuple[int, ...]]],
+    ) -> Dict[str, torch.Tensor]:
+        return _collate_tokenized_chunks(self._tokenizer, entries)
+
+    def _chunks_for_texts(self, texts: Sequence[str]) -> List[List[str]]:
+        chunks_by_text: List[List[str]] = []
+        for text in texts:
+            key = str(text or "")
+            chunks = self._chunk_cache.get(key)
+            if chunks is None:
+                chunks = split_text_into_word_chunks(
+                    key,
+                    self._chunk_size_words,
+                    self._chunk_overlap_words,
+                    self._max_chunks,
+                )
+                if len(self._chunk_cache) < self._chunk_cache_max_entries:
+                    self._chunk_cache[key] = chunks
+            chunks_by_text.append(chunks)
+        return chunks_by_text
+
+    def _populate_chunk_cache(self, texts: Sequence[str]) -> None:
+        if self._chunk_cache_max_entries <= 0:
+            return
+        self._chunks_for_texts(texts)
+
+    def make_batch_preprocessor(self) -> HierarchicalTransformerBatchPreprocessor:
+        self._ensure_encoder_initialized()
+        tokenize_for_transformers = (
+            not self._hash_backend
+            and self._effective_sentence_encoder_backend() == "transformers"
+        )
+        return HierarchicalTransformerBatchPreprocessor(
+            tokenizer=self._tokenizer if tokenize_for_transformers else None,
+            chunk_size_words=self._chunk_size_words,
+            chunk_overlap_words=self._chunk_overlap_words,
+            max_chunks=self._max_chunks,
+            max_chunk_length=self._max_chunk_length,
+            tokenize_for_transformers=tokenize_for_transformers,
+            chunk_cache_max_entries=self._chunk_cache_max_entries,
+            tokenization_cache_max_entries=self._tokenization_cache_max_entries,
+        )
+
+    def prepare_batch(self, texts: Sequence[str]) -> Dict[str, Any]:
+        return self.make_batch_preprocessor()(texts)
 
     def forward(self, texts_or_batch) -> torch.Tensor:
-        if isinstance(texts_or_batch, dict):
-            texts = texts_or_batch.get("texts")
-            if texts is None:
-                raise ValueError("hierarchical_transformer batch input requires 'texts'")
+        prepared_batch = texts_or_batch if isinstance(texts_or_batch, dict) else None
+        if prepared_batch is not None:
+            texts = prepared_batch.get("texts")
+            batch_chunks = prepared_batch.get("chunks")
+            if texts is None and batch_chunks is None:
+                raise ValueError(
+                    "hierarchical_transformer batch input requires 'texts' or 'chunks'"
+                )
         else:
             texts = texts_or_batch
-        if isinstance(texts, str):
-            texts = [texts]
-        texts = list(texts)
+        if prepared_batch is not None and batch_chunks is not None:
+            batch_chunks = [list(chunks) for chunks in batch_chunks]
+            texts = list(texts) if texts is not None else ["" for _ in batch_chunks]
+        else:
+            if isinstance(texts, str):
+                texts = [texts]
+            texts = list(texts)
+            batch_chunks = self._chunks_for_texts(texts)
         if not texts:
             return torch.zeros(0, self._projection_dim, device=self._device)
 
-        batch_chunks = self._chunks_for_texts(texts)
         flat_chunks = [chunk for chunks in batch_chunks for chunk in chunks]
-        flat_embeddings = self._encode_chunks(flat_chunks)
+        if (
+            prepared_batch is not None
+            and "chunk_input_ids" in prepared_batch
+            and "chunk_attention_mask" in prepared_batch
+            and not self._hash_backend
+            and self._effective_sentence_encoder_backend() == "transformers"
+        ):
+            self._ensure_encoder_initialized()
+            flat_embeddings = self._encode_prepared_transformer_chunks(
+                prepared_batch["chunk_input_ids"],
+                prepared_batch["chunk_attention_mask"],
+            )
+        else:
+            flat_embeddings = self._encode_chunks(flat_chunks)
         flat_embeddings = self._input_projection(flat_embeddings)
 
         batch_size = len(batch_chunks)
@@ -725,14 +966,17 @@ class HierarchicalTransformerExtractor(nn.Module):
         return features
 
     def fit_tokenizer(self, texts: List[str]) -> None:
-        del texts
+        self._populate_chunk_cache(texts)
         self._ensure_encoder_initialized()
         logger.info(
             "HierarchicalTransformerExtractor ready: backend=%s pooling=%s "
-            "trainable_params=%s",
+            "device=%s trainable_params=%s chunk_cache=%s token_cache=%s",
             self._effective_sentence_encoder_backend(),
             self._effective_sentence_pooling(),
+            self._device,
             self.get_num_parameters(),
+            len(self._chunk_cache),
+            len(self._tokenization_cache),
         )
 
     def interpret_attention(self, texts: List[str], top_k: int = 5) -> List[Dict[str, Any]]:

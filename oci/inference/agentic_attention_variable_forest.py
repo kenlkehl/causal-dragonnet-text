@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, roc_auc_score
 from sklearn.model_selection import KFold
+from torch.utils.data import DataLoader, Dataset
 
 from ..config import (
     AgenticAttentionVariableForestConfig,
@@ -78,8 +79,10 @@ class _NuisanceNet(nn.Module):
         self.propensity = nn.Linear(hidden_dim, 1)
         self.outcome = nn.Linear(hidden_dim, 1)
 
-    def forward(self, texts: Sequence[str]):
-        features = self.extractor(list(texts))
+    def forward(self, texts_or_batch):
+        features = self.extractor(
+            texts_or_batch if isinstance(texts_or_batch, dict) else list(texts_or_batch)
+        )
         hidden = self.shared(features)
         return self.propensity(hidden).squeeze(-1), self.outcome(hidden).squeeze(-1)
 
@@ -95,8 +98,69 @@ class _EffectNet(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, texts: Sequence[str]):
-        return self.head(self.extractor(list(texts))).squeeze(-1)
+    def forward(self, texts_or_batch):
+        features = self.extractor(
+            texts_or_batch if isinstance(texts_or_batch, dict) else list(texts_or_batch)
+        )
+        return self.head(features).squeeze(-1)
+
+
+class _FoldTextDataset(Dataset):
+    def __init__(
+        self,
+        texts: Sequence[str],
+        positions: Sequence[int],
+        fields: Optional[Dict[str, np.ndarray]] = None,
+    ):
+        self.texts = [str(text or "") for text in texts]
+        self.positions = np.asarray(positions, dtype=int)
+        self.fields = {
+            name: np.asarray(values)
+            for name, values in (fields or {}).items()
+        }
+
+    def __len__(self) -> int:
+        return int(len(self.positions))
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        position = int(self.positions[index])
+        item: Dict[str, Any] = {
+            "position": position,
+            "text": self.texts[position],
+        }
+        for name, values in self.fields.items():
+            item[name] = float(values[position])
+        return item
+
+
+class _FoldTextBatchCollator:
+    def __init__(self, text_preprocessor: Optional[Any] = None):
+        self.text_preprocessor = text_preprocessor
+
+    def __call__(self, items: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+        texts = [str(item["text"]) for item in items]
+        batch: Dict[str, Any] = {
+            "model_input": (
+                self.text_preprocessor(texts)
+                if self.text_preprocessor is not None
+                else texts
+            ),
+            "position": torch.as_tensor(
+                [int(item["position"]) for item in items],
+                dtype=torch.long,
+            ),
+        }
+        field_names = [
+            key
+            for key in items[0].keys()
+            if key not in {"position", "text"}
+        ] if items else []
+        for name in field_names:
+            batch[name] = torch.as_tensor(
+                [float(item[name]) for item in items],
+                dtype=torch.float32,
+            )
+        return batch
 
 
 class AgenticAttentionVariableForestRunner:
@@ -303,6 +367,40 @@ class AgenticAttentionVariableForestRunner:
                 "htr_trainable_sentence_encoder_layers",
                 0,
             ),
+        )
+
+    def _make_text_loader(
+        self,
+        model: nn.Module,
+        df: pd.DataFrame,
+        positions: Sequence[int],
+        *,
+        fields: Optional[Dict[str, np.ndarray]] = None,
+        shuffle: bool = False,
+        total_folds: Optional[int] = None,
+    ) -> DataLoader:
+        extractor = getattr(model, "extractor", None)
+        text_preprocessor = None
+        if extractor is not None and hasattr(extractor, "make_batch_preprocessor"):
+            text_preprocessor = extractor.make_batch_preprocessor()
+        workers = self._data_loader_workers(total_folds=total_folds)
+        loader_kwargs: Dict[str, Any] = {
+            "batch_size": max(1, int(self.config.training.batch_size)),
+            "shuffle": bool(shuffle),
+            "collate_fn": _FoldTextBatchCollator(text_preprocessor),
+            "num_workers": workers,
+            "pin_memory": self.device.type == "cuda",
+        }
+        if workers > 0:
+            loader_kwargs["persistent_workers"] = True
+            loader_kwargs["prefetch_factor"] = 2
+        return DataLoader(
+            _FoldTextDataset(
+                texts=df[self.config.text_column].astype(str).tolist(),
+                positions=positions,
+                fields=fields,
+            ),
+            **loader_kwargs,
         )
 
     def _crossfit_nuisance(self, df: pd.DataFrame, outer_fold: int) -> Dict[str, Any]:
@@ -678,23 +776,36 @@ class AgenticAttentionVariableForestRunner:
         model.extractor.fit_tokenizer(
             df.iloc[positions][self.config.text_column].astype(str).tolist()
         )
+        train_loader = self._make_text_loader(
+            model,
+            df,
+            positions,
+            fields={
+                "t": df[self.config.treatment_column].to_numpy(dtype=np.float32),
+                "y": df[self.config.outcome_column].to_numpy(dtype=np.float32),
+            },
+            shuffle=True,
+            total_folds=total_folds,
+        )
         optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
             lr=train_config.learning_rate,
             weight_decay=getattr(train_config, "weight_decay", 0.01),
         )
-        num_batches = max(1, int(np.ceil(len(positions) / train_config.batch_size)))
+        num_batches = max(1, len(train_loader))
         scheduler = _make_linear_lr_scheduler(optimizer, train_config, num_batches)
         progress_every = max(1, num_batches // 5)
         logger.info(
             "Outer fold %s nuisance fold %s/%s: training for %s epoch(s), "
-            "batch_size=%s, batches/epoch=%s, lr=%.3g, lr_schedule=%s%s",
+            "batch_size=%s, batches/epoch=%s, dataloader_workers=%s, "
+            "lr=%.3g, lr_schedule=%s%s",
             outer_fold,
             fold,
             total_folds,
             train_config.epochs,
             train_config.batch_size,
             num_batches,
+            train_loader.num_workers,
             _current_lr(optimizer),
             "linear" if scheduler is not None else "none",
             self._cuda_memory_summary(),
@@ -705,22 +816,11 @@ class AgenticAttentionVariableForestRunner:
             prop_sum = 0.0
             outcome_sum = 0.0
             batch_count = 0
-            for batch_idx, batch_pos in enumerate(
-                _batch_positions(positions, train_config.batch_size, shuffle=True),
-                start=1,
-            ):
-                batch = df.iloc[batch_pos]
-                texts = batch[self.config.text_column].tolist()
-                t = torch.as_tensor(
-                    batch[self.config.treatment_column].to_numpy(dtype=np.float32),
-                    device=self.device,
-                )
-                y = torch.as_tensor(
-                    batch[self.config.outcome_column].to_numpy(dtype=np.float32),
-                    device=self.device,
-                )
-                optimizer.zero_grad()
-                t_logit, y_pred = model(texts)
+            for batch_idx, batch in enumerate(train_loader, start=1):
+                t = batch["t"].to(self.device, non_blocking=True)
+                y = batch["y"].to(self.device, non_blocking=True)
+                optimizer.zero_grad(set_to_none=True)
+                t_logit, y_pred = model(batch["model_input"])
                 prop_loss = F.binary_cross_entropy_with_logits(t_logit, t)
                 if self.config.outcome_type == "continuous":
                     outcome_loss = F.mse_loss(y_pred, y)
@@ -788,23 +888,36 @@ class AgenticAttentionVariableForestRunner:
         model.extractor.fit_tokenizer(
             df.iloc[positions][self.config.text_column].astype(str).tolist()
         )
+        train_loader = self._make_text_loader(
+            model,
+            df,
+            positions,
+            fields={
+                "target": np.asarray(targets, dtype=np.float32),
+                "weight": np.asarray(weights, dtype=np.float32),
+            },
+            shuffle=True,
+            total_folds=total_folds,
+        )
         optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
             lr=train_config.learning_rate,
             weight_decay=getattr(train_config, "weight_decay", 0.01),
         )
-        num_batches = max(1, int(np.ceil(len(positions) / train_config.batch_size)))
+        num_batches = max(1, len(train_loader))
         scheduler = _make_linear_lr_scheduler(optimizer, train_config, num_batches)
         progress_every = max(1, num_batches // 5)
         logger.info(
             "Outer fold %s effect fold %s/%s: training for %s epoch(s), "
-            "batch_size=%s, batches/epoch=%s, lr=%.3g, lr_schedule=%s%s",
+            "batch_size=%s, batches/epoch=%s, dataloader_workers=%s, "
+            "lr=%.3g, lr_schedule=%s%s",
             outer_fold,
             fold,
             total_folds,
             train_config.epochs,
             train_config.batch_size,
             num_batches,
+            train_loader.num_workers,
             _current_lr(optimizer),
             "linear" if scheduler is not None else "none",
             self._cuda_memory_summary(),
@@ -813,16 +926,11 @@ class AgenticAttentionVariableForestRunner:
             model.train()
             loss_sum = 0.0
             batch_count = 0
-            for batch_idx, batch_pos in enumerate(
-                _batch_positions(positions, train_config.batch_size, shuffle=True),
-                start=1,
-            ):
-                batch = df.iloc[batch_pos]
-                texts = batch[self.config.text_column].tolist()
-                target = torch.as_tensor(targets[batch_pos], device=self.device)
-                weight = torch.as_tensor(weights[batch_pos], device=self.device)
-                optimizer.zero_grad()
-                tau = model(texts)
+            for batch_idx, batch in enumerate(train_loader, start=1):
+                target = batch["target"].to(self.device, non_blocking=True)
+                weight = batch["weight"].to(self.device, non_blocking=True)
+                optimizer.zero_grad(set_to_none=True)
+                tau = model(batch["model_input"])
                 loss = torch.mean(weight * torch.square(target - tau))
                 loss.backward()
                 self._clip_and_step(model, optimizer, scheduler)
@@ -873,10 +981,15 @@ class AgenticAttentionVariableForestRunner:
         model.eval()
         prop = []
         outcome = []
+        loader = self._make_text_loader(
+            model,
+            df,
+            np.arange(len(df), dtype=int),
+            shuffle=False,
+        )
         with torch.no_grad():
-            for start in range(0, len(df), self.config.training.batch_size):
-                batch = df.iloc[start:start + self.config.training.batch_size]
-                t_logit, y_pred = model(batch[self.config.text_column].tolist())
+            for batch in loader:
+                t_logit, y_pred = model(batch["model_input"])
                 prop.append(torch.sigmoid(t_logit).cpu().numpy())
                 if self.config.outcome_type == "continuous":
                     outcome.append(y_pred.cpu().numpy())
@@ -887,10 +1000,15 @@ class AgenticAttentionVariableForestRunner:
     def _predict_effect_model(self, model: _EffectNet, df: pd.DataFrame) -> np.ndarray:
         model.eval()
         tau = []
+        loader = self._make_text_loader(
+            model,
+            df,
+            np.arange(len(df), dtype=int),
+            shuffle=False,
+        )
         with torch.no_grad():
-            for start in range(0, len(df), self.config.training.batch_size):
-                batch = df.iloc[start:start + self.config.training.batch_size]
-                tau.append(model(batch[self.config.text_column].tolist()).cpu().numpy())
+            for batch in loader:
+                tau.append(model(batch["model_input"]).cpu().numpy())
         return np.concatenate(tau)
 
     def _attention_evidence(
@@ -1254,6 +1372,14 @@ class AgenticAttentionVariableForestRunner:
                 return 1
             return max(1, min(int(self.num_workers), int(folds)))
         return max(1, min(int(setting), int(folds)))
+
+    def _data_loader_workers(self, total_folds: Optional[int] = None) -> int:
+        env_workers = os.environ.get("OCI_AVF_DATALOADER_WORKERS")
+        if env_workers is not None:
+            return max(0, int(env_workers))
+        if total_folds is not None and self._fold_n_jobs(total_folds) > 1:
+            return 0
+        return max(0, int(self.num_workers or 0))
 
     def _crossfit_checkpoint_fingerprint(
         self,
@@ -1805,14 +1931,6 @@ def _fit_predict_outcome(
     )
     model.fit(train_x, train_y)
     return model.predict_proba(test_x)[:, 1]
-
-
-def _batch_positions(positions, batch_size: int, shuffle: bool) -> List[np.ndarray]:
-    positions = np.asarray(positions)
-    if shuffle:
-        positions = positions.copy()
-        np.random.shuffle(positions)
-    return [positions[start:start + batch_size] for start in range(0, len(positions), batch_size)]
 
 
 def _run_crossfit_fold_tasks(run_fold, split_items, n_jobs: int) -> List[Dict[str, Any]]:

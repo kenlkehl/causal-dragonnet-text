@@ -410,6 +410,69 @@ class TestHierarchicalTransformer:
         assert max_active == 1
         assert all(extractor._encoder_initialized for extractor in extractors)
 
+    def test_transformer_tokenization_is_cached(self):
+        from types import SimpleNamespace
+
+        from oci.models.hierarchical_transformer_extractor import (
+            HierarchicalTransformerExtractor,
+        )
+
+        calls = []
+
+        class FakeTokenizer:
+            pad_token_id = 0
+            padding_side = "right"
+
+            def __call__(self, text, padding=False, truncation=True, max_length=None):
+                del padding, truncation
+                calls.append(text)
+                token_ids = [101]
+                token_ids.extend(range(10, 10 + min(2, len(text.split()))))
+                token_ids.append(102)
+                if max_length is not None:
+                    token_ids = token_ids[:max_length]
+                return {
+                    "input_ids": token_ids,
+                    "attention_mask": [1] * len(token_ids),
+                }
+
+        class FakeEncoder(torch.nn.Module):
+            def forward(self, input_ids, attention_mask):
+                del attention_mask
+                hidden = input_ids.float().unsqueeze(-1).expand(-1, -1, 4)
+                return SimpleNamespace(last_hidden_state=hidden)
+
+        ext = HierarchicalTransformerExtractor(
+            sentence_encoder_model="some-bert",
+            chunk_size_words=3,
+            chunk_overlap_words=0,
+            max_chunks=4,
+            max_chunk_length=8,
+            num_transformer_layers=1,
+            num_attention_heads=2,
+            transformer_dim=8,
+            projection_dim=4,
+            transformer_dropout=0.0,
+        )
+        ext._encoder_initialized = True
+        ext._tokenizer = FakeTokenizer()
+        ext._sentence_encoder = FakeEncoder()
+        ext._sentence_dim = 4
+        ext._input_projection = torch.nn.Linear(4, 8)
+
+        texts = [
+            "one two three four five six",
+            "one two three four five six",
+        ]
+        first = ext(texts)
+        second = ext(texts)
+
+        assert first.shape == (2, 4)
+        assert second.shape == (2, 4)
+        assert calls == ["one two three", "four five six"]
+        assert len(ext._chunk_cache) == 1
+        assert len(ext._tokenization_cache) == 2
+
 
 class TestLearnedTokenizer:
     def test_fit_and_encode(self):
