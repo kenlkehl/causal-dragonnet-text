@@ -210,6 +210,7 @@ class AgenticAttentionVariableForestRunner:
         self.confounder_candidate_rows: List[Dict[str, Any]] = []
         self.modifier_candidate_rows: List[Dict[str, Any]] = []
         self.consensus_rows: List[Dict[str, Any]] = []
+        self.coverage_filter_rows: List[Dict[str, Any]] = []
         self.metric_rows: List[Dict[str, Any]] = []
 
     def run(self) -> None:
@@ -275,18 +276,20 @@ class AgenticAttentionVariableForestRunner:
     ) -> pd.DataFrame:
         discovery_df = self.dataset.iloc[train_idx].reset_index(drop=True)
         nuisance = self._crossfit_nuisance(discovery_df, outer_fold)
-        confounders = self._discover_variables_from_attention(
+        confounders = self._discover_extract_filter_with_retries(
             stage="confounder",
             outer_fold=outer_fold,
             discovery_df=discovery_df,
+            train_idx=train_idx,
             attention_rows=nuisance["attention"],
             existing_specs=self._initial_specs(),
         )
         r_stage = self._crossfit_effect(discovery_df, nuisance["predictions"], outer_fold)
-        modifiers = self._discover_variables_from_attention(
+        modifiers = self._discover_extract_filter_with_retries(
             stage="effect_modifier",
             outer_fold=outer_fold,
             discovery_df=discovery_df,
+            train_idx=train_idx,
             attention_rows=r_stage["attention"],
             existing_specs=self._merge_specs(self._initial_specs(), confounders),
         )
@@ -1069,8 +1072,17 @@ class AgenticAttentionVariableForestRunner:
         discovery_df: pd.DataFrame,
         attention_rows: Sequence[Dict[str, Any]],
         existing_specs: Sequence[ExplicitFeatureSpec],
+        proposal_attempt: int = 1,
+        rejected_low_coverage: Optional[Sequence[Dict[str, Any]]] = None,
+        excluded_feature_names: Optional[Sequence[str]] = None,
     ) -> List[ExplicitFeatureSpec]:
         proposals_by_fold: Dict[int, List[ExplicitFeatureSpec]] = {}
+        proposal_limit = self._candidate_proposal_limit()
+        excluded_names = {
+            _normalize_feature_name(name)
+            for name in (excluded_feature_names or [])
+            if _normalize_feature_name(name)
+        }
         for fold in sorted({int(row["fold"]) for row in attention_rows if row.get("fold") is not None}):
             fold_rows = [row for row in attention_rows if int(row.get("fold")) == fold]
             context = self._build_agent_context(
@@ -1080,12 +1092,17 @@ class AgenticAttentionVariableForestRunner:
                 discovery_df=discovery_df,
                 attention_rows=fold_rows,
                 existing_specs=existing_specs,
+                proposal_attempt=proposal_attempt,
+                max_proposals=proposal_limit,
+                rejected_low_coverage=rejected_low_coverage or [],
+                excluded_feature_names=sorted(excluded_names),
             )
             self._save_agent_candidate_checkpoint(
                 {
                     "outer_fold": outer_fold,
                     "fold": fold,
                     "stage": stage,
+                    "proposal_attempt": int(proposal_attempt),
                     "status": "started",
                     "context": self._stored_agent_context(context),
                 },
@@ -1100,6 +1117,7 @@ class AgenticAttentionVariableForestRunner:
                     "outer_fold": outer_fold,
                     "fold": fold,
                     "stage": stage,
+                    "proposal_attempt": int(proposal_attempt),
                     "status": "error",
                     "context": self._stored_agent_context(context),
                     "error": str(exc),
@@ -1115,15 +1133,22 @@ class AgenticAttentionVariableForestRunner:
                     fold=fold,
                 )
                 raise
-            specs = _proposal_dicts_to_specs(raw, required_role=stage)
+            raw_proposals = _proposal_list(raw)
+            specs = _proposal_dicts_to_specs(
+                raw_proposals,
+                required_role=stage,
+                max_specs=proposal_limit,
+                excluded_feature_names=excluded_names,
+            )
             proposals_by_fold[fold] = specs
             row = {
                 "outer_fold": outer_fold,
                 "fold": fold,
                 "stage": stage,
+                "proposal_attempt": int(proposal_attempt),
                 "status": "complete",
                 "context": self._stored_agent_context(context),
-                "proposals": [_spec_to_dict(spec) for spec in specs],
+                "proposals": _proposal_artifact_dicts(raw_proposals, specs),
             }
             if getattr(self.agent_search_config, "save_agent_raw_output", False):
                 row["agent_raw_output"] = _get_agent_response_trace(self.proposal_agent)
@@ -1153,6 +1178,73 @@ class AgenticAttentionVariableForestRunner:
         )
         return selected
 
+    def _discover_extract_filter_with_retries(
+        self,
+        stage: str,
+        outer_fold: int,
+        discovery_df: pd.DataFrame,
+        train_idx: np.ndarray,
+        attention_rows: Sequence[Dict[str, Any]],
+        existing_specs: Sequence[ExplicitFeatureSpec],
+    ) -> List[ExplicitFeatureSpec]:
+        kept_specs: List[ExplicitFeatureSpec] = []
+        rejected_low_coverage: List[Dict[str, Any]] = []
+        excluded_names: set[str] = set()
+        max_attempts = 1 + max(0, int(self.avf_config.coverage_retry_attempts))
+
+        for attempt in range(1, max_attempts + 1):
+            current_specs = self._merge_specs(existing_specs, kept_specs)
+            candidates = self._discover_variables_from_attention(
+                stage=stage,
+                outer_fold=outer_fold,
+                discovery_df=discovery_df,
+                attention_rows=attention_rows,
+                existing_specs=current_specs,
+                proposal_attempt=attempt,
+                rejected_low_coverage=rejected_low_coverage,
+                excluded_feature_names=sorted(excluded_names),
+            )
+            current_names = {_normalize_feature_name(spec.name) for spec in current_specs}
+            candidates = [
+                spec
+                for spec in candidates
+                if _normalize_feature_name(spec.name) not in current_names
+                and _normalize_feature_name(spec.name) not in excluded_names
+            ]
+            if not candidates:
+                break
+
+            self.dataset = self.extraction_provider.ensure_features(self.dataset, candidates)
+            train_df = self.dataset.iloc[train_idx].copy()
+            kept, dropped = self._partition_specs_by_extraction_coverage(
+                train_df,
+                candidates,
+                manual_specs=[],
+            )
+            self.coverage_filter_rows.append(
+                {
+                    "outer_fold": int(outer_fold),
+                    "stage": stage,
+                    "proposal_attempt": int(attempt),
+                    "candidate_features": [spec.name for spec in candidates],
+                    "kept_features": [spec.name for spec in kept],
+                    "dropped_features": dropped,
+                }
+            )
+            self._flush_coverage_filter_rows()
+            kept_specs = self._merge_specs(kept_specs, kept)
+
+            if not dropped or attempt >= max_attempts:
+                break
+
+            for row in dropped:
+                name = _normalize_feature_name(row.get("name", ""))
+                if name:
+                    excluded_names.add(name)
+                    rejected_low_coverage.append(row)
+
+        return kept_specs
+
     def _stored_agent_context(self, context: Dict[str, Any]) -> Dict[str, Any]:
         if getattr(self.agent_search_config, "save_agent_context", False):
             return context
@@ -1166,6 +1258,10 @@ class AgenticAttentionVariableForestRunner:
         discovery_df: pd.DataFrame,
         attention_rows: Sequence[Dict[str, Any]],
         existing_specs: Sequence[ExplicitFeatureSpec],
+        proposal_attempt: int = 1,
+        max_proposals: Optional[int] = None,
+        rejected_low_coverage: Optional[Sequence[Dict[str, Any]]] = None,
+        excluded_feature_names: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         evidence = sorted(
             attention_rows,
@@ -1173,15 +1269,17 @@ class AgenticAttentionVariableForestRunner:
             reverse=True,
         )[: max(1, self.avf_config.attention_top_k_chunks * 20)]
         instruction = (
-            "Propose pre-treatment confounder variables explaining treatment and outcome prediction evidence."
+            "Propose only pre-treatment confounder variables directly supported by repeated high-attention chunks."
             if stage == "confounder"
-            else "Propose pre-treatment effect modifier variables explaining high R-stage attention evidence."
+            else "Propose only pre-treatment effect modifier variables directly supported by repeated high R-stage attention chunks."
         )
         return {
             "prompt_version": "agentic_attention_variable_forest_v1",
             "stage": stage,
             "outer_fold": outer_fold,
             "fold": inner_fold,
+            "proposal_attempt": int(proposal_attempt),
+            "max_proposals": int(max_proposals or self._candidate_proposal_limit()),
             "instruction": instruction,
             "clinical_question": self.config.clinical_question,
             "estimand": {
@@ -1190,6 +1288,8 @@ class AgenticAttentionVariableForestRunner:
                 "outcome_type": self.config.outcome_type,
             },
             "current_features": [_spec_to_dict(spec) for spec in existing_specs],
+            "excluded_feature_names": list(excluded_feature_names or []),
+            "rejected_low_coverage_features": list(rejected_low_coverage or []),
             "attention_evidence": [
                 {
                     "row_id": int(row["row_id"]),
@@ -1229,6 +1329,11 @@ class AgenticAttentionVariableForestRunner:
                 ]
             },
         }
+
+    def _candidate_proposal_limit(self) -> int:
+        configured = int(getattr(self.avf_config, "candidate_proposals_per_fold", 3))
+        agent_limit = int(getattr(self.agent_search_config, "max_additions_per_iter", configured))
+        return max(1, min(configured, max(1, agent_limit)))
 
     def _fit_final_forest(
         self,
@@ -1574,9 +1679,13 @@ class AgenticAttentionVariableForestRunner:
         stage: str,
         outer_fold: int,
         fold: int,
+        proposal_attempt: int = 1,
     ) -> Path:
         stage_dir = self.artifact_dir / "agent_candidate_checkpoints" / stage
-        return stage_dir / f"outer_{int(outer_fold):03d}_fold_{int(fold):03d}.json"
+        stem = f"outer_{int(outer_fold):03d}_fold_{int(fold):03d}"
+        if int(proposal_attempt) > 1:
+            stem = f"{stem}_attempt_{int(proposal_attempt):03d}"
+        return stage_dir / f"{stem}.json"
 
     def _save_agent_candidate_checkpoint(
         self,
@@ -1585,7 +1694,12 @@ class AgenticAttentionVariableForestRunner:
         outer_fold: int,
         fold: int,
     ) -> None:
-        path = self._agent_candidate_checkpoint_path(stage, outer_fold, fold)
+        path = self._agent_candidate_checkpoint_path(
+            stage,
+            outer_fold,
+            fold,
+            proposal_attempt=int(row.get("proposal_attempt", 1)),
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
         _write_json_atomic(row, path)
         logger.info(
@@ -1605,6 +1719,12 @@ class AgenticAttentionVariableForestRunner:
         _write_jsonl(
             self.artifact_dir / "effect_modifier_candidates_by_fold.jsonl",
             self.modifier_candidate_rows,
+        )
+
+    def _flush_coverage_filter_rows(self) -> None:
+        _write_jsonl(
+            self.artifact_dir / "coverage_filter_by_attempt.jsonl",
+            self.coverage_filter_rows,
         )
 
     def _load_nuisance_fold_checkpoint(
@@ -1726,8 +1846,22 @@ class AgenticAttentionVariableForestRunner:
         specs: Sequence[ExplicitFeatureSpec],
         manual_specs: Sequence[ExplicitFeatureSpec],
     ) -> List[ExplicitFeatureSpec]:
+        kept, _ = self._partition_specs_by_extraction_coverage(
+            df,
+            specs,
+            manual_specs,
+        )
+        return kept
+
+    def _partition_specs_by_extraction_coverage(
+        self,
+        df: pd.DataFrame,
+        specs: Sequence[ExplicitFeatureSpec],
+        manual_specs: Sequence[ExplicitFeatureSpec],
+    ) -> Tuple[List[ExplicitFeatureSpec], List[Dict[str, Any]]]:
         manual_names = {_normalize_feature_name(spec.name) for spec in manual_specs}
-        kept = []
+        kept: List[ExplicitFeatureSpec] = []
+        dropped: List[Dict[str, Any]] = []
         for spec in specs:
             name = _normalize_feature_name(spec.name)
             coverage = _feature_coverage(df, name)
@@ -1741,9 +1875,21 @@ class AgenticAttentionVariableForestRunner:
                     coverage,
                     self.avf_config.min_extraction_coverage,
                 )
+                dropped.append(
+                    {
+                        "name": name,
+                        "type": spec.type,
+                        "roles": list(spec.roles),
+                        "description": spec.description,
+                        "coverage": float(coverage),
+                        "min_extraction_coverage": float(
+                            self.avf_config.min_extraction_coverage
+                        ),
+                    }
+                )
                 continue
             kept.append(spec)
-        return kept
+        return kept, dropped
 
     def _save_predictions(self, results_df: pd.DataFrame) -> None:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1779,6 +1925,10 @@ class AgenticAttentionVariableForestRunner:
         )
         with open(self.artifact_dir / "consensus.json", "w") as f:
             json.dump(self.consensus_rows, f, indent=2)
+        _write_jsonl(
+            self.artifact_dir / "coverage_filter_by_attempt.jsonl",
+            self.coverage_filter_rows,
+        )
         metrics_for_csv = [
             {key: value for key, value in row.items() if not isinstance(value, list)}
             for row in self.metric_rows
@@ -1841,9 +1991,15 @@ def consensus_feature_specs(
 def _proposal_dicts_to_specs(
     raw_proposals: Any,
     required_role: str,
+    max_specs: Optional[int] = None,
+    excluded_feature_names: Optional[Sequence[str]] = None,
 ) -> List[ExplicitFeatureSpec]:
-    if isinstance(raw_proposals, dict):
-        raw_proposals = raw_proposals.get("proposals", [])
+    raw_proposals = _proposal_list(raw_proposals)
+    excluded = {
+        _normalize_feature_name(name)
+        for name in (excluded_feature_names or [])
+        if _normalize_feature_name(name)
+    }
     specs = []
     for proposal in raw_proposals or []:
         if not isinstance(proposal, dict):
@@ -1853,6 +2009,8 @@ def _proposal_dicts_to_specs(
             continue
         name = _normalize_feature_name(proposal.get("name", ""))
         if not name:
+            continue
+        if name in excluded:
             continue
         typ = str(proposal.get("type") or "categorical").lower()
         if typ not in VALID_TYPES:
@@ -1877,9 +2035,41 @@ def _proposal_dicts_to_specs(
                     roles=roles,
                 )
             )
+            if max_specs is not None and len(specs) >= int(max_specs):
+                break
         except ValueError:
             continue
     return specs
+
+
+def _proposal_list(raw_proposals: Any) -> List[Dict[str, Any]]:
+    if isinstance(raw_proposals, dict):
+        raw_proposals = raw_proposals.get("proposals", [])
+    if not isinstance(raw_proposals, list):
+        return []
+    return [proposal for proposal in raw_proposals if isinstance(proposal, dict)]
+
+
+def _proposal_artifact_dicts(
+    raw_proposals: Sequence[Dict[str, Any]],
+    specs: Sequence[ExplicitFeatureSpec],
+) -> List[Dict[str, Any]]:
+    raw_by_name: Dict[str, List[Dict[str, Any]]] = {}
+    for proposal in raw_proposals:
+        name = _normalize_feature_name(proposal.get("name", ""))
+        if name:
+            raw_by_name.setdefault(name, []).append(proposal)
+
+    artifacts: List[Dict[str, Any]] = []
+    for spec in specs:
+        row = _spec_to_dict(spec)
+        raw = (raw_by_name.get(_normalize_feature_name(spec.name)) or [{}]).pop(0)
+        for key in ["action", "rationale", "expected_signal"]:
+            value = raw.get(key)
+            if value is not None:
+                row[key] = value
+        artifacts.append(row)
+    return artifacts
 
 
 def _fit_predict_propensity(

@@ -124,6 +124,8 @@ class AgenticAttentionOracleConfig:
     effect_folds: int = 5
     fold_parallelism: str = "auto"
     attention_top_k_chunks: int = 5
+    candidate_proposals_per_fold: int = 3
+    coverage_retry_attempts: int = 1
     consensus_min_fold_fraction: float = 2.0 / 3.0
     min_extraction_coverage: float = 0.70
     e_clip: float = 0.01
@@ -240,7 +242,7 @@ def _make_applied_config(
                 outer_folds=max(2, config.n_folds),
                 inner_folds=max(2, config.nuisance_folds),
                 max_iterations=1,
-                max_additions_per_iter=6,
+                max_additions_per_iter=config.candidate_proposals_per_fold,
                 max_removals_per_iter=0,
                 agent_server_url=config.agent_server_url,
                 agent_model_name=config.agent_model_name,
@@ -257,6 +259,8 @@ def _make_applied_config(
                 effect_folds=config.effect_folds,
                 fold_parallelism=config.fold_parallelism,
                 attention_top_k_chunks=config.attention_top_k_chunks,
+                candidate_proposals_per_fold=config.candidate_proposals_per_fold,
+                coverage_retry_attempts=config.coverage_retry_attempts,
                 consensus_min_fold_fraction=config.consensus_min_fold_fraction,
                 min_extraction_coverage=config.min_extraction_coverage,
                 e_clip=config.e_clip,
@@ -560,6 +564,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--attention-top-k-chunks", type=int, default=5)
+    parser.add_argument("--candidate-proposals-per-fold", type=int, default=3)
+    parser.add_argument("--coverage-retry-attempts", type=int, default=1)
     parser.add_argument("--consensus-min-fold-fraction", type=float, default=2.0 / 3.0)
     parser.add_argument("--min-extraction-coverage", type=float, default=0.70)
     parser.add_argument("--e-clip", type=float, default=0.01)
@@ -665,6 +671,8 @@ def _make_configs(args: argparse.Namespace) -> List[AgenticAttentionOracleConfig
                     effect_folds=args.effect_folds,
                     fold_parallelism=args.fold_parallelism,
                     attention_top_k_chunks=args.attention_top_k_chunks,
+                    candidate_proposals_per_fold=args.candidate_proposals_per_fold,
+                    coverage_retry_attempts=args.coverage_retry_attempts,
                     consensus_min_fold_fraction=args.consensus_min_fold_fraction,
                     min_extraction_coverage=args.min_extraction_coverage,
                     e_clip=args.e_clip,
@@ -714,6 +722,10 @@ def main() -> None:
         parser.error("--n-folds must be >= 2")
     if args.nuisance_folds < 2 or args.effect_folds < 2:
         parser.error("--nuisance-folds and --effect-folds must be >= 2")
+    if args.candidate_proposals_per_fold < 1:
+        parser.error("--candidate-proposals-per-fold must be >= 1")
+    if args.coverage_retry_attempts < 0:
+        parser.error("--coverage-retry-attempts must be >= 0")
     if args.htr_sentence_encoder_batch_size < 1:
         parser.error("--htr-sentence-encoder-batch-size must be >= 1")
     if args.htr_trainable_sentence_encoder_layers < 0:

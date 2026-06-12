@@ -450,6 +450,8 @@ class AgenticAttentionVariableForestConfig:
     # Set a positive integer to opt into that many concurrent folds on any device.
     fold_parallelism: str = "auto"
     attention_top_k_chunks: int = 5
+    candidate_proposals_per_fold: int = 3
+    coverage_retry_attempts: int = 1
     consensus_min_fold_fraction: float = 2.0 / 3.0
     min_extraction_coverage: float = 0.70
     e_clip: float = 0.01
@@ -472,6 +474,15 @@ class AgenticAttentionVariableForestConfig:
         if self.attention_top_k_chunks < 1:
             raise ValueError(
                 "agentic_attention_variable_forest.attention_top_k_chunks must be >= 1"
+            )
+        if self.candidate_proposals_per_fold < 1:
+            raise ValueError(
+                "agentic_attention_variable_forest.candidate_proposals_per_fold "
+                "must be >= 1"
+            )
+        if self.coverage_retry_attempts < 0:
+            raise ValueError(
+                "agentic_attention_variable_forest.coverage_retry_attempts must be >= 0"
             )
         if not 0.0 < self.consensus_min_fold_fraction <= 1.0:
             raise ValueError(

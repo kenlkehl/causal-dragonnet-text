@@ -1717,6 +1717,9 @@ def build_agent_prompt(
     search_config: AgenticFeatureSearchConfig,
 ) -> str:
     """Construct the proposal prompt sent to the LLM agent."""
+    if context.get("prompt_version") == "agentic_attention_variable_forest_v1":
+        return build_attention_variable_agent_prompt(context, search_config)
+
     if context.get("search_mode") == "broad_screen":
         if context.get("broad_screen_stage") == "selection":
             return build_broad_selection_agent_prompt(context, search_config)
@@ -1766,6 +1769,63 @@ Limits:
   extraction target, type/categories, or role to directly address failed_checks.
 
 Current nested-CV context:
+{context_json}
+"""
+
+
+def build_attention_variable_agent_prompt(
+    context: Dict[str, Any],
+    search_config: AgenticFeatureSearchConfig,
+) -> str:
+    """Construct the proposal prompt for attention-evidence variable discovery."""
+    context_json = json.dumps(context, indent=2, default=_json_default)
+    stage = str(context.get("stage", "confounder"))
+    max_proposals = int(
+        context.get(
+            "max_proposals",
+            max(1, int(getattr(search_config, "max_additions_per_iter", 3))),
+        )
+    )
+    stage_target = (
+        "pre-treatment confounders that explain treatment and outcome prediction evidence"
+        if stage == "confounder"
+        else "pre-treatment effect modifiers that explain R-stage treatment-effect evidence"
+    )
+    return f"""You are selecting explicit variables from neural attention evidence for a causal forest.
+
+Your task is narrow: propose at most {max_proposals} {stage_target}. Base every proposal on themes that actually emerge from the high-attention chunks in the context. Do not propose a variable just because it is a generally plausible oncology covariate; if the attended chunks do not support it, return a single "none" proposal.
+
+Rules:
+- Use only pre-treatment information visible in the attended chunks.
+- Prefer variables whose values appear repeatedly and look extractable across many patients.
+- Avoid sparse one-off concepts, downstream treatment response, toxicity after treatment, survival, and outcome-derived variables.
+- Avoid aliases or near-duplicates of current_features and excluded_feature_names.
+- If rejected_low_coverage_features is non-empty, do not repeat those extraction targets unchanged; propose a broader or more directly documented target only if the attended chunks support it.
+- For every add proposal, name the specific phrase/theme from the chunks in the rationale.
+
+Return JSON only with this shape:
+{{
+  "proposals": [
+    {{
+      "action": "add|none",
+      "name": "snake_case_variable_name",
+      "type": "categorical|continuous",
+      "categories": ["category_a", "category_b"],
+      "roles": ["{stage}"],
+      "description": "exact pre-treatment extraction target",
+      "rationale": "which attended chunk theme supports this variable",
+      "expected_signal": "treatment, outcome, or tau signal expected"
+    }}
+  ]
+}}
+
+Limits:
+- At most {max_proposals} add proposals.
+- Use "none" when the attended chunks do not support a defensible extractable variable.
+- For categorical variables, provide 2-8 mutually exclusive categories.
+- Use distinct names; avoid near-duplicate aliases for the same concept.
+
+Current attention-evidence context:
 {context_json}
 """
 

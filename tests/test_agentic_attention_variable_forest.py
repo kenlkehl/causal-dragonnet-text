@@ -25,6 +25,7 @@ from oci.inference.agentic_attention_variable_forest import (
     _run_crossfit_fold_tasks,
     run_agentic_attention_variable_forest,
 )
+from oci.inference.agentic_explicit_feature_forest import build_agent_prompt
 from oci.models import ECONML_AVAILABLE
 
 
@@ -468,6 +469,7 @@ def test_agent_candidate_output_is_saved_during_discovery(tmp_path):
                     "type": "continuous",
                     "roles": ["confounder"],
                     "description": "Baseline marker before treatment",
+                    "rationale": "important note repeatedly mentions the marker",
                 }
             ]
 
@@ -532,13 +534,159 @@ def test_agent_candidate_output_is_saved_during_discovery(tmp_path):
     payload = json.loads(checkpoint.read_text())
     assert payload["status"] == "complete"
     assert payload["context"]["attention_evidence"][0]["chunk_text"] == "important note"
+    assert payload["proposals"][0]["rationale"] == "important note repeatedly mentions the marker"
     assert payload["agent_raw_output"]["raw_content"] == "{\"proposals\": []}"
     jsonl_path = (
         tmp_path
         / "agentic_attention_variable_forest"
         / "confounder_candidates_by_fold.jsonl"
     )
-    assert "baseline_marker" in jsonl_path.read_text()
+    jsonl_payload = json.loads(jsonl_path.read_text().splitlines()[0])
+    assert jsonl_payload["context"]["attention_evidence"][0]["chunk_text"] == "important note"
+    assert jsonl_payload["proposals"][0]["rationale"] == "important note repeatedly mentions the marker"
+
+
+def test_attention_agent_prompt_is_attention_anchored():
+    prompt = build_agent_prompt(
+        {
+            "prompt_version": "agentic_attention_variable_forest_v1",
+            "stage": "confounder",
+            "max_proposals": 2,
+            "current_features": [],
+            "excluded_feature_names": ["low_coverage_marker"],
+            "rejected_low_coverage_features": [
+                {"name": "low_coverage_marker", "coverage": 0.1}
+            ],
+            "attention_evidence": [
+                {
+                    "row_id": 1,
+                    "chunk_text": "Age 78 years at treatment start.",
+                    "attention": 0.9,
+                }
+            ],
+        },
+        AgenticFeatureSearchConfig(max_additions_per_iter=6),
+    )
+
+    assert "Base every proposal on themes that actually emerge" in prompt
+    assert "Do not propose a variable just because" in prompt
+    assert "At most 2 add proposals" in prompt
+    assert "low_coverage_marker" in prompt
+
+
+def test_low_coverage_attention_candidates_trigger_retry(tmp_path):
+    class RetryAgent:
+        def __init__(self):
+            self.contexts = []
+
+        def propose(self, context):
+            self.contexts.append(context)
+            if context["proposal_attempt"] == 1:
+                return [
+                    {
+                        "action": "add",
+                        "name": "rare_marker",
+                        "type": "categorical",
+                        "categories": ["absent", "present"],
+                        "roles": ["confounder"],
+                        "description": "Sparse marker from one note",
+                        "rationale": "rare marker appears in a high-attention chunk",
+                    }
+                ]
+            assert "rare_marker" in context["excluded_feature_names"]
+            return [
+                {
+                    "action": "add",
+                    "name": "age_group",
+                    "type": "categorical",
+                    "categories": ["younger", "older"],
+                    "roles": ["confounder"],
+                    "description": "Age group before treatment",
+                    "rationale": "age appears repeatedly in high-attention chunks",
+                }
+            ]
+
+    class CoverageExtractionProvider:
+        def ensure_features(self, dataset, specs):
+            dataset = dataset.copy()
+            for spec in specs:
+                col = f"explicit_feat_{spec.name}"
+                miss_col = f"{col}_missing"
+                if spec.name == "rare_marker":
+                    dataset[col] = ["present", None, None, None]
+                    dataset[miss_col] = [False, True, True, True]
+                else:
+                    dataset[col] = ["older", "younger", "older", "younger"]
+                    dataset[miss_col] = False
+            return dataset
+
+    df = pd.DataFrame(
+        {
+            "clinical_text": [
+                "Age 78 years.",
+                "Age 61 years.",
+                "Age 80 years.",
+                "Age 55 years.",
+            ],
+            "treatment_indicator": [0, 1, 0, 1],
+            "outcome_indicator": [0, 1, 1, 0],
+        }
+    )
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        architecture=ModelArchitectureConfig(
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=2,
+                effect_folds=2,
+                candidate_proposals_per_fold=1,
+                coverage_retry_attempts=1,
+                consensus_min_fold_fraction=1.0,
+                min_extraction_coverage=0.75,
+            ),
+        ),
+    )
+    agent = RetryAgent()
+    runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "predictions.parquet",
+        device=torch.device("cpu"),
+        num_workers=1,
+        proposal_agent=agent,
+        extraction_provider=CoverageExtractionProvider(),
+    )
+    attention_rows = [
+        {
+            "row_id": int(runner.dataset.loc[i % len(df), "_oci_row_id"]),
+            "fold": fold,
+            "stage": "nuisance",
+            "chunk_text": f"Age {60 + i} years before treatment.",
+            "attention": 0.9,
+        }
+        for fold in [1, 2]
+        for i in [fold]
+    ]
+
+    selected = runner._discover_extract_filter_with_retries(
+        stage="confounder",
+        outer_fold=1,
+        discovery_df=runner.dataset,
+        train_idx=np.arange(len(runner.dataset)),
+        attention_rows=attention_rows,
+        existing_specs=[],
+    )
+
+    assert [spec.name for spec in selected] == ["age_group"]
+    assert {context["proposal_attempt"] for context in agent.contexts} == {1, 2}
+    assert all(context["max_proposals"] == 1 for context in agent.contexts)
+    coverage_path = (
+        tmp_path
+        / "agentic_attention_variable_forest"
+        / "coverage_filter_by_attempt.jsonl"
+    )
+    coverage_rows = [json.loads(line) for line in coverage_path.read_text().splitlines()]
+    assert coverage_rows[0]["dropped_features"][0]["name"] == "rare_marker"
+    assert coverage_rows[1]["kept_features"] == ["age_group"]
 
 
 def test_fold_parallelism_auto_is_conservative_on_cuda(tmp_path):
