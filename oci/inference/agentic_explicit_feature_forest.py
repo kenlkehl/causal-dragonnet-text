@@ -1801,6 +1801,7 @@ Rules:
 - Avoid sparse one-off concepts, downstream treatment response, toxicity after treatment, survival, and outcome-derived variables.
 - Avoid aliases or near-duplicates of current_features and excluded_feature_names.
 - If rejected_low_coverage_features is non-empty, do not repeat those extraction targets unchanged; propose a broader or more directly documented target only if the attended chunks support it.
+- If rejected_low_signal_features or multivariable_signal_feedback indicate weak treatment/outcome prediction, propose different attended-chunk themes that are more likely to be statistically associated with treatment assignment and/or outcome.
 - For every add proposal, name the specific phrase/theme from the chunks in the rationale.
 
 Return JSON only with this shape:

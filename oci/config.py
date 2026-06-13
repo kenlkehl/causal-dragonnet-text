@@ -452,6 +452,13 @@ class AgenticAttentionVariableForestConfig:
     attention_top_k_chunks: int = 5
     candidate_proposals_per_fold: int = 3
     coverage_retry_attempts: int = 1
+    signal_retry_attempts: int = 1
+    association_alpha: float = 0.05
+    association_min_n: int = 20
+    association_min_non_missing: int = 10
+    signal_cv_folds: int = 3
+    min_signal_treatment_auroc: float = 0.55
+    min_signal_outcome_auroc: float = 0.55
     consensus_min_fold_fraction: float = 2.0 / 3.0
     min_extraction_coverage: float = 0.70
     e_clip: float = 0.01
@@ -483,6 +490,36 @@ class AgenticAttentionVariableForestConfig:
         if self.coverage_retry_attempts < 0:
             raise ValueError(
                 "agentic_attention_variable_forest.coverage_retry_attempts must be >= 0"
+            )
+        if self.signal_retry_attempts < 0:
+            raise ValueError(
+                "agentic_attention_variable_forest.signal_retry_attempts must be >= 0"
+            )
+        if not 0.0 < self.association_alpha < 1.0:
+            raise ValueError(
+                "agentic_attention_variable_forest.association_alpha must be in (0, 1)"
+            )
+        if self.association_min_n < 1:
+            raise ValueError(
+                "agentic_attention_variable_forest.association_min_n must be >= 1"
+            )
+        if self.association_min_non_missing < 1:
+            raise ValueError(
+                "agentic_attention_variable_forest.association_min_non_missing must be >= 1"
+            )
+        if self.signal_cv_folds < 2:
+            raise ValueError(
+                "agentic_attention_variable_forest.signal_cv_folds must be >= 2"
+            )
+        if not 0.5 <= self.min_signal_treatment_auroc <= 1.0:
+            raise ValueError(
+                "agentic_attention_variable_forest.min_signal_treatment_auroc "
+                "must be in [0.5, 1]"
+            )
+        if not 0.5 <= self.min_signal_outcome_auroc <= 1.0:
+            raise ValueError(
+                "agentic_attention_variable_forest.min_signal_outcome_auroc "
+                "must be in [0.5, 1]"
             )
         if not 0.0 < self.consensus_min_fold_fraction <= 1.0:
             raise ValueError(

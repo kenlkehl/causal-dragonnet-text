@@ -689,6 +689,115 @@ def test_low_coverage_attention_candidates_trigger_retry(tmp_path):
     assert coverage_rows[1]["kept_features"] == ["age_group"]
 
 
+def test_attention_candidates_are_filtered_by_association_signal(tmp_path):
+    class AssociationAgent:
+        def propose(self, context):
+            assert context["max_proposals"] == 2
+            return [
+                {
+                    "action": "add",
+                    "name": "signal_covariate",
+                    "type": "categorical",
+                    "categories": ["low", "high"],
+                    "roles": ["confounder"],
+                    "description": "A baseline covariate associated with treatment and outcome",
+                },
+                {
+                    "action": "add",
+                    "name": "noise_covariate",
+                    "type": "categorical",
+                    "categories": ["a", "b"],
+                    "roles": ["confounder"],
+                    "description": "A baseline covariate not associated with treatment or outcome",
+                },
+            ]
+
+    class AssociationExtractionProvider:
+        def ensure_features(self, dataset, specs):
+            dataset = dataset.copy()
+            row_pos = np.arange(len(dataset))
+            for spec in specs:
+                col = f"explicit_feat_{spec.name}"
+                miss_col = f"{col}_missing"
+                if spec.name == "signal_covariate":
+                    dataset[col] = np.where(row_pos < len(dataset) // 2, "low", "high")
+                elif spec.name == "noise_covariate":
+                    dataset[col] = np.where(row_pos % 2 == 0, "a", "b")
+                else:
+                    dataset[col] = spec.categories[0]
+                dataset[miss_col] = False
+            return dataset
+
+    n = 80
+    signal = np.r_[np.zeros(n // 2, dtype=int), np.ones(n // 2, dtype=int)]
+    df = pd.DataFrame(
+        {
+            "clinical_text": [f"patient {i}" for i in range(n)],
+            "treatment_indicator": signal,
+            "outcome_indicator": signal,
+        }
+    )
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        architecture=ModelArchitectureConfig(
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=2,
+                effect_folds=2,
+                candidate_proposals_per_fold=2,
+                coverage_retry_attempts=0,
+                signal_retry_attempts=0,
+                consensus_min_fold_fraction=1.0,
+                min_extraction_coverage=0.75,
+                association_alpha=0.05,
+                association_min_n=20,
+                association_min_non_missing=10,
+                signal_cv_folds=2,
+                min_signal_treatment_auroc=0.55,
+                min_signal_outcome_auroc=0.55,
+            ),
+        ),
+    )
+    runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "predictions.parquet",
+        device=torch.device("cpu"),
+        num_workers=1,
+        proposal_agent=AssociationAgent(),
+        extraction_provider=AssociationExtractionProvider(),
+    )
+    attention_rows = [
+        {
+            "row_id": int(runner.dataset.loc[fold - 1, "_oci_row_id"]),
+            "fold": fold,
+            "stage": "nuisance",
+            "chunk_text": "high-attention baseline signal chunk",
+            "attention": 0.9,
+        }
+        for fold in [1, 2]
+    ]
+
+    selected = runner._discover_extract_filter_with_retries(
+        stage="confounder",
+        outer_fold=1,
+        discovery_df=runner.dataset,
+        train_idx=np.arange(len(runner.dataset)),
+        attention_rows=attention_rows,
+        existing_specs=[],
+    )
+
+    assert [spec.name for spec in selected] == ["signal_covariate"]
+    assoc_path = (
+        tmp_path
+        / "agentic_attention_variable_forest"
+        / "association_filter_by_attempt.jsonl"
+    )
+    rows = [json.loads(line) for line in assoc_path.read_text().splitlines()]
+    assert rows[0]["kept_features"] == ["signal_covariate"]
+    assert rows[0]["dropped_features"][0]["name"] == "noise_covariate"
+    assert rows[0]["multivariable_signal"]["adequate"] is True
+
+
 def test_fold_parallelism_auto_is_conservative_on_cuda(tmp_path):
     df = pd.DataFrame(
         {

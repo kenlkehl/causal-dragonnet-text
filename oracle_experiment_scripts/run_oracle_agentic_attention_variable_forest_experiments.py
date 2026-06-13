@@ -126,6 +126,13 @@ class AgenticAttentionOracleConfig:
     attention_top_k_chunks: int = 5
     candidate_proposals_per_fold: int = 3
     coverage_retry_attempts: int = 1
+    signal_retry_attempts: int = 1
+    association_alpha: float = 0.05
+    association_min_n: int = 20
+    association_min_non_missing: int = 10
+    signal_cv_folds: int = 3
+    min_signal_treatment_auroc: float = 0.55
+    min_signal_outcome_auroc: float = 0.55
     consensus_min_fold_fraction: float = 2.0 / 3.0
     min_extraction_coverage: float = 0.70
     e_clip: float = 0.01
@@ -261,6 +268,13 @@ def _make_applied_config(
                 attention_top_k_chunks=config.attention_top_k_chunks,
                 candidate_proposals_per_fold=config.candidate_proposals_per_fold,
                 coverage_retry_attempts=config.coverage_retry_attempts,
+                signal_retry_attempts=config.signal_retry_attempts,
+                association_alpha=config.association_alpha,
+                association_min_n=config.association_min_n,
+                association_min_non_missing=config.association_min_non_missing,
+                signal_cv_folds=config.signal_cv_folds,
+                min_signal_treatment_auroc=config.min_signal_treatment_auroc,
+                min_signal_outcome_auroc=config.min_signal_outcome_auroc,
                 consensus_min_fold_fraction=config.consensus_min_fold_fraction,
                 min_extraction_coverage=config.min_extraction_coverage,
                 e_clip=config.e_clip,
@@ -566,6 +580,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--attention-top-k-chunks", type=int, default=5)
     parser.add_argument("--candidate-proposals-per-fold", type=int, default=3)
     parser.add_argument("--coverage-retry-attempts", type=int, default=1)
+    parser.add_argument("--signal-retry-attempts", type=int, default=1)
+    parser.add_argument("--association-alpha", type=float, default=0.05)
+    parser.add_argument("--association-min-n", type=int, default=20)
+    parser.add_argument("--association-min-non-missing", type=int, default=10)
+    parser.add_argument("--signal-cv-folds", type=int, default=3)
+    parser.add_argument("--min-signal-treatment-auroc", type=float, default=0.55)
+    parser.add_argument("--min-signal-outcome-auroc", type=float, default=0.55)
     parser.add_argument("--consensus-min-fold-fraction", type=float, default=2.0 / 3.0)
     parser.add_argument("--min-extraction-coverage", type=float, default=0.70)
     parser.add_argument("--e-clip", type=float, default=0.01)
@@ -673,6 +694,13 @@ def _make_configs(args: argparse.Namespace) -> List[AgenticAttentionOracleConfig
                     attention_top_k_chunks=args.attention_top_k_chunks,
                     candidate_proposals_per_fold=args.candidate_proposals_per_fold,
                     coverage_retry_attempts=args.coverage_retry_attempts,
+                    signal_retry_attempts=args.signal_retry_attempts,
+                    association_alpha=args.association_alpha,
+                    association_min_n=args.association_min_n,
+                    association_min_non_missing=args.association_min_non_missing,
+                    signal_cv_folds=args.signal_cv_folds,
+                    min_signal_treatment_auroc=args.min_signal_treatment_auroc,
+                    min_signal_outcome_auroc=args.min_signal_outcome_auroc,
                     consensus_min_fold_fraction=args.consensus_min_fold_fraction,
                     min_extraction_coverage=args.min_extraction_coverage,
                     e_clip=args.e_clip,
@@ -726,6 +754,20 @@ def main() -> None:
         parser.error("--candidate-proposals-per-fold must be >= 1")
     if args.coverage_retry_attempts < 0:
         parser.error("--coverage-retry-attempts must be >= 0")
+    if args.signal_retry_attempts < 0:
+        parser.error("--signal-retry-attempts must be >= 0")
+    if not 0.0 < args.association_alpha < 1.0:
+        parser.error("--association-alpha must be in (0, 1)")
+    if args.association_min_n < 1:
+        parser.error("--association-min-n must be >= 1")
+    if args.association_min_non_missing < 1:
+        parser.error("--association-min-non-missing must be >= 1")
+    if args.signal_cv_folds < 2:
+        parser.error("--signal-cv-folds must be >= 2")
+    if not 0.5 <= args.min_signal_treatment_auroc <= 1.0:
+        parser.error("--min-signal-treatment-auroc must be in [0.5, 1]")
+    if not 0.5 <= args.min_signal_outcome_auroc <= 1.0:
+        parser.error("--min-signal-outcome-auroc must be in [0.5, 1]")
     if args.htr_sentence_encoder_batch_size < 1:
         parser.error("--htr-sentence-encoder-batch-size must be >= 1")
     if args.htr_trainable_sentence_encoder_layers < 0:

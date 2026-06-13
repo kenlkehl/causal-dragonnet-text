@@ -18,9 +18,16 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error, roc_auc_score
-from sklearn.model_selection import KFold
+from scipy import stats
+from sklearn.ensemble import (
+    HistGradientBoostingClassifier,
+    HistGradientBoostingRegressor,
+    RandomForestClassifier,
+    RandomForestRegressor,
+)
+from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.metrics import log_loss, mean_absolute_error, mean_squared_error, r2_score, roc_auc_score
+from sklearn.model_selection import KFold, StratifiedKFold
 from torch.utils.data import DataLoader, Dataset
 
 from ..config import (
@@ -211,6 +218,7 @@ class AgenticAttentionVariableForestRunner:
         self.modifier_candidate_rows: List[Dict[str, Any]] = []
         self.consensus_rows: List[Dict[str, Any]] = []
         self.coverage_filter_rows: List[Dict[str, Any]] = []
+        self.association_filter_rows: List[Dict[str, Any]] = []
         self.metric_rows: List[Dict[str, Any]] = []
 
     def run(self) -> None:
@@ -1074,6 +1082,8 @@ class AgenticAttentionVariableForestRunner:
         existing_specs: Sequence[ExplicitFeatureSpec],
         proposal_attempt: int = 1,
         rejected_low_coverage: Optional[Sequence[Dict[str, Any]]] = None,
+        rejected_low_signal: Optional[Sequence[Dict[str, Any]]] = None,
+        multivariable_signal_feedback: Optional[Dict[str, Any]] = None,
         excluded_feature_names: Optional[Sequence[str]] = None,
     ) -> List[ExplicitFeatureSpec]:
         proposals_by_fold: Dict[int, List[ExplicitFeatureSpec]] = {}
@@ -1095,6 +1105,8 @@ class AgenticAttentionVariableForestRunner:
                 proposal_attempt=proposal_attempt,
                 max_proposals=proposal_limit,
                 rejected_low_coverage=rejected_low_coverage or [],
+                rejected_low_signal=rejected_low_signal or [],
+                multivariable_signal_feedback=multivariable_signal_feedback or {},
                 excluded_feature_names=sorted(excluded_names),
             )
             self._save_agent_candidate_checkpoint(
@@ -1189,8 +1201,14 @@ class AgenticAttentionVariableForestRunner:
     ) -> List[ExplicitFeatureSpec]:
         kept_specs: List[ExplicitFeatureSpec] = []
         rejected_low_coverage: List[Dict[str, Any]] = []
+        rejected_low_signal: List[Dict[str, Any]] = []
+        multivariable_signal_feedback: Dict[str, Any] = {}
         excluded_names: set[str] = set()
-        max_attempts = 1 + max(0, int(self.avf_config.coverage_retry_attempts))
+        max_attempts = 1 + max(
+            0,
+            int(self.avf_config.coverage_retry_attempts),
+            int(getattr(self.avf_config, "signal_retry_attempts", 0)),
+        )
 
         for attempt in range(1, max_attempts + 1):
             current_specs = self._merge_specs(existing_specs, kept_specs)
@@ -1202,6 +1220,8 @@ class AgenticAttentionVariableForestRunner:
                 existing_specs=current_specs,
                 proposal_attempt=attempt,
                 rejected_low_coverage=rejected_low_coverage,
+                rejected_low_signal=rejected_low_signal,
+                multivariable_signal_feedback=multivariable_signal_feedback,
                 excluded_feature_names=sorted(excluded_names),
             )
             current_names = {_normalize_feature_name(spec.name) for spec in current_specs}
@@ -1216,7 +1236,7 @@ class AgenticAttentionVariableForestRunner:
 
             self.dataset = self.extraction_provider.ensure_features(self.dataset, candidates)
             train_df = self.dataset.iloc[train_idx].copy()
-            kept, dropped = self._partition_specs_by_extraction_coverage(
+            coverage_kept, coverage_dropped = self._partition_specs_by_extraction_coverage(
                 train_df,
                 candidates,
                 manual_specs=[],
@@ -1227,21 +1247,55 @@ class AgenticAttentionVariableForestRunner:
                     "stage": stage,
                     "proposal_attempt": int(attempt),
                     "candidate_features": [spec.name for spec in candidates],
-                    "kept_features": [spec.name for spec in kept],
-                    "dropped_features": dropped,
+                    "kept_features": [spec.name for spec in coverage_kept],
+                    "dropped_features": coverage_dropped,
                 }
             )
             self._flush_coverage_filter_rows()
-            kept_specs = self._merge_specs(kept_specs, kept)
 
-            if not dropped or attempt >= max_attempts:
+            signal_kept, signal_dropped = self._partition_specs_by_association_signal(
+                train_df=train_df,
+                stage=stage,
+                specs=coverage_kept,
+                existing_specs=current_specs,
+            )
+            kept_specs = self._merge_specs(kept_specs, signal_kept)
+            multivariable_signal_feedback = self._multivariable_signal_summary(
+                train_df=train_df,
+                stage=stage,
+                specs=self._merge_specs(existing_specs, kept_specs),
+            )
+            self.association_filter_rows.append(
+                {
+                    "outer_fold": int(outer_fold),
+                    "stage": stage,
+                    "proposal_attempt": int(attempt),
+                    "candidate_features": [spec.name for spec in coverage_kept],
+                    "kept_features": [spec.name for spec in signal_kept],
+                    "dropped_features": signal_dropped,
+                    "multivariable_signal": multivariable_signal_feedback,
+                }
+            )
+            self._flush_association_filter_rows()
+
+            dropped = [*coverage_dropped, *signal_dropped]
+            signal_inadequate = not bool(
+                multivariable_signal_feedback.get("adequate", True)
+            )
+
+            if (not dropped and not signal_inadequate) or attempt >= max_attempts:
                 break
 
-            for row in dropped:
+            for row in coverage_dropped:
                 name = _normalize_feature_name(row.get("name", ""))
                 if name:
                     excluded_names.add(name)
                     rejected_low_coverage.append(row)
+            for row in signal_dropped:
+                name = _normalize_feature_name(row.get("name", ""))
+                if name:
+                    excluded_names.add(name)
+                    rejected_low_signal.append(row)
 
         return kept_specs
 
@@ -1261,6 +1315,8 @@ class AgenticAttentionVariableForestRunner:
         proposal_attempt: int = 1,
         max_proposals: Optional[int] = None,
         rejected_low_coverage: Optional[Sequence[Dict[str, Any]]] = None,
+        rejected_low_signal: Optional[Sequence[Dict[str, Any]]] = None,
+        multivariable_signal_feedback: Optional[Dict[str, Any]] = None,
         excluded_feature_names: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         evidence = sorted(
@@ -1290,6 +1346,8 @@ class AgenticAttentionVariableForestRunner:
             "current_features": [_spec_to_dict(spec) for spec in existing_specs],
             "excluded_feature_names": list(excluded_feature_names or []),
             "rejected_low_coverage_features": list(rejected_low_coverage or []),
+            "rejected_low_signal_features": list(rejected_low_signal or []),
+            "multivariable_signal_feedback": multivariable_signal_feedback or {},
             "attention_evidence": [
                 {
                     "row_id": int(row["row_id"]),
@@ -1727,6 +1785,12 @@ class AgenticAttentionVariableForestRunner:
             self.coverage_filter_rows,
         )
 
+    def _flush_association_filter_rows(self) -> None:
+        _write_jsonl(
+            self.artifact_dir / "association_filter_by_attempt.jsonl",
+            self.association_filter_rows,
+        )
+
     def _load_nuisance_fold_checkpoint(
         self,
         df: pd.DataFrame,
@@ -1891,6 +1955,134 @@ class AgenticAttentionVariableForestRunner:
             kept.append(spec)
         return kept, dropped
 
+    def _partition_specs_by_association_signal(
+        self,
+        train_df: pd.DataFrame,
+        stage: str,
+        specs: Sequence[ExplicitFeatureSpec],
+        existing_specs: Sequence[ExplicitFeatureSpec],
+    ) -> Tuple[List[ExplicitFeatureSpec], List[Dict[str, Any]]]:
+        kept: List[ExplicitFeatureSpec] = []
+        dropped: List[Dict[str, Any]] = []
+        alpha = float(getattr(self.avf_config, "association_alpha", 0.05))
+        for spec in specs:
+            diagnostic = _feature_association_diagnostic(
+                df=train_df,
+                spec=spec,
+                config=self.config,
+                existing_specs=existing_specs,
+                alpha=alpha,
+                min_n=int(getattr(self.avf_config, "association_min_n", 20)),
+                min_non_missing=int(
+                    getattr(self.avf_config, "association_min_non_missing", 10)
+                ),
+            )
+            if diagnostic.get("status") == "skipped_insufficient_sample":
+                kept.append(spec)
+                continue
+
+            if stage == "confounder":
+                keep = bool(
+                    diagnostic.get("treatment_associated")
+                    and diagnostic.get("outcome_associated")
+                )
+                rejection_reason = "no_joint_treatment_outcome_association"
+            else:
+                keep = bool(
+                    diagnostic.get("outcome_associated")
+                    or diagnostic.get("interaction_associated")
+                )
+                rejection_reason = "no_outcome_or_interaction_association"
+
+            if keep:
+                kept.append(spec)
+                continue
+
+            dropped.append(
+                {
+                    "name": spec.name,
+                    "type": spec.type,
+                    "roles": list(spec.roles),
+                    "description": spec.description,
+                    "rejection_reason": rejection_reason,
+                    "diagnostic": diagnostic,
+                }
+            )
+        return kept, dropped
+
+    def _multivariable_signal_summary(
+        self,
+        train_df: pd.DataFrame,
+        stage: str,
+        specs: Sequence[ExplicitFeatureSpec],
+    ) -> Dict[str, Any]:
+        specs = list(specs)
+        if not specs:
+            return {
+                "status": "no_features",
+                "adequate": False,
+                "reason": "no_features_survived_association_screen",
+            }
+        min_n = int(getattr(self.avf_config, "association_min_n", 20))
+        if len(train_df) < min_n:
+            return {
+                "status": "skipped_insufficient_sample",
+                "adequate": True,
+                "n": int(len(train_df)),
+                "min_n": min_n,
+            }
+
+        matrix, feature_names = _signal_feature_matrix(train_df, specs)
+        if matrix is None or matrix.shape[1] == 0 or not _has_any_variation(matrix):
+            return {
+                "status": "no_varying_features",
+                "adequate": False,
+                "feature_names": feature_names,
+            }
+
+        folds = int(getattr(self.avf_config, "signal_cv_folds", 3))
+        treatment_score = _cross_validated_boosted_signal_score(
+            matrix,
+            train_df[self.config.treatment_column].to_numpy(),
+            target_kind="binary",
+            folds=folds,
+            random_state=71,
+        )
+        outcome_score = _cross_validated_boosted_signal_score(
+            matrix,
+            train_df[self.config.outcome_column].to_numpy(),
+            target_kind=self.config.outcome_type,
+            folds=folds,
+            random_state=173,
+        )
+        min_treatment = float(getattr(self.avf_config, "min_signal_treatment_auroc", 0.55))
+        min_outcome = float(getattr(self.avf_config, "min_signal_outcome_auroc", 0.55))
+        treatment_ok = _score_meets_signal_threshold(treatment_score, min_treatment)
+        outcome_ok = _score_meets_signal_threshold(outcome_score, min_outcome)
+        adequate = bool(
+            (treatment_ok and outcome_ok)
+            if stage == "confounder"
+            else outcome_ok
+        )
+        return {
+            "status": "ok",
+            "adequate": adequate,
+            "stage": stage,
+            "required": (
+                "treatment_and_outcome_auroc"
+                if stage == "confounder"
+                else "outcome_auroc"
+            ),
+            "min_treatment_auroc": min_treatment,
+            "min_outcome_auroc": min_outcome,
+            "treatment_ok": bool(treatment_ok),
+            "outcome_ok": bool(outcome_ok),
+            "treatment_model": treatment_score,
+            "outcome_model": outcome_score,
+            "feature_names": feature_names,
+            "features": [spec.name for spec in specs],
+        }
+
     def _save_predictions(self, results_df: pd.DataFrame) -> None:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         results_df.to_parquet(self.output_path, index=False)
@@ -1928,6 +2120,10 @@ class AgenticAttentionVariableForestRunner:
         _write_jsonl(
             self.artifact_dir / "coverage_filter_by_attempt.jsonl",
             self.coverage_filter_rows,
+        )
+        _write_jsonl(
+            self.artifact_dir / "association_filter_by_attempt.jsonl",
+            self.association_filter_rows,
         )
         metrics_for_csv = [
             {key: value for key, value in row.items() if not isinstance(value, list)}
@@ -2070,6 +2266,557 @@ def _proposal_artifact_dicts(
                 row[key] = value
         artifacts.append(row)
     return artifacts
+
+
+def _feature_association_diagnostic(
+    df: pd.DataFrame,
+    spec: ExplicitFeatureSpec,
+    config: AppliedInferenceConfig,
+    existing_specs: Sequence[ExplicitFeatureSpec],
+    alpha: float,
+    min_n: int,
+    min_non_missing: int,
+) -> Dict[str, Any]:
+    col = f"explicit_feat_{spec.name}"
+    miss_col = f"{col}_missing"
+    coverage = _feature_coverage(df, _normalize_feature_name(spec.name))
+    if len(df) < min_n:
+        return {
+            "status": "skipped_insufficient_sample",
+            "n": int(len(df)),
+            "min_n": int(min_n),
+            "coverage": float(coverage),
+            "treatment_associated": True,
+            "outcome_associated": True,
+            "interaction_associated": False,
+        }
+    if col not in df.columns:
+        return {
+            "status": "missing_extracted_column",
+            "coverage": 0.0,
+            "treatment_associated": False,
+            "outcome_associated": False,
+            "interaction_associated": False,
+        }
+    missing = df[miss_col].astype(bool).to_numpy() if miss_col in df.columns else df[col].isna().to_numpy()
+    non_missing_n = int((~missing).sum())
+    if non_missing_n < min_non_missing:
+        return {
+            "status": "insufficient_non_missing",
+            "n": int(len(df)),
+            "coverage": float(coverage),
+            "non_missing_n": non_missing_n,
+            "min_non_missing": int(min_non_missing),
+            "treatment_associated": False,
+            "outcome_associated": False,
+            "interaction_associated": False,
+        }
+
+    treatment_diag = _univariate_feature_target_association(
+        df,
+        spec,
+        config.treatment_column,
+        target_kind="binary",
+    )
+    outcome_diag = _univariate_feature_target_association(
+        df,
+        spec,
+        config.outcome_column,
+        target_kind=config.outcome_type,
+    )
+    interaction_diag = _treatment_interaction_association(
+        df=df,
+        spec=spec,
+        config=config,
+        existing_specs=existing_specs,
+    )
+    treatment_p = treatment_diag.get("p_value")
+    outcome_p = outcome_diag.get("p_value")
+    interaction_p = interaction_diag.get("p_value")
+    return {
+        "status": "ok",
+        "n": int(len(df)),
+        "coverage": float(coverage),
+        "non_missing_n": non_missing_n,
+        "alpha": float(alpha),
+        "treatment_association": treatment_diag,
+        "outcome_association": outcome_diag,
+        "treatment_interaction": interaction_diag,
+        "treatment_associated": _p_value_below(treatment_p, alpha),
+        "outcome_associated": _p_value_below(outcome_p, alpha),
+        "interaction_associated": _p_value_below(interaction_p, alpha),
+    }
+
+
+def _univariate_feature_target_association(
+    df: pd.DataFrame,
+    spec: ExplicitFeatureSpec,
+    target_col: str,
+    target_kind: str,
+) -> Dict[str, Any]:
+    col = f"explicit_feat_{spec.name}"
+    miss_col = f"{col}_missing"
+    if col not in df.columns or target_col not in df.columns:
+        return {"status": "missing_column"}
+    missing = df[miss_col].astype(bool) if miss_col in df.columns else df[col].isna()
+    target = df[target_col]
+    mask = (~missing) & df[col].notna() & target.notna()
+    if int(mask.sum()) < 3:
+        return {"status": "insufficient_rows", "n": int(mask.sum())}
+
+    y_raw = target.loc[mask]
+    x_raw = df.loc[mask, col]
+    target_kind = "continuous" if target_kind == "continuous" else "binary"
+    if target_kind == "binary":
+        y_codes, uniques = pd.factorize(y_raw)
+        if len(uniques) != 2:
+            return {"status": "constant_target", "n": int(mask.sum())}
+        y = y_codes.astype(float)
+        if spec.type == "continuous":
+            x = pd.to_numeric(x_raw, errors="coerce")
+            finite = x.notna().to_numpy()
+            if finite.sum() < 3 or len(np.unique(x[finite])) < 2:
+                return {"status": "constant_feature", "n": int(finite.sum())}
+            try:
+                stat, p_value = stats.pointbiserialr(y[finite], x[finite].to_numpy(dtype=float))
+            except Exception as exc:
+                return {"status": "test_failed", "error": str(exc)}
+            return {
+                "status": "ok",
+                "test": "point_biserial",
+                "statistic": _finite_or_none(stat),
+                "p_value": _finite_or_none(p_value),
+                "n": int(finite.sum()),
+            }
+        table = pd.crosstab(x_raw.astype(str), y_raw.astype(str))
+        if table.shape[0] < 2 or table.shape[1] != 2:
+            return {"status": "constant_feature", "n": int(mask.sum())}
+        try:
+            chi2, p_value, dof, _ = stats.chi2_contingency(table.to_numpy())
+        except Exception as exc:
+            return {"status": "test_failed", "error": str(exc)}
+        return {
+            "status": "ok",
+            "test": "chi_square",
+            "statistic": _finite_or_none(chi2),
+            "p_value": _finite_or_none(p_value),
+            "dof": int(dof),
+            "n": int(mask.sum()),
+        }
+
+    y = pd.to_numeric(y_raw, errors="coerce")
+    if spec.type == "continuous":
+        x = pd.to_numeric(x_raw, errors="coerce")
+        finite = x.notna() & y.notna()
+        if int(finite.sum()) < 3 or x[finite].nunique() < 2 or y[finite].nunique() < 2:
+            return {"status": "constant_feature_or_target", "n": int(finite.sum())}
+        try:
+            stat, p_value = stats.pearsonr(x[finite].to_numpy(dtype=float), y[finite].to_numpy(dtype=float))
+        except Exception as exc:
+            return {"status": "test_failed", "error": str(exc)}
+        return {
+            "status": "ok",
+            "test": "pearson",
+            "statistic": _finite_or_none(stat),
+            "p_value": _finite_or_none(p_value),
+            "n": int(finite.sum()),
+        }
+
+    groups = []
+    for _, values in y.groupby(x_raw.astype(str)):
+        values = values.dropna().to_numpy(dtype=float)
+        if len(values) >= 2:
+            groups.append(values)
+    if len(groups) < 2:
+        return {"status": "insufficient_groups", "n": int(mask.sum())}
+    try:
+        stat, p_value = stats.f_oneway(*groups)
+    except Exception as exc:
+        return {"status": "test_failed", "error": str(exc)}
+    return {
+        "status": "ok",
+        "test": "anova",
+        "statistic": _finite_or_none(stat),
+        "p_value": _finite_or_none(p_value),
+        "n": int(mask.sum()),
+        "n_groups": int(len(groups)),
+    }
+
+
+def _treatment_interaction_association(
+    df: pd.DataFrame,
+    spec: ExplicitFeatureSpec,
+    config: AppliedInferenceConfig,
+    existing_specs: Sequence[ExplicitFeatureSpec],
+) -> Dict[str, Any]:
+    if config.outcome_type == "continuous":
+        return _continuous_interaction_association(df, spec, config, existing_specs)
+    if config.treatment_column not in df.columns or config.outcome_column not in df.columns:
+        return {"status": "missing_target_column"}
+    outcome = np.asarray(df[config.outcome_column].to_numpy(), dtype=float)
+    treatment = np.asarray(df[config.treatment_column].to_numpy(), dtype=float)
+    if len(np.unique(outcome[~np.isnan(outcome)])) < 2 or len(np.unique(treatment[~np.isnan(treatment)])) < 2:
+        return {"status": "constant_target_or_treatment"}
+
+    current_confounders = [
+        item
+        for item in existing_specs
+        if item.name != spec.name and "confounder" in item.roles
+    ]
+    _, w_matrix, _, _, _, _ = _build_features(df, current_confounders)
+    candidate = ExplicitFeatureSpec(
+        name=spec.name,
+        type=spec.type,
+        categories=spec.categories,
+        description=spec.description,
+        roles=["confounder"],
+    )
+    _, z_matrix, _, z_names, _, _ = _build_features(df, [candidate])
+    w_matrix = _feature_matrix_or_empty(w_matrix, len(df))
+    z_matrix = _feature_matrix_or_empty(z_matrix, len(df))
+    if z_matrix.shape[1] == 0 or not _has_any_variation(z_matrix):
+        return {"status": "constant_candidate", "candidate_feature_names": z_names}
+
+    treatment_col = treatment.reshape(-1, 1)
+    base_x = np.hstack([w_matrix, treatment_col, z_matrix])
+    full_x = np.hstack([base_x, z_matrix * treatment_col])
+    finite = (
+        np.isfinite(outcome)
+        & np.isfinite(treatment)
+        & np.all(np.isfinite(base_x), axis=1)
+        & np.all(np.isfinite(full_x), axis=1)
+    )
+    if int(finite.sum()) < 10:
+        return {"status": "insufficient_finite_rows", "n": int(finite.sum())}
+    try:
+        p_value, lr_stat, dof = _binary_likelihood_ratio_p(
+            base_x[finite],
+            full_x[finite],
+            outcome[finite],
+            added_df=z_matrix.shape[1],
+        )
+    except Exception as exc:
+        return {"status": "test_failed", "error": str(exc)}
+    return {
+        "status": "ok",
+        "test": "logistic_likelihood_ratio",
+        "p_value": _finite_or_none(p_value),
+        "lr_statistic": _finite_or_none(lr_stat),
+        "dof": int(dof),
+        "candidate_feature_names": z_names,
+        "n": int(finite.sum()),
+    }
+
+
+def _continuous_interaction_association(
+    df: pd.DataFrame,
+    spec: ExplicitFeatureSpec,
+    config: AppliedInferenceConfig,
+    existing_specs: Sequence[ExplicitFeatureSpec],
+) -> Dict[str, Any]:
+    outcome = np.asarray(df[config.outcome_column].to_numpy(), dtype=float)
+    treatment = np.asarray(df[config.treatment_column].to_numpy(), dtype=float)
+    current_confounders = [
+        item
+        for item in existing_specs
+        if item.name != spec.name and "confounder" in item.roles
+    ]
+    _, w_matrix, _, _, _, _ = _build_features(df, current_confounders)
+    candidate = ExplicitFeatureSpec(
+        name=spec.name,
+        type=spec.type,
+        categories=spec.categories,
+        description=spec.description,
+        roles=["confounder"],
+    )
+    _, z_matrix, _, z_names, _, _ = _build_features(df, [candidate])
+    w_matrix = _feature_matrix_or_empty(w_matrix, len(df))
+    z_matrix = _feature_matrix_or_empty(z_matrix, len(df))
+    if z_matrix.shape[1] == 0 or not _has_any_variation(z_matrix):
+        return {"status": "constant_candidate", "candidate_feature_names": z_names}
+    treatment_col = treatment.reshape(-1, 1)
+    base_x = np.hstack([w_matrix, treatment_col, z_matrix])
+    full_x = np.hstack([base_x, z_matrix * treatment_col])
+    finite = (
+        np.isfinite(outcome)
+        & np.isfinite(treatment)
+        & np.all(np.isfinite(base_x), axis=1)
+        & np.all(np.isfinite(full_x), axis=1)
+    )
+    if int(finite.sum()) < 10:
+        return {"status": "insufficient_finite_rows", "n": int(finite.sum())}
+    try:
+        p_value, f_stat, dof_num, dof_den = _linear_nested_f_test(
+            base_x[finite],
+            full_x[finite],
+            outcome[finite],
+            added_df=z_matrix.shape[1],
+        )
+    except Exception as exc:
+        return {"status": "test_failed", "error": str(exc)}
+    return {
+        "status": "ok",
+        "test": "linear_nested_f",
+        "p_value": _finite_or_none(p_value),
+        "f_statistic": _finite_or_none(f_stat),
+        "dof_num": int(dof_num),
+        "dof_den": int(dof_den),
+        "candidate_feature_names": z_names,
+        "n": int(finite.sum()),
+    }
+
+
+def _signal_feature_matrix(
+    df: pd.DataFrame,
+    specs: Sequence[ExplicitFeatureSpec],
+) -> Tuple[Optional[np.ndarray], List[str]]:
+    x_matrix, w_matrix, x_names, w_names, _, _ = _build_features(df, list(specs))
+    matrix = _hstack_present(x_matrix, w_matrix)
+    names = [*(x_names or []), *(w_names or [])]
+    if matrix is None:
+        return None, names
+    return np.asarray(matrix, dtype=np.float32), names
+
+
+def _cross_validated_boosted_signal_score(
+    matrix: np.ndarray,
+    target: np.ndarray,
+    target_kind: str,
+    folds: int,
+    random_state: int,
+) -> Dict[str, Any]:
+    x = np.asarray(matrix, dtype=np.float32)
+    y = np.asarray(target)
+    finite = np.all(np.isfinite(x), axis=1) & pd.Series(y).notna().to_numpy()
+    x = x[finite]
+    y = y[finite]
+    if len(y) < 10:
+        return {"status": "insufficient_rows", "n": int(len(y))}
+    if target_kind != "continuous":
+        y_codes, uniques = pd.factorize(y)
+        if len(uniques) != 2:
+            return {"status": "constant_target", "n": int(len(y))}
+        y_binary = y_codes.astype(int)
+        class_counts = np.bincount(y_binary)
+        n_splits = min(int(folds), int(class_counts.min()))
+        if n_splits < 2:
+            return {
+                "status": "insufficient_class_counts",
+                "n": int(len(y)),
+                "class_counts": class_counts.tolist(),
+            }
+        preds = np.full(len(y_binary), np.nan, dtype=float)
+        model_name = None
+        splitter = StratifiedKFold(
+            n_splits=n_splits,
+            shuffle=True,
+            random_state=random_state,
+        )
+        for fold_idx, (train_idx, test_idx) in enumerate(splitter.split(x, y_binary)):
+            pred, model_name = _fit_predict_boosted_classifier(
+                x[train_idx],
+                y_binary[train_idx],
+                x[test_idx],
+                random_state=random_state + fold_idx,
+            )
+            preds[test_idx] = pred
+        mask = np.isfinite(preds)
+        return {
+            "status": "ok",
+            "target_kind": "binary",
+            "metric": "auroc",
+            "score": _safe_roc_auc(y_binary[mask], preds[mask]),
+            "model": model_name,
+            "n": int(mask.sum()),
+            "folds": int(n_splits),
+        }
+
+    y_cont = pd.to_numeric(pd.Series(y), errors="coerce").to_numpy(dtype=float)
+    finite = np.isfinite(y_cont)
+    x = x[finite]
+    y_cont = y_cont[finite]
+    if len(y_cont) < 10 or np.std(y_cont) == 0:
+        return {"status": "insufficient_or_constant_target", "n": int(len(y_cont))}
+    n_splits = min(int(folds), len(y_cont))
+    if n_splits < 2:
+        return {"status": "insufficient_rows", "n": int(len(y_cont))}
+    preds = np.full(len(y_cont), np.nan, dtype=float)
+    model_name = None
+    splitter = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    for fold_idx, (train_idx, test_idx) in enumerate(splitter.split(x)):
+        pred, model_name = _fit_predict_boosted_regressor(
+            x[train_idx],
+            y_cont[train_idx],
+            x[test_idx],
+            random_state=random_state + fold_idx,
+        )
+        preds[test_idx] = pred
+    mask = np.isfinite(preds)
+    return {
+        "status": "ok",
+        "target_kind": "continuous",
+        "metric": "r2",
+        "score": float(r2_score(y_cont[mask], preds[mask])),
+        "model": model_name,
+        "n": int(mask.sum()),
+        "folds": int(n_splits),
+    }
+
+
+def _fit_predict_boosted_classifier(
+    train_x: np.ndarray,
+    train_y: np.ndarray,
+    test_x: np.ndarray,
+    random_state: int,
+) -> Tuple[np.ndarray, str]:
+    try:
+        from xgboost import XGBClassifier  # type: ignore
+
+        model = XGBClassifier(
+            n_estimators=120,
+            max_depth=3,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            eval_metric="logloss",
+            random_state=random_state,
+            n_jobs=1,
+            verbosity=0,
+        )
+        model.fit(train_x, train_y)
+        return model.predict_proba(test_x)[:, 1], "xgboost.XGBClassifier"
+    except Exception:
+        model = HistGradientBoostingClassifier(
+            max_iter=120,
+            learning_rate=0.05,
+            max_leaf_nodes=15,
+            random_state=random_state,
+        )
+        model.fit(train_x, train_y)
+        return model.predict_proba(test_x)[:, 1], "sklearn.HistGradientBoostingClassifier"
+
+
+def _fit_predict_boosted_regressor(
+    train_x: np.ndarray,
+    train_y: np.ndarray,
+    test_x: np.ndarray,
+    random_state: int,
+) -> Tuple[np.ndarray, str]:
+    try:
+        from xgboost import XGBRegressor  # type: ignore
+
+        model = XGBRegressor(
+            n_estimators=120,
+            max_depth=3,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=random_state,
+            n_jobs=1,
+            verbosity=0,
+        )
+        model.fit(train_x, train_y)
+        return model.predict(test_x), "xgboost.XGBRegressor"
+    except Exception:
+        model = HistGradientBoostingRegressor(
+            max_iter=120,
+            learning_rate=0.05,
+            max_leaf_nodes=15,
+            random_state=random_state,
+        )
+        model.fit(train_x, train_y)
+        return model.predict(test_x), "sklearn.HistGradientBoostingRegressor"
+
+
+def _score_meets_signal_threshold(score: Dict[str, Any], threshold: float) -> bool:
+    if score.get("status") == "skipped_insufficient_sample":
+        return True
+    value = score.get("score")
+    if value is None or not np.isfinite(float(value)):
+        return False
+    if score.get("metric") == "auroc":
+        return float(value) >= float(threshold)
+    return float(value) > 0.0
+
+
+def _binary_likelihood_ratio_p(
+    base_x: np.ndarray,
+    full_x: np.ndarray,
+    y: np.ndarray,
+    added_df: int,
+) -> Tuple[float, float, int]:
+    y_codes, uniques = pd.factorize(y)
+    if len(uniques) != 2:
+        raise ValueError("binary likelihood ratio requires two outcome classes")
+    y_binary = y_codes.astype(int)
+    base_model = LogisticRegression(max_iter=1000, solver="lbfgs")
+    full_model = LogisticRegression(max_iter=1000, solver="lbfgs")
+    base_model.fit(_ensure_model_columns(base_x), y_binary)
+    full_model.fit(_ensure_model_columns(full_x), y_binary)
+    base_pred = np.clip(base_model.predict_proba(_ensure_model_columns(base_x))[:, 1], 1e-6, 1 - 1e-6)
+    full_pred = np.clip(full_model.predict_proba(_ensure_model_columns(full_x))[:, 1], 1e-6, 1 - 1e-6)
+    base_ll = -log_loss(y_binary, base_pred, labels=[0, 1], normalize=False)
+    full_ll = -log_loss(y_binary, full_pred, labels=[0, 1], normalize=False)
+    lr_stat = max(0.0, 2.0 * (float(full_ll) - float(base_ll)))
+    dof = max(1, int(added_df))
+    return float(stats.chi2.sf(lr_stat, dof)), float(lr_stat), dof
+
+
+def _linear_nested_f_test(
+    base_x: np.ndarray,
+    full_x: np.ndarray,
+    y: np.ndarray,
+    added_df: int,
+) -> Tuple[float, float, int, int]:
+    base_x = _ensure_model_columns(base_x)
+    full_x = _ensure_model_columns(full_x)
+    base_model = LinearRegression()
+    full_model = LinearRegression()
+    base_model.fit(base_x, y)
+    full_model.fit(full_x, y)
+    base_resid = y - base_model.predict(base_x)
+    full_resid = y - full_model.predict(full_x)
+    rss_base = float(np.sum(base_resid ** 2))
+    rss_full = float(np.sum(full_resid ** 2))
+    dof_num = max(1, int(added_df))
+    dof_den = max(1, int(len(y) - full_x.shape[1] - 1))
+    f_stat = max(0.0, ((rss_base - rss_full) / dof_num) / max(rss_full / dof_den, 1e-12))
+    return float(stats.f.sf(f_stat, dof_num, dof_den)), float(f_stat), dof_num, dof_den
+
+
+def _feature_matrix_or_empty(matrix: Optional[np.ndarray], n_rows: int) -> np.ndarray:
+    if matrix is None:
+        return np.zeros((n_rows, 0), dtype=np.float32)
+    return np.asarray(matrix, dtype=np.float32)
+
+
+def _ensure_model_columns(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    if x.ndim == 1:
+        x = x.reshape(-1, 1)
+    if x.shape[1] == 0:
+        return np.zeros((x.shape[0], 1), dtype=np.float64)
+    return x
+
+
+def _has_any_variation(matrix: np.ndarray) -> bool:
+    matrix = np.asarray(matrix, dtype=float)
+    return bool(matrix.size and np.any(np.nanstd(matrix, axis=0) > 1e-12))
+
+
+def _p_value_below(value: Any, alpha: float) -> bool:
+    try:
+        return bool(value is not None and np.isfinite(float(value)) and float(value) < alpha)
+    except (TypeError, ValueError):
+        return False
+
+
+def _finite_or_none(value: Any) -> Optional[float]:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) else None
 
 
 def _fit_predict_propensity(
