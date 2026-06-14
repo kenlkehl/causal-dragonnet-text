@@ -109,7 +109,7 @@ class AgenticAttentionOracleConfig:
     htr_hash_embedding_dim: int = 256
     htr_sentence_encoder_batch_size: int = 128
     htr_sentence_encoder_backend: str = "auto"
-    htr_sentence_pooling: str = "auto"
+    htr_sentence_pooling: str = "token_attention"
     htr_normalize_sentence_embeddings: bool = True
     htr_trainable_sentence_encoder_layers: int = 0
     htr_dropout: float = 0.1
@@ -553,7 +553,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--htr-sentence-pooling",
-        default="auto",
+        default="token_attention",
         choices=["auto", "cls", "last", "mean", "token_attention"],
     )
     parser.add_argument("--htr-normalize-sentence-embeddings", type=_parse_bool, default=True)
