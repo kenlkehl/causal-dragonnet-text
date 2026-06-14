@@ -460,7 +460,7 @@ class AgenticAttentionVariableForestConfig:
     min_signal_treatment_auroc: float = 0.55
     min_signal_outcome_auroc: float = 0.55
     consensus_min_fold_fraction: float = 2.0 / 3.0
-    min_extraction_coverage: float = 0.70
+    min_extraction_coverage: float = 0.10
     e_clip: float = 0.01
     manual_features_locked: bool = True
 

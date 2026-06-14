@@ -568,8 +568,9 @@ def test_attention_agent_prompt_is_attention_anchored():
         AgenticFeatureSearchConfig(max_additions_per_iter=6),
     )
 
-    assert "Base every proposal on themes that actually emerge" in prompt
-    assert "Do not propose a variable just because" in prompt
+    assert "highly attended token spans inside highly attended chunks" in prompt
+    assert "Do not propose a variable from general oncology knowledge" in prompt
+    assert "mundane patient-level fields count" in prompt
     assert "At most 2 add proposals" in prompt
     assert "low_coverage_marker" in prompt
 

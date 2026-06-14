@@ -134,7 +134,7 @@ class AgenticAttentionOracleConfig:
     min_signal_treatment_auroc: float = 0.55
     min_signal_outcome_auroc: float = 0.55
     consensus_min_fold_fraction: float = 2.0 / 3.0
-    min_extraction_coverage: float = 0.70
+    min_extraction_coverage: float = 0.10
     e_clip: float = 0.01
 
     cf_n_estimators: int = 200
@@ -554,7 +554,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--htr-sentence-pooling",
         default="auto",
-        choices=["auto", "cls", "last", "mean"],
+        choices=["auto", "cls", "last", "mean", "token_attention"],
     )
     parser.add_argument("--htr-normalize-sentence-embeddings", type=_parse_bool, default=True)
     parser.add_argument("--htr-trainable-sentence-encoder-layers", type=int, default=0)
@@ -588,7 +588,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-signal-treatment-auroc", type=float, default=0.55)
     parser.add_argument("--min-signal-outcome-auroc", type=float, default=0.55)
     parser.add_argument("--consensus-min-fold-fraction", type=float, default=2.0 / 3.0)
-    parser.add_argument("--min-extraction-coverage", type=float, default=0.70)
+    parser.add_argument("--min-extraction-coverage", type=float, default=0.10)
     parser.add_argument("--e-clip", type=float, default=0.01)
 
     parser.add_argument("--cf-n-estimators", type=int, default=200)

@@ -473,6 +473,116 @@ class TestHierarchicalTransformer:
         assert len(ext._chunk_cache) == 1
         assert len(ext._tokenization_cache) == 2
 
+    def test_token_attention_pooling_exports_token_spans(self):
+        import json
+        import re
+        from types import SimpleNamespace
+
+        from oci.models.hierarchical_transformer_extractor import (
+            HierarchicalTransformerExtractor,
+        )
+
+        class FakeTokenizer:
+            pad_token_id = 0
+            padding_side = "right"
+            all_special_ids = [0, 101, 102]
+            all_special_tokens = ["[PAD]", "[CLS]", "[SEP]"]
+
+            def __call__(
+                self,
+                text,
+                padding=False,
+                truncation=True,
+                max_length=None,
+                return_offsets_mapping=False,
+            ):
+                del padding, truncation
+                words = list(re.finditer(r"\S+", text))
+                input_ids = [101] + list(range(10, 10 + len(words))) + [102]
+                attention_mask = [1] * len(input_ids)
+                offsets = [(0, 0)] + [
+                    (int(match.start()), int(match.end())) for match in words
+                ] + [(0, 0)]
+                if max_length is not None:
+                    input_ids = input_ids[:max_length]
+                    attention_mask = attention_mask[:max_length]
+                    offsets = offsets[:max_length]
+                result = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                }
+                if return_offsets_mapping:
+                    result["offset_mapping"] = offsets
+                return result
+
+            def convert_ids_to_tokens(self, input_ids):
+                tokens = []
+                for token_id in input_ids:
+                    if token_id == 101:
+                        tokens.append("[CLS]")
+                    elif token_id == 102:
+                        tokens.append("[SEP]")
+                    elif token_id == 0:
+                        tokens.append("[PAD]")
+                    else:
+                        tokens.append(f"tok{token_id}")
+                return tokens
+
+        class FakeEncoder(torch.nn.Module):
+            def forward(self, input_ids, attention_mask):
+                del attention_mask
+                hidden = input_ids.float().unsqueeze(-1)
+                hidden = torch.cat(
+                    [
+                        hidden,
+                        hidden / 10.0,
+                        torch.sin(hidden),
+                        torch.cos(hidden),
+                    ],
+                    dim=-1,
+                )
+                return SimpleNamespace(last_hidden_state=hidden)
+
+        ext = HierarchicalTransformerExtractor(
+            sentence_encoder_model="some-bert",
+            sentence_pooling="token_attention",
+            chunk_size_words=10,
+            chunk_overlap_words=0,
+            max_chunks=2,
+            max_chunk_length=16,
+            num_transformer_layers=1,
+            num_attention_heads=2,
+            transformer_dim=8,
+            projection_dim=4,
+            transformer_dropout=0.0,
+        )
+        ext._encoder_initialized = True
+        ext._tokenizer = FakeTokenizer()
+        ext._sentence_encoder = FakeEncoder()
+        ext._sentence_dim = 4
+        ext._input_projection = torch.nn.Linear(4, 8)
+        ext._ensure_token_pooling_initialized()
+
+        evidence = ext.get_attention_evidence(
+            ["Encounter Record Timepoint: At age 84 PD-L1 1-49 percent"],
+            row_ids=[123],
+            fold=1,
+            stage="nuisance",
+            top_k=1,
+        )
+
+        assert evidence
+        row = evidence[0]
+        assert row["row_id"] == 123
+        assert "top_token_spans_json" in row
+        spans = json.loads(row["top_token_spans_json"])
+        assert spans
+        assert {"text", "focus_token", "token_attention", "salience"}.issubset(
+            spans[0]
+        )
+        assert row["attended_token_summary"]
+        assert "[[" in row["highlighted_chunk_text"]
+
 
 class TestLearnedTokenizer:
     def test_fit_and_encode(self):

@@ -7,6 +7,7 @@ attention from the pool token is exported as chunk-level evidence.
 """
 
 import hashlib
+import json
 import logging
 import math
 import os
@@ -19,6 +20,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from .gated_attention_pooling import GatedAttentionPooling
 
 logger = logging.getLogger(__name__)
 _TRANSFORMERS_ENCODER_INIT_LOCK = threading.Lock()
@@ -184,6 +187,21 @@ def _collate_tokenized_chunks(
     }
 
 
+def _find_overlapping_word(
+    words: Sequence[Tuple[str, int, int]],
+    start: int,
+    end: int,
+) -> Optional[int]:
+    best_idx: Optional[int] = None
+    best_overlap = 0
+    for idx, (_, word_start, word_end) in enumerate(words):
+        overlap = min(end, word_end) - max(start, word_start)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_idx = idx
+    return best_idx
+
+
 class _InterpretableTransformerLayer(nn.Module):
     """Transformer encoder layer that can return self-attention weights."""
 
@@ -292,8 +310,11 @@ class HierarchicalTransformerExtractor(nn.Module):
                 "sentence_encoder_backend must be one of: auto, sentence_transformers, transformers"
             )
         sentence_pooling = str(sentence_pooling or "auto").lower()
-        if sentence_pooling not in {"auto", "cls", "last", "mean"}:
-            raise ValueError("sentence_pooling must be one of: auto, cls, last, mean")
+        valid_pooling = {"auto", "cls", "last", "mean", "token_attention"}
+        if sentence_pooling not in valid_pooling:
+            raise ValueError(
+                "sentence_pooling must be one of: auto, cls, last, mean, token_attention"
+            )
         if trainable_sentence_encoder_layers < 0:
             raise ValueError("trainable_sentence_encoder_layers must be >= 0")
         self._sentence_encoder_batch_size = int(sentence_encoder_batch_size)
@@ -308,10 +329,13 @@ class HierarchicalTransformerExtractor(nn.Module):
             "hashing",
             "test_hash",
         }
+        if self._hash_backend and sentence_pooling == "token_attention":
+            raise ValueError("token_attention pooling requires a transformer token encoder")
 
         self._tokenizer = None
         self._sentence_encoder = None
         self._sentence_transformer_encoder = None
+        self._token_pooling: Optional[GatedAttentionPooling] = None
         self._resolved_sentence_encoder_path: Optional[str] = None
         self._sentence_dim = self._hash_embedding_dim if self._hash_backend else None
         self._encoder_initialized = self._hash_backend
@@ -358,6 +382,9 @@ class HierarchicalTransformerExtractor(nn.Module):
         )
         self._last_chunks: List[List[str]] = []
         self._last_chunk_weights: Optional[torch.Tensor] = None
+        self._last_token_weights_by_chunk: List[torch.Tensor] = []
+        self._capture_token_attention = False
+        self._token_weight_capture_buffer: List[torch.Tensor] = []
         self.to(self._device)
 
     @property
@@ -445,6 +472,7 @@ class HierarchicalTransformerExtractor(nn.Module):
         self._input_projection = nn.Linear(self._sentence_dim, self._transformer_dim).to(
             self._device
         )
+        self._ensure_token_pooling_initialized()
         logger.info(
             "Chunk encoder initialized with backend=%s pooling=%s hidden_dim=%s "
             "device=%s trainable_encoder_params=%s/%s",
@@ -581,6 +609,8 @@ class HierarchicalTransformerExtractor(nn.Module):
         return self._resolved_sentence_encoder_path
 
     def _effective_sentence_encoder_backend(self) -> str:
+        if self._sentence_pooling == "token_attention":
+            return "transformers"
         if self._sentence_encoder_backend != "auto":
             backend = self._sentence_encoder_backend
         elif (
@@ -613,6 +643,17 @@ class HierarchicalTransformerExtractor(nn.Module):
         if "qwen" in model_name and "embedding" in model_name:
             return "last"
         return "cls"
+
+    def _ensure_token_pooling_initialized(self) -> None:
+        if self._effective_sentence_pooling() != "token_attention":
+            return
+        if self._sentence_dim is None:
+            raise RuntimeError("token_attention pooling requires an initialized encoder")
+        if self._token_pooling is None:
+            self._token_pooling = GatedAttentionPooling(
+                hidden_dim=int(self._sentence_dim),
+                attention_dim=int(self._transformer_dim),
+            ).to(self._device)
 
     def _configure_sentence_encoder_training(self) -> None:
         if self._sentence_encoder is None:
@@ -704,18 +745,44 @@ class HierarchicalTransformerExtractor(nn.Module):
         self,
         last_hidden_state: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         pooling = self._effective_sentence_pooling()
         if pooling == "last":
             pooled = self._last_token_pool(last_hidden_state, attention_mask)
+            token_weights = None
         elif pooling == "mean":
             mask = attention_mask.unsqueeze(-1).to(last_hidden_state.dtype)
             pooled = (last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+            token_weights = None
+        elif pooling == "token_attention":
+            self._ensure_token_pooling_initialized()
+            if self._token_pooling is None:
+                raise RuntimeError("token_attention pooling was not initialized")
+            pooled, token_weights = self._token_pooling(
+                last_hidden_state,
+                attention_mask=attention_mask.to(last_hidden_state.dtype),
+            )
         else:
             pooled = last_hidden_state[:, 0, :]
+            token_weights = None
         if self._normalize_sentence_embeddings:
             pooled = F.normalize(pooled, p=2, dim=1)
-        return pooled
+        return pooled, token_weights
+
+    def _capture_token_weights(
+        self,
+        token_weights: Optional[torch.Tensor],
+        attention_mask: torch.Tensor,
+    ) -> None:
+        if not self._capture_token_attention or token_weights is None:
+            return
+        weights_cpu = token_weights.detach().cpu()
+        mask_cpu = attention_mask.detach().cpu()
+        for row in range(weights_cpu.shape[0]):
+            valid_len = int(mask_cpu[row].sum().item())
+            self._token_weight_capture_buffer.append(
+                weights_cpu[row, :valid_len].clone()
+            )
 
     def _encode_chunks(self, chunks: Sequence[str]) -> torch.Tensor:
         self._ensure_encoder_initialized()
@@ -766,9 +833,12 @@ class HierarchicalTransformerExtractor(nn.Module):
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                     )
-            outputs_by_batch.append(
-                self._pool_sentence_output(outputs.last_hidden_state, attention_mask).float()
+            pooled, token_weights = self._pool_sentence_output(
+                outputs.last_hidden_state,
+                attention_mask,
             )
+            self._capture_token_weights(token_weights, attention_mask)
+            outputs_by_batch.append(pooled.float())
         return torch.cat(outputs_by_batch, dim=0)
 
     def _encode_prepared_transformer_chunks(
@@ -796,12 +866,12 @@ class HierarchicalTransformerExtractor(nn.Module):
                         input_ids=batch_input_ids,
                         attention_mask=batch_attention_mask,
                     )
-            outputs_by_batch.append(
-                self._pool_sentence_output(
-                    outputs.last_hidden_state,
-                    batch_attention_mask,
-                ).float()
+            pooled, token_weights = self._pool_sentence_output(
+                outputs.last_hidden_state,
+                batch_attention_mask,
             )
+            self._capture_token_weights(token_weights, batch_attention_mask)
+            outputs_by_batch.append(pooled.float())
         return torch.cat(outputs_by_batch, dim=0)
 
     def _tokenize_chunks_for_transformers(self, chunks: Sequence[str]) -> Dict[str, torch.Tensor]:
@@ -900,6 +970,8 @@ class HierarchicalTransformerExtractor(nn.Module):
             return torch.zeros(0, self._projection_dim, device=self._device)
 
         flat_chunks = [chunk for chunks in batch_chunks for chunk in chunks]
+        if self._capture_token_attention:
+            self._token_weight_capture_buffer = []
         if (
             prepared_batch is not None
             and "chunk_input_ids" in prepared_batch
@@ -914,6 +986,10 @@ class HierarchicalTransformerExtractor(nn.Module):
             )
         else:
             flat_embeddings = self._encode_chunks(flat_chunks)
+        if self._capture_token_attention:
+            self._last_token_weights_by_chunk = list(self._token_weight_capture_buffer)
+        else:
+            self._last_token_weights_by_chunk = []
         flat_embeddings = self._input_projection(flat_embeddings)
 
         batch_size = len(batch_chunks)
@@ -981,10 +1057,20 @@ class HierarchicalTransformerExtractor(nn.Module):
 
     def interpret_attention(self, texts: List[str], top_k: int = 5) -> List[Dict[str, Any]]:
         self.eval()
+        previous_capture = self._capture_token_attention
+        self._capture_token_attention = True
         with torch.no_grad():
-            self.forward(texts)
+            try:
+                self.forward(texts)
+            finally:
+                self._capture_token_attention = previous_capture
         weights = self._last_chunk_weights
         results = []
+        flat_offsets = []
+        offset = 0
+        for chunks in self._last_chunks:
+            flat_offsets.append(offset)
+            offset += len(chunks)
         for row, chunks in enumerate(self._last_chunks):
             row_weights = (
                 weights[row, : len(chunks)].cpu().numpy().tolist()
@@ -992,14 +1078,29 @@ class HierarchicalTransformerExtractor(nn.Module):
                 else [0.0 for _ in chunks]
             )
             order = sorted(range(len(chunks)), key=lambda idx: row_weights[idx], reverse=True)
-            top = [
-                {
+            top = []
+            for idx in order[: min(top_k, len(order))]:
+                item = {
                     "chunk_index": int(idx),
                     "chunk": chunks[idx],
                     "attention": float(row_weights[idx]),
                 }
-                for idx in order[: min(top_k, len(order))]
-            ]
+                flat_idx = flat_offsets[row] + idx
+                if flat_idx < len(self._last_token_weights_by_chunk):
+                    token_spans = self._top_token_spans(
+                        chunks[idx],
+                        self._last_token_weights_by_chunk[flat_idx],
+                    )
+                    if token_spans:
+                        item["top_token_spans"] = token_spans
+                        item["attended_token_summary"] = "; ".join(
+                            span["text"] for span in token_spans[:6]
+                        )
+                        item["highlighted_chunk"] = self._highlight_chunk(
+                            chunks[idx],
+                            token_spans,
+                        )
+                top.append(item)
             results.append(
                 {
                     "chunks": chunks,
@@ -1034,9 +1135,181 @@ class HierarchicalTransformerExtractor(nn.Module):
                     "chunk_text": item["chunk"],
                     "attention": item["attention"],
                 }
+                if item.get("top_token_spans"):
+                    record["top_token_spans_json"] = json.dumps(
+                        item["top_token_spans"],
+                        ensure_ascii=False,
+                    )
+                    record["attended_token_summary"] = item.get(
+                        "attended_token_summary",
+                        "",
+                    )
+                    record["highlighted_chunk_text"] = item.get(
+                        "highlighted_chunk",
+                        item["chunk"],
+                    )
                 record.update(meta)
                 records.append(record)
         return records
+
+    def _top_token_spans(
+        self,
+        chunk: str,
+        token_weights: torch.Tensor,
+        top_n: int = 8,
+    ) -> List[Dict[str, Any]]:
+        if self._tokenizer is None or token_weights is None:
+            return []
+        try:
+            encoded = self._tokenizer(
+                chunk,
+                padding=False,
+                truncation=True,
+                max_length=self._max_chunk_length,
+                return_offsets_mapping=True,
+            )
+        except Exception:
+            return self._top_token_strings(token_weights, chunk, top_n=top_n)
+        offsets = encoded.get("offset_mapping")
+        if offsets is None:
+            return self._top_token_strings(token_weights, chunk, top_n=top_n)
+        words = [
+            (match.group(0), int(match.start()), int(match.end()))
+            for match in re.finditer(r"\S+", str(chunk or ""))
+        ]
+        if not words:
+            return []
+        word_scores = [0.0 for _ in words]
+        word_token_scores: List[List[float]] = [[] for _ in words]
+        max_len = min(len(offsets), int(token_weights.numel()))
+        weights = token_weights.detach().cpu().numpy().tolist()
+        special_ids = set(getattr(self._tokenizer, "all_special_ids", []) or [])
+        input_ids = encoded.get("input_ids") or []
+        for token_idx in range(max_len):
+            start, end = offsets[token_idx]
+            start = int(start)
+            end = int(end)
+            if end <= start:
+                continue
+            if token_idx < len(input_ids) and int(input_ids[token_idx]) in special_ids:
+                continue
+            token_text = str(chunk[start:end])
+            if not re.search(r"[A-Za-z0-9]", token_text):
+                continue
+            word_idx = _find_overlapping_word(words, start, end)
+            if word_idx is None:
+                continue
+            score = float(weights[token_idx])
+            word_scores[word_idx] += score
+            word_token_scores[word_idx].append(score)
+        order = sorted(range(len(words)), key=lambda idx: word_scores[idx], reverse=True)
+        spans: List[Dict[str, Any]] = []
+        seen_text = set()
+        for word_idx in order:
+            if word_scores[word_idx] <= 0.0:
+                break
+            left = max(0, word_idx - 2)
+            right = min(len(words), word_idx + 3)
+            phrase_start = words[left][1]
+            phrase_end = words[right - 1][2]
+            text = str(chunk[phrase_start:phrase_end]).strip()
+            if not text or text in seen_text:
+                continue
+            seen_text.add(text)
+            spans.append(
+                {
+                    "text": text,
+                    "focus_token": words[word_idx][0],
+                    "token_attention": float(max(word_token_scores[word_idx] or [0.0])),
+                    "salience": float(word_scores[word_idx]),
+                    "char_start": int(phrase_start),
+                    "char_end": int(phrase_end),
+                }
+            )
+            if len(spans) >= top_n:
+                break
+        return spans
+
+    def _top_token_strings(
+        self,
+        token_weights: torch.Tensor,
+        chunk: str,
+        top_n: int = 8,
+    ) -> List[Dict[str, Any]]:
+        try:
+            encoded = self._tokenizer(
+                chunk,
+                padding=False,
+                truncation=True,
+                max_length=self._max_chunk_length,
+            )
+            input_ids = encoded.get("input_ids") or []
+            tokens = self._tokenizer.convert_ids_to_tokens(input_ids)
+        except Exception:
+            return []
+        weights = token_weights.detach().cpu().numpy().tolist()
+        special_tokens = set(getattr(self._tokenizer, "all_special_tokens", []) or [])
+        candidates = []
+        for idx, token in enumerate(tokens[: len(weights)]):
+            token_text = str(token)
+            if token_text in special_tokens:
+                continue
+            token_text = token_text.replace("##", "").strip()
+            if not re.search(r"[A-Za-z0-9]", token_text):
+                continue
+            candidates.append((float(weights[idx]), token_text))
+        candidates.sort(reverse=True)
+        spans = []
+        seen = set()
+        for score, token_text in candidates:
+            if token_text in seen:
+                continue
+            seen.add(token_text)
+            spans.append(
+                {
+                    "text": token_text,
+                    "focus_token": token_text,
+                    "token_attention": float(score),
+                    "salience": float(score),
+                }
+            )
+            if len(spans) >= top_n:
+                break
+        return spans
+
+    @staticmethod
+    def _highlight_chunk(chunk: str, spans: Sequence[Dict[str, Any]]) -> str:
+        intervals = []
+        for span in spans:
+            if "char_start" not in span or "char_end" not in span:
+                continue
+            start = int(span["char_start"])
+            end = int(span["char_end"])
+            if end <= start:
+                continue
+            intervals.append((start, end))
+        intervals.sort()
+        selected = []
+        last_end = -1
+        for start, end in intervals:
+            if start < last_end:
+                continue
+            selected.append((start, end))
+            last_end = end
+            if len(selected) >= 5:
+                break
+        if not selected:
+            return chunk
+        pieces = []
+        cursor = 0
+        for start, end in selected:
+            pieces.append(chunk[cursor:start])
+            pieces.append("[[")
+            pieces.append(chunk[start:end])
+            pieces.append("]]")
+            cursor = end
+        pieces.append(chunk[cursor:])
+        return "".join(pieces)
 
     def get_attention_weights(self, texts: List[str]) -> Dict[str, Any]:
         return {

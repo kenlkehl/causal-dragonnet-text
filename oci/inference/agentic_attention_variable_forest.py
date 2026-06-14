@@ -1325,9 +1325,9 @@ class AgenticAttentionVariableForestRunner:
             reverse=True,
         )[: max(1, self.avf_config.attention_top_k_chunks * 20)]
         instruction = (
-            "Propose only pre-treatment confounder variables directly supported by repeated high-attention chunks."
+            "Propose only pre-treatment confounder variables directly supported by repeated high-attention token spans inside high-attention chunks."
             if stage == "confounder"
-            else "Propose only pre-treatment effect modifier variables directly supported by repeated high R-stage attention chunks."
+            else "Propose only pre-treatment effect modifier variables directly supported by repeated high-attention token spans inside high R-stage attention chunks."
         )
         return {
             "prompt_version": "agentic_attention_variable_forest_v1",
@@ -1349,24 +1349,7 @@ class AgenticAttentionVariableForestRunner:
             "rejected_low_signal_features": list(rejected_low_signal or []),
             "multivariable_signal_feedback": multivariable_signal_feedback or {},
             "attention_evidence": [
-                {
-                    "row_id": int(row["row_id"]),
-                    "chunk_text": row["chunk_text"],
-                    "attention": float(row["attention"]),
-                    **{
-                        key: row[key]
-                        for key in [
-                            "e_hat",
-                            "m_hat",
-                            "y_residual",
-                            "t_residual",
-                            "tau_hat_r_stage",
-                            "r_loss",
-                        ]
-                        if key in row
-                    },
-                }
-                for row in evidence
+                self._attention_evidence_context_row(row) for row in evidence
             ],
             "fold_label_summary": {
                 "n": int(len(discovery_df)),
@@ -1387,6 +1370,33 @@ class AgenticAttentionVariableForestRunner:
                 ]
             },
         }
+
+    def _attention_evidence_context_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        context_row: Dict[str, Any] = {
+            "row_id": int(row["row_id"]),
+            "chunk_text": row["chunk_text"],
+            "attention": float(row["attention"]),
+        }
+        for key in [
+            "e_hat",
+            "m_hat",
+            "y_residual",
+            "t_residual",
+            "tau_hat_r_stage",
+            "r_loss",
+        ]:
+            if key in row:
+                context_row[key] = row[key]
+        spans = _parse_top_token_spans(row.get("top_token_spans_json"))
+        if spans:
+            context_row["top_token_spans"] = spans
+            summary = row.get("attended_token_summary")
+            if isinstance(summary, str) and summary:
+                context_row["attended_token_summary"] = summary
+            highlighted = row.get("highlighted_chunk_text")
+            if isinstance(highlighted, str) and highlighted:
+                context_row["highlighted_chunk_text"] = highlighted
+        return context_row
 
     def _candidate_proposal_limit(self) -> int:
         configured = int(getattr(self.avf_config, "candidate_proposals_per_fold", 3))
@@ -3022,6 +3032,20 @@ def _hash_numeric_array(values: np.ndarray) -> str:
     digest.update(str(arr.shape).encode("utf-8"))
     digest.update(arr.tobytes())
     return digest.hexdigest()
+
+
+def _parse_top_token_spans(value: Any) -> List[Dict[str, Any]]:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if not isinstance(value, str) or not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [item for item in parsed if isinstance(item, dict)]
 
 
 def _json_default(value: Any) -> Any:
