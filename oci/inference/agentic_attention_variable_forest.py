@@ -223,6 +223,7 @@ class AgenticAttentionVariableForestRunner:
         self.effect_attention_rows: List[Dict[str, Any]] = []
         self.confounder_candidate_rows: List[Dict[str, Any]] = []
         self.modifier_candidate_rows: List[Dict[str, Any]] = []
+        self.consensus_disambiguation_rows: List[Dict[str, Any]] = []
         self.consensus_rows: List[Dict[str, Any]] = []
         self.coverage_filter_rows: List[Dict[str, Any]] = []
         self.association_filter_rows: List[Dict[str, Any]] = []
@@ -1094,6 +1095,7 @@ class AgenticAttentionVariableForestRunner:
         excluded_feature_names: Optional[Sequence[str]] = None,
     ) -> List[ExplicitFeatureSpec]:
         proposals_by_fold: Dict[int, List[ExplicitFeatureSpec]] = {}
+        proposal_artifacts_by_fold: Dict[int, List[Dict[str, Any]]] = {}
         proposal_limit = self._candidate_proposal_limit()
         excluded_names = {
             _normalize_feature_name(name)
@@ -1160,6 +1162,8 @@ class AgenticAttentionVariableForestRunner:
                 excluded_feature_names=excluded_names,
             )
             proposals_by_fold[fold] = specs
+            proposal_artifacts = _proposal_artifact_dicts(raw_proposals, specs)
+            proposal_artifacts_by_fold[fold] = proposal_artifacts
             row = {
                 "outer_fold": outer_fold,
                 "fold": fold,
@@ -1167,7 +1171,7 @@ class AgenticAttentionVariableForestRunner:
                 "proposal_attempt": int(proposal_attempt),
                 "status": "complete",
                 "context": self._stored_agent_context(context),
-                "proposals": _proposal_artifact_dicts(raw_proposals, specs),
+                "proposals": proposal_artifacts,
             }
             if getattr(self.agent_search_config, "save_agent_raw_output", False):
                 row["agent_raw_output"] = _get_agent_response_trace(self.proposal_agent)
@@ -1183,11 +1187,33 @@ class AgenticAttentionVariableForestRunner:
             )
             self._flush_agent_candidate_rows()
 
+        disambiguation = self._resolve_consensus_disambiguation(
+            stage=stage,
+            outer_fold=outer_fold,
+            proposal_attempt=proposal_attempt,
+            proposals_by_fold=proposals_by_fold,
+            proposal_artifacts_by_fold=proposal_artifacts_by_fold,
+            excluded_feature_names=sorted(excluded_names),
+        )
         selected = consensus_feature_specs(
             proposals_by_fold,
             min_fold_fraction=self.avf_config.consensus_min_fold_fraction,
             required_role=stage,
+            min_folds=getattr(self.avf_config, "consensus_min_folds", None),
+            concept_groups=(
+                disambiguation.get("validated_groups")
+                if disambiguation.get("status") == "complete"
+                else None
+            ),
         )
+        selected_group_names = {spec.name for spec in selected}
+        disambiguation["selected_groups"] = [
+            group
+            for group in disambiguation.get("validated_groups", [])
+            if _normalize_feature_name(group.get("canonical_name")) in selected_group_names
+        ]
+        self.consensus_disambiguation_rows.append(disambiguation)
+        self._flush_consensus_disambiguation_rows()
         logger.info(
             "Outer fold %s %s consensus selected %s variable(s): %s",
             outer_fold,
@@ -1820,6 +1846,190 @@ class AgenticAttentionVariableForestRunner:
             path,
         )
 
+    def _agent_consensus_checkpoint_path(
+        self,
+        stage: str,
+        outer_fold: int,
+        proposal_attempt: int = 1,
+    ) -> Path:
+        stage_dir = self.artifact_dir / "agent_candidate_checkpoints" / stage
+        stem = (
+            f"outer_{int(outer_fold):03d}_consensus_attempt_"
+            f"{int(proposal_attempt):03d}"
+        )
+        return stage_dir / f"{stem}.json"
+
+    def _save_agent_consensus_checkpoint(
+        self,
+        row: Dict[str, Any],
+        stage: str,
+        outer_fold: int,
+        proposal_attempt: int,
+    ) -> None:
+        path = self._agent_consensus_checkpoint_path(
+            stage=stage,
+            outer_fold=outer_fold,
+            proposal_attempt=proposal_attempt,
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(row, path)
+        logger.info(
+            "Outer fold %s %s consensus attempt %s: saved agent checkpoint "
+            "status=%s path=%s",
+            outer_fold,
+            stage,
+            proposal_attempt,
+            row.get("status", "unknown"),
+            path,
+        )
+
+    def _build_consensus_disambiguation_context(
+        self,
+        stage: str,
+        outer_fold: int,
+        proposal_attempt: int,
+        proposal_artifacts_by_fold: Dict[int, List[Dict[str, Any]]],
+        threshold: int,
+        excluded_feature_names: Sequence[str],
+    ) -> Dict[str, Any]:
+        proposed_by_fold: List[Dict[str, Any]] = []
+        for fold in sorted(proposal_artifacts_by_fold):
+            proposals = []
+            for proposal in proposal_artifacts_by_fold.get(fold, []):
+                name = _normalize_feature_name(proposal.get("name"))
+                if not name:
+                    continue
+                proposals.append(
+                    {
+                        "fold": int(fold),
+                        "name": name,
+                        "type": proposal.get("type"),
+                        "categories": proposal.get("categories"),
+                        "description": proposal.get("description"),
+                        "rationale": proposal.get("rationale"),
+                        "roles": list(proposal.get("roles") or [stage]),
+                    }
+                )
+            proposed_by_fold.append({"fold": int(fold), "proposals": proposals})
+
+        return {
+            "prompt_version": "agentic_attention_consensus_disambiguation_v1",
+            "stage": stage,
+            "required_role": stage,
+            "outer_fold": int(outer_fold),
+            "proposal_attempt": int(proposal_attempt),
+            "max_proposals": self._candidate_proposal_limit(),
+            "fold_count": int(len(proposal_artifacts_by_fold)),
+            "consensus_threshold": int(threshold),
+            "excluded_feature_names": list(excluded_feature_names),
+            "proposed_variables_by_fold": proposed_by_fold,
+        }
+
+    def _resolve_consensus_disambiguation(
+        self,
+        stage: str,
+        outer_fold: int,
+        proposal_attempt: int,
+        proposals_by_fold: Dict[int, List[ExplicitFeatureSpec]],
+        proposal_artifacts_by_fold: Dict[int, List[Dict[str, Any]]],
+        excluded_feature_names: Sequence[str],
+    ) -> Dict[str, Any]:
+        fold_count = len(proposals_by_fold)
+        threshold = _consensus_threshold(
+            fold_count=fold_count,
+            min_fold_fraction=self.avf_config.consensus_min_fold_fraction,
+            min_folds=getattr(self.avf_config, "consensus_min_folds", None),
+        )
+        raw_proposals = _proposals_by_fold_artifact(proposal_artifacts_by_fold)
+        base_row: Dict[str, Any] = {
+            "outer_fold": int(outer_fold),
+            "stage": stage,
+            "proposal_attempt": int(proposal_attempt),
+            "threshold": int(threshold),
+            "fold_count": int(fold_count),
+            "raw_proposals": raw_proposals,
+            "validated_groups": [],
+            "selected_groups": [],
+            "validation_errors": [],
+        }
+        folds_with_proposals = [
+            fold
+            for fold, specs in proposals_by_fold.items()
+            if any(stage in spec.roles for spec in specs)
+        ]
+        if threshold < 2 or len(folds_with_proposals) < 2:
+            base_row["status"] = "skipped_insufficient_fold_support"
+            return base_row
+
+        context = self._build_consensus_disambiguation_context(
+            stage=stage,
+            outer_fold=outer_fold,
+            proposal_attempt=proposal_attempt,
+            proposal_artifacts_by_fold=proposal_artifacts_by_fold,
+            threshold=threshold,
+            excluded_feature_names=excluded_feature_names,
+        )
+        started_row = {
+            **base_row,
+            "status": "started",
+            "context": self._stored_agent_context(context),
+        }
+        self._save_agent_consensus_checkpoint(
+            started_row,
+            stage=stage,
+            outer_fold=outer_fold,
+            proposal_attempt=proposal_attempt,
+        )
+
+        try:
+            raw_response = self.proposal_agent.propose(context)
+        except Exception as exc:
+            error_row = {
+                **base_row,
+                "status": "agent_error_fallback",
+                "context": self._stored_agent_context(context),
+                "error": str(exc),
+            }
+            if getattr(self.agent_search_config, "save_agent_raw_output", False):
+                error_row["agent_raw_output"] = _get_agent_response_trace(
+                    self.proposal_agent
+                )
+            self._save_agent_consensus_checkpoint(
+                error_row,
+                stage=stage,
+                outer_fold=outer_fold,
+                proposal_attempt=proposal_attempt,
+            )
+            return error_row
+
+        validated_groups, validation_errors = _validate_consensus_disambiguation_response(
+            raw_response,
+            proposals_by_fold=proposals_by_fold,
+            required_role=stage,
+        )
+        status = "complete"
+        if not isinstance(raw_response, dict):
+            status = "invalid_response_fallback"
+        elif validation_errors and not validated_groups:
+            status = "invalid_groups_fallback"
+        row = {
+            **base_row,
+            "status": status,
+            "context": self._stored_agent_context(context),
+            "raw_response": raw_response,
+            "validated_groups": validated_groups,
+            "validation_errors": validation_errors,
+        }
+        if getattr(self.agent_search_config, "save_agent_raw_output", False):
+            row["agent_raw_output"] = _get_agent_response_trace(self.proposal_agent)
+        self._save_agent_consensus_checkpoint(
+            row,
+            stage=stage,
+            outer_fold=outer_fold,
+            proposal_attempt=proposal_attempt,
+        )
+        return row
+
     def _flush_agent_candidate_rows(self) -> None:
         _write_jsonl(
             self.artifact_dir / "confounder_candidates_by_fold.jsonl",
@@ -1828,6 +2038,12 @@ class AgenticAttentionVariableForestRunner:
         _write_jsonl(
             self.artifact_dir / "effect_modifier_candidates_by_fold.jsonl",
             self.modifier_candidate_rows,
+        )
+
+    def _flush_consensus_disambiguation_rows(self) -> None:
+        _write_jsonl(
+            self.artifact_dir / "consensus_disambiguation_by_attempt.jsonl",
+            self.consensus_disambiguation_rows,
         )
 
     def _flush_coverage_filter_rows(self) -> None:
@@ -2166,6 +2382,10 @@ class AgenticAttentionVariableForestRunner:
             self.artifact_dir / "effect_modifier_candidates_by_fold.jsonl",
             self.modifier_candidate_rows,
         )
+        _write_jsonl(
+            self.artifact_dir / "consensus_disambiguation_by_attempt.jsonl",
+            self.consensus_disambiguation_rows,
+        )
         with open(self.artifact_dir / "consensus.json", "w") as f:
             json.dump(self.consensus_rows, f, indent=2)
         _write_jsonl(
@@ -2195,14 +2415,71 @@ class AgenticAttentionVariableForestRunner:
             json.dump(manifest, f, indent=2)
 
 
+def _consensus_threshold(
+    fold_count: int,
+    min_fold_fraction: float,
+    min_folds: Optional[int] = None,
+) -> int:
+    """Return the fold count required for consensus."""
+    fold_count = max(1, int(fold_count))
+    if min_folds is not None:
+        return min(fold_count, max(1, int(min_folds)))
+    return max(1, int(np.ceil(float(min_fold_fraction) * fold_count)))
+
+
 def consensus_feature_specs(
     proposals_by_fold: Dict[int, Sequence[ExplicitFeatureSpec]],
     min_fold_fraction: float,
     required_role: str,
+    min_folds: Optional[int] = None,
+    concept_groups: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> List[ExplicitFeatureSpec]:
     """Select specs whose normalized concept recurs across enough folds."""
     fold_count = max(1, len(proposals_by_fold))
-    threshold = int(np.ceil(min_fold_fraction * fold_count))
+    threshold = _consensus_threshold(fold_count, min_fold_fraction, min_folds)
+    if concept_groups is not None:
+        selected_from_groups: List[ExplicitFeatureSpec] = []
+        for group in sorted(
+            concept_groups,
+            key=lambda row: str(row.get("canonical_name", "")),
+        ):
+            folds = {
+                int(fold)
+                for fold in group.get("member_folds", [])
+                if str(fold).strip()
+            }
+            if len(folds) < threshold:
+                continue
+            roles = [
+                role
+                for role in group.get("roles", [])
+                if role in VALID_ROLES
+            ]
+            if required_role not in roles:
+                roles.append(required_role)
+            name = _normalize_feature_name(group.get("canonical_name"))
+            typ = str(group.get("type") or "categorical").lower()
+            if not name or typ not in VALID_TYPES:
+                continue
+            categories = group.get("categories") if typ == "categorical" else None
+            if typ == "categorical":
+                if not categories:
+                    continue
+                categories = [str(category) for category in categories[:8]]
+            try:
+                selected_from_groups.append(
+                    ExplicitFeatureSpec(
+                        name=name,
+                        type=typ,
+                        categories=categories,
+                        description=group.get("description") or name.replace("_", " "),
+                        roles=roles,
+                    )
+                )
+            except ValueError:
+                continue
+        return selected_from_groups
+
     grouped: Dict[str, List[ExplicitFeatureSpec]] = {}
     for specs in proposals_by_fold.values():
         seen_in_fold = set()
@@ -2233,6 +2510,202 @@ def consensus_feature_specs(
             )
         )
     return selected
+
+
+def _proposals_by_fold_artifact(
+    proposal_artifacts_by_fold: Dict[int, Sequence[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    return [
+        {
+            "fold": int(fold),
+            "proposals": [dict(proposal) for proposal in proposal_artifacts_by_fold[fold]],
+        }
+        for fold in sorted(proposal_artifacts_by_fold)
+    ]
+
+
+def _validate_consensus_disambiguation_response(
+    raw_response: Any,
+    proposals_by_fold: Dict[int, Sequence[ExplicitFeatureSpec]],
+    required_role: str,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Validate alias groups against actual per-fold proposals."""
+    if not isinstance(raw_response, dict):
+        return [], [f"response must be an object, got {type(raw_response).__name__}"]
+    raw_groups = raw_response.get("groups", [])
+    if not isinstance(raw_groups, list):
+        return [], ["response.groups must be a list"]
+
+    by_name: Dict[str, List[Tuple[int, ExplicitFeatureSpec]]] = {}
+    for fold, specs in proposals_by_fold.items():
+        seen_in_fold = set()
+        for spec in specs:
+            if required_role not in spec.roles:
+                continue
+            name = _normalize_feature_name(spec.name)
+            if not name or name in seen_in_fold:
+                continue
+            by_name.setdefault(name, []).append((int(fold), spec))
+            seen_in_fold.add(name)
+
+    validated: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    for group_idx, raw_group in enumerate(raw_groups, start=1):
+        label = f"group {group_idx}"
+        if not isinstance(raw_group, dict):
+            errors.append(f"{label}: expected object, got {type(raw_group).__name__}")
+            continue
+        member_values = raw_group.get("member_names", [])
+        if not isinstance(member_values, list):
+            errors.append(f"{label}: member_names must be a list")
+            continue
+        member_names = [
+            _normalize_feature_name(name)
+            for name in member_values
+            if _normalize_feature_name(name)
+        ]
+        member_names = list(dict.fromkeys(member_names))
+        if not member_names:
+            errors.append(f"{label}: no valid member_names")
+            continue
+        unknown_names = [name for name in member_names if name not in by_name]
+        if unknown_names:
+            errors.append(
+                f"{label}: member_names were not proposed: {sorted(unknown_names)}"
+            )
+            continue
+
+        member_folds, fold_error = _normalize_member_folds(raw_group.get("member_folds"))
+        if fold_error is not None:
+            errors.append(f"{label}: {fold_error}")
+            continue
+
+        members: List[Tuple[int, str, ExplicitFeatureSpec]] = []
+        for name in member_names:
+            for fold, spec in by_name.get(name, []):
+                if member_folds is None or fold in member_folds:
+                    members.append((fold, name, spec))
+        actual_folds = {fold for fold, _, _ in members}
+        if member_folds is not None:
+            missing_folds = sorted(set(member_folds) - actual_folds)
+            if missing_folds:
+                errors.append(
+                    f"{label}: no proposed member found in folds {missing_folds}"
+                )
+                continue
+        if len(actual_folds) < 2:
+            errors.append(
+                f"{label}: group must contain proposals from at least 2 distinct folds"
+            )
+            continue
+
+        member_specs = [spec for _, _, spec in members]
+        member_types = {spec.type for spec in member_specs}
+        if len(member_types) != 1:
+            errors.append(f"{label}: grouped members have conflicting types")
+            continue
+        group_type = str(raw_group.get("type") or next(iter(member_types))).lower()
+        if group_type not in VALID_TYPES:
+            errors.append(f"{label}: invalid type {raw_group.get('type')!r}")
+            continue
+        if group_type not in member_types:
+            errors.append(
+                f"{label}: group type {group_type!r} conflicts with member proposals"
+            )
+            continue
+
+        categories = None
+        if group_type == "categorical":
+            category_signatures = {
+                _category_signature(spec.categories)
+                for spec in member_specs
+            }
+            if len(category_signatures) != 1:
+                errors.append(
+                    f"{label}: grouped members have incompatible categories"
+                )
+                continue
+            category_signature = next(iter(category_signatures))
+            group_categories = raw_group.get("categories")
+            if group_categories:
+                group_signature = _category_signature(group_categories)
+                if group_signature != category_signature:
+                    errors.append(
+                        f"{label}: group categories conflict with member proposals"
+                    )
+                    continue
+                categories = [str(category) for category in group_categories[:8]]
+            else:
+                categories = list(next(spec.categories for spec in member_specs if spec.categories))
+            if not categories:
+                errors.append(f"{label}: categorical group has no categories")
+                continue
+
+        canonical_name = _normalize_feature_name(raw_group.get("canonical_name"))
+        if canonical_name not in member_names:
+            errors.append(
+                f"{label}: canonical_name was not a proposed member; using first member"
+            )
+            canonical_name = member_names[0]
+        prototype = member_specs[0]
+        roles = list(
+            dict.fromkeys(
+                role
+                for spec in member_specs
+                for role in spec.roles
+                if role in VALID_ROLES
+            )
+        )
+        if required_role not in roles:
+            roles.append(required_role)
+        validated.append(
+            {
+                "canonical_name": canonical_name,
+                "member_names": member_names,
+                "member_folds": sorted(actual_folds),
+                "type": group_type,
+                "categories": categories,
+                "description": (
+                    raw_group.get("description")
+                    or prototype.description
+                    or canonical_name.replace("_", " ")
+                ),
+                "rationale": raw_group.get("rationale"),
+                "roles": roles,
+                "members": [
+                    {
+                        "fold": int(fold),
+                        "name": name,
+                        "type": spec.type,
+                        "categories": spec.categories,
+                        "description": spec.description,
+                        "roles": list(spec.roles),
+                    }
+                    for fold, name, spec in members
+                ],
+            }
+        )
+    return validated, errors
+
+
+def _normalize_member_folds(raw_folds: Any) -> Tuple[Optional[set[int]], Optional[str]]:
+    if raw_folds is None:
+        return None, None
+    if not isinstance(raw_folds, list):
+        return None, "member_folds must be a list"
+    folds: set[int] = set()
+    for value in raw_folds:
+        try:
+            folds.add(int(value))
+        except (TypeError, ValueError):
+            return None, f"invalid member_folds value {value!r}"
+    if not folds:
+        return None, "member_folds must not be empty when provided"
+    return folds, None
+
+
+def _category_signature(categories: Optional[Sequence[Any]]) -> Tuple[str, ...]:
+    return tuple(str(category).strip().lower() for category in (categories or []))
 
 
 def _proposal_dicts_to_specs(
@@ -3210,12 +3683,13 @@ def _json_default(value: Any) -> Any:
 
 def _scrub_context(context: Dict[str, Any]) -> Dict[str, Any]:
     copied = dict(context)
-    copied["attention_evidence"] = [
-        {
-            key: value
-            for key, value in row.items()
-            if key not in {"chunk_text", "source_chunk_text"}
-        }
-        for row in copied.get("attention_evidence", [])
-    ]
+    if "attention_evidence" in copied:
+        copied["attention_evidence"] = [
+            {
+                key: value
+                for key, value in row.items()
+                if key not in {"chunk_text", "source_chunk_text"}
+            }
+            for row in copied.get("attention_evidence", [])
+        ]
     return copied

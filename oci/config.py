@@ -459,6 +459,7 @@ class AgenticAttentionVariableForestConfig:
     signal_cv_folds: int = 3
     min_signal_treatment_auroc: float = 0.55
     min_signal_outcome_auroc: float = 0.55
+    consensus_min_folds: Optional[int] = 2
     consensus_min_fold_fraction: float = 2.0 / 3.0
     min_extraction_coverage: float = 0.10
     e_clip: float = 0.01
@@ -520,6 +521,11 @@ class AgenticAttentionVariableForestConfig:
             raise ValueError(
                 "agentic_attention_variable_forest.min_signal_outcome_auroc "
                 "must be in [0.5, 1]"
+            )
+        if self.consensus_min_folds is not None and self.consensus_min_folds < 1:
+            raise ValueError(
+                "agentic_attention_variable_forest.consensus_min_folds "
+                "must be >= 1 when set"
             )
         if not 0.0 < self.consensus_min_fold_fraction <= 1.0:
             raise ValueError(

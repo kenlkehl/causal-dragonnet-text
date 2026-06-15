@@ -1186,7 +1186,7 @@ class OpenAICompatibleFeatureSearchAgent:
             )
         return self._resolved_agent_model_name
 
-    def propose(self, context: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def propose(self, context: Dict[str, Any]) -> Any:
         self._ensure_client()
         self.last_raw_response = None
         self.last_response_trace = None
@@ -1197,6 +1197,10 @@ class OpenAICompatibleFeatureSearchAgent:
         max_repair_attempts = max(
             0,
             int(getattr(self.search_config, "agent_schema_repair_attempts", 1)),
+        )
+        is_consensus_disambiguation = (
+            context.get("prompt_version")
+            == "agentic_attention_consensus_disambiguation_v1"
         )
 
         for attempt_idx in range(max_repair_attempts + 1):
@@ -1220,14 +1224,25 @@ class OpenAICompatibleFeatureSearchAgent:
             self.last_response_trace = _trace_with_repair_attempts(trace, attempts)
 
             try:
+                if is_consensus_disambiguation:
+                    parsed = parse_agent_json_object(content)
+                    issues = consensus_disambiguation_response_issues(parsed)
+                    if issues:
+                        raise ValueError("; ".join(issues))
+                    return parsed
                 proposals = parse_agent_response(content)
             except Exception as exc:
                 issues = [f"malformed JSON: {exc}"]
                 if attempt_idx < max_repair_attempts:
+                    repair_prompt = (
+                        build_consensus_disambiguation_repair_prompt(issues)
+                        if is_consensus_disambiguation
+                        else build_agent_repair_prompt(issues)
+                    )
                     messages.extend(
                         [
                             {"role": "assistant", "content": content},
-                            {"role": "user", "content": build_agent_repair_prompt(issues)},
+                            {"role": "user", "content": repair_prompt},
                         ]
                     )
                     continue
@@ -1717,6 +1732,9 @@ def build_agent_prompt(
     search_config: AgenticFeatureSearchConfig,
 ) -> str:
     """Construct the proposal prompt sent to the LLM agent."""
+    if context.get("prompt_version") == "agentic_attention_consensus_disambiguation_v1":
+        return build_attention_consensus_disambiguation_prompt(context, search_config)
+
     if context.get("prompt_version") == "agentic_attention_variable_forest_v1":
         return build_attention_variable_agent_prompt(context, search_config)
 
@@ -1822,6 +1840,52 @@ Limits:
 - Use distinct names; avoid near-duplicate aliases for the same concept.
 
 Current attention-evidence context:
+{context_json}
+"""
+
+
+def build_attention_consensus_disambiguation_prompt(
+    context: Dict[str, Any],
+    search_config: AgenticFeatureSearchConfig,
+) -> str:
+    """Construct the alias-resolution prompt for attention-variable consensus."""
+    context_json = json.dumps(context, indent=2, default=_json_default)
+    threshold = int(context.get("consensus_threshold", 2))
+    return f"""You are resolving aliases among candidate explicit variables proposed from separate inner folds.
+
+Your task is narrow: merge aliases only. Group proposal names only when they refer to the same explicit pre-treatment patient-level extraction target. Do not create new variables, broaden a target, or merge related but clinically distinct concepts.
+
+Return JSON only with this shape:
+{{
+  "groups": [
+    {{
+      "canonical_name": "one_existing_snake_case_member_name",
+      "member_names": ["existing_proposal_name_a", "existing_proposal_name_b"],
+      "member_folds": [1, 2],
+      "type": "categorical|continuous",
+      "categories": ["category_a", "category_b"],
+      "description": "exact shared extraction target",
+      "rationale": "brief reason these names are aliases"
+    }}
+  ],
+  "unmerged": [
+    {{
+      "name": "existing_proposal_name",
+      "reason": "why this was not equivalent to another proposal"
+    }}
+  ]
+}}
+
+Rules:
+- Use only names that appear in proposed_variables_by_fold.
+- canonical_name must be one of the member_names.
+- A group can pass consensus only if its members appear in at least {threshold} distinct folds.
+- Merge exact aliases such as different names for the same age-at-baseline target.
+- Do not merge variables with different types or incompatible categorical categories.
+- Do not merge nearby but distinct clinical concepts, such as age at diagnosis versus time since diagnosis, biomarker status versus mutation burden, or disease stage versus metastatic site.
+- Leave single-fold or ambiguous concepts unmerged rather than forcing a group.
+
+Current consensus-disambiguation context:
 {context_json}
 """
 
@@ -1938,6 +2002,37 @@ array containing only "confounder" and/or "effect_modifier".
 """
 
 
+def build_consensus_disambiguation_repair_prompt(issues: Sequence[str]) -> str:
+    """Construct a follow-up prompt asking the agent to repair group JSON."""
+    issue_lines = "\n".join(f"- {issue}" for issue in issues)
+    return f"""The previous response could not be used because it failed these schema checks:
+{issue_lines}
+
+Return corrected JSON only. Use this exact top-level shape:
+{{
+  "groups": [
+    {{
+      "canonical_name": "one_existing_snake_case_member_name",
+      "member_names": ["existing_proposal_name_a", "existing_proposal_name_b"],
+      "member_folds": [1, 2],
+      "type": "categorical|continuous",
+      "categories": ["category_a", "category_b"],
+      "description": "exact shared extraction target",
+      "rationale": "brief reason these names are aliases"
+    }}
+  ],
+  "unmerged": [
+    {{
+      "name": "existing_proposal_name",
+      "reason": "why this was not equivalent to another proposal"
+    }}
+  ]
+}}
+
+Do not add prose, markdown, comments, or code fences.
+"""
+
+
 def agent_response_schema_issues(
     proposals: Sequence[Any],
     context: Optional[Dict[str, Any]] = None,
@@ -2001,6 +2096,22 @@ def agent_response_schema_issues(
     return issues
 
 
+def consensus_disambiguation_response_issues(response: Any) -> List[str]:
+    """Return minimal schema issues for consensus-disambiguation responses."""
+    issues: List[str] = []
+    if not isinstance(response, dict):
+        return [f"expected a JSON object, got {type(response).__name__}"]
+    groups = response.get("groups")
+    if groups is None:
+        issues.append("missing groups list")
+    elif not isinstance(groups, list):
+        issues.append("groups must be a list")
+    unmerged = response.get("unmerged", [])
+    if unmerged is not None and not isinstance(unmerged, list):
+        issues.append("unmerged must be a list when provided")
+    return issues
+
+
 def _context_available_extracted_names(
     context: Optional[Dict[str, Any]],
 ) -> set:
@@ -2059,16 +2170,31 @@ def _missing_or_empty(value: Any) -> bool:
 
 def parse_agent_response(response: str) -> List[Dict[str, Any]]:
     """Parse JSON proposals from an LLM response."""
-    response = strip_reasoning_trace(response)
-    match = re.search(r"\{.*\}", response, re.DOTALL)
-    json_str = match.group(0) if match else response
-    parsed = json.loads(json_str)
+    parsed = parse_agent_json_object_or_list(response)
     if isinstance(parsed, list):
         return parsed
     proposals = parsed.get("proposals", [])
     if not isinstance(proposals, list):
         raise ValueError("Agent response JSON must contain a proposals list")
     return proposals
+
+
+def parse_agent_json_object(response: str) -> Dict[str, Any]:
+    """Parse a top-level JSON object from an LLM response."""
+    parsed = parse_agent_json_object_or_list(response)
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"Agent response JSON must be an object, got {type(parsed).__name__}"
+        )
+    return parsed
+
+
+def parse_agent_json_object_or_list(response: str) -> Any:
+    """Parse a JSON object or list from an LLM response."""
+    response = strip_reasoning_trace(response)
+    match = re.search(r"\{.*\}", response, re.DOTALL)
+    json_str = match.group(0) if match else response
+    return json.loads(json_str)
 
 
 def _chat_completion_trace(

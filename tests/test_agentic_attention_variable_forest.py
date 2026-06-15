@@ -21,6 +21,7 @@ from oci.config import (
 from oci.inference.agentic_attention_variable_forest import (
     AgenticAttentionVariableForestRunner,
     consensus_feature_specs,
+    _validate_consensus_disambiguation_response,
     _make_linear_lr_scheduler,
     _run_crossfit_fold_tasks,
     run_agentic_attention_variable_forest,
@@ -110,9 +111,166 @@ def test_consensus_feature_specs_requires_fold_recurrence():
         proposals,
         min_fold_fraction=2 / 3,
         required_role="confounder",
+        min_folds=2,
     )
 
     assert [spec.name for spec in selected] == ["age_group"]
+
+
+def test_consensus_feature_specs_uses_agentic_alias_groups():
+    proposals = {
+        1: [
+            ExplicitFeatureSpec(
+                name="patient_age",
+                type="continuous",
+                roles=["confounder"],
+                description="Patient age before treatment",
+            )
+        ],
+        2: [
+            ExplicitFeatureSpec(
+                name="age_at_diagnosis",
+                type="continuous",
+                roles=["confounder"],
+                description="Age when the baseline diagnosis was documented",
+            )
+        ],
+        3: [
+            ExplicitFeatureSpec(
+                name="tumor_stage",
+                type="categorical",
+                categories=["early", "advanced"],
+                roles=["confounder"],
+            )
+        ],
+        4: [
+            ExplicitFeatureSpec(
+                name="baseline_age",
+                type="continuous",
+                roles=["confounder"],
+                description="Baseline age before treatment",
+            )
+        ],
+        5: [
+            ExplicitFeatureSpec(
+                name="rare_marker",
+                type="categorical",
+                categories=["absent", "present"],
+                roles=["confounder"],
+            )
+        ],
+    }
+    raw_response = {
+        "groups": [
+            {
+                "canonical_name": "patient_age",
+                "member_names": [
+                    "patient_age",
+                    "age_at_diagnosis",
+                    "baseline_age",
+                ],
+                "member_folds": [1, 2, 4],
+                "type": "continuous",
+                "description": "Patient age at or before baseline diagnosis",
+                "rationale": "All names extract the patient's baseline age.",
+            },
+            {
+                "canonical_name": "rare_marker",
+                "member_names": ["rare_marker"],
+                "member_folds": [5],
+                "type": "categorical",
+                "categories": ["absent", "present"],
+            },
+        ],
+        "unmerged": [],
+    }
+
+    groups, errors = _validate_consensus_disambiguation_response(
+        raw_response,
+        proposals_by_fold=proposals,
+        required_role="confounder",
+    )
+    selected = consensus_feature_specs(
+        proposals,
+        min_fold_fraction=2 / 3,
+        min_folds=2,
+        required_role="confounder",
+        concept_groups=groups,
+    )
+
+    assert [spec.name for spec in selected] == ["patient_age"]
+    assert selected[0].type == "continuous"
+    assert any("at least 2 distinct folds" in error for error in errors)
+
+
+def test_consensus_disambiguation_rejects_unproposed_and_conflicting_groups():
+    proposals = {
+        1: [
+            ExplicitFeatureSpec(
+                name="patient_age",
+                type="continuous",
+                roles=["confounder"],
+            )
+        ],
+        2: [
+            ExplicitFeatureSpec(
+                name="baseline_age_bucket",
+                type="categorical",
+                categories=["younger", "older"],
+                roles=["confounder"],
+            )
+        ],
+        3: [
+            ExplicitFeatureSpec(
+                name="smoking_status",
+                type="categorical",
+                categories=["never", "ever"],
+                roles=["confounder"],
+            )
+        ],
+        4: [
+            ExplicitFeatureSpec(
+                name="tobacco_use",
+                type="categorical",
+                categories=["absent", "present"],
+                roles=["confounder"],
+            )
+        ],
+    }
+    raw_response = {
+        "groups": [
+            {
+                "canonical_name": "patient_age",
+                "member_names": ["patient_age", "invented_age"],
+                "member_folds": [1, 2],
+                "type": "continuous",
+            },
+            {
+                "canonical_name": "patient_age",
+                "member_names": ["patient_age", "baseline_age_bucket"],
+                "member_folds": [1, 2],
+                "type": "continuous",
+            },
+            {
+                "canonical_name": "smoking_status",
+                "member_names": ["smoking_status", "tobacco_use"],
+                "member_folds": [3, 4],
+                "type": "categorical",
+                "categories": ["never", "ever"],
+            },
+        ]
+    }
+
+    groups, errors = _validate_consensus_disambiguation_response(
+        raw_response,
+        proposals_by_fold=proposals,
+        required_role="confounder",
+    )
+
+    assert groups == []
+    assert any("were not proposed" in error for error in errors)
+    assert any("conflicting types" in error for error in errors)
+    assert any("incompatible categories" in error for error in errors)
 
 
 def test_config_parses_agentic_attention_variable_forest_block(tmp_path):
@@ -582,6 +740,45 @@ def test_attention_agent_prompt_is_attention_anchored():
     assert "low_coverage_marker" in prompt
 
 
+def test_consensus_disambiguation_prompt_is_alias_only():
+    prompt = build_agent_prompt(
+        {
+            "prompt_version": "agentic_attention_consensus_disambiguation_v1",
+            "stage": "confounder",
+            "consensus_threshold": 2,
+            "proposed_variables_by_fold": [
+                {
+                    "fold": 1,
+                    "proposals": [
+                        {
+                            "name": "patient_age",
+                            "type": "continuous",
+                            "description": "Patient age",
+                            "roles": ["confounder"],
+                        }
+                    ],
+                },
+                {
+                    "fold": 2,
+                    "proposals": [
+                        {
+                            "name": "baseline_age",
+                            "type": "continuous",
+                            "description": "Baseline age",
+                            "roles": ["confounder"],
+                        }
+                    ],
+                },
+            ],
+        },
+        AgenticFeatureSearchConfig(),
+    )
+
+    assert "merge aliases only" in prompt
+    assert '"groups"' in prompt
+    assert "Use only names that appear in proposed_variables_by_fold" in prompt
+
+
 def test_attention_agent_context_is_compact_and_filters_blank_chunks(tmp_path):
     df = pd.DataFrame(
         {
@@ -903,6 +1100,154 @@ def test_attention_candidates_are_filtered_by_association_signal(tmp_path):
     assert rows[0]["kept_features"] == ["signal_covariate"]
     assert rows[0]["dropped_features"][0]["name"] == "noise_covariate"
     assert rows[0]["multivariable_signal"]["adequate"] is True
+
+
+def test_alias_consensus_reaches_coverage_and_association_filtering(tmp_path):
+    class AliasAgent:
+        def propose(self, context):
+            if (
+                context["prompt_version"]
+                == "agentic_attention_consensus_disambiguation_v1"
+            ):
+                return {
+                    "groups": [
+                        {
+                            "canonical_name": "patient_age",
+                            "member_names": [
+                                "patient_age",
+                                "age_at_diagnosis",
+                                "baseline_age",
+                            ],
+                            "member_folds": [1, 2, 3],
+                            "type": "continuous",
+                            "description": "Patient age before treatment",
+                            "rationale": (
+                                "All three folds proposed the same age "
+                                "extraction target."
+                            ),
+                        }
+                    ],
+                    "unmerged": [
+                        {"name": "rare_marker", "reason": "Only one fold proposed it."}
+                    ],
+                }
+            names = {
+                1: "patient_age",
+                2: "age_at_diagnosis",
+                3: "baseline_age",
+                4: "rare_marker",
+                5: "noise_covariate",
+            }
+            name = names[int(context["fold"])]
+            return [
+                {
+                    "action": "add",
+                    "name": name,
+                    "type": "continuous" if "age" in name else "categorical",
+                    "categories": None if "age" in name else ["absent", "present"],
+                    "roles": ["confounder"],
+                    "description": f"{name} before treatment",
+                    "rationale": "high-attention baseline text",
+                }
+            ]
+
+    class AliasExtractionProvider:
+        def ensure_features(self, dataset, specs):
+            dataset = dataset.copy()
+            row_pos = np.arange(len(dataset))
+            for spec in specs:
+                col = f"explicit_feat_{spec.name}"
+                miss_col = f"{col}_missing"
+                if spec.name == "patient_age":
+                    dataset[col] = np.where(row_pos < len(dataset) // 2, 50.0, 80.0)
+                else:
+                    dataset[col] = spec.categories[0] if spec.categories else 0.0
+                dataset[miss_col] = False
+            return dataset
+
+    n = 80
+    signal = np.r_[np.zeros(n // 2, dtype=int), np.ones(n // 2, dtype=int)]
+    df = pd.DataFrame(
+        {
+            "clinical_text": [f"patient age note {i}" for i in range(n)],
+            "treatment_indicator": signal,
+            "outcome_indicator": signal,
+        }
+    )
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        architecture=ModelArchitectureConfig(
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=5,
+                effect_folds=5,
+                candidate_proposals_per_fold=1,
+                coverage_retry_attempts=0,
+                signal_retry_attempts=0,
+                consensus_min_folds=2,
+                min_extraction_coverage=0.75,
+                association_alpha=0.05,
+                association_min_n=20,
+                association_min_non_missing=10,
+                signal_cv_folds=2,
+                min_signal_treatment_auroc=0.55,
+                min_signal_outcome_auroc=0.55,
+            ),
+        ),
+    )
+    runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "predictions.parquet",
+        device=torch.device("cpu"),
+        num_workers=1,
+        proposal_agent=AliasAgent(),
+        extraction_provider=AliasExtractionProvider(),
+    )
+    attention_rows = [
+        {
+            "row_id": int(runner.dataset.loc[fold - 1, "_oci_row_id"]),
+            "fold": fold,
+            "stage": "nuisance",
+            "chunk_text": f"Age evidence fold {fold}.",
+            "attention": 0.9,
+        }
+        for fold in [1, 2, 3, 4, 5]
+    ]
+
+    selected = runner._discover_extract_filter_with_retries(
+        stage="confounder",
+        outer_fold=1,
+        discovery_df=runner.dataset,
+        train_idx=np.arange(len(runner.dataset)),
+        attention_rows=attention_rows,
+        existing_specs=[],
+    )
+
+    assert [spec.name for spec in selected] == ["patient_age"]
+    disambig_path = (
+        tmp_path
+        / "agentic_attention_variable_forest"
+        / "consensus_disambiguation_by_attempt.jsonl"
+    )
+    disambig_rows = [
+        json.loads(line) for line in disambig_path.read_text().splitlines()
+    ]
+    assert disambig_rows[0]["status"] == "complete"
+    assert disambig_rows[0]["selected_groups"][0]["canonical_name"] == "patient_age"
+    coverage_path = (
+        tmp_path
+        / "agentic_attention_variable_forest"
+        / "coverage_filter_by_attempt.jsonl"
+    )
+    coverage_rows = [json.loads(line) for line in coverage_path.read_text().splitlines()]
+    assert coverage_rows[0]["kept_features"] == ["patient_age"]
+    assoc_path = (
+        tmp_path
+        / "agentic_attention_variable_forest"
+        / "association_filter_by_attempt.jsonl"
+    )
+    assoc_rows = [json.loads(line) for line in assoc_path.read_text().splitlines()]
+    assert assoc_rows[0]["kept_features"] == ["patient_age"]
 
 
 def test_fold_parallelism_auto_is_conservative_on_cuda(tmp_path):

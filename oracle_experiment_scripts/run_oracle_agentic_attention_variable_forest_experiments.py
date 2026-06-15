@@ -133,6 +133,7 @@ class AgenticAttentionOracleConfig:
     signal_cv_folds: int = 3
     min_signal_treatment_auroc: float = 0.55
     min_signal_outcome_auroc: float = 0.55
+    consensus_min_folds: Optional[int] = 2
     consensus_min_fold_fraction: float = 2.0 / 3.0
     min_extraction_coverage: float = 0.10
     e_clip: float = 0.01
@@ -275,6 +276,7 @@ def _make_applied_config(
                 signal_cv_folds=config.signal_cv_folds,
                 min_signal_treatment_auroc=config.min_signal_treatment_auroc,
                 min_signal_outcome_auroc=config.min_signal_outcome_auroc,
+                consensus_min_folds=config.consensus_min_folds,
                 consensus_min_fold_fraction=config.consensus_min_fold_fraction,
                 min_extraction_coverage=config.min_extraction_coverage,
                 e_clip=config.e_clip,
@@ -510,6 +512,23 @@ def _parse_bool(value: str) -> bool:
     raise argparse.ArgumentTypeError(f"Expected boolean value, got {value!r}")
 
 
+def _parse_optional_positive_int(value: str) -> Optional[int]:
+    lowered = value.lower()
+    if lowered in {"none", "null"}:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"Expected positive integer or 'none', got {value!r}"
+        ) from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(
+            f"Expected positive integer or 'none', got {value!r}"
+        )
+    return parsed
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--datasets", nargs="+", default=DEFAULT_DATASETS)
@@ -587,6 +606,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--signal-cv-folds", type=int, default=3)
     parser.add_argument("--min-signal-treatment-auroc", type=float, default=0.55)
     parser.add_argument("--min-signal-outcome-auroc", type=float, default=0.55)
+    parser.add_argument(
+        "--consensus-min-folds",
+        type=_parse_optional_positive_int,
+        default=2,
+    )
     parser.add_argument("--consensus-min-fold-fraction", type=float, default=2.0 / 3.0)
     parser.add_argument("--min-extraction-coverage", type=float, default=0.10)
     parser.add_argument("--e-clip", type=float, default=0.01)
@@ -701,6 +725,7 @@ def _make_configs(args: argparse.Namespace) -> List[AgenticAttentionOracleConfig
                     signal_cv_folds=args.signal_cv_folds,
                     min_signal_treatment_auroc=args.min_signal_treatment_auroc,
                     min_signal_outcome_auroc=args.min_signal_outcome_auroc,
+                    consensus_min_folds=args.consensus_min_folds,
                     consensus_min_fold_fraction=args.consensus_min_fold_fraction,
                     min_extraction_coverage=args.min_extraction_coverage,
                     e_clip=args.e_clip,
@@ -768,6 +793,10 @@ def main() -> None:
         parser.error("--min-signal-treatment-auroc must be in [0.5, 1]")
     if not 0.5 <= args.min_signal_outcome_auroc <= 1.0:
         parser.error("--min-signal-outcome-auroc must be in [0.5, 1]")
+    if args.consensus_min_folds is not None and args.consensus_min_folds < 1:
+        parser.error("--consensus-min-folds must be >= 1 or 'none'")
+    if not 0.0 < args.consensus_min_fold_fraction <= 1.0:
+        parser.error("--consensus-min-fold-fraction must be in (0, 1]")
     if args.htr_sentence_encoder_batch_size < 1:
         parser.error("--htr-sentence-encoder-batch-size must be >= 1")
     if args.htr_trainable_sentence_encoder_layers < 0:
