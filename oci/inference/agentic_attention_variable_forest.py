@@ -49,6 +49,13 @@ logger = logging.getLogger(__name__)
 
 VALID_ROLES = {"confounder", "effect_modifier"}
 VALID_TYPES = {"categorical", "continuous"}
+_AGENT_CONTEXT_MIN_ROWS = 12
+_AGENT_CONTEXT_ROWS_PER_TOP_CHUNK = 8
+_AGENT_CONTEXT_MAX_ROWS = 48
+_AGENT_CONTEXT_TOKEN_SPANS_PER_ROW = 4
+_AGENT_CONTEXT_SNIPPET_CHARS = 480
+_AGENT_CONTEXT_SPAN_TEXT_CHARS = 120
+_AGENT_CONTEXT_SUMMARY_CHARS = 360
 
 
 def run_agentic_attention_variable_forest(
@@ -1319,11 +1326,33 @@ class AgenticAttentionVariableForestRunner:
         multivariable_signal_feedback: Optional[Dict[str, Any]] = None,
         excluded_feature_names: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
+        usable_rows = [
+            row for row in attention_rows if _attention_row_has_usable_text(row)
+        ]
+        if not usable_rows:
+            usable_rows = list(attention_rows)
+        evidence_limit = min(
+            _AGENT_CONTEXT_MAX_ROWS,
+            max(
+                _AGENT_CONTEXT_MIN_ROWS,
+                int(self.avf_config.attention_top_k_chunks)
+                * _AGENT_CONTEXT_ROWS_PER_TOP_CHUNK,
+            ),
+        )
         evidence = sorted(
-            attention_rows,
+            usable_rows,
             key=lambda row: abs(float(row.get("attention", 0.0))),
             reverse=True,
-        )[: max(1, self.avf_config.attention_top_k_chunks * 20)]
+        )[: max(1, evidence_limit)]
+        context_rows = [
+            self._attention_evidence_context_row(row)
+            for row in evidence
+        ]
+        context_rows = [
+            row
+            for row in context_rows
+            if row.get("evidence_snippet") or row.get("top_token_spans")
+        ]
         instruction = (
             "Infer explicit pre-treatment patient-level variables represented by repeated high-attention token spans inside high-attention chunks."
         )
@@ -1346,9 +1375,15 @@ class AgenticAttentionVariableForestRunner:
             "rejected_low_coverage_features": list(rejected_low_coverage or []),
             "rejected_low_signal_features": list(rejected_low_signal or []),
             "multivariable_signal_feedback": multivariable_signal_feedback or {},
-            "attention_evidence": [
-                self._attention_evidence_context_row(row) for row in evidence
-            ],
+            "attention_evidence_policy": {
+                "source_rows": int(len(attention_rows)),
+                "usable_source_rows": int(len(usable_rows)),
+                "max_rows": int(evidence_limit),
+                "max_token_spans_per_row": _AGENT_CONTEXT_TOKEN_SPANS_PER_ROW,
+                "snippet_chars": _AGENT_CONTEXT_SNIPPET_CHARS,
+                "selection": "highest absolute chunk attention after dropping blank text",
+            },
+            "attention_evidence": context_rows,
             "fold_label_summary": {
                 "n": int(len(discovery_df)),
                 "treatment_rate": float(discovery_df[self.config.treatment_column].mean()),
@@ -1369,11 +1404,21 @@ class AgenticAttentionVariableForestRunner:
         }
 
     def _attention_evidence_context_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        spans = _parse_top_token_spans(row.get("top_token_spans_json"))
+        compact_spans = _compact_token_spans(spans)
+        snippet = _attention_evidence_snippet(
+            row.get("chunk_text", ""),
+            spans,
+            row.get("highlighted_chunk_text"),
+        )
         context_row: Dict[str, Any] = {
             "row_id": int(row["row_id"]),
-            "chunk_text": row["chunk_text"],
-            "attention": float(row["attention"]),
+            "attention": _round_context_float(row.get("attention", 0.0)),
         }
+        if "chunk_index" in row:
+            context_row["chunk_index"] = int(row["chunk_index"])
+        if snippet:
+            context_row["evidence_snippet"] = snippet
         for key in [
             "e_hat",
             "m_hat",
@@ -1383,16 +1428,15 @@ class AgenticAttentionVariableForestRunner:
             "r_loss",
         ]:
             if key in row:
-                context_row[key] = row[key]
-        spans = _parse_top_token_spans(row.get("top_token_spans_json"))
-        if spans:
-            context_row["top_token_spans"] = spans
+                context_row[key] = _round_context_float(row[key])
+        if compact_spans:
+            context_row["top_token_spans"] = compact_spans
             summary = row.get("attended_token_summary")
             if isinstance(summary, str) and summary:
-                context_row["attended_token_summary"] = summary
-            highlighted = row.get("highlighted_chunk_text")
-            if isinstance(highlighted, str) and highlighted:
-                context_row["highlighted_chunk_text"] = highlighted
+                context_row["attended_token_summary"] = _truncate_text(
+                    summary,
+                    _AGENT_CONTEXT_SUMMARY_CHARS,
+                )
         return context_row
 
     def _candidate_proposal_limit(self) -> int:
@@ -3045,6 +3089,115 @@ def _parse_top_token_spans(value: Any) -> List[Dict[str, Any]]:
     return [item for item in parsed if isinstance(item, dict)]
 
 
+def _attention_row_has_usable_text(row: Dict[str, Any]) -> bool:
+    for key in ["chunk_text", "highlighted_chunk_text", "attended_token_summary"]:
+        value = row.get(key)
+        if isinstance(value, str) and re.search(r"[A-Za-z0-9]", value):
+            return True
+    for span in _parse_top_token_spans(row.get("top_token_spans_json")):
+        text = span.get("text")
+        if isinstance(text, str) and re.search(r"[A-Za-z0-9]", text):
+            return True
+    return False
+
+
+def _compact_token_spans(spans: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    compact: List[Dict[str, Any]] = []
+    seen = set()
+    for span in spans:
+        text = _truncate_text(
+            str(span.get("text", "")).strip(),
+            _AGENT_CONTEXT_SPAN_TEXT_CHARS,
+        )
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        item: Dict[str, Any] = {"text": text}
+        focus = str(span.get("focus_token", "")).strip()
+        if focus and focus != text:
+            item["focus_token"] = _truncate_text(focus, 48)
+        if "salience" in span:
+            item["salience"] = _round_context_float(span["salience"], ndigits=5)
+        compact.append(item)
+        if len(compact) >= _AGENT_CONTEXT_TOKEN_SPANS_PER_ROW:
+            break
+    return compact
+
+
+def _attention_evidence_snippet(
+    chunk_text: Any,
+    spans: Sequence[Dict[str, Any]],
+    highlighted_chunk_text: Any = None,
+) -> str:
+    chunk = _normalize_context_text(chunk_text)
+    if chunk:
+        intervals = []
+        for span in spans[:_AGENT_CONTEXT_TOKEN_SPANS_PER_ROW]:
+            if "char_start" not in span or "char_end" not in span:
+                continue
+            try:
+                start = int(span["char_start"])
+                end = int(span["char_end"])
+            except (TypeError, ValueError):
+                continue
+            if end <= start:
+                continue
+            intervals.append((max(0, start), min(len(chunk), end)))
+        if intervals:
+            start = max(
+                0,
+                min(start for start, _ in intervals)
+                - _AGENT_CONTEXT_SNIPPET_CHARS // 3,
+            )
+            end = min(
+                len(chunk),
+                max(end for _, end in intervals) + _AGENT_CONTEXT_SNIPPET_CHARS // 3,
+            )
+            return _truncate_text(
+                _normalize_context_text(chunk[start:end]),
+                _AGENT_CONTEXT_SNIPPET_CHARS,
+            )
+        return _truncate_text(chunk, _AGENT_CONTEXT_SNIPPET_CHARS)
+
+    highlighted = _normalize_context_text(highlighted_chunk_text)
+    if not highlighted:
+        return ""
+    marker_idx = highlighted.find("[[")
+    if marker_idx >= 0:
+        start = max(0, marker_idx - _AGENT_CONTEXT_SNIPPET_CHARS // 3)
+        end = min(
+            len(highlighted),
+            marker_idx + 2 * _AGENT_CONTEXT_SNIPPET_CHARS // 3,
+        )
+        return _truncate_text(highlighted[start:end], _AGENT_CONTEXT_SNIPPET_CHARS)
+    return _truncate_text(highlighted, _AGENT_CONTEXT_SNIPPET_CHARS)
+
+
+def _normalize_context_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _truncate_text(value: str, max_chars: int) -> str:
+    value = _normalize_context_text(value)
+    if len(value) <= max_chars:
+        return value
+    if max_chars <= 3:
+        return value[:max_chars]
+    return value[: max_chars - 3].rstrip() + "..."
+
+
+def _round_context_float(value: Any, ndigits: int = 6) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(numeric):
+        return 0.0
+    return round(numeric, ndigits)
+
+
 def _json_default(value: Any) -> Any:
     if isinstance(value, np.ndarray):
         return value.tolist()
@@ -3058,7 +3211,11 @@ def _json_default(value: Any) -> Any:
 def _scrub_context(context: Dict[str, Any]) -> Dict[str, Any]:
     copied = dict(context)
     copied["attention_evidence"] = [
-        {key: value for key, value in row.items() if key != "chunk_text"}
+        {
+            key: value
+            for key, value in row.items()
+            if key not in {"chunk_text", "source_chunk_text"}
+        }
         for row in copied.get("attention_evidence", [])
     ]
     return copied

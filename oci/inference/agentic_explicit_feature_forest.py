@@ -1788,12 +1788,12 @@ def build_attention_variable_agent_prompt(
     )
     return f"""You are inspecting attention evidence from a neural text model used in a downstream clinical prediction task.
 
-Your task is narrow: propose at most {max_proposals} explicit pre-treatment patient-level variables that the neural model may be capturing. Each evidence item contains highly attended token spans inside highly attended clinical text chunks. Treat those token spans as the primary clue; use the surrounding chunk text to name the variable loosely but concretely. If the attended evidence does not suggest a reusable extractable patient-level variable, return a single "none" proposal.
+Your task is narrow: propose at most {max_proposals} explicit pre-treatment patient-level variables that the neural model may be capturing. Each evidence item contains highly attended token spans inside highly attended clinical text snippets. Treat those token spans as the primary clue; use the surrounding evidence_snippet text to name the variable loosely but concretely. If the attended evidence does not suggest a reusable extractable patient-level variable, return a single "none" proposal.
 
 Rules:
 - Use only pre-treatment information visible in the attended evidence.
 - Before choosing proposals, mentally inventory repeated high-attention spans and the patient-level fields they imply; mundane patient-level fields count if they repeatedly appear with high token salience.
-- Prefer variables whose values appear repeatedly in top_token_spans, attended_token_summary, highlighted_chunk_text, or the surrounding chunk_text and look extractable across many patients.
+- Prefer variables whose values appear repeatedly in top_token_spans, attended_token_summary, or the surrounding evidence_snippet and look extractable across many patients.
 - Avoid sparse one-off concepts, downstream treatment response, toxicity after treatment, survival, and outcome-derived variables.
 - Avoid aliases or near-duplicates of current_features and excluded_feature_names.
 - If rejected_low_coverage_features is non-empty, do not repeat those extraction targets unchanged; propose a broader or more directly documented target only if the attended chunks support it.

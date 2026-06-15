@@ -461,7 +461,8 @@ def test_agent_candidate_output_is_saved_during_discovery(tmp_path):
         last_response_trace = {"raw_content": "{\"proposals\": []}"}
 
         def propose(self, context):
-            assert context["attention_evidence"][0]["chunk_text"] == "important note"
+            assert context["attention_evidence"][0]["evidence_snippet"] == "important note"
+            assert "chunk_text" not in context["attention_evidence"][0]
             return [
                 {
                     "action": "add",
@@ -533,7 +534,8 @@ def test_agent_candidate_output_is_saved_during_discovery(tmp_path):
     )
     payload = json.loads(checkpoint.read_text())
     assert payload["status"] == "complete"
-    assert payload["context"]["attention_evidence"][0]["chunk_text"] == "important note"
+    assert payload["context"]["attention_evidence"][0]["evidence_snippet"] == "important note"
+    assert "chunk_text" not in payload["context"]["attention_evidence"][0]
     assert payload["proposals"][0]["rationale"] == "important note repeatedly mentions the marker"
     assert payload["agent_raw_output"]["raw_content"] == "{\"proposals\": []}"
     jsonl_path = (
@@ -542,7 +544,8 @@ def test_agent_candidate_output_is_saved_during_discovery(tmp_path):
         / "confounder_candidates_by_fold.jsonl"
     )
     jsonl_payload = json.loads(jsonl_path.read_text().splitlines()[0])
-    assert jsonl_payload["context"]["attention_evidence"][0]["chunk_text"] == "important note"
+    assert jsonl_payload["context"]["attention_evidence"][0]["evidence_snippet"] == "important note"
+    assert "chunk_text" not in jsonl_payload["context"]["attention_evidence"][0]
     assert jsonl_payload["proposals"][0]["rationale"] == "important note repeatedly mentions the marker"
 
 
@@ -560,7 +563,7 @@ def test_attention_agent_prompt_is_attention_anchored():
             "attention_evidence": [
                 {
                     "row_id": 1,
-                    "chunk_text": "Age 78 years at treatment start.",
+                    "evidence_snippet": "Age 78 years at treatment start.",
                     "attention": 0.9,
                 }
             ],
@@ -569,13 +572,95 @@ def test_attention_agent_prompt_is_attention_anchored():
     )
 
     assert "downstream clinical prediction task" in prompt
-    assert "highly attended token spans inside highly attended clinical text chunks" in prompt
+    assert "highly attended token spans inside highly attended clinical text snippets" in prompt
     assert "mundane patient-level fields count" in prompt
+    assert "evidence_snippet" in prompt
     assert '"roles"' not in prompt
     assert "confounders:" not in prompt
     assert "effect modifiers:" not in prompt
     assert "At most 2 add proposals" in prompt
     assert "low_coverage_marker" in prompt
+
+
+def test_attention_agent_context_is_compact_and_filters_blank_chunks(tmp_path):
+    df = pd.DataFrame(
+        {
+            "clinical_text": ["note a", "note b"],
+            "treatment_indicator": [0, 1],
+            "outcome_indicator": [0, 1],
+        }
+    )
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        architecture=ModelArchitectureConfig(
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=2,
+                effect_folds=2,
+                attention_top_k_chunks=5,
+            ),
+        ),
+    )
+    runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "predictions.parquet",
+        device=torch.device("cpu"),
+        num_workers=1,
+        proposal_agent=FakeAttentionAgent(),
+        extraction_provider=FakeExtractionProvider(),
+    )
+
+    chunk = "Patient has baseline age 78 years before treatment. " * 40
+    start = chunk.find("age")
+    token_spans = json.dumps(
+        [
+            {
+                "text": "baseline age 78 years",
+                "focus_token": "age",
+                "salience": 0.123456789,
+                "token_attention": 0.987654321,
+                "char_start": start - len("baseline "),
+                "char_end": start + len("age 78 years"),
+            }
+        ]
+    )
+    attention_rows = [
+        {"row_id": 0, "chunk_text": "   ", "attention": 100.0},
+        *[
+            {
+                "row_id": i,
+                "chunk_index": 0,
+                "chunk_text": chunk,
+                "attention": float(i),
+                "top_token_spans_json": token_spans,
+                "attended_token_summary": "baseline age 78 years",
+            }
+            for i in range(1, 101)
+        ],
+    ]
+
+    context = runner._build_agent_context(
+        stage="confounder",
+        outer_fold=1,
+        inner_fold=1,
+        discovery_df=runner.dataset,
+        attention_rows=attention_rows,
+        existing_specs=[],
+    )
+
+    evidence = context["attention_evidence"]
+    assert 12 <= len(evidence) < 100
+    assert context["attention_evidence_policy"]["source_rows"] == 101
+    assert context["attention_evidence_policy"]["usable_source_rows"] == 100
+    assert all("chunk_text" not in row for row in evidence)
+    assert all(len(row["evidence_snippet"]) <= 480 for row in evidence)
+    assert all("baseline age 78 years" in row["evidence_snippet"] for row in evidence)
+    span = evidence[0]["top_token_spans"][0]
+    assert span == {
+        "text": "baseline age 78 years",
+        "focus_token": "age",
+        "salience": 0.12346,
+    }
 
 
 def test_attention_agent_prompt_allows_missing_roles():
