@@ -1325,9 +1325,7 @@ class AgenticAttentionVariableForestRunner:
             reverse=True,
         )[: max(1, self.avf_config.attention_top_k_chunks * 20)]
         instruction = (
-            "Propose only pre-treatment confounder variables directly supported by repeated high-attention token spans inside high-attention chunks."
-            if stage == "confounder"
-            else "Propose only pre-treatment effect modifier variables directly supported by repeated high-attention token spans inside high R-stage attention chunks."
+            "Infer explicit pre-treatment patient-level variables represented by repeated high-attention token spans inside high-attention chunks."
         )
         return {
             "prompt_version": "agentic_attention_variable_forest_v1",
@@ -1363,7 +1361,6 @@ class AgenticAttentionVariableForestRunner:
                         "name": "snake_case_variable_name",
                         "type": "categorical|continuous",
                         "categories": ["category_a", "category_b"],
-                        "roles": [stage],
                         "description": "exact pre-treatment extraction target",
                         "rationale": "why the attended chunks support this variable",
                     }

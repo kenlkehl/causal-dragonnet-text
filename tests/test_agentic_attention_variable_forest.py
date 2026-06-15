@@ -568,11 +568,32 @@ def test_attention_agent_prompt_is_attention_anchored():
         AgenticFeatureSearchConfig(max_additions_per_iter=6),
     )
 
-    assert "highly attended token spans inside highly attended chunks" in prompt
-    assert "Do not propose a variable from general oncology knowledge" in prompt
+    assert "downstream clinical prediction task" in prompt
+    assert "highly attended token spans inside highly attended clinical text chunks" in prompt
     assert "mundane patient-level fields count" in prompt
+    assert '"roles"' not in prompt
+    assert "confounders:" not in prompt
+    assert "effect modifiers:" not in prompt
     assert "At most 2 add proposals" in prompt
     assert "low_coverage_marker" in prompt
+
+
+def test_attention_agent_prompt_allows_missing_roles():
+    from oci.inference.agentic_explicit_feature_forest import agent_response_schema_issues
+
+    issues = agent_response_schema_issues(
+        [
+            {
+                "action": "add",
+                "name": "attended_patient_field",
+                "type": "continuous",
+                "description": "A field implied by repeated attended spans",
+            }
+        ],
+        context={"prompt_version": "agentic_attention_variable_forest_v1"},
+    )
+
+    assert not issues
 
 
 def test_low_coverage_attention_candidates_trigger_retry(tmp_path):

@@ -1786,14 +1786,9 @@ def build_attention_variable_agent_prompt(
             max(1, int(getattr(search_config, "max_additions_per_iter", 3))),
         )
     )
-    stage_target = (
-        "pre-treatment confounders: variables whose values could explain both treatment assignment and outcome risk"
-        if stage == "confounder"
-        else "pre-treatment effect modifiers: variables whose values could change the treatment effect"
-    )
-    return f"""You are trying to find explicit variables for causal inference.
+    return f"""You are inspecting attention evidence from a neural text model used in a downstream clinical prediction task.
 
-Your task is narrow: propose at most {max_proposals} {stage_target}. Your input is a set of highly attended token spans inside highly attended chunks. Treat those token spans as the primary evidence; use the surrounding chunk text only to understand what the span means. Do not propose a variable from general oncology knowledge unless the high-attention chunks and token spans support it; if the attended evidence does not support a defensible extractable variable, return a single "none" proposal.
+Your task is narrow: propose at most {max_proposals} explicit pre-treatment patient-level variables that the neural model may be capturing. Each evidence item contains highly attended token spans inside highly attended clinical text chunks. Treat those token spans as the primary clue; use the surrounding chunk text to name the variable loosely but concretely. If the attended evidence does not suggest a reusable extractable patient-level variable, return a single "none" proposal.
 
 Rules:
 - Use only pre-treatment information visible in the attended evidence.
@@ -1802,7 +1797,7 @@ Rules:
 - Avoid sparse one-off concepts, downstream treatment response, toxicity after treatment, survival, and outcome-derived variables.
 - Avoid aliases or near-duplicates of current_features and excluded_feature_names.
 - If rejected_low_coverage_features is non-empty, do not repeat those extraction targets unchanged; propose a broader or more directly documented target only if the attended chunks support it.
-- If rejected_low_signal_features or multivariable_signal_feedback indicate weak treatment/outcome prediction, propose different attended-chunk themes that are more likely to be statistically associated with treatment assignment and/or outcome.
+- If rejected_low_signal_features or multivariable_signal_feedback indicate weak downstream prediction signal, propose different repeated variables suggested by the attended evidence.
 - For every add proposal, name the specific high-attention token span or phrase from the evidence in the rationale.
 
 Return JSON only with this shape:
@@ -1813,10 +1808,9 @@ Return JSON only with this shape:
       "name": "snake_case_variable_name",
       "type": "categorical|continuous",
       "categories": ["category_a", "category_b"],
-      "roles": ["{stage}"],
       "description": "exact pre-treatment extraction target",
-      "rationale": "which attended chunk theme supports this variable",
-      "expected_signal": "treatment, outcome, or tau signal expected"
+      "rationale": "which attended token span or phrase supports this variable",
+      "expected_signal": "briefly state what downstream signal this variable might carry, if any"
     }}
   ]
 }}
@@ -1951,6 +1945,7 @@ def agent_response_schema_issues(
     """Return schema-level issues that are worth asking the LLM to repair."""
     issues: List[str] = []
     available_names = _context_available_extracted_names(context)
+    allow_missing_roles = _context_allows_missing_roles(context)
     for idx, raw in enumerate(proposals, start=1):
         if not isinstance(raw, dict):
             issues.append(f"proposal {idx}: expected an object, got {type(raw).__name__}")
@@ -1984,7 +1979,10 @@ def agent_response_schema_issues(
                     f"{label}: invalid type {proposal_type!r}; expected one of {sorted(VALID_TYPES)}"
                 )
 
-            roles_issue = _roles_schema_issue(raw.get("roles"))
+            roles_issue = _roles_schema_issue(
+                raw.get("roles"),
+                allow_missing=allow_missing_roles,
+            )
             if roles_issue is not None:
                 issues.append(f"{label}: {roles_issue}")
 
@@ -1993,7 +1991,10 @@ def agent_response_schema_issues(
             if _missing_or_empty(raw.get("description")):
                 issues.append(f"{label}: missing description")
         elif action == "update_role":
-            roles_issue = _roles_schema_issue(raw.get("roles"))
+            roles_issue = _roles_schema_issue(
+                raw.get("roles"),
+                allow_missing=allow_missing_roles,
+            )
             if roles_issue is not None:
                 issues.append(f"{label}: {roles_issue}")
 
@@ -2019,8 +2020,17 @@ def _context_available_extracted_names(
     return names
 
 
-def _roles_schema_issue(roles: Any) -> Optional[str]:
+def _context_allows_missing_roles(context: Optional[Dict[str, Any]]) -> bool:
+    return bool(
+        isinstance(context, dict)
+        and context.get("prompt_version") == "agentic_attention_variable_forest_v1"
+    )
+
+
+def _roles_schema_issue(roles: Any, allow_missing: bool = False) -> Optional[str]:
     if roles is None or roles == []:
+        if allow_missing:
+            return None
         return "missing roles"
     role_values = [roles] if isinstance(roles, str) else roles
     if not isinstance(role_values, list):
