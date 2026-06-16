@@ -464,6 +464,7 @@ class AgenticAttentionVariableForestConfig:
     min_extraction_coverage: float = 0.10
     e_clip: float = 0.01
     manual_features_locked: bool = True
+    neural_only: bool = False
 
     def __post_init__(self):
         if self.nuisance_folds < 2:
@@ -734,6 +735,7 @@ class TrainingConfig:
     lr_schedule: str = "linear"
     epochs: int = 50
     batch_size: int = 8
+    effect_batch_size: Optional[int] = 32
     alpha_propensity: float = 1.0
     beta_targreg: float = 0.1
     gamma_rlearner: float = 1.0  # Weight for R-learner loss (when model_type="rlearner")

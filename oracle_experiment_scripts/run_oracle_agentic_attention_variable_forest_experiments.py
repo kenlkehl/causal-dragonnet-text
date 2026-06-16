@@ -43,6 +43,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 import pandas as pd
 import torch
+from sklearn.metrics import mean_squared_error, roc_auc_score
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -116,6 +117,7 @@ class AgenticAttentionOracleConfig:
 
     epochs: int = 3
     batch_size: int = 8
+    effect_batch_size: int = 32
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
     gradient_clip_norm: float = 1.0
@@ -137,6 +139,7 @@ class AgenticAttentionOracleConfig:
     consensus_min_fold_fraction: float = 2.0 / 3.0
     min_extraction_coverage: float = 0.10
     e_clip: float = 0.01
+    neural_only: bool = False
 
     cf_n_estimators: int = 200
     cf_min_samples_leaf: int = 10
@@ -280,11 +283,13 @@ def _make_applied_config(
                 consensus_min_fold_fraction=config.consensus_min_fold_fraction,
                 min_extraction_coverage=config.min_extraction_coverage,
                 e_clip=config.e_clip,
+                neural_only=config.neural_only,
             ),
         ),
         training=TrainingConfig(
             epochs=config.epochs,
             batch_size=config.batch_size,
+            effect_batch_size=config.effect_batch_size,
             learning_rate=config.learning_rate,
             weight_decay=config.weight_decay,
             gradient_clip_norm=config.gradient_clip_norm,
@@ -356,6 +361,85 @@ def _safe_metrics(results_df: pd.DataFrame) -> Dict[str, Any]:
     )
 
 
+def _finite_or_none(value: Any) -> Optional[float]:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(numeric):
+        return None
+    return numeric
+
+
+def _safe_roc_auc(y_true: pd.Series, y_score: pd.Series) -> Optional[float]:
+    y = np.asarray(y_true)
+    score = np.asarray(y_score)
+    mask = pd.notna(y) & pd.notna(score)
+    if int(mask.sum()) < 2 or len(np.unique(y[mask])) < 2:
+        return None
+    try:
+        return float(roc_auc_score(y[mask], score[mask]))
+    except ValueError:
+        return None
+
+
+def _safe_neural_metrics(results_df: pd.DataFrame) -> Dict[str, Any]:
+    required = {"tau_hat_r_stage", "r_loss", "r_loss_at_zero_tau", "e_hat", "m_hat"}
+    if not required.issubset(results_df.columns):
+        return {}
+
+    metrics: Dict[str, Any] = {
+        "neural_r_loss_mean": _finite_or_none(results_df["r_loss"].mean()),
+        "neural_r_loss_at_zero_tau_mean": _finite_or_none(
+            results_df["r_loss_at_zero_tau"].mean()
+        ),
+        "neural_tau_hat_mean": _finite_or_none(results_df["tau_hat_r_stage"].mean()),
+        "neural_tau_hat_std": _finite_or_none(results_df["tau_hat_r_stage"].std()),
+    }
+    base_loss = metrics["neural_r_loss_at_zero_tau_mean"]
+    r_loss = metrics["neural_r_loss_mean"]
+    if base_loss is not None and base_loss > 0 and r_loss is not None:
+        # Interprets the neural R-stage tau model against the no-effect baseline:
+        # >0 means tau_hat reduces residual R-loss vs tau=0, ~0 means no gain,
+        # and <0 means the learned tau worsens the R-loss. A positive value is
+        # useful but not sufficient evidence of oracle CATE recovery.
+        metrics["neural_r_loss_relative_improvement"] = float(1.0 - r_loss / base_loss)
+    if "treatment_indicator" in results_df.columns:
+        metrics["neural_propensity_auroc"] = _safe_roc_auc(
+            results_df["treatment_indicator"],
+            results_df["e_hat"],
+        )
+    if "outcome_indicator" in results_df.columns:
+        metrics["neural_outcome_auroc"] = _safe_roc_auc(
+            results_df["outcome_indicator"],
+            results_df["m_hat"],
+        )
+    if {"true_ite_prob", "tau_hat_r_stage"}.issubset(results_df.columns):
+        metrics["neural_r_stage_ite_corr"] = _finite_or_none(
+            results_df["true_ite_prob"].corr(results_df["tau_hat_r_stage"])
+        )
+        metrics["neural_r_stage_ite_spearman_corr"] = _finite_or_none(
+            results_df["true_ite_prob"].corr(
+                results_df["tau_hat_r_stage"],
+                method="spearman",
+            )
+        )
+    if {"true_treatment_prob", "e_hat"}.issubset(results_df.columns):
+        metrics["neural_true_propensity_corr"] = _finite_or_none(
+            results_df["true_treatment_prob"].corr(results_df["e_hat"])
+        )
+    if {"true_outcome_prob", "m_hat"}.issubset(results_df.columns):
+        metrics["neural_true_outcome_rmse"] = _finite_or_none(
+            np.sqrt(
+                mean_squared_error(
+                    results_df["true_outcome_prob"],
+                    results_df["m_hat"],
+                )
+            )
+        )
+    return metrics
+
+
 def _selected_feature_summary(results_df: pd.DataFrame) -> Dict[str, float]:
     if "selected_feature_names" not in results_df.columns:
         return {}
@@ -381,6 +465,67 @@ def _load_candidate_names(path: Path) -> List[str]:
                 if name and name not in names:
                     names.append(name)
     return names
+
+
+def _append_unique(names: List[str], value: Any) -> None:
+    name = str(value or "").strip()
+    if name and name not in names:
+        names.append(name)
+
+
+def _load_selected_variable_summary(path: Path) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        "confounders": [],
+        "effect_modifiers": [],
+        "selected_features": [],
+        "by_outer_fold": [],
+    }
+    if not path.exists():
+        return summary
+
+    with open(path) as f:
+        rows = json.load(f)
+    if not isinstance(rows, list):
+        return summary
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        confounders = [str(name) for name in row.get("confounders", []) if name]
+        effect_modifiers = [
+            str(name) for name in row.get("effect_modifiers", []) if name
+        ]
+        selected_features = []
+        for feature in row.get("selected_features", []):
+            if not isinstance(feature, dict):
+                continue
+            name = feature.get("name")
+            if name:
+                selected_features.append(str(name))
+            roles = set(feature.get("roles", []))
+            if "confounder" in roles:
+                _append_unique(confounders, name)
+            if "effect_modifier" in roles:
+                _append_unique(effect_modifiers, name)
+
+        for name in confounders:
+            _append_unique(summary["confounders"], name)
+            _append_unique(summary["selected_features"], name)
+        for name in effect_modifiers:
+            _append_unique(summary["effect_modifiers"], name)
+            _append_unique(summary["selected_features"], name)
+        for name in selected_features:
+            _append_unique(summary["selected_features"], name)
+
+        summary["by_outer_fold"].append(
+            {
+                "outer_fold": row.get("outer_fold"),
+                "confounders": confounders,
+                "effect_modifiers": effect_modifiers,
+                "selected_features": selected_features,
+            }
+        )
+    return summary
 
 
 def run_experiment(
@@ -425,6 +570,7 @@ def run_experiment(
     results_df = pd.read_parquet(prediction_path)
     artifact_dir = prediction_path.parent / "agentic_attention_variable_forest"
     metrics = _safe_metrics(results_df)
+    metrics.update(_safe_neural_metrics(results_df))
     metrics.update(_selected_feature_summary(results_df))
     metrics["agentic_attention_n_initial_features"] = float(len(initial_specs))
 
@@ -446,6 +592,9 @@ def run_experiment(
                 artifact_dir / "effect_modifier_candidates_by_fold.jsonl"
             ),
         },
+        "agentic_attention_variables_selected": _load_selected_variable_summary(
+            artifact_dir / "consensus.json"
+        ),
     }
 
 
@@ -472,6 +621,9 @@ def _result_row(config_hash: str, result: Dict[str, Any]) -> Dict[str, Any]:
         "n_folds",
         "nuisance_folds",
         "effect_folds",
+        "batch_size",
+        "effect_batch_size",
+        "neural_only",
         "initial_feature_count",
         "initial_feature_strategy",
     ]:
@@ -481,6 +633,16 @@ def _result_row(config_hash: str, result: Dict[str, Any]) -> Dict[str, Any]:
     artifacts = result.get("artifacts", {})
     row["predictions_path"] = artifacts.get("predictions_path")
     row["artifact_dir"] = artifacts.get("artifact_dir")
+    selected = result.get("agentic_attention_variables_selected", {})
+    row["agentic_attention_selected_confounders"] = ",".join(
+        selected.get("confounders", [])
+    )
+    row["agentic_attention_selected_effect_modifiers"] = ",".join(
+        selected.get("effect_modifiers", [])
+    )
+    row["agentic_attention_selected_features"] = ",".join(
+        selected.get("selected_features", [])
+    )
     return row
 
 
@@ -581,6 +743,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--effect-batch-size", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
@@ -614,6 +777,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--consensus-min-fold-fraction", type=float, default=2.0 / 3.0)
     parser.add_argument("--min-extraction-coverage", type=float, default=0.10)
     parser.add_argument("--e-clip", type=float, default=0.01)
+    parser.add_argument(
+        "--neural-only",
+        action="store_true",
+        help="Run nuisance/R-stage neural cross-fitting and attention artifacts only.",
+    )
 
     parser.add_argument("--cf-n-estimators", type=int, default=200)
     parser.add_argument("--cf-min-samples-leaf", type=int, default=10)
@@ -709,6 +877,7 @@ def _make_configs(args: argparse.Namespace) -> List[AgenticAttentionOracleConfig
                     htr_dropout=args.htr_dropout,
                     epochs=args.epochs,
                     batch_size=args.batch_size,
+                    effect_batch_size=args.effect_batch_size,
                     learning_rate=args.learning_rate,
                     weight_decay=args.weight_decay,
                     gradient_clip_norm=args.gradient_clip_norm,
@@ -729,6 +898,7 @@ def _make_configs(args: argparse.Namespace) -> List[AgenticAttentionOracleConfig
                     consensus_min_fold_fraction=args.consensus_min_fold_fraction,
                     min_extraction_coverage=args.min_extraction_coverage,
                     e_clip=args.e_clip,
+                    neural_only=args.neural_only,
                     cf_n_estimators=args.cf_n_estimators,
                     cf_min_samples_leaf=args.cf_min_samples_leaf,
                     cf_max_depth=args.cf_max_depth,
@@ -801,6 +971,10 @@ def main() -> None:
         parser.error("--htr-sentence-encoder-batch-size must be >= 1")
     if args.htr_trainable_sentence_encoder_layers < 0:
         parser.error("--htr-trainable-sentence-encoder-layers must be >= 0")
+    if args.batch_size < 1:
+        parser.error("--batch-size must be >= 1")
+    if args.effect_batch_size < 1:
+        parser.error("--effect-batch-size must be >= 1")
     if any(count < 0 for count in args.initial_feature_counts):
         parser.error("--initial-feature-counts must be >= 0")
 

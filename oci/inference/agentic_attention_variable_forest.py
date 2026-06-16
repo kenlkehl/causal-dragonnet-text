@@ -292,6 +292,21 @@ class AgenticAttentionVariableForestRunner:
     ) -> pd.DataFrame:
         discovery_df = self.dataset.iloc[train_idx].reset_index(drop=True)
         nuisance = self._crossfit_nuisance(discovery_df, outer_fold)
+        if getattr(self.avf_config, "neural_only", False):
+            r_stage = self._crossfit_effect(discovery_df, nuisance["predictions"], outer_fold)
+            predictions = self._neural_only_prediction_frame(
+                discovery_df=discovery_df,
+                r_stage_predictions=r_stage["predictions"],
+                outer_fold=outer_fold,
+            )
+            self.metric_rows.append(
+                {
+                    "outer_fold": outer_fold,
+                    **self._neural_only_metrics(predictions),
+                }
+            )
+            return predictions
+
         confounders = self._discover_extract_filter_with_retries(
             stage="confounder",
             outer_fold=outer_fold,
@@ -339,6 +354,93 @@ class AgenticAttentionVariableForestRunner:
         predictions["selected_feature_names"] = ",".join(spec.name for spec in selected_specs)
         self.metric_rows.append({"outer_fold": outer_fold, **metrics})
         return predictions
+
+    def _neural_only_prediction_frame(
+        self,
+        discovery_df: pd.DataFrame,
+        r_stage_predictions: pd.DataFrame,
+        outer_fold: int,
+    ) -> pd.DataFrame:
+        """Build a long-form prediction frame for neural-only diagnostics."""
+        excluded_text_cols = {
+            self.config.text_column,
+            "patient_prompt",
+            "event_timeline",
+            "llm_raw_response",
+        }
+        metadata_cols = [
+            col
+            for col in discovery_df.columns
+            if col == "_oci_row_id" or col not in excluded_text_cols
+        ]
+        metadata = discovery_df[metadata_cols].drop_duplicates("_oci_row_id")
+        predictions = r_stage_predictions.merge(
+            metadata,
+            on="_oci_row_id",
+            how="left",
+            suffixes=("", "_source"),
+        )
+        predictions["outer_fold"] = int(outer_fold)
+        predictions["pred_ite_prob"] = predictions["tau_hat_r_stage"]
+        predictions["pred_propensity_prob"] = predictions["e_hat"]
+        predictions["pred_outcome_prob"] = predictions["m_hat"]
+        predictions["selected_feature_names"] = ""
+        predictions["neural_only"] = True
+        return predictions
+
+    def _neural_only_metrics(self, predictions: pd.DataFrame) -> Dict[str, Any]:
+        """Summarize nuisance and R-stage diagnostics for neural-only runs."""
+        metrics: Dict[str, Any] = {
+            "mode": "neural_only",
+            "n_train_rows": int(len(predictions)),
+            "r_loss_mean": _finite_or_none(predictions["r_loss"].mean()),
+            "r_loss_at_zero_tau_mean": _finite_or_none(
+                predictions["r_loss_at_zero_tau"].mean()
+            ),
+            "tau_hat_r_stage_mean": _finite_or_none(
+                predictions["tau_hat_r_stage"].mean()
+            ),
+            "tau_hat_r_stage_std": _finite_or_none(
+                predictions["tau_hat_r_stage"].std()
+            ),
+        }
+        zero_loss = metrics.get("r_loss_at_zero_tau_mean")
+        r_loss = metrics.get("r_loss_mean")
+        if zero_loss is not None and zero_loss > 0 and r_loss is not None:
+            metrics["r_loss_relative_improvement"] = float(1.0 - r_loss / zero_loss)
+        if self.config.treatment_column in predictions.columns:
+            metrics["nuisance_treatment_auroc"] = _safe_roc_auc(
+                predictions[self.config.treatment_column].to_numpy(),
+                predictions["e_hat"].to_numpy(),
+            )
+        if self.config.outcome_column in predictions.columns:
+            y = predictions[self.config.outcome_column].to_numpy()
+            m_hat = predictions["m_hat"].to_numpy()
+            if self.config.outcome_type == "continuous":
+                metrics["nuisance_outcome_rmse"] = _finite_or_none(
+                    np.sqrt(mean_squared_error(y, m_hat))
+                )
+            else:
+                metrics["nuisance_outcome_auroc"] = _safe_roc_auc(y, m_hat)
+        if "true_ite_prob" in predictions.columns:
+            metrics["r_stage_ite_corr"] = _safe_corr(
+                predictions["true_ite_prob"].to_numpy(),
+                predictions["tau_hat_r_stage"].to_numpy(),
+            )
+            try:
+                rho, _ = stats.spearmanr(
+                    predictions["true_ite_prob"].to_numpy(),
+                    predictions["tau_hat_r_stage"].to_numpy(),
+                )
+                metrics["r_stage_ite_spearman_corr"] = _finite_or_none(rho)
+            except Exception:
+                metrics["r_stage_ite_spearman_corr"] = None
+        if "true_treatment_prob" in predictions.columns:
+            metrics["nuisance_true_propensity_corr"] = _safe_corr(
+                predictions["true_treatment_prob"].to_numpy(),
+                predictions["e_hat"].to_numpy(),
+            )
+        return metrics
 
     def _initial_specs(self) -> List[ExplicitFeatureSpec]:
         if getattr(self.config.explicit_features, "features", None):
@@ -397,14 +499,18 @@ class AgenticAttentionVariableForestRunner:
         fields: Optional[Dict[str, np.ndarray]] = None,
         shuffle: bool = False,
         total_folds: Optional[int] = None,
+        batch_size: Optional[int] = None,
     ) -> DataLoader:
         extractor = getattr(model, "extractor", None)
         text_preprocessor = None
         if extractor is not None and hasattr(extractor, "make_batch_preprocessor"):
             text_preprocessor = extractor.make_batch_preprocessor()
         workers = self._data_loader_workers(total_folds=total_folds)
+        effective_batch_size = (
+            self.config.training.batch_size if batch_size is None else batch_size
+        )
         loader_kwargs: Dict[str, Any] = {
-            "batch_size": max(1, int(self.config.training.batch_size)),
+            "batch_size": max(1, int(effective_batch_size)),
             "shuffle": bool(shuffle),
             "collate_fn": _FoldTextBatchCollator(text_preprocessor),
             "num_workers": workers,
@@ -626,12 +732,6 @@ class AgenticAttentionVariableForestRunner:
         t = df[self.config.treatment_column].to_numpy(dtype=float)
         t_resid = t - np.clip(e, self.avf_config.e_clip, 1.0 - self.avf_config.e_clip)
         y_resid = y - m
-        weights = np.square(t_resid).astype(np.float32)
-        weights = np.maximum(weights, 1e-6)
-        denom = t_resid.copy()
-        near_zero = np.abs(denom) < 1e-6
-        denom[near_zero] = np.where(denom[near_zero] < 0, -1e-6, 1e-6)
-        targets = (y_resid / denom).astype(np.float32)
 
         split_items = list(
             enumerate(
@@ -645,6 +745,7 @@ class AgenticAttentionVariableForestRunner:
             extra_payload={
                 "e_hat_hash": _hash_numeric_array(e),
                 "m_hat_hash": _hash_numeric_array(m),
+                "effect_loss": "direct_residual_r_loss_v1",
             },
         )
 
@@ -682,8 +783,8 @@ class AgenticAttentionVariableForestRunner:
                     model,
                     df,
                     fit_pos,
-                    targets,
-                    weights,
+                    y_resid,
+                    t_resid,
                     outer_fold=outer_fold,
                     fold=fold,
                     total_folds=folds,
@@ -897,8 +998,8 @@ class AgenticAttentionVariableForestRunner:
         model: _EffectNet,
         df: pd.DataFrame,
         positions,
-        targets: np.ndarray,
-        weights: np.ndarray,
+        y_residuals: np.ndarray,
+        t_residuals: np.ndarray,
         outer_fold: int,
         fold: int,
         total_folds: int,
@@ -912,11 +1013,12 @@ class AgenticAttentionVariableForestRunner:
             df,
             positions,
             fields={
-                "target": np.asarray(targets, dtype=np.float32),
-                "weight": np.asarray(weights, dtype=np.float32),
+                "y_residual": np.asarray(y_residuals, dtype=np.float32),
+                "t_residual": np.asarray(t_residuals, dtype=np.float32),
             },
             shuffle=True,
             total_folds=total_folds,
+            batch_size=getattr(train_config, "effect_batch_size", None),
         )
         optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
@@ -934,7 +1036,7 @@ class AgenticAttentionVariableForestRunner:
             fold,
             total_folds,
             train_config.epochs,
-            train_config.batch_size,
+            train_loader.batch_size,
             num_batches,
             train_loader.num_workers,
             _current_lr(optimizer),
@@ -946,11 +1048,15 @@ class AgenticAttentionVariableForestRunner:
             loss_sum = 0.0
             batch_count = 0
             for batch_idx, batch in enumerate(train_loader, start=1):
-                target = batch["target"].to(self.device, non_blocking=True)
-                weight = batch["weight"].to(self.device, non_blocking=True)
+                y_residual = batch["y_residual"].to(self.device, non_blocking=True)
+                t_residual = batch["t_residual"].to(self.device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
                 tau = model(batch["model_input"])
-                loss = torch.mean(weight * torch.square(target - tau))
+                residual = y_residual - tau * t_residual
+                # Direct R-loss avoids high-variance y_residual / t_residual pseudo-labels.
+                # Next R-stage experiments to consider: lower LR, positivity filtering,
+                # and a binary-outcome loss alternative to squared residual MSE.
+                loss = torch.mean(torch.square(residual))
                 loss.backward()
                 self._clip_and_step(model, optimizer, scheduler)
                 batch_count += 1
@@ -1653,6 +1759,7 @@ class AgenticAttentionVariableForestRunner:
         train_keys = [
             "epochs",
             "batch_size",
+            "effect_batch_size",
             "learning_rate",
             "weight_decay",
             "gradient_clip_norm",
@@ -2401,7 +2508,13 @@ class AgenticAttentionVariableForestRunner:
             for row in self.metric_rows
         ]
         pd.DataFrame(metrics_for_csv).to_csv(self.artifact_dir / "metrics.csv", index=False)
-        if "true_ite_prob" in results_df.columns:
+        oracle_metric_columns = {
+            "true_ite_prob",
+            "pred_ite_prob",
+            "pred_y0_prob",
+            "pred_y1_prob",
+        }
+        if oracle_metric_columns.issubset(results_df.columns):
             metrics = _oracle_metrics(results_df)
             with open(self.artifact_dir / "oracle_metrics.json", "w") as f:
                 json.dump(metrics, f, indent=2)
