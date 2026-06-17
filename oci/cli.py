@@ -68,6 +68,22 @@ Examples:
         action='store_true',
         help='Skip pretraining even if enabled in config'
     )
+    run_parser.add_argument(
+        '--r-stage-min-propensity',
+        type=float,
+        help=(
+            'Override minimum nuisance propensity score eligible for '
+            'agentic_attention_variable_forest R-stage training'
+        )
+    )
+    run_parser.add_argument(
+        '--r-stage-max-propensity',
+        type=float,
+        help=(
+            'Override maximum nuisance propensity score eligible for '
+            'agentic_attention_variable_forest R-stage training'
+        )
+    )
     
     args = parser.parse_args()
     
@@ -95,6 +111,35 @@ Examples:
             config.output_dir = args.output_dir
         if args.skip_pretraining:
             config.pretraining.enabled = False
+        if (
+            args.r_stage_min_propensity is not None
+            or args.r_stage_max_propensity is not None
+        ):
+            model_type = getattr(config.applied_inference.architecture, 'model_type', None)
+            if model_type != "agentic_attention_variable_forest":
+                print(
+                    "--r-stage-min-propensity/--r-stage-max-propensity only apply "
+                    "to model_type='agentic_attention_variable_forest'"
+                )
+                return 1
+            avf_config = (
+                config.applied_inference.architecture
+                .agentic_attention_variable_forest
+            )
+            if args.r_stage_min_propensity is not None:
+                avf_config.r_stage_min_propensity = args.r_stage_min_propensity
+            if args.r_stage_max_propensity is not None:
+                avf_config.r_stage_max_propensity = args.r_stage_max_propensity
+            if not (
+                0.0
+                <= avf_config.r_stage_min_propensity
+                < avf_config.r_stage_max_propensity
+                <= 1.0
+            ):
+                print(
+                    "R-stage propensity bounds must satisfy 0 <= min < max <= 1"
+                )
+                return 1
         
         try:
             config.validate()

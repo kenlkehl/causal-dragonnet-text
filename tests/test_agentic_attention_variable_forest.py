@@ -411,6 +411,99 @@ def test_nuisance_crossfit_logs_heldout_aurocs(tmp_path, monkeypatch, caplog):
     assert "heldout metrics: propensity_auroc=1.0000 outcome_auroc=1.0000" in caplog.text
 
 
+def test_effect_crossfit_filters_training_rows_by_propensity(tmp_path, monkeypatch):
+    df = pd.DataFrame(
+        {
+            "clinical_text": [f"patient {i}" for i in range(10)],
+            "treatment_indicator": [0, 1] * 5,
+            "outcome_indicator": [1, 0, 1, 0, 0, 1, 0, 1, 0, 1],
+        }
+    )
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        cv_folds=0,
+        architecture=ModelArchitectureConfig(
+            model_type="agentic_attention_variable_forest",
+            feature_extractor_type="hierarchical_transformer",
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=2,
+                effect_folds=2,
+                fold_parallelism="1",
+                r_stage_min_propensity=0.2,
+                r_stage_max_propensity=0.8,
+            ),
+        ),
+        training=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-3),
+        explicit_features=ExplicitFeatureExtractionConfig(enabled=False, features=[]),
+    )
+    runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "predictions.parquet",
+        device=torch.device("cpu"),
+        num_workers=1,
+        proposal_agent=FakeAttentionAgent(),
+        extraction_provider=FakeExtractionProvider(),
+    )
+
+    class TinyExtractor(torch.nn.Module):
+        output_dim = 2
+
+        def forward(self, texts):
+            return torch.zeros(len(texts), self.output_dim)
+
+    nuisance_predictions = pd.DataFrame(
+        {
+            "_oci_row_id": runner.dataset["_oci_row_id"].to_numpy(),
+            "outer_fold": 1,
+            "e_hat": [0.05, 0.2, 0.4, 0.85, 0.7, 0.95, 0.3, 0.8, 0.1, 0.6],
+            "m_hat": np.full(len(runner.dataset), 0.5),
+            "y_residual": runner.dataset["outcome_indicator"].to_numpy(dtype=float) - 0.5,
+            "t_residual": runner.dataset["treatment_indicator"].to_numpy(dtype=float) - 0.5,
+            "r_loss_at_zero_tau": 0.25,
+            "nuisance_fold": 1,
+        }
+    )
+    train_positions = []
+
+    def record_effect_train(model, data, positions, *args, **kwargs):
+        del model, data, args, kwargs
+        train_positions.extend(int(pos) for pos in positions)
+
+    monkeypatch.setattr(runner, "_create_extractor", lambda: TinyExtractor())
+    monkeypatch.setattr(runner, "_train_effect_model", record_effect_train)
+    monkeypatch.setattr(
+        runner,
+        "_predict_effect_model",
+        lambda model, heldout: np.full(len(heldout), 0.25),
+    )
+    monkeypatch.setattr(runner, "_attention_evidence", lambda *args, **kwargs: [])
+
+    result = runner._crossfit_effect(
+        runner.dataset,
+        nuisance_predictions,
+        outer_fold=1,
+    )
+
+    e_hat = nuisance_predictions["e_hat"].to_numpy()
+    assert train_positions
+    assert all(0.2 <= e_hat[pos] <= 0.8 for pos in train_positions)
+    assert not any(e_hat[pos] < 0.2 or e_hat[pos] > 0.8 for pos in train_positions)
+    assert "r_stage_train_eligible" in result["predictions"].columns
+    assert result["predictions"]["r_stage_train_eligible"].tolist() == [
+        False,
+        True,
+        True,
+        False,
+        True,
+        False,
+        True,
+        True,
+        False,
+        True,
+    ]
+
+
 def test_nuisance_crossfit_resumes_from_fold_checkpoints(tmp_path, monkeypatch):
     df = pd.DataFrame(
         {

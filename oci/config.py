@@ -463,6 +463,8 @@ class AgenticAttentionVariableForestConfig:
     consensus_min_fold_fraction: float = 2.0 / 3.0
     min_extraction_coverage: float = 0.10
     e_clip: float = 0.01
+    r_stage_min_propensity: float = 0.0
+    r_stage_max_propensity: float = 1.0
     manual_features_locked: bool = True
     neural_only: bool = False
 
@@ -539,6 +541,11 @@ class AgenticAttentionVariableForestConfig:
             )
         if not 0.0 < self.e_clip < 0.5:
             raise ValueError("agentic_attention_variable_forest.e_clip must be in (0, 0.5)")
+        if not 0.0 <= self.r_stage_min_propensity < self.r_stage_max_propensity <= 1.0:
+            raise ValueError(
+                "agentic_attention_variable_forest r-stage propensity bounds "
+                "must satisfy 0 <= min < max <= 1"
+            )
 
 
 def normalize_feature_extractor_type(feature_type: str) -> str:
@@ -951,6 +958,18 @@ class ExperimentConfig:
                 "model_type='confounder_forest' has been removed. "
                 "Use model_type='explicit_feature_forest'."
             )
+        if self.applied_inference.architecture.model_type == "agentic_attention_variable_forest":
+            avf_config = self.applied_inference.architecture.agentic_attention_variable_forest
+            if not (
+                0.0
+                <= avf_config.r_stage_min_propensity
+                < avf_config.r_stage_max_propensity
+                <= 1.0
+            ):
+                raise ValueError(
+                    "agentic_attention_variable_forest R-stage propensity bounds "
+                    "must satisfy 0 <= min < max <= 1"
+                )
 
         if (
             self.applied_inference.explicit_features.enabled

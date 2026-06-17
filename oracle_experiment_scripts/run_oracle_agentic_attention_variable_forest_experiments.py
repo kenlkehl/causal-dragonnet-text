@@ -139,6 +139,8 @@ class AgenticAttentionOracleConfig:
     consensus_min_fold_fraction: float = 2.0 / 3.0
     min_extraction_coverage: float = 0.10
     e_clip: float = 0.01
+    r_stage_min_propensity: float = 0.0
+    r_stage_max_propensity: float = 1.0
     neural_only: bool = False
 
     cf_n_estimators: int = 200
@@ -283,6 +285,8 @@ def _make_applied_config(
                 consensus_min_fold_fraction=config.consensus_min_fold_fraction,
                 min_extraction_coverage=config.min_extraction_coverage,
                 e_clip=config.e_clip,
+                r_stage_min_propensity=config.r_stage_min_propensity,
+                r_stage_max_propensity=config.r_stage_max_propensity,
                 neural_only=config.neural_only,
             ),
         ),
@@ -623,6 +627,8 @@ def _result_row(config_hash: str, result: Dict[str, Any]) -> Dict[str, Any]:
         "effect_folds",
         "batch_size",
         "effect_batch_size",
+        "r_stage_min_propensity",
+        "r_stage_max_propensity",
         "neural_only",
         "initial_feature_count",
         "initial_feature_strategy",
@@ -777,6 +783,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--consensus-min-fold-fraction", type=float, default=2.0 / 3.0)
     parser.add_argument("--min-extraction-coverage", type=float, default=0.10)
     parser.add_argument("--e-clip", type=float, default=0.01)
+    parser.add_argument("--r-stage-min-propensity", type=float, default=0.0)
+    parser.add_argument("--r-stage-max-propensity", type=float, default=1.0)
     parser.add_argument(
         "--neural-only",
         action="store_true",
@@ -898,6 +906,8 @@ def _make_configs(args: argparse.Namespace) -> List[AgenticAttentionOracleConfig
                     consensus_min_fold_fraction=args.consensus_min_fold_fraction,
                     min_extraction_coverage=args.min_extraction_coverage,
                     e_clip=args.e_clip,
+                    r_stage_min_propensity=args.r_stage_min_propensity,
+                    r_stage_max_propensity=args.r_stage_max_propensity,
                     neural_only=args.neural_only,
                     cf_n_estimators=args.cf_n_estimators,
                     cf_min_samples_leaf=args.cf_min_samples_leaf,
@@ -975,6 +985,11 @@ def main() -> None:
         parser.error("--batch-size must be >= 1")
     if args.effect_batch_size < 1:
         parser.error("--effect-batch-size must be >= 1")
+    if not 0.0 <= args.r_stage_min_propensity < args.r_stage_max_propensity <= 1.0:
+        parser.error(
+            "--r-stage-min-propensity and --r-stage-max-propensity must satisfy "
+            "0 <= min < max <= 1"
+        )
     if any(count < 0 for count in args.initial_feature_counts):
         parser.error("--initial-feature-counts must be >= 0")
 

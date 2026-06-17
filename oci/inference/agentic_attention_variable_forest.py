@@ -408,6 +408,12 @@ class AgenticAttentionVariableForestRunner:
         r_loss = metrics.get("r_loss_mean")
         if zero_loss is not None and zero_loss > 0 and r_loss is not None:
             metrics["r_loss_relative_improvement"] = float(1.0 - r_loss / zero_loss)
+        if "r_stage_train_eligible" in predictions.columns:
+            eligible = predictions["r_stage_train_eligible"].astype(bool)
+            metrics["r_stage_train_eligible_rows"] = int(eligible.sum())
+            metrics["r_stage_train_eligible_fraction"] = _finite_or_none(
+                eligible.mean()
+            )
         if self.config.treatment_column in predictions.columns:
             metrics["nuisance_treatment_auroc"] = _safe_roc_auc(
                 predictions[self.config.treatment_column].to_numpy(),
@@ -730,6 +736,18 @@ class AgenticAttentionVariableForestRunner:
         m = r_df["m_hat"].to_numpy(dtype=float)
         y = df[self.config.outcome_column].to_numpy(dtype=float)
         t = df[self.config.treatment_column].to_numpy(dtype=float)
+        r_stage_min_propensity = float(
+            getattr(self.avf_config, "r_stage_min_propensity", 0.0)
+        )
+        r_stage_max_propensity = float(
+            getattr(self.avf_config, "r_stage_max_propensity", 1.0)
+        )
+        train_eligible = (
+            np.isfinite(e)
+            & (e >= r_stage_min_propensity)
+            & (e <= r_stage_max_propensity)
+        )
+        r_df["r_stage_train_eligible"] = train_eligible
         t_resid = t - np.clip(e, self.avf_config.e_clip, 1.0 - self.avf_config.e_clip)
         y_resid = y - m
 
@@ -746,10 +764,15 @@ class AgenticAttentionVariableForestRunner:
                 "e_hat_hash": _hash_numeric_array(e),
                 "m_hat_hash": _hash_numeric_array(m),
                 "effect_loss": "direct_residual_r_loss_v1",
+                "r_stage_min_propensity": r_stage_min_propensity,
+                "r_stage_max_propensity": r_stage_max_propensity,
             },
         )
 
         def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
+            fit_pos = np.asarray(fit_pos, dtype=int)
+            heldout_pos = np.asarray(heldout_pos, dtype=int)
+            eligible_fit_pos = fit_pos[train_eligible[fit_pos]]
             cached = self._load_effect_fold_checkpoint(
                 df=df,
                 outer_fold=outer_fold,
@@ -760,14 +783,25 @@ class AgenticAttentionVariableForestRunner:
             if cached is not None:
                 return cached
 
+            if len(eligible_fit_pos) < 1:
+                raise ValueError(
+                    "No rows remain for R-stage training in outer fold "
+                    f"{outer_fold} effect fold {fold} after applying propensity "
+                    f"bounds [{r_stage_min_propensity}, {r_stage_max_propensity}]"
+                )
+
             model = None
             logger.info(
-                "Outer fold %s effect fold %s/%s: train=%s heldout=%s%s",
+                "Outer fold %s effect fold %s/%s: train=%s/%s eligible "
+                "heldout=%s propensity_bounds=[%.3f, %.3f]%s",
                 outer_fold,
                 fold,
                 folds,
+                len(eligible_fit_pos),
                 len(fit_pos),
                 len(heldout_pos),
+                r_stage_min_propensity,
+                r_stage_max_propensity,
                 self._cuda_memory_summary(),
             )
             try:
@@ -782,7 +816,7 @@ class AgenticAttentionVariableForestRunner:
                 self._train_effect_model(
                     model,
                     df,
-                    fit_pos,
+                    eligible_fit_pos,
                     y_resid,
                     t_resid,
                     outer_fold=outer_fold,
@@ -830,6 +864,7 @@ class AgenticAttentionVariableForestRunner:
                     "tau_hat": tau_hat,
                     "r_loss": heldout_r_loss,
                     "attention": fold_attention,
+                    "r_stage_train_eligible": train_eligible[heldout_pos],
                 }
                 self._save_effect_fold_checkpoint(
                     df=df,
@@ -2267,6 +2302,13 @@ class AgenticAttentionVariableForestRunner:
                 "effect_fold": int(result["fold"]),
                 "tau_hat_r_stage": np.asarray(result["tau_hat"], dtype=float),
                 "r_loss": np.asarray(result["r_loss"], dtype=float),
+                "r_stage_train_eligible": np.asarray(
+                    result.get(
+                        "r_stage_train_eligible",
+                        np.ones(len(heldout_pos), dtype=bool),
+                    ),
+                    dtype=bool,
+                ),
             }
         )
         self._save_fold_checkpoint(
