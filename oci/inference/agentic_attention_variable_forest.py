@@ -119,6 +119,24 @@ class _EffectNet(nn.Module):
         return self.head(features).squeeze(-1)
 
 
+class _ResidualContrastiveNet(nn.Module):
+    def __init__(self, extractor: nn.Module, hidden_dim: int):
+        super().__init__()
+        self.extractor = extractor
+        self.head = nn.Sequential(
+            nn.Linear(extractor.output_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, texts_or_batch):
+        features = self.extractor(
+            texts_or_batch if isinstance(texts_or_batch, dict) else list(texts_or_batch)
+        )
+        return self.head(features).squeeze(-1)
+
+
 class _FoldTextDataset(Dataset):
     def __init__(
         self,
@@ -219,8 +237,10 @@ class AgenticAttentionVariableForestRunner:
 
         self.nuisance_rows: List[pd.DataFrame] = []
         self.r_stage_rows: List[pd.DataFrame] = []
+        self.residual_contrastive_rows: List[pd.DataFrame] = []
         self.nuisance_attention_rows: List[Dict[str, Any]] = []
         self.effect_attention_rows: List[Dict[str, Any]] = []
+        self.residual_contrastive_attention_rows: List[Dict[str, Any]] = []
         self.confounder_candidate_rows: List[Dict[str, Any]] = []
         self.modifier_candidate_rows: List[Dict[str, Any]] = []
         self.consensus_disambiguation_rows: List[Dict[str, Any]] = []
@@ -292,6 +312,13 @@ class AgenticAttentionVariableForestRunner:
     ) -> pd.DataFrame:
         discovery_df = self.dataset.iloc[train_idx].reset_index(drop=True)
         nuisance = self._crossfit_nuisance(discovery_df, outer_fold)
+        residual_contrastive = None
+        if self._residual_contrastive_enabled():
+            residual_contrastive = self._crossfit_residual_contrastive(
+                discovery_df,
+                nuisance["predictions"],
+                outer_fold,
+            )
         if getattr(self.avf_config, "neural_only", False):
             r_stage = self._crossfit_effect(discovery_df, nuisance["predictions"], outer_fold)
             predictions = self._neural_only_prediction_frame(
@@ -299,10 +326,18 @@ class AgenticAttentionVariableForestRunner:
                 r_stage_predictions=r_stage["predictions"],
                 outer_fold=outer_fold,
             )
+            if residual_contrastive is not None:
+                predictions = self._merge_residual_contrastive_predictions(
+                    predictions,
+                    residual_contrastive["predictions"],
+                )
+            metrics = self._neural_only_metrics(predictions)
+            if residual_contrastive is not None:
+                metrics.update(residual_contrastive["metrics"])
             self.metric_rows.append(
                 {
                     "outer_fold": outer_fold,
-                    **self._neural_only_metrics(predictions),
+                    **metrics,
                 }
             )
             return predictions
@@ -315,13 +350,27 @@ class AgenticAttentionVariableForestRunner:
             attention_rows=nuisance["attention"],
             existing_specs=self._initial_specs(),
         )
-        r_stage = self._crossfit_effect(discovery_df, nuisance["predictions"], outer_fold)
+        contrastive_for_discovery = (
+            residual_contrastive is not None
+            and bool(
+                getattr(
+                    self.avf_config,
+                    "residual_contrastive_use_for_effect_discovery",
+                    True,
+                )
+            )
+        )
+        if contrastive_for_discovery and residual_contrastive["attention"]:
+            modifier_attention = residual_contrastive["attention"]
+        else:
+            r_stage = self._crossfit_effect(discovery_df, nuisance["predictions"], outer_fold)
+            modifier_attention = r_stage["attention"]
         modifiers = self._discover_extract_filter_with_retries(
             stage="effect_modifier",
             outer_fold=outer_fold,
             discovery_df=discovery_df,
             train_idx=train_idx,
-            attention_rows=r_stage["attention"],
+            attention_rows=modifier_attention,
             existing_specs=self._merge_specs(self._initial_specs(), confounders),
         )
         selected_specs = self._merge_specs(self._initial_specs(), confounders, modifiers)
@@ -350,6 +399,8 @@ class AgenticAttentionVariableForestRunner:
             selected_specs=selected_specs,
             fold_id=outer_fold,
         )
+        if residual_contrastive is not None:
+            metrics.update(residual_contrastive["metrics"])
         predictions["outer_fold"] = outer_fold
         predictions["selected_feature_names"] = ",".join(spec.name for spec in selected_specs)
         self.metric_rows.append({"outer_fold": outer_fold, **metrics})
@@ -447,6 +498,37 @@ class AgenticAttentionVariableForestRunner:
                 predictions["e_hat"].to_numpy(),
             )
         return metrics
+
+    def _residual_contrastive_enabled(self) -> bool:
+        return bool(getattr(self.avf_config, "residual_contrastive_enabled", False))
+
+    def _merge_residual_contrastive_predictions(
+        self,
+        predictions: pd.DataFrame,
+        residual_predictions: pd.DataFrame,
+    ) -> pd.DataFrame:
+        if residual_predictions.empty:
+            return predictions
+        key_cols = ["_oci_row_id", "outer_fold"]
+        skip_cols = {
+            "e_hat",
+            "m_hat",
+            "y_residual",
+            "t_residual",
+            "r_loss_at_zero_tau",
+            "nuisance_fold",
+        }
+        merge_cols = [
+            col
+            for col in residual_predictions.columns
+            if col in key_cols
+            or (col not in predictions.columns and col not in skip_cols)
+        ]
+        return predictions.merge(
+            residual_predictions[merge_cols],
+            on=key_cols,
+            how="left",
+        )
 
     def _initial_specs(self) -> List[ExplicitFeatureSpec]:
         if getattr(self.config.explicit_features, "features", None):
@@ -918,6 +1000,259 @@ class AgenticAttentionVariableForestRunner:
         self.effect_attention_rows.extend(attention_rows)
         return {"predictions": r_df, "attention": attention_rows}
 
+    def _crossfit_residual_contrastive(
+        self,
+        df: pd.DataFrame,
+        nuisance_predictions: pd.DataFrame,
+        outer_fold: int,
+    ) -> Dict[str, Any]:
+        folds = _bounded_fold_count(self.avf_config.effect_folds, len(df))
+        contrast_df = _residual_contrastive_label_frame(
+            nuisance_predictions,
+            score_name=getattr(
+                self.avf_config,
+                "residual_contrastive_score",
+                "r_score",
+            ),
+            high_quantile=float(
+                getattr(self.avf_config, "residual_contrastive_high_quantile", 0.80)
+            ),
+            low_quantile=float(
+                getattr(self.avf_config, "residual_contrastive_low_quantile", 0.20)
+            ),
+            neutral_abs_quantile=float(
+                getattr(
+                    self.avf_config,
+                    "residual_contrastive_neutral_abs_quantile",
+                    0.40,
+                )
+            ),
+        )
+        for tail in ("high", "low"):
+            contrast_df[f"residual_contrastive_{tail}_logit"] = np.nan
+            contrast_df[f"residual_contrastive_{tail}_prob"] = np.nan
+        contrast_df["residual_contrastive_fold"] = np.nan
+
+        checkpoint_fingerprint = self._crossfit_checkpoint_fingerprint(
+            "residual_contrastive",
+            folds,
+            extra_payload={
+                "score": getattr(
+                    self.avf_config,
+                    "residual_contrastive_score",
+                    "r_score",
+                ),
+                "high_quantile": float(
+                    getattr(
+                        self.avf_config,
+                        "residual_contrastive_high_quantile",
+                        0.80,
+                    )
+                ),
+                "low_quantile": float(
+                    getattr(
+                        self.avf_config,
+                        "residual_contrastive_low_quantile",
+                        0.20,
+                    )
+                ),
+                "neutral_abs_quantile": float(
+                    getattr(
+                        self.avf_config,
+                        "residual_contrastive_neutral_abs_quantile",
+                        0.40,
+                    )
+                ),
+                "min_class_count": int(
+                    getattr(
+                        self.avf_config,
+                        "residual_contrastive_min_class_count",
+                        10,
+                    )
+                ),
+            },
+        )
+        splits = KFold(n_splits=folds, shuffle=True, random_state=outer_fold * 211 + 19)
+        split_items = [
+            (fold, (np.asarray(fit_pos), np.asarray(heldout_pos)))
+            for fold, (fit_pos, heldout_pos) in enumerate(splits.split(df), start=1)
+        ]
+
+        def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray) -> Dict[str, Any]:
+            cached = self._load_residual_contrastive_fold_checkpoint(
+                df,
+                outer_fold,
+                fold,
+                heldout_pos,
+                checkpoint_fingerprint,
+            )
+            if cached is not None:
+                return cached
+
+            fold_predictions = contrast_df.iloc[heldout_pos].copy()
+            fold_predictions["heldout_pos"] = heldout_pos
+            fold_predictions["residual_contrastive_fold"] = float(fold)
+            fold_attention: List[Dict[str, Any]] = []
+            hidden_dim = int(
+                getattr(
+                    self.config.architecture,
+                    "causal_head_hidden_outcome_dim",
+                    64,
+                )
+            )
+            min_class_count = int(
+                getattr(self.avf_config, "residual_contrastive_min_class_count", 10)
+            )
+            for tail in ("high", "low"):
+                label_col = f"residual_contrastive_{tail}_vs_neutral_label"
+                labels = contrast_df[label_col].to_numpy(dtype=float)
+                train_pos = fit_pos[np.isfinite(labels[fit_pos])]
+                train_labels = labels[train_pos]
+                n_pos = int(np.sum(train_labels == 1.0))
+                n_neg = int(np.sum(train_labels == 0.0))
+                if n_pos < min_class_count or n_neg < min_class_count:
+                    logger.info(
+                        "Outer fold %s residual contrastive %s fold %s/%s skipped: "
+                        "positive=%s neutral=%s min_class_count=%s",
+                        outer_fold,
+                        tail,
+                        fold,
+                        folds,
+                        n_pos,
+                        n_neg,
+                        min_class_count,
+                    )
+                    continue
+
+                model: Optional[_ResidualContrastiveNet] = None
+                try:
+                    model = _ResidualContrastiveNet(
+                        extractor=self._create_extractor(),
+                        hidden_dim=hidden_dim,
+                    ).to(self.device)
+                    self._train_residual_contrastive_model(
+                        model,
+                        df,
+                        train_pos,
+                        labels,
+                        contrast_tail=tail,
+                        outer_fold=outer_fold,
+                        fold=fold,
+                        total_folds=folds,
+                    )
+                    logits = self._predict_residual_contrastive_model(
+                        model,
+                        df.iloc[heldout_pos],
+                    )
+                    probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -50.0, 50.0)))
+                    fold_predictions[f"residual_contrastive_{tail}_logit"] = logits
+                    fold_predictions[f"residual_contrastive_{tail}_prob"] = probs
+
+                    attention_pos = _tail_attention_positions(
+                        heldout_pos=heldout_pos,
+                        labels=labels,
+                        probs=probs,
+                        max_rows=max(
+                            int(self.avf_config.attention_top_k_chunks) * 8,
+                            _AGENT_CONTEXT_MIN_ROWS,
+                        ),
+                    )
+                    if len(attention_pos) > 0:
+                        heldout_lookup = {
+                            int(pos): idx for idx, pos in enumerate(heldout_pos.tolist())
+                        }
+                        prob_values = np.asarray(
+                            [probs[heldout_lookup[int(pos)]] for pos in attention_pos],
+                            dtype=float,
+                        )
+                        evidence_df = df.iloc[attention_pos].reset_index(drop=True)
+                        evidence_rows = self._attention_evidence(
+                            model.extractor,
+                            evidence_df,
+                            fold=fold,
+                            outer_fold=outer_fold,
+                            stage=f"residual_contrastive_{tail}",
+                            extra={
+                                "residual_score": contrast_df.iloc[attention_pos][
+                                    "residual_score"
+                                ].to_numpy(dtype=float),
+                                "r_score": contrast_df.iloc[attention_pos][
+                                    "r_score"
+                                ].to_numpy(dtype=float),
+                                "r_score_normalized": contrast_df.iloc[attention_pos][
+                                    "r_score_normalized"
+                                ].to_numpy(dtype=float),
+                                "contrastive_label": np.ones(
+                                    len(attention_pos),
+                                    dtype=float,
+                                ),
+                                "contrastive_prob": prob_values,
+                                "contrastive_tail": np.asarray(
+                                    [tail] * len(attention_pos),
+                                    dtype=object,
+                                ),
+                            },
+                        )
+                        fold_attention.extend(evidence_rows)
+                except RuntimeError as exc:
+                    if _is_cuda_oom(exc):
+                        logger.error(
+                            "CUDA OOM in outer fold %s residual contrastive %s "
+                            "fold %s/%s%s",
+                            outer_fold,
+                            tail,
+                            fold,
+                            folds,
+                            self._cuda_memory_summary(),
+                        )
+                    raise
+                finally:
+                    if model is not None:
+                        self._cleanup_model(model)
+
+            result = {
+                "fold": fold,
+                "heldout_pos": heldout_pos,
+                "predictions": fold_predictions,
+                "attention": fold_attention,
+            }
+            self._save_residual_contrastive_fold_checkpoint(
+                result=result,
+                outer_fold=outer_fold,
+                fingerprint=checkpoint_fingerprint,
+            )
+            return result
+
+        n_jobs = self._fold_n_jobs(folds)
+        logger.info(
+            "Outer fold %s residual contrastive cross-fit parallelism: folds=%s "
+            "n_jobs=%s setting=%s device=%s",
+            outer_fold,
+            folds,
+            n_jobs,
+            self.avf_config.fold_parallelism,
+            self.device,
+        )
+        fold_results = _run_crossfit_fold_tasks(run_fold, split_items, n_jobs)
+        attention_rows: List[Dict[str, Any]] = []
+        for result in fold_results:
+            heldout_pos = np.asarray(result["heldout_pos"], dtype=int)
+            pred = result["predictions"].reset_index(drop=True)
+            for col in pred.columns:
+                if col in {"heldout_pos", "_oci_row_id"}:
+                    continue
+                contrast_df.loc[heldout_pos, col] = pred[col].to_numpy()
+            attention_rows.extend(result["attention"])
+
+        self.residual_contrastive_rows.append(contrast_df)
+        self.residual_contrastive_attention_rows.extend(attention_rows)
+        metrics = self._residual_contrastive_metrics(contrast_df)
+        return {
+            "predictions": contrast_df,
+            "attention": attention_rows,
+            "metrics": metrics,
+        }
+
     def _train_nuisance_model(
         self,
         model: _NuisanceNet,
@@ -1129,6 +1464,117 @@ class AgenticAttentionVariableForestRunner:
                 self._cuda_memory_summary(),
             )
 
+    def _train_residual_contrastive_model(
+        self,
+        model: _ResidualContrastiveNet,
+        df: pd.DataFrame,
+        positions,
+        labels: np.ndarray,
+        contrast_tail: str,
+        outer_fold: int,
+        fold: int,
+        total_folds: int,
+    ):
+        train_config = self.config.training
+        model.extractor.fit_tokenizer(
+            df.iloc[positions][self.config.text_column].astype(str).tolist()
+        )
+        label_values = np.asarray(labels, dtype=np.float32)
+        train_loader = self._make_text_loader(
+            model,
+            df,
+            positions,
+            fields={"contrastive_label": label_values},
+            shuffle=True,
+            total_folds=total_folds,
+            batch_size=getattr(train_config, "effect_batch_size", None),
+        )
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=train_config.learning_rate,
+            weight_decay=getattr(train_config, "weight_decay", 0.01),
+        )
+        train_labels = label_values[np.asarray(positions, dtype=int)]
+        n_pos = float(np.sum(train_labels == 1.0))
+        n_neg = float(np.sum(train_labels == 0.0))
+        pos_weight = torch.tensor(
+            [max(n_neg / max(n_pos, 1.0), 1e-6)],
+            device=self.device,
+            dtype=torch.float32,
+        )
+        num_batches = max(1, len(train_loader))
+        scheduler = _make_linear_lr_scheduler(optimizer, train_config, num_batches)
+        progress_every = max(1, num_batches // 5)
+        logger.info(
+            "Outer fold %s residual contrastive %s fold %s/%s: training for "
+            "%s epoch(s), positive=%s neutral=%s, batch_size=%s, batches/epoch=%s, "
+            "dataloader_workers=%s, lr=%.3g, lr_schedule=%s%s",
+            outer_fold,
+            contrast_tail,
+            fold,
+            total_folds,
+            train_config.epochs,
+            int(n_pos),
+            int(n_neg),
+            train_loader.batch_size,
+            num_batches,
+            train_loader.num_workers,
+            _current_lr(optimizer),
+            "linear" if scheduler is not None else "none",
+            self._cuda_memory_summary(),
+        )
+        for epoch in range(1, train_config.epochs + 1):
+            model.train()
+            loss_sum = 0.0
+            batch_count = 0
+            for batch_idx, batch in enumerate(train_loader, start=1):
+                y = batch["contrastive_label"].to(self.device, non_blocking=True)
+                optimizer.zero_grad(set_to_none=True)
+                logit = model(batch["model_input"])
+                loss = F.binary_cross_entropy_with_logits(
+                    logit,
+                    y,
+                    pos_weight=pos_weight,
+                )
+                loss.backward()
+                self._clip_and_step(model, optimizer, scheduler)
+                batch_count += 1
+                loss_value = float(loss.detach().cpu())
+                loss_sum += loss_value
+                if (
+                    batch_idx == 1
+                    or batch_idx == num_batches
+                    or batch_idx % progress_every == 0
+                ):
+                    logger.info(
+                        "Outer fold %s residual contrastive %s fold %s/%s "
+                        "epoch %s/%s batch %s/%s loss=%.4f lr=%.3g%s",
+                        outer_fold,
+                        contrast_tail,
+                        fold,
+                        total_folds,
+                        epoch,
+                        train_config.epochs,
+                        batch_idx,
+                        num_batches,
+                        loss_value,
+                        _current_lr(optimizer),
+                        self._cuda_memory_summary(),
+                    )
+            logger.info(
+                "Outer fold %s residual contrastive %s fold %s/%s epoch %s/%s "
+                "complete: loss=%.4f lr=%.3g%s",
+                outer_fold,
+                contrast_tail,
+                fold,
+                total_folds,
+                epoch,
+                train_config.epochs,
+                loss_sum / max(1, batch_count),
+                _current_lr(optimizer),
+                self._cuda_memory_summary(),
+            )
+
     def _clip_and_step(self, model: nn.Module, optimizer, scheduler=None) -> None:
         clip_norm = getattr(self.config.training, "gradient_clip_norm", 0.0)
         if clip_norm > 0:
@@ -1171,6 +1617,72 @@ class AgenticAttentionVariableForestRunner:
                 tau.append(model(batch["model_input"]).cpu().numpy())
         return np.concatenate(tau)
 
+    def _predict_residual_contrastive_model(
+        self,
+        model: _ResidualContrastiveNet,
+        df: pd.DataFrame,
+    ) -> np.ndarray:
+        model.eval()
+        logits = []
+        loader = self._make_text_loader(
+            model,
+            df,
+            np.arange(len(df), dtype=int),
+            shuffle=False,
+            batch_size=getattr(self.config.training, "effect_batch_size", None),
+        )
+        with torch.no_grad():
+            for batch in loader:
+                logits.append(model(batch["model_input"]).cpu().numpy())
+        return np.concatenate(logits)
+
+    def _residual_contrastive_metrics(
+        self,
+        predictions: pd.DataFrame,
+    ) -> Dict[str, Any]:
+        metrics: Dict[str, Any] = {
+            "residual_contrastive_enabled": True,
+            "residual_contrastive_score": getattr(
+                self.avf_config,
+                "residual_contrastive_score",
+                "r_score",
+            ),
+            "residual_contrastive_high_threshold": _finite_or_none(
+                predictions["residual_contrastive_high_threshold"].iloc[0]
+            ),
+            "residual_contrastive_low_threshold": _finite_or_none(
+                predictions["residual_contrastive_low_threshold"].iloc[0]
+            ),
+            "residual_contrastive_neutral_abs_threshold": _finite_or_none(
+                predictions["residual_contrastive_neutral_abs_threshold"].iloc[0]
+            ),
+        }
+        group_counts = predictions["residual_contrastive_group"].value_counts(dropna=False)
+        for group in ["high", "low", "neutral", "middle"]:
+            metrics[f"residual_contrastive_{group}_rows"] = int(
+                group_counts.get(group, 0)
+            )
+        for tail in ("high", "low"):
+            label_col = f"residual_contrastive_{tail}_vs_neutral_label"
+            prob_col = f"residual_contrastive_{tail}_prob"
+            mask = (
+                predictions[label_col].notna()
+                & predictions[prob_col].notna()
+                & np.isfinite(predictions[label_col].to_numpy(dtype=float))
+                & np.isfinite(predictions[prob_col].to_numpy(dtype=float))
+            )
+            metrics[f"residual_contrastive_{tail}_vs_neutral_rows"] = int(mask.sum())
+            if int(mask.sum()) > 1:
+                metrics[f"residual_contrastive_{tail}_vs_neutral_auroc"] = (
+                    _safe_roc_auc(
+                        predictions.loc[mask, label_col].to_numpy(dtype=float),
+                        predictions.loc[mask, prob_col].to_numpy(dtype=float),
+                    )
+                )
+            else:
+                metrics[f"residual_contrastive_{tail}_vs_neutral_auroc"] = None
+        return metrics
+
     def _attention_evidence(
         self,
         extractor: nn.Module,
@@ -1186,7 +1698,7 @@ class AgenticAttentionVariableForestRunner:
         for offset in range(len(df)):
             item = {"outer_fold": outer_fold}
             for key, values in extra.items():
-                item[key] = float(np.asarray(values)[offset])
+                item[key] = _metadata_value(values, offset)
             metadata.append(item)
         batch_size = max(1, int(self.config.training.batch_size))
         total_batches = max(1, int(np.ceil(len(texts) / batch_size)))
@@ -1521,8 +2033,19 @@ class AgenticAttentionVariableForestRunner:
             if row.get("evidence_snippet") or row.get("top_token_spans")
         ]
         instruction = (
-            "Infer explicit pre-treatment patient-level variables represented by repeated high-attention token spans inside high-attention chunks."
+            "Infer explicit pre-treatment patient-level variables represented by "
+            "repeated high-attention token spans inside high-attention chunks."
         )
+        if any(
+            str(row.get("stage", "")).startswith("residual_contrastive")
+            for row in attention_rows
+        ):
+            instruction = (
+                "Infer explicit pre-treatment patient-level variables that "
+                "distinguish residual-score tail patients from neutral "
+                "near-zero residual-score patients, using repeated "
+                "high-attention token spans as evidence."
+            )
         return {
             "prompt_version": "agentic_attention_variable_forest_v1",
             "stage": stage,
@@ -1550,6 +2073,14 @@ class AgenticAttentionVariableForestRunner:
                 "snippet_chars": _AGENT_CONTEXT_SNIPPET_CHARS,
                 "selection": "highest absolute chunk attention after dropping blank text",
             },
+            "signal_source": (
+                "residual_contrastive_tail_vs_neutral"
+                if any(
+                    str(row.get("stage", "")).startswith("residual_contrastive")
+                    for row in attention_rows
+                )
+                else "attention"
+            ),
             "attention_evidence": context_rows,
             "fold_label_summary": {
                 "n": int(len(discovery_df)),
@@ -1593,9 +2124,17 @@ class AgenticAttentionVariableForestRunner:
             "t_residual",
             "tau_hat_r_stage",
             "r_loss",
+            "residual_score",
+            "r_score",
+            "r_score_normalized",
+            "contrastive_label",
+            "contrastive_prob",
         ]:
             if key in row:
                 context_row[key] = _round_context_float(row[key])
+        for key in ["contrastive_tail"]:
+            if key in row and row[key] is not None:
+                context_row[key] = str(row[key])
         if compact_spans:
             context_row["top_token_spans"] = compact_spans
             summary = row.get("attended_token_summary")
@@ -2320,6 +2859,48 @@ class AgenticAttentionVariableForestRunner:
             fingerprint,
         )
 
+    def _load_residual_contrastive_fold_checkpoint(
+        self,
+        df: pd.DataFrame,
+        outer_fold: int,
+        fold: int,
+        heldout_pos: np.ndarray,
+        fingerprint: str,
+    ) -> Optional[Dict[str, Any]]:
+        loaded = self._load_fold_checkpoint(
+            "residual_contrastive",
+            df,
+            outer_fold,
+            fold,
+            heldout_pos,
+            fingerprint,
+        )
+        if loaded is None:
+            return None
+        pred_df, attention_rows = loaded
+        return {
+            "fold": fold,
+            "heldout_pos": np.asarray(heldout_pos),
+            "predictions": pred_df,
+            "attention": attention_rows,
+        }
+
+    def _save_residual_contrastive_fold_checkpoint(
+        self,
+        result: Dict[str, Any],
+        outer_fold: int,
+        fingerprint: str,
+    ) -> None:
+        predictions = result["predictions"].copy()
+        self._save_fold_checkpoint(
+            "residual_contrastive",
+            outer_fold,
+            int(result["fold"]),
+            predictions,
+            result["attention"],
+            fingerprint,
+        )
+
     def _filter_specs_by_extraction_coverage(
         self,
         df: pd.DataFrame,
@@ -2515,12 +3096,21 @@ class AgenticAttentionVariableForestRunner:
                 self.artifact_dir / "r_stage_oof_predictions.parquet",
                 index=False,
             )
+        if self.residual_contrastive_rows:
+            pd.concat(self.residual_contrastive_rows).to_parquet(
+                self.artifact_dir / "residual_contrastive_oof_predictions.parquet",
+                index=False,
+            )
         pd.DataFrame(self.nuisance_attention_rows).to_parquet(
             self.artifact_dir / "nuisance_attention_evidence.parquet",
             index=False,
         )
         pd.DataFrame(self.effect_attention_rows).to_parquet(
             self.artifact_dir / "r_stage_attention_evidence.parquet",
+            index=False,
+        )
+        pd.DataFrame(self.residual_contrastive_attention_rows).to_parquet(
+            self.artifact_dir / "residual_contrastive_attention_evidence.parquet",
             index=False,
         )
         _write_jsonl(
@@ -3564,6 +4154,108 @@ def _run_crossfit_fold_tasks(run_fold, split_items, n_jobs: int) -> List[Dict[st
             for fold, (fit_pos, heldout_pos) in split_items
         ]
         return [future.result() for future in futures]
+
+
+def _metadata_value(values: Any, offset: int) -> Any:
+    array = np.asarray(values, dtype=object)
+    value = array.item() if array.ndim == 0 else array[offset]
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        numeric = float(value)
+        return numeric if np.isfinite(numeric) else None
+    return str(value)
+
+
+def _residual_contrastive_label_frame(
+    nuisance_predictions: pd.DataFrame,
+    score_name: str,
+    high_quantile: float,
+    low_quantile: float,
+    neutral_abs_quantile: float,
+) -> pd.DataFrame:
+    df = nuisance_predictions.copy()
+    y_resid = df["y_residual"].to_numpy(dtype=float)
+    t_resid = df["t_residual"].to_numpy(dtype=float)
+    e_hat = df["e_hat"].to_numpy(dtype=float)
+    r_score = y_resid * t_resid
+    denom = np.clip(e_hat * (1.0 - e_hat), 1e-6, None)
+    normalized = r_score / denom
+    if score_name == "r_score":
+        score = r_score
+    elif score_name == "r_score_normalized":
+        score = normalized
+    else:
+        raise ValueError(f"Unsupported residual contrastive score: {score_name}")
+
+    finite = np.isfinite(score)
+    if not np.any(finite):
+        raise ValueError("No finite residual scores available for contrastive labels")
+    high_threshold = float(np.nanquantile(score[finite], high_quantile))
+    low_threshold = float(np.nanquantile(score[finite], low_quantile))
+    neutral_abs_threshold = float(
+        np.nanquantile(np.abs(score[finite]), neutral_abs_quantile)
+    )
+
+    neutral = finite & (np.abs(score) <= neutral_abs_threshold)
+    high = finite & (score >= high_threshold) & (score > neutral_abs_threshold)
+    low = finite & (score <= low_threshold) & (score < -neutral_abs_threshold)
+    group = np.full(len(df), "middle", dtype=object)
+    group[neutral] = "neutral"
+    group[high] = "high"
+    group[low] = "low"
+
+    high_label = np.full(len(df), np.nan, dtype=float)
+    high_label[neutral] = 0.0
+    high_label[high] = 1.0
+    low_label = np.full(len(df), np.nan, dtype=float)
+    low_label[neutral] = 0.0
+    low_label[low] = 1.0
+
+    df["r_score"] = r_score
+    df["r_score_normalized"] = normalized
+    df["residual_score"] = score
+    df["residual_contrastive_group"] = group
+    df["residual_contrastive_high_vs_neutral_label"] = high_label
+    df["residual_contrastive_low_vs_neutral_label"] = low_label
+    df["residual_contrastive_high_threshold"] = high_threshold
+    df["residual_contrastive_low_threshold"] = low_threshold
+    df["residual_contrastive_neutral_abs_threshold"] = neutral_abs_threshold
+    return df
+
+
+def _tail_attention_positions(
+    heldout_pos: np.ndarray,
+    labels: np.ndarray,
+    probs: np.ndarray,
+    max_rows: int,
+) -> np.ndarray:
+    heldout_pos = np.asarray(heldout_pos, dtype=int)
+    labels = np.asarray(labels, dtype=float)
+    probs = np.asarray(probs, dtype=float)
+    heldout_labels = labels[heldout_pos]
+    positive_mask = np.isfinite(heldout_labels) & (heldout_labels == 1.0)
+    selected = heldout_pos[positive_mask]
+    if selected.size == 0:
+        finite_prob = np.isfinite(probs)
+        if not np.any(finite_prob):
+            return np.asarray([], dtype=int)
+        order = np.argsort(probs[finite_prob])[::-1]
+        selected = heldout_pos[finite_prob][order]
+    else:
+        positive_probs = probs[positive_mask]
+        order = np.argsort(positive_probs)[::-1]
+        selected = selected[order]
+    return selected[: max(1, int(max_rows))]
 
 
 def _make_linear_lr_scheduler(optimizer, train_config, steps_per_epoch: int):

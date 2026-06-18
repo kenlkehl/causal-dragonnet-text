@@ -465,6 +465,13 @@ class AgenticAttentionVariableForestConfig:
     e_clip: float = 0.01
     r_stage_min_propensity: float = 0.0
     r_stage_max_propensity: float = 1.0
+    residual_contrastive_enabled: bool = False
+    residual_contrastive_use_for_effect_discovery: bool = True
+    residual_contrastive_score: str = "r_score"
+    residual_contrastive_high_quantile: float = 0.80
+    residual_contrastive_low_quantile: float = 0.20
+    residual_contrastive_neutral_abs_quantile: float = 0.40
+    residual_contrastive_min_class_count: int = 10
     manual_features_locked: bool = True
     neural_only: bool = False
 
@@ -545,6 +552,32 @@ class AgenticAttentionVariableForestConfig:
             raise ValueError(
                 "agentic_attention_variable_forest r-stage propensity bounds "
                 "must satisfy 0 <= min < max <= 1"
+            )
+        valid_scores = {"r_score", "r_score_normalized"}
+        if self.residual_contrastive_score not in valid_scores:
+            raise ValueError(
+                "agentic_attention_variable_forest.residual_contrastive_score "
+                f"must be one of {sorted(valid_scores)}"
+            )
+        if not (
+            0.0
+            < self.residual_contrastive_low_quantile
+            < self.residual_contrastive_high_quantile
+            < 1.0
+        ):
+            raise ValueError(
+                "agentic_attention_variable_forest residual contrastive low/high "
+                "quantiles must satisfy 0 < low < high < 1"
+            )
+        if not 0.0 < self.residual_contrastive_neutral_abs_quantile < 1.0:
+            raise ValueError(
+                "agentic_attention_variable_forest.residual_contrastive_neutral_abs_quantile "
+                "must be in (0, 1)"
+            )
+        if self.residual_contrastive_min_class_count < 1:
+            raise ValueError(
+                "agentic_attention_variable_forest.residual_contrastive_min_class_count "
+                "must be >= 1"
             )
 
 

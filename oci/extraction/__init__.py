@@ -15,6 +15,20 @@ from .explicit_features import (
     extract_explicit_features,
 )
 from .cache import ExtractionCache
+from .numeric_inventory import (
+    AgenticNumericInventoryExtractor,
+    CompletionResult,
+    NumericInventoryConfig,
+    NumericInventoryLLMClient,
+    NumericTextChunk,
+    build_chunk_extraction_prompt,
+    build_ontology_harmonization_prompt,
+    build_patient_reconciliation_prompt,
+    chunk_dataset_documents,
+    parse_numeric_values_response,
+    parse_ontology_mapping_response,
+    split_text_into_all_word_chunks,
+)
 
 # Backward-compatible import aliases. Old config keys are still rejected.
 ExplicitConfounderValue = ExplicitFeatureValue
@@ -31,6 +45,18 @@ __all__ = [
     "strip_reasoning_trace",
     "extract_explicit_features",
     "ExtractionCache",
+    "AgenticNumericInventoryExtractor",
+    "CompletionResult",
+    "NumericInventoryConfig",
+    "NumericInventoryLLMClient",
+    "NumericTextChunk",
+    "build_chunk_extraction_prompt",
+    "build_ontology_harmonization_prompt",
+    "build_patient_reconciliation_prompt",
+    "chunk_dataset_documents",
+    "parse_numeric_values_response",
+    "parse_ontology_mapping_response",
+    "split_text_into_all_word_chunks",
     "ExplicitConfounderValue",
     "VLLMConfounderExtractor",
     "extract_explicit_confounders",

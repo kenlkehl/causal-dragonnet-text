@@ -743,10 +743,9 @@ class CausalText(nn.Module):
 
         # Targeted regularization (R-loss)
         if beta_targreg > 0:
-            with torch.no_grad():
-                propensity = torch.sigmoid(t_logit).clamp(1e-3, 1 - 1e-3)
-                H = (treatments.unsqueeze(1) / propensity) - \
-                    ((1 - treatments.unsqueeze(1)) / (1 - propensity))
+            propensity = torch.sigmoid(t_logit).clamp(1e-3, 1 - 1e-3)
+            H = (treatments.unsqueeze(1) / propensity) - \
+                ((1 - treatments.unsqueeze(1)) / (1 - propensity))
 
             factual_prob = self._outcome_activation(factual_logit)
             moment = torch.mean((outcomes.unsqueeze(1) - factual_prob) * H)

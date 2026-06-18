@@ -6,7 +6,8 @@ cross-fitted nuisance predictions already exist. It skips nuisance training,
 agentic variable proposal, feature extraction, and the final forest. It loads a
 saved ``nuisance_oof_predictions.parquet`` file, retrains only the text-based
 R-stage tau model, and writes the usual neural diagnostics and attention
-artifacts.
+artifacts. Optionally, it can also train residual-score tail-vs-neutral
+contrastive text classifiers from the same saved nuisance residuals.
 
 Typical use, starting from a neural-only run:
 
@@ -107,10 +108,10 @@ class RStageOnlyOracleConfig:
     htr_trainable_sentence_encoder_layers: int = 0
     htr_dropout: float = 0.1
 
-    epochs: int = 25
+    epochs: int = 50
     batch_size: int = 8
     effect_batch_size: int = 128
-    learning_rate: float = 1e-4
+    learning_rate: float = 1e-5
     weight_decay: float = 0.01
     gradient_clip_norm: float = 1.0
 
@@ -120,6 +121,12 @@ class RStageOnlyOracleConfig:
     e_clip: float = 0.01
     r_stage_min_propensity: float = 0.0
     r_stage_max_propensity: float = 1.0
+    residual_contrastive_enabled: bool = False
+    residual_contrastive_score: str = "r_score"
+    residual_contrastive_high_quantile: float = 0.80
+    residual_contrastive_low_quantile: float = 0.20
+    residual_contrastive_neutral_abs_quantile: float = 0.40
+    residual_contrastive_min_class_count: int = 10
 
     def config_hash(self) -> str:
         payload = json.dumps(asdict(self), sort_keys=True, default=str)
@@ -232,6 +239,20 @@ def _make_applied_config(
                 e_clip=config.e_clip,
                 r_stage_min_propensity=config.r_stage_min_propensity,
                 r_stage_max_propensity=config.r_stage_max_propensity,
+                residual_contrastive_enabled=config.residual_contrastive_enabled,
+                residual_contrastive_score=config.residual_contrastive_score,
+                residual_contrastive_high_quantile=(
+                    config.residual_contrastive_high_quantile
+                ),
+                residual_contrastive_low_quantile=(
+                    config.residual_contrastive_low_quantile
+                ),
+                residual_contrastive_neutral_abs_quantile=(
+                    config.residual_contrastive_neutral_abs_quantile
+                ),
+                residual_contrastive_min_class_count=(
+                    config.residual_contrastive_min_class_count
+                ),
                 neural_only=True,
             ),
         ),
@@ -240,6 +261,7 @@ def _make_applied_config(
             batch_size=config.batch_size,
             effect_batch_size=config.effect_batch_size,
             learning_rate=config.learning_rate,
+            lr_schedule="linear",
             weight_decay=config.weight_decay,
             gradient_clip_norm=config.gradient_clip_norm,
         ),
@@ -426,6 +448,13 @@ def run_r_stage_only(
             config=applied_config,
         )
         runner.nuisance_rows.append(nuisance_predictions)
+        residual_contrastive = None
+        if config.residual_contrastive_enabled:
+            residual_contrastive = runner._crossfit_residual_contrastive(
+                discovery_df,
+                nuisance_predictions,
+                outer_fold,
+            )
         r_stage = runner._crossfit_effect(
             discovery_df,
             nuisance_predictions,
@@ -436,8 +465,15 @@ def run_r_stage_only(
             r_stage_predictions=r_stage["predictions"],
             outer_fold=outer_fold,
         )
+        if residual_contrastive is not None:
+            predictions = runner._merge_residual_contrastive_predictions(
+                predictions,
+                residual_contrastive["predictions"],
+            )
         fold_metrics = runner._neural_only_metrics(predictions)
         fold_metrics["mode"] = "r_stage_only"
+        if residual_contrastive is not None:
+            fold_metrics.update(residual_contrastive["metrics"])
         runner.metric_rows.append({"outer_fold": outer_fold, **fold_metrics})
         prediction_frames.append(predictions)
 
@@ -451,6 +487,8 @@ def run_r_stage_only(
 
     artifact_dir = prediction_path.parent / "agentic_attention_variable_forest"
     metrics = _aggregate_neural_metrics(results_df)
+    if config.residual_contrastive_enabled:
+        metrics.update(runner._residual_contrastive_metrics(results_df))
     return {
         "config": asdict(config),
         "metrics": metrics,
@@ -489,6 +527,12 @@ def _result_row(config_hash: str, result: Dict[str, Any]) -> Dict[str, Any]:
         "fold_parallelism",
         "r_stage_min_propensity",
         "r_stage_max_propensity",
+        "residual_contrastive_enabled",
+        "residual_contrastive_score",
+        "residual_contrastive_high_quantile",
+        "residual_contrastive_low_quantile",
+        "residual_contrastive_neutral_abs_quantile",
+        "residual_contrastive_min_class_count",
         "htr_sentence_model",
         "htr_freeze_sentence_encoder",
         "htr_sentence_encoder_backend",
@@ -573,16 +617,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--htr-trainable-sentence-encoder-layers", type=int, default=0)
     parser.add_argument("--htr-dropout", type=float, default=0.1)
 
-    parser.add_argument("--epochs", type=int, default=25)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--effect-batch-size", type=int, default=128)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
     parser.add_argument("--attention-top-k-chunks", type=int, default=5)
     parser.add_argument("--e-clip", type=float, default=0.01)
     parser.add_argument("--r-stage-min-propensity", type=float, default=0.0)
     parser.add_argument("--r-stage-max-propensity", type=float, default=1.0)
+    parser.add_argument(
+        "--residual-contrastive-enabled",
+        action="store_true",
+        help=(
+            "Train residual-score high-vs-neutral and low-vs-neutral text "
+            "classifiers from the saved nuisance residuals."
+        ),
+    )
+    parser.add_argument(
+        "--residual-contrastive-score",
+        default="r_score",
+        choices=["r_score", "r_score_normalized"],
+        help="Residual score used to define high/low tails.",
+    )
+    parser.add_argument("--residual-contrastive-high-quantile", type=float, default=0.80)
+    parser.add_argument("--residual-contrastive-low-quantile", type=float, default=0.20)
+    parser.add_argument(
+        "--residual-contrastive-neutral-abs-quantile",
+        type=float,
+        default=0.40,
+    )
+    parser.add_argument("--residual-contrastive-min-class-count", type=int, default=10)
     return parser
 
 
@@ -626,6 +692,16 @@ def _config_from_args(args: argparse.Namespace) -> RStageOnlyOracleConfig:
         e_clip=args.e_clip,
         r_stage_min_propensity=args.r_stage_min_propensity,
         r_stage_max_propensity=args.r_stage_max_propensity,
+        residual_contrastive_enabled=args.residual_contrastive_enabled,
+        residual_contrastive_score=args.residual_contrastive_score,
+        residual_contrastive_high_quantile=args.residual_contrastive_high_quantile,
+        residual_contrastive_low_quantile=args.residual_contrastive_low_quantile,
+        residual_contrastive_neutral_abs_quantile=(
+            args.residual_contrastive_neutral_abs_quantile
+        ),
+        residual_contrastive_min_class_count=(
+            args.residual_contrastive_min_class_count
+        ),
     )
 
 
@@ -660,6 +736,20 @@ def main() -> None:
             "--r-stage-min-propensity and --r-stage-max-propensity must satisfy "
             "0 <= min < max <= 1"
         )
+    if not (
+        0.0
+        < args.residual_contrastive_low_quantile
+        < args.residual_contrastive_high_quantile
+        < 1.0
+    ):
+        parser.error(
+            "--residual-contrastive-low-quantile and "
+            "--residual-contrastive-high-quantile must satisfy 0 < low < high < 1"
+        )
+    if not 0.0 < args.residual_contrastive_neutral_abs_quantile < 1.0:
+        parser.error("--residual-contrastive-neutral-abs-quantile must be in (0, 1)")
+    if args.residual_contrastive_min_class_count < 1:
+        parser.error("--residual-contrastive-min-class-count must be >= 1")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

@@ -141,6 +141,13 @@ class AgenticAttentionOracleConfig:
     e_clip: float = 0.01
     r_stage_min_propensity: float = 0.0
     r_stage_max_propensity: float = 1.0
+    residual_contrastive_enabled: bool = False
+    residual_contrastive_use_for_effect_discovery: bool = True
+    residual_contrastive_score: str = "r_score"
+    residual_contrastive_high_quantile: float = 0.80
+    residual_contrastive_low_quantile: float = 0.20
+    residual_contrastive_neutral_abs_quantile: float = 0.40
+    residual_contrastive_min_class_count: int = 10
     neural_only: bool = False
 
     cf_n_estimators: int = 200
@@ -287,6 +294,23 @@ def _make_applied_config(
                 e_clip=config.e_clip,
                 r_stage_min_propensity=config.r_stage_min_propensity,
                 r_stage_max_propensity=config.r_stage_max_propensity,
+                residual_contrastive_enabled=config.residual_contrastive_enabled,
+                residual_contrastive_use_for_effect_discovery=(
+                    config.residual_contrastive_use_for_effect_discovery
+                ),
+                residual_contrastive_score=config.residual_contrastive_score,
+                residual_contrastive_high_quantile=(
+                    config.residual_contrastive_high_quantile
+                ),
+                residual_contrastive_low_quantile=(
+                    config.residual_contrastive_low_quantile
+                ),
+                residual_contrastive_neutral_abs_quantile=(
+                    config.residual_contrastive_neutral_abs_quantile
+                ),
+                residual_contrastive_min_class_count=(
+                    config.residual_contrastive_min_class_count
+                ),
                 neural_only=config.neural_only,
             ),
         ),
@@ -629,6 +653,13 @@ def _result_row(config_hash: str, result: Dict[str, Any]) -> Dict[str, Any]:
         "effect_batch_size",
         "r_stage_min_propensity",
         "r_stage_max_propensity",
+        "residual_contrastive_enabled",
+        "residual_contrastive_use_for_effect_discovery",
+        "residual_contrastive_score",
+        "residual_contrastive_high_quantile",
+        "residual_contrastive_low_quantile",
+        "residual_contrastive_neutral_abs_quantile",
+        "residual_contrastive_min_class_count",
         "neural_only",
         "initial_feature_count",
         "initial_feature_strategy",
@@ -786,6 +817,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--r-stage-min-propensity", type=float, default=0.0)
     parser.add_argument("--r-stage-max-propensity", type=float, default=1.0)
     parser.add_argument(
+        "--residual-contrastive-enabled",
+        action="store_true",
+        help=(
+            "Train tail-vs-neutral residual-score text classifiers and save "
+            "their attention evidence."
+        ),
+    )
+    parser.add_argument(
+        "--residual-contrastive-use-for-effect-discovery",
+        type=_parse_bool,
+        default=True,
+        help=(
+            "When residual contrastive training is enabled, use its tail-vs-neutral "
+            "attention evidence for effect-modifier proposals."
+        ),
+    )
+    parser.add_argument(
+        "--residual-contrastive-score",
+        default="r_score",
+        choices=["r_score", "r_score_normalized"],
+        help="Residual score used to define high/low tails.",
+    )
+    parser.add_argument("--residual-contrastive-high-quantile", type=float, default=0.80)
+    parser.add_argument("--residual-contrastive-low-quantile", type=float, default=0.20)
+    parser.add_argument(
+        "--residual-contrastive-neutral-abs-quantile",
+        type=float,
+        default=0.40,
+    )
+    parser.add_argument("--residual-contrastive-min-class-count", type=int, default=10)
+    parser.add_argument(
         "--neural-only",
         action="store_true",
         help="Run nuisance/R-stage neural cross-fitting and attention artifacts only.",
@@ -908,6 +970,23 @@ def _make_configs(args: argparse.Namespace) -> List[AgenticAttentionOracleConfig
                     e_clip=args.e_clip,
                     r_stage_min_propensity=args.r_stage_min_propensity,
                     r_stage_max_propensity=args.r_stage_max_propensity,
+                    residual_contrastive_enabled=args.residual_contrastive_enabled,
+                    residual_contrastive_use_for_effect_discovery=(
+                        args.residual_contrastive_use_for_effect_discovery
+                    ),
+                    residual_contrastive_score=args.residual_contrastive_score,
+                    residual_contrastive_high_quantile=(
+                        args.residual_contrastive_high_quantile
+                    ),
+                    residual_contrastive_low_quantile=(
+                        args.residual_contrastive_low_quantile
+                    ),
+                    residual_contrastive_neutral_abs_quantile=(
+                        args.residual_contrastive_neutral_abs_quantile
+                    ),
+                    residual_contrastive_min_class_count=(
+                        args.residual_contrastive_min_class_count
+                    ),
                     neural_only=args.neural_only,
                     cf_n_estimators=args.cf_n_estimators,
                     cf_min_samples_leaf=args.cf_min_samples_leaf,
@@ -990,6 +1069,20 @@ def main() -> None:
             "--r-stage-min-propensity and --r-stage-max-propensity must satisfy "
             "0 <= min < max <= 1"
         )
+    if not (
+        0.0
+        < args.residual_contrastive_low_quantile
+        < args.residual_contrastive_high_quantile
+        < 1.0
+    ):
+        parser.error(
+            "--residual-contrastive-low-quantile and --residual-contrastive-high-quantile "
+            "must satisfy 0 < low < high < 1"
+        )
+    if not 0.0 < args.residual_contrastive_neutral_abs_quantile < 1.0:
+        parser.error("--residual-contrastive-neutral-abs-quantile must be in (0, 1)")
+    if args.residual_contrastive_min_class_count < 1:
+        parser.error("--residual-contrastive-min-class-count must be >= 1")
     if any(count < 0 for count in args.initial_feature_counts):
         parser.error("--initial-feature-counts must be >= 0")
 

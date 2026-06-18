@@ -21,6 +21,8 @@ from oci.config import (
 from oci.inference.agentic_attention_variable_forest import (
     AgenticAttentionVariableForestRunner,
     consensus_feature_specs,
+    _residual_contrastive_label_frame,
+    _tail_attention_positions,
     _validate_consensus_disambiguation_response,
     _make_linear_lr_scheduler,
     _run_crossfit_fold_tasks,
@@ -502,6 +504,173 @@ def test_effect_crossfit_filters_training_rows_by_propensity(tmp_path, monkeypat
         False,
         True,
     ]
+
+
+def test_residual_contrastive_label_frame_builds_tail_vs_neutral_labels():
+    scores = np.array([-4.0, -2.0, -0.1, 0.0, 0.1, 2.0, 4.0])
+    nuisance_predictions = pd.DataFrame(
+        {
+            "_oci_row_id": np.arange(len(scores)),
+            "outer_fold": 1,
+            "e_hat": np.full(len(scores), 0.5),
+            "m_hat": np.full(len(scores), 0.5),
+            "y_residual": scores,
+            "t_residual": np.ones(len(scores)),
+            "r_loss_at_zero_tau": scores**2,
+            "nuisance_fold": 1,
+        }
+    )
+
+    labeled = _residual_contrastive_label_frame(
+        nuisance_predictions,
+        score_name="r_score",
+        high_quantile=0.75,
+        low_quantile=0.25,
+        neutral_abs_quantile=0.30,
+    )
+
+    assert labeled["residual_contrastive_group"].tolist() == [
+        "low",
+        "low",
+        "neutral",
+        "neutral",
+        "neutral",
+        "high",
+        "high",
+    ]
+    high_labels = labeled["residual_contrastive_high_vs_neutral_label"].to_numpy()
+    low_labels = labeled["residual_contrastive_low_vs_neutral_label"].to_numpy()
+    assert np.isnan(high_labels[:2]).all()
+    assert high_labels[2:].tolist() == [0.0, 0.0, 0.0, 1.0, 1.0]
+    assert low_labels[:5].tolist() == [1.0, 1.0, 0.0, 0.0, 0.0]
+    assert np.isnan(low_labels[5:]).all()
+
+
+def test_tail_attention_positions_prefers_positive_tail_by_probability():
+    selected = _tail_attention_positions(
+        heldout_pos=np.array([0, 1, 2, 3]),
+        labels=np.array([1.0, 0.0, 1.0, np.nan]),
+        probs=np.array([0.2, 0.9, 0.8, 0.7]),
+        max_rows=2,
+    )
+
+    assert selected.tolist() == [2, 0]
+
+
+def test_residual_contrastive_crossfit_outputs_predictions_and_attention(
+    tmp_path,
+    monkeypatch,
+):
+    n = 40
+    df = pd.DataFrame(
+        {
+            "clinical_text": [f"patient residual note {i}" for i in range(n)],
+            "treatment_indicator": [0, 1] * (n // 2),
+            "outcome_indicator": [0, 1, 1, 0] * (n // 4),
+        }
+    )
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        cv_folds=0,
+        architecture=ModelArchitectureConfig(
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=2,
+                effect_folds=2,
+                fold_parallelism="1",
+                residual_contrastive_enabled=True,
+                residual_contrastive_min_class_count=1,
+            ),
+        ),
+        training=TrainingConfig(epochs=1, batch_size=4, effect_batch_size=4),
+        explicit_features=ExplicitFeatureExtractionConfig(enabled=False, features=[]),
+    )
+    runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "predictions.parquet",
+        device=torch.device("cpu"),
+        num_workers=1,
+        proposal_agent=FakeAttentionAgent(),
+        extraction_provider=FakeExtractionProvider(),
+    )
+
+    class TinyExtractor(torch.nn.Module):
+        output_dim = 2
+
+        def fit_tokenizer(self, texts):
+            del texts
+
+        def forward(self, texts):
+            return torch.zeros(len(texts), self.output_dim)
+
+    scores = np.linspace(-2.0, 2.0, n)
+    nuisance_predictions = pd.DataFrame(
+        {
+            "_oci_row_id": runner.dataset["_oci_row_id"].to_numpy(),
+            "outer_fold": 1,
+            "e_hat": np.full(n, 0.5),
+            "m_hat": np.full(n, 0.5),
+            "y_residual": scores,
+            "t_residual": np.ones(n),
+            "r_loss_at_zero_tau": scores**2,
+            "nuisance_fold": 1,
+        }
+    )
+    train_calls = []
+
+    def record_train(model, data, positions, labels, contrast_tail, *args, **kwargs):
+        del model, data, labels, args, kwargs
+        train_calls.append((contrast_tail, len(positions)))
+
+    def fake_predict(model, heldout):
+        del model
+        return np.linspace(-1.0, 1.0, len(heldout))
+
+    def fake_attention(extractor, heldout, fold, outer_fold, stage, extra):
+        del extractor
+        rows = []
+        for idx, row_id in enumerate(heldout["_oci_row_id"].tolist()):
+            rows.append(
+                {
+                    "row_id": int(row_id),
+                    "fold": int(fold),
+                    "outer_fold": int(outer_fold),
+                    "stage": stage,
+                    "chunk_text": "tail evidence",
+                    "attention": 1.0,
+                    "contrastive_tail": extra["contrastive_tail"][idx],
+                    "contrastive_prob": float(extra["contrastive_prob"][idx]),
+                }
+            )
+        return rows
+
+    monkeypatch.setattr(runner, "_create_extractor", lambda: TinyExtractor())
+    monkeypatch.setattr(runner, "_train_residual_contrastive_model", record_train)
+    monkeypatch.setattr(runner, "_predict_residual_contrastive_model", fake_predict)
+    monkeypatch.setattr(runner, "_attention_evidence", fake_attention)
+
+    result = runner._crossfit_residual_contrastive(
+        runner.dataset,
+        nuisance_predictions,
+        outer_fold=1,
+    )
+
+    preds = result["predictions"]
+    assert {"high", "low"} <= {tail for tail, _ in train_calls}
+    assert preds["residual_contrastive_high_prob"].notna().any()
+    assert preds["residual_contrastive_low_prob"].notna().any()
+    assert "residual_contrastive_high_vs_neutral_auroc" in result["metrics"]
+    assert {
+        "residual_contrastive_high",
+        "residual_contrastive_low",
+    } <= {row["stage"] for row in result["attention"]}
+    assert (
+        tmp_path
+        / "agentic_attention_variable_forest"
+        / "crossfit_fold_checkpoints"
+        / "residual_contrastive"
+        / "outer_001_fold_001.done.json"
+    ).exists()
 
 
 def test_nuisance_crossfit_resumes_from_fold_checkpoints(tmp_path, monkeypatch):
@@ -1445,6 +1614,17 @@ def test_oracle_agentic_attention_script_builds_configs(tmp_path):
             "mean",
             "--htr-trainable-sentence-encoder-layers",
             "1",
+            "--residual-contrastive-enabled",
+            "--residual-contrastive-score",
+            "r_score_normalized",
+            "--residual-contrastive-high-quantile",
+            "0.85",
+            "--residual-contrastive-low-quantile",
+            "0.15",
+            "--residual-contrastive-neutral-abs-quantile",
+            "0.35",
+            "--residual-contrastive-min-class-count",
+            "3",
             "--max-experiments",
             "1",
         ]
@@ -1459,6 +1639,12 @@ def test_oracle_agentic_attention_script_builds_configs(tmp_path):
     assert config.htr_sentence_encoder_backend == "transformers"
     assert config.htr_sentence_pooling == "mean"
     assert config.htr_trainable_sentence_encoder_layers == 1
+    assert config.residual_contrastive_enabled is True
+    assert config.residual_contrastive_score == "r_score_normalized"
+    assert config.residual_contrastive_high_quantile == 0.85
+    assert config.residual_contrastive_low_quantile == 0.15
+    assert config.residual_contrastive_neutral_abs_quantile == 0.35
+    assert config.residual_contrastive_min_class_count == 3
 
     applied = _make_applied_config(
         config,
@@ -1472,6 +1658,16 @@ def test_oracle_agentic_attention_script_builds_configs(tmp_path):
     assert applied.architecture.htr_sentence_pooling == "mean"
     assert applied.architecture.htr_trainable_sentence_encoder_layers == 1
     assert applied.architecture.agentic_attention_variable_forest.nuisance_folds == 2
+    assert (
+        applied.architecture.agentic_attention_variable_forest
+        .residual_contrastive_enabled
+        is True
+    )
+    assert (
+        applied.architecture.agentic_attention_variable_forest
+        .residual_contrastive_score
+        == "r_score_normalized"
+    )
 
 
 def test_applied_router_dispatches_agentic_attention_variable_forest(monkeypatch, tmp_path):
