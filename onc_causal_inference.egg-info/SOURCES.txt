@@ -18,6 +18,7 @@ oci/extraction/__init__.py
 oci/extraction/cache.py
 oci/extraction/explicit_confounders.py
 oci/extraction/explicit_features.py
+oci/extraction/numeric_inventory.py
 oci/inference/__init__.py
 oci/inference/agentic_attention_variable_forest.py
 oci/inference/agentic_explicit_feature_forest.py
@@ -26,6 +27,9 @@ oci/inference/applied_confounder_forest.py
 oci/inference/applied_explicit_feature_forest.py
 oci/inference/applied_forest.py
 oci/inference/applied_tfidf_forest.py
+oci/inference/build_neural_causal_forest_agent_context.py
+oci/inference/predict_neural_causal_forest.py
+oci/inference/train_neural_causal_forest.py
 oci/matching/__init__.py
 oci/matching/propensity_matcher.py
 oci/models/__init__.py
@@ -50,6 +54,7 @@ oci/models/hierarchical_gru_extractor.py
 oci/models/hierarchical_llm_extractor.py
 oci/models/hierarchical_transformer_extractor.py
 oci/models/learned_tokenizer.py
+oci/models/neural_causal_forest_extractor.py
 oci/models/outcome_model.py
 oci/models/propensity_model.py
 oci/models/rlearner.py
@@ -82,6 +87,7 @@ tests/test_extractors.py
 tests/test_gamma_scheduler.py
 tests/test_gemini_batch_client.py
 tests/test_gemini_batch_generation.py
+tests/test_numeric_inventory.py
 tests/test_slot_value_discovery.py
 tests/test_slot_value_xw_rlearner_forest.py
 tests/test_synthetic_feature_counts.py

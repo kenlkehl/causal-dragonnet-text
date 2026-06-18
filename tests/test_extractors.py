@@ -4,11 +4,13 @@ Tests each extractor's forward shape, fit_tokenizer, get_state, get_num_paramete
 LLM-based extractors are tested separately with @pytest.mark.slow.
 """
 
+import json
+import threading
+import time
+
 import pytest
 import pandas as pd
 import torch
-import threading
-import time
 
 # Sample texts for testing
 SAMPLE_TEXTS = [
@@ -582,6 +584,106 @@ class TestHierarchicalTransformer:
         )
         assert row["attended_token_summary"]
         assert "[[" in row["highlighted_chunk_text"]
+
+
+class TestNeuralCausalForest:
+    def _tokenizer_test_encoder(self, model_name="some-bert"):
+        from oci.models.neural_causal_forest_extractor import (
+            HierarchicalTokenAttentionEncoder,
+            NeuralCausalForestConfig,
+        )
+
+        encoder = object.__new__(HierarchicalTokenAttentionEncoder)
+        encoder.config = NeuralCausalForestConfig(encoder_model_name=model_name)
+        encoder._resolved_encoder_model_path = None
+        return encoder
+
+    def test_tokenizer_loader_falls_back_to_slow_tokenizer(self):
+        calls = []
+
+        class FakeAutoTokenizer:
+            @staticmethod
+            def from_pretrained(model_name, use_fast=True):
+                calls.append((model_name, use_fast))
+                if use_fast:
+                    raise ValueError("fast tokenizer conversion failed")
+                return "slow-tokenizer"
+
+        encoder = self._tokenizer_test_encoder("some-bert")
+        tokenizer = encoder._load_tokenizer(FakeAutoTokenizer)
+
+        assert tokenizer == "slow-tokenizer"
+        assert calls == [("some-bert", True), ("some-bert", False)]
+
+    def test_tokenizer_loader_uses_legacy_bert_snapshot(self, tmp_path):
+        (tmp_path / "vocab.txt").write_text(
+            "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\npatient\n",
+            encoding="utf-8",
+        )
+
+        class BrokenAutoTokenizer:
+            @staticmethod
+            def from_pretrained(model_name, use_fast=True):
+                raise ValueError(f"auto tokenizer failed: {model_name} {use_fast}")
+
+        encoder = self._tokenizer_test_encoder("prajjwal1/bert-tiny")
+        encoder._resolved_encoder_model_path = str(tmp_path)
+        tokenizer = encoder._load_tokenizer(BrokenAutoTokenizer)
+
+        assert tokenizer.__class__.__name__ == "BertTokenizer"
+        assert tokenizer.cls_token == "[CLS]"
+
+    def _ncf_hash_config(self):
+        from oci.models.neural_causal_forest_extractor import NeuralCausalForestConfig
+
+        return NeuralCausalForestConfig(
+            encoder_backend="hash",
+            representation_dim=8,
+            token_attention_dim=8,
+            chunk_attention_dim=8,
+            nuisance_hidden_dim=8,
+            chunk_size_words=8,
+            chunk_overlap_words=2,
+            max_chunks=4,
+        )
+
+    def test_nuisance_model_uses_ncf_encoder(self):
+        from oci.models.neural_causal_forest_extractor import (
+            HierarchicalTokenAttentionEncoder,
+            NuisanceTextModel,
+        )
+
+        config = self._ncf_hash_config()
+        model = NuisanceTextModel(config, device="cpu", outcome_type="binary")
+        out = model(SAMPLE_TEXTS[:2])
+
+        assert isinstance(model.encoder, HierarchicalTokenAttentionEncoder)
+        assert out["propensity_logit"].shape == (2,)
+        assert out["outcome_raw"].shape == (2,)
+
+    def test_ncf_nuisance_attention_schema(self):
+        from oci.models.neural_causal_forest_extractor import (
+            NuisanceTextModel,
+            nuisance_attention_evidence,
+        )
+
+        config = self._ncf_hash_config()
+        model = NuisanceTextModel(config, device="cpu", outcome_type="binary")
+        rows = nuisance_attention_evidence(
+            model,
+            SAMPLE_TEXTS[:2],
+            row_ids=[10, 11],
+            config=config,
+            top_k=2,
+            metadata=[{"nuisance_fold": 1}, {"nuisance_fold": 1}],
+        )
+
+        assert rows
+        assert {row["row_id"] for row in rows} == {10, 11}
+        assert all("token_text" in row for row in rows)
+        assert all("evidence_score" in row for row in rows)
+        assert all("snippet" in row for row in rows)
+        assert all(row["nuisance_fold"] == 1 for row in rows)
 
 
 class TestLearnedTokenizer:
