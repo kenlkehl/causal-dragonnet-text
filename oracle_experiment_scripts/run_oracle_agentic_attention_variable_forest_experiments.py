@@ -789,6 +789,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--effect-folds", type=int, default=5)
     parser.add_argument(
         "--fold-parallelism",
+        "--inner-fold-parallelism",
+        dest="fold_parallelism",
         default="auto",
         help=(
             "Number of cross-fit nuisance/effect folds to train concurrently. "

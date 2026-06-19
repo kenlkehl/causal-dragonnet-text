@@ -284,6 +284,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-batch-size", type=int, default=256)
     parser.add_argument("--n-folds", type=int, default=3)
     parser.add_argument("--rlearner-nuisance-folds", type=int, default=None)
+    parser.add_argument(
+        "--rlearner-inner-fold-parallelism",
+        "--inner-fold-parallelism",
+        dest="rlearner_inner_fold_parallelism",
+        default="auto",
+        help="Parallel inner nuisance folds for shared X/W R-learner runs.",
+    )
     parser.add_argument("--gamma-rlearner", type=float, default=1.0)
     parser.add_argument("--rlearner-effect-batch-size", type=int, default=None)
     parser.add_argument("--rlearner-effect-accumulation-steps", type=int, default=1)

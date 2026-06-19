@@ -487,6 +487,7 @@ class TestHierarchicalTransformer:
         class FakeTokenizer:
             pad_token_id = 0
             padding_side = "right"
+            is_fast = True
             all_special_ids = [0, 101, 102]
             all_special_tokens = ["[PAD]", "[CLS]", "[SEP]"]
 
@@ -585,6 +586,16 @@ class TestHierarchicalTransformer:
         assert row["attended_token_summary"]
         assert "[[" in row["highlighted_chunk_text"]
 
+        features, attention_info = ext(
+            ["Encounter Record Timepoint: At age 84 PD-L1 1-49 percent"],
+            return_attention_tensors=True,
+        )
+        assert features.shape == (1, 4)
+        assert attention_info["token_alpha"] is not None
+        assert attention_info["token_alpha_sources"]
+        features.square().sum().backward()
+        assert attention_info["token_alpha_sources"][0].grad is not None
+
 
 class TestNeuralCausalForest:
     def _tokenizer_test_encoder(self, model_name="some-bert"):
@@ -637,6 +648,7 @@ class TestNeuralCausalForest:
         from oci.models.neural_causal_forest_extractor import NeuralCausalForestConfig
 
         return NeuralCausalForestConfig(
+            encoder_architecture="ncf_token_attention",
             encoder_backend="hash",
             representation_dim=8,
             token_attention_dim=8,
@@ -647,7 +659,43 @@ class TestNeuralCausalForest:
             max_chunks=4,
         )
 
-    def test_nuisance_model_uses_ncf_encoder(self):
+    def _htr_hash_config(self):
+        from oci.models.neural_causal_forest_extractor import NeuralCausalForestConfig
+
+        return NeuralCausalForestConfig(
+            encoder_architecture="hierarchical_transformer",
+            encoder_model_name="hash",
+            encoder_backend="hash",
+            representation_dim=8,
+            token_attention_dim=8,
+            chunk_attention_dim=8,
+            nuisance_hidden_dim=8,
+            chunk_size_words=8,
+            chunk_overlap_words=2,
+            max_chunks=4,
+            htr_num_layers=1,
+            htr_num_heads=2,
+            htr_transformer_dim=8,
+            htr_sentence_pooling="auto",
+            htr_sentence_encoder_backend="auto",
+            htr_hash_embedding_dim=8,
+        )
+
+    def test_nuisance_model_uses_htr_encoder_by_default(self):
+        from oci.models.neural_causal_forest_extractor import (
+            HTRGradientAttentionEncoder,
+            NuisanceTextModel,
+        )
+
+        config = self._htr_hash_config()
+        model = NuisanceTextModel(config, device="cpu", outcome_type="binary")
+        out = model(SAMPLE_TEXTS[:2])
+
+        assert isinstance(model.encoder, HTRGradientAttentionEncoder)
+        assert out["propensity_logit"].shape == (2,)
+        assert out["outcome_raw"].shape == (2,)
+
+    def test_ncf_token_attention_encoder_still_selectable(self):
         from oci.models.neural_causal_forest_extractor import (
             HierarchicalTokenAttentionEncoder,
             NuisanceTextModel,
@@ -655,11 +703,31 @@ class TestNeuralCausalForest:
 
         config = self._ncf_hash_config()
         model = NuisanceTextModel(config, device="cpu", outcome_type="binary")
-        out = model(SAMPLE_TEXTS[:2])
 
         assert isinstance(model.encoder, HierarchicalTokenAttentionEncoder)
-        assert out["propensity_logit"].shape == (2,)
-        assert out["outcome_raw"].shape == (2,)
+
+    def test_inner_fold_parallelism_resolver_is_conservative_on_cuda(self):
+        from oci.models.neural_causal_forest_extractor import (
+            _resolve_inner_fold_parallelism,
+        )
+
+        config = self._ncf_hash_config()
+        config.inner_fold_parallelism = "auto"
+        config.num_workers = 3
+
+        assert _resolve_inner_fold_parallelism(config, 5, torch.device("cpu")) == 3
+        assert _resolve_inner_fold_parallelism(config, 5, torch.device("cuda:0")) == 1
+
+    def test_explicit_inner_fold_parallelism_overrides_cuda_serial_default(self):
+        from oci.models.neural_causal_forest_extractor import (
+            _resolve_inner_fold_parallelism,
+        )
+
+        config = self._ncf_hash_config()
+        config.inner_fold_parallelism = "2"
+        config.num_workers = 0
+
+        assert _resolve_inner_fold_parallelism(config, 5, torch.device("cuda:0")) == 2
 
     def test_ncf_nuisance_attention_schema(self):
         from oci.models.neural_causal_forest_extractor import (

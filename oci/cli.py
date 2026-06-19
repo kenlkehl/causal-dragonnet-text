@@ -84,6 +84,14 @@ Examples:
             'agentic_attention_variable_forest R-stage training'
         )
     )
+    run_parser.add_argument(
+        '--inner-fold-parallelism',
+        help=(
+            "Override inner cross-fit fold parallelism for "
+            "agentic_attention_variable_forest or causal_forest R-learner runs. "
+            "Use 'auto' or a positive integer."
+        )
+    )
     
     args = parser.parse_args()
     
@@ -111,10 +119,7 @@ Examples:
             config.output_dir = args.output_dir
         if args.skip_pretraining:
             config.pretraining.enabled = False
-        if (
-            args.r_stage_min_propensity is not None
-            or args.r_stage_max_propensity is not None
-        ):
+        if args.r_stage_min_propensity is not None or args.r_stage_max_propensity is not None:
             model_type = getattr(config.applied_inference.architecture, 'model_type', None)
             if model_type != "agentic_attention_variable_forest":
                 print(
@@ -138,6 +143,24 @@ Examples:
             ):
                 print(
                     "R-stage propensity bounds must satisfy 0 <= min < max <= 1"
+                )
+                return 1
+        if args.inner_fold_parallelism is not None:
+            model_type = getattr(config.applied_inference.architecture, 'model_type', None)
+            if model_type == "agentic_attention_variable_forest":
+                avf_config = (
+                    config.applied_inference.architecture
+                    .agentic_attention_variable_forest
+                )
+                avf_config.fold_parallelism = str(args.inner_fold_parallelism)
+            elif model_type == "causal_forest":
+                cf_config = config.applied_inference.architecture.causal_forest
+                cf_config.rlearner_inner_fold_parallelism = str(args.inner_fold_parallelism)
+            else:
+                print(
+                    "--inner-fold-parallelism only applies to "
+                    "model_type='agentic_attention_variable_forest' or "
+                    "model_type='causal_forest'"
                 )
                 return 1
         

@@ -28,6 +28,7 @@ import queue
 import random
 import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -120,6 +121,7 @@ class XWRLearnerForestConfig:
     learning_rate: float = 1e-4
     n_folds: int = 5
     rlearner_nuisance_folds: int = 5
+    rlearner_inner_fold_parallelism: str = "auto"
     gamma_rlearner: float = 1.0
     rlearner_effect_batch_size: Optional[int] = None
     rlearner_effect_accumulation_steps: int = 1
@@ -290,6 +292,14 @@ class XWRLearnerForestConfig:
         self.use_explicit_confounders = self.use_explicit_features
         self.flp_downprojection_dim = None
         self.hlm_downprojection_dim = None
+        if str(self.rlearner_inner_fold_parallelism).strip().lower() != "auto":
+            try:
+                if int(self.rlearner_inner_fold_parallelism) < 1:
+                    raise ValueError
+            except ValueError as exc:
+                raise ValueError(
+                    "rlearner_inner_fold_parallelism must be 'auto' or a positive integer"
+                ) from exc
 
     def config_hash(self) -> str:
         d = asdict(self)
@@ -787,6 +797,34 @@ def _nuisance_oof_summary(
     }
 
 
+def _resolve_rlearner_inner_fold_parallelism(
+    config: XWRLearnerForestConfig,
+    n_inner: int,
+    device: torch.device,
+) -> int:
+    setting = str(config.rlearner_inner_fold_parallelism).strip().lower()
+    if setting == "auto":
+        return 1
+    return max(1, min(int(setting), int(n_inner)))
+
+
+def _run_rlearner_inner_fold_tasks(run_fold, split_items, n_jobs: int) -> List[Dict[str, Any]]:
+    if n_jobs <= 1:
+        return [
+            run_fold(inner_fold, inner_train_pos, inner_val_pos)
+            for inner_fold, (inner_train_pos, inner_val_pos) in split_items
+        ]
+    with ThreadPoolExecutor(
+        max_workers=int(n_jobs),
+        thread_name_prefix="xw-rlearner-inner-fold",
+    ) as executor:
+        futures = [
+            executor.submit(run_fold, inner_fold, inner_train_pos, inner_val_pos)
+            for inner_fold, (inner_train_pos, inner_val_pos) in split_items
+        ]
+        return [future.result() for future in futures]
+
+
 def _is_high_pdl1_value(value: Any) -> bool:
     if pd.isna(value):
         return False
@@ -1191,63 +1229,95 @@ def run_shared_rlearner_forest_experiment(
                 shuffle=True,
                 random_state=20_000 + 42 + config.repeat_index + fold,
             )
+            split_items = list(enumerate(inner_kf.split(train_df), start=1))
+            n_inner_jobs = _resolve_rlearner_inner_fold_parallelism(config, n_inner, device)
+            logger.info(
+                "Outer fold %s shared R-learner nuisance inner parallelism: "
+                "folds=%s n_jobs=%s setting=%s device=%s",
+                fold + 1,
+                n_inner,
+                n_inner_jobs,
+                config.rlearner_inner_fold_parallelism,
+                device,
+            )
             oof_propensity = np.full(len(train_df), np.nan, dtype=np.float32)
             oof_outcome = np.full(len(train_df), np.nan, dtype=np.float32)
 
-            for inner_train_pos, inner_val_pos in inner_kf.split(train_df):
+            def run_inner_fold(
+                inner_fold: int,
+                inner_train_pos: np.ndarray,
+                inner_val_pos: np.ndarray,
+            ) -> Dict[str, Any]:
                 inner_train_df = train_df.iloc[inner_train_pos]
                 inner_val_df = train_df.iloc[inner_val_pos]
                 inner_train_idx = np.asarray(train_idx)[inner_train_pos]
                 inner_val_idx = np.asarray(train_idx)[inner_val_pos]
 
-                inner_model = _make_xw_model(
-                    config,
-                    device,
-                    explicit_feature_specs,
-                    gpu_store,
-                    hidden_state_cache,
-                    tokenizer_texts=inner_train_df[text_column].tolist(),
-                )
-                (
-                    inner_train_dataset,
-                    _inner_val_dataset,
-                    inner_train_loader,
-                    inner_val_loader,
-                    _inner_collate_fn,
-                    _inner_dl_kwargs,
-                ) = _create_datasets_and_loaders(
-                    inner_train_df,
-                    inner_val_df,
-                    inner_train_idx,
-                    inner_val_idx,
-                    text_column,
-                    explicit_feature_cols,
-                    batch_size,
-                    hidden_state_cache,
-                    gpu_store,
-                )
-                _fit_explicit_feature_state(inner_model, inner_train_dataset)
-                _train_nuisance_stage(
-                    inner_model,
-                    inner_train_loader,
-                    inner_val_loader,
-                    config,
-                    device,
-                    use_cached,
-                    gpu_store,
-                )
-                cf_kwargs = dict(gpu_store=gpu_store) if use_cached else {}
-                prop_hat, outcome_hat = inner_model.predict_nuisance(
-                    inner_val_loader,
-                    **cf_kwargs,
-                )
-                oof_propensity[inner_val_pos] = prop_hat
-                oof_outcome[inner_val_pos] = outcome_hat
+                inner_model = None
+                try:
+                    inner_model = _make_xw_model(
+                        config,
+                        device,
+                        explicit_feature_specs,
+                        gpu_store,
+                        hidden_state_cache,
+                        tokenizer_texts=inner_train_df[text_column].tolist(),
+                    )
+                    (
+                        inner_train_dataset,
+                        _inner_val_dataset,
+                        inner_train_loader,
+                        inner_val_loader,
+                        _inner_collate_fn,
+                        _inner_dl_kwargs,
+                    ) = _create_datasets_and_loaders(
+                        inner_train_df,
+                        inner_val_df,
+                        inner_train_idx,
+                        inner_val_idx,
+                        text_column,
+                        explicit_feature_cols,
+                        batch_size,
+                        hidden_state_cache,
+                        gpu_store,
+                    )
+                    _fit_explicit_feature_state(inner_model, inner_train_dataset)
+                    _train_nuisance_stage(
+                        inner_model,
+                        inner_train_loader,
+                        inner_val_loader,
+                        config,
+                        device,
+                        use_cached,
+                        gpu_store,
+                    )
+                    cf_kwargs = dict(gpu_store=gpu_store) if use_cached else {}
+                    prop_hat, outcome_hat = inner_model.predict_nuisance(
+                        inner_val_loader,
+                        **cf_kwargs,
+                    )
+                    return {
+                        "inner_fold": int(inner_fold),
+                        "inner_val_pos": np.asarray(inner_val_pos, dtype=int),
+                        "propensity": prop_hat,
+                        "outcome": outcome_hat,
+                    }
+                finally:
+                    if inner_model is not None:
+                        del inner_model
+                    gc.collect()
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
 
-                del inner_model
-                gc.collect()
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
+            inner_results = _run_rlearner_inner_fold_tasks(
+                run_inner_fold,
+                split_items,
+                n_inner_jobs,
+            )
+            for inner_result in inner_results:
+                inner_val_pos = inner_result["inner_val_pos"]
+                oof_propensity[inner_val_pos] = inner_result["propensity"]
+                oof_outcome[inner_val_pos] = inner_result["outcome"]
 
             if np.isnan(oof_propensity).any() or np.isnan(oof_outcome).any():
                 raise RuntimeError("Incomplete out-of-fold nuisance predictions")
@@ -1402,63 +1472,95 @@ def run_xw_rlearner_forest_experiment(
             shuffle=True,
             random_state=10_000 + 42 + config.repeat_index + fold,
         )
+        split_items = list(enumerate(inner_kf.split(train_df), start=1))
+        n_inner_jobs = _resolve_rlearner_inner_fold_parallelism(config, n_inner, device)
+        logger.info(
+            "Outer fold %s X/W R-learner nuisance inner parallelism: "
+            "folds=%s n_jobs=%s setting=%s device=%s",
+            fold + 1,
+            n_inner,
+            n_inner_jobs,
+            config.rlearner_inner_fold_parallelism,
+            device,
+        )
         oof_propensity = np.full(len(train_df), np.nan, dtype=np.float32)
         oof_outcome = np.full(len(train_df), np.nan, dtype=np.float32)
 
-        for inner_train_pos, inner_val_pos in inner_kf.split(train_df):
+        def run_inner_fold(
+            inner_fold: int,
+            inner_train_pos: np.ndarray,
+            inner_val_pos: np.ndarray,
+        ) -> Dict[str, Any]:
             inner_train_df = train_df.iloc[inner_train_pos]
             inner_val_df = train_df.iloc[inner_val_pos]
             inner_train_idx = np.asarray(train_idx)[inner_train_pos]
             inner_val_idx = np.asarray(train_idx)[inner_val_pos]
 
-            inner_model = _make_xw_model(
-                config,
-                device,
-                explicit_feature_specs,
-                gpu_store,
-                hidden_state_cache,
-                tokenizer_texts=inner_train_df[text_column].tolist(),
-            )
-            (
-                inner_train_dataset,
-                _inner_val_dataset,
-                inner_train_loader,
-                inner_val_loader,
-                _inner_collate_fn,
-                _inner_dl_kwargs,
-            ) = _create_datasets_and_loaders(
-                inner_train_df,
-                inner_val_df,
-                inner_train_idx,
-                inner_val_idx,
-                text_column,
-                explicit_feature_cols,
-                batch_size,
-                hidden_state_cache,
-                gpu_store,
-            )
-            _fit_explicit_feature_state(inner_model, inner_train_dataset)
-            _train_nuisance_stage(
-                inner_model,
-                inner_train_loader,
-                inner_val_loader,
-                config,
-                device,
-                use_cached,
-                gpu_store,
-            )
-            cf_kwargs = dict(gpu_store=gpu_store) if use_cached else {}
-            prop_hat, outcome_hat = inner_model.predict_nuisance(
-                inner_val_loader,
-                **cf_kwargs,
-            )
-            oof_propensity[inner_val_pos] = prop_hat
-            oof_outcome[inner_val_pos] = outcome_hat
+            inner_model = None
+            try:
+                inner_model = _make_xw_model(
+                    config,
+                    device,
+                    explicit_feature_specs,
+                    gpu_store,
+                    hidden_state_cache,
+                    tokenizer_texts=inner_train_df[text_column].tolist(),
+                )
+                (
+                    inner_train_dataset,
+                    _inner_val_dataset,
+                    inner_train_loader,
+                    inner_val_loader,
+                    _inner_collate_fn,
+                    _inner_dl_kwargs,
+                ) = _create_datasets_and_loaders(
+                    inner_train_df,
+                    inner_val_df,
+                    inner_train_idx,
+                    inner_val_idx,
+                    text_column,
+                    explicit_feature_cols,
+                    batch_size,
+                    hidden_state_cache,
+                    gpu_store,
+                )
+                _fit_explicit_feature_state(inner_model, inner_train_dataset)
+                _train_nuisance_stage(
+                    inner_model,
+                    inner_train_loader,
+                    inner_val_loader,
+                    config,
+                    device,
+                    use_cached,
+                    gpu_store,
+                )
+                cf_kwargs = dict(gpu_store=gpu_store) if use_cached else {}
+                prop_hat, outcome_hat = inner_model.predict_nuisance(
+                    inner_val_loader,
+                    **cf_kwargs,
+                )
+                return {
+                    "inner_fold": int(inner_fold),
+                    "inner_val_pos": np.asarray(inner_val_pos, dtype=int),
+                    "propensity": prop_hat,
+                    "outcome": outcome_hat,
+                }
+            finally:
+                if inner_model is not None:
+                    del inner_model
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
 
-            del inner_model
-            gc.collect()
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+        inner_results = _run_rlearner_inner_fold_tasks(
+            run_inner_fold,
+            split_items,
+            n_inner_jobs,
+        )
+        for inner_result in inner_results:
+            inner_val_pos = inner_result["inner_val_pos"]
+            oof_propensity[inner_val_pos] = inner_result["propensity"]
+            oof_outcome[inner_val_pos] = inner_result["outcome"]
 
         if np.isnan(oof_propensity).any() or np.isnan(oof_outcome).any():
             raise RuntimeError("Incomplete out-of-fold nuisance predictions")
@@ -1694,10 +1796,12 @@ def generate_experiment_grid(
     learning_rates: Optional[List[float]] = None,
     epoch_counts: Optional[List[int]] = None,
     include_explicit_feature_options: Optional[List[bool]] = None,
+    rlearner_nuisance_folds: Optional[int] = None,
     rlearner_effect_batch_size: Optional[int] = None,
     rlearner_effect_accumulation_steps: int = 1,
     rlearner_effect_e_clip: float = 0.01,
     rlearner_effect_grad_clip: float = 1.0,
+    rlearner_inner_fold_parallelism: str = "auto",
     contrastive_effect_enabled: bool = False,
     contrastive_bottleneck_dim: int = 8,
     contrastive_hidden_dim: int = 64,
@@ -1885,11 +1989,14 @@ def generate_experiment_grid(
                 )
 
     for cfg in configs:
+        if rlearner_nuisance_folds is not None:
+            cfg.rlearner_nuisance_folds = int(rlearner_nuisance_folds)
         cfg.contrastive_effect_enabled = contrastive_effect_enabled
         cfg.rlearner_effect_batch_size = rlearner_effect_batch_size
         cfg.rlearner_effect_accumulation_steps = rlearner_effect_accumulation_steps
         cfg.rlearner_effect_e_clip = rlearner_effect_e_clip
         cfg.rlearner_effect_grad_clip = rlearner_effect_grad_clip
+        cfg.rlearner_inner_fold_parallelism = str(rlearner_inner_fold_parallelism)
         cfg.contrastive_bottleneck_dim = contrastive_bottleneck_dim
         cfg.contrastive_hidden_dim = contrastive_hidden_dim
         cfg.contrastive_batch_size = contrastive_batch_size
@@ -2317,6 +2424,12 @@ def main():
         help="Physical batch size for the fixed-nuisance R-loss effect stage",
     )
     parser.add_argument(
+        "--rlearner-nuisance-folds",
+        type=int,
+        default=None,
+        help="Number of inner nuisance folds for R-learner OOF predictions",
+    )
+    parser.add_argument(
         "--rlearner-effect-accumulation-steps",
         type=int,
         default=1,
@@ -2333,6 +2446,17 @@ def main():
         type=float,
         default=1.0,
         help="Gradient clipping norm for the fixed-nuisance R-loss effect stage",
+    )
+    parser.add_argument(
+        "--rlearner-inner-fold-parallelism",
+        "--inner-fold-parallelism",
+        dest="rlearner_inner_fold_parallelism",
+        default="auto",
+        help=(
+            "Number of inner nuisance folds to train concurrently in R-learner "
+            "experiments. 'auto' preserves serial behavior; an explicit integer "
+            "opts into parallel inner folds."
+        ),
     )
     parser.add_argument(
         "--explicit-feature-options",
@@ -2391,10 +2515,12 @@ def main():
         learning_rates=args.learning_rates,
         epoch_counts=args.epoch_counts,
         include_explicit_feature_options=explicit_feature_options,
+        rlearner_nuisance_folds=args.rlearner_nuisance_folds,
         rlearner_effect_batch_size=args.rlearner_effect_batch_size,
         rlearner_effect_accumulation_steps=args.rlearner_effect_accumulation_steps,
         rlearner_effect_e_clip=args.rlearner_effect_e_clip,
         rlearner_effect_grad_clip=args.rlearner_effect_grad_clip,
+        rlearner_inner_fold_parallelism=args.rlearner_inner_fold_parallelism,
         contrastive_effect_enabled=args.contrastive_effect,
         contrastive_bottleneck_dim=args.contrastive_bottleneck_dim,
         contrastive_hidden_dim=args.contrastive_hidden_dim,

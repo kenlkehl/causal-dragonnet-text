@@ -4,6 +4,7 @@
 import gc
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Any
 import torch
@@ -1425,11 +1426,23 @@ def _train_representation(
             f"({n_inner} inner nuisance folds)"
         )
         inner_kf = KFold(n_splits=n_inner, shuffle=True, random_state=10_000 + 42)
+        inner_split_items = list(enumerate(inner_kf.split(train_df), start=1))
+        inner_parallelism = str(
+            getattr(cf_config, 'rlearner_inner_fold_parallelism', 'auto')
+        ).strip().lower()
+        n_inner_jobs = 1 if inner_parallelism == 'auto' else max(1, min(int(inner_parallelism), n_inner))
+        logger.info(
+            "Staged R-learner nuisance inner parallelism: folds=%s n_jobs=%s setting=%s device=%s",
+            n_inner,
+            n_inner_jobs,
+            inner_parallelism,
+            device,
+        )
         oof_propensity = np.full(len(train_df), np.nan, dtype=np.float32)
         oof_outcome = np.full(len(train_df), np.nan, dtype=np.float32)
         train_indices_array = np.asarray(train_indices) if train_indices is not None else None
 
-        for inner_train_pos, inner_val_pos in inner_kf.split(train_df):
+        def run_inner_fold(inner_fold, inner_train_pos, inner_val_pos):
             inner_train_df = train_df.iloc[inner_train_pos]
             inner_val_df = train_df.iloc[inner_val_pos]
             inner_train_indices = (
@@ -1443,41 +1456,71 @@ def _train_representation(
                 else None
             )
 
-            inner_model = make_inner_model(inner_train_df)
-            inner_train_dataset, inner_train_loader = _make_stage_dataset_and_loader(
-                inner_train_df,
-                inner_train_indices,
-                config,
-                train_config.batch_size,
-                shuffle=True,
-                hidden_state_cache=hidden_state_cache,
-                gpu_store=gpu_store,
-                explicit_feature_columns=explicit_feature_columns,
-            )
-            inner_val_dataset, inner_val_loader = _make_stage_dataset_and_loader(
-                inner_val_df,
-                inner_val_indices,
-                config,
-                train_config.batch_size,
-                shuffle=False,
-                hidden_state_cache=hidden_state_cache,
-                gpu_store=gpu_store,
-                explicit_feature_columns=explicit_feature_columns,
-            )
+            inner_model = None
+            inner_train_loader = None
+            inner_val_loader = None
+            inner_train_dataset = None
+            inner_val_dataset = None
+            try:
+                inner_model = make_inner_model(inner_train_df)
+                inner_train_dataset, inner_train_loader = _make_stage_dataset_and_loader(
+                    inner_train_df,
+                    inner_train_indices,
+                    config,
+                    train_config.batch_size,
+                    shuffle=True,
+                    hidden_state_cache=hidden_state_cache,
+                    gpu_store=gpu_store,
+                    explicit_feature_columns=explicit_feature_columns,
+                )
+                inner_val_dataset, inner_val_loader = _make_stage_dataset_and_loader(
+                    inner_val_df,
+                    inner_val_indices,
+                    config,
+                    train_config.batch_size,
+                    shuffle=False,
+                    hidden_state_cache=hidden_state_cache,
+                    gpu_store=gpu_store,
+                    explicit_feature_columns=explicit_feature_columns,
+                )
 
-            train_nuisance_stage(inner_model, inner_train_loader, inner_val_loader)
-            prop_hat, outcome_hat = inner_model.predict_nuisance(
-                inner_val_loader,
-                gpu_store=gpu_store,
-            )
-            oof_propensity[inner_val_pos] = prop_hat
-            oof_outcome[inner_val_pos] = outcome_hat
+                train_nuisance_stage(inner_model, inner_train_loader, inner_val_loader)
+                prop_hat, outcome_hat = inner_model.predict_nuisance(
+                    inner_val_loader,
+                    gpu_store=gpu_store,
+                )
+                return {
+                    "inner_fold": int(inner_fold),
+                    "inner_val_pos": np.asarray(inner_val_pos, dtype=int),
+                    "propensity": prop_hat,
+                    "outcome": outcome_hat,
+                }
+            finally:
+                del inner_model, inner_train_loader, inner_val_loader
+                del inner_train_dataset, inner_val_dataset
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
 
-            del inner_model, inner_train_loader, inner_val_loader
-            del inner_train_dataset, inner_val_dataset
-            gc.collect()
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+        if n_inner_jobs <= 1:
+            inner_results = [
+                run_inner_fold(inner_fold, inner_train_pos, inner_val_pos)
+                for inner_fold, (inner_train_pos, inner_val_pos) in inner_split_items
+            ]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=n_inner_jobs,
+                thread_name_prefix="applied-rlearner-inner-fold",
+            ) as executor:
+                futures = [
+                    executor.submit(run_inner_fold, inner_fold, inner_train_pos, inner_val_pos)
+                    for inner_fold, (inner_train_pos, inner_val_pos) in inner_split_items
+                ]
+                inner_results = [future.result() for future in futures]
+        for inner_result in inner_results:
+            inner_val_pos = inner_result["inner_val_pos"]
+            oof_propensity[inner_val_pos] = inner_result["propensity"]
+            oof_outcome[inner_val_pos] = inner_result["outcome"]
 
         if np.isnan(oof_propensity).any() or np.isnan(oof_outcome).any():
             raise RuntimeError("Incomplete out-of-fold nuisance predictions")

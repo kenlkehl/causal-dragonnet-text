@@ -8,8 +8,9 @@ Example:
         --output-dir ../ncf_runs/one_confounder_one_modifier \
         --device cuda:0 \
         --encoder-model prajjwal1/bert-tiny \
-        --nuisance-epochs 20 \
-        --forest-epochs 40 \
+        --nuisance-epochs 50 \
+        --forest-epochs 80 \
+        --inner-fold-parallelism 2 \
         --n-trees 32 --depth 3
 
 The script writes:
@@ -79,6 +80,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=None, help="Optional JSON config file")
 
     # Common overrides.
+    parser.add_argument(
+        "--encoder-architecture",
+        choices=["hierarchical_transformer", "htr", "ncf_token_attention", "ncf"],
+        default=None,
+    )
     parser.add_argument("--encoder-model", default=None)
     parser.add_argument("--encoder-backend", choices=["transformers", "hash"], default=None)
     parser.add_argument("--freeze-encoder", type=_bool_arg, default=None)
@@ -88,9 +94,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-overlap-words", type=int, default=None)
     parser.add_argument("--max-chunks", type=int, default=None)
     parser.add_argument("--representation-dim", type=int, default=None)
+    parser.add_argument("--htr-num-layers", type=int, default=None)
+    parser.add_argument("--htr-num-heads", type=int, default=None)
+    parser.add_argument("--htr-transformer-dim", type=int, default=None)
+    parser.add_argument("--htr-sentence-encoder-batch-size", type=int, default=None)
+    parser.add_argument(
+        "--htr-sentence-encoder-backend",
+        choices=["auto", "sentence_transformers", "transformers"],
+        default=None,
+    )
+    parser.add_argument(
+        "--htr-sentence-pooling",
+        choices=["auto", "cls", "last", "mean", "token_attention"],
+        default=None,
+    )
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--effect-batch-size", type=int, default=None)
     parser.add_argument("--nuisance-folds", type=int, default=None)
+    parser.add_argument(
+        "--inner-fold-parallelism",
+        default=None,
+        help=(
+            "Number of nuisance cross-fit folds to train concurrently. 'auto' "
+            "uses num_workers on CPU and stays serial on CUDA; an explicit "
+            "integer opts into that many concurrent folds, including on CUDA."
+        ),
+    )
     parser.add_argument("--nuisance-epochs", type=int, default=None)
     parser.add_argument("--forest-epochs", type=int, default=None)
     parser.add_argument("--n-trees", type=int, default=None)
@@ -119,6 +148,7 @@ def _make_config(args: argparse.Namespace) -> NeuralCausalForestConfig:
     else:
         config = NeuralCausalForestConfig()
     override_map = {
+        "encoder_architecture": args.encoder_architecture,
         "encoder_model_name": args.encoder_model,
         "encoder_backend": args.encoder_backend,
         "freeze_encoder": args.freeze_encoder,
@@ -128,9 +158,16 @@ def _make_config(args: argparse.Namespace) -> NeuralCausalForestConfig:
         "chunk_overlap_words": args.chunk_overlap_words,
         "max_chunks": args.max_chunks,
         "representation_dim": args.representation_dim,
+        "htr_num_layers": args.htr_num_layers,
+        "htr_num_heads": args.htr_num_heads,
+        "htr_transformer_dim": args.htr_transformer_dim,
+        "htr_sentence_encoder_batch_size": args.htr_sentence_encoder_batch_size,
+        "htr_sentence_encoder_backend": args.htr_sentence_encoder_backend,
+        "htr_sentence_pooling": args.htr_sentence_pooling,
         "batch_size": args.batch_size,
         "effect_batch_size": args.effect_batch_size,
         "nuisance_folds": args.nuisance_folds,
+        "inner_fold_parallelism": args.inner_fold_parallelism,
         "nuisance_epochs": args.nuisance_epochs,
         "forest_epochs": args.forest_epochs,
         "n_trees": args.n_trees,
@@ -192,6 +229,7 @@ def main() -> None:
         device=device,
         row_id_column=args.row_id_column,
         collect_attention=not args.no_attention,
+        nuisance_artifact_dir=output_dir,
     )
 
     model_dir = output_dir / "model"

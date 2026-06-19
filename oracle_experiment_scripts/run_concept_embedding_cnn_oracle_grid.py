@@ -166,6 +166,7 @@ def _make_config(
             cecnn_random_confounder_features=random_conf,
             cecnn_random_modifier_features=random_mod,
             rlearner_nuisance_folds=args.rlearner_nuisance_folds,
+            rlearner_inner_fold_parallelism=args.rlearner_inner_fold_parallelism,
         )
     return ExperimentConfig(
         **common,
@@ -517,6 +518,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-batch-size", type=int, default=256)
     parser.add_argument("--n-folds", type=int, default=3)
     parser.add_argument("--rlearner-nuisance-folds", type=int, default=3)
+    parser.add_argument(
+        "--rlearner-inner-fold-parallelism",
+        "--inner-fold-parallelism",
+        dest="rlearner_inner_fold_parallelism",
+        default="auto",
+        help="Parallel inner nuisance folds for X/W R-learner causal forest runs.",
+    )
     parser.add_argument("--gamma-rlearner", type=float, default=1.0)
     parser.add_argument("--projection-dim", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.1)

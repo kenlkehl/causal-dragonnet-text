@@ -220,6 +220,7 @@ class CausalForestConfig:
 
     # Inner folds used for out-of-fold nuisance predictions in staged R-learning.
     rlearner_nuisance_folds: int = 5
+    rlearner_inner_fold_parallelism: str = "auto"
 
     # Matched contrastive X-stage alternative to per-patient R-loss training.
     contrastive_effect: ContrastiveEffectConfig = field(default_factory=ContrastiveEffectConfig)
@@ -227,6 +228,15 @@ class CausalForestConfig:
     def __post_init__(self):
         if isinstance(self.contrastive_effect, dict):
             self.contrastive_effect = ContrastiveEffectConfig(**self.contrastive_effect)
+        if str(self.rlearner_inner_fold_parallelism).strip().lower() != "auto":
+            try:
+                if int(self.rlearner_inner_fold_parallelism) < 1:
+                    raise ValueError
+            except ValueError as exc:
+                raise ValueError(
+                    "causal_forest.rlearner_inner_fold_parallelism must be 'auto' "
+                    "or a positive integer"
+                ) from exc
 
 
 # =============================================================================
@@ -898,6 +908,15 @@ class ExperimentConfig:
                 )
             if 'causal_forest' in arch_data and isinstance(arch_data['causal_forest'], dict):
                 cf_data = arch_data['causal_forest'].copy()
+                if (
+                    'inner_fold_parallelism' in cf_data
+                    and 'rlearner_inner_fold_parallelism' not in cf_data
+                ):
+                    cf_data['rlearner_inner_fold_parallelism'] = cf_data.pop(
+                        'inner_fold_parallelism'
+                    )
+                else:
+                    cf_data.pop('inner_fold_parallelism', None)
                 if 'contrastive_effect' in cf_data and isinstance(cf_data['contrastive_effect'], dict):
                     cf_data['contrastive_effect'] = ContrastiveEffectConfig(**cf_data['contrastive_effect'])
                 arch_data['causal_forest'] = CausalForestConfig(**cf_data)
@@ -921,10 +940,13 @@ class ExperimentConfig:
                 'agentic_attention_variable_forest' in arch_data
                 and isinstance(arch_data['agentic_attention_variable_forest'], dict)
             ):
+                avf_data = arch_data['agentic_attention_variable_forest'].copy()
+                if 'inner_fold_parallelism' in avf_data and 'fold_parallelism' not in avf_data:
+                    avf_data['fold_parallelism'] = avf_data.pop('inner_fold_parallelism')
+                else:
+                    avf_data.pop('inner_fold_parallelism', None)
                 arch_data['agentic_attention_variable_forest'] = (
-                    AgenticAttentionVariableForestConfig(
-                        **arch_data['agentic_attention_variable_forest']
-                    )
+                    AgenticAttentionVariableForestConfig(**avf_data)
                 )
             return ModelArchitectureConfig(**arch_data)
 
@@ -1003,6 +1025,26 @@ class ExperimentConfig:
                     "agentic_attention_variable_forest R-stage propensity bounds "
                     "must satisfy 0 <= min < max <= 1"
                 )
+            if str(avf_config.fold_parallelism).strip().lower() != "auto":
+                try:
+                    if int(avf_config.fold_parallelism) < 1:
+                        raise ValueError
+                except ValueError as exc:
+                    raise ValueError(
+                        "agentic_attention_variable_forest.fold_parallelism must "
+                        "be 'auto' or a positive integer"
+                    ) from exc
+        if self.applied_inference.architecture.model_type == "causal_forest":
+            cf_config = self.applied_inference.architecture.causal_forest
+            if str(cf_config.rlearner_inner_fold_parallelism).strip().lower() != "auto":
+                try:
+                    if int(cf_config.rlearner_inner_fold_parallelism) < 1:
+                        raise ValueError
+                except ValueError as exc:
+                    raise ValueError(
+                        "causal_forest.rlearner_inner_fold_parallelism must be "
+                        "'auto' or a positive integer"
+                    ) from exc
 
         if (
             self.applied_inference.explicit_features.enabled

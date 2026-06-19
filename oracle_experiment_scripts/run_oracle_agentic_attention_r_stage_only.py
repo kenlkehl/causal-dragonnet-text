@@ -581,7 +581,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--n-folds", type=int, default=5)
     parser.add_argument("--effect-folds", type=int, default=5)
-    parser.add_argument("--fold-parallelism", default="auto")
+    parser.add_argument("--fold-parallelism", "--inner-fold-parallelism", dest="fold_parallelism", default="auto")
     parser.add_argument("--sample-size", type=int, default=None)
     parser.add_argument("--text-max-chars", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)

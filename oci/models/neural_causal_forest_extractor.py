@@ -25,7 +25,8 @@ import math
 import os
 import random
 import re
-from dataclasses import asdict, dataclass, field
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
 
@@ -59,6 +60,7 @@ class NeuralCausalForestConfig:
     """
 
     # Text encoder
+    encoder_architecture: str = "hierarchical_transformer"
     encoder_model_name: str = "prajjwal1/bert-tiny"
     encoder_backend: str = "transformers"  # "transformers" or "hash" for no-download tests
     freeze_encoder: bool = False
@@ -66,33 +68,46 @@ class NeuralCausalForestConfig:
     max_length: int = 128
     chunk_size_words: int = 96
     chunk_overlap_words: int = 24
-    max_chunks: int = 256
+    max_chunks: int = 128
     representation_dim: int = 128
     token_attention_dim: int = 128
     chunk_attention_dim: int = 128
     dropout: float = 0.10
-    normalize_representations: bool = True
+    normalize_representations: bool = False
+
+    # HTR encoder settings.  This is the default encoder architecture for both
+    # nuisance and CATE models; the older NCF token-attention encoder remains
+    # available via encoder_architecture="ncf_token_attention".
+    htr_num_layers: int = 2
+    htr_num_heads: int = 4
+    htr_transformer_dim: int = 256
+    htr_sentence_encoder_batch_size: int = 128
+    htr_sentence_encoder_backend: str = "transformers"
+    htr_sentence_pooling: str = "token_attention"
+    htr_normalize_sentence_embeddings: bool = True
+    htr_hash_embedding_dim: int = 256
 
     # Nuisance heads
     nuisance_hidden_dim: int = 128
-    nuisance_epochs: int = 20
-    nuisance_learning_rate: float = 2e-5
+    nuisance_epochs: int = 50
+    nuisance_learning_rate: float = 1e-4
     nuisance_weight_decay: float = 0.01
     nuisance_folds: int = 5
+    inner_fold_parallelism: str = "auto"
     alpha_propensity: float = 1.0
 
     # Soft neural causal forest
     n_trees: int = 32
     depth: int = 3
-    forest_learning_rate: float = 5e-5
+    forest_learning_rate: float = 1e-4
     forest_weight_decay: float = 0.01
-    forest_epochs: int = 40
+    forest_epochs: int = 80
     batch_size: int = 8
-    effect_batch_size: Optional[int] = 32
+    effect_batch_size: Optional[int] = 16
     gradient_clip_norm: float = 1.0
     temperature_start: float = 1.5
     temperature_end: float = 0.35
-    feature_subsample_fraction: float = 0.80
+    feature_subsample_fraction: float = 1.0
     leaf_ridge: float = 1e-3
     leaf_min_mass: float = 5.0
     tau_clip: Optional[float] = 2.0
@@ -103,7 +118,7 @@ class NeuralCausalForestConfig:
     lambda_leaf_balance: float = 0.02
     lambda_leaf_min_mass: float = 0.01
     lambda_leaf_tau_l2: float = 1e-4
-    lambda_heterogeneity: float = 0.02
+    lambda_heterogeneity: float = 0.05
 
     # Honest split/leaf refit
     honesty_fraction: float = 0.50
@@ -132,8 +147,45 @@ class NeuralCausalForestConfig:
             raise ValueError("feature_subsample_fraction must be in (0, 1]")
         if not 0.0 < self.honesty_fraction < 1.0:
             raise ValueError("honesty_fraction must be in (0, 1)")
+        if str(self.inner_fold_parallelism).strip().lower() != "auto":
+            try:
+                if int(self.inner_fold_parallelism) < 1:
+                    raise ValueError
+            except ValueError as exc:
+                raise ValueError("inner_fold_parallelism must be 'auto' or a positive integer") from exc
+        architecture = str(self.encoder_architecture or "").lower()
+        architecture_aliases = {
+            "htr": "hierarchical_transformer",
+            "hierarchical_transformer": "hierarchical_transformer",
+            "ncf": "ncf_token_attention",
+            "ncf_token_attention": "ncf_token_attention",
+            "token_attention": "ncf_token_attention",
+        }
+        if architecture not in architecture_aliases:
+            raise ValueError(
+                "encoder_architecture must be 'hierarchical_transformer' or 'ncf_token_attention'"
+            )
+        self.encoder_architecture = architecture_aliases[architecture]
         if self.encoder_backend not in {"transformers", "hash"}:
             raise ValueError("encoder_backend must be 'transformers' or 'hash'")
+        if self.htr_num_layers < 1:
+            raise ValueError("htr_num_layers must be >= 1")
+        if self.htr_num_heads < 1:
+            raise ValueError("htr_num_heads must be >= 1")
+        if self.htr_transformer_dim < 1:
+            raise ValueError("htr_transformer_dim must be >= 1")
+        if self.htr_transformer_dim % self.htr_num_heads != 0:
+            raise ValueError("htr_transformer_dim must be divisible by htr_num_heads")
+        if self.htr_sentence_encoder_batch_size < 1:
+            raise ValueError("htr_sentence_encoder_batch_size must be >= 1")
+        if self.htr_sentence_encoder_backend not in {"auto", "sentence_transformers", "transformers"}:
+            raise ValueError(
+                "htr_sentence_encoder_backend must be one of: auto, sentence_transformers, transformers"
+            )
+        if self.htr_sentence_pooling not in {"auto", "cls", "last", "mean", "token_attention"}:
+            raise ValueError(
+                "htr_sentence_pooling must be one of: auto, cls, last, mean, token_attention"
+            )
 
     @classmethod
     def from_json(cls, path: str | Path) -> "NeuralCausalForestConfig":
@@ -395,6 +447,7 @@ def make_text_loader(
 class EncoderForwardOutput:
     representation: torch.Tensor
     token_alpha: Optional[torch.Tensor] = None
+    token_alpha_sources: Optional[List[torch.Tensor]] = None
     chunk_alpha: Optional[torch.Tensor] = None
     flat_chunk_patient_index: Optional[torch.Tensor] = None
     flat_chunk_local_index: Optional[torch.Tensor] = None
@@ -810,6 +863,9 @@ class HierarchicalTokenAttentionEncoder(nn.Module):
         top_k = max(1, int(top_k))
         metadata = list(metadata or [{} for _ in row_ids])
         per_patient_candidates: Dict[int, List[Dict[str, Any]]] = {idx: [] for idx in range(len(row_ids))}
+        tokenizer = getattr(self, "tokenizer", None)
+        special_token_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+        special_tokens = set(getattr(tokenizer, "all_special_tokens", []) or [])
 
         for flat_idx in range(token_alpha.shape[0]):
             patient_idx = int(patient_index[flat_idx])
@@ -829,16 +885,23 @@ class HierarchicalTokenAttentionEncoder(nn.Module):
             top_local = torch.topk(local_scores, k=n_take).indices.tolist()
             for rank_position in top_local:
                 pos = int(valid_positions[rank_position])
+                token_id = int(input_ids[flat_idx, pos].item())
+                if token_id in special_token_ids:
+                    continue
                 start_local = int(offsets[flat_idx, pos, 0].item())
                 end_local = int(offsets[flat_idx, pos, 1].item())
                 if start_local < 0 or end_local <= start_local:
-                    token_text = self.decode_token(int(input_ids[flat_idx, pos].item()))
+                    token_text = self.decode_token(token_id)
                     char_start = chunk.char_start
                     char_end = min(chunk.char_end, chunk.char_start + len(token_text))
                 else:
                     char_start = chunk.char_start + start_local
                     char_end = chunk.char_start + end_local
                     token_text = output.texts[patient_idx][char_start:char_end]
+                if token_text in special_tokens:
+                    continue
+                if not re.search(r"[A-Za-z0-9]", str(token_text).replace("##", "")):
+                    continue
                 snippet_start = max(0, char_start - self.config.snippet_context_chars)
                 snippet_end = min(
                     len(output.texts[patient_idx]),
@@ -879,6 +942,169 @@ class HierarchicalTokenAttentionEncoder(nn.Module):
         return records
 
 
+class HTRGradientAttentionEncoder(nn.Module):
+    """HTR encoder adapter with the NCF attribution tensor contract."""
+
+    def __init__(self, config: NeuralCausalForestConfig, device: torch.device | str) -> None:
+        super().__init__()
+        from .hierarchical_transformer_extractor import HierarchicalTransformerExtractor
+
+        self.config = config
+        self.device_obj = torch.device(device)
+        self.output_dim = int(config.representation_dim)
+        sentence_encoder_model = (
+            "hash" if config.encoder_backend == "hash" else config.encoder_model_name
+        )
+        sentence_encoder_backend = (
+            "auto" if config.encoder_backend == "hash" else config.htr_sentence_encoder_backend
+        )
+        sentence_pooling = (
+            "auto" if config.encoder_backend == "hash" else config.htr_sentence_pooling
+        )
+        self.htr = HierarchicalTransformerExtractor(
+            sentence_encoder_model=sentence_encoder_model,
+            freeze_sentence_encoder=config.freeze_encoder,
+            chunk_size_words=config.chunk_size_words,
+            chunk_overlap_words=config.chunk_overlap_words,
+            max_chunks=config.max_chunks,
+            max_chunk_length=config.max_length,
+            num_transformer_layers=config.htr_num_layers,
+            num_attention_heads=config.htr_num_heads,
+            transformer_dim=config.htr_transformer_dim,
+            transformer_dropout=config.dropout,
+            projection_dim=config.representation_dim,
+            hash_embedding_dim=config.htr_hash_embedding_dim,
+            sentence_encoder_batch_size=config.htr_sentence_encoder_batch_size,
+            sentence_encoder_backend=sentence_encoder_backend,
+            sentence_pooling=sentence_pooling,
+            normalize_sentence_embeddings=config.htr_normalize_sentence_embeddings,
+            trainable_sentence_encoder_layers=config.trainable_encoder_layers,
+            device=self.device_obj,
+        )
+        # HTR initializes transformer/token-pooling parameters lazily.  The NCF
+        # optimizers are created immediately after model construction, so force
+        # initialization here to include the encoder parameters in the optimizer.
+        self.htr.fit_tokenizer([])
+        self.to(self.device_obj)
+
+    @property
+    def tokenizer(self) -> Any:
+        return getattr(self.htr, "_tokenizer", None)
+
+    def split_texts(self, texts: Sequence[str]) -> List[List[ChunkInfo]]:
+        return [
+            split_text_into_word_span_chunks(
+                text,
+                self.config.chunk_size_words,
+                self.config.chunk_overlap_words,
+                self.config.max_chunks,
+            )
+            for text in texts
+        ]
+
+    def _make_htr_batch(
+        self,
+        texts: Sequence[str],
+        chunks_by_patient: Sequence[Sequence[ChunkInfo]],
+    ) -> Dict[str, Any]:
+        return {
+            "texts": list(texts),
+            "chunks": [[chunk.text for chunk in chunks] for chunks in chunks_by_patient],
+        }
+
+    def forward(
+        self,
+        texts: Sequence[str],
+        *,
+        return_attention_tensors: bool = False,
+    ) -> EncoderForwardOutput:
+        texts = [str(text or "") for text in texts]
+        chunks_by_patient = self.split_texts(texts)
+        batch = self._make_htr_batch(texts, chunks_by_patient)
+        flat_patient_index: List[int] = []
+        flat_local_index: List[int] = []
+        for patient_idx, chunks in enumerate(chunks_by_patient):
+            for local_idx, _chunk in enumerate(chunks):
+                flat_patient_index.append(patient_idx)
+                flat_local_index.append(local_idx)
+
+        if return_attention_tensors:
+            representation, attention_info = self.htr(
+                batch,
+                return_attention_tensors=True,
+            )
+        else:
+            representation = self.htr(batch)
+            attention_info = None
+        if self.config.normalize_representations:
+            representation = F.normalize(representation, p=2, dim=-1)
+
+        if not return_attention_tensors:
+            return EncoderForwardOutput(representation=representation)
+
+        attention_info = attention_info or {}
+        token_alpha = attention_info.get("token_alpha")
+        token_alpha_sources = attention_info.get("token_alpha_sources") or None
+        chunk_alpha = attention_info.get("chunk_alpha")
+        return EncoderForwardOutput(
+            representation=representation,
+            token_alpha=token_alpha,
+            token_alpha_sources=token_alpha_sources,
+            chunk_alpha=chunk_alpha,
+            flat_chunk_patient_index=torch.as_tensor(
+                flat_patient_index, dtype=torch.long, device=representation.device
+            ),
+            flat_chunk_local_index=torch.as_tensor(
+                flat_local_index, dtype=torch.long, device=representation.device
+            ),
+            attention_mask=attention_info.get("attention_mask"),
+            input_ids=attention_info.get("input_ids"),
+            offset_mapping=attention_info.get("offset_mapping"),
+            chunks_by_patient=chunks_by_patient,
+            texts=texts,
+        )
+
+    def decode_token(self, token_id: int) -> str:
+        tokenizer = self.tokenizer
+        if tokenizer is None:
+            return ""
+        try:
+            return str(tokenizer.convert_ids_to_tokens([int(token_id)])[0])
+        except Exception:
+            return ""
+
+    def attention_records_from_output(
+        self,
+        output: EncoderForwardOutput,
+        row_ids: Sequence[Any],
+        *,
+        stage: str,
+        top_k: int,
+        metadata: Optional[Sequence[Dict[str, Any]]] = None,
+        token_scores: Optional[torch.Tensor] = None,
+    ) -> List[Dict[str, Any]]:
+        return HierarchicalTokenAttentionEncoder.attention_records_from_output(
+            self,
+            output,
+            row_ids,
+            stage=stage,
+            top_k=top_k,
+            metadata=metadata,
+            token_scores=token_scores,
+        )
+
+
+def make_ncf_text_encoder(
+    config: NeuralCausalForestConfig,
+    device: torch.device | str,
+) -> nn.Module:
+    if config.encoder_architecture == "hierarchical_transformer":
+        return HTRGradientAttentionEncoder(config, device)
+    if config.encoder_architecture == "ncf_token_attention":
+        return HierarchicalTokenAttentionEncoder(config, device)
+    raise ValueError(f"Unsupported encoder_architecture: {config.encoder_architecture!r}")
+
+
 # -----------------------------------------------------------------------------
 # Models
 # -----------------------------------------------------------------------------
@@ -894,7 +1120,7 @@ class NuisanceTextModel(nn.Module):
         super().__init__()
         self.config = config
         self.outcome_type = outcome_type
-        self.encoder = HierarchicalTokenAttentionEncoder(config, device)
+        self.encoder = make_ncf_text_encoder(config, device)
         self.shared = nn.Sequential(
             nn.Linear(config.representation_dim, config.nuisance_hidden_dim),
             nn.GELU(),
@@ -1037,7 +1263,7 @@ class NeuralCausalForestModel(nn.Module):
         super().__init__()
         self.config = config
         self.device_obj = torch.device(device)
-        self.encoder = HierarchicalTokenAttentionEncoder(config, self.device_obj)
+        self.encoder = make_ncf_text_encoder(config, self.device_obj)
         self.dropout = nn.Dropout(config.dropout)
         self.forest = SoftCausalForestHead(config, input_dim=config.representation_dim)
         self.to(self.device_obj)
@@ -1256,6 +1482,36 @@ def predict_nuisance_model(
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
 
+def _resolve_inner_fold_parallelism(
+    config: NeuralCausalForestConfig,
+    folds: int,
+    device: torch.device,
+) -> int:
+    setting = str(config.inner_fold_parallelism).strip().lower()
+    if setting == "auto":
+        if device.type != "cpu":
+            return 1
+        return max(1, min(int(config.num_workers or 1), int(folds)))
+    return max(1, min(int(setting), int(folds)))
+
+
+def _run_ncf_inner_fold_tasks(run_fold, split_items, n_jobs: int) -> List[Dict[str, Any]]:
+    if n_jobs <= 1:
+        return [
+            run_fold(fold, fit_idx, heldout_idx)
+            for fold, (fit_idx, heldout_idx) in split_items
+        ]
+    with ThreadPoolExecutor(
+        max_workers=int(n_jobs),
+        thread_name_prefix="ncf-nuisance-fold",
+    ) as executor:
+        futures = [
+            executor.submit(run_fold, fold, fit_idx, heldout_idx)
+            for fold, (fit_idx, heldout_idx) in split_items
+        ]
+        return [future.result() for future in futures]
+
+
 def crossfit_nuisance_predictions(
     df: pd.DataFrame,
     *,
@@ -1281,52 +1537,76 @@ def crossfit_nuisance_predictions(
         splitter = KFold(n_splits=folds, shuffle=True, random_state=config.seed + 101)
         split_iter = splitter.split(df)
 
+    split_items = list(enumerate(split_iter, start=1))
+    n_jobs = _resolve_inner_fold_parallelism(config, folds, device)
+    logger.info(
+        "nuisance cross-fit parallelism: folds=%d n_jobs=%d setting=%s device=%s",
+        folds,
+        n_jobs,
+        config.inner_fold_parallelism,
+        device,
+    )
+
+    def run_fold(fold: int, fit_idx: np.ndarray, heldout_idx: np.ndarray) -> Dict[str, Any]:
+        logger.info("nuisance fold %d/%d: train=%d heldout=%d", fold, folds, len(fit_idx), len(heldout_idx))
+        fold_config = replace(config, num_workers=0) if n_jobs > 1 and config.num_workers else config
+        model = NuisanceTextModel(fold_config, device=device, outcome_type=outcome_type)
+        try:
+            train_result = train_nuisance_model(
+                model,
+                df.iloc[fit_idx].reset_index(drop=True),
+                text_column=text_column,
+                treatment_column=treatment_column,
+                outcome_column=outcome_column,
+                outcome_type=outcome_type,
+                config=fold_config,
+                device=device,
+                row_id_column=row_id_column,
+            )
+            pred = predict_nuisance_model(
+                model,
+                df.iloc[heldout_idx].reset_index(drop=True),
+                text_column=text_column,
+                outcome_type=outcome_type,
+                config=fold_config,
+                device=device,
+                row_id_column=row_id_column,
+            )
+            pred["nuisance_fold"] = fold
+            fold_attention: List[Dict[str, Any]] = []
+            if collect_attention:
+                heldout_df = df.iloc[heldout_idx].reset_index(drop=True)
+                fold_attention = nuisance_attention_evidence(
+                    model,
+                    heldout_df[text_column].astype(str).tolist(),
+                    row_ids=heldout_df[row_id_column].tolist(),
+                    config=fold_config,
+                    stage="nuisance",
+                    top_k=fold_config.attention_top_k,
+                    metadata=[{"nuisance_fold": fold} for _ in range(len(heldout_df))],
+                )
+            return {
+                "fold": fold,
+                "predictions": pred,
+                "history": train_result["history"],
+                "attention": fold_attention,
+            }
+        finally:
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    fold_results = _run_ncf_inner_fold_tasks(run_fold, split_items, n_jobs)
+
     prediction_rows: List[pd.DataFrame] = []
     history_rows: List[Dict[str, Any]] = []
     attention_rows: List[Dict[str, Any]] = []
-
-    for fold, (fit_idx, heldout_idx) in enumerate(split_iter, start=1):
-        logger.info("nuisance fold %d/%d: train=%d heldout=%d", fold, folds, len(fit_idx), len(heldout_idx))
-        model = NuisanceTextModel(config, device=device, outcome_type=outcome_type)
-        train_result = train_nuisance_model(
-            model,
-            df.iloc[fit_idx].reset_index(drop=True),
-            text_column=text_column,
-            treatment_column=treatment_column,
-            outcome_column=outcome_column,
-            outcome_type=outcome_type,
-            config=config,
-            device=device,
-            row_id_column=row_id_column,
-        )
-        for row in train_result["history"]:
+    for result in fold_results:
+        fold = int(result["fold"])
+        prediction_rows.append(result["predictions"])
+        for row in result["history"]:
             history_rows.append({"fold": fold, **row})
-        pred = predict_nuisance_model(
-            model,
-            df.iloc[heldout_idx].reset_index(drop=True),
-            text_column=text_column,
-            outcome_type=outcome_type,
-            config=config,
-            device=device,
-            row_id_column=row_id_column,
-        )
-        pred["nuisance_fold"] = fold
-        prediction_rows.append(pred)
-        if collect_attention:
-            heldout_df = df.iloc[heldout_idx].reset_index(drop=True)
-            fold_attention = nuisance_attention_evidence(
-                model,
-                heldout_df[text_column].astype(str).tolist(),
-                row_ids=heldout_df[row_id_column].tolist(),
-                config=config,
-                stage="nuisance",
-                top_k=config.attention_top_k,
-                metadata=[{"nuisance_fold": fold} for _ in range(len(heldout_df))],
-            )
-            attention_rows.extend(fold_attention)
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        attention_rows.extend(result["attention"])
 
     predictions = pd.concat(prediction_rows, ignore_index=True).sort_values(row_id_column)
     predictions = predictions.merge(
@@ -1697,17 +1977,56 @@ def _grad_x_attention_token_scores(
 ) -> torch.Tensor:
     if enc.token_alpha is None:
         raise ValueError("Encoder output does not include token attention tensors")
-    token_grad = enc.token_alpha.grad
-    if token_grad is None:
-        token_scores = enc.token_alpha.detach()
+    source_scores = _grad_x_attention_source_scores(enc)
+    if source_scores is not None:
+        token_scores = source_scores
     else:
-        token_scores = torch.abs(token_grad.detach() * enc.token_alpha.detach())
+        token_grad = enc.token_alpha.grad
+        if token_grad is None:
+            token_scores = enc.token_alpha.detach()
+        else:
+            token_scores = torch.abs(token_grad.detach() * enc.token_alpha.detach())
     if enc.chunk_alpha is not None and enc.flat_chunk_patient_index is not None and enc.flat_chunk_local_index is not None:
         chunk_scores = enc.chunk_alpha.detach()[enc.flat_chunk_patient_index, enc.flat_chunk_local_index]
         token_scores = token_scores * chunk_scores.unsqueeze(-1)
     if enc.attention_mask is not None:
         token_scores = token_scores.masked_fill(enc.attention_mask <= 0, 0.0)
     return token_scores.to(device)
+
+
+def _grad_x_attention_source_scores(enc: EncoderForwardOutput) -> Optional[torch.Tensor]:
+    """Gradient x attention for original token-attention tensors before padding.
+
+    HTR encodes chunks in mini-batches.  The padded token_alpha tensor is only a
+    reporting view, while the per-mini-batch tensors are the ones used to pool
+    chunk embeddings.  Reading gradients from those source tensors preserves
+    actual gradient-based attribution.
+    """
+    if not enc.token_alpha_sources:
+        return None
+    if enc.token_alpha is None:
+        return None
+    max_len = int(enc.token_alpha.shape[1])
+    rows: List[torch.Tensor] = []
+    for source in enc.token_alpha_sources:
+        if source is None:
+            continue
+        grad = source.grad
+        if grad is None:
+            score = source.detach()
+        else:
+            score = torch.abs(grad.detach() * source.detach())
+        if int(score.shape[1]) < max_len:
+            score = F.pad(score, (0, max_len - int(score.shape[1])), value=0.0)
+        elif int(score.shape[1]) > max_len:
+            score = score[:, :max_len]
+        rows.append(score)
+    if not rows:
+        return None
+    token_scores = torch.cat(rows, dim=0)
+    if token_scores.shape != enc.token_alpha.shape:
+        return None
+    return token_scores
 
 
 # -----------------------------------------------------------------------------
@@ -1739,6 +2058,7 @@ def fit_neural_causal_forest_pipeline(
     device: torch.device | str = "cpu",
     row_id_column: str = "_ncf_row_id",
     collect_attention: bool = True,
+    nuisance_artifact_dir: Optional[str | Path] = None,
 ) -> FitPipelineResult:
     config = config or NeuralCausalForestConfig()
     config.__post_init__()
@@ -1763,6 +2083,10 @@ def fit_neural_causal_forest_pipeline(
         row_id_column=row_id_column,
         collect_attention=collect_attention,
     )
+    if nuisance_artifact_dir is not None:
+        nuisance_dir = Path(nuisance_artifact_dir)
+        write_dataframe(nuisance_predictions, nuisance_dir / "train_nuisance_predictions.parquet")
+        write_dataframe(nuisance_history, nuisance_dir / "nuisance_history.parquet")
     model = NeuralCausalForestModel(config, device=device_obj)
     train_result = train_neural_causal_forest(
         model,

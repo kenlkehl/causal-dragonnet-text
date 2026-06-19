@@ -609,6 +609,8 @@ class HierarchicalTransformerExtractor(nn.Module):
         return self._resolved_sentence_encoder_path
 
     def _effective_sentence_encoder_backend(self) -> str:
+        if self._hash_backend:
+            return "hash"
         if self._sentence_pooling == "token_attention":
             return "transformers"
         if self._sentence_encoder_backend != "auto":
@@ -637,6 +639,8 @@ class HierarchicalTransformerExtractor(nn.Module):
         )
 
     def _effective_sentence_pooling(self) -> str:
+        if self._hash_backend:
+            return "hash"
         if self._sentence_pooling != "auto":
             return self._sentence_pooling
         model_name = str(self._sentence_encoder_model).lower()
@@ -784,14 +788,28 @@ class HierarchicalTransformerExtractor(nn.Module):
                 weights_cpu[row, :valid_len].clone()
             )
 
-    def _encode_chunks(self, chunks: Sequence[str]) -> torch.Tensor:
+    def _encode_chunks(
+        self,
+        chunks: Sequence[str],
+        *,
+        return_attention_tensors: bool = False,
+    ):
         self._ensure_encoder_initialized()
         if self._hash_backend:
-            return torch.stack([self._hash_chunk_embedding(chunk) for chunk in chunks])
+            embeddings = torch.stack([self._hash_chunk_embedding(chunk) for chunk in chunks])
+            if return_attention_tensors:
+                return embeddings, None
+            return embeddings
 
         if self._effective_sentence_encoder_backend() == "sentence_transformers":
-            return self._encode_chunks_with_sentence_transformer(chunks)
-        return self._encode_chunks_with_transformers(chunks)
+            embeddings = self._encode_chunks_with_sentence_transformer(chunks)
+            if return_attention_tensors:
+                return embeddings, None
+            return embeddings
+        return self._encode_chunks_with_transformers(
+            chunks,
+            return_attention_tensors=return_attention_tensors,
+        )
 
     def _encode_chunks_with_sentence_transformer(self, chunks: Sequence[str]) -> torch.Tensor:
         if self._sentence_transformer_encoder is None:
@@ -811,12 +829,25 @@ class HierarchicalTransformerExtractor(nn.Module):
         embeddings_np = np.concatenate(embeddings_by_batch, axis=0)
         return torch.as_tensor(embeddings_np, dtype=torch.float32, device=self._device)
 
-    def _encode_chunks_with_transformers(self, chunks: Sequence[str]) -> torch.Tensor:
+    def _encode_chunks_with_transformers(
+        self,
+        chunks: Sequence[str],
+        *,
+        return_attention_tensors: bool = False,
+    ):
         chunk_list = list(chunks)
         outputs_by_batch = []
+        token_weights_by_batch: List[torch.Tensor] = []
+        input_ids_by_batch: List[torch.Tensor] = []
+        attention_mask_by_batch: List[torch.Tensor] = []
+        offset_mapping_by_batch: List[torch.Tensor] = []
         for start in range(0, len(chunk_list), self._sentence_encoder_batch_size):
             batch_chunks = chunk_list[start:start + self._sentence_encoder_batch_size]
-            encoded = self._tokenize_chunks_for_transformers(batch_chunks)
+            encoded = self._tokenize_chunks_for_transformers(
+                batch_chunks,
+                return_offsets_mapping=return_attention_tensors,
+            )
+            offset_mapping = encoded.pop("offset_mapping", None)
             input_ids = encoded["input_ids"].to(self._device)
             attention_mask = encoded["attention_mask"].to(self._device)
             if self._sentence_encoder is not None and not self._encoder_has_trainable_params:
@@ -839,18 +870,52 @@ class HierarchicalTransformerExtractor(nn.Module):
             )
             self._capture_token_weights(token_weights, attention_mask)
             outputs_by_batch.append(pooled.float())
-        return torch.cat(outputs_by_batch, dim=0)
+            if return_attention_tensors:
+                if token_weights is not None:
+                    token_weights_by_batch.append(token_weights)
+                input_ids_by_batch.append(input_ids)
+                attention_mask_by_batch.append(attention_mask)
+                if offset_mapping is None:
+                    offset_mapping = torch.full(
+                        (input_ids.shape[0], input_ids.shape[1], 2),
+                        -1,
+                        dtype=torch.long,
+                        device=self._device,
+                    )
+                else:
+                    offset_mapping = offset_mapping.to(self._device)
+                offset_mapping_by_batch.append(offset_mapping)
+        embeddings = torch.cat(outputs_by_batch, dim=0)
+        if not return_attention_tensors:
+            return embeddings
+        token_info: Dict[str, Any] = {
+            "token_alpha": (
+                self._pad_and_cat_token_batches(token_weights_by_batch, pad_value=0.0)
+                if token_weights_by_batch
+                else None
+            ),
+            "token_alpha_sources": token_weights_by_batch,
+            "input_ids": self._pad_and_cat_token_batches(input_ids_by_batch, pad_value=0),
+            "attention_mask": self._pad_and_cat_token_batches(attention_mask_by_batch, pad_value=0),
+            "offset_mapping": self._pad_and_cat_offset_batches(offset_mapping_by_batch),
+        }
+        return embeddings, token_info
 
     def _encode_prepared_transformer_chunks(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
+        *,
+        return_attention_tensors: bool = False,
+    ):
         input_ids = input_ids.to(self._device, non_blocking=True)
         attention_mask = attention_mask.to(self._device, non_blocking=True)
         if self._sentence_encoder is not None and not self._encoder_has_trainable_params:
             self._sentence_encoder.eval()
         outputs_by_batch = []
+        token_weights_by_batch: List[torch.Tensor] = []
+        input_ids_by_batch: List[torch.Tensor] = []
+        attention_mask_by_batch: List[torch.Tensor] = []
         for start in range(0, input_ids.shape[0], self._sentence_encoder_batch_size):
             batch_input_ids = input_ids[start:start + self._sentence_encoder_batch_size]
             batch_attention_mask = attention_mask[start:start + self._sentence_encoder_batch_size]
@@ -872,38 +937,136 @@ class HierarchicalTransformerExtractor(nn.Module):
             )
             self._capture_token_weights(token_weights, batch_attention_mask)
             outputs_by_batch.append(pooled.float())
-        return torch.cat(outputs_by_batch, dim=0)
+            if return_attention_tensors:
+                if token_weights is not None:
+                    token_weights_by_batch.append(token_weights)
+                input_ids_by_batch.append(batch_input_ids)
+                attention_mask_by_batch.append(batch_attention_mask)
+        embeddings = torch.cat(outputs_by_batch, dim=0)
+        if not return_attention_tensors:
+            return embeddings
+        token_info: Dict[str, Any] = {
+            "token_alpha": (
+                self._pad_and_cat_token_batches(token_weights_by_batch, pad_value=0.0)
+                if token_weights_by_batch
+                else None
+            ),
+            "token_alpha_sources": token_weights_by_batch,
+            "input_ids": self._pad_and_cat_token_batches(input_ids_by_batch, pad_value=0),
+            "attention_mask": self._pad_and_cat_token_batches(attention_mask_by_batch, pad_value=0),
+            "offset_mapping": torch.full(
+                (input_ids.shape[0], input_ids.shape[1], 2),
+                -1,
+                dtype=torch.long,
+                device=self._device,
+            ),
+        }
+        return embeddings, token_info
 
-    def _tokenize_chunks_for_transformers(self, chunks: Sequence[str]) -> Dict[str, torch.Tensor]:
-        entries = [self._tokenize_one_chunk_for_transformers(chunk) for chunk in chunks]
+    @staticmethod
+    def _pad_and_cat_token_batches(
+        batches: Sequence[torch.Tensor],
+        *,
+        pad_value: float,
+    ) -> torch.Tensor:
+        if not batches:
+            return torch.empty(0)
+        max_len = max(int(batch.shape[1]) for batch in batches)
+        padded = []
+        for batch in batches:
+            pad = max_len - int(batch.shape[1])
+            if pad > 0:
+                padded.append(F.pad(batch, (0, pad), value=pad_value))
+            else:
+                padded.append(batch)
+        return torch.cat(padded, dim=0)
+
+    @staticmethod
+    def _pad_and_cat_offset_batches(batches: Sequence[torch.Tensor]) -> torch.Tensor:
+        if not batches:
+            return torch.empty(0, 0, 2, dtype=torch.long)
+        max_len = max(int(batch.shape[1]) for batch in batches)
+        padded = []
+        for batch in batches:
+            pad = max_len - int(batch.shape[1])
+            if pad > 0:
+                padded.append(F.pad(batch, (0, 0, 0, pad), value=-1))
+            else:
+                padded.append(batch)
+        return torch.cat(padded, dim=0)
+
+    def _tokenize_chunks_for_transformers(
+        self,
+        chunks: Sequence[str],
+        *,
+        return_offsets_mapping: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        entries = [
+            self._tokenize_one_chunk_for_transformers(
+                chunk,
+                return_offsets_mapping=return_offsets_mapping,
+            )
+            for chunk in chunks
+        ]
         return self._collate_tokenized_chunks(entries)
 
     def _tokenize_one_chunk_for_transformers(
         self,
         chunk: str,
-    ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+        *,
+        return_offsets_mapping: bool = False,
+    ):
         key = str(chunk or "")
-        cached = self._tokenization_cache.get(key)
+        cached = None if return_offsets_mapping else self._tokenization_cache.get(key)
         if cached is not None:
             return cached
 
-        encoded = self._tokenizer(
-            key,
-            padding=False,
-            truncation=True,
-            max_length=self._max_chunk_length,
-        )
+        kwargs = {
+            "padding": False,
+            "truncation": True,
+            "max_length": self._max_chunk_length,
+        }
+        if return_offsets_mapping and bool(getattr(self._tokenizer, "is_fast", False)):
+            kwargs["return_offsets_mapping"] = True
+        encoded = self._tokenizer(key, **kwargs)
         input_ids = tuple(int(token_id) for token_id in encoded["input_ids"])
         attention_mask = tuple(int(mask_value) for mask_value in encoded["attention_mask"])
+        if return_offsets_mapping:
+            offsets = encoded.get("offset_mapping")
+            if offsets is None:
+                offsets = [(-1, -1) for _ in input_ids]
+            offset_tuple = tuple((int(start), int(end)) for start, end in offsets)
+            return input_ids, attention_mask, offset_tuple
         if len(self._tokenization_cache) < self._tokenization_cache_max_entries:
             self._tokenization_cache[key] = (input_ids, attention_mask)
         return input_ids, attention_mask
 
     def _collate_tokenized_chunks(
         self,
-        entries: Sequence[Tuple[Tuple[int, ...], Tuple[int, ...]]],
+        entries: Sequence[Any],
     ) -> Dict[str, torch.Tensor]:
-        return _collate_tokenized_chunks(self._tokenizer, entries)
+        if not entries:
+            return _collate_tokenized_chunks(self._tokenizer, entries)
+        has_offsets = len(entries[0]) == 3
+        if not has_offsets:
+            return _collate_tokenized_chunks(self._tokenizer, entries)
+        basic_entries = [(input_ids, attention_mask) for input_ids, attention_mask, _ in entries]
+        collated = _collate_tokenized_chunks(self._tokenizer, basic_entries)
+        max_length = int(collated["input_ids"].shape[1])
+        offsets_tensor = torch.full(
+            (len(entries), max_length, 2),
+            -1,
+            dtype=torch.long,
+        )
+        left_pad = getattr(self._tokenizer, "padding_side", "right") == "left"
+        for row, (_input_ids, _attention_mask, offsets) in enumerate(entries):
+            offset = max_length - len(offsets) if left_pad else 0
+            offsets_tensor[row, offset:offset + len(offsets)] = torch.as_tensor(
+                offsets,
+                dtype=torch.long,
+            )
+        collated["offset_mapping"] = offsets_tensor
+        return collated
 
     def _chunks_for_texts(self, texts: Sequence[str]) -> List[List[str]]:
         chunks_by_text: List[List[str]] = []
@@ -947,7 +1110,7 @@ class HierarchicalTransformerExtractor(nn.Module):
     def prepare_batch(self, texts: Sequence[str]) -> Dict[str, Any]:
         return self.make_batch_preprocessor()(texts)
 
-    def forward(self, texts_or_batch) -> torch.Tensor:
+    def forward(self, texts_or_batch, *, return_attention_tensors: bool = False):
         prepared_batch = texts_or_batch if isinstance(texts_or_batch, dict) else None
         if prepared_batch is not None:
             texts = prepared_batch.get("texts")
@@ -967,11 +1130,23 @@ class HierarchicalTransformerExtractor(nn.Module):
             texts = list(texts)
             batch_chunks = self._chunks_for_texts(texts)
         if not texts:
-            return torch.zeros(0, self._projection_dim, device=self._device)
+            features = torch.zeros(0, self._projection_dim, device=self._device)
+            if return_attention_tensors:
+                return features, {
+                    "token_alpha": None,
+                    "chunk_alpha": None,
+                    "input_ids": None,
+                    "attention_mask": None,
+                    "offset_mapping": None,
+                    "token_alpha_sources": [],
+                    "batch_chunks": [],
+                }
+            return features
 
         flat_chunks = [chunk for chunks in batch_chunks for chunk in chunks]
         if self._capture_token_attention:
             self._token_weight_capture_buffer = []
+        token_info = None
         if (
             prepared_batch is not None
             and "chunk_input_ids" in prepared_batch
@@ -980,12 +1155,20 @@ class HierarchicalTransformerExtractor(nn.Module):
             and self._effective_sentence_encoder_backend() == "transformers"
         ):
             self._ensure_encoder_initialized()
-            flat_embeddings = self._encode_prepared_transformer_chunks(
+            encoded_chunks = self._encode_prepared_transformer_chunks(
                 prepared_batch["chunk_input_ids"],
                 prepared_batch["chunk_attention_mask"],
+                return_attention_tensors=return_attention_tensors,
             )
         else:
-            flat_embeddings = self._encode_chunks(flat_chunks)
+            encoded_chunks = self._encode_chunks(
+                flat_chunks,
+                return_attention_tensors=return_attention_tensors,
+            )
+        if return_attention_tensors:
+            flat_embeddings, token_info = encoded_chunks
+        else:
+            flat_embeddings = encoded_chunks
         if self._capture_token_attention:
             self._last_token_weights_by_chunk = list(self._token_weight_capture_buffer)
         else:
@@ -1035,10 +1218,38 @@ class HierarchicalTransformerExtractor(nn.Module):
             pool_attention = attn_weights[:, 0, 1: 1 + max_chunks]
             pool_attention = pool_attention.masked_fill(~chunk_mask, 0.0)
             denom = pool_attention.sum(dim=1, keepdim=True).clamp_min(1e-9)
-            self._last_chunk_weights = (pool_attention / denom).detach()
+            chunk_alpha = pool_attention / denom
+            self._last_chunk_weights = chunk_alpha.detach()
         else:
+            chunk_alpha = None
             self._last_chunk_weights = None
         self._last_chunks = batch_chunks
+        if return_attention_tensors:
+            if token_info is None:
+                token_info = {
+                    "token_alpha": None,
+                    "input_ids": None,
+                    "attention_mask": None,
+                    "offset_mapping": None,
+                    "token_alpha_sources": [],
+                }
+            token_alpha = token_info.get("token_alpha")
+            for token_alpha_source in token_info.get("token_alpha_sources") or []:
+                if token_alpha_source is not None and token_alpha_source.requires_grad:
+                    token_alpha_source.retain_grad()
+            if token_alpha is not None and token_alpha.requires_grad:
+                token_alpha.retain_grad()
+            if chunk_alpha is not None and chunk_alpha.requires_grad:
+                chunk_alpha.retain_grad()
+            return features, {
+                "token_alpha": token_alpha,
+                "chunk_alpha": chunk_alpha,
+                "input_ids": token_info.get("input_ids"),
+                "attention_mask": token_info.get("attention_mask"),
+                "offset_mapping": token_info.get("offset_mapping"),
+                "token_alpha_sources": token_info.get("token_alpha_sources") or [],
+                "batch_chunks": batch_chunks,
+            }
         return features
 
     def fit_tokenizer(self, texts: List[str]) -> None:

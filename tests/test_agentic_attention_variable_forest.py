@@ -1585,6 +1585,76 @@ def test_explicit_fold_parallelism_overrides_cuda_serial_default(tmp_path):
     assert runner._fold_n_jobs(5) == 2
 
 
+def test_agentic_attention_config_accepts_inner_fold_parallelism_alias(tmp_path):
+    from oci.config import ExperimentConfig
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "applied_inference": {
+                    "architecture": {
+                        "model_type": "agentic_attention_variable_forest",
+                        "agentic_attention_variable_forest": {
+                            "nuisance_folds": 2,
+                            "effect_folds": 2,
+                            "inner_fold_parallelism": "2",
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = ExperimentConfig.from_json(config_path)
+
+    assert (
+        config.applied_inference.architecture.agentic_attention_variable_forest
+        .fold_parallelism
+        == "2"
+    )
+
+
+def test_causal_forest_config_accepts_inner_fold_parallelism_alias(tmp_path):
+    from oci.config import ExperimentConfig
+
+    dataset_path = tmp_path / "dataset.parquet"
+    pd.DataFrame(
+        {
+            "clinical_text": ["a", "b"],
+            "treatment_indicator": [0, 1],
+            "outcome_indicator": [0, 1],
+        }
+    ).to_parquet(dataset_path, index=False)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "applied_inference": {
+                    "dataset_path": str(dataset_path),
+                    "architecture": {
+                        "model_type": "causal_forest",
+                        "causal_forest": {
+                            "use_rlearner_representation": True,
+                            "inner_fold_parallelism": "2",
+                        },
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = ExperimentConfig.from_json(config_path)
+
+    assert (
+        config.applied_inference.architecture.causal_forest
+        .rlearner_inner_fold_parallelism
+        == "2"
+    )
+
+
 def test_oracle_agentic_attention_script_builds_configs(tmp_path):
     from oracle_experiment_scripts.run_oracle_agentic_attention_variable_forest_experiments import (
         _make_applied_config,
