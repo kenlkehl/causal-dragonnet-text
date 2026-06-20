@@ -128,6 +128,7 @@ def test_non_neural_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path: 
                 max_features=1000,
                 min_df=1,
                 top_n_features=5,
+                fold_parallelism="2",
             ),
         ),
         explicit_features=ExplicitFeatureExtractionConfig(enabled=True, features=[]),

@@ -423,6 +423,9 @@ class NonNeuralAgenticForestConfig:
     e_clip: float = 0.01
     top_n_features: int = 100
     candidate_proposals_per_fold: int = 30
+    # "auto" uses the runner num_workers setting; set a positive integer to
+    # parallelize BoW nuisance/effect cross-fit folds explicitly.
+    fold_parallelism: str = "auto"
 
     def __post_init__(self):
         if self.nuisance_folds < 2:
@@ -454,6 +457,15 @@ class NonNeuralAgenticForestConfig:
             raise ValueError(
                 "non_neural_agentic_forest.candidate_proposals_per_fold must be >= 1"
             )
+        if self.fold_parallelism != "auto":
+            try:
+                if int(self.fold_parallelism) < 1:
+                    raise ValueError
+            except ValueError as exc:
+                raise ValueError(
+                    "non_neural_agentic_forest.fold_parallelism must be 'auto' "
+                    "or a positive integer"
+                ) from exc
 
 
 EXTRACTOR_ALIASES = {

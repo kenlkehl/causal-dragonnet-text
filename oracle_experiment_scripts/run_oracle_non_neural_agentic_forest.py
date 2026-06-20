@@ -62,6 +62,7 @@ class NonNeuralAgenticOracleConfig:
     e_clip: float = 0.01
     top_n_features: int = 100
     candidate_proposals_per_fold: int = 30
+    fold_parallelism: str = "auto"
 
     cf_n_estimators: int = 200
     cf_min_samples_leaf: int = 10
@@ -83,7 +84,7 @@ class NonNeuralAgenticOracleConfig:
     extraction_model_name: str = "Qwen/Qwen3.6-27B"
     extraction_mode: str = "server"
     extraction_reasoning_parser: Optional[str] = "auto"
-    extraction_batch_size: int = 16
+    extraction_batch_size: int = 100
     extraction_max_retries: int = 3
     extraction_temperature: float = 0.0
     extraction_max_tokens: int = 4096
@@ -150,6 +151,7 @@ def _make_applied_config(
                 e_clip=config.e_clip,
                 top_n_features=config.top_n_features,
                 candidate_proposals_per_fold=config.candidate_proposals_per_fold,
+                fold_parallelism=config.fold_parallelism,
             ),
         ),
         explicit_features=ExplicitFeatureExtractionConfig(
@@ -284,6 +286,14 @@ def main() -> None:
     parser.add_argument("--ridge-alpha", type=float, default=10.0)
     parser.add_argument("--top-n-features", type=int, default=100)
     parser.add_argument("--candidate-proposals-per-fold", type=int, default=30)
+    parser.add_argument(
+        "--fold-parallelism",
+        default="auto",
+        help=(
+            "Parallelism for BoW nuisance/effect cross-fit folds: 'auto' uses "
+            "num_workers from the runner, or pass a positive integer."
+        ),
+    )
 
     parser.add_argument("--cf-n-estimators", type=int, default=200)
     parser.add_argument("--cf-min-samples-leaf", type=int, default=10)
@@ -305,7 +315,7 @@ def main() -> None:
         choices=["server", "start_server", "python_api"],
     )
     parser.add_argument("--extraction-reasoning-parser", default="auto")
-    parser.add_argument("--extraction-batch-size", type=int, default=16)
+    parser.add_argument("--extraction-batch-size", type=int, default=100)
     parser.add_argument("--extraction-max-tokens", type=int, default=4096)
     parser.add_argument("--extraction-max-text-length", type=int, default=8000)
     parser.add_argument("--extraction-cache-dir", default=None)
@@ -334,6 +344,7 @@ def main() -> None:
         ridge_alpha=args.ridge_alpha,
         top_n_features=args.top_n_features,
         candidate_proposals_per_fold=args.candidate_proposals_per_fold,
+        fold_parallelism=args.fold_parallelism,
         cf_n_estimators=args.cf_n_estimators,
         cf_min_samples_leaf=args.cf_min_samples_leaf,
         cf_max_depth=args.cf_max_depth,

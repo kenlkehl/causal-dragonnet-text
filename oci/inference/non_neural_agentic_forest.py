@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from joblib import Parallel, delayed
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import brier_score_loss, log_loss, mean_squared_error
@@ -60,11 +61,12 @@ def run_non_neural_agentic_forest(
     evaluator: Optional[Any] = None,
 ) -> None:
     """Run BoW-guided agentic variable discovery and final explicit-feature forest."""
-    del device, num_workers
+    del device
     runner = NonNeuralAgenticForestRunner(
         dataset=dataset,
         config=config,
         output_path=output_path,
+        num_workers=num_workers,
         proposal_agent=proposal_agent,
         extraction_provider=extraction_provider,
         evaluator=evaluator,
@@ -80,6 +82,7 @@ class NonNeuralAgenticForestRunner:
         dataset: pd.DataFrame,
         config: AppliedInferenceConfig,
         output_path: Path,
+        num_workers: int = 1,
         proposal_agent: Optional[Any] = None,
         extraction_provider: Optional[Any] = None,
         evaluator: Optional[Any] = None,
@@ -90,6 +93,7 @@ class NonNeuralAgenticForestRunner:
         self.output_path = Path(output_path)
         self.artifact_dir = self.output_path.parent / "non_neural_agentic_forest"
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
+        self.num_workers = 1 if num_workers is None else int(num_workers)
 
         self.nn_config: NonNeuralAgenticForestConfig = getattr(
             config.architecture,
@@ -334,13 +338,19 @@ class NonNeuralAgenticForestRunner:
         labels = labels.astype(int)
         oof = np.full(len(labels), np.nan, dtype=float)
         random_state = 11_000 + 100 * outer_fold + (1 if label_name == "outcome" else 2)
-        split_items = _binary_split_items(
-            labels,
-            requested_folds=self.nn_config.nuisance_folds,
-            random_state=random_state,
+        split_items = list(
+            enumerate(
+                _binary_split_items(
+                    labels,
+                    requested_folds=self.nn_config.nuisance_folds,
+                    random_state=random_state,
+                ),
+                start=1,
+            )
         )
         folds = len(split_items)
-        for fold, (fit_pos, heldout_pos) in enumerate(split_items, start=1):
+
+        def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
             logger.info(
                 "Outer fold %s BoW %s nuisance fold %s/%s: train=%s heldout=%s",
                 outer_fold,
@@ -351,8 +361,11 @@ class NonNeuralAgenticForestRunner:
                 len(heldout_pos),
             )
             if len(np.unique(labels[fit_pos])) < 2:
-                oof[heldout_pos] = float(np.mean(labels[fit_pos]))
-                continue
+                return heldout_pos, np.full(
+                    len(heldout_pos),
+                    float(np.mean(labels[fit_pos])),
+                    dtype=float,
+                )
             model = Pipeline(
                 [
                     ("tfidf", self._make_vectorizer()),
@@ -360,7 +373,11 @@ class NonNeuralAgenticForestRunner:
                 ]
             )
             model.fit([texts[i] for i in fit_pos], labels[fit_pos])
-            oof[heldout_pos] = model.predict_proba([texts[i] for i in heldout_pos])[:, 1]
+            return heldout_pos, model.predict_proba([texts[i] for i in heldout_pos])[:, 1]
+
+        results = self._run_fold_tasks(run_fold, split_items)
+        for heldout_pos, values in results:
+            oof[heldout_pos] = values
         return np.clip(oof, self.nn_config.e_clip, 1.0 - self.nn_config.e_clip)
 
     def _crossfit_continuous(
@@ -377,7 +394,9 @@ class NonNeuralAgenticForestRunner:
             shuffle=True,
             random_state=12_000 + 100 * outer_fold,
         )
-        for fold, (fit_pos, heldout_pos) in enumerate(splitter.split(texts), start=1):
+        split_items = list(enumerate(splitter.split(texts), start=1))
+
+        def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
             logger.info(
                 "Outer fold %s BoW %s nuisance fold %s/%s: train=%s heldout=%s",
                 outer_fold,
@@ -394,7 +413,11 @@ class NonNeuralAgenticForestRunner:
                 ]
             )
             model.fit([texts[i] for i in fit_pos], values[fit_pos])
-            oof[heldout_pos] = model.predict([texts[i] for i in heldout_pos])
+            return heldout_pos, model.predict([texts[i] for i in heldout_pos])
+
+        results = self._run_fold_tasks(run_fold, split_items)
+        for heldout_pos, fold_values in results:
+            oof[heldout_pos] = fold_values
         return oof
 
     def _crossfit_pseudo_target(
@@ -410,7 +433,9 @@ class NonNeuralAgenticForestRunner:
             shuffle=True,
             random_state=13_000 + outer_fold,
         )
-        for fold, (fit_pos, heldout_pos) in enumerate(splitter.split(texts), start=1):
+        split_items = list(enumerate(splitter.split(texts), start=1))
+
+        def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
             logger.info(
                 "Outer fold %s BoW pseudo-target fold %s/%s: train=%s heldout=%s",
                 outer_fold,
@@ -426,7 +451,11 @@ class NonNeuralAgenticForestRunner:
                 ]
             )
             model.fit([texts[i] for i in fit_pos], pseudo_target[fit_pos])
-            oof[heldout_pos] = model.predict([texts[i] for i in heldout_pos])
+            return heldout_pos, model.predict([texts[i] for i in heldout_pos])
+
+        results = self._run_fold_tasks(run_fold, split_items)
+        for heldout_pos, values in results:
+            oof[heldout_pos] = values
         return oof
 
     def _fit_feature_importance_models(
@@ -731,6 +760,30 @@ class NonNeuralAgenticForestRunner:
 
     def _make_ridge(self) -> Ridge:
         return Ridge(alpha=float(self.nn_config.ridge_alpha), random_state=17)
+
+    def _fold_n_jobs(self, folds: int) -> int:
+        setting = str(self.nn_config.fold_parallelism).strip().lower()
+        if setting == "auto":
+            return max(1, min(int(self.num_workers), int(folds)))
+        return max(1, min(int(setting), int(folds)))
+
+    def _run_fold_tasks(self, run_fold: Any, split_items: Sequence[Any]) -> List[Any]:
+        n_jobs = self._fold_n_jobs(len(split_items))
+        if n_jobs <= 1:
+            return [
+                run_fold(int(fold), np.asarray(fit_pos), np.asarray(heldout_pos))
+                for fold, (fit_pos, heldout_pos) in split_items
+            ]
+        logger.info(
+            "Non-neural BoW cross-fit parallelism: folds=%s n_jobs=%s setting=%s",
+            len(split_items),
+            n_jobs,
+            self.nn_config.fold_parallelism,
+        )
+        return Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(run_fold)(int(fold), np.asarray(fit_pos), np.asarray(heldout_pos))
+            for fold, (fit_pos, heldout_pos) in split_items
+        )
 
     def _save_predictions(self, results_df: pd.DataFrame) -> None:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
