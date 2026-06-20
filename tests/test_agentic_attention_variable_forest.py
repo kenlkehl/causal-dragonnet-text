@@ -21,7 +21,10 @@ from oci.config import (
 from oci.inference.agentic_attention_variable_forest import (
     AgenticAttentionVariableForestRunner,
     consensus_feature_specs,
+    _InteractionOutcomeNet,
     _JointRNet,
+    _TarNetOffsetNet,
+    _tarnet_offset_heterogeneity_penalty,
     _residual_contrastive_label_frame,
     _tail_attention_positions,
     _validate_consensus_disambiguation_response,
@@ -164,6 +167,78 @@ def test_joint_rlearner_r_loss_detaches_nuisance_heads():
     nuisance_params += list(model.propensity.parameters())
     nuisance_params += list(model.outcome.parameters())
     assert all(param.grad is None for param in nuisance_params)
+
+
+def test_interaction_outcome_net_counterfactual_tau_binary():
+    torch.manual_seed(0)
+    model = _InteractionOutcomeNet(
+        extractor=DummyTensorExtractor(),
+        hidden_dim=5,
+        outcome_type="binary",
+    )
+    inputs = [torch.randn(3) for _ in range(4)]
+    treatment = torch.tensor([0.0, 1.0, 0.0, 1.0])
+    with torch.no_grad():
+        model.global_treatment_effect.fill_(0.3)
+        model.set_interaction_center(0.1)
+
+    out = model(inputs, treatment=treatment)
+
+    expected_centered = out["interaction_raw"] - 0.1
+    expected_delta = 0.3 + expected_centered
+    expected_observed = out["y0_raw"] + treatment * expected_delta
+    expected_tau = torch.sigmoid(out["y1_raw"]) - torch.sigmoid(out["y0_raw"])
+    assert out["propensity_logit"].shape == (4,)
+    assert out["observed_outcome_raw"].shape == (4,)
+    assert torch.allclose(out["interaction_centered"], expected_centered)
+    assert torch.allclose(out["treatment_delta"], expected_delta)
+    assert torch.allclose(out["observed_outcome_raw"], expected_observed)
+    assert torch.allclose(out["tau"], expected_tau)
+
+
+def test_tarnet_offset_net_counterfactual_tau_binary():
+    torch.manual_seed(0)
+    model = _TarNetOffsetNet(
+        extractor=DummyTensorExtractor(),
+        hidden_dim=5,
+        outcome_type="binary",
+    )
+    inputs = [torch.randn(3) for _ in range(4)]
+    baseline = torch.tensor([-0.5, 0.0, 0.5, 1.0])
+    treatment = torch.tensor([0.0, 1.0, 0.0, 1.0])
+
+    out = model(inputs, baseline_raw=baseline, treatment=treatment)
+
+    expected_y0 = baseline + out["offset0"]
+    expected_y1 = baseline + out["offset1"]
+    expected_observed = torch.where(treatment >= 0.5, expected_y1, expected_y0)
+    expected_tau = torch.sigmoid(expected_y1) - torch.sigmoid(expected_y0)
+    assert out["offset0"].shape == (4,)
+    assert out["offset1"].shape == (4,)
+    assert torch.allclose(out["offset_contrast"], out["offset1"] - out["offset0"])
+    assert torch.allclose(out["y0_raw"], expected_y0)
+    assert torch.allclose(out["y1_raw"], expected_y1)
+    assert torch.allclose(out["observed_outcome_raw"], expected_observed)
+    assert torch.allclose(out["tau"], expected_tau)
+
+
+def test_tarnet_offset_heterogeneity_penalty_is_variance_floor():
+    flat = torch.tensor([0.2, 0.2, 0.2, 0.2])
+    flat_penalty, flat_variance = _tarnet_offset_heterogeneity_penalty(
+        flat,
+        min_logit_std=0.5,
+    )
+
+    varied = torch.tensor([-1.0, -0.3, 0.4, 1.1])
+    varied_penalty, varied_variance = _tarnet_offset_heterogeneity_penalty(
+        varied,
+        min_logit_std=0.5,
+    )
+
+    assert flat_variance.item() == pytest.approx(0.0)
+    assert flat_penalty.item() == pytest.approx(0.25)
+    assert varied_variance.item() > 0.25
+    assert varied_penalty.item() == pytest.approx(0.0)
 
 
 def test_consensus_feature_specs_uses_agentic_alias_groups():
@@ -366,6 +441,10 @@ def test_config_parses_agentic_attention_variable_forest_block(tmp_path):
     assert avf.effect_objective == "squared_r_loss"
     assert avf.neural_stage_mode == "staged"
     assert avf.joint_rlearner_gamma == pytest.approx(1.0)
+    assert avf.interaction_l2_weight == pytest.approx(1e-3)
+    assert avf.tarnet_offset_batch_size == 128
+    assert avf.tarnet_offset_heterogeneity_weight == pytest.approx(0.1)
+    assert avf.tarnet_offset_min_logit_std == pytest.approx(0.5)
 
 
 def test_agentic_attention_config_accepts_logistic_effect_objective(tmp_path):
@@ -432,6 +511,80 @@ def test_agentic_attention_config_accepts_joint_rlearner_mode(tmp_path):
     avf = config.applied_inference.architecture.agentic_attention_variable_forest
     assert avf.neural_stage_mode == "joint_rlearner"
     assert avf.joint_rlearner_gamma == pytest.approx(0.5)
+
+
+def test_agentic_attention_config_accepts_interaction_outcome_mode(tmp_path):
+    from oci.config import ExperimentConfig
+
+    dataset_path = tmp_path / "dataset.parquet"
+    pd.DataFrame(
+        {
+            "clinical_text": ["a", "b"],
+            "treatment_indicator": [0, 1],
+            "outcome_indicator": [0, 1],
+        }
+    ).to_parquet(dataset_path, index=False)
+
+    config = ExperimentConfig.from_dict(
+        {
+            "applied_inference": {
+                "dataset_path": str(dataset_path),
+                "architecture": {
+                    "model_type": "agentic_attention_variable_forest",
+                    "agentic_attention_variable_forest": {
+                        "nuisance_folds": 2,
+                        "effect_folds": 2,
+                        "neural_stage_mode": "interaction_outcome",
+                        "interaction_l2_weight": "0.02",
+                    },
+                },
+            }
+        }
+    )
+
+    avf = config.applied_inference.architecture.agentic_attention_variable_forest
+    assert avf.neural_stage_mode == "interaction_outcome"
+    assert avf.interaction_l2_weight == pytest.approx(0.02)
+
+
+def test_agentic_attention_config_accepts_tarnet_offset_mode(tmp_path):
+    from oci.config import ExperimentConfig
+
+    dataset_path = tmp_path / "dataset.parquet"
+    pd.DataFrame(
+        {
+            "clinical_text": ["a", "b"],
+            "treatment_indicator": [0, 1],
+            "outcome_indicator": [0, 1],
+        }
+    ).to_parquet(dataset_path, index=False)
+
+    config = ExperimentConfig.from_dict(
+        {
+            "applied_inference": {
+                "dataset_path": str(dataset_path),
+                "architecture": {
+                    "model_type": "agentic_attention_variable_forest",
+                    "agentic_attention_variable_forest": {
+                        "nuisance_folds": 2,
+                        "effect_folds": 2,
+                        "neural_stage_mode": "tarnet_offset",
+                        "interaction_l2_weight": "0.03",
+                        "tarnet_offset_batch_size": "256",
+                        "tarnet_offset_heterogeneity_weight": "0.2",
+                        "tarnet_offset_min_logit_std": "0.75",
+                    },
+                },
+            }
+        }
+    )
+
+    avf = config.applied_inference.architecture.agentic_attention_variable_forest
+    assert avf.neural_stage_mode == "tarnet_offset"
+    assert avf.interaction_l2_weight == pytest.approx(0.03)
+    assert avf.tarnet_offset_batch_size == 256
+    assert avf.tarnet_offset_heterogeneity_weight == pytest.approx(0.2)
+    assert avf.tarnet_offset_min_logit_std == pytest.approx(0.75)
 
 
 def test_linear_lr_scheduler_spans_fold_training_steps():
@@ -1907,12 +2060,22 @@ def test_oracle_agentic_attention_script_builds_configs(tmp_path):
             "1",
             "--non-nuisance-epochs",
             "4",
+            "--alpha-propensity",
+            "0.2",
             "--effect-objective",
             "logistic_r_loss",
             "--neural-stage-mode",
             "joint_rlearner",
             "--joint-rlearner-gamma",
             "0.7",
+            "--interaction-l2-weight",
+            "0.02",
+            "--tarnet-offset-batch-size",
+            "256",
+            "--tarnet-offset-heterogeneity-weight",
+            "0.25",
+            "--tarnet-offset-min-logit-std",
+            "0.8",
             "--residual-contrastive-enabled",
             "--residual-contrastive-score",
             "r_score_normalized",
@@ -1939,9 +2102,14 @@ def test_oracle_agentic_attention_script_builds_configs(tmp_path):
     assert config.htr_sentence_pooling == "mean"
     assert config.htr_trainable_sentence_encoder_layers == 1
     assert config.non_nuisance_epochs == 4
+    assert config.alpha_propensity == pytest.approx(0.2)
     assert config.effect_objective == "logistic_r_loss"
     assert config.neural_stage_mode == "joint_rlearner"
     assert config.joint_rlearner_gamma == pytest.approx(0.7)
+    assert config.interaction_l2_weight == pytest.approx(0.02)
+    assert config.tarnet_offset_batch_size == 256
+    assert config.tarnet_offset_heterogeneity_weight == pytest.approx(0.25)
+    assert config.tarnet_offset_min_logit_std == pytest.approx(0.8)
     assert config.residual_contrastive_enabled is True
     assert config.residual_contrastive_score == "r_score_normalized"
     assert config.residual_contrastive_high_quantile == 0.85
@@ -1965,6 +2133,7 @@ def test_oracle_agentic_attention_script_builds_configs(tmp_path):
     assert applied.architecture.htr_sentence_pooling == "mean"
     assert applied.architecture.htr_trainable_sentence_encoder_layers == 1
     assert applied.training.epochs == 4
+    assert applied.training.alpha_propensity == pytest.approx(0.2)
     assert applied.architecture.agentic_attention_variable_forest.nuisance_folds == 2
     assert applied.architecture.agentic_attention_variable_forest.nuisance_epochs == 20
     assert (
@@ -1978,6 +2147,24 @@ def test_oracle_agentic_attention_script_builds_configs(tmp_path):
     assert (
         applied.architecture.agentic_attention_variable_forest.joint_rlearner_gamma
         == pytest.approx(0.7)
+    )
+    assert (
+        applied.architecture.agentic_attention_variable_forest.interaction_l2_weight
+        == pytest.approx(0.02)
+    )
+    assert (
+        applied.architecture.agentic_attention_variable_forest.tarnet_offset_batch_size
+        == 256
+    )
+    assert (
+        applied.architecture.agentic_attention_variable_forest
+        .tarnet_offset_heterogeneity_weight
+        == pytest.approx(0.25)
+    )
+    assert (
+        applied.architecture.agentic_attention_variable_forest
+        .tarnet_offset_min_logit_std
+        == pytest.approx(0.8)
     )
     assert (
         applied.architecture.agentic_attention_variable_forest.nuisance_weight_decay
@@ -2291,3 +2478,322 @@ def test_joint_rlearner_neural_only_writes_oof_artifacts(tmp_path, monkeypatch):
     assert set(r_stage_attention["stage"]) == {"effect_modifier"}
     assert manifest["config"]["neural_stage_mode"] == "joint_rlearner"
     assert manifest["config"]["joint_rlearner_gamma"] == pytest.approx(0.5)
+
+
+def test_interaction_outcome_crossfit_writes_tau_and_interaction_evidence(tmp_path, monkeypatch):
+    texts = [
+        f"Patient {idx}. Age {'older' if idx % 2 else 'younger'}. "
+        f"PD-L1 {'high' if idx % 3 == 0 else 'low'}."
+        for idx in range(12)
+    ]
+    df = pd.DataFrame(
+        {
+            "clinical_text": texts,
+            "treatment_indicator": np.asarray([idx % 2 for idx in range(12)], dtype=int),
+            "outcome_indicator": np.asarray([(idx // 2) % 2 for idx in range(12)], dtype=int),
+            "true_ite_prob": np.linspace(-0.1, 0.3, 12),
+        }
+    )
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        cv_folds=2,
+        clinical_question="Compare treatment A versus B in NSCLC.",
+        architecture=ModelArchitectureConfig(
+            model_type="agentic_attention_variable_forest",
+            feature_extractor_type="hierarchical_transformer",
+            htr_sentence_model="hash",
+            causal_head_hidden_outcome_dim=8,
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=2,
+                effect_folds=2,
+                nuisance_epochs=1,
+                nuisance_calibration="none",
+                attention_top_k_chunks=1,
+                neural_only=True,
+                neural_stage_mode="interaction_outcome",
+                interaction_l2_weight=0.02,
+                fold_parallelism="auto",
+            ),
+        ),
+        training=TrainingConfig(
+            epochs=1,
+            batch_size=4,
+            learning_rate=1e-3,
+            gradient_clip_norm=1.0,
+            alpha_propensity=0.2,
+        ),
+        explicit_features=ExplicitFeatureExtractionConfig(enabled=False, features=[]),
+    )
+    runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "predictions.parquet",
+        device=torch.device("cpu"),
+        num_workers=0,
+        proposal_agent=FakeAttentionAgent(),
+        extraction_provider=FakeExtractionProvider(),
+    )
+    monkeypatch.setattr(runner, "_create_extractor", lambda: DummyTensorExtractor())
+    monkeypatch.setattr(runner, "_train_interaction_outcome_model", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runner, "_fit_interaction_outcome_center", lambda *args, **kwargs: 0.05)
+
+    def predict_interaction(model, frame):
+        n = len(frame)
+        scale = np.linspace(0.0, 1.0, n, dtype=float)
+        return {
+            "e_raw": 0.25 + 0.5 * scale,
+            "m_raw": 0.30 + 0.4 * scale,
+            "m_logit": -0.5 + scale,
+            "y0_raw": 0.20 + 0.2 * scale,
+            "y1_raw": 0.35 + 0.3 * scale,
+            "y0_logit": -0.8 + scale,
+            "y1_logit": -0.2 + scale,
+            "interaction_raw": -0.1 + 0.2 * scale,
+            "interaction_centered": -0.05 + 0.1 * scale,
+            "global_treatment_effect": np.full(n, 0.15),
+            "treatment_delta": 0.10 + 0.1 * scale,
+            "tau_raw": 0.15 + 0.1 * scale,
+        }
+
+    def evidence(extractor, frame, fold, outer_fold, stage, extra):
+        rows = []
+        for offset, row_id in enumerate(frame["_oci_row_id"].tolist()):
+            record = {
+                "row_id": int(row_id),
+                "fold": int(fold),
+                "stage": stage,
+                "chunk_index": 0,
+                "chunk_text": frame.iloc[offset]["clinical_text"],
+                "attention": 1.0,
+                "outer_fold": int(outer_fold),
+            }
+            for key, values in extra.items():
+                value = np.asarray(values, dtype=object)[offset]
+                record[key] = value.item() if hasattr(value, "item") else value
+            rows.append(record)
+        return rows
+
+    def interaction_evidence(model, frame, fold, outer_fold, stage, extra):
+        rows = evidence(model.extractor, frame, fold, outer_fold, stage, extra)
+        for row in rows:
+            row["attribution_target"] = "interaction_heterogeneity"
+        return rows
+
+    monkeypatch.setattr(runner, "_predict_interaction_outcome_model", predict_interaction)
+    monkeypatch.setattr(runner, "_attention_evidence", evidence)
+    monkeypatch.setattr(runner, "_interaction_outcome_attention_evidence", interaction_evidence)
+
+    result = runner._crossfit_interaction_outcome(runner.dataset.copy(), outer_fold=1)
+
+    predictions = result["predictions"]
+    assert set(predictions["neural_stage_mode"]) == {"interaction_outcome"}
+    assert set(predictions["effect_objective"]) == {"interaction_outcome_supervised"}
+    assert np.all(np.isfinite(predictions["tau_hat_r_stage"].to_numpy(dtype=float)))
+    assert np.all(np.isfinite(predictions["y0_hat"].to_numpy(dtype=float)))
+    assert np.all(np.isfinite(predictions["y1_hat"].to_numpy(dtype=float)))
+    assert set(row["stage"] for row in result["nuisance_attention"]) == {"nuisance"}
+    assert set(row["stage"] for row in result["attention"]) == {"effect_modifier"}
+    assert {
+        row.get("attribution_target") for row in result["attention"]
+    } == {"interaction_heterogeneity"}
+
+
+def test_tarnet_offset_crossfit_writes_tau_and_offset_evidence(tmp_path, monkeypatch):
+    texts = [
+        f"Patient {idx}. Age {'older' if idx % 2 else 'younger'}. "
+        f"PD-L1 {'high' if idx % 3 == 0 else 'low'}."
+        for idx in range(12)
+    ]
+    df = pd.DataFrame(
+        {
+            "clinical_text": texts,
+            "treatment_indicator": np.asarray([idx % 2 for idx in range(12)], dtype=int),
+            "outcome_indicator": np.asarray([(idx // 2) % 2 for idx in range(12)], dtype=int),
+            "true_ite_prob": np.linspace(-0.1, 0.3, 12),
+        }
+    )
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        cv_folds=2,
+        clinical_question="Compare treatment A versus B in NSCLC.",
+        architecture=ModelArchitectureConfig(
+            model_type="agentic_attention_variable_forest",
+            feature_extractor_type="hierarchical_transformer",
+            htr_sentence_model="hash",
+            causal_head_hidden_outcome_dim=8,
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=2,
+                effect_folds=2,
+                nuisance_epochs=1,
+                nuisance_calibration="none",
+                attention_top_k_chunks=1,
+                neural_only=True,
+                neural_stage_mode="tarnet_offset",
+                interaction_l2_weight=0.02,
+                fold_parallelism="auto",
+            ),
+        ),
+        training=TrainingConfig(
+            epochs=1,
+            batch_size=4,
+            effect_batch_size=4,
+            learning_rate=1e-3,
+            gradient_clip_norm=1.0,
+        ),
+        explicit_features=ExplicitFeatureExtractionConfig(enabled=False, features=[]),
+    )
+    runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "predictions.parquet",
+        device=torch.device("cpu"),
+        num_workers=0,
+        proposal_agent=FakeAttentionAgent(),
+        extraction_provider=FakeExtractionProvider(),
+    )
+    monkeypatch.setattr(runner, "_create_extractor", lambda: DummyTensorExtractor())
+    monkeypatch.setattr(runner, "_train_tarnet_offset_model", lambda *args, **kwargs: None)
+
+    y = runner.dataset[config.outcome_column].to_numpy(dtype=float)
+    t = runner.dataset[config.treatment_column].to_numpy(dtype=float)
+    e_hat = np.linspace(0.2, 0.8, len(runner.dataset))
+    m_hat = np.linspace(0.3, 0.7, len(runner.dataset))
+    nuisance_predictions = pd.DataFrame(
+        {
+            "_oci_row_id": runner.dataset["_oci_row_id"].to_numpy(),
+            "outer_fold": 1,
+            "e_hat": e_hat,
+            "e_hat_raw": e_hat,
+            "m_hat": m_hat,
+            "m_hat_raw": m_hat,
+            "y_residual": y - m_hat,
+            "t_residual": t - e_hat,
+            "r_loss_at_zero_tau": (y - m_hat) ** 2,
+            "nuisance_fold": 1,
+        }
+    )
+
+    def predict_tarnet(model, frame, baseline_raw, treatment):
+        n = len(frame)
+        scale = np.linspace(0.0, 1.0, n, dtype=float)
+        baseline = np.asarray(baseline_raw, dtype=float)
+        offset0 = -0.20 + 0.10 * scale
+        offset1 = 0.10 + 0.20 * scale
+        y0_raw = baseline + offset0
+        y1_raw = baseline + offset1
+        observed = np.where(np.asarray(treatment) >= 0.5, y1_raw, y0_raw)
+        tau = 1.0 / (1.0 + np.exp(-y1_raw)) - 1.0 / (1.0 + np.exp(-y0_raw))
+        return {
+            "baseline_raw": baseline,
+            "offset0": offset0,
+            "offset1": offset1,
+            "offset_contrast": offset1 - offset0,
+            "observed_outcome_raw": observed,
+            "y0_raw": y0_raw,
+            "y1_raw": y1_raw,
+            "tau_raw": tau,
+        }
+
+    def offset_evidence(model, frame, fold, outer_fold, stage, extra):
+        rows = []
+        for offset, row_id in enumerate(frame["_oci_row_id"].tolist()):
+            record = {
+                "row_id": int(row_id),
+                "fold": int(fold),
+                "stage": stage,
+                "chunk_index": 0,
+                "chunk_text": frame.iloc[offset]["clinical_text"],
+                "attention": 1.0,
+                "outer_fold": int(outer_fold),
+                "attribution_target": "tarnet_offset_contrast",
+            }
+            for key, values in extra.items():
+                value = np.asarray(values, dtype=object)[offset]
+                record[key] = value.item() if hasattr(value, "item") else value
+            rows.append(record)
+        return rows
+
+    monkeypatch.setattr(runner, "_predict_tarnet_offset_model", predict_tarnet)
+    monkeypatch.setattr(runner, "_tarnet_offset_attention_evidence", offset_evidence)
+
+    result = runner._crossfit_tarnet_offset(
+        runner.dataset.copy(),
+        nuisance_predictions,
+        outer_fold=1,
+    )
+
+    predictions = result["predictions"]
+    assert set(predictions["neural_stage_mode"]) == {"tarnet_offset"}
+    assert set(predictions["effect_objective"]) == {"tarnet_offset_outcome"}
+    for col in [
+        "baseline_outcome_raw",
+        "observed_outcome_raw",
+        "y0_hat",
+        "y1_hat",
+        "y0_raw",
+        "y1_raw",
+        "offset0",
+        "offset1",
+        "offset_contrast",
+        "tau_hat_r_stage",
+        "tau_logit_modifier",
+        "r_loss",
+        "effect_loss",
+    ]:
+        assert np.all(np.isfinite(predictions[col].to_numpy(dtype=float)))
+    assert np.allclose(
+        predictions["tau_logit_modifier"].to_numpy(dtype=float),
+        predictions["offset_contrast"].to_numpy(dtype=float),
+    )
+    assert set(row["stage"] for row in result["attention"]) == {"effect_modifier"}
+    assert {
+        row.get("attribution_target") for row in result["attention"]
+    } == {"tarnet_offset_contrast"}
+
+
+def test_interaction_attention_records_use_gradient_scores(tmp_path):
+    df = pd.DataFrame(
+        {
+            "clinical_text": ["baseline age. PD-L1 high."],
+            "treatment_indicator": [1],
+            "outcome_indicator": [1],
+        }
+    )
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        architecture=ModelArchitectureConfig(
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=2,
+                effect_folds=2,
+                attention_top_k_chunks=1,
+            ),
+        ),
+    )
+    runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "predictions.parquet",
+        device=torch.device("cpu"),
+        num_workers=0,
+        proposal_agent=FakeAttentionAgent(),
+        extraction_provider=FakeExtractionProvider(),
+    )
+    chunk_alpha = torch.tensor([[0.9, 0.1]], requires_grad=True)
+    chunk_alpha.grad = torch.tensor([[0.0, 5.0]])
+    records = runner._interaction_attention_records_from_output(
+        {
+            "batch_chunks": [["baseline age", "PD-L1 high"]],
+            "chunk_alpha": chunk_alpha,
+        },
+        extractor=DummyTensorExtractor(),
+        row_ids=[7],
+        fold=1,
+        stage="effect_modifier",
+        top_k=1,
+        metadata=[{"outer_fold": 1}],
+    )
+
+    assert len(records) == 1
+    assert records[0]["chunk_index"] == 1
+    assert records[0]["chunk_text"] == "PD-L1 high"
+    assert records[0]["attribution_target"] == "interaction_heterogeneity"

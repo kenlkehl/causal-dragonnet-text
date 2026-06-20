@@ -399,6 +399,63 @@ class AgenticFeatureSearchConfig:
             )
 
 
+@dataclass
+class NonNeuralAgenticForestConfig:
+    """Configuration for BoW-guided agentic variable discovery.
+
+    This pathway uses cross-fitted sparse text models to produce nuisance
+    predictions and an unweighted R pseudo-target. The proposal agent receives
+    feature-importance summaries from those models and selects explicit
+    variables for downstream extraction and CausalForestDML fitting.
+    """
+
+    nuisance_folds: int = 5
+    effect_folds: int = 5
+    max_features: int = 30000
+    min_df: int = 5
+    max_df: float = 0.95
+    ngram_range_min: int = 1
+    ngram_range_max: int = 2
+    sublinear_tf: bool = True
+    logistic_c: float = 1.0
+    logistic_max_iter: int = 1000
+    ridge_alpha: float = 10.0
+    e_clip: float = 0.01
+    top_n_features: int = 100
+    candidate_proposals_per_fold: int = 30
+
+    def __post_init__(self):
+        if self.nuisance_folds < 2:
+            raise ValueError("non_neural_agentic_forest.nuisance_folds must be >= 2")
+        if self.effect_folds < 2:
+            raise ValueError("non_neural_agentic_forest.effect_folds must be >= 2")
+        if self.max_features < 1:
+            raise ValueError("non_neural_agentic_forest.max_features must be >= 1")
+        if self.min_df < 1:
+            raise ValueError("non_neural_agentic_forest.min_df must be >= 1")
+        if not 0.0 < self.max_df <= 1.0:
+            raise ValueError("non_neural_agentic_forest.max_df must be in (0, 1]")
+        if self.ngram_range_min < 1 or self.ngram_range_max < self.ngram_range_min:
+            raise ValueError(
+                "non_neural_agentic_forest ngram range must satisfy "
+                "1 <= ngram_range_min <= ngram_range_max"
+            )
+        if self.logistic_c <= 0:
+            raise ValueError("non_neural_agentic_forest.logistic_c must be > 0")
+        if self.logistic_max_iter < 1:
+            raise ValueError("non_neural_agentic_forest.logistic_max_iter must be >= 1")
+        if self.ridge_alpha < 0:
+            raise ValueError("non_neural_agentic_forest.ridge_alpha must be >= 0")
+        if not 0.0 < self.e_clip < 0.5:
+            raise ValueError("non_neural_agentic_forest.e_clip must be in (0, 0.5)")
+        if self.top_n_features < 1:
+            raise ValueError("non_neural_agentic_forest.top_n_features must be >= 1")
+        if self.candidate_proposals_per_fold < 1:
+            raise ValueError(
+                "non_neural_agentic_forest.candidate_proposals_per_fold must be >= 1"
+            )
+
+
 EXTRACTOR_ALIASES = {
     "frozen_llm_pooler": {"frozen_llm_pooler", "frozen_llm", "llm_pooler", "llm_pool", "flp"},
     "hierarchical_llm": {"hierarchical_llm", "hier_llm", "hlm"},
@@ -482,6 +539,10 @@ class AgenticAttentionVariableForestConfig:
     effect_objective: str = "squared_r_loss"
     neural_stage_mode: str = "staged"
     joint_rlearner_gamma: float = 1.0
+    interaction_l2_weight: float = 1e-3
+    tarnet_offset_batch_size: Optional[int] = 128
+    tarnet_offset_heterogeneity_weight: float = 0.1
+    tarnet_offset_min_logit_std: float = 0.5
     residual_contrastive_enabled: bool = False
     residual_contrastive_use_for_effect_discovery: bool = True
     residual_contrastive_score: str = "r_score"
@@ -537,16 +598,48 @@ class AgenticAttentionVariableForestConfig:
             )
         self.effect_objective = effect_objective
         neural_stage_mode = str(self.neural_stage_mode).strip().lower()
-        if neural_stage_mode not in {"staged", "joint_rlearner"}:
+        if neural_stage_mode not in {
+            "staged",
+            "joint_rlearner",
+            "interaction_outcome",
+            "tarnet_offset",
+        }:
             raise ValueError(
                 "agentic_attention_variable_forest.neural_stage_mode must be "
-                "one of 'staged' or 'joint_rlearner'"
+                "one of 'staged', 'joint_rlearner', 'interaction_outcome', "
+                "or 'tarnet_offset'"
             )
         self.neural_stage_mode = neural_stage_mode
         self.joint_rlearner_gamma = float(self.joint_rlearner_gamma)
         if self.joint_rlearner_gamma < 0:
             raise ValueError(
                 "agentic_attention_variable_forest.joint_rlearner_gamma must be >= 0"
+            )
+        self.interaction_l2_weight = float(self.interaction_l2_weight)
+        if self.interaction_l2_weight < 0:
+            raise ValueError(
+                "agentic_attention_variable_forest.interaction_l2_weight must be >= 0"
+            )
+        if self.tarnet_offset_batch_size is not None:
+            self.tarnet_offset_batch_size = int(self.tarnet_offset_batch_size)
+            if self.tarnet_offset_batch_size < 1:
+                raise ValueError(
+                    "agentic_attention_variable_forest.tarnet_offset_batch_size "
+                    "must be >= 1 when set"
+                )
+        self.tarnet_offset_heterogeneity_weight = float(
+            self.tarnet_offset_heterogeneity_weight
+        )
+        if self.tarnet_offset_heterogeneity_weight < 0:
+            raise ValueError(
+                "agentic_attention_variable_forest."
+                "tarnet_offset_heterogeneity_weight must be >= 0"
+            )
+        self.tarnet_offset_min_logit_std = float(self.tarnet_offset_min_logit_std)
+        if self.tarnet_offset_min_logit_std < 0:
+            raise ValueError(
+                "agentic_attention_variable_forest.tarnet_offset_min_logit_std "
+                "must be >= 0"
             )
         if self.candidate_proposals_per_fold < 1:
             raise ValueError(
@@ -667,7 +760,7 @@ def normalize_feature_extractor_type(feature_type: str) -> str:
 @dataclass
 class ModelArchitectureConfig:
     """Configuration for model architecture."""
-    model_type: str = "dragonnet"  # "dragonnet", "rlearner", "causal_forest", "tfidf_forest", "explicit_feature_forest", or "agentic_explicit_feature_forest"
+    model_type: str = "dragonnet"  # "dragonnet", "rlearner", "causal_forest", "tfidf_forest", "explicit_feature_forest", "agentic_explicit_feature_forest", "agentic_attention_variable_forest", or "non_neural_agentic_forest"
 
     # Feature extractor type: "frozen_llm_pooler"
     feature_extractor_type: str = "frozen_llm_pooler"
@@ -819,6 +912,11 @@ class ModelArchitectureConfig:
     # Agentic attention-evidence variable discovery + explicit-feature causal forest
     agentic_attention_variable_forest: AgenticAttentionVariableForestConfig = field(
         default_factory=AgenticAttentionVariableForestConfig
+    )
+
+    # Non-neural BoW-guided variable discovery + explicit-feature causal forest
+    non_neural_agentic_forest: NonNeuralAgenticForestConfig = field(
+        default_factory=NonNeuralAgenticForestConfig
     )
 
 
@@ -993,6 +1091,15 @@ class ExperimentConfig:
                 arch_data['agentic_attention_variable_forest'] = (
                     AgenticAttentionVariableForestConfig(**avf_data)
                 )
+            if (
+                'non_neural_agentic_forest' in arch_data
+                and isinstance(arch_data['non_neural_agentic_forest'], dict)
+            ):
+                arch_data['non_neural_agentic_forest'] = (
+                    NonNeuralAgenticForestConfig(
+                        **arch_data['non_neural_agentic_forest']
+                    )
+                )
             return ModelArchitectureConfig(**arch_data)
 
         def parse_explicit_features_config(feat_data: Dict[str, Any]) -> ExplicitFeatureExtractionConfig:
@@ -1097,6 +1204,7 @@ class ExperimentConfig:
             and self.applied_inference.architecture.model_type not in {
                 "agentic_explicit_feature_forest",
                 "agentic_attention_variable_forest",
+                "non_neural_agentic_forest",
             }
         ):
             raise ValueError(

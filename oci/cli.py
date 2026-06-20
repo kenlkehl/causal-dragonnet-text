@@ -102,7 +102,7 @@ Examples:
     )
     run_parser.add_argument(
         '--neural-stage-mode',
-        choices=['staged', 'joint_rlearner'],
+        choices=['staged', 'joint_rlearner', 'interaction_outcome', 'tarnet_offset'],
         help=(
             "Override neural learning mode for "
             "model_type='agentic_attention_variable_forest'."
@@ -115,6 +115,44 @@ Examples:
             "Override detached-nuisance R-loss weight for "
             "agentic_attention_variable_forest joint_rlearner mode."
         )
+    )
+    run_parser.add_argument(
+        '--interaction-l2-weight',
+        type=float,
+        help=(
+            "Override interaction/offset component L2 penalty for "
+            "agentic_attention_variable_forest interaction_outcome or "
+            "tarnet_offset mode."
+        )
+    )
+    run_parser.add_argument(
+        '--tarnet-offset-batch-size',
+        type=int,
+        help=(
+            "Override TarNet-offset batch size for "
+            "agentic_attention_variable_forest tarnet_offset mode."
+        )
+    )
+    run_parser.add_argument(
+        '--tarnet-offset-heterogeneity-weight',
+        type=float,
+        help=(
+            "Override weight for the TarNet-offset within-batch "
+            "heterogeneity floor."
+        )
+    )
+    run_parser.add_argument(
+        '--tarnet-offset-min-logit-std',
+        type=float,
+        help=(
+            "Override target minimum within-batch std of offset1-offset0 "
+            "in TarNet-offset mode."
+        )
+    )
+    run_parser.add_argument(
+        '--alpha-propensity',
+        type=float,
+        help="Override applied inference treatment/propensity loss weight."
     )
     
     args = parser.parse_args()
@@ -226,6 +264,60 @@ Examples:
                 .agentic_attention_variable_forest
                 .joint_rlearner_gamma
             ) = args.joint_rlearner_gamma
+        if args.interaction_l2_weight is not None:
+            model_type = getattr(config.applied_inference.architecture, 'model_type', None)
+            if model_type != "agentic_attention_variable_forest":
+                print(
+                    "--interaction-l2-weight only applies to "
+                    "model_type='agentic_attention_variable_forest'"
+                )
+                return 1
+            (
+                config.applied_inference.architecture
+                .agentic_attention_variable_forest
+                .interaction_l2_weight
+            ) = args.interaction_l2_weight
+        if args.tarnet_offset_batch_size is not None:
+            model_type = getattr(config.applied_inference.architecture, 'model_type', None)
+            if model_type != "agentic_attention_variable_forest":
+                print(
+                    "--tarnet-offset-batch-size only applies to "
+                    "model_type='agentic_attention_variable_forest'"
+                )
+                return 1
+            (
+                config.applied_inference.architecture
+                .agentic_attention_variable_forest
+                .tarnet_offset_batch_size
+            ) = args.tarnet_offset_batch_size
+        if args.tarnet_offset_heterogeneity_weight is not None:
+            model_type = getattr(config.applied_inference.architecture, 'model_type', None)
+            if model_type != "agentic_attention_variable_forest":
+                print(
+                    "--tarnet-offset-heterogeneity-weight only applies to "
+                    "model_type='agentic_attention_variable_forest'"
+                )
+                return 1
+            (
+                config.applied_inference.architecture
+                .agentic_attention_variable_forest
+                .tarnet_offset_heterogeneity_weight
+            ) = args.tarnet_offset_heterogeneity_weight
+        if args.tarnet_offset_min_logit_std is not None:
+            model_type = getattr(config.applied_inference.architecture, 'model_type', None)
+            if model_type != "agentic_attention_variable_forest":
+                print(
+                    "--tarnet-offset-min-logit-std only applies to "
+                    "model_type='agentic_attention_variable_forest'"
+                )
+                return 1
+            (
+                config.applied_inference.architecture
+                .agentic_attention_variable_forest
+                .tarnet_offset_min_logit_std
+            ) = args.tarnet_offset_min_logit_std
+        if args.alpha_propensity is not None:
+            config.applied_inference.training.alpha_propensity = args.alpha_propensity
         
         try:
             config.validate()

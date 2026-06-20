@@ -1738,6 +1738,9 @@ def build_agent_prompt(
     if context.get("prompt_version") == "agentic_attention_variable_forest_v1":
         return build_attention_variable_agent_prompt(context, search_config)
 
+    if context.get("prompt_version") == "non_neural_agentic_forest_v1":
+        return build_non_neural_agentic_forest_prompt(context, search_config)
+
     if context.get("search_mode") == "broad_screen":
         if context.get("broad_screen_stage") == "selection":
             return build_broad_selection_agent_prompt(context, search_config)
@@ -1886,6 +1889,58 @@ Rules:
 - Leave single-fold or ambiguous concepts unmerged rather than forcing a group.
 
 Current consensus-disambiguation context:
+{context_json}
+"""
+
+
+def build_non_neural_agentic_forest_prompt(
+    context: Dict[str, Any],
+    search_config: AgenticFeatureSearchConfig,
+) -> str:
+    """Construct the proposal prompt for sparse BoW feature review."""
+    context_json = json.dumps(context, indent=2, default=_json_default)
+    max_proposals = int(
+        context.get(
+            "max_proposals",
+            max(1, int(getattr(search_config, "max_additions_per_iter", 6))),
+        )
+    )
+    return f"""You are helping convert sparse bag-of-words model evidence into explicit variables for causal inference.
+
+The upstream models are non-neural:
+- cross-fitted bag-of-words treatment and outcome models produce honest nuisance predictions;
+- an unweighted R pseudo-target is computed as (Y - m_hat) / (T - e_hat);
+- a bag-of-words regression model predicts that pseudo-target.
+
+Your task is to propose at most {max_proposals} extractable pre-treatment patient-level variables for a downstream causal forest.
+
+Rules:
+- Propose variables, not raw tokens. For example, convert features like "age 78" or "78-year-old" into an age variable.
+- Variables supported by both treatment and outcome feature weights should usually be confounders.
+- Variables supported by pseudo-target feature weights should usually be effect modifiers.
+- A variable may have both roles when justified.
+- Use only pre-treatment information.
+- Avoid treatment, post-treatment response, toxicity after treatment, survival, and outcome-derived variables.
+- For categorical variables, provide 2-8 mutually exclusive categories.
+- Do not duplicate current_features.
+
+Return JSON only with this shape:
+{{
+  "proposals": [
+    {{
+      "action": "add|none",
+      "name": "snake_case_variable_name",
+      "type": "categorical|continuous",
+      "categories": ["category_a", "category_b"],
+      "roles": ["confounder", "effect_modifier"],
+      "description": "exact pre-treatment extraction target",
+      "rationale": "which BoW features support this variable",
+      "expected_signal": "treatment, outcome, or pseudo-target signal expected"
+    }}
+  ]
+}}
+
+Current BoW feature-review context:
 {context_json}
 """
 

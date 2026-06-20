@@ -211,6 +211,18 @@ def run_applied_inference(
         )
         return
 
+    if hasattr(config, 'architecture') and config.architecture.model_type == "non_neural_agentic_forest":
+        logger.info("Routing to Non-Neural Agentic Causal Forest pipeline")
+        from .non_neural_agentic_forest import run_non_neural_agentic_forest
+        run_non_neural_agentic_forest(
+            dataset=dataset,
+            config=config,
+            output_path=output_path,
+            device=device,
+            num_workers=num_workers,
+        )
+        return
+
     # Explicit feature extraction (if enabled)
     explicit_feature_columns = None
     if hasattr(config, 'explicit_features') and config.explicit_features.enabled:

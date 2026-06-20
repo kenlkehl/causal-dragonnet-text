@@ -114,6 +114,53 @@ def _logistic_r_tau_from_delta(
     return p1 - p0
 
 
+def _interaction_source_token_scores(
+    encoder_attention: Dict[str, Any],
+) -> Optional[torch.Tensor]:
+    token_alpha = encoder_attention.get("token_alpha")
+    sources = encoder_attention.get("token_alpha_sources") or []
+    if token_alpha is None or not sources:
+        return None
+    max_len = int(token_alpha.shape[1])
+    rows: List[torch.Tensor] = []
+    for source in sources:
+        if source is None:
+            continue
+        grad = getattr(source, "grad", None)
+        if grad is None:
+            score = source.detach()
+        else:
+            score = torch.abs(grad.detach() * source.detach())
+        pad = max_len - int(score.shape[1])
+        if pad > 0:
+            score = F.pad(score, (0, pad), value=0.0)
+        rows.append(score)
+    if not rows:
+        return None
+    return torch.cat(rows, dim=0)
+
+
+def _tarnet_offset_heterogeneity_penalty(
+    offset_contrast: torch.Tensor,
+    min_logit_std: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Penalty for batches whose treatment-effect logit contrast is too flat."""
+    if int(offset_contrast.numel()) < 2 or min_logit_std <= 0:
+        zero = torch.zeros((), device=offset_contrast.device, dtype=offset_contrast.dtype)
+        return zero, zero
+    variance = torch.var(offset_contrast, unbiased=False)
+    target_variance = float(min_logit_std) ** 2
+    penalty = F.relu(
+        torch.as_tensor(
+            target_variance,
+            device=offset_contrast.device,
+            dtype=offset_contrast.dtype,
+        )
+        - variance
+    )
+    return penalty, variance
+
+
 def run_agentic_attention_variable_forest(
     dataset: pd.DataFrame,
     config: AppliedInferenceConfig,
@@ -203,6 +250,156 @@ class _JointRNet(nn.Module):
         outcome_raw = self.outcome(nuisance_hidden).squeeze(-1)
         effect = self.effect_head(features).squeeze(-1)
         return propensity_logit, outcome_raw, effect
+
+
+class _InteractionOutcomeNet(nn.Module):
+    """Supervised outcome model with an explicit treatment interaction branch."""
+
+    def __init__(self, extractor: nn.Module, hidden_dim: int, outcome_type: str):
+        super().__init__()
+        self.extractor = extractor
+        self.outcome_type = outcome_type
+        self.shared = nn.Sequential(
+            nn.Linear(extractor.output_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+        )
+        self.propensity = nn.Linear(hidden_dim, 1)
+        self.baseline_outcome = nn.Linear(hidden_dim, 1)
+        self.interaction_outcome = nn.Linear(hidden_dim, 1)
+        self.global_treatment_effect = nn.Parameter(torch.zeros(()))
+        self.register_buffer("interaction_center", torch.zeros(()))
+
+    def set_interaction_center(self, value: float) -> None:
+        self.interaction_center.fill_(float(value))
+
+    def forward(
+        self,
+        texts_or_batch,
+        treatment: Optional[torch.Tensor] = None,
+        *,
+        return_attention_tensors: bool = False,
+        center_interaction_batch: bool = False,
+    ) -> Dict[str, Any]:
+        extractor_input = (
+            texts_or_batch if isinstance(texts_or_batch, dict) else list(texts_or_batch)
+        )
+        if return_attention_tensors:
+            features, encoder_attention = self.extractor(
+                extractor_input,
+                return_attention_tensors=True,
+            )
+        else:
+            features = self.extractor(extractor_input)
+            encoder_attention = None
+        hidden = self.shared(features)
+        propensity_logit = self.propensity(hidden).squeeze(-1)
+        y0_raw = self.baseline_outcome(hidden).squeeze(-1)
+        interaction_raw = self.interaction_outcome(hidden).squeeze(-1)
+        if center_interaction_batch:
+            interaction_center = interaction_raw.mean()
+        else:
+            interaction_center = self.interaction_center.to(
+                device=interaction_raw.device,
+                dtype=interaction_raw.dtype,
+            )
+        interaction_centered = interaction_raw - interaction_center
+        global_effect = self.global_treatment_effect.to(
+            device=interaction_raw.device,
+            dtype=interaction_raw.dtype,
+        )
+        treatment_delta = global_effect + interaction_centered
+        y1_raw = y0_raw + treatment_delta
+        if treatment is None:
+            observed_raw = y0_raw
+        else:
+            observed_raw = y0_raw + treatment.to(y0_raw.device, dtype=y0_raw.dtype) * treatment_delta
+        if self.outcome_type == "continuous":
+            tau = y1_raw - y0_raw
+        else:
+            tau = torch.sigmoid(y1_raw) - torch.sigmoid(y0_raw)
+        return {
+            "propensity_logit": propensity_logit,
+            "observed_outcome_raw": observed_raw,
+            "y0_raw": y0_raw,
+            "y1_raw": y1_raw,
+            "interaction_raw": interaction_raw,
+            "interaction_centered": interaction_centered,
+            "interaction_center": interaction_center,
+            "global_treatment_effect": global_effect.expand_as(interaction_raw),
+            "treatment_delta": treatment_delta,
+            "tau": tau,
+            "encoder_attention": encoder_attention,
+        }
+
+
+class _TarNetOffsetNet(nn.Module):
+    """Treatment-specific outcome-offset model anchored to nuisance predictions."""
+
+    def __init__(self, extractor: nn.Module, hidden_dim: int, outcome_type: str):
+        super().__init__()
+        self.extractor = extractor
+        self.outcome_type = outcome_type
+        self.shared = nn.Sequential(
+            nn.Linear(extractor.output_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+        )
+        self.offset0 = nn.Linear(hidden_dim, 1)
+        self.offset1 = nn.Linear(hidden_dim, 1)
+
+    def forward(
+        self,
+        texts_or_batch,
+        baseline_raw: Optional[torch.Tensor] = None,
+        treatment: Optional[torch.Tensor] = None,
+        *,
+        return_attention_tensors: bool = False,
+    ) -> Dict[str, Any]:
+        extractor_input = (
+            texts_or_batch if isinstance(texts_or_batch, dict) else list(texts_or_batch)
+        )
+        if return_attention_tensors:
+            features, encoder_attention = self.extractor(
+                extractor_input,
+                return_attention_tensors=True,
+            )
+        else:
+            features = self.extractor(extractor_input)
+            encoder_attention = None
+        hidden = self.shared(features)
+        offset0 = self.offset0(hidden).squeeze(-1)
+        offset1 = self.offset1(hidden).squeeze(-1)
+        offset_contrast = offset1 - offset0
+        result: Dict[str, Any] = {
+            "offset0": offset0,
+            "offset1": offset1,
+            "offset_contrast": offset_contrast,
+            "encoder_attention": encoder_attention,
+        }
+        if baseline_raw is not None:
+            baseline = baseline_raw.to(offset0.device, dtype=offset0.dtype)
+            y0_raw = baseline + offset0
+            y1_raw = baseline + offset1
+            if treatment is None:
+                observed_raw = y0_raw
+            else:
+                t = treatment.to(offset0.device, dtype=offset0.dtype)
+                observed_raw = torch.where(t >= 0.5, y1_raw, y0_raw)
+            if self.outcome_type == "continuous":
+                tau = y1_raw - y0_raw
+            else:
+                tau = torch.sigmoid(y1_raw) - torch.sigmoid(y0_raw)
+            result.update(
+                {
+                    "baseline_raw": baseline,
+                    "observed_outcome_raw": observed_raw,
+                    "y0_raw": y0_raw,
+                    "y1_raw": y1_raw,
+                    "tau": tau,
+                }
+            )
+        return result
 
 
 class _ResidualContrastiveNet(nn.Module):
@@ -398,7 +595,24 @@ class AgenticAttentionVariableForestRunner:
     ) -> pd.DataFrame:
         discovery_df = self.dataset.iloc[train_idx].reset_index(drop=True)
         r_stage = None
-        if self._joint_rlearner_enabled():
+        if self._interaction_outcome_enabled():
+            interaction = self._crossfit_interaction_outcome(discovery_df, outer_fold)
+            nuisance = {
+                "predictions": interaction["nuisance_predictions"],
+                "attention": interaction["nuisance_attention"],
+            }
+            r_stage = {
+                "predictions": interaction["predictions"],
+                "attention": interaction["attention"],
+            }
+        elif self._tarnet_offset_enabled():
+            nuisance = self._crossfit_nuisance(discovery_df, outer_fold)
+            r_stage = self._crossfit_tarnet_offset(
+                discovery_df,
+                nuisance["predictions"],
+                outer_fold,
+            )
+        elif self._joint_rlearner_enabled():
             joint = self._crossfit_joint_rlearner(discovery_df, outer_fold)
             nuisance = {
                 "predictions": joint["nuisance_predictions"],
@@ -650,6 +864,26 @@ class AgenticAttentionVariableForestRunner:
             str(getattr(self.avf_config, "neural_stage_mode", "staged")).strip().lower()
             == "joint_rlearner"
         )
+
+    def _interaction_outcome_enabled(self) -> bool:
+        return (
+            str(getattr(self.avf_config, "neural_stage_mode", "staged")).strip().lower()
+            == "interaction_outcome"
+        )
+
+    def _tarnet_offset_enabled(self) -> bool:
+        return (
+            str(getattr(self.avf_config, "neural_stage_mode", "staged")).strip().lower()
+            == "tarnet_offset"
+        )
+
+    def _tarnet_offset_batch_size(self) -> int:
+        value = getattr(self.avf_config, "tarnet_offset_batch_size", None)
+        if value is None:
+            value = getattr(self.config.training, "effect_batch_size", None)
+        if value is None:
+            value = self.config.training.batch_size
+        return max(1, int(value))
 
     def _merge_residual_contrastive_predictions(
         self,
@@ -1273,6 +1507,695 @@ class AgenticAttentionVariableForestRunner:
         self.r_stage_rows.append(r_df)
         self.effect_attention_rows.extend(attention_rows)
         return {"predictions": r_df, "attention": attention_rows}
+
+    def _crossfit_tarnet_offset(
+        self,
+        df: pd.DataFrame,
+        nuisance_predictions: pd.DataFrame,
+        outer_fold: int,
+    ) -> Dict[str, Any]:
+        folds = _bounded_fold_count(self.avf_config.effect_folds, len(df))
+        effect_objective = "tarnet_offset_outcome"
+        r_df = nuisance_predictions.copy()
+        for col in [
+            "baseline_outcome_raw",
+            "observed_outcome_raw",
+            "y0_hat",
+            "y1_hat",
+            "y0_raw",
+            "y1_raw",
+            "offset0",
+            "offset1",
+            "offset_contrast",
+            "tau_hat_r_stage",
+            "tau_logit_modifier",
+            "r_loss",
+            "effect_loss",
+            "effect_loss_at_zero_tau",
+            "effect_fold",
+        ]:
+            r_df[col] = np.nan
+        r_df["r_stage_train_eligible"] = False
+        r_df["effect_objective"] = effect_objective
+        r_df["neural_stage_mode"] = "tarnet_offset"
+        attention_rows: List[Dict[str, Any]] = []
+
+        e = r_df["e_hat"].to_numpy(dtype=float)
+        m = r_df["m_hat"].to_numpy(dtype=float)
+        y = df[self.config.outcome_column].to_numpy(dtype=float)
+        t = df[self.config.treatment_column].to_numpy(dtype=float)
+        r_stage_min_propensity = float(
+            getattr(self.avf_config, "r_stage_min_propensity", 0.0)
+        )
+        r_stage_max_propensity = float(
+            getattr(self.avf_config, "r_stage_max_propensity", 1.0)
+        )
+        train_eligible = (
+            np.isfinite(e)
+            & (e >= r_stage_min_propensity)
+            & (e <= r_stage_max_propensity)
+        )
+        r_df["r_stage_train_eligible"] = train_eligible
+        e_clipped = np.clip(e, self.avf_config.e_clip, 1.0 - self.avf_config.e_clip)
+        if self.config.outcome_type == "continuous":
+            baseline_raw = m
+            baseline_for_residual = m
+            r_df["effect_loss_at_zero_tau"] = (baseline_raw - y) ** 2
+        else:
+            m_clipped = clip_probability(m)
+            baseline_raw = _probability_logit(m_clipped)
+            baseline_for_residual = m_clipped
+            r_df["effect_loss_at_zero_tau"] = _binary_log_loss_from_logits(
+                baseline_raw,
+                y,
+            )
+        y_resid = y - baseline_for_residual
+        t_resid = t - e_clipped
+
+        split_items = list(
+            enumerate(
+                KFold(n_splits=folds, shuffle=True, random_state=30_000 + outer_fold).split(df),
+                start=1,
+            )
+        )
+        checkpoint_fingerprint = self._crossfit_checkpoint_fingerprint(
+            "tarnet_offset",
+            folds,
+            extra_payload={
+                "e_hat_hash": _hash_numeric_array(e),
+                "m_hat_hash": _hash_numeric_array(m),
+                "effect_objective": effect_objective,
+                "outcome_loss": "baseline_plus_treatment_specific_offsets_v1",
+                "offset_l2_weight": float(self.avf_config.interaction_l2_weight),
+                "tarnet_offset_batch_size": self._tarnet_offset_batch_size(),
+                "tarnet_offset_heterogeneity_weight": float(
+                    self.avf_config.tarnet_offset_heterogeneity_weight
+                ),
+                "tarnet_offset_min_logit_std": float(
+                    self.avf_config.tarnet_offset_min_logit_std
+                ),
+                "r_stage_min_propensity": r_stage_min_propensity,
+                "r_stage_max_propensity": r_stage_max_propensity,
+            },
+        )
+
+        def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
+            fit_pos = np.asarray(fit_pos, dtype=int)
+            heldout_pos = np.asarray(heldout_pos, dtype=int)
+            eligible_fit_pos = fit_pos[train_eligible[fit_pos]]
+            cached = self._load_tarnet_offset_fold_checkpoint(
+                df=df,
+                outer_fold=outer_fold,
+                fold=fold,
+                heldout_pos=heldout_pos,
+                fingerprint=checkpoint_fingerprint,
+            )
+            if cached is not None:
+                return cached
+
+            if len(eligible_fit_pos) < 1:
+                raise ValueError(
+                    "No rows remain for TarNet-offset training in outer fold "
+                    f"{outer_fold} fold {fold} after applying propensity bounds "
+                    f"[{r_stage_min_propensity}, {r_stage_max_propensity}]"
+                )
+
+            model = None
+            logger.info(
+                "Outer fold %s TarNet-offset fold %s/%s: train=%s/%s eligible "
+                "heldout=%s offset_l2=%.3g propensity_bounds=[%.3f, %.3f]%s",
+                outer_fold,
+                fold,
+                folds,
+                len(eligible_fit_pos),
+                len(fit_pos),
+                len(heldout_pos),
+                float(self.avf_config.interaction_l2_weight),
+                r_stage_min_propensity,
+                r_stage_max_propensity,
+                self._cuda_memory_summary(),
+            )
+            try:
+                model = _TarNetOffsetNet(
+                    extractor=self._create_extractor(),
+                    hidden_dim=getattr(
+                        self.config.architecture,
+                        "causal_head_hidden_outcome_dim",
+                        64,
+                    ),
+                    outcome_type=self.config.outcome_type,
+                ).to(self.device)
+                self._train_tarnet_offset_model(
+                    model,
+                    df,
+                    eligible_fit_pos,
+                    y,
+                    t,
+                    baseline_raw,
+                    outer_fold=outer_fold,
+                    fold=fold,
+                    total_folds=folds,
+                )
+                heldout = df.iloc[heldout_pos]
+                pred = self._predict_tarnet_offset_model(
+                    model,
+                    heldout,
+                    baseline_raw[heldout_pos],
+                    t[heldout_pos],
+                )
+                tau_hat = pred["tau_raw"]
+                tau_logit_modifier = (
+                    pred["offset_contrast"]
+                    if self.config.outcome_type != "continuous"
+                    else np.full(len(heldout_pos), np.nan)
+                )
+                if self.config.outcome_type == "continuous":
+                    y0_hat = pred["y0_raw"]
+                    y1_hat = pred["y1_raw"]
+                    heldout_effect_loss = (pred["observed_outcome_raw"] - y[heldout_pos]) ** 2
+                else:
+                    y0_hat = 1.0 / (
+                        1.0 + np.exp(-np.clip(pred["y0_raw"], -50.0, 50.0))
+                    )
+                    y1_hat = 1.0 / (
+                        1.0 + np.exp(-np.clip(pred["y1_raw"], -50.0, 50.0))
+                    )
+                    heldout_effect_loss = _binary_log_loss_from_logits(
+                        pred["observed_outcome_raw"],
+                        y[heldout_pos],
+                    )
+                heldout_r_loss = (
+                    y_resid[heldout_pos] - tau_hat * t_resid[heldout_pos]
+                ) ** 2
+                fold_attention = self._tarnet_offset_attention_evidence(
+                    model,
+                    heldout,
+                    fold=fold,
+                    outer_fold=outer_fold,
+                    stage="effect_modifier",
+                    extra={
+                        "tau_hat_r_stage": tau_hat,
+                        "tau_logit_modifier": tau_logit_modifier,
+                        "baseline_outcome_raw": pred["baseline_raw"],
+                        "observed_outcome_raw": pred["observed_outcome_raw"],
+                        "y0_hat": y0_hat,
+                        "y1_hat": y1_hat,
+                        "y0_raw": pred["y0_raw"],
+                        "y1_raw": pred["y1_raw"],
+                        "offset0": pred["offset0"],
+                        "offset1": pred["offset1"],
+                        "offset_contrast": pred["offset_contrast"],
+                        "r_loss": heldout_r_loss,
+                        "effect_loss": heldout_effect_loss,
+                        "effect_objective": np.asarray(
+                            [effect_objective] * len(heldout_pos),
+                            dtype=object,
+                        ),
+                        "neural_stage_mode": np.asarray(
+                            ["tarnet_offset"] * len(heldout_pos),
+                            dtype=object,
+                        ),
+                    },
+                )
+                logger.info(
+                    "Outer fold %s TarNet-offset fold %s/%s complete: "
+                    "attention_rows=%s tau_mean=%.4f tau_logit_std=%.4f "
+                    "r_loss_mean=%.4f effect_loss_mean=%.4f%s",
+                    outer_fold,
+                    fold,
+                    folds,
+                    len(fold_attention),
+                    float(np.mean(tau_hat)),
+                    float(np.std(pred["offset_contrast"])),
+                    float(np.mean(heldout_r_loss)),
+                    float(np.mean(heldout_effect_loss)),
+                    self._cuda_memory_summary(),
+                )
+                result = {
+                    "fold": fold,
+                    "heldout_pos": heldout_pos,
+                    "baseline_outcome_raw": pred["baseline_raw"],
+                    "observed_outcome_raw": pred["observed_outcome_raw"],
+                    "y0_hat": y0_hat,
+                    "y1_hat": y1_hat,
+                    "y0_raw": pred["y0_raw"],
+                    "y1_raw": pred["y1_raw"],
+                    "offset0": pred["offset0"],
+                    "offset1": pred["offset1"],
+                    "offset_contrast": pred["offset_contrast"],
+                    "tau_hat": tau_hat,
+                    "tau_logit_modifier": tau_logit_modifier,
+                    "r_loss": heldout_r_loss,
+                    "effect_loss": heldout_effect_loss,
+                    "effect_loss_at_zero_tau": r_df.iloc[heldout_pos][
+                        "effect_loss_at_zero_tau"
+                    ].to_numpy(dtype=float),
+                    "effect_objective": effect_objective,
+                    "attention": fold_attention,
+                    "r_stage_train_eligible": train_eligible[heldout_pos],
+                }
+                self._save_tarnet_offset_fold_checkpoint(
+                    df=df,
+                    result=result,
+                    outer_fold=outer_fold,
+                    fingerprint=checkpoint_fingerprint,
+                )
+                return result
+            except RuntimeError as exc:
+                if _is_cuda_oom(exc):
+                    logger.error(
+                        "CUDA OOM in outer fold %s TarNet-offset fold %s/%s%s",
+                        outer_fold,
+                        fold,
+                        folds,
+                        self._cuda_memory_summary(),
+                    )
+                raise
+            finally:
+                if model is not None:
+                    self._cleanup_model(model)
+                    model = None
+                    logger.info(
+                        "Outer fold %s TarNet-offset fold %s/%s: model cleanup complete%s",
+                        outer_fold,
+                        fold,
+                        folds,
+                        self._cuda_memory_summary(),
+                    )
+
+        n_jobs = self._fold_n_jobs(folds)
+        logger.info(
+            "Outer fold %s TarNet-offset cross-fit parallelism: folds=%s n_jobs=%s "
+            "setting=%s device=%s",
+            outer_fold,
+            folds,
+            n_jobs,
+            self.avf_config.fold_parallelism,
+            self.device,
+        )
+        fold_results = _run_crossfit_fold_tasks(run_fold, split_items, n_jobs)
+
+        for result in fold_results:
+            heldout_pos = result["heldout_pos"]
+            for col, key in [
+                ("baseline_outcome_raw", "baseline_outcome_raw"),
+                ("observed_outcome_raw", "observed_outcome_raw"),
+                ("y0_hat", "y0_hat"),
+                ("y1_hat", "y1_hat"),
+                ("y0_raw", "y0_raw"),
+                ("y1_raw", "y1_raw"),
+                ("offset0", "offset0"),
+                ("offset1", "offset1"),
+                ("offset_contrast", "offset_contrast"),
+                ("tau_hat_r_stage", "tau_hat"),
+                ("tau_logit_modifier", "tau_logit_modifier"),
+                ("r_loss", "r_loss"),
+                ("effect_loss", "effect_loss"),
+                ("effect_loss_at_zero_tau", "effect_loss_at_zero_tau"),
+            ]:
+                r_df.loc[heldout_pos, col] = result.get(
+                    key,
+                    np.full(len(heldout_pos), np.nan),
+                )
+            r_df.loc[heldout_pos, "effect_fold"] = result["fold"]
+            r_df.loc[heldout_pos, "r_stage_train_eligible"] = result.get(
+                "r_stage_train_eligible",
+                np.ones(len(heldout_pos), dtype=bool),
+            )
+            attention_rows.extend(result["attention"])
+
+        self.r_stage_rows.append(r_df)
+        self.effect_attention_rows.extend(attention_rows)
+        return {"predictions": r_df, "attention": attention_rows}
+
+    def _crossfit_interaction_outcome(self, df: pd.DataFrame, outer_fold: int) -> Dict[str, Any]:
+        folds = _bounded_fold_count(self.avf_config.nuisance_folds, len(df))
+        effect_objective = "interaction_outcome_supervised"
+        predictions = pd.DataFrame(
+            {
+                "_oci_row_id": df["_oci_row_id"].to_numpy(),
+                "outer_fold": outer_fold,
+                "e_hat": np.nan,
+                "e_hat_raw": np.nan,
+                "m_hat": np.nan,
+                "m_hat_raw": np.nan,
+                "y0_hat": np.nan,
+                "y1_hat": np.nan,
+                "interaction_raw": np.nan,
+                "interaction_centered": np.nan,
+                "interaction_center": np.nan,
+                "global_treatment_effect": np.nan,
+                "treatment_delta": np.nan,
+                "y_residual": np.nan,
+                "t_residual": np.nan,
+                "r_loss_at_zero_tau": np.nan,
+                "nuisance_fold": np.nan,
+                "tau_hat_r_stage": np.nan,
+                "tau_logit_modifier": np.nan,
+                "r_loss": np.nan,
+                "effect_loss": np.nan,
+                "effect_loss_at_zero_tau": np.nan,
+                "effect_fold": np.nan,
+                "r_stage_train_eligible": False,
+                "effect_objective": effect_objective,
+                "neural_stage_mode": "interaction_outcome",
+            }
+        )
+        nuisance_attention_rows: List[Dict[str, Any]] = []
+        effect_attention_rows: List[Dict[str, Any]] = []
+
+        split_items = list(
+            enumerate(
+                KFold(n_splits=folds, shuffle=True, random_state=10_000 + outer_fold).split(df),
+                start=1,
+            )
+        )
+        checkpoint_fingerprint = self._crossfit_checkpoint_fingerprint(
+            "interaction_outcome",
+            folds,
+            extra_payload={
+                "effect_objective": effect_objective,
+                "outcome_loss": "observed_outcome_with_global_plus_centered_interaction_v1",
+                "interaction_l2_weight": float(self.avf_config.interaction_l2_weight),
+                "alpha_propensity": float(self.config.training.alpha_propensity),
+                "r_stage_min_propensity": float(self.avf_config.r_stage_min_propensity),
+                "r_stage_max_propensity": float(self.avf_config.r_stage_max_propensity),
+            },
+        )
+
+        def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
+            fit_pos = np.asarray(fit_pos, dtype=int)
+            heldout_pos = np.asarray(heldout_pos, dtype=int)
+            cached = self._load_interaction_outcome_fold_checkpoint(
+                df=df,
+                outer_fold=outer_fold,
+                fold=fold,
+                heldout_pos=heldout_pos,
+                fingerprint=checkpoint_fingerprint,
+            )
+            if cached is not None:
+                return cached
+
+            model = None
+            logger.info(
+                "Outer fold %s interaction-outcome fold %s/%s: train=%s heldout=%s "
+                "interaction_l2=%.3g alpha_propensity=%.3g%s",
+                outer_fold,
+                fold,
+                folds,
+                len(fit_pos),
+                len(heldout_pos),
+                float(self.avf_config.interaction_l2_weight),
+                float(self.config.training.alpha_propensity),
+                self._cuda_memory_summary(),
+            )
+            try:
+                model = _InteractionOutcomeNet(
+                    extractor=self._create_extractor(),
+                    hidden_dim=getattr(
+                        self.config.architecture,
+                        "causal_head_hidden_outcome_dim",
+                        64,
+                    ),
+                    outcome_type=self.config.outcome_type,
+                ).to(self.device)
+                self._train_interaction_outcome_model(
+                    model,
+                    df,
+                    fit_pos,
+                    outer_fold=outer_fold,
+                    fold=fold,
+                    total_folds=folds,
+                )
+                fit_df = df.iloc[fit_pos]
+                heldout = df.iloc[heldout_pos]
+                interaction_center = self._fit_interaction_outcome_center(model, fit_df)
+                fit_pred = self._predict_interaction_outcome_model(model, fit_df)
+                heldout_pred = self._predict_interaction_outcome_model(model, heldout)
+                prop_calibrator = BinaryProbabilityCalibrator.fit(
+                    fit_pred["e_raw"],
+                    fit_df[self.config.treatment_column].to_numpy(dtype=float),
+                    method=self.avf_config.nuisance_calibration,
+                )
+                e_hat = prop_calibrator.transform(heldout_pred["e_raw"])
+                if self.config.outcome_type == "continuous":
+                    m_hat = heldout_pred["m_raw"]
+                    y0_hat = heldout_pred["y0_raw"]
+                    y1_hat = heldout_pred["y1_raw"]
+                    tau_hat = y1_hat - y0_hat
+                else:
+                    outcome_calibrator = BinaryProbabilityCalibrator.fit(
+                        fit_pred["m_raw"],
+                        fit_df[self.config.outcome_column].to_numpy(dtype=float),
+                        method=self.avf_config.nuisance_calibration,
+                    )
+                    m_hat = outcome_calibrator.transform(heldout_pred["m_raw"])
+                    y0_hat = outcome_calibrator.transform(heldout_pred["y0_raw"])
+                    y1_hat = outcome_calibrator.transform(heldout_pred["y1_raw"])
+                    tau_hat = y1_hat - y0_hat
+
+                y = heldout[self.config.outcome_column].to_numpy(dtype=float)
+                t = heldout[self.config.treatment_column].to_numpy(dtype=float)
+                e_clipped = np.clip(
+                    e_hat,
+                    self.avf_config.e_clip,
+                    1.0 - self.avf_config.e_clip,
+                )
+                y_resid = y - m_hat
+                t_resid = t - e_clipped
+                train_eligible = (
+                    np.isfinite(e_hat)
+                    & (e_hat >= float(self.avf_config.r_stage_min_propensity))
+                    & (e_hat <= float(self.avf_config.r_stage_max_propensity))
+                )
+                if self.config.outcome_type == "continuous":
+                    effect_loss = (heldout_pred["m_raw"] - y) ** 2
+                    effect_loss_at_zero = (heldout_pred["y0_raw"] - y) ** 2
+                    tau_logit_modifier = np.full(len(heldout_pos), np.nan)
+                else:
+                    effect_loss = _binary_log_loss_from_logits(
+                        heldout_pred["m_logit"],
+                        y,
+                    )
+                    effect_loss_at_zero = _binary_log_loss_from_logits(
+                        heldout_pred["y0_logit"],
+                        y,
+                    )
+                    tau_logit_modifier = heldout_pred["treatment_delta"]
+                r_loss = (y_resid - tau_hat * t_resid) ** 2
+
+                logger.info(
+                    "Outer fold %s interaction-outcome fold %s/%s: collecting "
+                    "nuisance and interaction evidence",
+                    outer_fold,
+                    fold,
+                    folds,
+                )
+                nuisance_attention = self._attention_evidence(
+                    model.extractor,
+                    heldout,
+                    fold=fold,
+                    outer_fold=outer_fold,
+                    stage="nuisance",
+                    extra={
+                        "e_hat": e_hat,
+                        "e_hat_raw": heldout_pred["e_raw"],
+                        "m_hat": m_hat,
+                        "m_hat_raw": heldout_pred["m_raw"],
+                        "y_residual": y_resid,
+                        "t_residual": t_resid,
+                        "neural_stage_mode": np.asarray(
+                            ["interaction_outcome"] * len(heldout_pos),
+                            dtype=object,
+                        ),
+                    },
+                )
+                effect_attention = self._interaction_outcome_attention_evidence(
+                    model,
+                    heldout,
+                    fold=fold,
+                    outer_fold=outer_fold,
+                    stage="effect_modifier",
+                    extra={
+                        "tau_hat_r_stage": tau_hat,
+                        "tau_logit_modifier": tau_logit_modifier,
+                        "interaction_raw": heldout_pred["interaction_raw"],
+                        "interaction_centered": heldout_pred["interaction_centered"],
+                        "global_treatment_effect": heldout_pred["global_treatment_effect"],
+                        "interaction_center": np.asarray(
+                            [interaction_center] * len(heldout_pos),
+                            dtype=float,
+                        ),
+                        "treatment_delta": heldout_pred["treatment_delta"],
+                        "y0_hat": y0_hat,
+                        "y1_hat": y1_hat,
+                        "r_loss": r_loss,
+                        "effect_loss": effect_loss,
+                        "effect_objective": np.asarray(
+                            [effect_objective] * len(heldout_pos),
+                            dtype=object,
+                        ),
+                        "neural_stage_mode": np.asarray(
+                            ["interaction_outcome"] * len(heldout_pos),
+                            dtype=object,
+                        ),
+                    },
+                )
+                result = {
+                    "fold": fold,
+                    "heldout_pos": heldout_pos,
+                    "e_hat": e_hat,
+                    "e_hat_raw": heldout_pred["e_raw"],
+                    "m_hat": m_hat,
+                    "m_hat_raw": heldout_pred["m_raw"],
+                    "y0_hat": y0_hat,
+                    "y1_hat": y1_hat,
+                    "interaction_raw": heldout_pred["interaction_raw"],
+                    "interaction_centered": heldout_pred["interaction_centered"],
+                    "global_treatment_effect": heldout_pred["global_treatment_effect"],
+                    "interaction_center": np.asarray(
+                        [interaction_center] * len(heldout_pos),
+                        dtype=float,
+                    ),
+                    "treatment_delta": heldout_pred["treatment_delta"],
+                    "y_resid": y_resid,
+                    "t_resid": t_resid,
+                    "tau_hat": tau_hat,
+                    "tau_logit_modifier": tau_logit_modifier,
+                    "r_loss": r_loss,
+                    "effect_loss": effect_loss,
+                    "effect_loss_at_zero_tau": effect_loss_at_zero,
+                    "effect_objective": effect_objective,
+                    "r_stage_train_eligible": train_eligible,
+                    "nuisance_attention": nuisance_attention,
+                    "effect_attention": effect_attention,
+                }
+                self._save_interaction_outcome_fold_checkpoint(
+                    df=df,
+                    result=result,
+                    outer_fold=outer_fold,
+                    fingerprint=checkpoint_fingerprint,
+                )
+                logger.info(
+                    "Outer fold %s interaction-outcome fold %s/%s complete: "
+                    "tau_mean=%.4f r_loss_mean=%.4f outcome_loss_mean=%.4f%s",
+                    outer_fold,
+                    fold,
+                    folds,
+                    float(np.mean(tau_hat)),
+                    float(np.mean(r_loss)),
+                    float(np.mean(effect_loss)),
+                    self._cuda_memory_summary(),
+                )
+                return result
+            except RuntimeError as exc:
+                if _is_cuda_oom(exc):
+                    logger.error(
+                        "CUDA OOM in outer fold %s interaction-outcome fold %s/%s%s",
+                        outer_fold,
+                        fold,
+                        folds,
+                        self._cuda_memory_summary(),
+                    )
+                raise
+            finally:
+                if model is not None:
+                    self._cleanup_model(model)
+                    model = None
+                    logger.info(
+                        "Outer fold %s interaction-outcome fold %s/%s: model cleanup complete%s",
+                        outer_fold,
+                        fold,
+                        folds,
+                        self._cuda_memory_summary(),
+                    )
+
+        n_jobs = self._fold_n_jobs(folds)
+        logger.info(
+            "Outer fold %s interaction-outcome cross-fit parallelism: folds=%s "
+            "n_jobs=%s setting=%s device=%s",
+            outer_fold,
+            folds,
+            n_jobs,
+            self.avf_config.fold_parallelism,
+            self.device,
+        )
+        fold_results = _run_crossfit_fold_tasks(run_fold, split_items, n_jobs)
+
+        for result in fold_results:
+            heldout_pos = result["heldout_pos"]
+            predictions.loc[heldout_pos, "e_hat"] = result["e_hat"]
+            predictions.loc[heldout_pos, "e_hat_raw"] = result.get("e_hat_raw", result["e_hat"])
+            predictions.loc[heldout_pos, "m_hat"] = result["m_hat"]
+            predictions.loc[heldout_pos, "m_hat_raw"] = result.get("m_hat_raw", result["m_hat"])
+            predictions.loc[heldout_pos, "y0_hat"] = result.get("y0_hat", np.nan)
+            predictions.loc[heldout_pos, "y1_hat"] = result.get("y1_hat", np.nan)
+            predictions.loc[heldout_pos, "interaction_raw"] = result.get("interaction_raw", np.nan)
+            predictions.loc[heldout_pos, "interaction_centered"] = result.get(
+                "interaction_centered",
+                np.nan,
+            )
+            predictions.loc[heldout_pos, "interaction_center"] = result.get(
+                "interaction_center",
+                np.nan,
+            )
+            predictions.loc[heldout_pos, "global_treatment_effect"] = result.get(
+                "global_treatment_effect",
+                np.nan,
+            )
+            predictions.loc[heldout_pos, "treatment_delta"] = result.get(
+                "treatment_delta",
+                np.nan,
+            )
+            predictions.loc[heldout_pos, "y_residual"] = result["y_resid"]
+            predictions.loc[heldout_pos, "t_residual"] = result["t_resid"]
+            predictions.loc[heldout_pos, "r_loss_at_zero_tau"] = result["y_resid"] ** 2
+            predictions.loc[heldout_pos, "nuisance_fold"] = result["fold"]
+            predictions.loc[heldout_pos, "tau_hat_r_stage"] = result["tau_hat"]
+            predictions.loc[heldout_pos, "tau_logit_modifier"] = result.get(
+                "tau_logit_modifier",
+                np.full(len(heldout_pos), np.nan),
+            )
+            predictions.loc[heldout_pos, "r_loss"] = result["r_loss"]
+            predictions.loc[heldout_pos, "effect_loss"] = result.get(
+                "effect_loss",
+                result["r_loss"],
+            )
+            predictions.loc[heldout_pos, "effect_loss_at_zero_tau"] = result.get(
+                "effect_loss_at_zero_tau",
+                result["y_resid"] ** 2,
+            )
+            predictions.loc[heldout_pos, "effect_fold"] = result["fold"]
+            predictions.loc[heldout_pos, "r_stage_train_eligible"] = result.get(
+                "r_stage_train_eligible",
+                np.ones(len(heldout_pos), dtype=bool),
+            )
+            nuisance_attention_rows.extend(result["nuisance_attention"])
+            effect_attention_rows.extend(result["effect_attention"])
+
+        nuisance_cols = [
+            "_oci_row_id",
+            "outer_fold",
+            "e_hat",
+            "e_hat_raw",
+            "m_hat",
+            "m_hat_raw",
+            "y_residual",
+            "t_residual",
+            "r_loss_at_zero_tau",
+            "nuisance_fold",
+        ]
+        nuisance_predictions = predictions[nuisance_cols].copy()
+        self.nuisance_rows.append(nuisance_predictions)
+        self.r_stage_rows.append(predictions)
+        self.nuisance_attention_rows.extend(nuisance_attention_rows)
+        self.effect_attention_rows.extend(effect_attention_rows)
+        return {
+            "nuisance_predictions": nuisance_predictions,
+            "nuisance_attention": nuisance_attention_rows,
+            "predictions": predictions,
+            "attention": effect_attention_rows,
+        }
 
     def _crossfit_joint_rlearner(self, df: pd.DataFrame, outer_fold: int) -> Dict[str, Any]:
         folds = _bounded_fold_count(self.avf_config.nuisance_folds, len(df))
@@ -2188,6 +3111,327 @@ class AgenticAttentionVariableForestRunner:
                 self._cuda_memory_summary(),
             )
 
+    def _train_interaction_outcome_model(
+        self,
+        model: _InteractionOutcomeNet,
+        df: pd.DataFrame,
+        positions,
+        outer_fold: int,
+        fold: int,
+        total_folds: int,
+    ):
+        train_config = self.config.training
+        epochs = int(
+            self.avf_config.nuisance_epochs
+            if self.avf_config.nuisance_epochs is not None
+            else train_config.epochs
+        )
+        weight_decay = float(
+            self.avf_config.nuisance_weight_decay
+            if self.avf_config.nuisance_weight_decay is not None
+            else getattr(train_config, "weight_decay", 0.01)
+        )
+        label_smoothing = float(self.avf_config.nuisance_label_smoothing)
+        interaction_l2 = float(self.avf_config.interaction_l2_weight)
+        alpha_propensity = float(self.config.training.alpha_propensity)
+        model.extractor.fit_tokenizer(
+            df.iloc[positions][self.config.text_column].astype(str).tolist()
+        )
+        train_loader = self._make_text_loader(
+            model,
+            df,
+            positions,
+            fields={
+                "t": df[self.config.treatment_column].to_numpy(dtype=np.float32),
+                "y": df[self.config.outcome_column].to_numpy(dtype=np.float32),
+            },
+            shuffle=True,
+            total_folds=total_folds,
+        )
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=train_config.learning_rate,
+            weight_decay=weight_decay,
+        )
+        num_batches = max(1, len(train_loader))
+        scheduler = _make_linear_lr_scheduler(
+            optimizer,
+            train_config,
+            num_batches,
+            epochs_override=epochs,
+        )
+        progress_every = max(1, num_batches // 5)
+        logger.info(
+            "Outer fold %s interaction-outcome fold %s/%s: training for %s epoch(s), "
+            "batch_size=%s, batches/epoch=%s, dataloader_workers=%s, lr=%.3g, "
+            "weight_decay=%.3g, label_smoothing=%.3g, alpha_propensity=%.3g, "
+            "interaction_l2=%.3g, lr_schedule=%s%s",
+            outer_fold,
+            fold,
+            total_folds,
+            epochs,
+            train_config.batch_size,
+            num_batches,
+            train_loader.num_workers,
+            _current_lr(optimizer),
+            weight_decay,
+            label_smoothing,
+            alpha_propensity,
+            interaction_l2,
+            "linear" if scheduler is not None else "none",
+            self._cuda_memory_summary(),
+        )
+        for epoch in range(1, epochs + 1):
+            model.train()
+            loss_sum = 0.0
+            prop_sum = 0.0
+            outcome_sum = 0.0
+            interaction_sum = 0.0
+            batch_count = 0
+            for batch_idx, batch in enumerate(train_loader, start=1):
+                t = batch["t"].to(self.device, non_blocking=True)
+                y = batch["y"].to(self.device, non_blocking=True)
+                optimizer.zero_grad(set_to_none=True)
+                out = model(
+                    batch["model_input"],
+                    treatment=t,
+                    center_interaction_batch=True,
+                )
+                if label_smoothing > 0:
+                    t_target = t * (1.0 - label_smoothing) + 0.5 * label_smoothing
+                else:
+                    t_target = t
+                prop_loss = F.binary_cross_entropy_with_logits(
+                    out["propensity_logit"],
+                    t_target,
+                )
+                if self.config.outcome_type == "continuous":
+                    outcome_loss = F.mse_loss(out["observed_outcome_raw"], y)
+                else:
+                    if label_smoothing > 0:
+                        y_target = y * (1.0 - label_smoothing) + 0.5 * label_smoothing
+                    else:
+                        y_target = y
+                    outcome_loss = F.binary_cross_entropy_with_logits(
+                        out["observed_outcome_raw"],
+                        y_target,
+                    )
+                interaction_penalty = torch.mean(torch.square(out["interaction_centered"]))
+                loss = (
+                    outcome_loss
+                    + alpha_propensity * prop_loss
+                    + interaction_l2 * interaction_penalty
+                )
+                loss.backward()
+                self._clip_and_step(model, optimizer, scheduler)
+                batch_count += 1
+                loss_value = float(loss.detach().cpu())
+                prop_value = float(prop_loss.detach().cpu())
+                outcome_value = float(outcome_loss.detach().cpu())
+                interaction_value = float(interaction_penalty.detach().cpu())
+                loss_sum += loss_value
+                prop_sum += prop_value
+                outcome_sum += outcome_value
+                interaction_sum += interaction_value
+                if (
+                    batch_idx == 1
+                    or batch_idx == num_batches
+                    or batch_idx % progress_every == 0
+                ):
+                    logger.info(
+                        "Outer fold %s interaction-outcome fold %s/%s epoch %s/%s "
+                        "batch %s/%s loss=%.4f outcome=%.4f propensity=%.4f "
+                        "interaction_l2_term=%.4f lr=%.3g%s",
+                        outer_fold,
+                        fold,
+                        total_folds,
+                        epoch,
+                        epochs,
+                        batch_idx,
+                        num_batches,
+                        loss_value,
+                        outcome_value,
+                        prop_value,
+                        interaction_l2 * interaction_value,
+                        _current_lr(optimizer),
+                        self._cuda_memory_summary(),
+                    )
+            denom = max(1, batch_count)
+            logger.info(
+                "Outer fold %s interaction-outcome fold %s/%s epoch %s/%s complete: "
+                "loss=%.4f outcome=%.4f propensity=%.4f interaction_penalty=%.4f "
+                "lr=%.3g%s",
+                outer_fold,
+                fold,
+                total_folds,
+                epoch,
+                epochs,
+                loss_sum / denom,
+                outcome_sum / denom,
+                prop_sum / denom,
+                interaction_sum / denom,
+                _current_lr(optimizer),
+                self._cuda_memory_summary(),
+            )
+
+    def _train_tarnet_offset_model(
+        self,
+        model: _TarNetOffsetNet,
+        df: pd.DataFrame,
+        positions,
+        outcomes: np.ndarray,
+        treatments: np.ndarray,
+        baseline_raw: np.ndarray,
+        outer_fold: int,
+        fold: int,
+        total_folds: int,
+    ):
+        train_config = self.config.training
+        offset_l2 = float(self.avf_config.interaction_l2_weight)
+        heterogeneity_weight = float(
+            self.avf_config.tarnet_offset_heterogeneity_weight
+        )
+        min_logit_std = float(self.avf_config.tarnet_offset_min_logit_std)
+        model.extractor.fit_tokenizer(
+            df.iloc[positions][self.config.text_column].astype(str).tolist()
+        )
+        train_loader = self._make_text_loader(
+            model,
+            df,
+            positions,
+            fields={
+                "outcome": np.asarray(outcomes, dtype=np.float32),
+                "treatment": np.asarray(treatments, dtype=np.float32),
+                "baseline_raw": np.asarray(baseline_raw, dtype=np.float32),
+            },
+            shuffle=True,
+            total_folds=total_folds,
+            batch_size=self._tarnet_offset_batch_size(),
+        )
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=train_config.learning_rate,
+            weight_decay=getattr(train_config, "weight_decay", 0.01),
+        )
+        num_batches = max(1, len(train_loader))
+        scheduler = _make_linear_lr_scheduler(optimizer, train_config, num_batches)
+        progress_every = max(1, num_batches // 5)
+        logger.info(
+            "Outer fold %s TarNet-offset fold %s/%s: training for %s epoch(s), "
+            "batch_size=%s, batches/epoch=%s, dataloader_workers=%s, lr=%.3g, "
+            "offset_l2=%.3g, heterogeneity_weight=%.3g, min_logit_std=%.3g, "
+            "lr_schedule=%s%s",
+            outer_fold,
+            fold,
+            total_folds,
+            train_config.epochs,
+            train_loader.batch_size,
+            num_batches,
+            train_loader.num_workers,
+            _current_lr(optimizer),
+            offset_l2,
+            heterogeneity_weight,
+            min_logit_std,
+            "linear" if scheduler is not None else "none",
+            self._cuda_memory_summary(),
+        )
+        for epoch in range(1, train_config.epochs + 1):
+            model.train()
+            loss_sum = 0.0
+            outcome_sum = 0.0
+            offset_sum = 0.0
+            heterogeneity_sum = 0.0
+            contrast_std_sum = 0.0
+            batch_count = 0
+            for batch_idx, batch in enumerate(train_loader, start=1):
+                y = batch["outcome"].to(self.device, non_blocking=True)
+                t = batch["treatment"].to(self.device, non_blocking=True)
+                baseline = batch["baseline_raw"].to(self.device, non_blocking=True)
+                optimizer.zero_grad(set_to_none=True)
+                out = model(
+                    batch["model_input"],
+                    baseline_raw=baseline,
+                    treatment=t,
+                )
+                if self.config.outcome_type == "continuous":
+                    outcome_loss = F.mse_loss(out["observed_outcome_raw"], y)
+                else:
+                    outcome_loss = F.binary_cross_entropy_with_logits(
+                        out["observed_outcome_raw"],
+                        y,
+                    )
+                offset_penalty = 0.5 * (
+                    torch.mean(torch.square(out["offset0"]))
+                    + torch.mean(torch.square(out["offset1"]))
+                )
+                heterogeneity_penalty, contrast_variance = (
+                    _tarnet_offset_heterogeneity_penalty(
+                        out["offset_contrast"],
+                        min_logit_std,
+                    )
+                )
+                loss = (
+                    outcome_loss
+                    + offset_l2 * offset_penalty
+                    + heterogeneity_weight * heterogeneity_penalty
+                )
+                loss.backward()
+                self._clip_and_step(model, optimizer, scheduler)
+                batch_count += 1
+                loss_value = float(loss.detach().cpu())
+                outcome_value = float(outcome_loss.detach().cpu())
+                offset_value = float(offset_penalty.detach().cpu())
+                heterogeneity_value = float(heterogeneity_penalty.detach().cpu())
+                contrast_std_value = float(torch.sqrt(contrast_variance.detach()).cpu())
+                loss_sum += loss_value
+                outcome_sum += outcome_value
+                offset_sum += offset_value
+                heterogeneity_sum += heterogeneity_value
+                contrast_std_sum += contrast_std_value
+                if (
+                    batch_idx == 1
+                    or batch_idx == num_batches
+                    or batch_idx % progress_every == 0
+                ):
+                    logger.info(
+                        "Outer fold %s TarNet-offset fold %s/%s epoch %s/%s "
+                        "batch %s/%s loss=%.4f outcome=%.4f "
+                        "offset_l2_term=%.4f heterogeneity_term=%.4f "
+                        "contrast_std=%.4f lr=%.3g%s",
+                        outer_fold,
+                        fold,
+                        total_folds,
+                        epoch,
+                        train_config.epochs,
+                        batch_idx,
+                        num_batches,
+                        loss_value,
+                        outcome_value,
+                        offset_l2 * offset_value,
+                        heterogeneity_weight * heterogeneity_value,
+                        contrast_std_value,
+                        _current_lr(optimizer),
+                        self._cuda_memory_summary(),
+                    )
+            denom = max(1, batch_count)
+            logger.info(
+                "Outer fold %s TarNet-offset fold %s/%s epoch %s/%s complete: "
+                "loss=%.4f outcome=%.4f offset_penalty=%.4f "
+                "heterogeneity_penalty=%.4f contrast_std=%.4f lr=%.3g%s",
+                outer_fold,
+                fold,
+                total_folds,
+                epoch,
+                train_config.epochs,
+                loss_sum / denom,
+                outcome_sum / denom,
+                offset_sum / denom,
+                heterogeneity_sum / denom,
+                contrast_std_sum / denom,
+                _current_lr(optimizer),
+                self._cuda_memory_summary(),
+            )
+
     def _train_effect_model(
         self,
         model: _EffectNet,
@@ -2477,6 +3721,156 @@ class AgenticAttentionVariableForestRunner:
                 effect.append(tau.cpu().numpy())
         return np.concatenate(prop), np.concatenate(outcome), np.concatenate(effect)
 
+    def _predict_interaction_outcome_model(
+        self,
+        model: _InteractionOutcomeNet,
+        df: pd.DataFrame,
+    ) -> Dict[str, np.ndarray]:
+        model.eval()
+        prop = []
+        observed = []
+        observed_logit = []
+        y0 = []
+        y1 = []
+        y0_logit = []
+        y1_logit = []
+        interaction = []
+        interaction_centered = []
+        global_effect = []
+        treatment_delta = []
+        tau = []
+        treatment = df[self.config.treatment_column].to_numpy(dtype=np.float32)
+        loader = self._make_text_loader(
+            model,
+            df,
+            np.arange(len(df), dtype=int),
+            fields={"t": treatment},
+            shuffle=False,
+        )
+        with torch.no_grad():
+            for batch in loader:
+                t = batch["t"].to(self.device, non_blocking=True)
+                out = model(batch["model_input"], treatment=t)
+                prop.append(torch.sigmoid(out["propensity_logit"]).cpu().numpy())
+                interaction.append(out["interaction_raw"].cpu().numpy())
+                interaction_centered.append(out["interaction_centered"].cpu().numpy())
+                global_effect.append(out["global_treatment_effect"].cpu().numpy())
+                treatment_delta.append(out["treatment_delta"].cpu().numpy())
+                tau.append(out["tau"].cpu().numpy())
+                if self.config.outcome_type == "continuous":
+                    observed.append(out["observed_outcome_raw"].cpu().numpy())
+                    y0.append(out["y0_raw"].cpu().numpy())
+                    y1.append(out["y1_raw"].cpu().numpy())
+                    observed_logit.append(out["observed_outcome_raw"].cpu().numpy())
+                    y0_logit.append(out["y0_raw"].cpu().numpy())
+                    y1_logit.append(out["y1_raw"].cpu().numpy())
+                else:
+                    observed_logit.append(out["observed_outcome_raw"].cpu().numpy())
+                    y0_logit.append(out["y0_raw"].cpu().numpy())
+                    y1_logit.append(out["y1_raw"].cpu().numpy())
+                    observed.append(torch.sigmoid(out["observed_outcome_raw"]).cpu().numpy())
+                    y0.append(torch.sigmoid(out["y0_raw"]).cpu().numpy())
+                    y1.append(torch.sigmoid(out["y1_raw"]).cpu().numpy())
+        return {
+            "e_raw": np.concatenate(prop),
+            "m_raw": np.concatenate(observed),
+            "m_logit": np.concatenate(observed_logit),
+            "y0_raw": np.concatenate(y0),
+            "y1_raw": np.concatenate(y1),
+            "y0_logit": np.concatenate(y0_logit),
+            "y1_logit": np.concatenate(y1_logit),
+            "interaction_raw": np.concatenate(interaction),
+            "interaction_centered": np.concatenate(interaction_centered),
+            "global_treatment_effect": np.concatenate(global_effect),
+            "treatment_delta": np.concatenate(treatment_delta),
+            "tau_raw": np.concatenate(tau),
+        }
+
+    def _predict_tarnet_offset_model(
+        self,
+        model: _TarNetOffsetNet,
+        df: pd.DataFrame,
+        baseline_raw: np.ndarray,
+        treatment: np.ndarray,
+    ) -> Dict[str, np.ndarray]:
+        model.eval()
+        baseline = np.asarray(baseline_raw, dtype=np.float32)
+        treatment_values = np.asarray(treatment, dtype=np.float32)
+        offset0 = []
+        offset1 = []
+        offset_contrast = []
+        observed = []
+        y0_raw = []
+        y1_raw = []
+        tau = []
+        loader = self._make_text_loader(
+            model,
+            df,
+            np.arange(len(df), dtype=int),
+            fields={
+                "baseline_raw": baseline,
+                "treatment": treatment_values,
+            },
+            shuffle=False,
+            batch_size=self._tarnet_offset_batch_size(),
+        )
+        with torch.no_grad():
+            for batch in loader:
+                baseline_tensor = batch["baseline_raw"].to(
+                    self.device,
+                    non_blocking=True,
+                )
+                treatment_tensor = batch["treatment"].to(
+                    self.device,
+                    non_blocking=True,
+                )
+                out = model(
+                    batch["model_input"],
+                    baseline_raw=baseline_tensor,
+                    treatment=treatment_tensor,
+                )
+                offset0.append(out["offset0"].cpu().numpy())
+                offset1.append(out["offset1"].cpu().numpy())
+                offset_contrast.append(out["offset_contrast"].cpu().numpy())
+                observed.append(out["observed_outcome_raw"].cpu().numpy())
+                y0_raw.append(out["y0_raw"].cpu().numpy())
+                y1_raw.append(out["y1_raw"].cpu().numpy())
+                tau.append(out["tau"].cpu().numpy())
+        return {
+            "baseline_raw": baseline,
+            "offset0": np.concatenate(offset0),
+            "offset1": np.concatenate(offset1),
+            "offset_contrast": np.concatenate(offset_contrast),
+            "observed_outcome_raw": np.concatenate(observed),
+            "y0_raw": np.concatenate(y0_raw),
+            "y1_raw": np.concatenate(y1_raw),
+            "tau_raw": np.concatenate(tau),
+        }
+
+    def _fit_interaction_outcome_center(
+        self,
+        model: _InteractionOutcomeNet,
+        df: pd.DataFrame,
+    ) -> float:
+        model.eval()
+        raw_values = []
+        treatment = df[self.config.treatment_column].to_numpy(dtype=np.float32)
+        loader = self._make_text_loader(
+            model,
+            df,
+            np.arange(len(df), dtype=int),
+            fields={"t": treatment},
+            shuffle=False,
+        )
+        with torch.no_grad():
+            for batch in loader:
+                t = batch["t"].to(self.device, non_blocking=True)
+                out = model(batch["model_input"], treatment=t)
+                raw_values.append(out["interaction_raw"].cpu().numpy())
+        center = float(np.mean(np.concatenate(raw_values))) if raw_values else 0.0
+        model.set_interaction_center(center)
+        return center
+
     def _predict_effect_model(self, model: _EffectNet, df: pd.DataFrame) -> np.ndarray:
         model.eval()
         tau = []
@@ -2607,6 +4001,311 @@ class AgenticAttentionVariableForestRunner:
                     self._cuda_memory_summary(),
                 )
         return records
+
+    def _tarnet_offset_attention_evidence(
+        self,
+        model: _TarNetOffsetNet,
+        df: pd.DataFrame,
+        fold: int,
+        outer_fold: int,
+        stage: str,
+        extra: Dict[str, np.ndarray],
+    ) -> List[Dict[str, Any]]:
+        if not hasattr(model.extractor, "forward") or not hasattr(model.extractor, "_top_token_spans"):
+            if not hasattr(model.extractor, "get_attention_evidence"):
+                return []
+            return self._attention_evidence(
+                model.extractor,
+                df,
+                fold=fold,
+                outer_fold=outer_fold,
+                stage=stage,
+                extra=extra,
+            )
+
+        texts = df[self.config.text_column].astype(str).tolist()
+        row_ids = df["_oci_row_id"].tolist()
+        metadata = []
+        for offset in range(len(df)):
+            item = {"outer_fold": outer_fold}
+            for key, values in extra.items():
+                item[key] = _metadata_value(values, offset)
+            metadata.append(item)
+
+        batch_size = self._tarnet_offset_batch_size()
+        total_batches = max(1, int(np.ceil(len(texts) / batch_size)))
+        progress_every = max(1, total_batches // 5)
+        records: List[Dict[str, Any]] = []
+        for batch_idx, start in enumerate(range(0, len(texts), batch_size), start=1):
+            end = min(start + batch_size, len(texts))
+            batch_texts = texts[start:end]
+            try:
+                model.zero_grad(set_to_none=True)
+                out = model(
+                    batch_texts,
+                    return_attention_tensors=True,
+                )
+                contrast = out["offset_contrast"]
+                objective = torch.sum(torch.square(contrast))
+                if float(objective.detach().cpu()) <= 1e-12:
+                    objective = torch.sum(torch.abs(contrast))
+                objective.backward()
+                batch_records = self._interaction_attention_records_from_output(
+                    out.get("encoder_attention"),
+                    extractor=model.extractor,
+                    row_ids=row_ids[start:end],
+                    fold=fold,
+                    stage=stage,
+                    top_k=self.avf_config.attention_top_k_chunks,
+                    metadata=metadata[start:end],
+                    attribution_target="tarnet_offset_contrast",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "TarNet-offset attribution failed in outer fold %s fold %s "
+                    "batch %s/%s; falling back to HTR attention: %s",
+                    outer_fold,
+                    fold,
+                    batch_idx,
+                    total_batches,
+                    exc,
+                )
+                batch_records = model.extractor.get_attention_evidence(
+                    batch_texts,
+                    row_ids=row_ids[start:end],
+                    fold=fold,
+                    stage=stage,
+                    top_k=self.avf_config.attention_top_k_chunks,
+                    metadata=metadata[start:end],
+                )
+            records.extend(batch_records)
+            if (
+                batch_idx == 1
+                or batch_idx == total_batches
+                or batch_idx % progress_every == 0
+            ):
+                logger.info(
+                    "Outer fold %s %s fold %s: TarNet-offset attribution batch "
+                    "%s/%s rows=%s/%s%s",
+                    outer_fold,
+                    stage,
+                    fold,
+                    batch_idx,
+                    total_batches,
+                    end,
+                    len(texts),
+                    self._cuda_memory_summary(),
+                )
+        return records
+
+    def _interaction_outcome_attention_evidence(
+        self,
+        model: _InteractionOutcomeNet,
+        df: pd.DataFrame,
+        fold: int,
+        outer_fold: int,
+        stage: str,
+        extra: Dict[str, np.ndarray],
+    ) -> List[Dict[str, Any]]:
+        if not hasattr(model.extractor, "forward") or not hasattr(model.extractor, "_top_token_spans"):
+            if not hasattr(model.extractor, "get_attention_evidence"):
+                return []
+            return self._attention_evidence(
+                model.extractor,
+                df,
+                fold=fold,
+                outer_fold=outer_fold,
+                stage=stage,
+                extra=extra,
+            )
+
+        texts = df[self.config.text_column].astype(str).tolist()
+        row_ids = df["_oci_row_id"].tolist()
+        treatments = df[self.config.treatment_column].to_numpy(dtype=np.float32)
+        metadata = []
+        for offset in range(len(df)):
+            item = {"outer_fold": outer_fold}
+            for key, values in extra.items():
+                item[key] = _metadata_value(values, offset)
+            metadata.append(item)
+
+        batch_size = max(1, int(self.config.training.batch_size))
+        total_batches = max(1, int(np.ceil(len(texts) / batch_size)))
+        progress_every = max(1, total_batches // 5)
+        records: List[Dict[str, Any]] = []
+        for batch_idx, start in enumerate(range(0, len(texts), batch_size), start=1):
+            end = min(start + batch_size, len(texts))
+            batch_texts = texts[start:end]
+            batch_t = torch.as_tensor(
+                treatments[start:end],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            try:
+                model.zero_grad(set_to_none=True)
+                out = model(
+                    batch_texts,
+                    treatment=batch_t,
+                    return_attention_tensors=True,
+                )
+                interaction = out["interaction_centered"]
+                objective = torch.sum(torch.square(interaction))
+                if float(objective.detach().cpu()) <= 1e-12:
+                    objective = torch.sum(torch.abs(interaction))
+                objective.backward()
+                batch_records = self._interaction_attention_records_from_output(
+                    out.get("encoder_attention"),
+                    extractor=model.extractor,
+                    row_ids=row_ids[start:end],
+                    fold=fold,
+                    stage=stage,
+                    top_k=self.avf_config.attention_top_k_chunks,
+                    metadata=metadata[start:end],
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Interaction attribution failed in outer fold %s fold %s "
+                    "batch %s/%s; falling back to HTR attention: %s",
+                    outer_fold,
+                    fold,
+                    batch_idx,
+                    total_batches,
+                    exc,
+                )
+                batch_records = model.extractor.get_attention_evidence(
+                    batch_texts,
+                    row_ids=row_ids[start:end],
+                    fold=fold,
+                    stage=stage,
+                    top_k=self.avf_config.attention_top_k_chunks,
+                    metadata=metadata[start:end],
+                )
+            records.extend(batch_records)
+            if (
+                batch_idx == 1
+                or batch_idx == total_batches
+                or batch_idx % progress_every == 0
+            ):
+                logger.info(
+                    "Outer fold %s %s fold %s: interaction attribution batch "
+                    "%s/%s rows=%s/%s%s",
+                    outer_fold,
+                    stage,
+                    fold,
+                    batch_idx,
+                    total_batches,
+                    end,
+                    len(texts),
+                    self._cuda_memory_summary(),
+                )
+        return records
+
+    def _interaction_attention_records_from_output(
+        self,
+        encoder_attention: Optional[Dict[str, Any]],
+        *,
+        extractor: nn.Module,
+        row_ids: Sequence[Any],
+        fold: int,
+        stage: str,
+        top_k: int,
+        metadata: Sequence[Dict[str, Any]],
+        attribution_target: str = "interaction_heterogeneity",
+    ) -> List[Dict[str, Any]]:
+        if not encoder_attention:
+            raise ValueError("missing encoder attention tensors")
+        batch_chunks = encoder_attention.get("batch_chunks") or []
+        sequence_input = encoder_attention.get("sequence_input")
+        chunk_mask = encoder_attention.get("chunk_mask")
+        chunk_alpha = encoder_attention.get("chunk_alpha")
+        if sequence_input is not None and getattr(sequence_input, "grad", None) is not None:
+            grad = sequence_input.grad[:, 1:, :]
+            activation = sequence_input.detach()[:, 1:, :]
+            chunk_scores = torch.sum(torch.abs(grad * activation), dim=-1)
+        elif chunk_alpha is not None and getattr(chunk_alpha, "grad", None) is not None:
+            chunk_scores = torch.abs(chunk_alpha.grad.detach() * chunk_alpha.detach())
+        elif chunk_alpha is not None:
+            chunk_scores = chunk_alpha.detach()
+        else:
+            raise ValueError("missing chunk attribution tensors")
+        if chunk_mask is not None:
+            chunk_scores = chunk_scores.masked_fill(~chunk_mask.to(chunk_scores.device), 0.0)
+        token_scores = self._interaction_token_scores(encoder_attention)
+        records: List[Dict[str, Any]] = []
+        flat_offset = 0
+        for row_offset, chunks in enumerate(batch_chunks):
+            row_scores = chunk_scores[row_offset, : len(chunks)].detach().cpu().numpy()
+            score_sum = float(np.sum(row_scores))
+            if score_sum > 0:
+                row_scores = row_scores / score_sum
+            order = sorted(range(len(chunks)), key=lambda idx: row_scores[idx], reverse=True)
+            meta = metadata[row_offset] if row_offset < len(metadata) else {}
+            for chunk_index in order[: min(int(top_k), len(order))]:
+                record = {
+                    "row_id": row_ids[row_offset],
+                    "fold": fold,
+                    "stage": stage,
+                    "chunk_index": int(chunk_index),
+                    "chunk_text": chunks[chunk_index],
+                    "attention": float(row_scores[chunk_index]),
+                    "attribution_target": attribution_target,
+                }
+                flat_idx = flat_offset + chunk_index
+                if token_scores is not None and flat_idx < int(token_scores.shape[0]):
+                    spans = self._top_token_spans_for_extractor(
+                        extractor,
+                        chunks[chunk_index],
+                        token_scores[flat_idx],
+                    )
+                    if spans:
+                        record["top_token_spans_json"] = json.dumps(
+                            spans,
+                            ensure_ascii=False,
+                        )
+                        record["attended_token_summary"] = "; ".join(
+                            span["text"] for span in spans[:6]
+                        )
+                        if hasattr(extractor, "_highlight_chunk"):
+                            record["highlighted_chunk_text"] = extractor._highlight_chunk(
+                                chunks[chunk_index],
+                                spans,
+                            )
+                record.update(meta)
+                records.append(record)
+            flat_offset += len(chunks)
+        return records
+
+    @staticmethod
+    def _interaction_token_scores(encoder_attention: Dict[str, Any]) -> Optional[torch.Tensor]:
+        token_alpha = encoder_attention.get("token_alpha")
+        if token_alpha is None:
+            return None
+        if getattr(token_alpha, "grad", None) is not None:
+            scores = torch.abs(token_alpha.grad.detach() * token_alpha.detach())
+        else:
+            source_scores = _interaction_source_token_scores(encoder_attention)
+            if source_scores is not None:
+                scores = source_scores
+            else:
+                scores = token_alpha.detach()
+        attention_mask = encoder_attention.get("attention_mask")
+        if attention_mask is not None:
+            scores = scores.masked_fill(attention_mask.to(scores.device) <= 0, 0.0)
+        return scores.detach()
+
+    def _top_token_spans_for_extractor(
+        self,
+        extractor: nn.Module,
+        chunk: str,
+        token_weights: torch.Tensor,
+    ) -> List[Dict[str, Any]]:
+        if not hasattr(extractor, "_top_token_spans"):
+            return []
+        spans = extractor._top_token_spans(chunk, token_weights)
+        if spans:
+            for span in spans:
+                span.setdefault("attribution", "interaction")
+        return spans
 
     def _discover_variables_from_attention(
         self,
@@ -3229,6 +4928,12 @@ class AgenticAttentionVariableForestRunner:
             "nuisance_calibration": self.avf_config.nuisance_calibration,
             "neural_stage_mode": self.avf_config.neural_stage_mode,
             "joint_rlearner_gamma": self.avf_config.joint_rlearner_gamma,
+            "interaction_l2_weight": self.avf_config.interaction_l2_weight,
+            "tarnet_offset_batch_size": self.avf_config.tarnet_offset_batch_size,
+            "tarnet_offset_heterogeneity_weight": (
+                self.avf_config.tarnet_offset_heterogeneity_weight
+            ),
+            "tarnet_offset_min_logit_std": self.avf_config.tarnet_offset_min_logit_std,
             "architecture": {key: getattr(arch, key, None) for key in arch_keys},
             "training": {key: getattr(train, key, None) for key in train_keys},
         }
@@ -3617,6 +5322,341 @@ class AgenticAttentionVariableForestRunner:
         _write_jsonl(
             self.artifact_dir / "association_filter_by_attempt.jsonl",
             self.association_filter_rows,
+        )
+
+    def _load_tarnet_offset_fold_checkpoint(
+        self,
+        df: pd.DataFrame,
+        outer_fold: int,
+        fold: int,
+        heldout_pos: np.ndarray,
+        fingerprint: str,
+    ) -> Optional[Dict[str, Any]]:
+        loaded = self._load_fold_checkpoint(
+            "tarnet_offset",
+            df,
+            outer_fold,
+            fold,
+            heldout_pos,
+            fingerprint,
+        )
+        if loaded is None:
+            return None
+        pred_df, attention_rows = loaded
+        default_effect_loss = (
+            pred_df["effect_loss"].to_numpy(dtype=float)
+            if "effect_loss" in pred_df.columns
+            else pred_df["r_loss"].to_numpy(dtype=float)
+        )
+        default_effect_loss_at_zero = (
+            pred_df["effect_loss_at_zero_tau"].to_numpy(dtype=float)
+            if "effect_loss_at_zero_tau" in pred_df.columns
+            else np.full(len(pred_df), np.nan, dtype=float)
+        )
+
+        def column(name: str, default: float = np.nan) -> np.ndarray:
+            if name in pred_df.columns:
+                return pred_df[name].to_numpy(dtype=float)
+            return np.full(len(pred_df), default, dtype=float)
+
+        return {
+            "fold": fold,
+            "heldout_pos": np.asarray(heldout_pos),
+            "baseline_outcome_raw": column("baseline_outcome_raw"),
+            "observed_outcome_raw": column("observed_outcome_raw"),
+            "y0_hat": column("y0_hat"),
+            "y1_hat": column("y1_hat"),
+            "y0_raw": column("y0_raw"),
+            "y1_raw": column("y1_raw"),
+            "offset0": column("offset0"),
+            "offset1": column("offset1"),
+            "offset_contrast": column("offset_contrast"),
+            "tau_hat": pred_df["tau_hat_r_stage"].to_numpy(dtype=float),
+            "tau_logit_modifier": (
+                pred_df["tau_logit_modifier"].to_numpy(dtype=float)
+                if "tau_logit_modifier" in pred_df.columns
+                else np.full(len(pred_df), np.nan, dtype=float)
+            ),
+            "r_loss": pred_df["r_loss"].to_numpy(dtype=float),
+            "effect_loss": default_effect_loss,
+            "effect_loss_at_zero_tau": default_effect_loss_at_zero,
+            "effect_objective": (
+                str(pred_df["effect_objective"].iloc[0])
+                if "effect_objective" in pred_df.columns and len(pred_df) > 0
+                else "tarnet_offset_outcome"
+            ),
+            "r_stage_train_eligible": (
+                pred_df["r_stage_train_eligible"].to_numpy(dtype=bool)
+                if "r_stage_train_eligible" in pred_df.columns
+                else np.ones(len(pred_df), dtype=bool)
+            ),
+            "attention": attention_rows,
+        }
+
+    def _save_tarnet_offset_fold_checkpoint(
+        self,
+        df: pd.DataFrame,
+        result: Dict[str, Any],
+        outer_fold: int,
+        fingerprint: str,
+    ) -> None:
+        heldout_pos = np.asarray(result["heldout_pos"], dtype=int)
+
+        def values(name: str, default: float = np.nan) -> np.ndarray:
+            return np.asarray(
+                result.get(name, np.full(len(heldout_pos), default)),
+                dtype=float,
+            )
+
+        predictions = pd.DataFrame(
+            {
+                "heldout_pos": heldout_pos,
+                "_oci_row_id": df.iloc[heldout_pos]["_oci_row_id"].to_numpy(),
+                "outer_fold": int(outer_fold),
+                "effect_fold": int(result["fold"]),
+                "baseline_outcome_raw": values("baseline_outcome_raw"),
+                "observed_outcome_raw": values("observed_outcome_raw"),
+                "y0_hat": values("y0_hat"),
+                "y1_hat": values("y1_hat"),
+                "y0_raw": values("y0_raw"),
+                "y1_raw": values("y1_raw"),
+                "offset0": values("offset0"),
+                "offset1": values("offset1"),
+                "offset_contrast": values("offset_contrast"),
+                "tau_hat_r_stage": values("tau_hat"),
+                "tau_logit_modifier": values("tau_logit_modifier"),
+                "r_loss": values("r_loss"),
+                "effect_loss": values("effect_loss"),
+                "effect_loss_at_zero_tau": values("effect_loss_at_zero_tau"),
+                "effect_objective": np.asarray(
+                    [str(result.get("effect_objective", "tarnet_offset_outcome"))]
+                    * len(heldout_pos),
+                    dtype=object,
+                ),
+                "r_stage_train_eligible": np.asarray(
+                    result.get(
+                        "r_stage_train_eligible",
+                        np.ones(len(heldout_pos), dtype=bool),
+                    ),
+                    dtype=bool,
+                ),
+                "neural_stage_mode": np.asarray(
+                    ["tarnet_offset"] * len(heldout_pos),
+                    dtype=object,
+                ),
+            }
+        )
+        self._save_fold_checkpoint(
+            "tarnet_offset",
+            outer_fold,
+            int(result["fold"]),
+            predictions,
+            result["attention"],
+            fingerprint,
+        )
+
+    def _load_interaction_outcome_fold_checkpoint(
+        self,
+        df: pd.DataFrame,
+        outer_fold: int,
+        fold: int,
+        heldout_pos: np.ndarray,
+        fingerprint: str,
+    ) -> Optional[Dict[str, Any]]:
+        loaded = self._load_fold_checkpoint(
+            "interaction_outcome",
+            df,
+            outer_fold,
+            fold,
+            heldout_pos,
+            fingerprint,
+        )
+        if loaded is None:
+            return None
+        pred_df, attention_rows = loaded
+        nuisance_attention = [
+            row for row in attention_rows if str(row.get("stage", "")) == "nuisance"
+        ]
+        effect_attention = [
+            row for row in attention_rows if str(row.get("stage", "")) == "effect_modifier"
+        ]
+        default_effect_loss = (
+            pred_df["effect_loss"].to_numpy(dtype=float)
+            if "effect_loss" in pred_df.columns
+            else pred_df["r_loss"].to_numpy(dtype=float)
+        )
+        default_effect_loss_at_zero = (
+            pred_df["effect_loss_at_zero_tau"].to_numpy(dtype=float)
+            if "effect_loss_at_zero_tau" in pred_df.columns
+            else pred_df["r_loss_at_zero_tau"].to_numpy(dtype=float)
+        )
+        return {
+            "fold": fold,
+            "heldout_pos": np.asarray(heldout_pos),
+            "e_hat": pred_df["e_hat"].to_numpy(dtype=float),
+            "e_hat_raw": (
+                pred_df["e_hat_raw"].to_numpy(dtype=float)
+                if "e_hat_raw" in pred_df.columns
+                else pred_df["e_hat"].to_numpy(dtype=float)
+            ),
+            "m_hat": pred_df["m_hat"].to_numpy(dtype=float),
+            "m_hat_raw": (
+                pred_df["m_hat_raw"].to_numpy(dtype=float)
+                if "m_hat_raw" in pred_df.columns
+                else pred_df["m_hat"].to_numpy(dtype=float)
+            ),
+            "y0_hat": (
+                pred_df["y0_hat"].to_numpy(dtype=float)
+                if "y0_hat" in pred_df.columns
+                else np.full(len(pred_df), np.nan, dtype=float)
+            ),
+            "y1_hat": (
+                pred_df["y1_hat"].to_numpy(dtype=float)
+                if "y1_hat" in pred_df.columns
+                else np.full(len(pred_df), np.nan, dtype=float)
+            ),
+            "interaction_raw": (
+                pred_df["interaction_raw"].to_numpy(dtype=float)
+                if "interaction_raw" in pred_df.columns
+                else np.full(len(pred_df), np.nan, dtype=float)
+            ),
+            "interaction_centered": (
+                pred_df["interaction_centered"].to_numpy(dtype=float)
+                if "interaction_centered" in pred_df.columns
+                else np.full(len(pred_df), np.nan, dtype=float)
+            ),
+            "interaction_center": (
+                pred_df["interaction_center"].to_numpy(dtype=float)
+                if "interaction_center" in pred_df.columns
+                else np.full(len(pred_df), np.nan, dtype=float)
+            ),
+            "global_treatment_effect": (
+                pred_df["global_treatment_effect"].to_numpy(dtype=float)
+                if "global_treatment_effect" in pred_df.columns
+                else np.full(len(pred_df), np.nan, dtype=float)
+            ),
+            "treatment_delta": (
+                pred_df["treatment_delta"].to_numpy(dtype=float)
+                if "treatment_delta" in pred_df.columns
+                else np.full(len(pred_df), np.nan, dtype=float)
+            ),
+            "y_resid": pred_df["y_residual"].to_numpy(dtype=float),
+            "t_resid": pred_df["t_residual"].to_numpy(dtype=float),
+            "tau_hat": pred_df["tau_hat_r_stage"].to_numpy(dtype=float),
+            "tau_logit_modifier": (
+                pred_df["tau_logit_modifier"].to_numpy(dtype=float)
+                if "tau_logit_modifier" in pred_df.columns
+                else np.full(len(pred_df), np.nan, dtype=float)
+            ),
+            "r_loss": pred_df["r_loss"].to_numpy(dtype=float),
+            "effect_loss": default_effect_loss,
+            "effect_loss_at_zero_tau": default_effect_loss_at_zero,
+            "effect_objective": (
+                str(pred_df["effect_objective"].iloc[0])
+                if "effect_objective" in pred_df.columns and len(pred_df) > 0
+                else "interaction_outcome_supervised"
+            ),
+            "r_stage_train_eligible": (
+                pred_df["r_stage_train_eligible"].to_numpy(dtype=bool)
+                if "r_stage_train_eligible" in pred_df.columns
+                else np.ones(len(pred_df), dtype=bool)
+            ),
+            "nuisance_attention": nuisance_attention,
+            "effect_attention": effect_attention,
+        }
+
+    def _save_interaction_outcome_fold_checkpoint(
+        self,
+        df: pd.DataFrame,
+        result: Dict[str, Any],
+        outer_fold: int,
+        fingerprint: str,
+    ) -> None:
+        heldout_pos = np.asarray(result["heldout_pos"], dtype=int)
+        predictions = pd.DataFrame(
+            {
+                "heldout_pos": heldout_pos,
+                "_oci_row_id": df.iloc[heldout_pos]["_oci_row_id"].to_numpy(),
+                "outer_fold": int(outer_fold),
+                "nuisance_fold": int(result["fold"]),
+                "effect_fold": int(result["fold"]),
+                "e_hat": np.asarray(result["e_hat"], dtype=float),
+                "e_hat_raw": np.asarray(result.get("e_hat_raw", result["e_hat"]), dtype=float),
+                "m_hat": np.asarray(result["m_hat"], dtype=float),
+                "m_hat_raw": np.asarray(result.get("m_hat_raw", result["m_hat"]), dtype=float),
+                "y0_hat": np.asarray(result.get("y0_hat", np.nan), dtype=float),
+                "y1_hat": np.asarray(result.get("y1_hat", np.nan), dtype=float),
+                "interaction_raw": np.asarray(
+                    result.get("interaction_raw", np.full(len(heldout_pos), np.nan)),
+                    dtype=float,
+                ),
+                "interaction_centered": np.asarray(
+                    result.get("interaction_centered", np.full(len(heldout_pos), np.nan)),
+                    dtype=float,
+                ),
+                "interaction_center": np.asarray(
+                    result.get("interaction_center", np.full(len(heldout_pos), np.nan)),
+                    dtype=float,
+                ),
+                "global_treatment_effect": np.asarray(
+                    result.get("global_treatment_effect", np.full(len(heldout_pos), np.nan)),
+                    dtype=float,
+                ),
+                "treatment_delta": np.asarray(
+                    result.get("treatment_delta", np.full(len(heldout_pos), np.nan)),
+                    dtype=float,
+                ),
+                "y_residual": np.asarray(result["y_resid"], dtype=float),
+                "t_residual": np.asarray(result["t_resid"], dtype=float),
+                "tau_hat_r_stage": np.asarray(result["tau_hat"], dtype=float),
+                "tau_logit_modifier": np.asarray(
+                    result.get(
+                        "tau_logit_modifier",
+                        np.full(len(heldout_pos), np.nan),
+                    ),
+                    dtype=float,
+                ),
+                "r_loss": np.asarray(result["r_loss"], dtype=float),
+                "effect_loss": np.asarray(
+                    result.get("effect_loss", result["r_loss"]),
+                    dtype=float,
+                ),
+                "effect_loss_at_zero_tau": np.asarray(
+                    result.get(
+                        "effect_loss_at_zero_tau",
+                        np.asarray(result["y_resid"], dtype=float) ** 2,
+                    ),
+                    dtype=float,
+                ),
+                "effect_objective": np.asarray(
+                    [str(result.get("effect_objective", "interaction_outcome_supervised"))]
+                    * len(heldout_pos),
+                    dtype=object,
+                ),
+                "r_stage_train_eligible": np.asarray(
+                    result.get(
+                        "r_stage_train_eligible",
+                        np.ones(len(heldout_pos), dtype=bool),
+                    ),
+                    dtype=bool,
+                ),
+                "neural_stage_mode": np.asarray(
+                    ["interaction_outcome"] * len(heldout_pos),
+                    dtype=object,
+                ),
+            }
+        )
+        predictions["r_loss_at_zero_tau"] = predictions["y_residual"] ** 2
+        attention = list(result.get("nuisance_attention", [])) + list(
+            result.get("effect_attention", [])
+        )
+        self._save_fold_checkpoint(
+            "interaction_outcome",
+            outer_fold,
+            int(result["fold"]),
+            predictions,
+            attention,
+            fingerprint,
         )
 
     def _load_joint_rlearner_fold_checkpoint(

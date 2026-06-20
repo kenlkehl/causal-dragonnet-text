@@ -121,6 +121,7 @@ class AgenticAttentionOracleConfig:
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
     gradient_clip_norm: float = 1.0
+    alpha_propensity: float = 1.0
 
     nuisance_folds: int = 5
     nuisance_epochs: int = 20
@@ -148,6 +149,10 @@ class AgenticAttentionOracleConfig:
     effect_objective: str = "squared_r_loss"
     neural_stage_mode: str = "staged"
     joint_rlearner_gamma: float = 1.0
+    interaction_l2_weight: float = 1e-3
+    tarnet_offset_batch_size: Optional[int] = 128
+    tarnet_offset_heterogeneity_weight: float = 0.1
+    tarnet_offset_min_logit_std: float = 0.5
     residual_contrastive_enabled: bool = False
     residual_contrastive_use_for_effect_discovery: bool = True
     residual_contrastive_score: str = "r_score"
@@ -308,6 +313,12 @@ def _make_applied_config(
                 effect_objective=config.effect_objective,
                 neural_stage_mode=config.neural_stage_mode,
                 joint_rlearner_gamma=config.joint_rlearner_gamma,
+                interaction_l2_weight=config.interaction_l2_weight,
+                tarnet_offset_batch_size=config.tarnet_offset_batch_size,
+                tarnet_offset_heterogeneity_weight=(
+                    config.tarnet_offset_heterogeneity_weight
+                ),
+                tarnet_offset_min_logit_std=config.tarnet_offset_min_logit_std,
                 residual_contrastive_enabled=config.residual_contrastive_enabled,
                 residual_contrastive_use_for_effect_discovery=(
                     config.residual_contrastive_use_for_effect_discovery
@@ -335,6 +346,7 @@ def _make_applied_config(
             learning_rate=config.learning_rate,
             weight_decay=config.weight_decay,
             gradient_clip_norm=config.gradient_clip_norm,
+            alpha_propensity=config.alpha_propensity,
         ),
         explicit_features=ExplicitFeatureExtractionConfig(
             enabled=bool(initial_specs),
@@ -695,11 +707,16 @@ def _result_row(config_hash: str, result: Dict[str, Any]) -> Dict[str, Any]:
         "effect_folds",
         "batch_size",
         "effect_batch_size",
+        "alpha_propensity",
         "r_stage_min_propensity",
         "r_stage_max_propensity",
         "effect_objective",
         "neural_stage_mode",
         "joint_rlearner_gamma",
+        "interaction_l2_weight",
+        "tarnet_offset_batch_size",
+        "tarnet_offset_heterogeneity_weight",
+        "tarnet_offset_min_logit_std",
         "residual_contrastive_enabled",
         "residual_contrastive_use_for_effect_discovery",
         "residual_contrastive_score",
@@ -840,9 +857,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--effect-batch-size", type=int, default=32)
+    parser.add_argument(
+        "--tarnet-offset-batch-size",
+        type=int,
+        default=128,
+        help=(
+            "Batch size for neural-stage-mode=tarnet_offset training, "
+            "prediction, and attribution. Overrides --effect-batch-size for "
+            "that stage."
+        ),
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--alpha-propensity",
+        type=float,
+        default=1.0,
+        help="Weight on the treatment/propensity prediction loss in neural stages.",
+    )
 
     parser.add_argument("--nuisance-folds", type=int, default=5)
     parser.add_argument("--nuisance-epochs", type=int, default=20)
@@ -896,12 +929,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--neural-stage-mode",
-        choices=["staged", "joint_rlearner"],
+        choices=["staged", "joint_rlearner", "interaction_outcome", "tarnet_offset"],
         default="staged",
         help=(
             "Neural learning mode. staged trains nuisance and R/effect models "
             "sequentially; joint_rlearner trains nuisance and tau heads in one "
-            "HTR model with detached nuisance predictions inside the R-loss."
+            "HTR model with detached nuisance predictions inside the R-loss; "
+            "interaction_outcome trains a supervised outcome model with an "
+            "explicit treatment-interaction branch; tarnet_offset trains "
+            "nuisance first, then treatment-specific outcome-logit offset heads."
         ),
     )
     parser.add_argument(
@@ -909,6 +945,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="Weight on the detached-nuisance R-loss in neural-stage-mode=joint_rlearner.",
+    )
+    parser.add_argument(
+        "--interaction-l2-weight",
+        type=float,
+        default=1e-3,
+        help=(
+            "L2 penalty on the interaction/offset outcome component in "
+            "neural-stage-mode=interaction_outcome or tarnet_offset."
+        ),
+    )
+    parser.add_argument(
+        "--tarnet-offset-heterogeneity-weight",
+        type=float,
+        default=0.1,
+        help=(
+            "Weight for the TarNet offset within-batch heterogeneity floor. "
+            "The penalty is max(0, min_std^2 - var(offset1 - offset0))."
+        ),
+    )
+    parser.add_argument(
+        "--tarnet-offset-min-logit-std",
+        type=float,
+        default=0.5,
+        help=(
+            "Target minimum within-batch standard deviation for the TarNet "
+            "offset logit contrast offset1 - offset0."
+        ),
     )
     parser.add_argument(
         "--residual-contrastive-enabled",
@@ -1045,6 +1108,7 @@ def _make_configs(args: argparse.Namespace) -> List[AgenticAttentionOracleConfig
                     learning_rate=args.learning_rate,
                     weight_decay=args.weight_decay,
                     gradient_clip_norm=args.gradient_clip_norm,
+                    alpha_propensity=args.alpha_propensity,
                     nuisance_folds=args.nuisance_folds,
                     nuisance_epochs=args.nuisance_epochs,
                     nuisance_weight_decay=args.nuisance_weight_decay,
@@ -1071,6 +1135,12 @@ def _make_configs(args: argparse.Namespace) -> List[AgenticAttentionOracleConfig
                     effect_objective=args.effect_objective,
                     neural_stage_mode=args.neural_stage_mode,
                     joint_rlearner_gamma=args.joint_rlearner_gamma,
+                    interaction_l2_weight=args.interaction_l2_weight,
+                    tarnet_offset_batch_size=args.tarnet_offset_batch_size,
+                    tarnet_offset_heterogeneity_weight=(
+                        args.tarnet_offset_heterogeneity_weight
+                    ),
+                    tarnet_offset_min_logit_std=args.tarnet_offset_min_logit_std,
                     residual_contrastive_enabled=args.residual_contrastive_enabled,
                     residual_contrastive_use_for_effect_discovery=(
                         args.residual_contrastive_use_for_effect_discovery
@@ -1173,6 +1243,12 @@ def main() -> None:
         parser.error("--batch-size must be >= 1")
     if args.effect_batch_size < 1:
         parser.error("--effect-batch-size must be >= 1")
+    if args.tarnet_offset_batch_size < 1:
+        parser.error("--tarnet-offset-batch-size must be >= 1")
+    if args.tarnet_offset_heterogeneity_weight < 0:
+        parser.error("--tarnet-offset-heterogeneity-weight must be >= 0")
+    if args.tarnet_offset_min_logit_std < 0:
+        parser.error("--tarnet-offset-min-logit-std must be >= 0")
     if not 0.0 <= args.r_stage_min_propensity < args.r_stage_max_propensity <= 1.0:
         parser.error(
             "--r-stage-min-propensity and --r-stage-max-propensity must satisfy "

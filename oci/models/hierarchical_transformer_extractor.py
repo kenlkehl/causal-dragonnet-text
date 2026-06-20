@@ -1194,6 +1194,9 @@ class HierarchicalTransformerExtractor(nn.Module):
         pool = self._pool_token.to(self._device).expand(batch_size, 1, -1)
         sequence = torch.cat([pool, chunk_tensor], dim=1)
         sequence = sequence + self._positional_encoding[: sequence.shape[1]].to(self._device)
+        sequence_input = sequence
+        if return_attention_tensors and sequence_input.requires_grad:
+            sequence_input.retain_grad()
 
         valid_mask = torch.cat(
             [
@@ -1249,6 +1252,8 @@ class HierarchicalTransformerExtractor(nn.Module):
                 "offset_mapping": token_info.get("offset_mapping"),
                 "token_alpha_sources": token_info.get("token_alpha_sources") or [],
                 "batch_chunks": batch_chunks,
+                "sequence_input": sequence_input,
+                "chunk_mask": chunk_mask,
             }
         return features
 
