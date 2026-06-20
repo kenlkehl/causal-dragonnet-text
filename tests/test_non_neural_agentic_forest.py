@@ -6,6 +6,7 @@ import pandas as pd
 from oci.config import (
     AgenticFeatureSearchConfig,
     AppliedInferenceConfig,
+    ExperimentConfig,
     ExplicitFeatureExtractionConfig,
     ExplicitFeatureForestConfig,
     ModelArchitectureConfig,
@@ -156,3 +157,28 @@ def test_non_neural_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path: 
     artifact_dir = output_path.parent / "non_neural_agentic_forest"
     assert (artifact_dir / "bow_oof_predictions.parquet").exists()
     assert (artifact_dir / "agent_candidate_proposals.jsonl").exists()
+
+
+def test_non_neural_agentic_forest_parses_bow_model_option():
+    cfg = ExperimentConfig.from_dict(
+        {
+            "applied_inference": {
+                "dataset_path": (
+                    "synthetic_data/example_synthetic_datasets/"
+                    "one_confounder_one_effect_modifier_nsclc_with_structured/"
+                    "dataset.parquet"
+                ),
+                "architecture": {
+                    "model_type": "non_neural_agentic_forest",
+                    "non_neural_agentic_forest": {
+                        "bow_model": "extratrees",
+                        "nuisance_folds": 2,
+                        "effect_folds": 2,
+                    },
+                },
+                "explicit_features": {"enabled": True, "features": []},
+            }
+        }
+    )
+    assert cfg.applied_inference.architecture.non_neural_agentic_forest.bow_model == "extratrees"
+    cfg.validate()

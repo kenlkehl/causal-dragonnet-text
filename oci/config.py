@@ -417,6 +417,9 @@ class NonNeuralAgenticForestConfig:
     ngram_range_min: int = 1
     ngram_range_max: int = 2
     sublinear_tf: bool = True
+    # Learner family for BoW nuisance and pseudo-target models:
+    # "linear", "extratrees", "random_forest", or "xgboost".
+    bow_model: str = "linear"
     logistic_c: float = 1.0
     logistic_max_iter: int = 1000
     ridge_alpha: float = 10.0
@@ -443,6 +446,13 @@ class NonNeuralAgenticForestConfig:
                 "non_neural_agentic_forest ngram range must satisfy "
                 "1 <= ngram_range_min <= ngram_range_max"
             )
+        bow_model = str(self.bow_model).strip().lower()
+        if bow_model not in {"linear", "extratrees", "random_forest", "xgboost"}:
+            raise ValueError(
+                "non_neural_agentic_forest.bow_model must be one of "
+                "'linear', 'extratrees', 'random_forest', or 'xgboost'"
+            )
+        self.bow_model = bow_model
         if self.logistic_c <= 0:
             raise ValueError("non_neural_agentic_forest.logistic_c must be > 0")
         if self.logistic_max_iter < 1:

@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
+from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor, RandomForestClassifier, RandomForestRegressor
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import brier_score_loss, log_loss, mean_squared_error
@@ -369,7 +370,7 @@ class NonNeuralAgenticForestRunner:
             model = Pipeline(
                 [
                     ("tfidf", self._make_vectorizer()),
-                    ("logreg", self._make_logistic_regression()),
+                    ("model", self._make_classifier(random_state=17 + fold)),
                 ]
             )
             model.fit([texts[i] for i in fit_pos], labels[fit_pos])
@@ -409,7 +410,7 @@ class NonNeuralAgenticForestRunner:
             model = Pipeline(
                 [
                     ("tfidf", self._make_vectorizer()),
-                    ("ridge", self._make_ridge()),
+                    ("model", self._make_regressor(random_state=17 + fold)),
                 ]
             )
             model.fit([texts[i] for i in fit_pos], values[fit_pos])
@@ -447,7 +448,7 @@ class NonNeuralAgenticForestRunner:
             model = Pipeline(
                 [
                     ("tfidf", self._make_vectorizer()),
-                    ("ridge", self._make_ridge()),
+                    ("model", self._make_regressor(random_state=17 + fold)),
                 ]
             )
             model.fit([texts[i] for i in fit_pos], pseudo_target[fit_pos])
@@ -472,25 +473,25 @@ class NonNeuralAgenticForestRunner:
         if len(np.unique(t.astype(int))) < 2:
             treatment_coef = np.zeros(len(features), dtype=float)
         else:
-            treatment_model = self._make_logistic_regression()
+            treatment_model = self._make_classifier(random_state=101)
             treatment_model.fit(x_text, t.astype(int))
-            treatment_coef = treatment_model.coef_.ravel().astype(float)
+            treatment_coef = _model_feature_scores(treatment_model, len(features))
 
         if self.config.outcome_type == "continuous":
-            outcome_model = self._make_ridge()
+            outcome_model = self._make_regressor(random_state=202)
             outcome_model.fit(x_text, y)
-            outcome_coef = outcome_model.coef_.ravel().astype(float)
+            outcome_coef = _model_feature_scores(outcome_model, len(features))
         else:
             if len(np.unique(y.astype(int))) < 2:
                 outcome_coef = np.zeros(len(features), dtype=float)
             else:
-                outcome_model = self._make_logistic_regression()
+                outcome_model = self._make_classifier(random_state=202)
                 outcome_model.fit(x_text, y.astype(int))
-                outcome_coef = outcome_model.coef_.ravel().astype(float)
+                outcome_coef = _model_feature_scores(outcome_model, len(features))
 
-        effect_model = self._make_ridge()
+        effect_model = self._make_regressor(random_state=303)
         effect_model.fit(x_text, pseudo_target)
-        effect_coef = effect_model.coef_.ravel().astype(float)
+        effect_coef = _model_feature_scores(effect_model, len(features))
 
         top_n = int(self.nn_config.top_n_features)
         confounder_score = np.abs(treatment_coef) * np.abs(outcome_coef)
@@ -750,12 +751,97 @@ class NonNeuralAgenticForestRunner:
             dtype=np.float32,
         )
 
-    def _make_logistic_regression(self) -> LogisticRegression:
+    def _make_classifier(self, random_state: int = 17):
+        model_name = str(self.nn_config.bow_model).strip().lower()
+        if model_name == "linear":
+            return self._make_logistic_regression(random_state=random_state)
+        if model_name == "extratrees":
+            return ExtraTreesClassifier(
+                n_estimators=300,
+                max_depth=None,
+                min_samples_leaf=2,
+                max_features="sqrt",
+                random_state=random_state,
+                n_jobs=1,
+            )
+        if model_name == "random_forest":
+            return RandomForestClassifier(
+                n_estimators=300,
+                max_depth=None,
+                min_samples_leaf=2,
+                max_features="sqrt",
+                random_state=random_state,
+                n_jobs=1,
+            )
+        if model_name == "xgboost":
+            try:
+                from xgboost import XGBClassifier
+            except ImportError as exc:
+                raise ImportError(
+                    "bow_model='xgboost' requires the xgboost package"
+                ) from exc
+            return XGBClassifier(
+                n_estimators=300,
+                max_depth=3,
+                learning_rate=0.05,
+                subsample=0.9,
+                colsample_bytree=0.6,
+                objective="binary:logistic",
+                eval_metric="logloss",
+                tree_method="hist",
+                random_state=random_state,
+                n_jobs=1,
+            )
+        raise ValueError(f"Unsupported bow_model: {model_name}")
+
+    def _make_regressor(self, random_state: int = 17):
+        model_name = str(self.nn_config.bow_model).strip().lower()
+        if model_name == "linear":
+            return self._make_ridge()
+        if model_name == "extratrees":
+            return ExtraTreesRegressor(
+                n_estimators=300,
+                max_depth=None,
+                min_samples_leaf=2,
+                max_features="sqrt",
+                random_state=random_state,
+                n_jobs=1,
+            )
+        if model_name == "random_forest":
+            return RandomForestRegressor(
+                n_estimators=300,
+                max_depth=None,
+                min_samples_leaf=2,
+                max_features="sqrt",
+                random_state=random_state,
+                n_jobs=1,
+            )
+        if model_name == "xgboost":
+            try:
+                from xgboost import XGBRegressor
+            except ImportError as exc:
+                raise ImportError(
+                    "bow_model='xgboost' requires the xgboost package"
+                ) from exc
+            return XGBRegressor(
+                n_estimators=300,
+                max_depth=3,
+                learning_rate=0.05,
+                subsample=0.9,
+                colsample_bytree=0.6,
+                objective="reg:squarederror",
+                tree_method="hist",
+                random_state=random_state,
+                n_jobs=1,
+            )
+        raise ValueError(f"Unsupported bow_model: {model_name}")
+
+    def _make_logistic_regression(self, random_state: int = 17) -> LogisticRegression:
         return LogisticRegression(
             C=float(self.nn_config.logistic_c),
             solver="liblinear",
             max_iter=int(self.nn_config.logistic_max_iter),
-            random_state=17,
+            random_state=random_state,
         )
 
     def _make_ridge(self) -> Ridge:
@@ -879,13 +965,48 @@ def _top_feature_rows(
             "score": _finite_or_none(scores[idx]),
         }
         if treatment_coef is not None:
-            row["treatment_coef"] = _finite_or_none(treatment_coef[idx])
-            row["abs_treatment_coef"] = _finite_or_none(abs(treatment_coef[idx]))
+            row["treatment_score"] = _finite_or_none(treatment_coef[idx])
+            row["abs_treatment_score"] = _finite_or_none(abs(treatment_coef[idx]))
         if outcome_coef is not None:
-            row["outcome_coef"] = _finite_or_none(outcome_coef[idx])
-            row["abs_outcome_coef"] = _finite_or_none(abs(outcome_coef[idx]))
+            row["outcome_score"] = _finite_or_none(outcome_coef[idx])
+            row["abs_outcome_score"] = _finite_or_none(abs(outcome_coef[idx]))
         rows.append(row)
     return rows
+
+
+def _model_feature_scores(model: Any, n_features: int) -> np.ndarray:
+    coef = getattr(model, "coef_", None)
+    if coef is not None:
+        values = np.asarray(coef, dtype=float).ravel()
+        return _resize_scores(values, n_features)
+    importances = getattr(model, "feature_importances_", None)
+    if importances is not None:
+        values = np.asarray(importances, dtype=float).ravel()
+        return _resize_scores(values, n_features)
+    booster = getattr(model, "get_booster", None)
+    if booster is not None:
+        try:
+            score = booster().get_score(importance_type="gain")
+            values = np.zeros(n_features, dtype=float)
+            for key, value in score.items():
+                if key.startswith("f"):
+                    index = int(key[1:])
+                    if 0 <= index < n_features:
+                        values[index] = float(value)
+            return values
+        except Exception:
+            pass
+    return np.zeros(n_features, dtype=float)
+
+
+def _resize_scores(values: np.ndarray, n_features: int) -> np.ndarray:
+    values = np.asarray(values, dtype=float).ravel()
+    if len(values) == n_features:
+        return values
+    resized = np.zeros(n_features, dtype=float)
+    limit = min(n_features, len(values))
+    resized[:limit] = values[:limit]
+    return resized
 
 
 def _dedupe_specs(specs: Sequence[ExplicitFeatureSpec]) -> List[ExplicitFeatureSpec]:

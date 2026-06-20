@@ -57,6 +57,7 @@ class NonNeuralAgenticOracleConfig:
     max_df: float = 0.95
     ngram_range_min: int = 1
     ngram_range_max: int = 2
+    bow_model: str = "linear"
     logistic_c: float = 1.0
     ridge_alpha: float = 10.0
     e_clip: float = 0.01
@@ -146,6 +147,7 @@ def _make_applied_config(
                 max_df=config.max_df,
                 ngram_range_min=config.ngram_range_min,
                 ngram_range_max=config.ngram_range_max,
+                bow_model=config.bow_model,
                 logistic_c=config.logistic_c,
                 ridge_alpha=config.ridge_alpha,
                 e_clip=config.e_clip,
@@ -283,6 +285,15 @@ def main() -> None:
     parser.add_argument("--effect-folds", type=int, default=5)
     parser.add_argument("--max-features", type=int, default=30000)
     parser.add_argument("--min-df", type=int, default=5)
+    parser.add_argument(
+        "--bow-model",
+        default="linear",
+        choices=["linear", "extratrees", "random_forest", "xgboost"],
+        help=(
+            "BoW learner family for nuisance and pseudo-target models. "
+            "linear is sparse logistic/ridge; tree options allow feature interactions."
+        ),
+    )
     parser.add_argument("--ridge-alpha", type=float, default=10.0)
     parser.add_argument("--top-n-features", type=int, default=100)
     parser.add_argument("--candidate-proposals-per-fold", type=int, default=30)
@@ -341,6 +352,7 @@ def main() -> None:
         effect_folds=args.effect_folds,
         max_features=args.max_features,
         min_df=args.min_df,
+        bow_model=args.bow_model,
         ridge_alpha=args.ridge_alpha,
         top_n_features=args.top_n_features,
         candidate_proposals_per_fold=args.candidate_proposals_per_fold,
