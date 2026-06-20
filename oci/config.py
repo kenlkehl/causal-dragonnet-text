@@ -455,6 +455,10 @@ class AgenticAttentionVariableForestConfig:
     """
 
     nuisance_folds: int = 5
+    nuisance_epochs: Optional[int] = 20
+    nuisance_weight_decay: Optional[float] = 0.05
+    nuisance_label_smoothing: float = 0.02
+    nuisance_calibration: str = "temperature_isotonic"
     effect_folds: int = 5
     # "auto" parallelizes folds on CPU via num_workers and stays serial on CUDA.
     # Set a positive integer to opt into that many concurrent folds on any device.
@@ -475,6 +479,9 @@ class AgenticAttentionVariableForestConfig:
     e_clip: float = 0.01
     r_stage_min_propensity: float = 0.0
     r_stage_max_propensity: float = 1.0
+    effect_objective: str = "squared_r_loss"
+    neural_stage_mode: str = "staged"
+    joint_rlearner_gamma: float = 1.0
     residual_contrastive_enabled: bool = False
     residual_contrastive_use_for_effect_discovery: bool = True
     residual_contrastive_score: str = "r_score"
@@ -488,6 +495,25 @@ class AgenticAttentionVariableForestConfig:
     def __post_init__(self):
         if self.nuisance_folds < 2:
             raise ValueError("agentic_attention_variable_forest.nuisance_folds must be >= 2")
+        if self.nuisance_epochs is not None and self.nuisance_epochs < 1:
+            raise ValueError(
+                "agentic_attention_variable_forest.nuisance_epochs must be >= 1 when set"
+            )
+        if self.nuisance_weight_decay is not None and self.nuisance_weight_decay < 0:
+            raise ValueError(
+                "agentic_attention_variable_forest.nuisance_weight_decay must be >= 0 when set"
+            )
+        if not 0.0 <= float(self.nuisance_label_smoothing) < 1.0:
+            raise ValueError(
+                "agentic_attention_variable_forest.nuisance_label_smoothing must be in [0, 1)"
+            )
+        nuisance_calibration = str(self.nuisance_calibration).strip().lower()
+        if nuisance_calibration not in {"none", "temperature", "isotonic", "temperature_isotonic"}:
+            raise ValueError(
+                "agentic_attention_variable_forest.nuisance_calibration must be one of "
+                "'none', 'temperature', 'isotonic', or 'temperature_isotonic'"
+            )
+        self.nuisance_calibration = nuisance_calibration
         if self.effect_folds < 2:
             raise ValueError("agentic_attention_variable_forest.effect_folds must be >= 2")
         if self.fold_parallelism != "auto":
@@ -502,6 +528,25 @@ class AgenticAttentionVariableForestConfig:
         if self.attention_top_k_chunks < 1:
             raise ValueError(
                 "agentic_attention_variable_forest.attention_top_k_chunks must be >= 1"
+            )
+        effect_objective = str(self.effect_objective).strip().lower()
+        if effect_objective not in {"squared_r_loss", "logistic_r_loss"}:
+            raise ValueError(
+                "agentic_attention_variable_forest.effect_objective must be one "
+                "of 'squared_r_loss' or 'logistic_r_loss'"
+            )
+        self.effect_objective = effect_objective
+        neural_stage_mode = str(self.neural_stage_mode).strip().lower()
+        if neural_stage_mode not in {"staged", "joint_rlearner"}:
+            raise ValueError(
+                "agentic_attention_variable_forest.neural_stage_mode must be "
+                "one of 'staged' or 'joint_rlearner'"
+            )
+        self.neural_stage_mode = neural_stage_mode
+        self.joint_rlearner_gamma = float(self.joint_rlearner_gamma)
+        if self.joint_rlearner_gamma < 0:
+            raise ValueError(
+                "agentic_attention_variable_forest.joint_rlearner_gamma must be >= 0"
             )
         if self.candidate_proposals_per_fold < 1:
             raise ValueError(

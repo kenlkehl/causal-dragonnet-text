@@ -695,6 +695,36 @@ class TestNeuralCausalForest:
         assert out["propensity_logit"].shape == (2,)
         assert out["outcome_raw"].shape == (2,)
 
+    def test_ncf_nuisance_defaults_are_calibration_oriented(self):
+        from oci.models.neural_causal_forest_extractor import NeuralCausalForestConfig
+
+        config = NeuralCausalForestConfig()
+
+        assert config.nuisance_epochs == 20
+        assert config.nuisance_weight_decay == pytest.approx(0.05)
+        assert config.nuisance_label_smoothing == pytest.approx(0.02)
+        assert config.nuisance_calibration == "temperature_isotonic"
+
+    def test_ncf_config_loader_ignores_unknown_fields(self, tmp_path):
+        from oci.models.neural_causal_forest_extractor import NeuralCausalForestConfig
+
+        path = tmp_path / "ncf_config.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "encoder_backend": "hash",
+                    "encoder_model_name": "hash",
+                    "future_nuisance_only_field": 123,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        config = NeuralCausalForestConfig.from_json(path)
+
+        assert config.encoder_backend == "hash"
+        assert not hasattr(config, "future_nuisance_only_field")
+
     def test_ncf_token_attention_encoder_still_selectable(self):
         from oci.models.neural_causal_forest_extractor import (
             HierarchicalTokenAttentionEncoder,

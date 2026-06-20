@@ -8,10 +8,10 @@ Example:
         --output-dir ../ncf_runs/one_confounder_one_modifier \
         --device cuda:0 \
         --encoder-model prajjwal1/bert-tiny \
-        --nuisance-epochs 50 \
+        --nuisance-epochs 20 \
         --forest-epochs 80 \
         --inner-fold-parallelism 2 \
-        --n-trees 32 --depth 3
+        --n-trees 32 --depth 1
 
 The script writes:
 
@@ -126,6 +126,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depth", type=int, default=None)
     parser.add_argument("--forest-learning-rate", type=float, default=None)
     parser.add_argument("--nuisance-learning-rate", type=float, default=None)
+    parser.add_argument("--nuisance-weight-decay", type=float, default=None)
+    parser.add_argument("--nuisance-label-smoothing", type=float, default=None)
+    parser.add_argument(
+        "--nuisance-calibration",
+        choices=["none", "temperature", "isotonic", "temperature_isotonic"],
+        default=None,
+    )
     parser.add_argument("--lambda-heterogeneity", type=float, default=None)
     parser.add_argument("--attention-top-k", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
@@ -174,6 +181,9 @@ def _make_config(args: argparse.Namespace) -> NeuralCausalForestConfig:
         "depth": args.depth,
         "forest_learning_rate": args.forest_learning_rate,
         "nuisance_learning_rate": args.nuisance_learning_rate,
+        "nuisance_weight_decay": args.nuisance_weight_decay,
+        "nuisance_label_smoothing": args.nuisance_label_smoothing,
+        "nuisance_calibration": args.nuisance_calibration,
         "lambda_heterogeneity": args.lambda_heterogeneity,
         "attention_top_k": args.attention_top_k,
         "num_workers": args.num_workers,

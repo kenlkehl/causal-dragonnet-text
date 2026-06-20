@@ -58,6 +58,7 @@ from oci.config import (  # noqa: E402
 from oci.inference.agentic_attention_variable_forest import (  # noqa: E402
     AgenticAttentionVariableForestRunner,
 )
+from oci.utils.calibration import binary_calibration_metrics  # noqa: E402
 from run_oracle_experiments import _resolve_parquet_file  # noqa: E402
 
 
@@ -121,6 +122,7 @@ class RStageOnlyOracleConfig:
     e_clip: float = 0.01
     r_stage_min_propensity: float = 0.0
     r_stage_max_propensity: float = 1.0
+    effect_objective: str = "squared_r_loss"
     residual_contrastive_enabled: bool = False
     residual_contrastive_score: str = "r_score"
     residual_contrastive_high_quantile: float = 0.80
@@ -239,6 +241,7 @@ def _make_applied_config(
                 e_clip=config.e_clip,
                 r_stage_min_propensity=config.r_stage_min_propensity,
                 r_stage_max_propensity=config.r_stage_max_propensity,
+                effect_objective=config.effect_objective,
                 residual_contrastive_enabled=config.residual_contrastive_enabled,
                 residual_contrastive_score=config.residual_contrastive_score,
                 residual_contrastive_high_quantile=(
@@ -341,6 +344,11 @@ def _aggregate_neural_metrics(results_df: pd.DataFrame) -> Dict[str, Any]:
 
     metrics: Dict[str, Any] = {
         "mode": "r_stage_only",
+        "neural_effect_objective": (
+            str(results_df["effect_objective"].iloc[0])
+            if "effect_objective" in results_df.columns and len(results_df) > 0
+            else "squared_r_loss"
+        ),
         "neural_r_loss_mean": _finite_or_none(results_df["r_loss"].mean()),
         "neural_r_loss_at_zero_tau_mean": _finite_or_none(
             results_df["r_loss_at_zero_tau"].mean()
@@ -355,6 +363,31 @@ def _aggregate_neural_metrics(results_df: pd.DataFrame) -> Dict[str, Any]:
         # and <0 means the learned tau worsens the R-loss. This is useful but
         # not sufficient evidence of oracle CATE recovery.
         metrics["neural_r_loss_relative_improvement"] = float(1.0 - r_loss / zero_loss)
+    if {
+        "effect_loss",
+        "effect_loss_at_zero_tau",
+    }.issubset(results_df.columns):
+        metrics["neural_effect_loss_mean"] = _finite_or_none(
+            results_df["effect_loss"].mean()
+        )
+        metrics["neural_effect_loss_at_zero_tau_mean"] = _finite_or_none(
+            results_df["effect_loss_at_zero_tau"].mean()
+        )
+        effect_zero = metrics.get("neural_effect_loss_at_zero_tau_mean")
+        effect_loss = metrics.get("neural_effect_loss_mean")
+        if effect_zero is not None and effect_zero > 0 and effect_loss is not None:
+            metrics["neural_effect_loss_relative_improvement"] = float(
+                1.0 - effect_loss / effect_zero
+            )
+    if "tau_logit_modifier" in results_df.columns:
+        modifier = results_df["tau_logit_modifier"].to_numpy(dtype=float)
+        finite = modifier[np.isfinite(modifier)]
+        metrics["neural_tau_logit_modifier_mean"] = (
+            _finite_or_none(np.mean(finite)) if finite.size > 0 else None
+        )
+        metrics["neural_tau_logit_modifier_std"] = (
+            _finite_or_none(np.std(finite)) if finite.size > 0 else None
+        )
     if "r_stage_train_eligible" in results_df.columns:
         eligible = results_df["r_stage_train_eligible"].astype(bool)
         metrics["neural_r_stage_train_eligible_rows"] = int(eligible.sum())
@@ -362,15 +395,25 @@ def _aggregate_neural_metrics(results_df: pd.DataFrame) -> Dict[str, Any]:
             eligible.mean()
         )
     if "treatment_indicator" in results_df.columns:
-        metrics["neural_propensity_auroc"] = _safe_roc_auc(
-            results_df["treatment_indicator"],
-            results_df["e_hat"],
-        )
+        treatment = results_df["treatment_indicator"].to_numpy()
+        e_hat = results_df["e_hat"].to_numpy()
+        metrics["neural_propensity_auroc"] = _safe_roc_auc(treatment, e_hat)
+        metrics.update(binary_calibration_metrics(treatment, e_hat, prefix="neural_propensity"))
+        if "e_hat_raw" in results_df.columns:
+            e_raw = results_df["e_hat_raw"].to_numpy()
+            metrics["neural_propensity_raw_auroc"] = _safe_roc_auc(treatment, e_raw)
+            metrics.update(
+                binary_calibration_metrics(treatment, e_raw, prefix="neural_propensity_raw")
+            )
     if "outcome_indicator" in results_df.columns:
-        metrics["neural_outcome_auroc"] = _safe_roc_auc(
-            results_df["outcome_indicator"],
-            results_df["m_hat"],
-        )
+        outcome = results_df["outcome_indicator"].to_numpy()
+        m_hat = results_df["m_hat"].to_numpy()
+        metrics["neural_outcome_auroc"] = _safe_roc_auc(outcome, m_hat)
+        metrics.update(binary_calibration_metrics(outcome, m_hat, prefix="neural_outcome"))
+        if "m_hat_raw" in results_df.columns:
+            m_raw = results_df["m_hat_raw"].to_numpy()
+            metrics["neural_outcome_raw_auroc"] = _safe_roc_auc(outcome, m_raw)
+            metrics.update(binary_calibration_metrics(outcome, m_raw, prefix="neural_outcome_raw"))
     if {"true_ite_prob", "tau_hat_r_stage"}.issubset(results_df.columns):
         metrics["neural_r_stage_ite_corr"] = _finite_or_none(
             results_df["true_ite_prob"].corr(results_df["tau_hat_r_stage"])
@@ -527,6 +570,7 @@ def _result_row(config_hash: str, result: Dict[str, Any]) -> Dict[str, Any]:
         "fold_parallelism",
         "r_stage_min_propensity",
         "r_stage_max_propensity",
+        "effect_objective",
         "residual_contrastive_enabled",
         "residual_contrastive_score",
         "residual_contrastive_high_quantile",
@@ -628,6 +672,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--r-stage-min-propensity", type=float, default=0.0)
     parser.add_argument("--r-stage-max-propensity", type=float, default=1.0)
     parser.add_argument(
+        "--effect-objective",
+        choices=["squared_r_loss", "logistic_r_loss"],
+        default="squared_r_loss",
+        help=(
+            "Neural effect-stage objective. logistic_r_loss trains a Bernoulli "
+            "R-learner logit modifier and reports probability-scale CATE."
+        ),
+    )
+    parser.add_argument(
         "--residual-contrastive-enabled",
         action="store_true",
         help=(
@@ -692,6 +745,7 @@ def _config_from_args(args: argparse.Namespace) -> RStageOnlyOracleConfig:
         e_clip=args.e_clip,
         r_stage_min_propensity=args.r_stage_min_propensity,
         r_stage_max_propensity=args.r_stage_max_propensity,
+        effect_objective=args.effect_objective,
         residual_contrastive_enabled=args.residual_contrastive_enabled,
         residual_contrastive_score=args.residual_contrastive_score,
         residual_contrastive_high_quantile=args.residual_contrastive_high_quantile,

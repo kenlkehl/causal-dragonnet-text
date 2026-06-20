@@ -115,7 +115,7 @@ class AgenticAttentionOracleConfig:
     htr_trainable_sentence_encoder_layers: int = 0
     htr_dropout: float = 0.1
 
-    epochs: int = 3
+    non_nuisance_epochs: int = 3
     batch_size: int = 8
     effect_batch_size: int = 32
     learning_rate: float = 1e-4
@@ -123,6 +123,10 @@ class AgenticAttentionOracleConfig:
     gradient_clip_norm: float = 1.0
 
     nuisance_folds: int = 5
+    nuisance_epochs: int = 20
+    nuisance_weight_decay: float = 0.05
+    nuisance_label_smoothing: float = 0.02
+    nuisance_calibration: str = "temperature_isotonic"
     effect_folds: int = 5
     fold_parallelism: str = "auto"
     attention_top_k_chunks: int = 5
@@ -141,6 +145,9 @@ class AgenticAttentionOracleConfig:
     e_clip: float = 0.01
     r_stage_min_propensity: float = 0.0
     r_stage_max_propensity: float = 1.0
+    effect_objective: str = "squared_r_loss"
+    neural_stage_mode: str = "staged"
+    joint_rlearner_gamma: float = 1.0
     residual_contrastive_enabled: bool = False
     residual_contrastive_use_for_effect_discovery: bool = True
     residual_contrastive_score: str = "r_score"
@@ -276,6 +283,10 @@ def _make_applied_config(
             ),
             agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
                 nuisance_folds=config.nuisance_folds,
+                nuisance_epochs=config.nuisance_epochs,
+                nuisance_weight_decay=config.nuisance_weight_decay,
+                nuisance_label_smoothing=config.nuisance_label_smoothing,
+                nuisance_calibration=config.nuisance_calibration,
                 effect_folds=config.effect_folds,
                 fold_parallelism=config.fold_parallelism,
                 attention_top_k_chunks=config.attention_top_k_chunks,
@@ -294,6 +305,9 @@ def _make_applied_config(
                 e_clip=config.e_clip,
                 r_stage_min_propensity=config.r_stage_min_propensity,
                 r_stage_max_propensity=config.r_stage_max_propensity,
+                effect_objective=config.effect_objective,
+                neural_stage_mode=config.neural_stage_mode,
+                joint_rlearner_gamma=config.joint_rlearner_gamma,
                 residual_contrastive_enabled=config.residual_contrastive_enabled,
                 residual_contrastive_use_for_effect_discovery=(
                     config.residual_contrastive_use_for_effect_discovery
@@ -315,7 +329,7 @@ def _make_applied_config(
             ),
         ),
         training=TrainingConfig(
-            epochs=config.epochs,
+            epochs=config.non_nuisance_epochs,
             batch_size=config.batch_size,
             effect_batch_size=config.effect_batch_size,
             learning_rate=config.learning_rate,
@@ -417,6 +431,11 @@ def _safe_neural_metrics(results_df: pd.DataFrame) -> Dict[str, Any]:
         return {}
 
     metrics: Dict[str, Any] = {
+        "neural_effect_objective": (
+            str(results_df["effect_objective"].iloc[0])
+            if "effect_objective" in results_df.columns and len(results_df) > 0
+            else "squared_r_loss"
+        ),
         "neural_r_loss_mean": _finite_or_none(results_df["r_loss"].mean()),
         "neural_r_loss_at_zero_tau_mean": _finite_or_none(
             results_df["r_loss_at_zero_tau"].mean()
@@ -432,6 +451,31 @@ def _safe_neural_metrics(results_df: pd.DataFrame) -> Dict[str, Any]:
         # and <0 means the learned tau worsens the R-loss. A positive value is
         # useful but not sufficient evidence of oracle CATE recovery.
         metrics["neural_r_loss_relative_improvement"] = float(1.0 - r_loss / base_loss)
+    if {
+        "effect_loss",
+        "effect_loss_at_zero_tau",
+    }.issubset(results_df.columns):
+        metrics["neural_effect_loss_mean"] = _finite_or_none(
+            results_df["effect_loss"].mean()
+        )
+        metrics["neural_effect_loss_at_zero_tau_mean"] = _finite_or_none(
+            results_df["effect_loss_at_zero_tau"].mean()
+        )
+        effect_zero = metrics.get("neural_effect_loss_at_zero_tau_mean")
+        effect_loss = metrics.get("neural_effect_loss_mean")
+        if effect_zero is not None and effect_zero > 0 and effect_loss is not None:
+            metrics["neural_effect_loss_relative_improvement"] = float(
+                1.0 - effect_loss / effect_zero
+            )
+    if "tau_logit_modifier" in results_df.columns:
+        modifier = results_df["tau_logit_modifier"].to_numpy(dtype=float)
+        finite = modifier[np.isfinite(modifier)]
+        metrics["neural_tau_logit_modifier_mean"] = (
+            _finite_or_none(np.mean(finite)) if finite.size > 0 else None
+        )
+        metrics["neural_tau_logit_modifier_std"] = (
+            _finite_or_none(np.std(finite)) if finite.size > 0 else None
+        )
     if "treatment_indicator" in results_df.columns:
         metrics["neural_propensity_auroc"] = _safe_roc_auc(
             results_df["treatment_indicator"],
@@ -653,6 +697,9 @@ def _result_row(config_hash: str, result: Dict[str, Any]) -> Dict[str, Any]:
         "effect_batch_size",
         "r_stage_min_propensity",
         "r_stage_max_propensity",
+        "effect_objective",
+        "neural_stage_mode",
+        "joint_rlearner_gamma",
         "residual_contrastive_enabled",
         "residual_contrastive_use_for_effect_discovery",
         "residual_contrastive_score",
@@ -778,7 +825,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--htr-trainable-sentence-encoder-layers", type=int, default=0)
     parser.add_argument("--htr-dropout", type=float, default=0.1)
 
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument(
+        "--non-nuisance-epochs",
+        dest="non_nuisance_epochs",
+        type=int,
+        default=3,
+        help="Epochs for non-nuisance neural stages, including the R/effect stage.",
+    )
+    parser.add_argument(
+        "--epochs",
+        dest="non_nuisance_epochs",
+        type=int,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--effect-batch-size", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
@@ -786,6 +845,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
 
     parser.add_argument("--nuisance-folds", type=int, default=5)
+    parser.add_argument("--nuisance-epochs", type=int, default=20)
+    parser.add_argument("--nuisance-weight-decay", type=float, default=0.05)
+    parser.add_argument("--nuisance-label-smoothing", type=float, default=0.02)
+    parser.add_argument(
+        "--nuisance-calibration",
+        choices=["none", "temperature", "isotonic", "temperature_isotonic"],
+        default="temperature_isotonic",
+    )
     parser.add_argument("--effect-folds", type=int, default=5)
     parser.add_argument(
         "--fold-parallelism",
@@ -818,6 +885,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--e-clip", type=float, default=0.01)
     parser.add_argument("--r-stage-min-propensity", type=float, default=0.0)
     parser.add_argument("--r-stage-max-propensity", type=float, default=1.0)
+    parser.add_argument(
+        "--effect-objective",
+        choices=["squared_r_loss", "logistic_r_loss"],
+        default="squared_r_loss",
+        help=(
+            "Neural effect-stage objective. logistic_r_loss trains a Bernoulli "
+            "R-learner logit modifier and reports probability-scale CATE."
+        ),
+    )
+    parser.add_argument(
+        "--neural-stage-mode",
+        choices=["staged", "joint_rlearner"],
+        default="staged",
+        help=(
+            "Neural learning mode. staged trains nuisance and R/effect models "
+            "sequentially; joint_rlearner trains nuisance and tau heads in one "
+            "HTR model with detached nuisance predictions inside the R-loss."
+        ),
+    )
+    parser.add_argument(
+        "--joint-rlearner-gamma",
+        type=float,
+        default=1.0,
+        help="Weight on the detached-nuisance R-loss in neural-stage-mode=joint_rlearner.",
+    )
     parser.add_argument(
         "--residual-contrastive-enabled",
         action="store_true",
@@ -947,13 +1039,17 @@ def _make_configs(args: argparse.Namespace) -> List[AgenticAttentionOracleConfig
                         args.htr_trainable_sentence_encoder_layers
                     ),
                     htr_dropout=args.htr_dropout,
-                    epochs=args.epochs,
+                    non_nuisance_epochs=args.non_nuisance_epochs,
                     batch_size=args.batch_size,
                     effect_batch_size=args.effect_batch_size,
                     learning_rate=args.learning_rate,
                     weight_decay=args.weight_decay,
                     gradient_clip_norm=args.gradient_clip_norm,
                     nuisance_folds=args.nuisance_folds,
+                    nuisance_epochs=args.nuisance_epochs,
+                    nuisance_weight_decay=args.nuisance_weight_decay,
+                    nuisance_label_smoothing=args.nuisance_label_smoothing,
+                    nuisance_calibration=args.nuisance_calibration,
                     effect_folds=args.effect_folds,
                     fold_parallelism=args.fold_parallelism,
                     attention_top_k_chunks=args.attention_top_k_chunks,
@@ -972,6 +1068,9 @@ def _make_configs(args: argparse.Namespace) -> List[AgenticAttentionOracleConfig
                     e_clip=args.e_clip,
                     r_stage_min_propensity=args.r_stage_min_propensity,
                     r_stage_max_propensity=args.r_stage_max_propensity,
+                    effect_objective=args.effect_objective,
+                    neural_stage_mode=args.neural_stage_mode,
+                    joint_rlearner_gamma=args.joint_rlearner_gamma,
                     residual_contrastive_enabled=args.residual_contrastive_enabled,
                     residual_contrastive_use_for_effect_discovery=(
                         args.residual_contrastive_use_for_effect_discovery
@@ -1034,8 +1133,16 @@ def main() -> None:
         parser.error("--n-repeats must be >= 1")
     if args.n_folds < 2:
         parser.error("--n-folds must be >= 2")
+    if args.non_nuisance_epochs < 1:
+        parser.error("--non-nuisance-epochs must be >= 1")
     if args.nuisance_folds < 2 or args.effect_folds < 2:
         parser.error("--nuisance-folds and --effect-folds must be >= 2")
+    if args.nuisance_epochs < 1:
+        parser.error("--nuisance-epochs must be >= 1")
+    if args.nuisance_weight_decay < 0:
+        parser.error("--nuisance-weight-decay must be >= 0")
+    if not 0.0 <= args.nuisance_label_smoothing < 1.0:
+        parser.error("--nuisance-label-smoothing must be in [0, 1)")
     if args.candidate_proposals_per_fold < 1:
         parser.error("--candidate-proposals-per-fold must be >= 1")
     if args.coverage_retry_attempts < 0:

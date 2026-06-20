@@ -92,6 +92,30 @@ Examples:
             "Use 'auto' or a positive integer."
         )
     )
+    run_parser.add_argument(
+        '--effect-objective',
+        choices=['squared_r_loss', 'logistic_r_loss'],
+        help=(
+            "Override neural effect-stage objective for "
+            "model_type='agentic_attention_variable_forest'."
+        )
+    )
+    run_parser.add_argument(
+        '--neural-stage-mode',
+        choices=['staged', 'joint_rlearner'],
+        help=(
+            "Override neural learning mode for "
+            "model_type='agentic_attention_variable_forest'."
+        )
+    )
+    run_parser.add_argument(
+        '--joint-rlearner-gamma',
+        type=float,
+        help=(
+            "Override detached-nuisance R-loss weight for "
+            "agentic_attention_variable_forest joint_rlearner mode."
+        )
+    )
     
     args = parser.parse_args()
     
@@ -163,6 +187,45 @@ Examples:
                     "model_type='causal_forest'"
                 )
                 return 1
+        if args.effect_objective is not None:
+            model_type = getattr(config.applied_inference.architecture, 'model_type', None)
+            if model_type != "agentic_attention_variable_forest":
+                print(
+                    "--effect-objective only applies to "
+                    "model_type='agentic_attention_variable_forest'"
+                )
+                return 1
+            (
+                config.applied_inference.architecture
+                .agentic_attention_variable_forest
+                .effect_objective
+            ) = args.effect_objective
+        if args.neural_stage_mode is not None:
+            model_type = getattr(config.applied_inference.architecture, 'model_type', None)
+            if model_type != "agentic_attention_variable_forest":
+                print(
+                    "--neural-stage-mode only applies to "
+                    "model_type='agentic_attention_variable_forest'"
+                )
+                return 1
+            (
+                config.applied_inference.architecture
+                .agentic_attention_variable_forest
+                .neural_stage_mode
+            ) = args.neural_stage_mode
+        if args.joint_rlearner_gamma is not None:
+            model_type = getattr(config.applied_inference.architecture, 'model_type', None)
+            if model_type != "agentic_attention_variable_forest":
+                print(
+                    "--joint-rlearner-gamma only applies to "
+                    "model_type='agentic_attention_variable_forest'"
+                )
+                return 1
+            (
+                config.applied_inference.architecture
+                .agentic_attention_variable_forest
+                .joint_rlearner_gamma
+            ) = args.joint_rlearner_gamma
         
         try:
             config.validate()

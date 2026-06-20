@@ -44,6 +44,11 @@ from .agentic_explicit_feature_forest import (
     _get_agent_response_trace,
 )
 from .applied_explicit_feature_forest import _build_features, _hstack_present
+from ..utils.calibration import (
+    BinaryProbabilityCalibrator,
+    binary_calibration_metrics,
+    clip_probability,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +61,57 @@ _AGENT_CONTEXT_TOKEN_SPANS_PER_ROW = 4
 _AGENT_CONTEXT_SNIPPET_CHARS = 480
 _AGENT_CONTEXT_SPAN_TEXT_CHARS = 120
 _AGENT_CONTEXT_SUMMARY_CHARS = 360
+
+
+def _effect_objective_name(config: AgenticAttentionVariableForestConfig) -> str:
+    value = str(getattr(config, "effect_objective", "squared_r_loss")).strip().lower()
+    if value not in {"squared_r_loss", "logistic_r_loss"}:
+        raise ValueError(
+            "agentic_attention_variable_forest.effect_objective must be one of "
+            "'squared_r_loss' or 'logistic_r_loss'"
+        )
+    return value
+
+
+def _probability_logit(prob: Any) -> np.ndarray:
+    p = clip_probability(prob)
+    return np.log(p / (1.0 - p))
+
+
+def _binary_log_loss_from_logits(logits: Any, target: Any) -> np.ndarray:
+    z = np.asarray(logits, dtype=float)
+    y = np.asarray(target, dtype=float)
+    return np.maximum(z, 0.0) - z * y + np.log1p(np.exp(-np.abs(z)))
+
+
+def _logistic_r_logits(
+    delta: Any,
+    treatment: Any,
+    e_hat: Any,
+    m_hat: Any,
+    *,
+    e_clip: float,
+) -> np.ndarray:
+    delta_arr = np.asarray(delta, dtype=float)
+    t = np.asarray(treatment, dtype=float)
+    e = np.clip(np.asarray(e_hat, dtype=float), e_clip, 1.0 - e_clip)
+    baseline = _probability_logit(m_hat)
+    return baseline + (t - e) * delta_arr
+
+
+def _logistic_r_tau_from_delta(
+    delta: Any,
+    e_hat: Any,
+    m_hat: Any,
+    *,
+    e_clip: float,
+) -> np.ndarray:
+    delta_arr = np.asarray(delta, dtype=float)
+    e = np.clip(np.asarray(e_hat, dtype=float), e_clip, 1.0 - e_clip)
+    baseline = _probability_logit(m_hat)
+    p1 = 1.0 / (1.0 + np.exp(-np.clip(baseline + (1.0 - e) * delta_arr, -50.0, 50.0)))
+    p0 = 1.0 / (1.0 + np.exp(-np.clip(baseline - e * delta_arr, -50.0, 50.0)))
+    return p1 - p0
 
 
 def run_agentic_attention_variable_forest(
@@ -117,6 +173,36 @@ class _EffectNet(nn.Module):
             texts_or_batch if isinstance(texts_or_batch, dict) else list(texts_or_batch)
         )
         return self.head(features).squeeze(-1)
+
+
+class _JointRNet(nn.Module):
+    def __init__(self, extractor: nn.Module, hidden_dim: int, outcome_type: str):
+        super().__init__()
+        self.extractor = extractor
+        self.outcome_type = outcome_type
+        self.nuisance_shared = nn.Sequential(
+            nn.Linear(extractor.output_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+        )
+        self.propensity = nn.Linear(hidden_dim, 1)
+        self.outcome = nn.Linear(hidden_dim, 1)
+        self.effect_head = nn.Sequential(
+            nn.Linear(extractor.output_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, texts_or_batch) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        features = self.extractor(
+            texts_or_batch if isinstance(texts_or_batch, dict) else list(texts_or_batch)
+        )
+        nuisance_hidden = self.nuisance_shared(features)
+        propensity_logit = self.propensity(nuisance_hidden).squeeze(-1)
+        outcome_raw = self.outcome(nuisance_hidden).squeeze(-1)
+        effect = self.effect_head(features).squeeze(-1)
+        return propensity_logit, outcome_raw, effect
 
 
 class _ResidualContrastiveNet(nn.Module):
@@ -215,7 +301,7 @@ class AgenticAttentionVariableForestRunner:
         self.artifact_dir = self.output_path.parent / "agentic_attention_variable_forest"
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self.device = device
-        self.num_workers = int(num_workers or 1)
+        self.num_workers = 1 if num_workers is None else int(num_workers)
         self.avf_config: AgenticAttentionVariableForestConfig = getattr(
             config.architecture,
             "agentic_attention_variable_forest",
@@ -311,7 +397,19 @@ class AgenticAttentionVariableForestRunner:
         test_idx: np.ndarray,
     ) -> pd.DataFrame:
         discovery_df = self.dataset.iloc[train_idx].reset_index(drop=True)
-        nuisance = self._crossfit_nuisance(discovery_df, outer_fold)
+        r_stage = None
+        if self._joint_rlearner_enabled():
+            joint = self._crossfit_joint_rlearner(discovery_df, outer_fold)
+            nuisance = {
+                "predictions": joint["nuisance_predictions"],
+                "attention": joint["nuisance_attention"],
+            }
+            r_stage = {
+                "predictions": joint["predictions"],
+                "attention": joint["attention"],
+            }
+        else:
+            nuisance = self._crossfit_nuisance(discovery_df, outer_fold)
         residual_contrastive = None
         if self._residual_contrastive_enabled():
             residual_contrastive = self._crossfit_residual_contrastive(
@@ -320,7 +418,8 @@ class AgenticAttentionVariableForestRunner:
                 outer_fold,
             )
         if getattr(self.avf_config, "neural_only", False):
-            r_stage = self._crossfit_effect(discovery_df, nuisance["predictions"], outer_fold)
+            if r_stage is None:
+                r_stage = self._crossfit_effect(discovery_df, nuisance["predictions"], outer_fold)
             predictions = self._neural_only_prediction_frame(
                 discovery_df=discovery_df,
                 r_stage_predictions=r_stage["predictions"],
@@ -363,7 +462,8 @@ class AgenticAttentionVariableForestRunner:
         if contrastive_for_discovery and residual_contrastive["attention"]:
             modifier_attention = residual_contrastive["attention"]
         else:
-            r_stage = self._crossfit_effect(discovery_df, nuisance["predictions"], outer_fold)
+            if r_stage is None:
+                r_stage = self._crossfit_effect(discovery_df, nuisance["predictions"], outer_fold)
             modifier_attention = r_stage["attention"]
         modifiers = self._discover_extract_filter_with_retries(
             stage="effect_modifier",
@@ -444,6 +544,11 @@ class AgenticAttentionVariableForestRunner:
         metrics: Dict[str, Any] = {
             "mode": "neural_only",
             "n_train_rows": int(len(predictions)),
+            "effect_objective": str(
+                predictions["effect_objective"].iloc[0]
+                if "effect_objective" in predictions.columns and len(predictions) > 0
+                else _effect_objective_name(self.avf_config)
+            ),
             "r_loss_mean": _finite_or_none(predictions["r_loss"].mean()),
             "r_loss_at_zero_tau_mean": _finite_or_none(
                 predictions["r_loss_at_zero_tau"].mean()
@@ -459,6 +564,31 @@ class AgenticAttentionVariableForestRunner:
         r_loss = metrics.get("r_loss_mean")
         if zero_loss is not None and zero_loss > 0 and r_loss is not None:
             metrics["r_loss_relative_improvement"] = float(1.0 - r_loss / zero_loss)
+        if {
+            "effect_loss",
+            "effect_loss_at_zero_tau",
+        }.issubset(predictions.columns):
+            metrics["effect_loss_mean"] = _finite_or_none(
+                predictions["effect_loss"].mean()
+            )
+            metrics["effect_loss_at_zero_tau_mean"] = _finite_or_none(
+                predictions["effect_loss_at_zero_tau"].mean()
+            )
+            effect_zero = metrics.get("effect_loss_at_zero_tau_mean")
+            effect_loss = metrics.get("effect_loss_mean")
+            if effect_zero is not None and effect_zero > 0 and effect_loss is not None:
+                metrics["effect_loss_relative_improvement"] = float(
+                    1.0 - effect_loss / effect_zero
+                )
+        if "tau_logit_modifier" in predictions.columns:
+            modifier = predictions["tau_logit_modifier"].to_numpy(dtype=float)
+            finite = modifier[np.isfinite(modifier)]
+            metrics["tau_logit_modifier_mean"] = (
+                _finite_or_none(np.mean(finite)) if finite.size > 0 else None
+            )
+            metrics["tau_logit_modifier_std"] = (
+                _finite_or_none(np.std(finite)) if finite.size > 0 else None
+            )
         if "r_stage_train_eligible" in predictions.columns:
             eligible = predictions["r_stage_train_eligible"].astype(bool)
             metrics["r_stage_train_eligible_rows"] = int(eligible.sum())
@@ -466,10 +596,16 @@ class AgenticAttentionVariableForestRunner:
                 eligible.mean()
             )
         if self.config.treatment_column in predictions.columns:
-            metrics["nuisance_treatment_auroc"] = _safe_roc_auc(
-                predictions[self.config.treatment_column].to_numpy(),
-                predictions["e_hat"].to_numpy(),
-            )
+            t = predictions[self.config.treatment_column].to_numpy()
+            e_hat = predictions["e_hat"].to_numpy()
+            metrics["nuisance_treatment_auroc"] = _safe_roc_auc(t, e_hat)
+            metrics.update(binary_calibration_metrics(t, e_hat, prefix="nuisance_treatment"))
+            if "e_hat_raw" in predictions.columns:
+                e_raw = predictions["e_hat_raw"].to_numpy()
+                metrics["nuisance_treatment_raw_auroc"] = _safe_roc_auc(t, e_raw)
+                metrics.update(
+                    binary_calibration_metrics(t, e_raw, prefix="nuisance_treatment_raw")
+                )
         if self.config.outcome_column in predictions.columns:
             y = predictions[self.config.outcome_column].to_numpy()
             m_hat = predictions["m_hat"].to_numpy()
@@ -479,6 +615,13 @@ class AgenticAttentionVariableForestRunner:
                 )
             else:
                 metrics["nuisance_outcome_auroc"] = _safe_roc_auc(y, m_hat)
+                metrics.update(binary_calibration_metrics(y, m_hat, prefix="nuisance_outcome"))
+                if "m_hat_raw" in predictions.columns:
+                    m_raw = predictions["m_hat_raw"].to_numpy()
+                    metrics["nuisance_outcome_raw_auroc"] = _safe_roc_auc(y, m_raw)
+                    metrics.update(
+                        binary_calibration_metrics(y, m_raw, prefix="nuisance_outcome_raw")
+                    )
         if "true_ite_prob" in predictions.columns:
             metrics["r_stage_ite_corr"] = _safe_corr(
                 predictions["true_ite_prob"].to_numpy(),
@@ -501,6 +644,12 @@ class AgenticAttentionVariableForestRunner:
 
     def _residual_contrastive_enabled(self) -> bool:
         return bool(getattr(self.avf_config, "residual_contrastive_enabled", False))
+
+    def _joint_rlearner_enabled(self) -> bool:
+        return (
+            str(getattr(self.avf_config, "neural_stage_mode", "staged")).strip().lower()
+            == "joint_rlearner"
+        )
 
     def _merge_residual_contrastive_predictions(
         self,
@@ -623,7 +772,9 @@ class AgenticAttentionVariableForestRunner:
                 "_oci_row_id": df["_oci_row_id"].to_numpy(),
                 "outer_fold": outer_fold,
                 "e_hat": np.nan,
+                "e_hat_raw": np.nan,
                 "m_hat": np.nan,
+                "m_hat_raw": np.nan,
                 "y_residual": np.nan,
                 "t_residual": np.nan,
                 "r_loss_at_zero_tau": np.nan,
@@ -687,23 +838,65 @@ class AgenticAttentionVariableForestRunner:
                     folds,
                     self._cuda_memory_summary(),
                 )
-                e_hat, m_hat = self._predict_nuisance_model(model, heldout)
+                fit_df = df.iloc[fit_pos]
+                e_fit_raw, m_fit_raw = self._predict_nuisance_model(model, fit_df)
+                e_raw, m_raw = self._predict_nuisance_model(model, heldout)
+                prop_calibrator = BinaryProbabilityCalibrator.fit(
+                    e_fit_raw,
+                    fit_df[self.config.treatment_column].to_numpy(dtype=float),
+                    method=self.avf_config.nuisance_calibration,
+                )
+                e_hat = prop_calibrator.transform(e_raw)
+                if self.config.outcome_type == "continuous":
+                    m_hat = m_raw
+                else:
+                    outcome_calibrator = BinaryProbabilityCalibrator.fit(
+                        m_fit_raw,
+                        fit_df[self.config.outcome_column].to_numpy(dtype=float),
+                        method=self.avf_config.nuisance_calibration,
+                    )
+                    m_hat = outcome_calibrator.transform(m_raw)
                 y = heldout[self.config.outcome_column].to_numpy(dtype=float)
                 t = heldout[self.config.treatment_column].to_numpy(dtype=float)
                 propensity_auroc = _safe_roc_auc(t, e_hat)
+                propensity_raw_auroc = _safe_roc_auc(t, e_raw)
                 outcome_auroc = (
                     _safe_roc_auc(y, m_hat)
                     if self.config.outcome_type != "continuous"
                     else None
                 )
+                outcome_raw_auroc = (
+                    _safe_roc_auc(y, m_raw)
+                    if self.config.outcome_type != "continuous"
+                    else None
+                )
+                prop_cal = binary_calibration_metrics(t, e_hat, prefix="propensity")
+                prop_raw_cal = binary_calibration_metrics(t, e_raw, prefix="propensity_raw")
+                out_cal = (
+                    binary_calibration_metrics(y, m_hat, prefix="outcome")
+                    if self.config.outcome_type != "continuous"
+                    else {}
+                )
+                out_raw_cal = (
+                    binary_calibration_metrics(y, m_raw, prefix="outcome_raw")
+                    if self.config.outcome_type != "continuous"
+                    else {}
+                )
                 logger.info(
                     "Outer fold %s nuisance fold %s/%s heldout metrics: "
-                    "propensity_auroc=%s outcome_auroc=%s",
+                    "propensity_auroc=%s raw=%s propensity_ece=%s raw_ece=%s "
+                    "outcome_auroc=%s raw=%s outcome_ece=%s raw_ece=%s",
                     outer_fold,
                     fold,
                     folds,
                     _format_optional_metric(propensity_auroc),
+                    _format_optional_metric(propensity_raw_auroc),
+                    _format_optional_metric(prop_cal.get("propensity_ece")),
+                    _format_optional_metric(prop_raw_cal.get("propensity_raw_ece")),
                     _format_optional_metric(outcome_auroc),
+                    _format_optional_metric(outcome_raw_auroc),
+                    _format_optional_metric(out_cal.get("outcome_ece")),
+                    _format_optional_metric(out_raw_cal.get("outcome_raw_ece")),
                 )
                 y_resid = y - m_hat
                 t_resid = t - e_hat
@@ -721,7 +914,9 @@ class AgenticAttentionVariableForestRunner:
                     stage="nuisance",
                     extra={
                         "e_hat": e_hat,
+                        "e_hat_raw": e_raw,
                         "m_hat": m_hat,
+                        "m_hat_raw": m_raw,
                         "y_residual": y_resid,
                         "t_residual": t_resid,
                     },
@@ -741,7 +936,9 @@ class AgenticAttentionVariableForestRunner:
                     "fold": fold,
                     "heldout_pos": heldout_pos,
                     "e_hat": e_hat,
+                    "e_hat_raw": e_raw,
                     "m_hat": m_hat,
+                    "m_hat_raw": m_raw,
                     "y_resid": y_resid,
                     "t_resid": t_resid,
                     "attention": fold_attention,
@@ -790,7 +987,9 @@ class AgenticAttentionVariableForestRunner:
         for result in fold_results:
             heldout_pos = result["heldout_pos"]
             predictions.loc[heldout_pos, "e_hat"] = result["e_hat"]
+            predictions.loc[heldout_pos, "e_hat_raw"] = result.get("e_hat_raw", result["e_hat"])
             predictions.loc[heldout_pos, "m_hat"] = result["m_hat"]
+            predictions.loc[heldout_pos, "m_hat_raw"] = result.get("m_hat_raw", result["m_hat"])
             predictions.loc[heldout_pos, "y_residual"] = result["y_resid"]
             predictions.loc[heldout_pos, "t_residual"] = result["t_resid"]
             predictions.loc[heldout_pos, "r_loss_at_zero_tau"] = result["y_resid"] ** 2
@@ -808,9 +1007,15 @@ class AgenticAttentionVariableForestRunner:
         outer_fold: int,
     ) -> Dict[str, Any]:
         folds = _bounded_fold_count(self.avf_config.effect_folds, len(df))
+        effect_objective = _effect_objective_name(self.avf_config)
+        if effect_objective == "logistic_r_loss" and self.config.outcome_type != "binary":
+            raise ValueError("logistic_r_loss effect objective requires binary outcomes")
         r_df = nuisance_predictions.copy()
         r_df["tau_hat_r_stage"] = np.nan
+        r_df["tau_logit_modifier"] = np.nan
         r_df["r_loss"] = np.nan
+        r_df["effect_loss"] = np.nan
+        r_df["effect_loss_at_zero_tau"] = np.nan
         r_df["effect_fold"] = np.nan
         attention_rows: List[Dict[str, Any]] = []
 
@@ -830,8 +1035,18 @@ class AgenticAttentionVariableForestRunner:
             & (e <= r_stage_max_propensity)
         )
         r_df["r_stage_train_eligible"] = train_eligible
-        t_resid = t - np.clip(e, self.avf_config.e_clip, 1.0 - self.avf_config.e_clip)
+        e_clipped = np.clip(e, self.avf_config.e_clip, 1.0 - self.avf_config.e_clip)
+        m_clipped = clip_probability(m)
+        t_resid = t - e_clipped
         y_resid = y - m
+        r_df["effect_objective"] = effect_objective
+        if effect_objective == "squared_r_loss":
+            r_df["effect_loss_at_zero_tau"] = y_resid**2
+        else:
+            r_df["effect_loss_at_zero_tau"] = _binary_log_loss_from_logits(
+                _probability_logit(m_clipped),
+                y,
+            )
 
         split_items = list(
             enumerate(
@@ -845,7 +1060,8 @@ class AgenticAttentionVariableForestRunner:
             extra_payload={
                 "e_hat_hash": _hash_numeric_array(e),
                 "m_hat_hash": _hash_numeric_array(m),
-                "effect_loss": "direct_residual_r_loss_v1",
+                "effect_objective": effect_objective,
+                "effect_loss": f"{effect_objective}_v1",
                 "r_stage_min_propensity": r_stage_min_propensity,
                 "r_stage_max_propensity": r_stage_max_propensity,
             },
@@ -899,6 +1115,10 @@ class AgenticAttentionVariableForestRunner:
                     model,
                     df,
                     eligible_fit_pos,
+                    y,
+                    t,
+                    e_clipped,
+                    m_clipped,
                     y_resid,
                     t_resid,
                     outer_fold=outer_fold,
@@ -913,7 +1133,31 @@ class AgenticAttentionVariableForestRunner:
                     folds,
                     self._cuda_memory_summary(),
                 )
-                tau_hat = self._predict_effect_model(model, heldout)
+                raw_effect = self._predict_effect_model(model, heldout)
+                if effect_objective == "logistic_r_loss":
+                    tau_logit_modifier = raw_effect
+                    tau_hat = _logistic_r_tau_from_delta(
+                        tau_logit_modifier,
+                        e_clipped[heldout_pos],
+                        m_clipped[heldout_pos],
+                        e_clip=self.avf_config.e_clip,
+                    )
+                    heldout_effect_loss = _binary_log_loss_from_logits(
+                        _logistic_r_logits(
+                            tau_logit_modifier,
+                            t[heldout_pos],
+                            e_clipped[heldout_pos],
+                            m_clipped[heldout_pos],
+                            e_clip=self.avf_config.e_clip,
+                        ),
+                        y[heldout_pos],
+                    )
+                else:
+                    tau_hat = raw_effect
+                    tau_logit_modifier = np.full(len(heldout_pos), np.nan)
+                    heldout_effect_loss = (
+                        y_resid[heldout_pos] - tau_hat * t_resid[heldout_pos]
+                    ) ** 2
                 heldout_r_loss = (y_resid[heldout_pos] - tau_hat * t_resid[heldout_pos]) ** 2
                 logger.info(
                     "Outer fold %s effect fold %s/%s: collecting attention evidence",
@@ -927,24 +1171,42 @@ class AgenticAttentionVariableForestRunner:
                     fold=fold,
                     outer_fold=outer_fold,
                     stage="effect_modifier",
-                    extra={"tau_hat_r_stage": tau_hat, "r_loss": heldout_r_loss},
+                    extra={
+                        "tau_hat_r_stage": tau_hat,
+                        "tau_logit_modifier": tau_logit_modifier,
+                        "r_loss": heldout_r_loss,
+                        "effect_loss": heldout_effect_loss,
+                        "effect_objective": np.asarray(
+                            [effect_objective] * len(heldout_pos),
+                            dtype=object,
+                        ),
+                    },
                 )
                 logger.info(
                     "Outer fold %s effect fold %s/%s complete: attention_rows=%s "
-                    "tau_mean=%.4f r_loss_mean=%.4f%s",
+                    "objective=%s tau_mean=%.4f r_loss_mean=%.4f "
+                    "effect_loss_mean=%.4f%s",
                     outer_fold,
                     fold,
                     folds,
                     len(fold_attention),
+                    effect_objective,
                     float(np.mean(tau_hat)),
                     float(np.mean(heldout_r_loss)),
+                    float(np.mean(heldout_effect_loss)),
                     self._cuda_memory_summary(),
                 )
                 result = {
                     "fold": fold,
                     "heldout_pos": heldout_pos,
                     "tau_hat": tau_hat,
+                    "tau_logit_modifier": tau_logit_modifier,
                     "r_loss": heldout_r_loss,
+                    "effect_loss": heldout_effect_loss,
+                    "effect_loss_at_zero_tau": r_df.iloc[heldout_pos][
+                        "effect_loss_at_zero_tau"
+                    ].to_numpy(dtype=float),
+                    "effect_objective": effect_objective,
                     "attention": fold_attention,
                     "r_stage_train_eligible": train_eligible[heldout_pos],
                 }
@@ -992,13 +1254,358 @@ class AgenticAttentionVariableForestRunner:
         for result in fold_results:
             heldout_pos = result["heldout_pos"]
             r_df.loc[heldout_pos, "tau_hat_r_stage"] = result["tau_hat"]
+            r_df.loc[heldout_pos, "tau_logit_modifier"] = result.get(
+                "tau_logit_modifier",
+                np.full(len(heldout_pos), np.nan),
+            )
             r_df.loc[heldout_pos, "r_loss"] = result["r_loss"]
+            r_df.loc[heldout_pos, "effect_loss"] = result.get(
+                "effect_loss",
+                result["r_loss"],
+            )
+            r_df.loc[heldout_pos, "effect_loss_at_zero_tau"] = result.get(
+                "effect_loss_at_zero_tau",
+                r_df.iloc[heldout_pos]["r_loss_at_zero_tau"].to_numpy(dtype=float),
+            )
             r_df.loc[heldout_pos, "effect_fold"] = result["fold"]
             attention_rows.extend(result["attention"])
 
         self.r_stage_rows.append(r_df)
         self.effect_attention_rows.extend(attention_rows)
         return {"predictions": r_df, "attention": attention_rows}
+
+    def _crossfit_joint_rlearner(self, df: pd.DataFrame, outer_fold: int) -> Dict[str, Any]:
+        folds = _bounded_fold_count(self.avf_config.nuisance_folds, len(df))
+        effect_objective = _effect_objective_name(self.avf_config)
+        if effect_objective == "logistic_r_loss" and self.config.outcome_type != "binary":
+            raise ValueError("logistic_r_loss effect objective requires binary outcomes")
+
+        predictions = pd.DataFrame(
+            {
+                "_oci_row_id": df["_oci_row_id"].to_numpy(),
+                "outer_fold": outer_fold,
+                "e_hat": np.nan,
+                "e_hat_raw": np.nan,
+                "m_hat": np.nan,
+                "m_hat_raw": np.nan,
+                "y_residual": np.nan,
+                "t_residual": np.nan,
+                "r_loss_at_zero_tau": np.nan,
+                "nuisance_fold": np.nan,
+                "tau_hat_r_stage": np.nan,
+                "tau_logit_modifier": np.nan,
+                "r_loss": np.nan,
+                "effect_loss": np.nan,
+                "effect_loss_at_zero_tau": np.nan,
+                "effect_fold": np.nan,
+                "r_stage_train_eligible": False,
+                "effect_objective": effect_objective,
+            }
+        )
+        nuisance_attention_rows: List[Dict[str, Any]] = []
+        effect_attention_rows: List[Dict[str, Any]] = []
+
+        split_items = list(
+            enumerate(
+                KFold(n_splits=folds, shuffle=True, random_state=10_000 + outer_fold).split(df),
+                start=1,
+            )
+        )
+        checkpoint_fingerprint = self._crossfit_checkpoint_fingerprint(
+            "joint_rlearner",
+            folds,
+            extra_payload={
+                "effect_objective": effect_objective,
+                "effect_loss": f"{effect_objective}_joint_detached_nuisance_v1",
+                "neural_stage_mode": "joint_rlearner",
+                "joint_rlearner_gamma": float(self.avf_config.joint_rlearner_gamma),
+                "r_stage_min_propensity": float(self.avf_config.r_stage_min_propensity),
+                "r_stage_max_propensity": float(self.avf_config.r_stage_max_propensity),
+            },
+        )
+
+        def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
+            fit_pos = np.asarray(fit_pos, dtype=int)
+            heldout_pos = np.asarray(heldout_pos, dtype=int)
+            cached = self._load_joint_rlearner_fold_checkpoint(
+                df=df,
+                outer_fold=outer_fold,
+                fold=fold,
+                heldout_pos=heldout_pos,
+                fingerprint=checkpoint_fingerprint,
+            )
+            if cached is not None:
+                return cached
+
+            model = None
+            logger.info(
+                "Outer fold %s joint R-learner fold %s/%s: train=%s heldout=%s "
+                "objective=%s gamma=%.3g%s",
+                outer_fold,
+                fold,
+                folds,
+                len(fit_pos),
+                len(heldout_pos),
+                effect_objective,
+                float(self.avf_config.joint_rlearner_gamma),
+                self._cuda_memory_summary(),
+            )
+            try:
+                model = _JointRNet(
+                    extractor=self._create_extractor(),
+                    hidden_dim=getattr(
+                        self.config.architecture,
+                        "causal_head_hidden_outcome_dim",
+                        64,
+                    ),
+                    outcome_type=self.config.outcome_type,
+                ).to(self.device)
+                self._train_joint_rlearner_model(
+                    model,
+                    df,
+                    fit_pos,
+                    outer_fold=outer_fold,
+                    fold=fold,
+                    total_folds=folds,
+                )
+                fit_df = df.iloc[fit_pos]
+                heldout = df.iloc[heldout_pos]
+                e_fit_raw, m_fit_raw, _ = self._predict_joint_rlearner_model(model, fit_df)
+                e_raw, m_raw, raw_effect = self._predict_joint_rlearner_model(model, heldout)
+                prop_calibrator = BinaryProbabilityCalibrator.fit(
+                    e_fit_raw,
+                    fit_df[self.config.treatment_column].to_numpy(dtype=float),
+                    method=self.avf_config.nuisance_calibration,
+                )
+                e_hat = prop_calibrator.transform(e_raw)
+                if self.config.outcome_type == "continuous":
+                    m_hat = m_raw
+                    m_for_effect = m_hat
+                else:
+                    outcome_calibrator = BinaryProbabilityCalibrator.fit(
+                        m_fit_raw,
+                        fit_df[self.config.outcome_column].to_numpy(dtype=float),
+                        method=self.avf_config.nuisance_calibration,
+                    )
+                    m_hat = outcome_calibrator.transform(m_raw)
+                    m_for_effect = clip_probability(m_hat)
+
+                y = heldout[self.config.outcome_column].to_numpy(dtype=float)
+                t = heldout[self.config.treatment_column].to_numpy(dtype=float)
+                e_clipped = np.clip(
+                    e_hat,
+                    self.avf_config.e_clip,
+                    1.0 - self.avf_config.e_clip,
+                )
+                y_resid = y - m_hat
+                t_resid = t - e_clipped
+                train_eligible = (
+                    np.isfinite(e_hat)
+                    & (e_hat >= float(self.avf_config.r_stage_min_propensity))
+                    & (e_hat <= float(self.avf_config.r_stage_max_propensity))
+                )
+                if effect_objective == "logistic_r_loss":
+                    tau_logit_modifier = raw_effect
+                    tau_hat = _logistic_r_tau_from_delta(
+                        tau_logit_modifier,
+                        e_clipped,
+                        m_for_effect,
+                        e_clip=self.avf_config.e_clip,
+                    )
+                    effect_loss = _binary_log_loss_from_logits(
+                        _logistic_r_logits(
+                            tau_logit_modifier,
+                            t,
+                            e_clipped,
+                            m_for_effect,
+                            e_clip=self.avf_config.e_clip,
+                        ),
+                        y,
+                    )
+                    effect_loss_at_zero = _binary_log_loss_from_logits(
+                        _probability_logit(m_for_effect),
+                        y,
+                    )
+                else:
+                    tau_hat = raw_effect
+                    tau_logit_modifier = np.full(len(heldout_pos), np.nan)
+                    effect_loss = (y_resid - tau_hat * t_resid) ** 2
+                    effect_loss_at_zero = y_resid**2
+                r_loss = (y_resid - tau_hat * t_resid) ** 2
+
+                logger.info(
+                    "Outer fold %s joint R-learner fold %s/%s: collecting "
+                    "nuisance and effect attention evidence",
+                    outer_fold,
+                    fold,
+                    folds,
+                )
+                nuisance_attention = self._attention_evidence(
+                    model.extractor,
+                    heldout,
+                    fold=fold,
+                    outer_fold=outer_fold,
+                    stage="nuisance",
+                    extra={
+                        "e_hat": e_hat,
+                        "e_hat_raw": e_raw,
+                        "m_hat": m_hat,
+                        "m_hat_raw": m_raw,
+                        "y_residual": y_resid,
+                        "t_residual": t_resid,
+                        "neural_stage_mode": np.asarray(
+                            ["joint_rlearner"] * len(heldout_pos),
+                            dtype=object,
+                        ),
+                    },
+                )
+                effect_attention = self._attention_evidence(
+                    model.extractor,
+                    heldout,
+                    fold=fold,
+                    outer_fold=outer_fold,
+                    stage="effect_modifier",
+                    extra={
+                        "tau_hat_r_stage": tau_hat,
+                        "tau_logit_modifier": tau_logit_modifier,
+                        "r_loss": r_loss,
+                        "effect_loss": effect_loss,
+                        "effect_objective": np.asarray(
+                            [effect_objective] * len(heldout_pos),
+                            dtype=object,
+                        ),
+                        "neural_stage_mode": np.asarray(
+                            ["joint_rlearner"] * len(heldout_pos),
+                            dtype=object,
+                        ),
+                    },
+                )
+                result = {
+                    "fold": fold,
+                    "heldout_pos": heldout_pos,
+                    "e_hat": e_hat,
+                    "e_hat_raw": e_raw,
+                    "m_hat": m_hat,
+                    "m_hat_raw": m_raw,
+                    "y_resid": y_resid,
+                    "t_resid": t_resid,
+                    "tau_hat": tau_hat,
+                    "tau_logit_modifier": tau_logit_modifier,
+                    "r_loss": r_loss,
+                    "effect_loss": effect_loss,
+                    "effect_loss_at_zero_tau": effect_loss_at_zero,
+                    "effect_objective": effect_objective,
+                    "r_stage_train_eligible": train_eligible,
+                    "nuisance_attention": nuisance_attention,
+                    "effect_attention": effect_attention,
+                }
+                self._save_joint_rlearner_fold_checkpoint(
+                    df=df,
+                    result=result,
+                    outer_fold=outer_fold,
+                    fingerprint=checkpoint_fingerprint,
+                )
+                logger.info(
+                    "Outer fold %s joint R-learner fold %s/%s complete: "
+                    "tau_mean=%.4f r_loss_mean=%.4f effect_loss_mean=%.4f%s",
+                    outer_fold,
+                    fold,
+                    folds,
+                    float(np.mean(tau_hat)),
+                    float(np.mean(r_loss)),
+                    float(np.mean(effect_loss)),
+                    self._cuda_memory_summary(),
+                )
+                return result
+            except RuntimeError as exc:
+                if _is_cuda_oom(exc):
+                    logger.error(
+                        "CUDA OOM in outer fold %s joint R-learner fold %s/%s%s",
+                        outer_fold,
+                        fold,
+                        folds,
+                        self._cuda_memory_summary(),
+                    )
+                raise
+            finally:
+                if model is not None:
+                    self._cleanup_model(model)
+                    model = None
+                    logger.info(
+                        "Outer fold %s joint R-learner fold %s/%s: model cleanup complete%s",
+                        outer_fold,
+                        fold,
+                        folds,
+                        self._cuda_memory_summary(),
+                    )
+
+        n_jobs = self._fold_n_jobs(folds)
+        logger.info(
+            "Outer fold %s joint R-learner cross-fit parallelism: folds=%s "
+            "n_jobs=%s setting=%s device=%s",
+            outer_fold,
+            folds,
+            n_jobs,
+            self.avf_config.fold_parallelism,
+            self.device,
+        )
+        fold_results = _run_crossfit_fold_tasks(run_fold, split_items, n_jobs)
+
+        for result in fold_results:
+            heldout_pos = result["heldout_pos"]
+            predictions.loc[heldout_pos, "e_hat"] = result["e_hat"]
+            predictions.loc[heldout_pos, "e_hat_raw"] = result.get("e_hat_raw", result["e_hat"])
+            predictions.loc[heldout_pos, "m_hat"] = result["m_hat"]
+            predictions.loc[heldout_pos, "m_hat_raw"] = result.get("m_hat_raw", result["m_hat"])
+            predictions.loc[heldout_pos, "y_residual"] = result["y_resid"]
+            predictions.loc[heldout_pos, "t_residual"] = result["t_resid"]
+            predictions.loc[heldout_pos, "r_loss_at_zero_tau"] = result["y_resid"] ** 2
+            predictions.loc[heldout_pos, "nuisance_fold"] = result["fold"]
+            predictions.loc[heldout_pos, "tau_hat_r_stage"] = result["tau_hat"]
+            predictions.loc[heldout_pos, "tau_logit_modifier"] = result.get(
+                "tau_logit_modifier",
+                np.full(len(heldout_pos), np.nan),
+            )
+            predictions.loc[heldout_pos, "r_loss"] = result["r_loss"]
+            predictions.loc[heldout_pos, "effect_loss"] = result.get(
+                "effect_loss",
+                result["r_loss"],
+            )
+            predictions.loc[heldout_pos, "effect_loss_at_zero_tau"] = result.get(
+                "effect_loss_at_zero_tau",
+                result["y_resid"] ** 2,
+            )
+            predictions.loc[heldout_pos, "effect_fold"] = result["fold"]
+            predictions.loc[heldout_pos, "r_stage_train_eligible"] = result.get(
+                "r_stage_train_eligible",
+                np.ones(len(heldout_pos), dtype=bool),
+            )
+            nuisance_attention_rows.extend(result["nuisance_attention"])
+            effect_attention_rows.extend(result["effect_attention"])
+
+        nuisance_cols = [
+            "_oci_row_id",
+            "outer_fold",
+            "e_hat",
+            "e_hat_raw",
+            "m_hat",
+            "m_hat_raw",
+            "y_residual",
+            "t_residual",
+            "r_loss_at_zero_tau",
+            "nuisance_fold",
+        ]
+        nuisance_predictions = predictions[nuisance_cols].copy()
+        self.nuisance_rows.append(nuisance_predictions)
+        self.r_stage_rows.append(predictions)
+        self.nuisance_attention_rows.extend(nuisance_attention_rows)
+        self.effect_attention_rows.extend(effect_attention_rows)
+        return {
+            "nuisance_predictions": nuisance_predictions,
+            "nuisance_attention": nuisance_attention_rows,
+            "predictions": predictions,
+            "attention": effect_attention_rows,
+        }
 
     def _crossfit_residual_contrastive(
         self,
@@ -1263,6 +1870,17 @@ class AgenticAttentionVariableForestRunner:
         total_folds: int,
     ):
         train_config = self.config.training
+        nuisance_epochs = int(
+            self.avf_config.nuisance_epochs
+            if self.avf_config.nuisance_epochs is not None
+            else train_config.epochs
+        )
+        nuisance_weight_decay = float(
+            self.avf_config.nuisance_weight_decay
+            if self.avf_config.nuisance_weight_decay is not None
+            else getattr(train_config, "weight_decay", 0.01)
+        )
+        nuisance_label_smoothing = float(self.avf_config.nuisance_label_smoothing)
         model.extractor.fit_tokenizer(
             df.iloc[positions][self.config.text_column].astype(str).tolist()
         )
@@ -1280,27 +1898,35 @@ class AgenticAttentionVariableForestRunner:
         optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
             lr=train_config.learning_rate,
-            weight_decay=getattr(train_config, "weight_decay", 0.01),
+            weight_decay=nuisance_weight_decay,
         )
         num_batches = max(1, len(train_loader))
-        scheduler = _make_linear_lr_scheduler(optimizer, train_config, num_batches)
+        scheduler = _make_linear_lr_scheduler(
+            optimizer,
+            train_config,
+            num_batches,
+            epochs_override=nuisance_epochs,
+        )
         progress_every = max(1, num_batches // 5)
         logger.info(
             "Outer fold %s nuisance fold %s/%s: training for %s epoch(s), "
             "batch_size=%s, batches/epoch=%s, dataloader_workers=%s, "
-            "lr=%.3g, lr_schedule=%s%s",
+            "lr=%.3g, weight_decay=%.3g, label_smoothing=%.3g, "
+            "lr_schedule=%s%s",
             outer_fold,
             fold,
             total_folds,
-            train_config.epochs,
+            nuisance_epochs,
             train_config.batch_size,
             num_batches,
             train_loader.num_workers,
             _current_lr(optimizer),
+            nuisance_weight_decay,
+            nuisance_label_smoothing,
             "linear" if scheduler is not None else "none",
             self._cuda_memory_summary(),
         )
-        for epoch in range(1, train_config.epochs + 1):
+        for epoch in range(1, nuisance_epochs + 1):
             model.train()
             loss_sum = 0.0
             prop_sum = 0.0
@@ -1311,11 +1937,19 @@ class AgenticAttentionVariableForestRunner:
                 y = batch["y"].to(self.device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
                 t_logit, y_pred = model(batch["model_input"])
-                prop_loss = F.binary_cross_entropy_with_logits(t_logit, t)
+                if nuisance_label_smoothing > 0:
+                    t_target = t * (1.0 - nuisance_label_smoothing) + 0.5 * nuisance_label_smoothing
+                else:
+                    t_target = t
+                prop_loss = F.binary_cross_entropy_with_logits(t_logit, t_target)
                 if self.config.outcome_type == "continuous":
                     outcome_loss = F.mse_loss(y_pred, y)
                 else:
-                    outcome_loss = F.binary_cross_entropy_with_logits(y_pred, y)
+                    if nuisance_label_smoothing > 0:
+                        y_target = y * (1.0 - nuisance_label_smoothing) + 0.5 * nuisance_label_smoothing
+                    else:
+                        y_target = y
+                    outcome_loss = F.binary_cross_entropy_with_logits(y_pred, y_target)
                 loss = outcome_loss + self.config.training.alpha_propensity * prop_loss
                 loss.backward()
                 self._clip_and_step(model, optimizer, scheduler)
@@ -1338,7 +1972,7 @@ class AgenticAttentionVariableForestRunner:
                         fold,
                         total_folds,
                         epoch,
-                        train_config.epochs,
+                        nuisance_epochs,
                         batch_idx,
                         num_batches,
                         loss_value,
@@ -1355,10 +1989,201 @@ class AgenticAttentionVariableForestRunner:
                 fold,
                 total_folds,
                 epoch,
-                train_config.epochs,
+                nuisance_epochs,
                 loss_sum / denom,
                 outcome_sum / denom,
                 prop_sum / denom,
+                _current_lr(optimizer),
+                self._cuda_memory_summary(),
+            )
+
+    def _train_joint_rlearner_model(
+        self,
+        model: _JointRNet,
+        df: pd.DataFrame,
+        positions,
+        outer_fold: int,
+        fold: int,
+        total_folds: int,
+    ):
+        train_config = self.config.training
+        joint_epochs = int(
+            self.avf_config.nuisance_epochs
+            if self.avf_config.nuisance_epochs is not None
+            else train_config.epochs
+        )
+        nuisance_weight_decay = float(
+            self.avf_config.nuisance_weight_decay
+            if self.avf_config.nuisance_weight_decay is not None
+            else getattr(train_config, "weight_decay", 0.01)
+        )
+        nuisance_label_smoothing = float(self.avf_config.nuisance_label_smoothing)
+        joint_gamma = float(self.avf_config.joint_rlearner_gamma)
+        effect_objective = _effect_objective_name(self.avf_config)
+        model.extractor.fit_tokenizer(
+            df.iloc[positions][self.config.text_column].astype(str).tolist()
+        )
+        train_loader = self._make_text_loader(
+            model,
+            df,
+            positions,
+            fields={
+                "t": df[self.config.treatment_column].to_numpy(dtype=np.float32),
+                "y": df[self.config.outcome_column].to_numpy(dtype=np.float32),
+            },
+            shuffle=True,
+            total_folds=total_folds,
+        )
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=train_config.learning_rate,
+            weight_decay=nuisance_weight_decay,
+        )
+        num_batches = max(1, len(train_loader))
+        scheduler = _make_linear_lr_scheduler(
+            optimizer,
+            train_config,
+            num_batches,
+            epochs_override=joint_epochs,
+        )
+        progress_every = max(1, num_batches // 5)
+        logger.info(
+            "Outer fold %s joint R-learner fold %s/%s: training for %s epoch(s), "
+            "objective=%s, gamma=%.3g, batch_size=%s, batches/epoch=%s, "
+            "dataloader_workers=%s, lr=%.3g, weight_decay=%.3g, "
+            "label_smoothing=%.3g, lr_schedule=%s%s",
+            outer_fold,
+            fold,
+            total_folds,
+            joint_epochs,
+            effect_objective,
+            joint_gamma,
+            train_config.batch_size,
+            num_batches,
+            train_loader.num_workers,
+            _current_lr(optimizer),
+            nuisance_weight_decay,
+            nuisance_label_smoothing,
+            "linear" if scheduler is not None else "none",
+            self._cuda_memory_summary(),
+        )
+        for epoch in range(1, joint_epochs + 1):
+            model.train()
+            loss_sum = 0.0
+            prop_sum = 0.0
+            outcome_sum = 0.0
+            effect_sum = 0.0
+            batch_count = 0
+            for batch_idx, batch in enumerate(train_loader, start=1):
+                t = batch["t"].to(self.device, non_blocking=True)
+                y = batch["y"].to(self.device, non_blocking=True)
+                optimizer.zero_grad(set_to_none=True)
+                t_logit, y_pred, effect = model(batch["model_input"])
+                if nuisance_label_smoothing > 0:
+                    t_target = t * (1.0 - nuisance_label_smoothing) + 0.5 * nuisance_label_smoothing
+                else:
+                    t_target = t
+                prop_loss = F.binary_cross_entropy_with_logits(t_logit, t_target)
+                if self.config.outcome_type == "continuous":
+                    outcome_target = y
+                    outcome_loss = F.mse_loss(y_pred, outcome_target)
+                    m_for_r = y_pred.detach()
+                else:
+                    if nuisance_label_smoothing > 0:
+                        outcome_target = y * (1.0 - nuisance_label_smoothing) + 0.5 * nuisance_label_smoothing
+                    else:
+                        outcome_target = y
+                    outcome_loss = F.binary_cross_entropy_with_logits(
+                        y_pred,
+                        outcome_target,
+                    )
+                    m_for_r = torch.sigmoid(y_pred).detach()
+                e_for_r = torch.sigmoid(t_logit).detach().clamp(
+                    float(self.avf_config.e_clip),
+                    1.0 - float(self.avf_config.e_clip),
+                )
+                train_eligible = (
+                    (e_for_r >= float(self.avf_config.r_stage_min_propensity))
+                    & (e_for_r <= float(self.avf_config.r_stage_max_propensity))
+                )
+                if effect_objective == "logistic_r_loss":
+                    baseline_logit = torch.logit(
+                        torch.clamp(m_for_r, 1e-4, 1.0 - 1e-4)
+                    )
+                    logits = baseline_logit + (t - e_for_r) * effect
+                    effect_loss_vector = F.binary_cross_entropy_with_logits(
+                        logits,
+                        y,
+                        reduction="none",
+                    )
+                else:
+                    y_residual = y - m_for_r
+                    t_residual = t - e_for_r
+                    effect_loss_vector = torch.square(
+                        y_residual - effect * t_residual
+                    )
+                if torch.any(train_eligible):
+                    effect_loss = effect_loss_vector[train_eligible].mean()
+                else:
+                    effect_loss = effect_loss_vector.mean()
+                loss = (
+                    outcome_loss
+                    + self.config.training.alpha_propensity * prop_loss
+                    + joint_gamma * effect_loss
+                )
+                loss.backward()
+                self._clip_and_step(model, optimizer, scheduler)
+                batch_count += 1
+                loss_value = float(loss.detach().cpu())
+                prop_value = float(prop_loss.detach().cpu())
+                outcome_value = float(outcome_loss.detach().cpu())
+                effect_value = float(effect_loss.detach().cpu())
+                loss_sum += loss_value
+                prop_sum += prop_value
+                outcome_sum += outcome_value
+                effect_sum += effect_value
+                if (
+                    batch_idx == 1
+                    or batch_idx == num_batches
+                    or batch_idx % progress_every == 0
+                ):
+                    logger.info(
+                        "Outer fold %s joint R-learner fold %s/%s epoch %s/%s "
+                        "batch %s/%s loss=%.4f outcome=%.4f propensity=%.4f "
+                        "%s=%.4f lr=%.3g%s",
+                        outer_fold,
+                        fold,
+                        total_folds,
+                        epoch,
+                        joint_epochs,
+                        batch_idx,
+                        num_batches,
+                        loss_value,
+                        outcome_value,
+                        prop_value,
+                        "logistic_r_loss"
+                        if effect_objective == "logistic_r_loss"
+                        else "r_loss",
+                        effect_value,
+                        _current_lr(optimizer),
+                        self._cuda_memory_summary(),
+                    )
+            denom = max(1, batch_count)
+            logger.info(
+                "Outer fold %s joint R-learner fold %s/%s epoch %s/%s complete: "
+                "loss=%.4f outcome=%.4f propensity=%.4f %s=%.4f lr=%.3g%s",
+                outer_fold,
+                fold,
+                total_folds,
+                epoch,
+                joint_epochs,
+                loss_sum / denom,
+                outcome_sum / denom,
+                prop_sum / denom,
+                "logistic_r_loss"
+                if effect_objective == "logistic_r_loss"
+                else "r_loss",
+                effect_sum / denom,
                 _current_lr(optimizer),
                 self._cuda_memory_summary(),
             )
@@ -1368,6 +2193,10 @@ class AgenticAttentionVariableForestRunner:
         model: _EffectNet,
         df: pd.DataFrame,
         positions,
+        outcomes: np.ndarray,
+        treatments: np.ndarray,
+        e_hat: np.ndarray,
+        m_hat: np.ndarray,
         y_residuals: np.ndarray,
         t_residuals: np.ndarray,
         outer_fold: int,
@@ -1383,6 +2212,10 @@ class AgenticAttentionVariableForestRunner:
             df,
             positions,
             fields={
+                "outcome": np.asarray(outcomes, dtype=np.float32),
+                "treatment": np.asarray(treatments, dtype=np.float32),
+                "e_hat": np.asarray(e_hat, dtype=np.float32),
+                "m_hat": np.asarray(m_hat, dtype=np.float32),
                 "y_residual": np.asarray(y_residuals, dtype=np.float32),
                 "t_residual": np.asarray(t_residuals, dtype=np.float32),
             },
@@ -1398,14 +2231,16 @@ class AgenticAttentionVariableForestRunner:
         num_batches = max(1, len(train_loader))
         scheduler = _make_linear_lr_scheduler(optimizer, train_config, num_batches)
         progress_every = max(1, num_batches // 5)
+        effect_objective = _effect_objective_name(self.avf_config)
         logger.info(
             "Outer fold %s effect fold %s/%s: training for %s epoch(s), "
-            "batch_size=%s, batches/epoch=%s, dataloader_workers=%s, "
+            "objective=%s, batch_size=%s, batches/epoch=%s, dataloader_workers=%s, "
             "lr=%.3g, lr_schedule=%s%s",
             outer_fold,
             fold,
             total_folds,
             train_config.epochs,
+            effect_objective,
             train_loader.batch_size,
             num_batches,
             train_loader.num_workers,
@@ -1421,12 +2256,19 @@ class AgenticAttentionVariableForestRunner:
                 y_residual = batch["y_residual"].to(self.device, non_blocking=True)
                 t_residual = batch["t_residual"].to(self.device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
-                tau = model(batch["model_input"])
-                residual = y_residual - tau * t_residual
-                # Direct R-loss avoids high-variance y_residual / t_residual pseudo-labels.
-                # Next R-stage experiments to consider: lower LR, positivity filtering,
-                # and a binary-outcome loss alternative to squared residual MSE.
-                loss = torch.mean(torch.square(residual))
+                effect = model(batch["model_input"])
+                if effect_objective == "logistic_r_loss":
+                    y = batch["outcome"].to(self.device, non_blocking=True)
+                    t = batch["treatment"].to(self.device, non_blocking=True)
+                    e_batch = batch["e_hat"].to(self.device, non_blocking=True)
+                    m_batch = batch["m_hat"].to(self.device, non_blocking=True)
+                    baseline_logit = torch.logit(torch.clamp(m_batch, 1e-4, 1.0 - 1e-4))
+                    logits = baseline_logit + (t - e_batch) * effect
+                    loss = F.binary_cross_entropy_with_logits(logits, y)
+                else:
+                    residual = y_residual - effect * t_residual
+                    # Direct R-loss avoids high-variance y_residual / t_residual pseudo-labels.
+                    loss = torch.mean(torch.square(residual))
                 loss.backward()
                 self._clip_and_step(model, optimizer, scheduler)
                 batch_count += 1
@@ -1439,7 +2281,7 @@ class AgenticAttentionVariableForestRunner:
                 ):
                     logger.info(
                         "Outer fold %s effect fold %s/%s epoch %s/%s "
-                        "batch %s/%s r_loss=%.4f lr=%.3g%s",
+                        "batch %s/%s %s=%.4f lr=%.3g%s",
                         outer_fold,
                         fold,
                         total_folds,
@@ -1447,18 +2289,24 @@ class AgenticAttentionVariableForestRunner:
                         train_config.epochs,
                         batch_idx,
                         num_batches,
+                        "logistic_r_loss"
+                        if effect_objective == "logistic_r_loss"
+                        else "r_loss",
                         loss_value,
                         _current_lr(optimizer),
                         self._cuda_memory_summary(),
                     )
             logger.info(
                 "Outer fold %s effect fold %s/%s epoch %s/%s complete: "
-                "r_loss=%.4f lr=%.3g%s",
+                "%s=%.4f lr=%.3g%s",
                 outer_fold,
                 fold,
                 total_folds,
                 epoch,
                 train_config.epochs,
+                "logistic_r_loss"
+                if effect_objective == "logistic_r_loss"
+                else "r_loss",
                 loss_sum / max(1, batch_count),
                 _current_lr(optimizer),
                 self._cuda_memory_summary(),
@@ -1602,6 +2450,32 @@ class AgenticAttentionVariableForestRunner:
                 else:
                     outcome.append(torch.sigmoid(y_pred).cpu().numpy())
         return np.concatenate(prop), np.concatenate(outcome)
+
+    def _predict_joint_rlearner_model(
+        self,
+        model: _JointRNet,
+        df: pd.DataFrame,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        model.eval()
+        prop = []
+        outcome = []
+        effect = []
+        loader = self._make_text_loader(
+            model,
+            df,
+            np.arange(len(df), dtype=int),
+            shuffle=False,
+        )
+        with torch.no_grad():
+            for batch in loader:
+                t_logit, y_pred, tau = model(batch["model_input"])
+                prop.append(torch.sigmoid(t_logit).cpu().numpy())
+                if self.config.outcome_type == "continuous":
+                    outcome.append(y_pred.cpu().numpy())
+                else:
+                    outcome.append(torch.sigmoid(y_pred).cpu().numpy())
+                effect.append(tau.cpu().numpy())
+        return np.concatenate(prop), np.concatenate(outcome), np.concatenate(effect)
 
     def _predict_effect_model(self, model: _EffectNet, df: pd.DataFrame) -> np.ndarray:
         model.eval()
@@ -2349,6 +3223,12 @@ class AgenticAttentionVariableForestRunner:
             "treatment_column": self.config.treatment_column,
             "attention_top_k_chunks": self.avf_config.attention_top_k_chunks,
             "e_clip": self.avf_config.e_clip,
+            "nuisance_epochs": self.avf_config.nuisance_epochs,
+            "nuisance_weight_decay": self.avf_config.nuisance_weight_decay,
+            "nuisance_label_smoothing": self.avf_config.nuisance_label_smoothing,
+            "nuisance_calibration": self.avf_config.nuisance_calibration,
+            "neural_stage_mode": self.avf_config.neural_stage_mode,
+            "joint_rlearner_gamma": self.avf_config.joint_rlearner_gamma,
             "architecture": {key: getattr(arch, key, None) for key in arch_keys},
             "training": {key: getattr(train, key, None) for key in train_keys},
         }
@@ -2739,6 +3619,168 @@ class AgenticAttentionVariableForestRunner:
             self.association_filter_rows,
         )
 
+    def _load_joint_rlearner_fold_checkpoint(
+        self,
+        df: pd.DataFrame,
+        outer_fold: int,
+        fold: int,
+        heldout_pos: np.ndarray,
+        fingerprint: str,
+    ) -> Optional[Dict[str, Any]]:
+        loaded = self._load_fold_checkpoint(
+            "joint_rlearner",
+            df,
+            outer_fold,
+            fold,
+            heldout_pos,
+            fingerprint,
+        )
+        if loaded is None:
+            return None
+        pred_df, attention_rows = loaded
+        stage_values = [
+            str(row.get("stage", ""))
+            for row in attention_rows
+        ]
+        nuisance_attention = [
+            row
+            for row, stage in zip(attention_rows, stage_values)
+            if stage == "nuisance"
+        ]
+        effect_attention = [
+            row
+            for row, stage in zip(attention_rows, stage_values)
+            if stage == "effect_modifier"
+        ]
+        default_effect_loss = (
+            pred_df["effect_loss"].to_numpy(dtype=float)
+            if "effect_loss" in pred_df.columns
+            else pred_df["r_loss"].to_numpy(dtype=float)
+        )
+        default_effect_loss_at_zero = (
+            pred_df["effect_loss_at_zero_tau"].to_numpy(dtype=float)
+            if "effect_loss_at_zero_tau" in pred_df.columns
+            else pred_df["r_loss_at_zero_tau"].to_numpy(dtype=float)
+        )
+        return {
+            "fold": fold,
+            "heldout_pos": np.asarray(heldout_pos),
+            "e_hat": pred_df["e_hat"].to_numpy(dtype=float),
+            "e_hat_raw": (
+                pred_df["e_hat_raw"].to_numpy(dtype=float)
+                if "e_hat_raw" in pred_df.columns
+                else pred_df["e_hat"].to_numpy(dtype=float)
+            ),
+            "m_hat": pred_df["m_hat"].to_numpy(dtype=float),
+            "m_hat_raw": (
+                pred_df["m_hat_raw"].to_numpy(dtype=float)
+                if "m_hat_raw" in pred_df.columns
+                else pred_df["m_hat"].to_numpy(dtype=float)
+            ),
+            "y_resid": pred_df["y_residual"].to_numpy(dtype=float),
+            "t_resid": pred_df["t_residual"].to_numpy(dtype=float),
+            "tau_hat": pred_df["tau_hat_r_stage"].to_numpy(dtype=float),
+            "tau_logit_modifier": (
+                pred_df["tau_logit_modifier"].to_numpy(dtype=float)
+                if "tau_logit_modifier" in pred_df.columns
+                else np.full(len(pred_df), np.nan, dtype=float)
+            ),
+            "r_loss": pred_df["r_loss"].to_numpy(dtype=float),
+            "effect_loss": default_effect_loss,
+            "effect_loss_at_zero_tau": default_effect_loss_at_zero,
+            "effect_objective": (
+                str(pred_df["effect_objective"].iloc[0])
+                if "effect_objective" in pred_df.columns and len(pred_df) > 0
+                else _effect_objective_name(self.avf_config)
+            ),
+            "r_stage_train_eligible": (
+                pred_df["r_stage_train_eligible"].to_numpy(dtype=bool)
+                if "r_stage_train_eligible" in pred_df.columns
+                else np.ones(len(pred_df), dtype=bool)
+            ),
+            "nuisance_attention": nuisance_attention,
+            "effect_attention": effect_attention,
+        }
+
+    def _save_joint_rlearner_fold_checkpoint(
+        self,
+        df: pd.DataFrame,
+        result: Dict[str, Any],
+        outer_fold: int,
+        fingerprint: str,
+    ) -> None:
+        heldout_pos = np.asarray(result["heldout_pos"], dtype=int)
+        predictions = pd.DataFrame(
+            {
+                "heldout_pos": heldout_pos,
+                "_oci_row_id": df.iloc[heldout_pos]["_oci_row_id"].to_numpy(),
+                "outer_fold": int(outer_fold),
+                "nuisance_fold": int(result["fold"]),
+                "effect_fold": int(result["fold"]),
+                "e_hat": np.asarray(result["e_hat"], dtype=float),
+                "e_hat_raw": np.asarray(result.get("e_hat_raw", result["e_hat"]), dtype=float),
+                "m_hat": np.asarray(result["m_hat"], dtype=float),
+                "m_hat_raw": np.asarray(result.get("m_hat_raw", result["m_hat"]), dtype=float),
+                "y_residual": np.asarray(result["y_resid"], dtype=float),
+                "t_residual": np.asarray(result["t_resid"], dtype=float),
+                "tau_hat_r_stage": np.asarray(result["tau_hat"], dtype=float),
+                "tau_logit_modifier": np.asarray(
+                    result.get(
+                        "tau_logit_modifier",
+                        np.full(len(heldout_pos), np.nan),
+                    ),
+                    dtype=float,
+                ),
+                "r_loss": np.asarray(result["r_loss"], dtype=float),
+                "effect_loss": np.asarray(
+                    result.get("effect_loss", result["r_loss"]),
+                    dtype=float,
+                ),
+                "effect_loss_at_zero_tau": np.asarray(
+                    result.get(
+                        "effect_loss_at_zero_tau",
+                        np.asarray(result["y_resid"], dtype=float) ** 2,
+                    ),
+                    dtype=float,
+                ),
+                "effect_objective": np.asarray(
+                    [
+                        str(
+                            result.get(
+                                "effect_objective",
+                                _effect_objective_name(self.avf_config),
+                            )
+                        )
+                    ]
+                    * len(heldout_pos),
+                    dtype=object,
+                ),
+                "r_stage_train_eligible": np.asarray(
+                    result.get(
+                        "r_stage_train_eligible",
+                        np.ones(len(heldout_pos), dtype=bool),
+                    ),
+                    dtype=bool,
+                ),
+                "neural_stage_mode": np.asarray(
+                    ["joint_rlearner"] * len(heldout_pos),
+                    dtype=object,
+                ),
+            }
+        )
+        predictions["r_loss_at_zero_tau"] = predictions["y_residual"] ** 2
+        attention = list(result.get("nuisance_attention", [])) + list(
+            result.get("effect_attention", [])
+        )
+        self._save_fold_checkpoint(
+            "joint_rlearner",
+            outer_fold,
+            int(result["fold"]),
+            predictions,
+            attention,
+            fingerprint,
+        )
+
     def _load_nuisance_fold_checkpoint(
         self,
         df: pd.DataFrame,
@@ -2762,7 +3804,17 @@ class AgenticAttentionVariableForestRunner:
             "fold": fold,
             "heldout_pos": np.asarray(heldout_pos),
             "e_hat": pred_df["e_hat"].to_numpy(dtype=float),
+            "e_hat_raw": (
+                pred_df["e_hat_raw"].to_numpy(dtype=float)
+                if "e_hat_raw" in pred_df.columns
+                else pred_df["e_hat"].to_numpy(dtype=float)
+            ),
             "m_hat": pred_df["m_hat"].to_numpy(dtype=float),
+            "m_hat_raw": (
+                pred_df["m_hat_raw"].to_numpy(dtype=float)
+                if "m_hat_raw" in pred_df.columns
+                else pred_df["m_hat"].to_numpy(dtype=float)
+            ),
             "y_resid": pred_df["y_residual"].to_numpy(dtype=float),
             "t_resid": pred_df["t_residual"].to_numpy(dtype=float),
             "attention": attention_rows,
@@ -2783,7 +3835,9 @@ class AgenticAttentionVariableForestRunner:
                 "outer_fold": int(outer_fold),
                 "nuisance_fold": int(result["fold"]),
                 "e_hat": np.asarray(result["e_hat"], dtype=float),
+                "e_hat_raw": np.asarray(result.get("e_hat_raw", result["e_hat"]), dtype=float),
                 "m_hat": np.asarray(result["m_hat"], dtype=float),
+                "m_hat_raw": np.asarray(result.get("m_hat_raw", result["m_hat"]), dtype=float),
                 "y_residual": np.asarray(result["y_resid"], dtype=float),
                 "t_residual": np.asarray(result["t_resid"], dtype=float),
             }
@@ -2817,11 +3871,33 @@ class AgenticAttentionVariableForestRunner:
         if loaded is None:
             return None
         pred_df, attention_rows = loaded
+        default_effect_loss = (
+            pred_df["effect_loss"].to_numpy(dtype=float)
+            if "effect_loss" in pred_df.columns
+            else pred_df["r_loss"].to_numpy(dtype=float)
+        )
+        default_effect_loss_at_zero = (
+            pred_df["effect_loss_at_zero_tau"].to_numpy(dtype=float)
+            if "effect_loss_at_zero_tau" in pred_df.columns
+            else np.full(len(pred_df), np.nan, dtype=float)
+        )
         return {
             "fold": fold,
             "heldout_pos": np.asarray(heldout_pos),
             "tau_hat": pred_df["tau_hat_r_stage"].to_numpy(dtype=float),
+            "tau_logit_modifier": (
+                pred_df["tau_logit_modifier"].to_numpy(dtype=float)
+                if "tau_logit_modifier" in pred_df.columns
+                else np.full(len(pred_df), np.nan, dtype=float)
+            ),
             "r_loss": pred_df["r_loss"].to_numpy(dtype=float),
+            "effect_loss": default_effect_loss,
+            "effect_loss_at_zero_tau": default_effect_loss_at_zero,
+            "effect_objective": (
+                str(pred_df["effect_objective"].iloc[0])
+                if "effect_objective" in pred_df.columns and len(pred_df) > 0
+                else _effect_objective_name(self.avf_config)
+            ),
             "attention": attention_rows,
         }
 
@@ -2840,7 +3916,37 @@ class AgenticAttentionVariableForestRunner:
                 "outer_fold": int(outer_fold),
                 "effect_fold": int(result["fold"]),
                 "tau_hat_r_stage": np.asarray(result["tau_hat"], dtype=float),
+                "tau_logit_modifier": np.asarray(
+                    result.get(
+                        "tau_logit_modifier",
+                        np.full(len(heldout_pos), np.nan),
+                    ),
+                    dtype=float,
+                ),
                 "r_loss": np.asarray(result["r_loss"], dtype=float),
+                "effect_loss": np.asarray(
+                    result.get("effect_loss", result["r_loss"]),
+                    dtype=float,
+                ),
+                "effect_loss_at_zero_tau": np.asarray(
+                    result.get(
+                        "effect_loss_at_zero_tau",
+                        np.full(len(heldout_pos), np.nan),
+                    ),
+                    dtype=float,
+                ),
+                "effect_objective": np.asarray(
+                    [
+                        str(
+                            result.get(
+                                "effect_objective",
+                                _effect_objective_name(self.avf_config),
+                            )
+                        )
+                    ]
+                    * len(heldout_pos),
+                    dtype=object,
+                ),
                 "r_stage_train_eligible": np.asarray(
                     result.get(
                         "r_stage_train_eligible",
@@ -4258,11 +5364,18 @@ def _tail_attention_positions(
     return selected[: max(1, int(max_rows))]
 
 
-def _make_linear_lr_scheduler(optimizer, train_config, steps_per_epoch: int):
+def _make_linear_lr_scheduler(
+    optimizer,
+    train_config,
+    steps_per_epoch: int,
+    *,
+    epochs_override: Optional[int] = None,
+):
     lr_schedule = str(getattr(train_config, "lr_schedule", "linear") or "").lower()
     if lr_schedule != "linear":
         return None
-    total_steps = max(1, int(steps_per_epoch) * int(getattr(train_config, "epochs", 1)))
+    epochs = int(epochs_override if epochs_override is not None else getattr(train_config, "epochs", 1))
+    total_steps = max(1, int(steps_per_epoch) * epochs)
     return torch.optim.lr_scheduler.LinearLR(
         optimizer,
         start_factor=1.0,

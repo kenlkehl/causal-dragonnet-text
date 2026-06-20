@@ -26,7 +26,7 @@ import os
 import random
 import re
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields as dataclass_fields, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
 
@@ -38,6 +38,11 @@ import torch.nn.functional as F
 from sklearn.metrics import mean_squared_error, roc_auc_score
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
 from torch.utils.data import DataLoader, Dataset
+
+from ..utils.calibration import (
+    BinaryProbabilityCalibrator,
+    binary_calibration_metrics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,21 +94,23 @@ class NeuralCausalForestConfig:
 
     # Nuisance heads
     nuisance_hidden_dim: int = 128
-    nuisance_epochs: int = 50
+    nuisance_epochs: int = 20
     nuisance_learning_rate: float = 1e-4
-    nuisance_weight_decay: float = 0.01
+    nuisance_weight_decay: float = 0.05
+    nuisance_label_smoothing: float = 0.02
+    nuisance_calibration: str = "temperature_isotonic"
     nuisance_folds: int = 5
     inner_fold_parallelism: str = "auto"
     alpha_propensity: float = 1.0
 
     # Soft neural causal forest
     n_trees: int = 32
-    depth: int = 3
+    depth: int = 1
     forest_learning_rate: float = 1e-4
     forest_weight_decay: float = 0.01
     forest_epochs: int = 80
     batch_size: int = 8
-    effect_batch_size: Optional[int] = 16
+    effect_batch_size: Optional[int] = 256
     gradient_clip_norm: float = 1.0
     temperature_start: float = 1.5
     temperature_end: float = 0.35
@@ -139,6 +146,17 @@ class NeuralCausalForestConfig:
             raise ValueError("depth must be >= 1")
         if self.n_trees < 1:
             raise ValueError("n_trees must be >= 1")
+        if self.nuisance_epochs < 1:
+            raise ValueError("nuisance_epochs must be >= 1")
+        if not 0.0 <= float(self.nuisance_label_smoothing) < 1.0:
+            raise ValueError("nuisance_label_smoothing must be in [0, 1)")
+        calibration = str(self.nuisance_calibration).strip().lower()
+        if calibration not in {"none", "temperature", "isotonic", "temperature_isotonic"}:
+            raise ValueError(
+                "nuisance_calibration must be one of 'none', 'temperature', "
+                "'isotonic', or 'temperature_isotonic'"
+            )
+        self.nuisance_calibration = calibration
         if self.max_chunks < 1:
             raise ValueError("max_chunks must be >= 1")
         if self.chunk_overlap_words >= self.chunk_size_words:
@@ -188,10 +206,21 @@ class NeuralCausalForestConfig:
             )
 
     @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "NeuralCausalForestConfig":
+        known_fields = {item.name for item in dataclass_fields(cls)}
+        unknown_fields = sorted(set(payload) - known_fields)
+        if unknown_fields:
+            logger.warning(
+                "Ignoring unknown NeuralCausalForestConfig field(s): %s",
+                ", ".join(unknown_fields),
+            )
+        return cls(**{key: value for key, value in payload.items() if key in known_fields})
+
+    @classmethod
     def from_json(cls, path: str | Path) -> "NeuralCausalForestConfig":
         with open(path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
-        return cls(**payload)
+        return cls.from_dict(payload)
 
     def to_json(self, path: str | Path) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -1297,12 +1326,22 @@ def nuisance_loss(
     *,
     outcome_type: OutcomeType,
     alpha_propensity: float,
+    label_smoothing: float = 0.0,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    prop_loss = F.binary_cross_entropy_with_logits(model_output["propensity_logit"], t)
+    smoothing = float(label_smoothing)
+    if smoothing > 0:
+        t_target = t * (1.0 - smoothing) + 0.5 * smoothing
+    else:
+        t_target = t
+    prop_loss = F.binary_cross_entropy_with_logits(model_output["propensity_logit"], t_target)
     if outcome_type == "continuous":
         out_loss = F.mse_loss(model_output["outcome_raw"], y)
     else:
-        out_loss = F.binary_cross_entropy_with_logits(model_output["outcome_raw"], y)
+        if smoothing > 0:
+            y_target = y * (1.0 - smoothing) + 0.5 * smoothing
+        else:
+            y_target = y
+        out_loss = F.binary_cross_entropy_with_logits(model_output["outcome_raw"], y_target)
     loss = out_loss + float(alpha_propensity) * prop_loss
     return loss, {
         "loss": float(loss.detach().cpu()),
@@ -1417,6 +1456,7 @@ def train_nuisance_model(
                 y,
                 outcome_type=outcome_type,
                 alpha_propensity=config.alpha_propensity,
+                label_smoothing=config.nuisance_label_smoothing,
             )
             loss.backward()
             if config.gradient_clip_norm > 0:
@@ -1563,19 +1603,46 @@ def crossfit_nuisance_predictions(
                 device=device,
                 row_id_column=row_id_column,
             )
-            pred = predict_nuisance_model(
+            fit_df = df.iloc[fit_idx].reset_index(drop=True)
+            heldout_df = df.iloc[heldout_idx].reset_index(drop=True)
+            calibration_pred = predict_nuisance_model(
                 model,
-                df.iloc[heldout_idx].reset_index(drop=True),
+                fit_df,
                 text_column=text_column,
                 outcome_type=outcome_type,
                 config=fold_config,
                 device=device,
                 row_id_column=row_id_column,
             )
+            pred = predict_nuisance_model(
+                model,
+                heldout_df,
+                text_column=text_column,
+                outcome_type=outcome_type,
+                config=fold_config,
+                device=device,
+                row_id_column=row_id_column,
+            )
+            pred["e_hat_raw"] = pred["e_hat"].to_numpy(dtype=float)
+            prop_calibrator = BinaryProbabilityCalibrator.fit(
+                calibration_pred["e_hat"].to_numpy(dtype=float),
+                fit_df[treatment_column].to_numpy(dtype=float),
+                method=fold_config.nuisance_calibration,
+            )
+            pred["e_hat"] = prop_calibrator.transform(pred["e_hat_raw"].to_numpy(dtype=float))
+            if outcome_type != "continuous":
+                pred["m_hat_raw"] = pred["m_hat"].to_numpy(dtype=float)
+                outcome_calibrator = BinaryProbabilityCalibrator.fit(
+                    calibration_pred["m_hat"].to_numpy(dtype=float),
+                    fit_df[outcome_column].to_numpy(dtype=float),
+                    method=fold_config.nuisance_calibration,
+                )
+                pred["m_hat"] = outcome_calibrator.transform(pred["m_hat_raw"].to_numpy(dtype=float))
+            else:
+                pred["m_hat_raw"] = pred["m_hat"].to_numpy(dtype=float)
             pred["nuisance_fold"] = fold
             fold_attention: List[Dict[str, Any]] = []
             if collect_attention:
-                heldout_df = df.iloc[heldout_idx].reset_index(drop=True)
                 fold_attention = nuisance_attention_evidence(
                     model,
                     heldout_df[text_column].astype(str).tolist(),
@@ -2144,10 +2211,15 @@ def fit_neural_causal_forest_pipeline(
             target="tau_heterogeneity",
         )
 
+    nuisance_metric_cols = [
+        col
+        for col in [row_id_column, "e_hat", "m_hat", "e_hat_raw", "m_hat_raw"]
+        if col in nuisance_predictions.columns
+    ]
     metrics = summarize_pipeline_metrics(
         df=df,
         predictions=train_predictions.merge(
-            nuisance_predictions[[row_id_column, "e_hat", "m_hat"]], on=row_id_column, how="left"
+            nuisance_predictions[nuisance_metric_cols], on=row_id_column, how="left"
         ),
         treatment_column=treatment_column,
         outcome_column=outcome_column,
@@ -2205,23 +2277,37 @@ def summarize_pipeline_metrics(
             1.0 - metrics["r_loss_mean"] / metrics["r_loss_at_zero_tau_mean"]
         )
     if "e_hat" in source:
+        treatment = source[treatment_column].to_numpy(dtype=float)
+        e_hat = source["e_hat"].to_numpy(dtype=float)
         metrics["propensity_auroc"] = _safe_roc_auc(
-            source[treatment_column].to_numpy(dtype=float), source["e_hat"].to_numpy(dtype=float)
+            treatment, e_hat
         )
+        metrics.update(binary_calibration_metrics(treatment, e_hat, prefix="propensity"))
+    if "e_hat_raw" in source:
+        treatment = source[treatment_column].to_numpy(dtype=float)
+        e_hat_raw = source["e_hat_raw"].to_numpy(dtype=float)
+        metrics["propensity_raw_auroc"] = _safe_roc_auc(treatment, e_hat_raw)
+        metrics.update(binary_calibration_metrics(treatment, e_hat_raw, prefix="propensity_raw"))
     if "m_hat" in source:
+        outcome = source[outcome_column].to_numpy(dtype=float)
+        m_hat = source["m_hat"].to_numpy(dtype=float)
         if outcome_type == "continuous":
             metrics["outcome_rmse"] = float(
                 math.sqrt(
                     mean_squared_error(
-                        source[outcome_column].to_numpy(dtype=float),
-                        source["m_hat"].to_numpy(dtype=float),
+                        outcome,
+                        m_hat,
                     )
                 )
             )
         else:
-            metrics["outcome_auroc"] = _safe_roc_auc(
-                source[outcome_column].to_numpy(dtype=float), source["m_hat"].to_numpy(dtype=float)
-            )
+            metrics["outcome_auroc"] = _safe_roc_auc(outcome, m_hat)
+            metrics.update(binary_calibration_metrics(outcome, m_hat, prefix="outcome"))
+    if outcome_type != "continuous" and "m_hat_raw" in source:
+        outcome = source[outcome_column].to_numpy(dtype=float)
+        m_hat_raw = source["m_hat_raw"].to_numpy(dtype=float)
+        metrics["outcome_raw_auroc"] = _safe_roc_auc(outcome, m_hat_raw)
+        metrics.update(binary_calibration_metrics(outcome, m_hat_raw, prefix="outcome_raw"))
     for true_col in ("true_ite_prob", "true_ite", "tau", "true_tau"):
         if true_col in df.columns:
             source = source.merge(df[[row_id_column, true_col]], on=row_id_column, how="left")
@@ -2296,7 +2382,7 @@ def load_neural_causal_forest_model(
     if config_payload is None:
         config = NeuralCausalForestConfig.from_json(model_dir / "neural_causal_forest_config.json")
     else:
-        config = NeuralCausalForestConfig(**config_payload)
+        config = NeuralCausalForestConfig.from_dict(config_payload)
     model = NeuralCausalForestModel(config, device=device)
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
