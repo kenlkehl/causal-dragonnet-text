@@ -29,6 +29,7 @@ Example usage:
 """
 
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -37,6 +38,29 @@ import torch.nn as nn
 from ..config import ExplicitFeatureSpec
 
 logger = logging.getLogger(__name__)
+
+
+def _category_match_key(value: Any) -> str:
+    text = str(value).strip().lower()
+    text = text.replace("\u2265", ">=").replace("\u2264", "<=")
+    text = re.sub(r"[\s_-]+", "", text)
+    return text
+
+
+def _categorical_value_map(spec: ExplicitFeatureSpec) -> Dict[str, str]:
+    cats = spec.categories or []
+    value_map = {_category_match_key(cat): str(cat) for cat in cats}
+    by_category_key = {_category_match_key(cat): str(cat) for cat in cats}
+    aliases = getattr(spec, "value_aliases", None) or {}
+    if isinstance(aliases, dict):
+        for raw_category, raw_aliases in aliases.items():
+            category = by_category_key.get(_category_match_key(raw_category))
+            if category is None:
+                continue
+            alias_values = raw_aliases if isinstance(raw_aliases, list) else [raw_aliases]
+            for alias in alias_values:
+                value_map[_category_match_key(alias)] = category
+    return value_map
 
 
 def filter_specs_by_role(
@@ -342,12 +366,15 @@ def get_raw_explicit_features(
 
             if spec.type == "categorical":
                 cats = spec.categories or []
-                # Normalize value for comparison (spaces/underscores/hyphens, case)
-                val_norm = str(val).strip().lower().replace(" ", "_").replace("-", "_") if val is not None else ""
+                value_map = _categorical_value_map(spec)
+                canonical_val = (
+                    value_map.get(_category_match_key(val))
+                    if val is not None
+                    else None
+                )
                 # k-1 dummy coding
                 for i, cat in enumerate(cats[1:], 1):
-                    cat_norm = cat.strip().lower().replace(" ", "_").replace("-", "_")
-                    if not missing and val_norm == cat_norm:
+                    if not missing and canonical_val == cat:
                         features.append(1.0)
                     else:
                         features.append(0.0)

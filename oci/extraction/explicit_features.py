@@ -104,6 +104,42 @@ def strip_reasoning_trace(response: str) -> str:
     return text
 
 
+def _category_match_key(value: Any) -> str:
+    text = str(value).strip().lower()
+    text = text.replace("\u2265", ">=").replace("\u2264", "<=")
+    text = re.sub(r"[\s_-]+", "", text)
+    return text
+
+
+def _categorical_value_map(spec: ExplicitFeatureSpec) -> Dict[str, str]:
+    categories = spec.categories or []
+    value_map = {_category_match_key(category): str(category) for category in categories}
+    by_category_key = {_category_match_key(category): str(category) for category in categories}
+    aliases = getattr(spec, "value_aliases", None) or {}
+    if isinstance(aliases, dict):
+        for raw_category, raw_aliases in aliases.items():
+            category = by_category_key.get(_category_match_key(raw_category))
+            if category is None:
+                continue
+            alias_values = raw_aliases if isinstance(raw_aliases, list) else [raw_aliases]
+            for alias in alias_values:
+                value_map[_category_match_key(alias)] = category
+    return value_map
+
+
+def _format_value_aliases(spec: ExplicitFeatureSpec) -> str:
+    aliases = getattr(spec, "value_aliases", None) or {}
+    if not isinstance(aliases, dict):
+        return ""
+    chunks = []
+    for category, raw_aliases in aliases.items():
+        alias_values = raw_aliases if isinstance(raw_aliases, list) else [raw_aliases]
+        clean_aliases = [str(alias).strip() for alias in alias_values if str(alias).strip()]
+        if clean_aliases:
+            chunks.append(f'{category}: {", ".join(clean_aliases)}')
+    return "; ".join(chunks)
+
+
 @dataclass
 class ExplicitFeatureValue:
     """Extracted value for a single feature."""
@@ -139,9 +175,16 @@ def build_extraction_prompt(
         if conf_type == "categorical":
             categories = spec.categories or []
             cat_list = ", ".join(f'"{c}"' for c in categories)
+            alias_text = _format_value_aliases(spec)
+            alias_instruction = (
+                f"\n   Value aliases to canonicalize: {alias_text}"
+                if alias_text
+                else ""
+            )
             instructions.append(
                 f'{i}. {name} (categorical): {description}\n'
                 f'   Valid values: {cat_list}'
+                f'{alias_instruction}'
             )
             json_fields.append(f'"{name}": "<category>"')
         else:  # continuous
@@ -223,18 +266,9 @@ def parse_extraction_response(
                 result[name] = ExplicitFeatureValue(
                     name=name, type=conf_type, value=None, is_missing=True
                 )
-            elif str(value) in categories:
-                result[name] = ExplicitFeatureValue(
-                    name=name, type=conf_type, value=str(value), is_missing=False
-                )
             else:
-                # Try case-insensitive match
-                value_lower = str(value).lower()
-                matched_cat = None
-                for cat in categories:
-                    if cat.lower() == value_lower:
-                        matched_cat = cat
-                        break
+                value_map = _categorical_value_map(spec)
+                matched_cat = value_map.get(_category_match_key(value))
                 if matched_cat:
                     result[name] = ExplicitFeatureValue(
                         name=name, type=conf_type, value=matched_cat, is_missing=False

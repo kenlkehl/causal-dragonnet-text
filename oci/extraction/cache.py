@@ -32,6 +32,11 @@ def _compute_config_hash(config: Dict[str, Any]) -> str:
                 'type': c.get('type') if isinstance(c, dict) else c.type,
                 'categories': c.get('categories') if isinstance(c, dict) else c.categories,
                 'description': c.get('description') if isinstance(c, dict) else c.description,
+                'value_aliases': (
+                    c.get('value_aliases')
+                    if isinstance(c, dict)
+                    else getattr(c, 'value_aliases', None)
+                ),
                 'roles': c.get('roles') if isinstance(c, dict) else c.roles,
             }
             for c in config.get('features', config.get('confounders', []))

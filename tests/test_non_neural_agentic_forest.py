@@ -41,6 +41,31 @@ class FakeProposalAgent:
                 ],
                 "unmerged": [{"name": "age", "reason": "No alias proposed."}],
             }
+        if context.get("prompt_version") == "non_neural_agentic_value_harmonization_v1":
+            return {
+                "features": [
+                    {
+                        "name": "age",
+                        "type": "continuous",
+                        "categories": None,
+                        "description": "Patient age at treatment initiation in years.",
+                        "missing_values": ["unknown", "not_reported", "high", "low"],
+                        "rationale": "Age should remain numeric; qualitative labels are missing.",
+                    },
+                    {
+                        "name": "pd_l1_expression",
+                        "type": "categorical",
+                        "categories": ["<1%", "1-49%", ">=50%", "unknown"],
+                        "description": "Pretreatment tumor PD-L1 expression category.",
+                        "value_aliases": {
+                            "<1%": ["low negative"],
+                            ">=50%": ["high", "50% or greater"],
+                        },
+                        "missing_values": ["unknown", "not_reported"],
+                        "rationale": "Collapse high/low aliases into threshold categories.",
+                    },
+                ]
+            }
         return [
             {
                 "action": "add",
@@ -55,7 +80,7 @@ class FakeProposalAgent:
                 "action": "add",
                 "name": "pd_l1_expression",
                 "type": "categorical",
-                "categories": ["<1%", "1-49%", ">=50%"],
+                "categories": ["low", "high", "unknown"],
                 "roles": ["effect_modifier"],
                 "description": "Pretreatment tumor PD-L1 expression category.",
                 "rationale": "PD-L1 threshold terms appear in the pseudo-target model.",
@@ -100,7 +125,7 @@ class FakeEvaluator:
         self.seen_specs = []
 
     def evaluate_split(self, train_df, test_df, specs, fold_id):
-        self.seen_specs.append([spec.name for spec in specs])
+        self.seen_specs.append(specs)
         predictions = test_df.copy()
         predictions["pred_ite_prob"] = 0.1
         predictions["pred_y0_prob"] = 0.4
@@ -182,11 +207,35 @@ def test_non_neural_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path: 
     assert agent.contexts
     assert agent.contexts[0]["prompt_version"] == "non_neural_agentic_forest_v1"
     assert agent.contexts[1]["prompt_version"] == "non_neural_agentic_alias_resolution_v1"
+    assert agent.contexts[2]["prompt_version"] == "non_neural_agentic_value_harmonization_v1"
     assert "feature_importance" in agent.contexts[0]
     assert "canonical_feature_name_guidance" not in agent.contexts[0]
     assert "true_" not in json.dumps(agent.contexts[0])
-    assert all({"age", "pd_l1_expression"}.issubset(set(names)) for names in evaluator.seen_specs)
-    assert all(names.count("pd_l1_expression") == 1 for names in evaluator.seen_specs)
+    seen_names = [[spec.name for spec in specs] for specs in evaluator.seen_specs]
+    assert all({"age", "pd_l1_expression"}.issubset(set(names)) for names in seen_names)
+    assert all(names.count("pd_l1_expression") == 1 for names in seen_names)
+    pdl1_specs = [
+        spec
+        for specs in evaluator.seen_specs
+        for spec in specs
+        if spec.name == "pd_l1_expression"
+    ]
+    assert pdl1_specs
+    assert all(spec.categories == ["<1%", "1-49%", ">=50%"] for spec in pdl1_specs)
+    assert all("unknown" not in spec.categories for spec in pdl1_specs)
+    assert all(
+        spec.value_aliases[">=50%"] == ["high", "50% or greater"]
+        for spec in pdl1_specs
+    )
+    age_specs = [
+        spec
+        for specs in evaluator.seen_specs
+        for spec in specs
+        if spec.name == "age"
+    ]
+    assert age_specs
+    assert all(spec.type == "continuous" and spec.categories is None for spec in age_specs)
+    assert all("numeric value only" in (spec.description or "") for spec in age_specs)
     artifact_dir = output_path.parent / "non_neural_agentic_forest"
     assert (artifact_dir / "bow_oof_predictions.parquet").exists()
     assert (artifact_dir / "agent_candidate_proposals.jsonl").exists()

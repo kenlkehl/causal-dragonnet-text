@@ -28,6 +28,7 @@ oci/inference/applied_explicit_feature_forest.py
 oci/inference/applied_forest.py
 oci/inference/applied_tfidf_forest.py
 oci/inference/build_neural_causal_forest_agent_context.py
+oci/inference/non_neural_agentic_forest.py
 oci/inference/predict_neural_causal_forest.py
 oci/inference/train_neural_causal_forest.py
 oci/matching/__init__.py
@@ -89,6 +90,7 @@ tests/test_extractors.py
 tests/test_gamma_scheduler.py
 tests/test_gemini_batch_client.py
 tests/test_gemini_batch_generation.py
+tests/test_non_neural_agentic_forest.py
 tests/test_numeric_inventory.py
 tests/test_slot_value_discovery.py
 tests/test_slot_value_xw_rlearner_forest.py

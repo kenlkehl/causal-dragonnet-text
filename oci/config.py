@@ -24,6 +24,7 @@ class ExplicitFeatureSpec:
     categories: Optional[List[str]] = None  # For categorical only (e.g., ["0", "1", "2", "3", "4"])
     description: Optional[str] = None  # Used in LLM prompt (e.g., "ECOG performance status")
     roles: List[str] = field(default_factory=list)  # "confounder", "effect_modifier", or both
+    value_aliases: Optional[Dict[str, List[str]]] = None  # canonical category -> accepted aliases
 
     def __post_init__(self):
         if self.type not in ("categorical", "continuous"):
@@ -44,6 +45,25 @@ class ExplicitFeatureSpec:
             )
         # Preserve order while deduplicating roles.
         self.roles = list(dict.fromkeys(self.roles))
+        if self.type != "categorical":
+            self.value_aliases = None
+        elif self.value_aliases:
+            normalized_aliases: Dict[str, List[str]] = {}
+            for category, aliases in self.value_aliases.items():
+                category_text = str(category).strip()
+                if not category_text:
+                    continue
+                alias_values = aliases if isinstance(aliases, list) else [aliases]
+                normalized_aliases[category_text] = [
+                    str(alias).strip()
+                    for alias in alias_values
+                    if str(alias).strip()
+                ]
+            self.value_aliases = {
+                category: values
+                for category, values in normalized_aliases.items()
+                if values
+            } or None
 
 
 @dataclass

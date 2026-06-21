@@ -4828,6 +4828,7 @@ class AgenticAttentionVariableForestRunner:
                         type=merged[name].type,
                         categories=merged[name].categories,
                         description=merged[name].description or spec.description,
+                        value_aliases=getattr(merged[name], "value_aliases", None),
                         roles=roles,
                     )
                 else:
@@ -6397,6 +6398,7 @@ def consensus_feature_specs(
                 type=prototype.type,
                 categories=prototype.categories,
                 description=prototype.description,
+                value_aliases=getattr(prototype, "value_aliases", None),
                 roles=roles,
             )
         )
@@ -6884,6 +6886,7 @@ def _treatment_interaction_association(
         type=spec.type,
         categories=spec.categories,
         description=spec.description,
+        value_aliases=getattr(spec, "value_aliases", None),
         roles=["confounder"],
     )
     _, z_matrix, _, z_names, _, _ = _build_features(df, [candidate])
@@ -6942,6 +6945,7 @@ def _continuous_interaction_association(
         type=spec.type,
         categories=spec.categories,
         description=spec.description,
+        value_aliases=getattr(spec, "value_aliases", None),
         roles=["confounder"],
     )
     _, z_matrix, _, z_names, _, _ = _build_features(df, [candidate])
@@ -7466,6 +7470,7 @@ def _spec_to_dict(spec: ExplicitFeatureSpec) -> Dict[str, Any]:
         "type": spec.type,
         "categories": spec.categories,
         "description": spec.description,
+        "value_aliases": getattr(spec, "value_aliases", None),
         "roles": list(spec.roles),
     }
 

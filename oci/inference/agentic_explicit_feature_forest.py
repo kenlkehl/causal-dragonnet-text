@@ -1202,6 +1202,9 @@ class OpenAICompatibleFeatureSearchAgent:
             "agentic_attention_consensus_disambiguation_v1",
             "non_neural_agentic_alias_resolution_v1",
         }
+        is_value_harmonization = (
+            context.get("prompt_version") == "non_neural_agentic_value_harmonization_v1"
+        )
 
         for attempt_idx in range(max_repair_attempts + 1):
             response = self._client.chat.completions.create(
@@ -1224,9 +1227,13 @@ class OpenAICompatibleFeatureSearchAgent:
             self.last_response_trace = _trace_with_repair_attempts(trace, attempts)
 
             try:
-                if is_consensus_disambiguation:
+                if is_consensus_disambiguation or is_value_harmonization:
                     parsed = parse_agent_json_object(content)
-                    issues = consensus_disambiguation_response_issues(parsed)
+                    issues = (
+                        value_harmonization_response_issues(parsed, context)
+                        if is_value_harmonization
+                        else consensus_disambiguation_response_issues(parsed)
+                    )
                     if issues:
                         raise ValueError("; ".join(issues))
                     return parsed
@@ -1234,11 +1241,14 @@ class OpenAICompatibleFeatureSearchAgent:
             except Exception as exc:
                 issues = [f"malformed JSON: {exc}"]
                 if attempt_idx < max_repair_attempts:
-                    repair_prompt = (
-                        build_consensus_disambiguation_repair_prompt(issues)
-                        if is_consensus_disambiguation
-                        else build_agent_repair_prompt(issues)
-                    )
+                    if is_value_harmonization:
+                        repair_prompt = build_value_harmonization_repair_prompt(issues)
+                    elif is_consensus_disambiguation:
+                        repair_prompt = build_consensus_disambiguation_repair_prompt(
+                            issues
+                        )
+                    else:
+                        repair_prompt = build_agent_repair_prompt(issues)
                     messages.extend(
                         [
                             {"role": "assistant", "content": content},
@@ -1738,6 +1748,11 @@ def build_agent_prompt(
     if context.get("prompt_version") == "non_neural_agentic_alias_resolution_v1":
         return build_non_neural_agentic_alias_resolution_prompt(context, search_config)
 
+    if context.get("prompt_version") == "non_neural_agentic_value_harmonization_v1":
+        return build_non_neural_agentic_value_harmonization_prompt(
+            context, search_config
+        )
+
     if context.get("prompt_version") == "agentic_attention_variable_forest_v1":
         return build_attention_variable_agent_prompt(context, search_config)
 
@@ -1940,6 +1955,49 @@ Current alias-resolution context:
 """
 
 
+def build_non_neural_agentic_value_harmonization_prompt(
+    context: Dict[str, Any],
+    search_config: AgenticFeatureSearchConfig,
+) -> str:
+    """Construct a prompt that canonicalizes value contracts for selected features."""
+    del search_config
+    context_json = json.dumps(context, indent=2, default=_json_default)
+    return f"""You are harmonizing value contracts for explicit patient-level variables before extraction.
+
+Your task is narrow: keep the same variables, but make each variable's extracted values canonical and machine-usable. This applies to categorical variables and to variables that look numeric; numeric variables must not accept strings like "unknown", "high", or "not reported" as values.
+
+Return JSON only with this shape:
+{{
+  "features": [
+    {{
+      "name": "existing_variable_name",
+      "type": "categorical|continuous",
+      "categories": ["canonical_category_a", "canonical_category_b"],
+      "description": "exact extraction target and value policy",
+      "value_aliases": {{
+        "canonical_category_a": ["alias_a", "alias_b"]
+      }},
+      "missing_values": ["unknown", "not_reported"],
+      "rationale": "brief reason for the value contract"
+    }}
+  ]
+}}
+
+Rules:
+- Include every selected feature exactly once. Do not add, remove, or rename variables.
+- Preserve each variable's causal roles conceptually; this pass only harmonizes values.
+- For continuous variables, set "type" to "continuous" and omit categories or set them to null/[].
+- For continuous variables, the description must say to return a numeric value only and return null for unknown, not reported, not assessed, qualitative-only values such as high/low, or unavailable values.
+- For categorical variables, choose mutually exclusive canonical categories and list only those categories.
+- Use value_aliases to map synonymous or formatting variants to canonical categories.
+- Do not include missing-like values such as unknown, not_reported, not_assessed, not_tested, unavailable, or null as categories; represent unavailable values as null.
+- Prefer clinically meaningful thresholds over broad high/low categories when thresholds are available in the candidate category list or feature evidence.
+
+Current value-harmonization context:
+{context_json}
+"""
+
+
 def build_non_neural_agentic_forest_prompt(
     context: Dict[str, Any],
     search_config: AgenticFeatureSearchConfig,
@@ -2135,6 +2193,33 @@ Do not add prose, markdown, comments, or code fences.
 """
 
 
+def build_value_harmonization_repair_prompt(issues: Sequence[str]) -> str:
+    """Construct a follow-up prompt asking the agent to repair value-contract JSON."""
+    issue_lines = "\n".join(f"- {issue}" for issue in issues)
+    return f"""The previous response could not be used because it failed these schema checks:
+{issue_lines}
+
+Return corrected JSON only. Use this exact top-level shape:
+{{
+  "features": [
+    {{
+      "name": "existing_variable_name",
+      "type": "categorical|continuous",
+      "categories": ["canonical_category_a", "canonical_category_b"],
+      "description": "exact extraction target and value policy",
+      "value_aliases": {{
+        "canonical_category_a": ["alias_a", "alias_b"]
+      }},
+      "missing_values": ["unknown", "not_reported"],
+      "rationale": "brief reason for the value contract"
+    }}
+  ]
+}}
+
+Do not add prose, markdown, comments, or code fences.
+"""
+
+
 def agent_response_schema_issues(
     proposals: Sequence[Any],
     context: Optional[Dict[str, Any]] = None,
@@ -2211,6 +2296,65 @@ def consensus_disambiguation_response_issues(response: Any) -> List[str]:
     unmerged = response.get("unmerged", [])
     if unmerged is not None and not isinstance(unmerged, list):
         issues.append("unmerged must be a list when provided")
+    return issues
+
+
+def value_harmonization_response_issues(
+    response: Any,
+    context: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Return schema issues for value-harmonization responses."""
+    if not isinstance(response, dict):
+        return [f"expected a JSON object, got {type(response).__name__}"]
+    features = response.get("features")
+    if not isinstance(features, list):
+        return ["missing features list"]
+
+    expected_names = set()
+    if isinstance(context, dict):
+        for item in context.get("selected_features", []):
+            if isinstance(item, dict) and item.get("name"):
+                expected_names.add(_normalize_feature_name(item["name"]))
+
+    issues: List[str] = []
+    seen_names = set()
+    for idx, item in enumerate(features, start=1):
+        if not isinstance(item, dict):
+            issues.append(f"feature {idx}: expected an object")
+            continue
+        name = _normalize_feature_name(item.get("name", ""))
+        if not name:
+            issues.append(f"feature {idx}: missing name")
+            continue
+        if expected_names and name not in expected_names:
+            issues.append(f"feature {idx} ({name}): name was not in selected_features")
+        if name in seen_names:
+            issues.append(f"feature {idx} ({name}): duplicate feature")
+        seen_names.add(name)
+
+        feature_type = str(item.get("type", "")).strip().lower()
+        if feature_type not in VALID_TYPES:
+            issues.append(
+                f"feature {idx} ({name}): invalid type {item.get('type')!r}; "
+                f"expected one of {sorted(VALID_TYPES)}"
+            )
+            continue
+
+        categories = item.get("categories")
+        if feature_type == "categorical":
+            if not isinstance(categories, list) or not categories:
+                issues.append(f"feature {idx} ({name}): categorical feature needs categories")
+            elif len(categories) > 8:
+                issues.append(f"feature {idx} ({name}): too many categories")
+        elif categories not in (None, []):
+            issues.append(f"feature {idx} ({name}): continuous feature must not have categories")
+
+        if _missing_or_empty(item.get("description")):
+            issues.append(f"feature {idx} ({name}): missing description")
+
+    missing = sorted(expected_names - seen_names)
+    if missing:
+        issues.append(f"missing selected feature(s): {missing}")
     return issues
 
 
@@ -2462,6 +2606,7 @@ def apply_proposals(
                             type=spec.type,
                             categories=spec.categories,
                             description=spec.description,
+                            value_aliases=getattr(spec, "value_aliases", None),
                             roles=proposal.roles,
                         )
                     )
@@ -2558,6 +2703,7 @@ def _canonicalize_broad_screen_prepared_folds(
             type=canonical.type,
             categories=canonical.categories,
             description=canonical.description,
+            value_aliases=getattr(canonical, "value_aliases", None),
             roles=merged_roles.get(name, canonical.roles or []),
         )
 
@@ -2772,6 +2918,7 @@ def screen_agentic_candidate_specs(
                 type=proposed_spec.type,
                 categories=proposed_spec.categories,
                 description=proposed_spec.description,
+                value_aliases=getattr(proposed_spec, "value_aliases", None),
                 roles=recommended_roles,
             )
 
@@ -2931,6 +3078,7 @@ def _evaluate_single_candidate_role_diagnostic(
         type=candidate_spec.type,
         categories=candidate_spec.categories,
         description=candidate_spec.description,
+        value_aliases=getattr(candidate_spec, "value_aliases", None),
         roles=["confounder"],
     )
     _, z_matrix, _, z_names, _, _ = _build_features(df, [z_spec])
@@ -3575,6 +3723,7 @@ def _spec_extraction_contract_dict(spec: ExplicitFeatureSpec) -> Dict[str, Any]:
         "type": spec.type,
         "categories": spec.categories,
         "description": spec.description,
+        "value_aliases": getattr(spec, "value_aliases", None),
         # Roles are omitted from the prompt; keep a stable placeholder because
         # ExtractionCache's generic hash currently includes this field.
         "roles": [],
@@ -3868,6 +4017,7 @@ def _spec_to_dict(spec: ExplicitFeatureSpec) -> Dict[str, Any]:
         "type": spec.type,
         "categories": spec.categories,
         "description": spec.description,
+        "value_aliases": getattr(spec, "value_aliases", None),
         "roles": spec.roles,
     }
 
@@ -3883,6 +4033,7 @@ def _spec_signature(specs: Sequence[ExplicitFeatureSpec]) -> List[Tuple[Any, ...
             spec.type,
             tuple(spec.categories or []),
             spec.description,
+            json.dumps(getattr(spec, "value_aliases", None), sort_keys=True),
             tuple(spec.roles or []),
         )
         for spec in specs

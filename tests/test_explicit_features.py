@@ -145,6 +145,52 @@ def test_parse_extraction_response_strips_inline_reasoning_trace():
     assert parsed["age"].is_missing is False
 
 
+def test_parse_extraction_response_maps_categorical_value_aliases():
+    specs = [
+        ExplicitFeatureSpec(
+            name="pd_l1_expression",
+            type="categorical",
+            categories=["<1%", "1-49%", ">=50%"],
+            value_aliases={">=50%": ["high", "50% or greater"]},
+            roles=["effect_modifier"],
+        ),
+    ]
+
+    parsed = parse_extraction_response('{"pd_l1_expression": "high"}', specs)
+
+    assert parsed["pd_l1_expression"].value == ">=50%"
+    assert parsed["pd_l1_expression"].is_missing is False
+
+
+def test_raw_explicit_features_maps_categorical_value_aliases():
+    specs = [
+        ExplicitFeatureSpec(
+            name="pd_l1_expression",
+            type="categorical",
+            categories=["<1%", "1-49%", ">=50%"],
+            value_aliases={">=50%": ["high"]},
+            roles=["effect_modifier"],
+        ),
+    ]
+    features, names = get_raw_explicit_features(
+        [
+            {
+                "pd_l1_expression": "high",
+                "pd_l1_expression_missing": False,
+            }
+        ],
+        specs,
+        role="effect_modifier",
+    )
+
+    assert names == [
+        "pd_l1_expression_1-49%",
+        "pd_l1_expression_>=50%",
+        "pd_l1_expression_missing",
+    ]
+    assert features == [[0.0, 1.0, 0.0]]
+
+
 def test_vllm_feature_extractor_server_client_has_no_timeout(monkeypatch):
     calls = {}
 
