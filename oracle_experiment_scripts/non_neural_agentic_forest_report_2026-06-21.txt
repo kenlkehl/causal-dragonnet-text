@@ -1,0 +1,167 @@
+Non-Neural Agentic Forest Report
+Date: 2026-06-21 17:29:34 EDT
+
+Run artifact:
+../pcori_experiments/non_neural_agentic_forest_consistency_parallel/results/cffbefec9970.json
+
+Prediction artifact:
+../pcori_experiments/non_neural_agentic_forest_consistency_parallel/non_neural_agentic_predictions/cffbefec9970/predictions.parquet
+
+Command run
+-----------
+This command is reconstructed from the saved run configuration:
+
+~/oldtorch/bin/python oracle_experiment_scripts/run_oracle_non_neural_agentic_forest.py \
+  --dataset synthetic_data/example_synthetic_datasets/one_confounder_one_effect_modifier_nsclc_with_structured \
+  --output-dir ../pcori_experiments/non_neural_agentic_forest_consistency_parallel \
+  --n-folds 5 \
+  --seed 42 \
+  --num-workers 10 \
+  --nuisance-folds 5 \
+  --effect-folds 5 \
+  --bow-model linear \
+  --top-n-features 100 \
+  --candidate-proposals-per-fold 30 \
+  --candidate-consistency-inner-folds 3 \
+  --candidate-consistency-min-folds 2 \
+  --candidate-consistency-min-fold-fraction 0.5 \
+  --candidate-consistency-recovery-max-candidates 12 \
+  --candidate-consistency-parallelism 5 \
+  --outer-parallelism 5 \
+  --fold-parallelism 5 \
+  --bow-parallel-backend processes \
+  --agent-server-url http://localhost:8010/v1 \
+  --agent-model-name auto \
+  --agent-max-tokens 25000 \
+  --extraction-server-url http://localhost:8010/v1 \
+  --extraction-model-name auto \
+  --extraction-batch-size 100 \
+  --extraction-max-tokens 25000 \
+  --extraction-max-text-length 400000
+
+Ground Truth Dataset and Data-Generating Process
+------------------------------------------------
+The dataset is a controlled synthetic NSCLC cohort with 1,000 patient-level
+records. The clinical question is a comparison of vinorelbine to gemcitabine
+for advanced/metastatic NSCLC. Each row contains long generated clinical text
+and structured ground-truth columns, including treatment probability, outcome
+probability, potential-outcome probabilities, true ITE, true age, and true
+PD-L1 expression. The synthetic notes are long: the metadata reports a mean
+clinical-text length of 51,718 characters, a mean of 19.2 notes per patient,
+and structured data such as encounters, hospitalizations, labs, and PROs.
+
+The causal structure is intentionally simple. Age is the sole true confounder:
+it affects both treatment assignment and baseline outcome risk. PD-L1
+expression is the sole true effect modifier: it changes the treatment effect
+through treatment-by-PD-L1 interaction terms in the outcome equation. The
+ground-truth metadata reports a treatment-equation age coefficient of -2.016
+and an outcome-equation age coefficient of -1.728 on the generated logit scale.
+The outcome equation has a global treatment coefficient of 0.200, plus
+treatment interactions of -0.578 for PD-L1 1-49% and 2.077 for PD-L1 >=50%.
+Treatment and outcome are still stochastic binary draws from known probabilities,
+so even oracle feature recovery does not make the observed labels deterministic.
+
+Workflow
+--------
+The non-neural agentic forest path uses sparse bag-of-words/TF-IDF models as a
+feature-discovery layer rather than as the final causal model. Within each
+outer training fold, it fits honest cross-fitted BoW nuisance models for
+treatment and outcome prediction. It then uses those nuisance predictions to
+compute an unweighted pseudo-effect target and fits another BoW model to find
+text features associated with treatment-effect heterogeneity. The top lexical
+features from treatment, outcome, and pseudo-effect models are shown to an
+agent, which proposes candidate confounders and effect modifiers.
+
+The agentic layer performs candidate proposal, cross-fold consistency review,
+alias resolution, feature extraction, and value harmonization. The consistency
+step is designed to gate out noisy one-off candidates while allowing recovery
+of variables that emerge in weaker inner folds under different names. Extraction
+then pulls values for both candidate confounders and candidate effect modifiers
+in one pass. After extraction and value harmonization, the final CATE estimator
+is an explicit-feature causal forest trained only on extracted structured
+features selected inside the relevant outer training fold.
+
+Fold Structure
+--------------
+Outer folds are used for honest final evaluation: each held-out outer fold is
+predicted by a workflow that discovered variables, extracted values, trained
+the final causal forest, and produced ITE estimates without using that held-out
+fold for model fitting. Inner folds are used within the outer training data for
+honest nuisance prediction, pseudo-effect feature discovery, and candidate
+consistency checks. In this run, there were 5 outer folds, 5 nuisance folds,
+5 effect folds, and 3 inner folds for candidate consistency.
+
+Overall Quantitative Results
+----------------------------
+| Metric          | Value      |
+|-----------------|------------|
+| n rows          | 1000       |
+| treatment AUROC | 0.8428     |
+| outcome AUROC   | 0.8282     |
+| ITE correlation | 0.6534     |
+| ITE MSE         | 0.0181     |
+| ITE MAE         | 0.1131     |
+
+PD-L1 Subgroup Results
+----------------------
+| True PD-L1 group | n   | true mean ITE | pred mean ITE | bias    | ITE MAE | within-group corr | treatment rate | outcome rate |
+|------------------|-----|---------------|---------------|---------|---------|-------------------|----------------|--------------|
+| 1-49%            | 347 | -0.0638       | 0.0796        | 0.1433  | 0.1434  | 0.0309            | 0.5187         | 0.4755       |
+| <1%              | 434 | 0.0336        | 0.0776        | 0.0440  | 0.0649  | 0.1084            | 0.4447         | 0.5277       |
+| >=50%            | 219 | 0.3208        | 0.2103        | -0.1106 | 0.1608  | 0.3848            | 0.5205         | 0.6849       |
+
+Outer Fold Results
+------------------
+| Fold | n   | true mean ITE | pred mean ITE | ITE MAE | ITE corr |
+|------|-----|---------------|---------------|---------|----------|
+| 1    | 200 | 0.0637        | 0.0934        | 0.1054  | 0.7063   |
+| 2    | 200 | 0.0420        | 0.0914        | 0.1063  | 0.6441   |
+| 3    | 200 | 0.0707        | 0.0904        | 0.1075  | 0.6227   |
+| 4    | 200 | 0.0668        | 0.1185        | 0.1263  | 0.6432   |
+| 5    | 200 | 0.0705        | 0.1430        | 0.1202  | 0.9162   |
+
+Selected Feature Role Frequency Across Outer Folds
+--------------------------------------------------
+| Feature                         | selected folds | confounder folds | effect-modifier folds |
+|---------------------------------|----------------|------------------|-----------------------|
+| employment_status               | 5              | 5                | 3                     |
+| patient_age                     | 5              | 5                | 5                     |
+| systolic_blood_pressure         | 5              | 5                | 1                     |
+| pd_l1_expression_level          | 4              | 0                | 4                     |
+| tumor_pd_l1_expression          | 1              | 0                | 1                     |
+| social_support_status           | 3              | 1                | 3                     |
+| smoking_history_pack_years      | 3              | 3                | 3                     |
+| comorbidity_hyperlipidemia      | 2              | 2                | 0                     |
+| smoking_history_status          | 2              | 2                | 0                     |
+| social_alcohol_use              | 2              | 2                | 1                     |
+| comorbidity_copd                | 1              | 1                | 1                     |
+| biomarker_stk11_mutation        | 1              | 0                | 1                     |
+| functional_status_ecog          | 1              | 1                | 1                     |
+| comorbidity_osteoarthritis      | 1              | 1                | 1                     |
+| ecog_performance_status         | 1              | 1                | 1                     |
+| copd_presence                   | 1              | 1                | 1                     |
+| osteoarthritis_presence         | 1              | 1                | 1                     |
+| smoking_status                  | 1              | 1                | 1                     |
+| tumor_histology_type            | 1              | 0                | 1                     |
+
+Interpretation
+--------------
+This run recovered the two important oracle concepts better than the earlier
+neural CATE attempts. Age was selected in all 5 folds and always used as a
+confounder. PD-L1 was selected in all 5 folds as an effect modifier, although
+one fold used the name tumor_pd_l1_expression and four folds used
+pd_l1_expression_level. That naming difference should not directly affect the
+reported metrics because each outer fold trains and predicts with its own
+fold-specific extracted variables, but it does show that alias harmonization
+could still be made stricter across folds.
+
+The main remaining limitation is CATE shrinkage/bias. The model captured the
+directional high-PD-L1 treatment-benefit signal: the predicted mean ITE for
+PD-L1 >=50% was 0.210, clearly above the lower PD-L1 strata. But it compressed
+the group means toward a positive average effect. It overpredicted benefit for
+PD-L1 1-49% and <1%, and underpredicted benefit for PD-L1 >=50%. This pattern
+is consistent with the final causal forest learning real heterogeneity from the
+extracted variables, but regularizing or averaging strongly enough that it does
+not fully reproduce the oracle subgroup contrasts. The stochastic binary outcome
+and treatment assignment also make the final supervised signal noisy even when
+the discovered variables are mostly right.
