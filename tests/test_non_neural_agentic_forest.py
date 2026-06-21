@@ -13,8 +13,15 @@ from oci.config import (
     ModelArchitectureConfig,
     NonNeuralAgenticForestConfig,
 )
-from oci.inference.agentic_explicit_feature_forest import SplitEvaluation
-from oci.inference.non_neural_agentic_forest import run_non_neural_agentic_forest
+from oci.inference.agentic_explicit_feature_forest import (
+    AgenticFeatureProposal,
+    SplitEvaluation,
+)
+from oci.inference.non_neural_agentic_forest import (
+    _candidate_consistency_threshold,
+    _fallback_consistency_proposals,
+    run_non_neural_agentic_forest,
+)
 
 
 class FakeProposalAgent:
@@ -183,6 +190,7 @@ def test_non_neural_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path: 
                 max_features=1000,
                 min_df=1,
                 top_n_features=5,
+                candidate_consistency_enabled=False,
                 fold_parallelism="2",
             ),
         ),
@@ -204,6 +212,14 @@ def test_non_neural_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path: 
     predictions = pd.read_parquet(output_path)
     assert len(predictions) == len(dataset)
     assert "selected_feature_names" in predictions.columns
+    assert "selected_feature_roles" in predictions.columns
+    assert "selected_confounder_names" in predictions.columns
+    assert "selected_effect_modifier_names" in predictions.columns
+    assert set(predictions["selected_feature_roles"]) == {
+        "age[confounder],pd_l1_expression[effect_modifier]"
+    }
+    assert set(predictions["selected_confounder_names"]) == {"age"}
+    assert set(predictions["selected_effect_modifier_names"]) == {"pd_l1_expression"}
     assert agent.contexts
     assert agent.contexts[0]["prompt_version"] == "non_neural_agentic_forest_v1"
     assert agent.contexts[1]["prompt_version"] == "non_neural_agentic_alias_resolution_v1"
@@ -256,11 +272,61 @@ def test_non_neural_agentic_forest_parses_bow_model_option():
                         "bow_model": "extratrees",
                         "nuisance_folds": 2,
                         "effect_folds": 2,
+                        "candidate_consistency_enabled": True,
+                        "candidate_consistency_inner_folds": 4,
+                        "candidate_consistency_min_folds": 2,
+                        "candidate_consistency_min_fold_fraction": 0.5,
+                        "candidate_consistency_parallelism": "2",
+                        "outer_parallelism": "3",
                     },
                 },
                 "explicit_features": {"enabled": True, "features": []},
             }
         }
     )
-    assert cfg.applied_inference.architecture.non_neural_agentic_forest.bow_model == "extratrees"
+    nn_cfg = cfg.applied_inference.architecture.non_neural_agentic_forest
+    assert nn_cfg.bow_model == "extratrees"
+    assert nn_cfg.candidate_consistency_enabled is True
+    assert nn_cfg.candidate_consistency_inner_folds == 4
+    assert nn_cfg.candidate_consistency_min_folds == 2
+    assert nn_cfg.candidate_consistency_min_fold_fraction == 0.5
+    assert nn_cfg.candidate_consistency_parallelism == "2"
+    assert nn_cfg.outer_parallelism == "3"
     cfg.validate()
+
+
+def test_non_neural_candidate_consistency_fallback_prefers_stable_candidates():
+    assert _candidate_consistency_threshold(
+        3,
+        min_folds=2,
+        min_fold_fraction=0.5,
+    ) == 2
+    age = AgenticFeatureProposal(
+        action="add",
+        name="patient_age",
+        type="continuous",
+        roles=["confounder"],
+    )
+    noise = AgenticFeatureProposal(
+        action="add",
+        name="rare_noise",
+        type="categorical",
+        categories=["present", "absent"],
+        roles=["effect_modifier"],
+    )
+    selected = _fallback_consistency_proposals(
+        [
+            {
+                "name": "patient_age",
+                "passes_consistency_gate": True,
+                "proposed_on_full_outer_train": True,
+            },
+            {
+                "name": "rare_noise",
+                "passes_consistency_gate": False,
+                "proposed_on_full_outer_train": True,
+            },
+        ],
+        {"patient_age": age, "rare_noise": noise},
+    )
+    assert selected == [age]

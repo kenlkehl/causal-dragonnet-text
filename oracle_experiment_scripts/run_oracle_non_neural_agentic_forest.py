@@ -49,6 +49,7 @@ class NonNeuralAgenticOracleConfig:
     seed: int = 42
     sample_size: Optional[int] = None
     text_max_chars: Optional[int] = None
+    num_workers: int = 1
 
     nuisance_folds: int = 5
     effect_folds: int = 5
@@ -63,6 +64,13 @@ class NonNeuralAgenticOracleConfig:
     e_clip: float = 0.01
     top_n_features: int = 100
     candidate_proposals_per_fold: int = 30
+    candidate_consistency_enabled: bool = True
+    candidate_consistency_inner_folds: int = 3
+    candidate_consistency_min_folds: int = 2
+    candidate_consistency_min_fold_fraction: float = 0.5
+    candidate_consistency_recovery_max_candidates: int = 12
+    candidate_consistency_parallelism: str = "1"
+    outer_parallelism: str = "1"
     fold_parallelism: str = "auto"
 
     cf_n_estimators: int = 200
@@ -77,7 +85,7 @@ class NonNeuralAgenticOracleConfig:
     agent_model_name: str = "Qwen/Qwen3.6-27B"
     agent_api_key: str = "EMPTY"
     agent_temperature: float = 0.0
-    agent_max_tokens: int = 8192
+    agent_max_tokens: int = 25000
     agent_save_context: bool = False
     agent_save_raw_output: bool = False
 
@@ -88,8 +96,8 @@ class NonNeuralAgenticOracleConfig:
     extraction_batch_size: int = 100
     extraction_max_retries: int = 3
     extraction_temperature: float = 0.0
-    extraction_max_tokens: int = 4096
-    extraction_max_text_length: int = 8000
+    extraction_max_tokens: int = 25000
+    extraction_max_text_length: int = 400000
     extraction_cache_enabled: bool = True
     extraction_cache_dir: Optional[str] = None
 
@@ -153,6 +161,13 @@ def _make_applied_config(
                 e_clip=config.e_clip,
                 top_n_features=config.top_n_features,
                 candidate_proposals_per_fold=config.candidate_proposals_per_fold,
+                candidate_consistency_enabled=config.candidate_consistency_enabled,
+                candidate_consistency_inner_folds=config.candidate_consistency_inner_folds,
+                candidate_consistency_min_folds=config.candidate_consistency_min_folds,
+                candidate_consistency_min_fold_fraction=config.candidate_consistency_min_fold_fraction,
+                candidate_consistency_recovery_max_candidates=config.candidate_consistency_recovery_max_candidates,
+                candidate_consistency_parallelism=config.candidate_consistency_parallelism,
+                outer_parallelism=config.outer_parallelism,
                 fold_parallelism=config.fold_parallelism,
             ),
         ),
@@ -219,6 +234,21 @@ def _metrics(results_df: pd.DataFrame) -> Dict[str, Any]:
     if "selected_feature_names" in results_df.columns:
         selected_sets = sorted(set(results_df["selected_feature_names"].fillna("")))
         metrics["selected_feature_sets"] = selected_sets
+    if "selected_feature_roles" in results_df.columns:
+        selected_role_sets = sorted(
+            set(results_df["selected_feature_roles"].fillna(""))
+        )
+        metrics["selected_feature_role_sets"] = selected_role_sets
+    if "selected_confounder_names" in results_df.columns:
+        confounder_sets = sorted(
+            set(results_df["selected_confounder_names"].fillna(""))
+        )
+        metrics["selected_confounder_sets"] = confounder_sets
+    if "selected_effect_modifier_names" in results_df.columns:
+        effect_modifier_sets = sorted(
+            set(results_df["selected_effect_modifier_names"].fillna(""))
+        )
+        metrics["selected_effect_modifier_sets"] = effect_modifier_sets
     return metrics
 
 
@@ -237,7 +267,12 @@ def _run_one(config: NonNeuralAgenticOracleConfig, output_dir: Path) -> Dict[str
         len(df),
         run_hash,
     )
-    run_non_neural_agentic_forest(df, applied, prediction_path)
+    run_non_neural_agentic_forest(
+        df,
+        applied,
+        prediction_path,
+        num_workers=config.num_workers,
+    )
     results_df = pd.read_parquet(prediction_path)
     result = {
         **asdict(config),
@@ -280,6 +315,12 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--sample-size", type=int, default=None)
     parser.add_argument("--text-max-chars", type=int, default=None)
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help="Worker budget used by 'auto' parallelism settings.",
+    )
 
     parser.add_argument("--nuisance-folds", type=int, default=5)
     parser.add_argument("--effect-folds", type=int, default=5)
@@ -298,6 +339,37 @@ def main() -> None:
     parser.add_argument("--top-n-features", type=int, default=100)
     parser.add_argument("--candidate-proposals-per-fold", type=int, default=30)
     parser.add_argument(
+        "--no-candidate-consistency",
+        action="store_true",
+        help="Disable inner-fold candidate consistency selection.",
+    )
+    parser.add_argument("--candidate-consistency-inner-folds", type=int, default=3)
+    parser.add_argument("--candidate-consistency-min-folds", type=int, default=2)
+    parser.add_argument(
+        "--candidate-consistency-min-fold-fraction",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument(
+        "--candidate-consistency-recovery-max-candidates",
+        type=int,
+        default=12,
+        help="Maximum below-threshold candidates shown to the consistency agent for recovery.",
+    )
+    parser.add_argument(
+        "--candidate-consistency-parallelism",
+        default="1",
+        help=(
+            "Parallelism for inner-fold agentic consistency candidate proposal: "
+            "'auto' uses runner workers, or pass a positive integer."
+        ),
+    )
+    parser.add_argument(
+        "--outer-parallelism",
+        default="1",
+        help="Parallelism for outer CV folds: 'auto' uses runner workers, or pass a positive integer.",
+    )
+    parser.add_argument(
         "--fold-parallelism",
         default="auto",
         help=(
@@ -314,7 +386,7 @@ def main() -> None:
     parser.add_argument("--agent-server-url", default="http://localhost:8000/v1")
     parser.add_argument("--agent-model-name", default="Qwen/Qwen3.6-27B")
     parser.add_argument("--agent-api-key", default="EMPTY")
-    parser.add_argument("--agent-max-tokens", type=int, default=8192)
+    parser.add_argument("--agent-max-tokens", type=int, default=25000)
     parser.add_argument("--agent-save-context", action="store_true")
     parser.add_argument("--agent-save-raw-output", action="store_true")
 
@@ -327,8 +399,8 @@ def main() -> None:
     )
     parser.add_argument("--extraction-reasoning-parser", default="auto")
     parser.add_argument("--extraction-batch-size", type=int, default=100)
-    parser.add_argument("--extraction-max-tokens", type=int, default=4096)
-    parser.add_argument("--extraction-max-text-length", type=int, default=8000)
+    parser.add_argument("--extraction-max-tokens", type=int, default=25000)
+    parser.add_argument("--extraction-max-text-length", type=int, default=400000)
     parser.add_argument("--extraction-cache-dir", default=None)
     parser.add_argument("--no-extraction-cache", action="store_true")
     parser.add_argument("--verbose", action="store_true")
@@ -348,6 +420,7 @@ def main() -> None:
         seed=args.seed,
         sample_size=args.sample_size,
         text_max_chars=args.text_max_chars,
+        num_workers=args.num_workers,
         nuisance_folds=args.nuisance_folds,
         effect_folds=args.effect_folds,
         max_features=args.max_features,
@@ -356,6 +429,15 @@ def main() -> None:
         ridge_alpha=args.ridge_alpha,
         top_n_features=args.top_n_features,
         candidate_proposals_per_fold=args.candidate_proposals_per_fold,
+        candidate_consistency_enabled=not args.no_candidate_consistency,
+        candidate_consistency_inner_folds=args.candidate_consistency_inner_folds,
+        candidate_consistency_min_folds=args.candidate_consistency_min_folds,
+        candidate_consistency_min_fold_fraction=args.candidate_consistency_min_fold_fraction,
+        candidate_consistency_recovery_max_candidates=(
+            args.candidate_consistency_recovery_max_candidates
+        ),
+        candidate_consistency_parallelism=args.candidate_consistency_parallelism,
+        outer_parallelism=args.outer_parallelism,
         fold_parallelism=args.fold_parallelism,
         cf_n_estimators=args.cf_n_estimators,
         cf_min_samples_leaf=args.cf_min_samples_leaf,

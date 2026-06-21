@@ -152,14 +152,14 @@ class ExplicitFeatureValue:
 def build_extraction_prompt(
     clinical_text: str,
     specs: List[ExplicitFeatureSpec],
-    max_text_length: int = 8000
+    max_text_length: int = 400000
 ) -> str:
     """Build prompt for feature extraction.
 
     Args:
         clinical_text: Clinical text to extract from
         specs: List of feature specifications
-        max_text_length: Maximum characters of text to include
+        max_text_length: Maximum tail characters of text to include
 
     Returns:
         Formatted prompt string for the LLM
@@ -197,8 +197,11 @@ def build_extraction_prompt(
     instructions_text = "\n".join(instructions)
     json_example = "{" + ", ".join(json_fields) + "}"
 
-    # Truncate text if needed
-    text = clinical_text[:max_text_length]
+    # Keep the end of long notes where addenda, latest staging, and recent labs
+    # are often documented.
+    text = str(clinical_text)
+    if max_text_length is not None and len(text) > int(max_text_length):
+        text = text[-int(max_text_length):]
 
     prompt = f"""Read this clinical note and extract the following patient characteristics.
 Use only information available before or at treatment initiation. If the value is not explicitly stated or cannot be inferred from pre-treatment information, return null for that field.
@@ -322,7 +325,7 @@ class VLLMFeatureExtractor:
         max_retries: int = 3,
         temperature: float = 0.0,
         max_tokens: int = 1024,
-        max_text_length: int = 8000
+        max_text_length: int = 400000
     ):
         """Initialize extractor.
 
@@ -677,7 +680,7 @@ def extract_explicit_features(
     max_retries: int = 3,
     temperature: float = 0.0,
     max_tokens: int = 1024,
-    max_text_length: int = 8000,
+    max_text_length: int = 400000,
     batch_size: int = 32
 ) -> pd.DataFrame:
     """Convenience function to extract features from texts.

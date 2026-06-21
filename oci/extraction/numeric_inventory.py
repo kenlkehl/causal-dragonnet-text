@@ -41,9 +41,9 @@ class NumericInventoryConfig:
     chunk_size_words: int = 900
     chunk_overlap_words: int = 100
     extraction_temperature: float = 0.0
-    chunk_max_tokens: int = 4096
-    reconcile_max_tokens: int = 8192
-    ontology_max_tokens: int = 12000
+    chunk_max_tokens: int = 25000
+    reconcile_max_tokens: int = 25000
+    ontology_max_tokens: int = 25000
     extraction_batch_size: int = 32
     extraction_max_retries: int = 3
     patient_reconcile_max_records_per_call: int = 120

@@ -1753,6 +1753,9 @@ def build_agent_prompt(
             context, search_config
         )
 
+    if context.get("prompt_version") == "non_neural_agentic_consistency_v1":
+        return build_non_neural_agentic_consistency_prompt(context, search_config)
+
     if context.get("prompt_version") == "agentic_attention_variable_forest_v1":
         return build_attention_variable_agent_prompt(context, search_config)
 
@@ -2046,6 +2049,51 @@ Return JSON only with this shape:
 }}
 
 Current BoW feature-review context:
+{context_json}
+"""
+
+
+def build_non_neural_agentic_consistency_prompt(
+    context: Dict[str, Any],
+    search_config: AgenticFeatureSearchConfig,
+) -> str:
+    """Construct the consistency-selection prompt for non-neural candidates."""
+    del search_config
+    context_json = json.dumps(context, indent=2, default=_json_default)
+    return f"""You are selecting stable explicit variables for a causal forest from candidates proposed on separate inner folds.
+
+The outer test fold is not included here. All evidence comes from the current outer-train data only.
+
+Your goals:
+- Gate out one-off noisy candidates that appear in only weak or idiosyncratic inner-fold evidence.
+- Recover plausible real variables that missed one weak inner fold but have strong full outer-train evidence, coherent roles, or clear alias-stable support.
+- Preserve honest causal inference: use only the supplied candidate summaries and do not invent new variables.
+
+Return JSON only with this shape:
+{{
+  "proposals": [
+    {{
+      "action": "add|none",
+      "name": "existing_candidate_name",
+      "type": "categorical|continuous",
+      "categories": ["category_a", "category_b"],
+      "roles": ["confounder", "effect_modifier"],
+      "description": "exact pre-treatment extraction target",
+      "rationale": "why this candidate is stable enough or should be recovered",
+      "expected_signal": "treatment, outcome, or pseudo-target signal expected"
+    }}
+  ]
+}}
+
+Rules:
+- Choose only names listed in candidate_summaries.
+- Prefer candidates that pass the consistency gate.
+- You may recover a below-threshold candidate only if it has strong full_outer_train support or a clear explanation for fold instability.
+- Do not select variables that are post-treatment, outcome-derived, treatment choice itself, response, survival, or toxicity.
+- Keep roles tied to evidence: treatment+outcome support implies confounder; pseudo-target support implies effect_modifier; both signals may justify both roles.
+- Return at most max_selected_candidates add proposals.
+
+Current consistency-selection context:
 {context_json}
 """
 

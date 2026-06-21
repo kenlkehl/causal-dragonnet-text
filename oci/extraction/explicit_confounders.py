@@ -69,14 +69,14 @@ class ExplicitConfounderValue:
 def build_extraction_prompt(
     clinical_text: str,
     specs: List[ExplicitConfounderSpec],
-    max_text_length: int = 8000
+    max_text_length: int = 400000
 ) -> str:
     """Build prompt for confounder extraction.
 
     Args:
         clinical_text: Clinical text to extract from
         specs: List of confounder specifications
-        max_text_length: Maximum characters of text to include
+        max_text_length: Maximum tail characters of text to include
 
     Returns:
         Formatted prompt string for the LLM
@@ -107,8 +107,11 @@ def build_extraction_prompt(
     instructions_text = "\n".join(instructions)
     json_example = "{" + ", ".join(json_fields) + "}"
 
-    # Truncate text if needed
-    text = clinical_text[:max_text_length]
+    # Keep the end of long notes where addenda, latest staging, and recent labs
+    # are often documented.
+    text = str(clinical_text)
+    if max_text_length is not None and len(text) > int(max_text_length):
+        text = text[-int(max_text_length):]
 
     prompt = f"""Read this clinical note and extract the following patient characteristics:
 

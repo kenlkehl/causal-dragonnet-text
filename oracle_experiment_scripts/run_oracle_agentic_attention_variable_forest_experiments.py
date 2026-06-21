@@ -177,7 +177,7 @@ class AgenticAttentionOracleConfig:
     agent_model_name: str = "Qwen/Qwen3.6-27B"
     agent_api_key: str = "EMPTY"
     agent_temperature: float = 0.0
-    agent_max_tokens: int = 8192
+    agent_max_tokens: int = 25000
     agent_schema_repair_attempts: int = 1
     agent_save_context: bool = False
     agent_save_raw_output: bool = False
@@ -189,8 +189,8 @@ class AgenticAttentionOracleConfig:
     extraction_batch_size: int = 16
     extraction_max_retries: int = 3
     extraction_temperature: float = 0.0
-    extraction_max_tokens: int = 4096
-    extraction_max_text_length: int = 8000
+    extraction_max_tokens: int = 25000
+    extraction_max_text_length: int = 400000
     extraction_cache_enabled: bool = True
     extraction_cache_dir: Optional[str] = None
 
@@ -1038,7 +1038,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--agent-api-key", default="EMPTY")
     parser.add_argument("--agent-temperature", type=float, default=0.0)
-    parser.add_argument("--agent-max-tokens", type=int, default=8192)
+    parser.add_argument("--agent-max-tokens", type=int, default=25000)
     parser.add_argument("--agent-schema-repair-attempts", type=int, default=1)
     parser.add_argument("--save-agent-context", action="store_true")
     parser.add_argument("--save-agent-raw-output", action="store_true")
@@ -1058,8 +1058,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--extraction-batch-size", type=int, default=16)
     parser.add_argument("--extraction-max-retries", type=int, default=3)
     parser.add_argument("--extraction-temperature", type=float, default=0.0)
-    parser.add_argument("--extraction-max-tokens", type=int, default=4096)
-    parser.add_argument("--extraction-max-text-length", type=int, default=8000)
+    parser.add_argument("--extraction-max-tokens", type=int, default=25000)
+    parser.add_argument("--extraction-max-text-length", type=int, default=400000)
     parser.add_argument("--extraction-cache-dir", default=None)
     parser.add_argument("--no-extraction-cache", action="store_true")
     return parser

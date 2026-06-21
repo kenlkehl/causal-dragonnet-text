@@ -72,9 +72,9 @@ def main() -> None:
     parser.add_argument("--extraction-batch-size", type=int, default=32)
     parser.add_argument("--extraction-max-retries", type=int, default=3)
     parser.add_argument("--extraction-temperature", type=float, default=0.0)
-    parser.add_argument("--chunk-max-tokens", type=int, default=4096)
-    parser.add_argument("--reconcile-max-tokens", type=int, default=8192)
-    parser.add_argument("--ontology-max-tokens", type=int, default=12000)
+    parser.add_argument("--chunk-max-tokens", type=int, default=25000)
+    parser.add_argument("--reconcile-max-tokens", type=int, default=25000)
+    parser.add_argument("--ontology-max-tokens", type=int, default=25000)
     parser.add_argument("--patient-reconcile-max-records-per-call", type=int, default=120)
     parser.add_argument("--ontology-concepts-per-batch", type=int, default=150)
     parser.add_argument(

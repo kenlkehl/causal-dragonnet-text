@@ -2117,7 +2117,7 @@ def test_experiment_config_parses_agentic_search_config(tmp_path):
     assert search_config.search_mode == "broad_screen"
     assert search_config.broad_candidate_count == 80
     assert search_config.broad_screen_top_k == 20
-    assert search_config.agent_max_tokens == 8000
+    assert search_config.agent_max_tokens == 25000
     empty_start = ExperimentConfig.from_dict(
         {
             "applied_inference": {

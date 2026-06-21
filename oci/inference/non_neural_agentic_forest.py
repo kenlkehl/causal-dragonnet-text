@@ -95,6 +95,11 @@ class NonNeuralAgenticForestRunner:
         self.artifact_dir = self.output_path.parent / "non_neural_agentic_forest"
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self.num_workers = 1 if num_workers is None else int(num_workers)
+        self._has_external_components = (
+            proposal_agent is not None
+            or extraction_provider is not None
+            or evaluator is not None
+        )
 
         self.nn_config: NonNeuralAgenticForestConfig = getattr(
             config.architecture,
@@ -135,25 +140,96 @@ class NonNeuralAgenticForestRunner:
         logger.info("NON-NEURAL AGENTIC FEATURE CAUSAL FOREST")
         logger.info("=" * 80)
 
-        prediction_frames: List[pd.DataFrame] = []
-        for outer_fold, train_idx, test_idx in self._analysis_splits():
+        splits = self._analysis_splits()
+        outer_n_jobs = self._outer_n_jobs(len(splits))
+        if outer_n_jobs > 1 and self._has_external_components:
+            logger.warning(
+                "Outer fold parallelism disabled because custom agent/extractor/"
+                "evaluator objects were supplied and may not be thread-safe."
+            )
+            outer_n_jobs = 1
+
+        if outer_n_jobs > 1:
             logger.info(
-                "Non-neural agentic fold %s: train=%s test=%s",
-                outer_fold,
-                len(train_idx),
-                len(test_idx),
+                "Running %s non-neural outer fold(s) with outer_parallelism=%s",
+                len(splits),
+                outer_n_jobs,
             )
-            prediction_frames.append(
-                self._run_one_analysis_split(
-                    outer_fold=outer_fold,
-                    train_idx=train_idx,
-                    test_idx=test_idx,
+            fold_results = Parallel(n_jobs=outer_n_jobs, prefer="threads")(
+                delayed(self._run_one_analysis_split_isolated)(
+                    int(outer_fold),
+                    np.asarray(train_idx),
+                    np.asarray(test_idx),
+                    outer_n_jobs,
                 )
+                for outer_fold, train_idx, test_idx in splits
             )
+            fold_results = sorted(fold_results, key=lambda item: item["outer_fold"])
+            prediction_frames = [item["predictions"] for item in fold_results]
+            for item in fold_results:
+                self.bow_prediction_frames.extend(item["bow_prediction_frames"])
+                self.importance_rows.extend(item["importance_rows"])
+                self.agent_rows.extend(item["agent_rows"])
+                self.feature_set_rows.extend(item["feature_set_rows"])
+                self.outer_metric_rows.extend(item["outer_metric_rows"])
+        else:
+            prediction_frames: List[pd.DataFrame] = []
+            for outer_fold, train_idx, test_idx in splits:
+                logger.info(
+                    "Non-neural agentic fold %s: train=%s test=%s",
+                    outer_fold,
+                    len(train_idx),
+                    len(test_idx),
+                )
+                prediction_frames.append(
+                    self._run_one_analysis_split(
+                        outer_fold=outer_fold,
+                        train_idx=train_idx,
+                        test_idx=test_idx,
+                    )
+                )
 
         results_df = pd.concat(prediction_frames).sort_values("_oci_row_id")
         self._save_predictions(results_df)
         self._save_artifacts()
+
+    def _run_one_analysis_split_isolated(
+        self,
+        outer_fold: int,
+        train_idx: np.ndarray,
+        test_idx: np.ndarray,
+        outer_n_jobs: int,
+    ) -> Dict[str, Any]:
+        logger.info(
+            "Non-neural agentic isolated fold %s: train=%s test=%s",
+            outer_fold,
+            len(train_idx),
+            len(test_idx),
+        )
+        fold_runner = NonNeuralAgenticForestRunner(
+            dataset=self.dataset,
+            config=self.config,
+            output_path=(
+                self.artifact_dir
+                / f"outer_fold_{int(outer_fold):03d}"
+                / "predictions.parquet"
+            ),
+            num_workers=self._inner_workers_for_outer_job(outer_n_jobs),
+        )
+        predictions = fold_runner._run_one_analysis_split(
+            outer_fold=outer_fold,
+            train_idx=train_idx,
+            test_idx=test_idx,
+        )
+        return {
+            "outer_fold": int(outer_fold),
+            "predictions": predictions,
+            "bow_prediction_frames": fold_runner.bow_prediction_frames,
+            "importance_rows": fold_runner.importance_rows,
+            "agent_rows": fold_runner.agent_rows,
+            "feature_set_rows": fold_runner.feature_set_rows,
+            "outer_metric_rows": fold_runner.outer_metric_rows,
+        }
 
     def _analysis_splits(self) -> List[Tuple[int, np.ndarray, np.ndarray]]:
         if self.config.cv_folds > 1:
@@ -243,6 +319,15 @@ class NonNeuralAgenticForestRunner:
         predictions["outer_fold"] = int(outer_fold)
         predictions["selected_feature_names"] = ",".join(
             spec.name for spec in selected_specs
+        )
+        predictions["selected_feature_roles"] = _format_selected_feature_roles(
+            selected_specs
+        )
+        predictions["selected_confounder_names"] = ",".join(
+            spec.name for spec in selected_specs if "confounder" in spec.roles
+        )
+        predictions["selected_effect_modifier_names"] = ",".join(
+            spec.name for spec in selected_specs if "effect_modifier" in spec.roles
         )
 
         self.outer_metric_rows.append(
@@ -655,6 +740,25 @@ class NonNeuralAgenticForestRunner:
         discovery_df: pd.DataFrame,
         bow_context: Dict[str, Any],
     ) -> List[ExplicitFeatureSpec]:
+        if bool(getattr(self.nn_config, "candidate_consistency_enabled", True)):
+            return self._propose_selected_specs_with_consistency(
+                outer_fold=outer_fold,
+                discovery_df=discovery_df,
+                bow_context=bow_context,
+            )
+        return self._propose_selected_specs_without_consistency(
+            outer_fold=outer_fold,
+            discovery_df=discovery_df,
+            bow_context=bow_context,
+        )
+
+    def _propose_selected_specs_without_consistency(
+        self,
+        *,
+        outer_fold: int,
+        discovery_df: pd.DataFrame,
+        bow_context: Dict[str, Any],
+    ) -> List[ExplicitFeatureSpec]:
         del discovery_df
         raw_proposals = self.proposal_agent.propose(bow_context)
         proposal_agent_trace = _get_agent_response_trace(self.proposal_agent)
@@ -717,6 +821,527 @@ class NonNeuralAgenticForestRunner:
             row["agent_raw_output"] = proposal_agent_trace
         self.agent_rows.append(row)
         return selected_specs
+
+    def _propose_selected_specs_with_consistency(
+        self,
+        *,
+        outer_fold: int,
+        discovery_df: pd.DataFrame,
+        bow_context: Dict[str, Any],
+    ) -> List[ExplicitFeatureSpec]:
+        full_bundle = self._propose_candidate_bundle(
+            outer_fold=outer_fold,
+            scope="full_outer_train",
+            bow_context={
+                **bow_context,
+                "consistency_scope": "full_outer_train",
+            },
+            n_rows=len(discovery_df),
+        )
+        bundles = [
+            full_bundle,
+            *self._inner_consistency_candidate_bundles(
+                outer_fold=outer_fold,
+                discovery_df=discovery_df,
+            ),
+        ]
+        all_proposals = [
+            proposal
+            for bundle in bundles
+            for proposal in bundle.get("valid_proposals", [])
+            if proposal.action == "add"
+        ]
+        if not all_proposals:
+            selected_specs = self._initial_specs()
+            selected_specs, value_harmonization = self._harmonize_value_contracts(
+                outer_fold=outer_fold,
+                selected_specs=selected_specs,
+            )
+            self.agent_rows.append(
+                {
+                    "outer_fold": int(outer_fold),
+                    "consistency_enabled": True,
+                    "proposal_bundles": [
+                        _proposal_bundle_artifact(bundle) for bundle in bundles
+                    ],
+                    "selected_features": [_spec_to_dict(spec) for spec in selected_specs],
+                    "value_harmonization": value_harmonization,
+                    "skipped": "no_valid_consistency_candidates",
+                }
+            )
+            return selected_specs
+
+        alias_input = _merge_duplicate_proposals(all_proposals)
+        alias_resolved, alias_resolution = self._resolve_proposal_aliases(
+            outer_fold=outer_fold,
+            proposals=alias_input,
+        )
+        alias_map = {
+            item["from"]: item["to"]
+            for item in alias_resolution.get("applied_aliases", [])
+            if item.get("from") and item.get("to")
+        }
+        canonical_proposals = {
+            proposal.name: proposal
+            for proposal in alias_resolved
+            if proposal.action == "add"
+        }
+        candidate_summaries, threshold, inner_fold_count = (
+            self._build_consistency_candidate_summaries(
+                bundles=bundles,
+                alias_map=alias_map,
+                canonical_proposals=canonical_proposals,
+            )
+        )
+        consistency_context = self._build_consistency_context(
+            outer_fold=outer_fold,
+            candidate_summaries=candidate_summaries,
+            threshold=threshold,
+            inner_fold_count=inner_fold_count,
+        )
+        consistency_proposals, consistency_selection = self._select_consistent_proposals(
+            context=consistency_context,
+            candidate_summaries=candidate_summaries,
+            canonical_proposals=canonical_proposals,
+        )
+        selected_specs = self._selected_specs_from_proposals(consistency_proposals)
+        selected_specs, value_harmonization = self._harmonize_value_contracts(
+            outer_fold=outer_fold,
+            selected_specs=selected_specs,
+        )
+        self._remember_alias_reference_specs(selected_specs)
+
+        row: Dict[str, Any] = {
+            "outer_fold": int(outer_fold),
+            "consistency_enabled": True,
+            "proposal_bundles": [_proposal_bundle_artifact(bundle) for bundle in bundles],
+            "alias_resolution": alias_resolution,
+            "consistency": {
+                "inner_fold_count": int(inner_fold_count),
+                "min_support_folds": int(threshold),
+                "candidate_summaries": candidate_summaries,
+                "selection": consistency_selection,
+            },
+            "value_harmonization": value_harmonization,
+            "selected_features": [_spec_to_dict(spec) for spec in selected_specs],
+        }
+        if self.search_config.save_agent_context:
+            row["consistency_context"] = consistency_context
+        self.agent_rows.append(row)
+        return selected_specs
+
+    def _propose_candidate_bundle(
+        self,
+        *,
+        outer_fold: int,
+        scope: str,
+        bow_context: Dict[str, Any],
+        n_rows: int,
+        inner_fold: Optional[int] = None,
+        heldout_rows: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        raw_proposals = self.proposal_agent.propose(bow_context)
+        proposal_agent_trace = _get_agent_response_trace(self.proposal_agent)
+        proposals, rejected = validate_agentic_proposals(
+            raw_proposals,
+            current_specs=self._initial_specs(),
+            search_config=self.search_config,
+            allow_removals=False,
+            max_additions=self.nn_config.candidate_proposals_per_fold,
+        )
+        bundle: Dict[str, Any] = {
+            "outer_fold": int(outer_fold),
+            "scope": scope,
+            "inner_fold": inner_fold,
+            "n_rows": int(n_rows),
+            "heldout_rows": None if heldout_rows is None else int(heldout_rows),
+            "raw_proposals": raw_proposals,
+            "valid_proposals": proposals,
+            "rejected_proposals": rejected,
+        }
+        if self.search_config.save_agent_context:
+            bundle["context"] = bow_context
+        if self.search_config.save_agent_raw_output:
+            bundle["agent_raw_output"] = proposal_agent_trace
+        return bundle
+
+    def _inner_consistency_candidate_bundles(
+        self,
+        *,
+        outer_fold: int,
+        discovery_df: pd.DataFrame,
+    ) -> List[Dict[str, Any]]:
+        try:
+            fold_count = _bounded_fold_count(
+                int(self.nn_config.candidate_consistency_inner_folds),
+                len(discovery_df),
+            )
+        except ValueError:
+            return []
+
+        splitter = KFold(
+            n_splits=fold_count,
+            shuffle=True,
+            random_state=51_000 + int(outer_fold),
+        )
+        split_items = [
+            (inner_fold, np.asarray(fit_pos), np.asarray(heldout_pos))
+            for inner_fold, (fit_pos, heldout_pos) in enumerate(
+                splitter.split(discovery_df),
+                start=1,
+            )
+        ]
+        n_jobs = self._candidate_consistency_n_jobs(len(split_items))
+        if n_jobs > 1 and self._has_external_components:
+            logger.warning(
+                "Candidate consistency parallelism disabled because custom "
+                "agent/extractor/evaluator objects were supplied and may not be "
+                "thread-safe."
+            )
+            n_jobs = 1
+
+        if n_jobs <= 1:
+            return [
+                self._build_inner_consistency_candidate_bundle(
+                    outer_fold=outer_fold,
+                    discovery_df=discovery_df,
+                    inner_fold=int(inner_fold),
+                    fit_pos=fit_pos,
+                    heldout_pos=heldout_pos,
+                    total_inner_folds=fold_count,
+                )
+                for inner_fold, fit_pos, heldout_pos in split_items
+            ]
+
+        logger.info(
+            "Non-neural candidate consistency parallelism: outer_fold=%s "
+            "inner_folds=%s n_jobs=%s setting=%s",
+            outer_fold,
+            len(split_items),
+            n_jobs,
+            self.nn_config.candidate_consistency_parallelism,
+        )
+        return Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(self._build_inner_consistency_candidate_bundle_isolated)(
+                int(outer_fold),
+                discovery_df,
+                int(inner_fold),
+                fit_pos,
+                heldout_pos,
+                int(fold_count),
+                int(n_jobs),
+            )
+            for inner_fold, fit_pos, heldout_pos in split_items
+        )
+
+    def _build_inner_consistency_candidate_bundle_isolated(
+        self,
+        outer_fold: int,
+        discovery_df: pd.DataFrame,
+        inner_fold: int,
+        fit_pos: np.ndarray,
+        heldout_pos: np.ndarray,
+        total_inner_folds: int,
+        candidate_n_jobs: int,
+    ) -> Dict[str, Any]:
+        worker = NonNeuralAgenticForestRunner(
+            dataset=self.dataset,
+            config=self.config,
+            output_path=(
+                self.artifact_dir
+                / f"outer_{int(outer_fold):03d}_candidate_inner_{int(inner_fold):03d}"
+                / "predictions.parquet"
+            ),
+            num_workers=self._inner_workers_for_nested_job(candidate_n_jobs),
+        )
+        return worker._build_inner_consistency_candidate_bundle(
+            outer_fold=outer_fold,
+            discovery_df=discovery_df,
+            inner_fold=inner_fold,
+            fit_pos=fit_pos,
+            heldout_pos=heldout_pos,
+            total_inner_folds=total_inner_folds,
+        )
+
+    def _build_inner_consistency_candidate_bundle(
+        self,
+        *,
+        outer_fold: int,
+        discovery_df: pd.DataFrame,
+        inner_fold: int,
+        fit_pos: np.ndarray,
+        heldout_pos: np.ndarray,
+        total_inner_folds: int,
+    ) -> Dict[str, Any]:
+        inner_df = discovery_df.iloc[np.asarray(fit_pos)].reset_index(drop=True)
+        try:
+            bow_result = self._fit_bow_discovery(
+                inner_df,
+                outer_fold=1000 * int(outer_fold) + int(inner_fold),
+            )
+            context = {
+                **bow_result["context"],
+                "outer_fold": int(outer_fold),
+                "inner_fold": int(inner_fold),
+                "consistency_scope": "inner_train",
+                "inner_train_rows": int(len(fit_pos)),
+                "inner_heldout_rows": int(len(heldout_pos)),
+            }
+            return self._propose_candidate_bundle(
+                outer_fold=outer_fold,
+                scope="inner_train",
+                inner_fold=int(inner_fold),
+                bow_context=context,
+                n_rows=len(fit_pos),
+                heldout_rows=len(heldout_pos),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Skipping non-neural candidate consistency inner fold %s/%s "
+                "for outer fold %s: %s",
+                inner_fold,
+                total_inner_folds,
+                outer_fold,
+                exc,
+                exc_info=True,
+            )
+            return {
+                "outer_fold": int(outer_fold),
+                "scope": "inner_train",
+                "inner_fold": int(inner_fold),
+                "n_rows": int(len(fit_pos)),
+                "heldout_rows": int(len(heldout_pos)),
+                "error": str(exc),
+                "valid_proposals": [],
+                "rejected_proposals": [],
+            }
+
+    def _build_consistency_candidate_summaries(
+        self,
+        *,
+        bundles: Sequence[Dict[str, Any]],
+        alias_map: Dict[str, str],
+        canonical_proposals: Dict[str, AgenticFeatureProposal],
+    ) -> Tuple[List[Dict[str, Any]], int, int]:
+        inner_folds = sorted(
+            {
+                int(bundle["inner_fold"])
+                for bundle in bundles
+                if bundle.get("scope") == "inner_train"
+                and bundle.get("inner_fold") is not None
+                and not bundle.get("error")
+            }
+        )
+        inner_fold_count = len(inner_folds)
+        threshold = _candidate_consistency_threshold(
+            inner_fold_count,
+            min_folds=int(self.nn_config.candidate_consistency_min_folds),
+            min_fold_fraction=float(
+                self.nn_config.candidate_consistency_min_fold_fraction
+            ),
+        )
+
+        summary_by_name: Dict[str, Dict[str, Any]] = {}
+        for bundle in bundles:
+            scope = str(bundle.get("scope") or "")
+            inner_fold = bundle.get("inner_fold")
+            for proposal in bundle.get("valid_proposals", []):
+                if proposal.action != "add":
+                    continue
+                name = _resolve_alias_name(proposal.name, alias_map)
+                canonical = canonical_proposals.get(name, proposal)
+                summary = summary_by_name.setdefault(
+                    name,
+                    {
+                        "name": name,
+                        "type": canonical.type,
+                        "categories": canonical.categories,
+                        "roles": canonical.roles,
+                        "description": canonical.description,
+                        "expected_signal": canonical.expected_signal,
+                        "inner_folds": [],
+                        "proposed_on_full_outer_train": False,
+                        "rationales": [],
+                        "expected_signals": [],
+                    },
+                )
+                summary["roles"] = _merge_ordered_values(
+                    summary.get("roles"),
+                    proposal.roles,
+                )
+                summary["categories"] = (
+                    _merge_ordered_values(summary.get("categories"), proposal.categories)
+                    or None
+                )
+                summary["description"] = _merge_text_values(
+                    summary.get("description"),
+                    proposal.description,
+                )
+                summary["expected_signal"] = _merge_text_values(
+                    summary.get("expected_signal"),
+                    proposal.expected_signal,
+                )
+                if proposal.rationale:
+                    summary["rationales"].append(
+                        {
+                            "scope": scope,
+                            "inner_fold": inner_fold,
+                            "text": proposal.rationale,
+                        }
+                    )
+                if proposal.expected_signal:
+                    summary["expected_signals"].append(str(proposal.expected_signal))
+                if scope == "inner_train" and inner_fold is not None:
+                    if int(inner_fold) not in summary["inner_folds"]:
+                        summary["inner_folds"].append(int(inner_fold))
+                elif scope == "full_outer_train":
+                    summary["proposed_on_full_outer_train"] = True
+
+        summaries = []
+        for name in sorted(summary_by_name):
+            summary = summary_by_name[name]
+            support_count = len(summary["inner_folds"])
+            support_fraction = (
+                float(support_count / inner_fold_count)
+                if inner_fold_count > 0
+                else None
+            )
+            summary["inner_folds"] = sorted(summary["inner_folds"])
+            summary["inner_support_count"] = int(support_count)
+            summary["inner_support_fraction"] = support_fraction
+            summary["passes_consistency_gate"] = bool(
+                support_count >= threshold
+                or (inner_fold_count == 0 and summary["proposed_on_full_outer_train"])
+            )
+            summary["rationales"] = summary["rationales"][:5]
+            summary["expected_signals"] = list(
+                dict.fromkeys(summary["expected_signals"])
+            )[:5]
+            summaries.append(summary)
+        return summaries, threshold, inner_fold_count
+
+    def _build_consistency_context(
+        self,
+        *,
+        outer_fold: int,
+        candidate_summaries: List[Dict[str, Any]],
+        threshold: int,
+        inner_fold_count: int,
+    ) -> Dict[str, Any]:
+        recovery_limit = int(
+            self.nn_config.candidate_consistency_recovery_max_candidates
+        )
+        below_threshold = [
+            item
+            for item in _rank_consistency_summaries(candidate_summaries)
+            if not item.get("passes_consistency_gate")
+        ][:recovery_limit]
+        passed = [
+            item
+            for item in _rank_consistency_summaries(candidate_summaries)
+            if item.get("passes_consistency_gate")
+        ]
+        return {
+            "prompt_version": "non_neural_agentic_consistency_v1",
+            "outer_fold": int(outer_fold),
+            "max_selected_candidates": int(self.nn_config.candidate_proposals_per_fold),
+            "inner_fold_count": int(inner_fold_count),
+            "min_support_folds": int(threshold),
+            "min_support_fraction": float(
+                self.nn_config.candidate_consistency_min_fold_fraction
+            ),
+            "selection_policy": [
+                "Keep candidates that pass the inner-fold support gate unless they are redundant or likely leakage.",
+                "Recover below-threshold candidates only when full outer-train evidence is strong or fold absence appears unstable rather than absent.",
+                "Do not invent variables outside candidate_summaries.",
+            ],
+            "candidate_summaries": passed + below_threshold,
+        }
+
+    def _select_consistent_proposals(
+        self,
+        *,
+        context: Dict[str, Any],
+        candidate_summaries: Sequence[Dict[str, Any]],
+        canonical_proposals: Dict[str, AgenticFeatureProposal],
+    ) -> Tuple[List[AgenticFeatureProposal], Dict[str, Any]]:
+        allowed_names = {str(item.get("name")) for item in candidate_summaries}
+        fallback = _fallback_consistency_proposals(
+            candidate_summaries,
+            canonical_proposals,
+        )
+        try:
+            raw_selection = self.proposal_agent.propose(context)
+            selection_trace = _get_agent_response_trace(self.proposal_agent)
+            selected, rejected = validate_agentic_proposals(
+                raw_selection,
+                current_specs=self._initial_specs(),
+                search_config=self.search_config,
+                allow_removals=False,
+                max_additions=self.nn_config.candidate_proposals_per_fold,
+            )
+            filtered = [
+                proposal
+                for proposal in selected
+                if proposal.action == "add" and proposal.name in allowed_names
+            ]
+            rejected.extend(
+                {
+                    "proposal": _proposal_to_dict(proposal),
+                    "reason": "not_in_consistency_candidates",
+                }
+                for proposal in selected
+                if proposal.action == "add" and proposal.name not in allowed_names
+            )
+            if not filtered:
+                filtered = fallback
+                used_fallback = True
+            else:
+                filtered = [
+                    _merge_proposals(canonical_proposals.get(p.name, p), p)
+                    for p in filtered
+                ]
+                used_fallback = False
+            result: Dict[str, Any] = {
+                "raw_selection": raw_selection,
+                "valid_proposals": [_proposal_to_dict(p) for p in filtered],
+                "rejected_proposals": rejected,
+                "used_fallback": used_fallback,
+            }
+            if self.search_config.save_agent_raw_output:
+                result["agent_raw_output"] = selection_trace
+            return filtered, result
+        except Exception as exc:
+            logger.warning(
+                "Non-neural candidate consistency selection failed; using gate fallback",
+                exc_info=True,
+            )
+            return fallback, {
+                "error": str(exc),
+                "valid_proposals": [_proposal_to_dict(p) for p in fallback],
+                "used_fallback": True,
+            }
+
+    def _selected_specs_from_proposals(
+        self,
+        proposals: Sequence[AgenticFeatureProposal],
+    ) -> List[ExplicitFeatureSpec]:
+        return _dedupe_specs(
+            [
+                *self._initial_specs(),
+                *[
+                    ExplicitFeatureSpec(
+                        name=proposal.name,
+                        type=proposal.type or "continuous",
+                        categories=proposal.categories,
+                        roles=proposal.roles,
+                        description=proposal.description,
+                    )
+                    for proposal in proposals
+                    if proposal.action == "add"
+                ],
+            ]
+        )
 
     def _resolve_proposal_aliases(
         self,
@@ -972,11 +1597,44 @@ class NonNeuralAgenticForestRunner:
     def _make_ridge(self) -> Ridge:
         return Ridge(alpha=float(self.nn_config.ridge_alpha), random_state=17)
 
+    def _parallel_n_jobs(self, setting: Any, tasks: int, *, auto_workers: int) -> int:
+        if tasks <= 0:
+            return 1
+        setting_text = str(setting).strip().lower()
+        if setting_text == "auto":
+            return max(1, min(int(auto_workers), int(tasks)))
+        return max(1, min(int(setting_text), int(tasks)))
+
+    def _outer_n_jobs(self, folds: int) -> int:
+        return self._parallel_n_jobs(
+            self.nn_config.outer_parallelism,
+            folds,
+            auto_workers=self.num_workers,
+        )
+
+    def _candidate_consistency_n_jobs(self, folds: int) -> int:
+        return self._parallel_n_jobs(
+            self.nn_config.candidate_consistency_parallelism,
+            folds,
+            auto_workers=self.num_workers,
+        )
+
+    def _inner_workers_for_outer_job(self, outer_n_jobs: int) -> int:
+        if str(self.nn_config.fold_parallelism).strip().lower() != "auto":
+            return self.num_workers
+        return max(1, int(self.num_workers) // max(1, int(outer_n_jobs)))
+
+    def _inner_workers_for_nested_job(self, n_jobs: int) -> int:
+        if str(self.nn_config.fold_parallelism).strip().lower() != "auto":
+            return self.num_workers
+        return max(1, int(self.num_workers) // max(1, int(n_jobs)))
+
     def _fold_n_jobs(self, folds: int) -> int:
-        setting = str(self.nn_config.fold_parallelism).strip().lower()
-        if setting == "auto":
-            return max(1, min(int(self.num_workers), int(folds)))
-        return max(1, min(int(setting), int(folds)))
+        return self._parallel_n_jobs(
+            self.nn_config.fold_parallelism,
+            folds,
+            auto_workers=self.num_workers,
+        )
 
     def _run_fold_tasks(self, run_fold: Any, split_items: Sequence[Any]) -> List[Any]:
         n_jobs = self._fold_n_jobs(len(split_items))
@@ -1026,6 +1684,123 @@ def _normalize_text(value: Any) -> str:
     text = unicodedata.normalize("NFKC", str(value)).translate(_DASH_TRANSLATION)
     text = text.replace("\u2265", ">=").replace("\u2264", "<=")
     return text.lower()
+
+
+def _format_selected_feature_roles(specs: Sequence[ExplicitFeatureSpec]) -> str:
+    return ",".join(
+        f"{spec.name}[{'+'.join(_ordered_roles(spec.roles))}]"
+        for spec in specs
+    )
+
+
+def _ordered_roles(roles: Sequence[str]) -> List[str]:
+    role_set = {str(role) for role in roles}
+    ordered = [
+        role for role in ("confounder", "effect_modifier") if role in role_set
+    ]
+    ordered.extend(sorted(role_set.difference(ordered)))
+    return ordered or ["unspecified"]
+
+
+def _candidate_consistency_threshold(
+    fold_count: int,
+    *,
+    min_folds: int,
+    min_fold_fraction: float,
+) -> int:
+    if fold_count <= 0:
+        return 1
+    return min(
+        int(fold_count),
+        max(
+            1,
+            int(min_folds),
+            int(np.ceil(float(min_fold_fraction) * int(fold_count))),
+        ),
+    )
+
+
+def _resolve_alias_name(name: str, alias_map: Dict[str, str]) -> str:
+    current = str(name)
+    seen = set()
+    while current in alias_map and current not in seen:
+        seen.add(current)
+        current = alias_map[current]
+    return current
+
+
+def _merge_duplicate_proposals(
+    proposals: Sequence[AgenticFeatureProposal],
+) -> List[AgenticFeatureProposal]:
+    merged: Dict[str, AgenticFeatureProposal] = {}
+    for proposal in proposals:
+        if proposal.action != "add":
+            continue
+        if proposal.name in merged:
+            merged[proposal.name] = _merge_proposals(merged[proposal.name], proposal)
+        else:
+            merged[proposal.name] = proposal
+    return list(merged.values())
+
+
+def _fallback_consistency_proposals(
+    candidate_summaries: Sequence[Dict[str, Any]],
+    canonical_proposals: Dict[str, AgenticFeatureProposal],
+) -> List[AgenticFeatureProposal]:
+    selected = [
+        canonical_proposals[item["name"]]
+        for item in candidate_summaries
+        if item.get("passes_consistency_gate") and item.get("name") in canonical_proposals
+    ]
+    if selected:
+        return selected
+    full_supported = [
+        canonical_proposals[item["name"]]
+        for item in candidate_summaries
+        if item.get("proposed_on_full_outer_train")
+        and item.get("name") in canonical_proposals
+    ]
+    return full_supported[:1]
+
+
+def _rank_consistency_summaries(
+    candidate_summaries: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    return sorted(
+        candidate_summaries,
+        key=lambda item: (
+            -int(bool(item.get("passes_consistency_gate"))),
+            -int(item.get("inner_support_count") or 0),
+            -int(bool(item.get("proposed_on_full_outer_train"))),
+            str(item.get("name") or ""),
+        ),
+    )
+
+
+def _proposal_bundle_artifact(bundle: Dict[str, Any]) -> Dict[str, Any]:
+    artifact = {
+        key: value
+        for key, value in bundle.items()
+        if key not in {"valid_proposals"}
+    }
+    artifact["valid_proposals"] = [
+        _proposal_to_dict(proposal)
+        for proposal in bundle.get("valid_proposals", [])
+    ]
+    return artifact
+
+
+def _proposal_to_dict(proposal: AgenticFeatureProposal) -> Dict[str, Any]:
+    return {
+        "action": proposal.action,
+        "name": proposal.name,
+        "type": proposal.type,
+        "categories": proposal.categories,
+        "roles": proposal.roles,
+        "description": proposal.description,
+        "rationale": proposal.rationale,
+        "expected_signal": proposal.expected_signal,
+    }
 
 
 def _bounded_fold_count(requested: int, n_rows: int) -> int:

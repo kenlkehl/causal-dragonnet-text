@@ -4,6 +4,7 @@ from oci.config import ExperimentConfig, ExplicitFeatureSpec
 from oci.extraction import (
     ExplicitFeatureValue,
     VLLMFeatureExtractor,
+    build_extraction_prompt,
     infer_vllm_reasoning_parser,
     parse_extraction_response,
     resolve_vllm_reasoning_parser,
@@ -143,6 +144,21 @@ def test_parse_extraction_response_strips_inline_reasoning_trace():
 
     assert parsed["age"].value == 71.0
     assert parsed["age"].is_missing is False
+
+
+def test_build_extraction_prompt_truncates_to_note_tail():
+    specs = [
+        ExplicitFeatureSpec(name="age", type="continuous", roles=["confounder"]),
+    ]
+
+    prompt = build_extraction_prompt(
+        "beginning age 44. " + ("middle " * 20) + "end age 71.",
+        specs,
+        max_text_length=30,
+    )
+
+    assert "end age 71" in prompt
+    assert "beginning age 44" not in prompt
 
 
 def test_parse_extraction_response_maps_categorical_value_aliases():

@@ -48,7 +48,7 @@ def _compute_config_hash(config: Dict[str, Any]) -> str:
         'extraction_max_tokens': config.get('extraction_max_tokens', 1024),
         'extraction_max_text_length': config.get(
             'extraction_max_text_length',
-            config.get('max_text_length', 8000),
+            config.get('max_text_length', 400000),
         ),
     }
     config_str = json.dumps(hash_dict, sort_keys=True)

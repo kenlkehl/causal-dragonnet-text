@@ -8,6 +8,16 @@ import json
 import hashlib
 
 
+def _validate_parallelism_setting(value: Any, name: str) -> None:
+    if str(value).strip().lower() == "auto":
+        return
+    try:
+        if int(value) < 1:
+            raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be 'auto' or a positive integer") from exc
+
+
 # =============================================================================
 # EXPLICIT FEATURE EXTRACTION CONFIGURATION
 # =============================================================================
@@ -93,8 +103,8 @@ class ExplicitFeatureExtractionConfig:
     extraction_batch_size: int = 32
     extraction_max_retries: int = 3  # Retries per patient before marking as missing
     extraction_temperature: float = 0.0  # LLM temperature (0 for deterministic)
-    extraction_max_tokens: int = 1024  # Max tokens for LLM response
-    extraction_max_text_length: int = 8000  # Max clinical text chars in extraction prompt
+    extraction_max_tokens: int = 25000  # Max tokens for LLM response
+    extraction_max_text_length: int = 400000  # Max clinical text chars in extraction prompt
 
     # Caching
     cache_enabled: bool = True  # Cache extraction results to disk
@@ -354,7 +364,7 @@ class AgenticFeatureSearchConfig:
     agent_model_name: str = "Qwen/Qwen2.5-7B-Instruct"
     agent_api_key: str = "EMPTY"
     agent_temperature: float = 0.0
-    agent_max_tokens: int = 8000
+    agent_max_tokens: int = 25000
     agent_schema_repair_attempts: int = 1
 
     # Prompt/context controls. Clinical text examples are sent to the proposal
@@ -446,6 +456,13 @@ class NonNeuralAgenticForestConfig:
     e_clip: float = 0.01
     top_n_features: int = 100
     candidate_proposals_per_fold: int = 30
+    candidate_consistency_enabled: bool = True
+    candidate_consistency_inner_folds: int = 3
+    candidate_consistency_min_folds: int = 2
+    candidate_consistency_min_fold_fraction: float = 0.5
+    candidate_consistency_recovery_max_candidates: int = 12
+    candidate_consistency_parallelism: str = "1"
+    outer_parallelism: str = "1"
     # "auto" uses the runner num_workers setting; set a positive integer to
     # parallelize BoW nuisance/effect cross-fit folds explicitly.
     fold_parallelism: str = "auto"
@@ -487,6 +504,32 @@ class NonNeuralAgenticForestConfig:
             raise ValueError(
                 "non_neural_agentic_forest.candidate_proposals_per_fold must be >= 1"
             )
+        if self.candidate_consistency_inner_folds < 2:
+            raise ValueError(
+                "non_neural_agentic_forest.candidate_consistency_inner_folds must be >= 2"
+            )
+        if self.candidate_consistency_min_folds < 1:
+            raise ValueError(
+                "non_neural_agentic_forest.candidate_consistency_min_folds must be >= 1"
+            )
+        if not 0.0 < self.candidate_consistency_min_fold_fraction <= 1.0:
+            raise ValueError(
+                "non_neural_agentic_forest.candidate_consistency_min_fold_fraction "
+                "must be in (0, 1]"
+            )
+        if self.candidate_consistency_recovery_max_candidates < 0:
+            raise ValueError(
+                "non_neural_agentic_forest.candidate_consistency_recovery_max_candidates "
+                "must be >= 0"
+            )
+        _validate_parallelism_setting(
+            self.candidate_consistency_parallelism,
+            "non_neural_agentic_forest.candidate_consistency_parallelism",
+        )
+        _validate_parallelism_setting(
+            self.outer_parallelism,
+            "non_neural_agentic_forest.outer_parallelism",
+        )
         if self.fold_parallelism != "auto":
             try:
                 if int(self.fold_parallelism) < 1:

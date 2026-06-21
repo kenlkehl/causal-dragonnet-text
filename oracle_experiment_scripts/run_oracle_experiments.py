@@ -189,7 +189,7 @@ class ExperimentConfig:
     agentic_agent_server_url: Optional[str] = None
     agentic_agent_model_name: str = "Qwen/Qwen2.5-7B-Instruct"
     agentic_agent_api_key: str = "EMPTY"
-    agentic_agent_max_tokens: int = 8000
+    agentic_agent_max_tokens: int = 25000
     agentic_agent_context_chars: int = 4800
     agentic_agent_context_examples: int = 3
     agentic_save_agent_context: bool = False
@@ -201,8 +201,8 @@ class ExperimentConfig:
     agentic_vllm_max_model_len: Optional[int] = None
     agentic_vllm_reasoning_parser: Optional[str] = "auto"
     agentic_extraction_max_retries: int = 3
-    agentic_extraction_max_tokens: int = 1024
-    agentic_extraction_max_text_length: int = 8000
+    agentic_extraction_max_tokens: int = 25000
+    agentic_extraction_max_text_length: int = 400000
     agentic_extraction_batch_size: int = 32
     agentic_cache_dir: Optional[str] = None
 
@@ -2272,7 +2272,7 @@ def generate_experiment_grid(
     agentic_agent_server_url: Optional[str] = None,
     agentic_agent_model_name: str = "nvidia/Gemma-4-31B-IT-NVFP4",
     agentic_agent_api_key: str = "EMPTY",
-    agentic_agent_max_tokens: int = 8000,
+    agentic_agent_max_tokens: int = 25000,
     agentic_agent_context_chars: int = 4800,
     agentic_agent_context_examples: int = 3,
     agentic_save_agent_context: bool = False,
@@ -2284,8 +2284,8 @@ def generate_experiment_grid(
     agentic_vllm_max_model_len: Optional[int] = None,
     agentic_vllm_reasoning_parser: Optional[str] = "auto",
     agentic_extraction_max_retries: int = 3,
-    agentic_extraction_max_tokens: int = 1024,
-    agentic_extraction_max_text_length: int = 8000,
+    agentic_extraction_max_tokens: int = 25000,
+    agentic_extraction_max_text_length: int = 400000,
     agentic_extraction_batch_size: int = 32,
     agentic_cache_dir: Optional[str] = None,
 ) -> List[ExperimentConfig]:
@@ -3112,7 +3112,7 @@ def main():
     parser.add_argument(
         "--agentic-agent-max-tokens",
         type=int,
-        default=8000,
+        default=25000,
         help="Maximum generation tokens for the feature proposal agent."
     )
     parser.add_argument(
@@ -3213,13 +3213,13 @@ def main():
     parser.add_argument(
         "--agentic-extraction-max-tokens",
         type=int,
-        default=1024,
+        default=25000,
         help="Maximum extraction response tokens per feature."
     )
     parser.add_argument(
         "--agentic-extraction-max-text-length",
         type=int,
-        default=8000,
+        default=400000,
         help="Maximum clinical text characters included in extraction prompts."
     )
     parser.add_argument(
