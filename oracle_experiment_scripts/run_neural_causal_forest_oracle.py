@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 """Oracle experiment runner for the neural causal-forest text extractor.
 
-The runner is tailored to the synthetic oncology datasets where the true
-confounder/effect modifier columns are present.  It trains the neural causal
-forest inside outer folds, evaluates held-out CATE recovery, and reports whether
-attention evidence hits age and PD-L1 terms.
+The runner is tailored to synthetic datasets where true treatment-effect columns
+may be present.  It trains the neural causal forest inside outer folds, evaluates
+held-out CATE recovery, and can optionally add synthetic oracle-hit annotations
+to exported attention evidence for debugging.
 
 Typical quick run:
 
@@ -68,8 +68,6 @@ from oci.models.neural_causal_forest_extractor import (  # noqa: E402
 logger = logging.getLogger(__name__)
 
 TRUE_TAU_CANDIDATES = ["true_ite_prob", "true_ite", "true_tau", "tau"]
-TRUE_CONFOUNDER_CANDIDATES = ["true_age", "age"]
-TRUE_EFFECT_MODIFIER_CANDIDATES = ["true_pdl1", "pdl1", "pd_l1", "pdl1_status"]
 
 
 def _bool_arg(value: str) -> bool:
@@ -178,6 +176,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=None)
 
     parser.add_argument("--no-attention", action="store_true", help="Skip attention evidence artifacts")
+    parser.add_argument(
+        "--add-oracle-hits",
+        action="store_true",
+        help="Annotate attention evidence artifacts with synthetic oracle regex hits for debugging.",
+    )
     parser.add_argument("--save-fold-models", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--verbose", action="store_true")
@@ -457,17 +460,26 @@ def _run_one_fold(
             )
         )
         if not effect_attention.empty:
-            effect_attention = add_oracle_attention_hits(effect_attention)
-            write_dataframe(effect_attention, fold_dir / "heldout_effect_attention.parquet")
+            effect_attention_artifact = (
+                add_oracle_attention_hits(effect_attention)
+                if args.add_oracle_hits
+                else effect_attention
+            )
+            write_dataframe(effect_attention_artifact, fold_dir / "heldout_effect_attention.parquet")
             _write_jsonl(
-                build_agent_context_rows(effect_attention, stage="effect_modifier", max_rows=80),
+                build_agent_context_rows(effect_attention_artifact, stage="effect_modifier", max_rows=80),
                 fold_dir / "agent_context_effect_modifier.jsonl",
             )
         if not result.nuisance_attention.empty:
-            nuisance_attention = add_oracle_attention_hits(result.nuisance_attention)
-            write_dataframe(nuisance_attention, fold_dir / "train_nuisance_attention.parquet")
+            nuisance_attention = result.nuisance_attention
+            nuisance_attention_artifact = (
+                add_oracle_attention_hits(nuisance_attention)
+                if args.add_oracle_hits
+                else nuisance_attention
+            )
+            write_dataframe(nuisance_attention_artifact, fold_dir / "train_nuisance_attention.parquet")
             _write_jsonl(
-                build_agent_context_rows(nuisance_attention, stage="nuisance", max_rows=80),
+                build_agent_context_rows(nuisance_attention_artifact, stage="nuisance", max_rows=80),
                 fold_dir / "agent_context_nuisance.jsonl",
             )
         else:

@@ -137,6 +137,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attention-top-k", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--no-attention", action="store_true", help="Skip attention evidence export")
+    parser.add_argument(
+        "--add-oracle-hits",
+        action="store_true",
+        help="Annotate attention evidence with synthetic oracle regex hits for debugging.",
+    )
     return parser.parse_args()
 
 
@@ -262,14 +267,22 @@ def main() -> None:
     write_dataframe(result.train_predictions, output_dir / "train_predictions.parquet")
 
     if not result.nuisance_attention.empty:
-        nuisance_attention = add_oracle_attention_hits(result.nuisance_attention)
+        nuisance_attention = (
+            add_oracle_attention_hits(result.nuisance_attention)
+            if args.add_oracle_hits
+            else result.nuisance_attention
+        )
         write_dataframe(nuisance_attention, output_dir / "nuisance_attention_evidence.parquet")
         _write_jsonl(
             build_agent_context_rows(nuisance_attention, stage="nuisance", max_rows=100),
             output_dir / "agent_context_nuisance.jsonl",
         )
     if not result.effect_attention.empty:
-        effect_attention = add_oracle_attention_hits(result.effect_attention)
+        effect_attention = (
+            add_oracle_attention_hits(result.effect_attention)
+            if args.add_oracle_hits
+            else result.effect_attention
+        )
         write_dataframe(effect_attention, output_dir / "effect_attention_evidence.parquet")
         _write_jsonl(
             build_agent_context_rows(effect_attention, stage="effect_modifier", max_rows=100),

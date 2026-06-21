@@ -1198,10 +1198,10 @@ class OpenAICompatibleFeatureSearchAgent:
             0,
             int(getattr(self.search_config, "agent_schema_repair_attempts", 1)),
         )
-        is_consensus_disambiguation = (
-            context.get("prompt_version")
-            == "agentic_attention_consensus_disambiguation_v1"
-        )
+        is_consensus_disambiguation = context.get("prompt_version") in {
+            "agentic_attention_consensus_disambiguation_v1",
+            "non_neural_agentic_alias_resolution_v1",
+        }
 
         for attempt_idx in range(max_repair_attempts + 1):
             response = self._client.chat.completions.create(
@@ -1735,6 +1735,9 @@ def build_agent_prompt(
     if context.get("prompt_version") == "agentic_attention_consensus_disambiguation_v1":
         return build_attention_consensus_disambiguation_prompt(context, search_config)
 
+    if context.get("prompt_version") == "non_neural_agentic_alias_resolution_v1":
+        return build_non_neural_agentic_alias_resolution_prompt(context, search_config)
+
     if context.get("prompt_version") == "agentic_attention_variable_forest_v1":
         return build_attention_variable_agent_prompt(context, search_config)
 
@@ -1883,12 +1886,56 @@ Rules:
 - Use only names that appear in proposed_variables_by_fold.
 - canonical_name must be one of the member_names.
 - A group can pass consensus only if its members appear in at least {threshold} distinct folds.
-- Merge exact aliases such as different names for the same age-at-baseline target.
+- Merge exact aliases such as different names for the same measurement target and timing.
 - Do not merge variables with different types or incompatible categorical categories.
-- Do not merge nearby but distinct clinical concepts, such as age at diagnosis versus time since diagnosis, biomarker status versus mutation burden, or disease stage versus metastatic site.
+- Do not merge nearby but distinct clinical concepts, such as baseline value versus change over time, biomarker status versus mutation burden, or disease stage versus metastatic site.
 - Leave single-fold or ambiguous concepts unmerged rather than forcing a group.
 
 Current consensus-disambiguation context:
+{context_json}
+"""
+
+
+def build_non_neural_agentic_alias_resolution_prompt(
+    context: Dict[str, Any],
+    search_config: AgenticFeatureSearchConfig,
+) -> str:
+    """Construct a generic alias-resolution prompt for non-neural proposals."""
+    del search_config
+    context_json = json.dumps(context, indent=2, default=_json_default)
+    return f"""You are resolving aliases among explicit patient-level variables proposed for causal inference.
+
+Your task is narrow: merge aliases only. Group names only when they refer to the same exact pre-treatment extraction target. Do not create new variables, broaden a target, or merge related but clinically distinct concepts.
+
+Return JSON only with this shape:
+{{
+  "groups": [
+    {{
+      "canonical_name": "one_existing_candidate_or_known_name",
+      "member_names": ["existing_name_a", "existing_name_b"],
+      "type": "categorical|continuous",
+      "categories": ["category_a", "category_b"],
+      "description": "exact shared extraction target",
+      "roles": ["confounder", "effect_modifier"],
+      "rationale": "brief reason these names are aliases"
+    }}
+  ],
+  "unmerged": [
+    {{
+      "name": "existing_name",
+      "reason": "why this was not equivalent to another proposal"
+    }}
+  ]
+}}
+
+Rules:
+- Use only names that appear in proposed_features or known_canonical_features.
+- canonical_name must be one of member_names, unless a member is an alias of a known_canonical_features name; in that case prefer the known canonical name.
+- Merge only when the names, descriptions, categories, and roles describe the same measurable variable.
+- Do not merge broad and narrow targets, timing variants, measurement-method variants, or clinically related but distinct concepts.
+- Leave singletons and ambiguous concepts unmerged.
+
+Current alias-resolution context:
 {context_json}
 """
 
@@ -1915,7 +1962,7 @@ The upstream models are non-neural:
 Your task is to propose at most {max_proposals} extractable pre-treatment patient-level variables for a downstream causal forest.
 
 Rules:
-- Propose variables, not raw tokens. For example, convert features like "age 78" or "78-year-old" into an age variable.
+- Propose variables, not raw tokens. Convert token patterns into precise extractable patient-level variables.
 - Variables supported by both treatment and outcome feature weights should usually be confounders.
 - Variables supported by pseudo-target feature weights should usually be effect modifiers.
 - A variable may have both roles when justified.

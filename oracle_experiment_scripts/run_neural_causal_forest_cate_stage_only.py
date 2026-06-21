@@ -62,8 +62,6 @@ from oci.models.neural_causal_forest_extractor import (  # noqa: E402
 logger = logging.getLogger(__name__)
 
 TRUE_TAU_CANDIDATES = ["true_ite_prob", "true_ite", "true_tau", "tau"]
-TRUE_CONFOUNDER_CANDIDATES = ["true_age", "age"]
-TRUE_EFFECT_MODIFIER_CANDIDATES = ["true_pdl1", "pdl1", "pd_l1", "pdl1_status"]
 
 
 def _bool_arg(value: str) -> bool:
@@ -204,6 +202,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=None)
 
     parser.add_argument("--no-attention", action="store_true", help="Skip effect attention artifacts")
+    parser.add_argument(
+        "--add-oracle-hits",
+        action="store_true",
+        help="Annotate attention evidence artifacts with synthetic oracle regex hits for debugging.",
+    )
     parser.add_argument("--save-fold-models", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--verbose", action="store_true")
@@ -643,10 +646,14 @@ def _run_one_fold(
             )
         )
         if not effect_attention.empty:
-            effect_attention = add_oracle_attention_hits(effect_attention)
-            write_dataframe(effect_attention, fold_dir / "heldout_effect_attention.parquet")
+            effect_attention_artifact = (
+                add_oracle_attention_hits(effect_attention)
+                if args.add_oracle_hits
+                else effect_attention
+            )
+            write_dataframe(effect_attention_artifact, fold_dir / "heldout_effect_attention.parquet")
             _write_jsonl(
-                build_agent_context_rows(effect_attention, stage="effect_modifier", max_rows=80),
+                build_agent_context_rows(effect_attention_artifact, stage="effect_modifier", max_rows=80),
                 fold_dir / "agent_context_effect_modifier.jsonl",
             )
 

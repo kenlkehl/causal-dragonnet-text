@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -27,6 +26,7 @@ from ..config import (
     NonNeuralAgenticForestConfig,
 )
 from .agentic_explicit_feature_forest import (
+    AgenticFeatureProposal,
     CausalForestExplicitEvaluator,
     OpenAICompatibleFeatureSearchAgent,
     SplitEvaluation,
@@ -49,47 +49,6 @@ _DASH_TRANSLATION = dict.fromkeys(
     map(ord, "\u2010\u2011\u2012\u2013\u2014\u2212"),
     "-",
 )
-
-_CANONICAL_FEATURE_ALIASES = {
-    "age_at_baseline": "age",
-    "age_at_diagnosis": "age",
-    "age_at_start": "age",
-    "age_at_treatment": "age",
-    "age_at_treatment_initiation": "age",
-    "age_in_years": "age",
-    "age_years": "age",
-    "baseline_age": "age",
-    "patient_age": "age",
-    "patient_age_years": "age",
-    "pdl1_expression": "pd_l1_expression",
-    "pdl1_expression_level": "pd_l1_expression",
-    "pdl1_level": "pd_l1_expression",
-    "pdl1_status": "pd_l1_expression",
-    "pdl1_tps": "pd_l1_expression",
-    "pd_l1_expression_level": "pd_l1_expression",
-    "pd_l1_level": "pd_l1_expression",
-    "pd_l1_status": "pd_l1_expression",
-    "pd_l1_tps": "pd_l1_expression",
-    "pd_l1_tumor_proportion_score": "pd_l1_expression",
-    "tumor_pd_l1_expression": "pd_l1_expression",
-    "tumor_pd_l1_expression_level": "pd_l1_expression",
-    "tumor_pd_l1_status": "pd_l1_expression",
-}
-
-_CANONICAL_FEATURE_NAME_GUIDANCE = {
-    "age": [
-        "patient_age",
-        "baseline_age",
-        "age_at_treatment_initiation",
-        "age_in_years",
-    ],
-    "pd_l1_expression": [
-        "pdl1_expression",
-        "pd_l1_expression_level",
-        "pd_l1_status",
-        "pd_l1_tps",
-    ],
-}
 
 
 def run_non_neural_agentic_forest(
@@ -169,6 +128,7 @@ class NonNeuralAgenticForestRunner:
         self.agent_rows: List[Dict[str, Any]] = []
         self.feature_set_rows: List[Dict[str, Any]] = []
         self.outer_metric_rows: List[Dict[str, Any]] = []
+        self.alias_reference_specs: List[ExplicitFeatureSpec] = self._initial_specs()
 
     def run(self) -> None:
         logger.info("=" * 80)
@@ -661,11 +621,10 @@ class NonNeuralAgenticForestRunner:
                 "Suggest explicit pre-treatment patient-level variables, not raw text tokens.",
                 "Use variables predictive of both treatment and outcome as confounders.",
                 "Use variables predictive of the pseudo-target as effect modifiers.",
-                "Use canonical feature names for common aliases; for example use age for patient age and pd_l1_expression for PD-L1 expression, PD-L1 level, PD-L1 status, or PD-L1 TPS.",
+                "Avoid near-duplicate aliases for the same extraction target; a separate alias-resolution pass may merge proposal names.",
             ],
             "current_features": [_spec_to_dict(spec) for spec in self._initial_specs()],
-            "canonical_feature_name_guidance": _CANONICAL_FEATURE_NAME_GUIDANCE,
-            "model_diagnostics": metrics,
+            "model_diagnostics": _agent_visible_metrics(metrics),
             "feature_importance": importance,
             "clinical_text_examples": _clinical_text_examples(
                 discovery_df,
@@ -698,15 +657,17 @@ class NonNeuralAgenticForestRunner:
     ) -> List[ExplicitFeatureSpec]:
         del discovery_df
         raw_proposals = self.proposal_agent.propose(bow_context)
-        canonical_raw_proposals, canonical_aliases = _canonicalize_raw_proposals(
-            raw_proposals
-        )
+        proposal_agent_trace = _get_agent_response_trace(self.proposal_agent)
         proposals, rejected = validate_agentic_proposals(
-            canonical_raw_proposals,
+            raw_proposals,
             current_specs=self._initial_specs(),
             search_config=self.search_config,
             allow_removals=False,
             max_additions=self.nn_config.candidate_proposals_per_fold,
+        )
+        proposals, alias_resolution = self._resolve_proposal_aliases(
+            outer_fold=outer_fold,
+            proposals=proposals,
         )
         selected_specs = _dedupe_specs(
             [
@@ -724,11 +685,11 @@ class NonNeuralAgenticForestRunner:
                 ],
             ]
         )
+        self._remember_alias_reference_specs(selected_specs)
         row: Dict[str, Any] = {
             "outer_fold": int(outer_fold),
             "raw_proposals": raw_proposals,
-            "canonicalized_raw_proposals": canonical_raw_proposals,
-            "canonical_aliases": canonical_aliases,
+            "alias_resolution": alias_resolution,
             "valid_proposals": [
                 {
                     "action": proposal.action,
@@ -748,9 +709,79 @@ class NonNeuralAgenticForestRunner:
         if self.search_config.save_agent_context:
             row["context"] = bow_context
         if self.search_config.save_agent_raw_output:
-            row["agent_raw_output"] = _get_agent_response_trace(self.proposal_agent)
+            row["agent_raw_output"] = proposal_agent_trace
         self.agent_rows.append(row)
         return selected_specs
+
+    def _resolve_proposal_aliases(
+        self,
+        *,
+        outer_fold: int,
+        proposals: List[AgenticFeatureProposal],
+    ) -> Tuple[List[AgenticFeatureProposal], Dict[str, Any]]:
+        add_proposals = [proposal for proposal in proposals if proposal.action == "add"]
+        known_specs = _dedupe_specs(self.alias_reference_specs)
+        if not add_proposals:
+            return proposals, {"skipped": "no_valid_additions"}
+        if len(add_proposals) < 2 and not known_specs:
+            return proposals, {"skipped": "fewer_than_two_additions_and_no_known_features"}
+
+        context = {
+            "prompt_version": "non_neural_agentic_alias_resolution_v1",
+            "outer_fold": int(outer_fold),
+            "known_canonical_features": [_spec_to_dict(spec) for spec in known_specs],
+            "proposed_features": [
+                {
+                    "name": proposal.name,
+                    "type": proposal.type,
+                    "categories": proposal.categories,
+                    "roles": proposal.roles,
+                    "description": proposal.description,
+                    "rationale": proposal.rationale,
+                    "expected_signal": proposal.expected_signal,
+                }
+                for proposal in add_proposals
+            ],
+        }
+
+        try:
+            response = self.proposal_agent.propose(context)
+            alias_trace = _get_agent_response_trace(self.proposal_agent)
+        except Exception as exc:
+            logger.warning(
+                "Non-neural alias resolution failed; using unmerged proposal names",
+                exc_info=True,
+            )
+            return proposals, {"error": str(exc), "applied_aliases": []}
+
+        resolved, applied_aliases = _apply_alias_resolution(
+            proposals=proposals,
+            known_specs=known_specs,
+            response=response,
+        )
+        result: Dict[str, Any] = {
+            "response": response,
+            "applied_aliases": applied_aliases,
+        }
+        if self.search_config.save_agent_raw_output:
+            result["agent_raw_output"] = alias_trace
+        return resolved, result
+
+    def _remember_alias_reference_specs(
+        self,
+        selected_specs: Sequence[ExplicitFeatureSpec],
+    ) -> None:
+        initial_names = {initial.name for initial in self._initial_specs()}
+        self.alias_reference_specs = _dedupe_specs(
+            [
+                *self.alias_reference_specs,
+                *[
+                    spec
+                    for spec in selected_specs
+                    if spec.name not in initial_names
+                ],
+            ]
+        )
 
     def _filter_specs_by_extraction_coverage(
         self,
@@ -948,7 +979,6 @@ def _normalize_texts(values: Sequence[Any]) -> List[str]:
 def _normalize_text(value: Any) -> str:
     text = unicodedata.normalize("NFKC", str(value)).translate(_DASH_TRANSLATION)
     text = text.replace("\u2265", ">=").replace("\u2264", "<=")
-    text = re.sub(r"pd\s*-\s*l1", "pd-l1", text, flags=re.IGNORECASE)
     return text.lower()
 
 
@@ -1057,67 +1087,140 @@ def _resize_scores(values: np.ndarray, n_features: int) -> np.ndarray:
     return resized
 
 
-def _canonical_feature_name(name: Any) -> str:
-    normalized = _normalize_feature_name(name)
-    return _CANONICAL_FEATURE_ALIASES.get(normalized, normalized)
+def _apply_alias_resolution(
+    *,
+    proposals: Sequence[AgenticFeatureProposal],
+    known_specs: Sequence[ExplicitFeatureSpec],
+    response: Any,
+) -> Tuple[List[AgenticFeatureProposal], List[Dict[str, str]]]:
+    if not isinstance(response, dict):
+        return list(proposals), []
 
+    proposal_by_name = {
+        proposal.name: proposal for proposal in proposals if proposal.action == "add"
+    }
+    known_by_name = {spec.name: spec for spec in known_specs}
+    allowed_names = set(proposal_by_name) | set(known_by_name)
+    alias_to_canonical: Dict[str, str] = {}
+    applied_aliases: List[Dict[str, str]] = []
 
-def _canonicalize_raw_proposals(
-    raw_proposals: Sequence[Dict[str, Any]],
-) -> Tuple[List[Any], List[Dict[str, str]]]:
-    merged_by_key: Dict[Tuple[str, str], Any] = {}
-    order: List[Tuple[str, str]] = []
-    aliases: List[Dict[str, str]] = []
-    passthrough_counter = 0
+    groups = response.get("groups") or []
+    if not isinstance(groups, list):
+        return list(proposals), []
 
-    for raw in raw_proposals:
-        if not isinstance(raw, dict):
-            passthrough_counter += 1
-            key = (f"malformed:{passthrough_counter}", "")
-            merged_by_key[key] = raw
-            order.append(key)
+    for group in groups:
+        if not isinstance(group, dict):
             continue
-
-        copied = dict(raw)
-        original_name = _normalize_feature_name(copied.get("name", ""))
-        canonical_name = _canonical_feature_name(original_name)
-        if original_name and canonical_name != original_name:
-            aliases.append({"from": original_name, "to": canonical_name})
-            copied["name"] = canonical_name
-
-        action = str(copied.get("action", "")).strip().lower()
-        if action == "add" and canonical_name:
-            key = (action, canonical_name)
-            if key not in merged_by_key:
-                merged_by_key[key] = copied
-                order.append(key)
-            else:
-                merged_by_key[key] = _merge_raw_proposals(merged_by_key[key], copied)
+        canonical = _normalize_feature_name(group.get("canonical_name", ""))
+        raw_members = group.get("member_names") or []
+        if not isinstance(raw_members, list):
             continue
+        members = [
+            _normalize_feature_name(member)
+            for member in raw_members
+            if _normalize_feature_name(member) in allowed_names
+        ]
+        if canonical not in allowed_names:
+            continue
+        if canonical not in members and canonical not in known_by_name:
+            continue
+        if len(set([canonical, *members])) < 2:
+            continue
+        for member in members:
+            if member in proposal_by_name and member != canonical:
+                alias_to_canonical[member] = canonical
+                applied_aliases.append(
+                    {
+                        "from": member,
+                        "to": canonical,
+                        "rationale": str(group.get("rationale") or ""),
+                    }
+                )
 
-        passthrough_counter += 1
-        key = (f"{action}:{passthrough_counter}", canonical_name)
-        merged_by_key[key] = copied
-        order.append(key)
+    if not alias_to_canonical:
+        return list(proposals), []
 
-    return [merged_by_key[key] for key in order], aliases
+    rewritten: List[AgenticFeatureProposal] = []
+    emitted_add_names: set = set()
+    for proposal in proposals:
+        if proposal.action != "add":
+            rewritten.append(proposal)
+            continue
+        target_name = alias_to_canonical.get(proposal.name, proposal.name)
+        known_spec = known_by_name.get(target_name)
+        retargeted = _retarget_proposal(
+            proposal=proposal,
+            target_name=target_name,
+            known_spec=known_spec,
+        )
+        if target_name in emitted_add_names:
+            for index, existing in enumerate(rewritten):
+                if existing.action == "add" and existing.name == target_name:
+                    rewritten[index] = _merge_proposals(existing, retargeted)
+                    break
+            continue
+        rewritten.append(retargeted)
+        emitted_add_names.add(target_name)
+
+    return rewritten, applied_aliases
 
 
-def _merge_raw_proposals(base: Dict[str, Any], other: Dict[str, Any]) -> Dict[str, Any]:
-    merged = dict(base)
-    merged["roles"] = _merge_ordered_values(base.get("roles"), other.get("roles"))
-    merged["categories"] = _merge_ordered_values(
-        base.get("categories"),
-        other.get("categories"),
+def _retarget_proposal(
+    *,
+    proposal: AgenticFeatureProposal,
+    target_name: str,
+    known_spec: Optional[ExplicitFeatureSpec],
+) -> AgenticFeatureProposal:
+    if known_spec is None:
+        return AgenticFeatureProposal(
+            action=proposal.action,
+            name=target_name,
+            type=proposal.type,
+            categories=proposal.categories,
+            description=proposal.description,
+            roles=proposal.roles,
+            rationale=proposal.rationale,
+            expected_signal=proposal.expected_signal,
+        )
+
+    categories = _merge_ordered_values(known_spec.categories, proposal.categories) or None
+    feature_type = (
+        "categorical"
+        if known_spec.type == "categorical" or proposal.type == "categorical" or categories
+        else known_spec.type
     )
-    if other.get("type") == "categorical" or merged.get("categories"):
-        merged["type"] = "categorical"
-    elif not merged.get("type") and other.get("type"):
-        merged["type"] = other.get("type")
+    return AgenticFeatureProposal(
+        action=proposal.action,
+        name=target_name,
+        type=feature_type,
+        categories=categories,
+        description=_merge_text_values(known_spec.description, proposal.description),
+        roles=_merge_ordered_values(known_spec.roles, proposal.roles),
+        rationale=proposal.rationale,
+        expected_signal=proposal.expected_signal,
+    )
 
-    for field in ["description", "rationale", "expected_signal"]:
-        merged[field] = _merge_text_values(base.get(field), other.get(field))
-    return merged
+
+def _merge_proposals(
+    left: AgenticFeatureProposal,
+    right: AgenticFeatureProposal,
+) -> AgenticFeatureProposal:
+    categories = _merge_ordered_values(left.categories, right.categories) or None
+    feature_type = (
+        "categorical"
+        if left.type == "categorical" or right.type == "categorical" or categories
+        else (left.type or right.type)
+    )
+    return AgenticFeatureProposal(
+        action="add",
+        name=left.name,
+        type=feature_type,
+        categories=categories,
+        description=_merge_text_values(left.description, right.description),
+        roles=_merge_ordered_values(left.roles, right.roles),
+        rationale=_merge_text_values(left.rationale, right.rationale),
+        expected_signal=_merge_text_values(left.expected_signal, right.expected_signal),
+    )
 
 
 def _merge_ordered_values(left: Any, right: Any) -> List[str]:
@@ -1149,12 +1252,12 @@ def _as_list(value: Any) -> List[Any]:
     return [value]
 
 
-def _canonicalize_spec(spec: ExplicitFeatureSpec) -> ExplicitFeatureSpec:
-    canonical_name = _canonical_feature_name(spec.name)
-    if canonical_name == spec.name:
+def _normalize_spec(spec: ExplicitFeatureSpec) -> ExplicitFeatureSpec:
+    normalized_name = _normalize_feature_name(spec.name)
+    if normalized_name == spec.name:
         return spec
     return ExplicitFeatureSpec(
-        name=canonical_name,
+        name=normalized_name,
         type=spec.type,
         categories=spec.categories,
         description=spec.description,
@@ -1165,8 +1268,8 @@ def _canonicalize_spec(spec: ExplicitFeatureSpec) -> ExplicitFeatureSpec:
 def _dedupe_specs(specs: Sequence[ExplicitFeatureSpec]) -> List[ExplicitFeatureSpec]:
     by_name: Dict[str, ExplicitFeatureSpec] = {}
     for spec in specs:
-        spec = _canonicalize_spec(spec)
-        name = _canonical_feature_name(spec.name)
+        spec = _normalize_spec(spec)
+        name = _normalize_feature_name(spec.name)
         if not name:
             continue
         if name not in by_name:
@@ -1197,6 +1300,23 @@ def _finite_or_none(value: Any) -> Optional[float]:
     if not np.isfinite(numeric):
         return None
     return numeric
+
+
+def _agent_visible_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in metrics.items()
+        if not _is_oracle_metric_name(key)
+    }
+
+
+def _is_oracle_metric_name(key: Any) -> bool:
+    name = str(key).lower()
+    return (
+        name.startswith("oracle_")
+        or name.startswith("true_")
+        or "true_" in name
+    )
 
 
 def _scalar_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:

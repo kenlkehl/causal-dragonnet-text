@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,24 @@ class FakeProposalAgent:
 
     def propose(self, context):
         self.contexts.append(context)
+        if context.get("prompt_version") == "non_neural_agentic_alias_resolution_v1":
+            return {
+                "groups": [
+                    {
+                        "canonical_name": "pd_l1_expression",
+                        "member_names": [
+                            "pd_l1_expression",
+                            "pd_l1_expression_level",
+                        ],
+                        "type": "categorical",
+                        "categories": ["<1%", "1-49%", ">=50%"],
+                        "description": "Pretreatment tumor PD-L1 expression category.",
+                        "roles": ["effect_modifier"],
+                        "rationale": "The two names refer to the same extraction target.",
+                    }
+                ],
+                "unmerged": [{"name": "age", "reason": "No alias proposed."}],
+            }
         return [
             {
                 "action": "add",
@@ -34,7 +53,7 @@ class FakeProposalAgent:
             },
             {
                 "action": "add",
-                "name": "pd_l1_expression_level",
+                "name": "pd_l1_expression",
                 "type": "categorical",
                 "categories": ["<1%", "1-49%", ">=50%"],
                 "roles": ["effect_modifier"],
@@ -44,12 +63,12 @@ class FakeProposalAgent:
             },
             {
                 "action": "add",
-                "name": "pdl1_expression",
+                "name": "pd_l1_expression_level",
                 "type": "categorical",
                 "categories": ["<1%", "1-49%", ">=50%"],
                 "roles": ["effect_modifier"],
                 "description": "Pretreatment tumor PD-L1 expression category.",
-                "rationale": "Alternative alias for the same PD-L1 concept.",
+                "rationale": "PD-L1 threshold terms appear in the pseudo-target model.",
                 "expected_signal": "pseudo-target",
             },
         ]
@@ -162,7 +181,10 @@ def test_non_neural_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path: 
     assert "selected_feature_names" in predictions.columns
     assert agent.contexts
     assert agent.contexts[0]["prompt_version"] == "non_neural_agentic_forest_v1"
+    assert agent.contexts[1]["prompt_version"] == "non_neural_agentic_alias_resolution_v1"
     assert "feature_importance" in agent.contexts[0]
+    assert "canonical_feature_name_guidance" not in agent.contexts[0]
+    assert "true_" not in json.dumps(agent.contexts[0])
     assert all({"age", "pd_l1_expression"}.issubset(set(names)) for names in evaluator.seen_specs)
     assert all(names.count("pd_l1_expression") == 1 for names in evaluator.seen_specs)
     artifact_dir = output_path.parent / "non_neural_agentic_forest"
