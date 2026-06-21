@@ -50,6 +50,47 @@ _DASH_TRANSLATION = dict.fromkeys(
     "-",
 )
 
+_CANONICAL_FEATURE_ALIASES = {
+    "age_at_baseline": "age",
+    "age_at_diagnosis": "age",
+    "age_at_start": "age",
+    "age_at_treatment": "age",
+    "age_at_treatment_initiation": "age",
+    "age_in_years": "age",
+    "age_years": "age",
+    "baseline_age": "age",
+    "patient_age": "age",
+    "patient_age_years": "age",
+    "pdl1_expression": "pd_l1_expression",
+    "pdl1_expression_level": "pd_l1_expression",
+    "pdl1_level": "pd_l1_expression",
+    "pdl1_status": "pd_l1_expression",
+    "pdl1_tps": "pd_l1_expression",
+    "pd_l1_expression_level": "pd_l1_expression",
+    "pd_l1_level": "pd_l1_expression",
+    "pd_l1_status": "pd_l1_expression",
+    "pd_l1_tps": "pd_l1_expression",
+    "pd_l1_tumor_proportion_score": "pd_l1_expression",
+    "tumor_pd_l1_expression": "pd_l1_expression",
+    "tumor_pd_l1_expression_level": "pd_l1_expression",
+    "tumor_pd_l1_status": "pd_l1_expression",
+}
+
+_CANONICAL_FEATURE_NAME_GUIDANCE = {
+    "age": [
+        "patient_age",
+        "baseline_age",
+        "age_at_treatment_initiation",
+        "age_in_years",
+    ],
+    "pd_l1_expression": [
+        "pdl1_expression",
+        "pd_l1_expression_level",
+        "pd_l1_status",
+        "pd_l1_tps",
+    ],
+}
+
 
 def run_non_neural_agentic_forest(
     dataset: pd.DataFrame,
@@ -620,8 +661,10 @@ class NonNeuralAgenticForestRunner:
                 "Suggest explicit pre-treatment patient-level variables, not raw text tokens.",
                 "Use variables predictive of both treatment and outcome as confounders.",
                 "Use variables predictive of the pseudo-target as effect modifiers.",
+                "Use canonical feature names for common aliases; for example use age for patient age and pd_l1_expression for PD-L1 expression, PD-L1 level, PD-L1 status, or PD-L1 TPS.",
             ],
             "current_features": [_spec_to_dict(spec) for spec in self._initial_specs()],
+            "canonical_feature_name_guidance": _CANONICAL_FEATURE_NAME_GUIDANCE,
             "model_diagnostics": metrics,
             "feature_importance": importance,
             "clinical_text_examples": _clinical_text_examples(
@@ -655,8 +698,11 @@ class NonNeuralAgenticForestRunner:
     ) -> List[ExplicitFeatureSpec]:
         del discovery_df
         raw_proposals = self.proposal_agent.propose(bow_context)
+        canonical_raw_proposals, canonical_aliases = _canonicalize_raw_proposals(
+            raw_proposals
+        )
         proposals, rejected = validate_agentic_proposals(
-            raw_proposals,
+            canonical_raw_proposals,
             current_specs=self._initial_specs(),
             search_config=self.search_config,
             allow_removals=False,
@@ -681,6 +727,8 @@ class NonNeuralAgenticForestRunner:
         row: Dict[str, Any] = {
             "outer_fold": int(outer_fold),
             "raw_proposals": raw_proposals,
+            "canonicalized_raw_proposals": canonical_raw_proposals,
+            "canonical_aliases": canonical_aliases,
             "valid_proposals": [
                 {
                     "action": proposal.action,
@@ -733,7 +781,7 @@ class NonNeuralAgenticForestRunner:
 
     def _initial_specs(self) -> List[ExplicitFeatureSpec]:
         if getattr(self.config.explicit_features, "features", None):
-            return list(self.config.explicit_features.features)
+            return _dedupe_specs(list(self.config.explicit_features.features))
         return []
 
     def _make_vectorizer(self) -> TfidfVectorizer:
@@ -1009,10 +1057,116 @@ def _resize_scores(values: np.ndarray, n_features: int) -> np.ndarray:
     return resized
 
 
+def _canonical_feature_name(name: Any) -> str:
+    normalized = _normalize_feature_name(name)
+    return _CANONICAL_FEATURE_ALIASES.get(normalized, normalized)
+
+
+def _canonicalize_raw_proposals(
+    raw_proposals: Sequence[Dict[str, Any]],
+) -> Tuple[List[Any], List[Dict[str, str]]]:
+    merged_by_key: Dict[Tuple[str, str], Any] = {}
+    order: List[Tuple[str, str]] = []
+    aliases: List[Dict[str, str]] = []
+    passthrough_counter = 0
+
+    for raw in raw_proposals:
+        if not isinstance(raw, dict):
+            passthrough_counter += 1
+            key = (f"malformed:{passthrough_counter}", "")
+            merged_by_key[key] = raw
+            order.append(key)
+            continue
+
+        copied = dict(raw)
+        original_name = _normalize_feature_name(copied.get("name", ""))
+        canonical_name = _canonical_feature_name(original_name)
+        if original_name and canonical_name != original_name:
+            aliases.append({"from": original_name, "to": canonical_name})
+            copied["name"] = canonical_name
+
+        action = str(copied.get("action", "")).strip().lower()
+        if action == "add" and canonical_name:
+            key = (action, canonical_name)
+            if key not in merged_by_key:
+                merged_by_key[key] = copied
+                order.append(key)
+            else:
+                merged_by_key[key] = _merge_raw_proposals(merged_by_key[key], copied)
+            continue
+
+        passthrough_counter += 1
+        key = (f"{action}:{passthrough_counter}", canonical_name)
+        merged_by_key[key] = copied
+        order.append(key)
+
+    return [merged_by_key[key] for key in order], aliases
+
+
+def _merge_raw_proposals(base: Dict[str, Any], other: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(base)
+    merged["roles"] = _merge_ordered_values(base.get("roles"), other.get("roles"))
+    merged["categories"] = _merge_ordered_values(
+        base.get("categories"),
+        other.get("categories"),
+    )
+    if other.get("type") == "categorical" or merged.get("categories"):
+        merged["type"] = "categorical"
+    elif not merged.get("type") and other.get("type"):
+        merged["type"] = other.get("type")
+
+    for field in ["description", "rationale", "expected_signal"]:
+        merged[field] = _merge_text_values(base.get(field), other.get(field))
+    return merged
+
+
+def _merge_ordered_values(left: Any, right: Any) -> List[str]:
+    values: List[str] = []
+    for item in _as_list(left) + _as_list(right):
+        text = str(item).strip()
+        if text and text not in values:
+            values.append(text)
+    return values
+
+
+def _merge_text_values(left: Any, right: Any) -> Optional[str]:
+    left_text = str(left).strip() if left is not None else ""
+    right_text = str(right).strip() if right is not None else ""
+    if not left_text:
+        return right_text or None
+    if not right_text or right_text == left_text:
+        return left_text
+    return f"{left_text} / {right_text}"
+
+
+def _as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _canonicalize_spec(spec: ExplicitFeatureSpec) -> ExplicitFeatureSpec:
+    canonical_name = _canonical_feature_name(spec.name)
+    if canonical_name == spec.name:
+        return spec
+    return ExplicitFeatureSpec(
+        name=canonical_name,
+        type=spec.type,
+        categories=spec.categories,
+        description=spec.description,
+        roles=spec.roles,
+    )
+
+
 def _dedupe_specs(specs: Sequence[ExplicitFeatureSpec]) -> List[ExplicitFeatureSpec]:
     by_name: Dict[str, ExplicitFeatureSpec] = {}
     for spec in specs:
-        name = _normalize_feature_name(spec.name)
+        spec = _canonicalize_spec(spec)
+        name = _canonical_feature_name(spec.name)
         if not name:
             continue
         if name not in by_name:
@@ -1020,11 +1174,16 @@ def _dedupe_specs(specs: Sequence[ExplicitFeatureSpec]) -> List[ExplicitFeatureS
             continue
         existing = by_name[name]
         roles = list(dict.fromkeys([*existing.roles, *spec.roles]))
+        categories = _merge_ordered_values(existing.categories, spec.categories) or None
+        if existing.type == "categorical" or spec.type == "categorical" or categories:
+            feature_type = "categorical"
+        else:
+            feature_type = existing.type
         by_name[name] = ExplicitFeatureSpec(
-            name=existing.name,
-            type=existing.type,
-            categories=existing.categories,
-            description=existing.description or spec.description,
+            name=name,
+            type=feature_type,
+            categories=categories,
+            description=_merge_text_values(existing.description, spec.description),
             roles=roles,
         )
     return list(by_name.values())

@@ -34,12 +34,22 @@ class FakeProposalAgent:
             },
             {
                 "action": "add",
-                "name": "pdl1_expression",
+                "name": "pd_l1_expression_level",
                 "type": "categorical",
                 "categories": ["<1%", "1-49%", ">=50%"],
                 "roles": ["effect_modifier"],
                 "description": "Pretreatment tumor PD-L1 expression category.",
                 "rationale": "PD-L1 threshold terms appear in the pseudo-target model.",
+                "expected_signal": "pseudo-target",
+            },
+            {
+                "action": "add",
+                "name": "pdl1_expression",
+                "type": "categorical",
+                "categories": ["<1%", "1-49%", ">=50%"],
+                "roles": ["effect_modifier"],
+                "description": "Pretreatment tumor PD-L1 expression category.",
+                "rationale": "Alternative alias for the same PD-L1 concept.",
                 "expected_signal": "pseudo-target",
             },
         ]
@@ -54,7 +64,7 @@ class FakeExtractionProvider:
             missing_col = f"{value_col}_missing"
             if spec.name == "age":
                 dataset[value_col] = text.str.extract(r"age (\d+)").astype(float)
-            elif spec.name == "pdl1_expression":
+            elif spec.name == "pd_l1_expression":
                 dataset[value_col] = np.where(
                     text.str.contains(">=50%"),
                     ">=50%",
@@ -153,7 +163,8 @@ def test_non_neural_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path: 
     assert agent.contexts
     assert agent.contexts[0]["prompt_version"] == "non_neural_agentic_forest_v1"
     assert "feature_importance" in agent.contexts[0]
-    assert all({"age", "pdl1_expression"}.issubset(set(names)) for names in evaluator.seen_specs)
+    assert all({"age", "pd_l1_expression"}.issubset(set(names)) for names in evaluator.seen_specs)
+    assert all(names.count("pd_l1_expression") == 1 for names in evaluator.seen_specs)
     artifact_dir = output_path.parent / "non_neural_agentic_forest"
     assert (artifact_dir / "bow_oof_predictions.parquet").exists()
     assert (artifact_dir / "agent_candidate_proposals.jsonl").exists()
