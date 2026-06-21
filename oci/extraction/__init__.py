@@ -29,6 +29,11 @@ from .numeric_inventory import (
     parse_ontology_mapping_response,
     split_text_into_all_word_chunks,
 )
+from .llm_routing import (
+    OpenAIClientPool,
+    call_with_exponential_backoff,
+    parse_server_urls,
+)
 
 # Backward-compatible import aliases. Old config keys are still rejected.
 ExplicitConfounderValue = ExplicitFeatureValue
@@ -57,6 +62,9 @@ __all__ = [
     "parse_numeric_values_response",
     "parse_ontology_mapping_response",
     "split_text_into_all_word_chunks",
+    "OpenAIClientPool",
+    "call_with_exponential_backoff",
+    "parse_server_urls",
     "ExplicitConfounderValue",
     "VLLMConfounderExtractor",
     "extract_explicit_confounders",

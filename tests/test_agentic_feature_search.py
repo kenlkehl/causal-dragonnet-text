@@ -879,6 +879,53 @@ def test_openai_agent_autodiscovers_legacy_oracle_default_model_name():
     assert client.completions.calls[0]["model"] == "served-agent-model"
 
 
+def test_openai_agent_retries_next_server(monkeypatch):
+    calls = []
+
+    class FakeCompletions:
+        def __init__(self, base_url):
+            self.base_url = base_url
+
+        def create(self, **kwargs):
+            calls.append(self.base_url)
+            if self.base_url == "http://server-a/v1":
+                raise TimeoutError("server overloaded")
+            message = SimpleNamespace(content=json.dumps({"proposals": []}))
+            choice = SimpleNamespace(message=message, finish_reason="stop")
+            return SimpleNamespace(
+                choices=[choice],
+                model=kwargs["model"],
+                id="response-ok",
+                created=0,
+                usage=None,
+            )
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(
+                completions=FakeCompletions(kwargs["base_url"])
+            )
+            self.models = FakeOpenAIModels(["unused-model"])
+
+    monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
+    agent = OpenAICompatibleFeatureSearchAgent(
+        AgenticFeatureSearchConfig(
+            agent_server_url="http://server-a/v1,http://server-b/v1",
+            agent_model_name="served-agent-model",
+            agent_schema_repair_attempts=0,
+            agent_request_max_retries=1,
+            agent_retry_initial_delay=0.0,
+        )
+    )
+    agent._ensure_client()
+    agent._client_pool._next_index = 0
+
+    proposals = agent.propose({"current_features": [], "iteration_feedback": []})
+
+    assert proposals == []
+    assert calls == ["http://server-a/v1", "http://server-b/v1"]
+
+
 def test_openai_agent_repairs_missing_required_proposal_fields():
     client = FakeOpenAIClient(
         [

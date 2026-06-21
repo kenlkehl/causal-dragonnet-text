@@ -24,6 +24,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import pandas as pd
 
 from .explicit_features import strip_reasoning_trace
+from .llm_routing import OpenAIClientPool, parse_server_urls, retry_delay
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,9 @@ class NumericInventoryConfig:
     ontology_max_tokens: int = 25000
     extraction_batch_size: int = 32
     extraction_max_retries: int = 3
+    extraction_retry_initial_delay: float = 1.0
+    extraction_retry_max_delay: float = 30.0
+    extraction_retry_backoff_factor: float = 2.0
     patient_reconcile_max_records_per_call: int = 120
     ontology_concepts_per_batch: int = 150
     save_agent_raw_output: bool = False
@@ -62,6 +66,12 @@ class NumericInventoryConfig:
             raise ValueError("extraction_batch_size must be >= 1")
         if self.extraction_max_retries < 1:
             raise ValueError("extraction_max_retries must be >= 1")
+        if self.extraction_retry_initial_delay < 0:
+            raise ValueError("extraction_retry_initial_delay must be >= 0")
+        if self.extraction_retry_max_delay < 0:
+            raise ValueError("extraction_retry_max_delay must be >= 0")
+        if self.extraction_retry_backoff_factor < 1:
+            raise ValueError("extraction_retry_backoff_factor must be >= 1")
         if self.patient_reconcile_max_records_per_call < 1:
             raise ValueError("patient_reconcile_max_records_per_call must be >= 1")
         if self.ontology_concepts_per_batch < 1:
@@ -107,7 +117,8 @@ class NumericInventoryLLMClient:
         if mode not in {"server", "python_api"}:
             raise ValueError(f"mode must be 'server' or 'python_api', got {mode!r}")
         self.mode = mode
-        self.server_url = server_url
+        self.server_urls = parse_server_urls(server_url)
+        self.server_url = self.server_urls[0]
         self.model_name = model_name
         self.api_key = api_key
         self.tensor_parallel_size = tensor_parallel_size
@@ -116,6 +127,7 @@ class NumericInventoryLLMClient:
         self.max_model_len = max_model_len
         self.reasoning_parser = reasoning_parser
         self._client = None
+        self._client_pool: Optional[OpenAIClientPool] = None
         self._llm = None
         self._resolved_model_name: Optional[str] = None
 
@@ -157,20 +169,18 @@ class NumericInventoryLLMClient:
     def cleanup(self) -> None:
         self._llm = None
         self._client = None
+        self._client_pool = None
 
     def _ensure_server_client(self) -> None:
         if self._client is not None:
             return
-        try:
-            from openai import OpenAI
-        except ImportError as exc:
-            raise ImportError("openai package is required for server extraction") from exc
-        self._client = OpenAI(
-            base_url=self.server_url,
+        self._client_pool = OpenAIClientPool(
+            server_urls=self.server_urls,
             api_key=self.api_key,
             timeout=None,
             max_retries=0,
         )
+        self._client = self._client_pool.client_for_url(self.server_url)
 
     def _ensure_python_api(self) -> None:
         if self._llm is not None:
@@ -203,7 +213,10 @@ class NumericInventoryLLMClient:
         if self._resolved_model_name is not None:
             return self._resolved_model_name
         self._ensure_server_client()
-        response = self._client.models.list()
+        client = self._client
+        if self._client_pool is not None:
+            client = self._client_pool.client_for_url(self._client_pool.first_url())
+        response = client.models.list()
         models = getattr(response, "data", response)
         for model in models or []:
             model_id = model if isinstance(model, str) else getattr(model, "id", None)
@@ -261,7 +274,12 @@ class NumericInventoryLLMClient:
         max_tokens: int,
         temperature: float,
     ) -> CompletionResult:
-        response = self._client.chat.completions.create(
+        if self._client_pool is not None:
+            server_url, client = self._client_pool.next_client()
+            logger.debug("Sending numeric inventory request to %s", server_url)
+        else:
+            client = self._client
+        response = client.chat.completions.create(
             model=model_name,
             messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
@@ -680,7 +698,22 @@ class AgenticNumericInventoryExtractor:
                     last_exc = exc
             except Exception as exc:
                 last_exc = exc
-            time.sleep(min(2.0, 0.25 * (attempt + 1)))
+            if attempt < self.config.extraction_max_retries - 1:
+                delay = retry_delay(
+                    attempt,
+                    initial_delay=self.config.extraction_retry_initial_delay,
+                    max_delay=self.config.extraction_retry_max_delay,
+                    backoff_factor=self.config.extraction_retry_backoff_factor,
+                )
+                logger.warning(
+                    "Numeric inventory LLM request failed on attempt %s/%s: %s. "
+                    "Retrying in %.2fs.",
+                    attempt + 1,
+                    self.config.extraction_max_retries,
+                    last_exc,
+                    delay,
+                )
+                time.sleep(delay)
         if last_exc is not None:
             raise last_exc
         return [CompletionResult(content="") for _ in prompts]

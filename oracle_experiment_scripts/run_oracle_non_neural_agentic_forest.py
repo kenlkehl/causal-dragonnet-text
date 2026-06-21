@@ -87,6 +87,10 @@ class NonNeuralAgenticOracleConfig:
     agent_api_key: str = "EMPTY"
     agent_temperature: float = 0.0
     agent_max_tokens: int = 25000
+    agent_request_max_retries: int = 3
+    agent_retry_initial_delay: float = 1.0
+    agent_retry_max_delay: float = 30.0
+    agent_retry_backoff_factor: float = 2.0
     agent_save_context: bool = False
     agent_save_raw_output: bool = False
 
@@ -96,6 +100,9 @@ class NonNeuralAgenticOracleConfig:
     extraction_reasoning_parser: Optional[str] = "auto"
     extraction_batch_size: int = 100
     extraction_max_retries: int = 3
+    extraction_retry_initial_delay: float = 1.0
+    extraction_retry_max_delay: float = 30.0
+    extraction_retry_backoff_factor: float = 2.0
     extraction_temperature: float = 0.0
     extraction_max_tokens: int = 25000
     extraction_max_text_length: int = 400000
@@ -144,6 +151,10 @@ def _make_applied_config(
                 agent_api_key=config.agent_api_key,
                 agent_temperature=config.agent_temperature,
                 agent_max_tokens=config.agent_max_tokens,
+                agent_request_max_retries=config.agent_request_max_retries,
+                agent_retry_initial_delay=config.agent_retry_initial_delay,
+                agent_retry_max_delay=config.agent_retry_max_delay,
+                agent_retry_backoff_factor=config.agent_retry_backoff_factor,
                 save_agent_context=config.agent_save_context,
                 save_agent_raw_output=config.agent_save_raw_output,
                 random_state=config.seed,
@@ -182,6 +193,9 @@ def _make_applied_config(
             vllm_reasoning_parser=config.extraction_reasoning_parser,
             extraction_batch_size=config.extraction_batch_size,
             extraction_max_retries=config.extraction_max_retries,
+            extraction_retry_initial_delay=config.extraction_retry_initial_delay,
+            extraction_retry_max_delay=config.extraction_retry_max_delay,
+            extraction_retry_backoff_factor=config.extraction_retry_backoff_factor,
             extraction_temperature=config.extraction_temperature,
             extraction_max_tokens=config.extraction_max_tokens,
             extraction_max_text_length=config.extraction_max_text_length,
@@ -391,14 +405,30 @@ def main() -> None:
     parser.add_argument("--cf-max-depth", type=int, default=None)
     parser.add_argument("--cf-no-inference", action="store_true")
 
-    parser.add_argument("--agent-server-url", default="http://localhost:8000/v1")
+    parser.add_argument(
+        "--agent-server-url",
+        "--agent-server-urls",
+        dest="agent_server_url",
+        default="http://localhost:8000/v1",
+        help="OpenAI-compatible agent endpoint, or comma-separated endpoints.",
+    )
     parser.add_argument("--agent-model-name", default="Qwen/Qwen3.6-27B")
     parser.add_argument("--agent-api-key", default="EMPTY")
     parser.add_argument("--agent-max-tokens", type=int, default=25000)
+    parser.add_argument("--agent-request-max-retries", type=int, default=3)
+    parser.add_argument("--agent-retry-initial-delay", type=float, default=1.0)
+    parser.add_argument("--agent-retry-max-delay", type=float, default=30.0)
+    parser.add_argument("--agent-retry-backoff-factor", type=float, default=2.0)
     parser.add_argument("--agent-save-context", action="store_true")
     parser.add_argument("--agent-save-raw-output", action="store_true")
 
-    parser.add_argument("--extraction-server-url", default="http://localhost:8000/v1")
+    parser.add_argument(
+        "--extraction-server-url",
+        "--extraction-server-urls",
+        dest="extraction_server_url",
+        default="http://localhost:8000/v1",
+        help="OpenAI-compatible extraction endpoint, or comma-separated endpoints.",
+    )
     parser.add_argument("--extraction-model-name", default="Qwen/Qwen3.6-27B")
     parser.add_argument(
         "--extraction-mode",
@@ -407,6 +437,10 @@ def main() -> None:
     )
     parser.add_argument("--extraction-reasoning-parser", default="auto")
     parser.add_argument("--extraction-batch-size", type=int, default=100)
+    parser.add_argument("--extraction-max-retries", type=int, default=3)
+    parser.add_argument("--extraction-retry-initial-delay", type=float, default=1.0)
+    parser.add_argument("--extraction-retry-max-delay", type=float, default=30.0)
+    parser.add_argument("--extraction-retry-backoff-factor", type=float, default=2.0)
     parser.add_argument("--extraction-max-tokens", type=int, default=25000)
     parser.add_argument("--extraction-max-text-length", type=int, default=400000)
     parser.add_argument("--extraction-cache-dir", default=None)
@@ -456,6 +490,10 @@ def main() -> None:
         agent_model_name=args.agent_model_name,
         agent_api_key=args.agent_api_key,
         agent_max_tokens=args.agent_max_tokens,
+        agent_request_max_retries=args.agent_request_max_retries,
+        agent_retry_initial_delay=args.agent_retry_initial_delay,
+        agent_retry_max_delay=args.agent_retry_max_delay,
+        agent_retry_backoff_factor=args.agent_retry_backoff_factor,
         agent_save_context=args.agent_save_context,
         agent_save_raw_output=args.agent_save_raw_output,
         extraction_server_url=args.extraction_server_url,
@@ -463,6 +501,10 @@ def main() -> None:
         extraction_mode=args.extraction_mode,
         extraction_reasoning_parser=args.extraction_reasoning_parser,
         extraction_batch_size=args.extraction_batch_size,
+        extraction_max_retries=args.extraction_max_retries,
+        extraction_retry_initial_delay=args.extraction_retry_initial_delay,
+        extraction_retry_max_delay=args.extraction_retry_max_delay,
+        extraction_retry_backoff_factor=args.extraction_retry_backoff_factor,
         extraction_max_tokens=args.extraction_max_tokens,
         extraction_max_text_length=args.extraction_max_text_length,
         extraction_cache_enabled=not args.no_extraction_cache,

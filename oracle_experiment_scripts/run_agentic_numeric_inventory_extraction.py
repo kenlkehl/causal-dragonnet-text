@@ -53,7 +53,13 @@ def main() -> None:
         choices=["server", "python_api"],
         help="Use an existing OpenAI-compatible server or in-process vLLM.",
     )
-    parser.add_argument("--extraction-server-url", default="http://localhost:8000/v1")
+    parser.add_argument(
+        "--extraction-server-url",
+        "--extraction-server-urls",
+        dest="extraction_server_url",
+        default="http://localhost:8000/v1",
+        help="OpenAI-compatible extraction endpoint, or comma-separated endpoints.",
+    )
     parser.add_argument(
         "--extraction-model-name",
         default="auto",
@@ -71,6 +77,9 @@ def main() -> None:
     )
     parser.add_argument("--extraction-batch-size", type=int, default=32)
     parser.add_argument("--extraction-max-retries", type=int, default=3)
+    parser.add_argument("--extraction-retry-initial-delay", type=float, default=1.0)
+    parser.add_argument("--extraction-retry-max-delay", type=float, default=30.0)
+    parser.add_argument("--extraction-retry-backoff-factor", type=float, default=2.0)
     parser.add_argument("--extraction-temperature", type=float, default=0.0)
     parser.add_argument("--chunk-max-tokens", type=int, default=25000)
     parser.add_argument("--reconcile-max-tokens", type=int, default=25000)
@@ -127,6 +136,9 @@ def main() -> None:
         ontology_max_tokens=args.ontology_max_tokens,
         extraction_batch_size=args.extraction_batch_size,
         extraction_max_retries=args.extraction_max_retries,
+        extraction_retry_initial_delay=args.extraction_retry_initial_delay,
+        extraction_retry_max_delay=args.extraction_retry_max_delay,
+        extraction_retry_backoff_factor=args.extraction_retry_backoff_factor,
         patient_reconcile_max_records_per_call=args.patient_reconcile_max_records_per_call,
         ontology_concepts_per_batch=args.ontology_concepts_per_batch,
         save_agent_raw_output=args.save_agent_raw_output,

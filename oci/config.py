@@ -102,6 +102,9 @@ class ExplicitFeatureExtractionConfig:
     # Extraction settings
     extraction_batch_size: int = 32
     extraction_max_retries: int = 3  # Retries per patient before marking as missing
+    extraction_retry_initial_delay: float = 1.0
+    extraction_retry_max_delay: float = 30.0
+    extraction_retry_backoff_factor: float = 2.0
     extraction_temperature: float = 0.0  # LLM temperature (0 for deterministic)
     extraction_max_tokens: int = 25000  # Max tokens for LLM response
     extraction_max_text_length: int = 400000  # Max clinical text chars in extraction prompt
@@ -366,6 +369,10 @@ class AgenticFeatureSearchConfig:
     agent_temperature: float = 0.0
     agent_max_tokens: int = 25000
     agent_schema_repair_attempts: int = 1
+    agent_request_max_retries: int = 3
+    agent_retry_initial_delay: float = 1.0
+    agent_retry_max_delay: float = 30.0
+    agent_retry_backoff_factor: float = 2.0
 
     # Prompt/context controls. Clinical text examples are sent to the proposal
     # agent to ground variable suggestions, but are not written to artifacts by
@@ -426,6 +433,22 @@ class AgenticFeatureSearchConfig:
         if self.agent_schema_repair_attempts < 0:
             raise ValueError(
                 "agentic_feature_search.agent_schema_repair_attempts must be >= 0"
+            )
+        if self.agent_request_max_retries < 0:
+            raise ValueError(
+                "agentic_feature_search.agent_request_max_retries must be >= 0"
+            )
+        if self.agent_retry_initial_delay < 0:
+            raise ValueError(
+                "agentic_feature_search.agent_retry_initial_delay must be >= 0"
+            )
+        if self.agent_retry_max_delay < 0:
+            raise ValueError(
+                "agentic_feature_search.agent_retry_max_delay must be >= 0"
+            )
+        if self.agent_retry_backoff_factor < 1:
+            raise ValueError(
+                "agentic_feature_search.agent_retry_backoff_factor must be >= 1"
             )
 
 

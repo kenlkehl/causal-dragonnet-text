@@ -55,6 +55,12 @@ import pandas as pd
 from tqdm import tqdm
 
 from ..config import ExplicitFeatureSpec
+from .llm_routing import (
+    OpenAIClientPool,
+    is_retryable_llm_exception,
+    parse_server_urls,
+    retry_delay,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -323,6 +329,9 @@ class VLLMFeatureExtractor:
         vllm_reasoning_parser: Optional[str] = "auto",
         api_key: str = "EMPTY",
         max_retries: int = 3,
+        retry_initial_delay: float = 1.0,
+        retry_max_delay: float = 30.0,
+        retry_backoff_factor: float = 2.0,
         temperature: float = 0.0,
         max_tokens: int = 1024,
         max_text_length: int = 400000
@@ -341,6 +350,9 @@ class VLLMFeatureExtractor:
             vllm_reasoning_parser: vLLM reasoning parser name, "auto", or disabled with None/"none"
             api_key: API key (use "EMPTY" for local vLLM)
             max_retries: Maximum retries per patient before marking as missing
+            retry_initial_delay: Initial exponential backoff delay after request failures
+            retry_max_delay: Maximum exponential backoff delay after request failures
+            retry_backoff_factor: Exponential backoff multiplier
             temperature: LLM temperature (0 for deterministic)
             max_tokens: Maximum tokens in response
             max_text_length: Maximum clinical text characters included in prompt
@@ -350,7 +362,8 @@ class VLLMFeatureExtractor:
 
         self.specs = specs
         self.mode = mode
-        self.server_url = server_url
+        self.server_urls = parse_server_urls(server_url)
+        self.server_url = self.server_urls[0]
         self.model_name = model_name
         self.tensor_parallel_size = tensor_parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
@@ -362,12 +375,16 @@ class VLLMFeatureExtractor:
         )
         self.api_key = api_key
         self.max_retries = max_retries
+        self.retry_initial_delay = retry_initial_delay
+        self.retry_max_delay = retry_max_delay
+        self.retry_backoff_factor = retry_backoff_factor
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.max_text_length = max_text_length
 
         # These are set lazily
         self._client = None
+        self._client_pool: Optional[OpenAIClientPool] = None
         self._llm = None
         self._server_process = None
 
@@ -381,18 +398,14 @@ class VLLMFeatureExtractor:
 
     def _init_server_client(self):
         """Initialize OpenAI client for server mode."""
-        try:
-            from openai import OpenAI
-        except ImportError:
-            raise ImportError("openai package required. Install with: pip install openai")
-
-        self._client = OpenAI(
-            base_url=self.server_url,
+        self._client_pool = OpenAIClientPool(
+            server_urls=self.server_urls,
             api_key=self.api_key,
             timeout=None,
             max_retries=0,   # No internal retries (we have our own outer retry loop)
         )
-        logger.info(f"Connected to vLLM server at: {self.server_url}")
+        self._client = self._client_pool.client_for_url(self.server_url)
+        logger.info("Configured %s vLLM server endpoint(s)", len(self.server_urls))
 
     def _start_server(self):
         """Start vLLM server subprocess."""
@@ -475,10 +488,24 @@ class VLLMFeatureExtractor:
         """Extract features from single text using server API."""
         prompt = build_extraction_prompt(text, self.specs, max_text_length=self.max_text_length)
         best_result = None
+        max_attempts = max(1, int(self.max_retries))
+        start_index = (
+            self._client_pool.reserve_start_index()
+            if self._client_pool is not None
+            else 0
+        )
 
-        for attempt in range(self.max_retries):
+        for attempt in range(max_attempts):
             try:
-                response = self._client.chat.completions.create(
+                if self._client_pool is not None:
+                    server_url, client = self._client_pool.client_for_attempt(
+                        start_index,
+                        attempt,
+                    )
+                    logger.debug("Sending explicit feature extraction request to %s", server_url)
+                else:
+                    client = self._client
+                response = client.chat.completions.create(
                     model=self.model_name,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=self.temperature,
@@ -497,6 +524,23 @@ class VLLMFeatureExtractor:
                         return result
             except Exception as e:
                 logger.debug(f"Extraction attempt {attempt + 1} failed: {e}")
+                if attempt < max_attempts - 1 and is_retryable_llm_exception(e):
+                    delay = retry_delay(
+                        attempt,
+                        initial_delay=self.retry_initial_delay,
+                        max_delay=self.retry_max_delay,
+                        backoff_factor=self.retry_backoff_factor,
+                    )
+                    logger.warning(
+                        "Explicit feature extraction request failed on attempt "
+                        "%s/%s with %s: %s. Retrying in %.2fs.",
+                        attempt + 1,
+                        max_attempts,
+                        e.__class__.__name__,
+                        e,
+                        delay,
+                    )
+                    time.sleep(delay)
 
         # Return best partial result, or all-missing if no successful parse
         if best_result is not None:
@@ -678,6 +722,9 @@ def extract_explicit_features(
     max_model_len: Optional[int] = None,
     vllm_reasoning_parser: Optional[str] = "auto",
     max_retries: int = 3,
+    retry_initial_delay: float = 1.0,
+    retry_max_delay: float = 30.0,
+    retry_backoff_factor: float = 2.0,
     temperature: float = 0.0,
     max_tokens: int = 1024,
     max_text_length: int = 400000,
@@ -697,6 +744,9 @@ def extract_explicit_features(
         max_model_len: Maximum model context length (for start_server/python_api)
         vllm_reasoning_parser: vLLM reasoning parser name, "auto", or disabled with None/"none"
         max_retries: Retries per patient before marking as missing
+        retry_initial_delay: Initial exponential backoff delay after request failures
+        retry_max_delay: Maximum exponential backoff delay after request failures
+        retry_backoff_factor: Exponential backoff multiplier
         temperature: LLM temperature
         max_tokens: Max response tokens
         max_text_length: Maximum clinical text characters included in prompt
@@ -716,6 +766,9 @@ def extract_explicit_features(
         max_model_len=max_model_len,
         vllm_reasoning_parser=vllm_reasoning_parser,
         max_retries=max_retries,
+        retry_initial_delay=retry_initial_delay,
+        retry_max_delay=retry_max_delay,
+        retry_backoff_factor=retry_backoff_factor,
         temperature=temperature,
         max_tokens=max_tokens,
         max_text_length=max_text_length

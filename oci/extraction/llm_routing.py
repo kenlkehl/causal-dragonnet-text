@@ -1,0 +1,189 @@
+"""OpenAI-compatible LLM retry and endpoint routing helpers."""
+
+from __future__ import annotations
+
+import logging
+import os
+import random
+import threading
+import time
+from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
+
+
+_RETRYABLE_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504, 529}
+
+
+def parse_server_urls(
+    value: Any,
+    *,
+    default: str = "http://localhost:8000/v1",
+) -> List[str]:
+    """Normalize a single URL, comma-separated URLs, or a list of URLs."""
+    if value is None:
+        return [default]
+    raw_values: Iterable[Any]
+    if isinstance(value, (list, tuple, set)):
+        raw_values = value
+    else:
+        raw_values = [value]
+
+    urls: List[str] = []
+    for raw in raw_values:
+        text = str(raw).strip()
+        if not text:
+            continue
+        for chunk in text.split(","):
+            url = chunk.strip()
+            if url:
+                urls.append(url)
+    return urls or [default]
+
+
+def retry_delay(
+    attempt_index: int,
+    *,
+    initial_delay: float = 1.0,
+    max_delay: float = 30.0,
+    backoff_factor: float = 2.0,
+    jitter_fraction: float = 0.15,
+) -> float:
+    """Return an exponential-backoff sleep with small multiplicative jitter."""
+    delay = float(initial_delay) * (float(backoff_factor) ** max(0, int(attempt_index)))
+    delay = min(float(max_delay), max(0.0, delay))
+    if delay > 0.0 and jitter_fraction > 0.0:
+        jitter = delay * float(jitter_fraction)
+        delay = random.uniform(max(0.0, delay - jitter), delay + jitter)
+    return delay
+
+
+def is_retryable_llm_exception(exc: BaseException) -> bool:
+    """Best-effort classification of transient OpenAI-compatible server errors."""
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+    if status_code is not None:
+        try:
+            return int(status_code) in _RETRYABLE_STATUS_CODES
+        except (TypeError, ValueError):
+            return True
+
+    name = exc.__class__.__name__.lower()
+    retryable_markers = (
+        "timeout",
+        "connection",
+        "rate",
+        "serviceunavailable",
+        "internalserver",
+        "apiconnection",
+        "apitimeout",
+        "temporary",
+    )
+    return any(marker in name for marker in retryable_markers) or isinstance(
+        exc,
+        (TimeoutError, ConnectionError),
+    )
+
+
+def call_with_exponential_backoff(
+    operation: Callable[[int], Any],
+    *,
+    max_attempts: int,
+    initial_delay: float = 1.0,
+    max_delay: float = 30.0,
+    backoff_factor: float = 2.0,
+    retryable: Callable[[BaseException], bool] = is_retryable_llm_exception,
+    context: str = "LLM request",
+) -> Any:
+    """Run operation(attempt_index), retrying transient failures with backoff."""
+    attempts = max(1, int(max_attempts))
+    for attempt in range(attempts):
+        try:
+            return operation(attempt)
+        except Exception as exc:
+            if attempt >= attempts - 1 or not retryable(exc):
+                raise
+            delay = retry_delay(
+                attempt,
+                initial_delay=initial_delay,
+                max_delay=max_delay,
+                backoff_factor=backoff_factor,
+            )
+            logger.warning(
+                "%s failed on attempt %s/%s with %s: %s. Retrying in %.2fs.",
+                context,
+                attempt + 1,
+                attempts,
+                exc.__class__.__name__,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
+
+
+class OpenAIClientPool:
+    """Lazy OpenAI-compatible client pool with round-robin endpoint selection."""
+
+    def __init__(
+        self,
+        *,
+        server_urls: Any,
+        api_key: str = "EMPTY",
+        timeout: Any = None,
+        max_retries: int = 0,
+        client_factory: Optional[Callable[..., Any]] = None,
+    ) -> None:
+        self.server_urls = parse_server_urls(server_urls)
+        self.api_key = api_key
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self._client_factory = client_factory
+        self._clients: dict[str, Any] = {}
+        self._lock = threading.Lock()
+        self._next_index = os.getpid() % len(self.server_urls)
+
+    def next_client(self) -> Tuple[str, Any]:
+        with self._lock:
+            idx = self._next_index
+            self._next_index = (self._next_index + 1) % len(self.server_urls)
+        url = self.server_urls[idx]
+        return url, self.client_for_url(url)
+
+    def client_for_attempt(self, start_index: int, attempt: int) -> Tuple[str, Any]:
+        url = self.server_urls[(int(start_index) + int(attempt)) % len(self.server_urls)]
+        return url, self.client_for_url(url)
+
+    def reserve_start_index(self) -> int:
+        with self._lock:
+            idx = self._next_index
+            self._next_index = (self._next_index + 1) % len(self.server_urls)
+        return idx
+
+    def client_for_url(self, url: str) -> Any:
+        with self._lock:
+            client = self._clients.get(url)
+            if client is not None:
+                return client
+            if self._client_factory is None:
+                try:
+                    from openai import OpenAI
+                except ImportError as exc:
+                    raise ImportError(
+                        "openai package is required for OpenAI-compatible LLM clients"
+                    ) from exc
+                self._client_factory = OpenAI
+            client = self._client_factory(
+                base_url=url,
+                api_key=self.api_key,
+                timeout=self.timeout,
+                max_retries=self.max_retries,
+            )
+            self._clients[url] = client
+            logger.info("Connected to OpenAI-compatible LLM server at: %s", url)
+            return client
+
+    def first_url(self) -> str:
+        return self.server_urls[0]
+

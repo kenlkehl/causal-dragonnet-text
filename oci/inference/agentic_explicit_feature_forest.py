@@ -31,6 +31,8 @@ from ..extraction import (
     resolve_vllm_reasoning_parser,
     strip_reasoning_trace,
 )
+from ..extraction.llm_routing import OpenAIClientPool, call_with_exponential_backoff
+from ..extraction.llm_routing import parse_server_urls
 from ..models.causal_forest_head import CausalForestHead
 from .applied_explicit_feature_forest import _build_features, _hstack_present
 
@@ -1153,23 +1155,18 @@ class OpenAICompatibleFeatureSearchAgent:
     def __init__(self, search_config: AgenticFeatureSearchConfig):
         self.search_config = search_config
         self._client = None
+        self._client_pool: Optional[OpenAIClientPool] = None
         self._resolved_agent_model_name: Optional[str] = None
         self.last_raw_response: Optional[str] = None
         self.last_response_trace: Optional[Dict[str, Any]] = None
 
     def _ensure_client(self):
-        if self._client is not None:
+        if self._client is not None or self._client_pool is not None:
             return
-        try:
-            from openai import OpenAI
-        except ImportError as exc:
-            raise ImportError(
-                "openai package is required for agentic feature proposals. "
-                "Install the extraction extra or inject a custom proposal_agent."
-            ) from exc
-        self._client = OpenAI(
-            base_url=self.search_config.agent_server_url,
+        self._client_pool = OpenAIClientPool(
+            server_urls=self.search_config.agent_server_url,
             api_key=self.search_config.agent_api_key,
+            timeout=None,
             max_retries=0,
         )
 
@@ -1179,12 +1176,50 @@ class OpenAICompatibleFeatureSearchAgent:
             return str(configured)
         if self._resolved_agent_model_name is None:
             self._ensure_client()
+            client = self._client
+            server_url = self.search_config.agent_server_url
+            if client is None:
+                assert self._client_pool is not None
+                server_url = self._client_pool.first_url()
+                client = self._client_pool.client_for_url(server_url)
             self._resolved_agent_model_name = _discover_openai_compatible_model_name(
-                self._client,
-                server_url=self.search_config.agent_server_url,
+                client,
+                server_url=server_url,
                 purpose="agent proposal",
             )
         return self._resolved_agent_model_name
+
+    def _create_completion(self, **kwargs: Any) -> Any:
+        self._ensure_client()
+        max_attempts = 1 + max(
+            0,
+            int(getattr(self.search_config, "agent_request_max_retries", 3)),
+        )
+        retry_kwargs = {
+            "max_attempts": max_attempts,
+            "initial_delay": float(
+                getattr(self.search_config, "agent_retry_initial_delay", 1.0)
+            ),
+            "max_delay": float(getattr(self.search_config, "agent_retry_max_delay", 30.0)),
+            "backoff_factor": float(
+                getattr(self.search_config, "agent_retry_backoff_factor", 2.0)
+            ),
+            "context": "agent proposal LLM request",
+        }
+        if self._client is not None:
+            return call_with_exponential_backoff(
+                lambda _attempt: self._client.chat.completions.create(**kwargs),
+                **retry_kwargs,
+            )
+        assert self._client_pool is not None
+        start_index = self._client_pool.reserve_start_index()
+
+        def operation(attempt: int) -> Any:
+            server_url, client = self._client_pool.client_for_attempt(start_index, attempt)
+            logger.debug("Sending agent proposal request to %s", server_url)
+            return client.chat.completions.create(**kwargs)
+
+        return call_with_exponential_backoff(operation, **retry_kwargs)
 
     def propose(self, context: Dict[str, Any]) -> Any:
         self._ensure_client()
@@ -1207,7 +1242,7 @@ class OpenAICompatibleFeatureSearchAgent:
         )
 
         for attempt_idx in range(max_repair_attempts + 1):
-            response = self._client.chat.completions.create(
+            response = self._create_completion(
                 model=model_name,
                 messages=messages,
                 temperature=self.search_config.agent_temperature,
@@ -1442,6 +1477,21 @@ class VLLMExplicitFeatureExtractionProvider:
             max_model_len=self.feature_config.vllm_max_model_len,
             vllm_reasoning_parser=self.feature_config.vllm_reasoning_parser,
             max_retries=self.feature_config.extraction_max_retries,
+            retry_initial_delay=getattr(
+                self.feature_config,
+                "extraction_retry_initial_delay",
+                1.0,
+            ),
+            retry_max_delay=getattr(
+                self.feature_config,
+                "extraction_retry_max_delay",
+                30.0,
+            ),
+            retry_backoff_factor=getattr(
+                self.feature_config,
+                "extraction_retry_backoff_factor",
+                2.0,
+            ),
             temperature=self.feature_config.extraction_temperature,
             max_tokens=self.feature_config.extraction_max_tokens,
             max_text_length=self.feature_config.extraction_max_text_length,
@@ -1615,14 +1665,15 @@ class VLLMExplicitFeatureExtractionProvider:
             raise ImportError(
                 "openai package is required to autodiscover the vLLM server model"
             ) from exc
+        server_url = parse_server_urls(self.feature_config.vllm_server_url)[0]
         client = OpenAI(
-            base_url=self.feature_config.vllm_server_url or "http://localhost:8000/v1",
+            base_url=server_url,
             api_key="EMPTY",
             max_retries=0,
         )
         self._resolved_vllm_model_name = _discover_openai_compatible_model_name(
             client,
-            server_url=self.feature_config.vllm_server_url,
+            server_url=server_url,
             purpose="explicit feature extraction",
         )
         return self._resolved_vllm_model_name

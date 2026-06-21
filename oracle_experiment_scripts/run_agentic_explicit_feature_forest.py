@@ -75,8 +75,11 @@ def main():
     parser.add_argument(
         "--extraction-server-url",
         "--vllm-server-url",
+        "--extraction-server-urls",
+        "--vllm-server-urls",
         dest="vllm_server_url",
         default="http://localhost:8000/v1",
+        help="OpenAI-compatible extraction endpoint, or comma-separated endpoints.",
     )
     parser.add_argument(
         "--extraction-model-name",
@@ -110,15 +113,28 @@ def main():
     )
     parser.add_argument("--extraction-batch-size", type=int, default=64)
     parser.add_argument("--extraction-max-retries", type=int, default=5)
+    parser.add_argument("--extraction-retry-initial-delay", type=float, default=1.0)
+    parser.add_argument("--extraction-retry-max-delay", type=float, default=30.0)
+    parser.add_argument("--extraction-retry-backoff-factor", type=float, default=2.0)
     parser.add_argument("--extraction-max-tokens", type=int, default=25000)
     parser.add_argument("--extraction-max-text-length", type=int, default=400000)
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument("--no-cache", action="store_true")
 
-    parser.add_argument("--agent-server-url", default="http://localhost:8000/v1")
+    parser.add_argument(
+        "--agent-server-url",
+        "--agent-server-urls",
+        dest="agent_server_url",
+        default="http://localhost:8000/v1",
+        help="OpenAI-compatible agent endpoint, or comma-separated endpoints.",
+    )
     parser.add_argument("--agent-model-name", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--agent-api-key", default="EMPTY")
     parser.add_argument("--agent-max-tokens", type=int, default=25000)
+    parser.add_argument("--agent-request-max-retries", type=int, default=3)
+    parser.add_argument("--agent-retry-initial-delay", type=float, default=1.0)
+    parser.add_argument("--agent-retry-max-delay", type=float, default=30.0)
+    parser.add_argument("--agent-retry-backoff-factor", type=float, default=2.0)
     parser.add_argument("--agent-context-chars", type=int, default=4800)
     parser.add_argument("--agent-context-examples", type=int, default=3)
     parser.add_argument("--save-agent-context", action="store_true")
@@ -175,6 +191,10 @@ def main():
                 agent_model_name=args.agent_model_name,
                 agent_api_key=args.agent_api_key,
                 agent_max_tokens=args.agent_max_tokens,
+                agent_request_max_retries=args.agent_request_max_retries,
+                agent_retry_initial_delay=args.agent_retry_initial_delay,
+                agent_retry_max_delay=args.agent_retry_max_delay,
+                agent_retry_backoff_factor=args.agent_retry_backoff_factor,
                 clinical_text_examples_per_prompt=agent_context_examples,
                 clinical_text_example_chars=agent_example_chars,
                 save_agent_context=args.save_agent_context,
@@ -191,6 +211,9 @@ def main():
             vllm_reasoning_parser=args.vllm_reasoning_parser,
             extraction_batch_size=args.extraction_batch_size,
             extraction_max_retries=args.extraction_max_retries,
+            extraction_retry_initial_delay=args.extraction_retry_initial_delay,
+            extraction_retry_max_delay=args.extraction_retry_max_delay,
+            extraction_retry_backoff_factor=args.extraction_retry_backoff_factor,
             extraction_max_tokens=args.extraction_max_tokens,
             extraction_max_text_length=args.extraction_max_text_length,
             cache_enabled=not args.no_cache,

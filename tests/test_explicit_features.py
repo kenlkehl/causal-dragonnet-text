@@ -7,6 +7,7 @@ from oci.extraction import (
     build_extraction_prompt,
     infer_vllm_reasoning_parser,
     parse_extraction_response,
+    parse_server_urls,
     resolve_vllm_reasoning_parser,
 )
 from oci.models.explicit_feature_featurizer import (
@@ -264,6 +265,61 @@ def test_vllm_feature_extractor_request_does_not_set_timeout():
     result = extractor._extract_single_server("Age: 41")
 
     assert "timeout" not in calls
+    assert result["age"].value == 41.0
+    assert result["age"].is_missing is False
+
+
+def test_vllm_feature_extractor_retries_next_server(monkeypatch):
+    calls = []
+
+    class FakeCompletions:
+        def __init__(self, base_url):
+            self.base_url = base_url
+
+        def create(self, **kwargs):
+            calls.append(self.base_url)
+            if self.base_url == "http://server-a/v1":
+                raise TimeoutError("server overloaded")
+
+            class Message:
+                content = '{"age": 41}'
+
+            class Choice:
+                message = Message()
+
+            class Response:
+                choices = [Choice()]
+
+            return Response()
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = type(
+                "Chat",
+                (),
+                {"completions": FakeCompletions(kwargs["base_url"])},
+            )()
+
+    monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
+    extractor = VLLMFeatureExtractor(
+        specs=[
+            ExplicitFeatureSpec(name="age", type="continuous", roles=["confounder"]),
+        ],
+        mode="server",
+        server_url="http://server-a/v1,http://server-b/v1",
+        max_retries=2,
+        retry_initial_delay=0.0,
+    )
+    extractor._init_server_client()
+    extractor._client_pool._next_index = 0
+
+    result = extractor._extract_single_server("Age: 41")
+
+    assert parse_server_urls("http://server-a/v1, http://server-b/v1") == [
+        "http://server-a/v1",
+        "http://server-b/v1",
+    ]
+    assert calls == ["http://server-a/v1", "http://server-b/v1"]
     assert result["age"].value == 41.0
     assert result["age"].is_missing is False
 

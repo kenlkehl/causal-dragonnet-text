@@ -190,6 +190,10 @@ class ExperimentConfig:
     agentic_agent_model_name: str = "Qwen/Qwen2.5-7B-Instruct"
     agentic_agent_api_key: str = "EMPTY"
     agentic_agent_max_tokens: int = 25000
+    agentic_agent_request_max_retries: int = 3
+    agentic_agent_retry_initial_delay: float = 1.0
+    agentic_agent_retry_max_delay: float = 30.0
+    agentic_agent_retry_backoff_factor: float = 2.0
     agentic_agent_context_chars: int = 4800
     agentic_agent_context_examples: int = 3
     agentic_save_agent_context: bool = False
@@ -201,6 +205,9 @@ class ExperimentConfig:
     agentic_vllm_max_model_len: Optional[int] = None
     agentic_vllm_reasoning_parser: Optional[str] = "auto"
     agentic_extraction_max_retries: int = 3
+    agentic_extraction_retry_initial_delay: float = 1.0
+    agentic_extraction_retry_max_delay: float = 30.0
+    agentic_extraction_retry_backoff_factor: float = 2.0
     agentic_extraction_max_tokens: int = 25000
     agentic_extraction_max_text_length: int = 400000
     agentic_extraction_batch_size: int = 32
@@ -2068,6 +2075,10 @@ def run_agentic_experiment(
                 agent_model_name=config.agentic_agent_model_name,
                 agent_api_key=config.agentic_agent_api_key,
                 agent_max_tokens=config.agentic_agent_max_tokens,
+                agent_request_max_retries=config.agentic_agent_request_max_retries,
+                agent_retry_initial_delay=config.agentic_agent_retry_initial_delay,
+                agent_retry_max_delay=config.agentic_agent_retry_max_delay,
+                agent_retry_backoff_factor=config.agentic_agent_retry_backoff_factor,
                 clinical_text_examples_per_prompt=agent_context_examples,
                 clinical_text_example_chars=agent_example_chars,
                 save_agent_context=config.agentic_save_agent_context,
@@ -2087,6 +2098,9 @@ def run_agentic_experiment(
             vllm_reasoning_parser=config.agentic_vllm_reasoning_parser,
             extraction_batch_size=config.agentic_extraction_batch_size,
             extraction_max_retries=config.agentic_extraction_max_retries,
+            extraction_retry_initial_delay=config.agentic_extraction_retry_initial_delay,
+            extraction_retry_max_delay=config.agentic_extraction_retry_max_delay,
+            extraction_retry_backoff_factor=config.agentic_extraction_retry_backoff_factor,
             extraction_max_tokens=config.agentic_extraction_max_tokens,
             extraction_max_text_length=config.agentic_extraction_max_text_length,
             cache_enabled=True,
@@ -2273,6 +2287,10 @@ def generate_experiment_grid(
     agentic_agent_model_name: str = "nvidia/Gemma-4-31B-IT-NVFP4",
     agentic_agent_api_key: str = "EMPTY",
     agentic_agent_max_tokens: int = 25000,
+    agentic_agent_request_max_retries: int = 3,
+    agentic_agent_retry_initial_delay: float = 1.0,
+    agentic_agent_retry_max_delay: float = 30.0,
+    agentic_agent_retry_backoff_factor: float = 2.0,
     agentic_agent_context_chars: int = 4800,
     agentic_agent_context_examples: int = 3,
     agentic_save_agent_context: bool = False,
@@ -2284,6 +2302,9 @@ def generate_experiment_grid(
     agentic_vllm_max_model_len: Optional[int] = None,
     agentic_vllm_reasoning_parser: Optional[str] = "auto",
     agentic_extraction_max_retries: int = 3,
+    agentic_extraction_retry_initial_delay: float = 1.0,
+    agentic_extraction_retry_max_delay: float = 30.0,
+    agentic_extraction_retry_backoff_factor: float = 2.0,
     agentic_extraction_max_tokens: int = 25000,
     agentic_extraction_max_text_length: int = 400000,
     agentic_extraction_batch_size: int = 32,
@@ -2553,6 +2574,10 @@ def generate_experiment_grid(
                     agentic_agent_model_name=agentic_agent_model_name,
                     agentic_agent_api_key=agentic_agent_api_key,
                     agentic_agent_max_tokens=agentic_agent_max_tokens,
+                    agentic_agent_request_max_retries=agentic_agent_request_max_retries,
+                    agentic_agent_retry_initial_delay=agentic_agent_retry_initial_delay,
+                    agentic_agent_retry_max_delay=agentic_agent_retry_max_delay,
+                    agentic_agent_retry_backoff_factor=agentic_agent_retry_backoff_factor,
                     agentic_agent_context_chars=agentic_agent_context_chars,
                     agentic_agent_context_examples=agentic_agent_context_examples,
                     agentic_save_agent_context=agentic_save_agent_context,
@@ -2564,6 +2589,9 @@ def generate_experiment_grid(
                     agentic_vllm_max_model_len=agentic_vllm_max_model_len,
                     agentic_vllm_reasoning_parser=agentic_vllm_reasoning_parser,
                     agentic_extraction_max_retries=agentic_extraction_max_retries,
+                    agentic_extraction_retry_initial_delay=agentic_extraction_retry_initial_delay,
+                    agentic_extraction_retry_max_delay=agentic_extraction_retry_max_delay,
+                    agentic_extraction_retry_backoff_factor=agentic_extraction_retry_backoff_factor,
                     agentic_extraction_max_tokens=agentic_extraction_max_tokens,
                     agentic_extraction_max_text_length=agentic_extraction_max_text_length,
                     agentic_extraction_batch_size=agentic_extraction_batch_size,
@@ -3093,9 +3121,11 @@ def main():
     )
     parser.add_argument(
         "--agentic-agent-server-url",
+        "--agentic-agent-server-urls",
+        dest="agentic_agent_server_url",
         type=str,
         default=None,
-        help="OpenAI-compatible endpoint for the feature proposal agent."
+        help="OpenAI-compatible endpoint for the feature proposal agent, or comma-separated endpoints."
     )
     parser.add_argument(
         "--agentic-agent-model-name",
@@ -3115,6 +3145,10 @@ def main():
         default=25000,
         help="Maximum generation tokens for the feature proposal agent."
     )
+    parser.add_argument("--agentic-agent-request-max-retries", type=int, default=3)
+    parser.add_argument("--agentic-agent-retry-initial-delay", type=float, default=1.0)
+    parser.add_argument("--agentic-agent-retry-max-delay", type=float, default=30.0)
+    parser.add_argument("--agentic-agent-retry-backoff-factor", type=float, default=2.0)
     parser.add_argument(
         "--agentic-agent-context-chars",
         type=int,
@@ -3146,10 +3180,12 @@ def main():
     parser.add_argument(
         "--agentic-extraction-server-url",
         "--agentic-vllm-server-url",
+        "--agentic-extraction-server-urls",
+        "--agentic-vllm-server-urls",
         dest="agentic_vllm_server_url",
         type=str,
         default=None,
-        help="OpenAI-compatible endpoint for explicit feature extraction."
+        help="OpenAI-compatible endpoint for explicit feature extraction, or comma-separated endpoints."
     )
     parser.add_argument(
         "--agentic-extraction-model-name",
@@ -3210,6 +3246,9 @@ def main():
         default=3,
         help="Retries per patient for agentic explicit feature extraction."
     )
+    parser.add_argument("--agentic-extraction-retry-initial-delay", type=float, default=1.0)
+    parser.add_argument("--agentic-extraction-retry-max-delay", type=float, default=30.0)
+    parser.add_argument("--agentic-extraction-retry-backoff-factor", type=float, default=2.0)
     parser.add_argument(
         "--agentic-extraction-max-tokens",
         type=int,
@@ -3302,6 +3341,10 @@ def main():
         agentic_agent_model_name=args.agentic_agent_model_name,
         agentic_agent_api_key=args.agentic_agent_api_key,
         agentic_agent_max_tokens=args.agentic_agent_max_tokens,
+        agentic_agent_request_max_retries=args.agentic_agent_request_max_retries,
+        agentic_agent_retry_initial_delay=args.agentic_agent_retry_initial_delay,
+        agentic_agent_retry_max_delay=args.agentic_agent_retry_max_delay,
+        agentic_agent_retry_backoff_factor=args.agentic_agent_retry_backoff_factor,
         agentic_agent_context_chars=args.agentic_agent_context_chars,
         agentic_agent_context_examples=args.agentic_agent_context_examples,
         agentic_save_agent_context=args.agentic_save_agent_context,
@@ -3313,6 +3356,9 @@ def main():
         agentic_vllm_max_model_len=args.agentic_vllm_max_model_len,
         agentic_vllm_reasoning_parser=args.agentic_vllm_reasoning_parser,
         agentic_extraction_max_retries=args.agentic_extraction_max_retries,
+        agentic_extraction_retry_initial_delay=args.agentic_extraction_retry_initial_delay,
+        agentic_extraction_retry_max_delay=args.agentic_extraction_retry_max_delay,
+        agentic_extraction_retry_backoff_factor=args.agentic_extraction_retry_backoff_factor,
         agentic_extraction_max_tokens=args.agentic_extraction_max_tokens,
         agentic_extraction_max_text_length=args.agentic_extraction_max_text_length,
         agentic_extraction_batch_size=args.agentic_extraction_batch_size,
