@@ -71,6 +71,7 @@ class NonNeuralAgenticOracleConfig:
     candidate_consistency_recovery_max_candidates: int = 12
     candidate_consistency_parallelism: str = "1"
     outer_parallelism: str = "1"
+    bow_parallel_backend: str = "processes"
     fold_parallelism: str = "auto"
 
     cf_n_estimators: int = 200
@@ -168,6 +169,7 @@ def _make_applied_config(
                 candidate_consistency_recovery_max_candidates=config.candidate_consistency_recovery_max_candidates,
                 candidate_consistency_parallelism=config.candidate_consistency_parallelism,
                 outer_parallelism=config.outer_parallelism,
+                bow_parallel_backend=config.bow_parallel_backend,
                 fold_parallelism=config.fold_parallelism,
             ),
         ),
@@ -370,6 +372,12 @@ def main() -> None:
         help="Parallelism for outer CV folds: 'auto' uses runner workers, or pass a positive integer.",
     )
     parser.add_argument(
+        "--bow-parallel-backend",
+        default="processes",
+        choices=["processes", "threads"],
+        help="Backend for BoW cross-fit fold jobs. Processes usually use CPU better for TF-IDF.",
+    )
+    parser.add_argument(
         "--fold-parallelism",
         default="auto",
         help=(
@@ -438,6 +446,7 @@ def main() -> None:
         ),
         candidate_consistency_parallelism=args.candidate_consistency_parallelism,
         outer_parallelism=args.outer_parallelism,
+        bow_parallel_backend=args.bow_parallel_backend,
         fold_parallelism=args.fold_parallelism,
         cf_n_estimators=args.cf_n_estimators,
         cf_min_samples_leaf=args.cf_min_samples_leaf,

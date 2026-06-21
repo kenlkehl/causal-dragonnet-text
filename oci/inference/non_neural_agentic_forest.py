@@ -150,17 +150,29 @@ class NonNeuralAgenticForestRunner:
             outer_n_jobs = 1
 
         if outer_n_jobs > 1:
+            backend = self._parallel_backend_name()
             logger.info(
-                "Running %s non-neural outer fold(s) with outer_parallelism=%s",
+                "Running %s non-neural outer fold(s) with outer_parallelism=%s "
+                "backend=%s joblib_backend=%s",
                 len(splits),
                 outer_n_jobs,
+                self.nn_config.bow_parallel_backend,
+                backend,
             )
-            fold_results = Parallel(n_jobs=outer_n_jobs, prefer="threads")(
-                delayed(self._run_one_analysis_split_isolated)(
+            fold_results = Parallel(
+                n_jobs=outer_n_jobs,
+                backend=backend,
+                batch_size=1,
+                pre_dispatch="all",
+            )(
+                delayed(_run_non_neural_outer_fold_worker)(
+                    self.dataset,
+                    self.config,
+                    self.artifact_dir,
                     int(outer_fold),
                     np.asarray(train_idx),
                     np.asarray(test_idx),
-                    outer_n_jobs,
+                    self._inner_workers_for_outer_job(outer_n_jobs),
                 )
                 for outer_fold, train_idx, test_idx in splits
             )
@@ -436,6 +448,8 @@ class NonNeuralAgenticForestRunner:
             )
         )
         folds = len(split_items)
+        vectorizer_params = self._vectorizer_params()
+        model_params = self._model_params()
 
         def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
             logger.info(
@@ -447,20 +461,15 @@ class NonNeuralAgenticForestRunner:
                 len(fit_pos),
                 len(heldout_pos),
             )
-            if len(np.unique(labels[fit_pos])) < 2:
-                return heldout_pos, np.full(
-                    len(heldout_pos),
-                    float(np.mean(labels[fit_pos])),
-                    dtype=float,
-                )
-            model = Pipeline(
-                [
-                    ("tfidf", self._make_vectorizer()),
-                    ("model", self._make_classifier(random_state=17 + fold)),
-                ]
+            return _fit_binary_bow_fold(
+                texts,
+                labels,
+                fit_pos,
+                heldout_pos,
+                vectorizer_params,
+                model_params,
+                random_state=17 + fold,
             )
-            model.fit([texts[i] for i in fit_pos], labels[fit_pos])
-            return heldout_pos, model.predict_proba([texts[i] for i in heldout_pos])[:, 1]
 
         results = self._run_fold_tasks(run_fold, split_items)
         for heldout_pos, values in results:
@@ -482,6 +491,8 @@ class NonNeuralAgenticForestRunner:
             random_state=12_000 + 100 * outer_fold,
         )
         split_items = list(enumerate(splitter.split(texts), start=1))
+        vectorizer_params = self._vectorizer_params()
+        model_params = self._model_params()
 
         def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
             logger.info(
@@ -493,14 +504,15 @@ class NonNeuralAgenticForestRunner:
                 len(fit_pos),
                 len(heldout_pos),
             )
-            model = Pipeline(
-                [
-                    ("tfidf", self._make_vectorizer()),
-                    ("model", self._make_regressor(random_state=17 + fold)),
-                ]
+            return _fit_regression_bow_fold(
+                texts,
+                values,
+                fit_pos,
+                heldout_pos,
+                vectorizer_params,
+                model_params,
+                random_state=17 + fold,
             )
-            model.fit([texts[i] for i in fit_pos], values[fit_pos])
-            return heldout_pos, model.predict([texts[i] for i in heldout_pos])
 
         results = self._run_fold_tasks(run_fold, split_items)
         for heldout_pos, fold_values in results:
@@ -521,6 +533,8 @@ class NonNeuralAgenticForestRunner:
             random_state=13_000 + outer_fold,
         )
         split_items = list(enumerate(splitter.split(texts), start=1))
+        vectorizer_params = self._vectorizer_params()
+        model_params = self._model_params()
 
         def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
             logger.info(
@@ -531,14 +545,15 @@ class NonNeuralAgenticForestRunner:
                 len(fit_pos),
                 len(heldout_pos),
             )
-            model = Pipeline(
-                [
-                    ("tfidf", self._make_vectorizer()),
-                    ("model", self._make_regressor(random_state=17 + fold)),
-                ]
+            return _fit_regression_bow_fold(
+                texts,
+                pseudo_target,
+                fit_pos,
+                heldout_pos,
+                vectorizer_params,
+                model_params,
+                random_state=17 + fold,
             )
-            model.fit([texts[i] for i in fit_pos], pseudo_target[fit_pos])
-            return heldout_pos, model.predict([texts[i] for i in heldout_pos])
 
         results = self._run_fold_tasks(run_fold, split_items)
         for heldout_pos, values in results:
@@ -556,28 +571,47 @@ class NonNeuralAgenticForestRunner:
         x_text = vectorizer.fit_transform(texts)
         features = np.asarray(vectorizer.get_feature_names_out())
 
-        if len(np.unique(t.astype(int))) < 2:
-            treatment_coef = np.zeros(len(features), dtype=float)
-        else:
+        def fit_treatment() -> np.ndarray:
+            if len(np.unique(t.astype(int))) < 2:
+                return np.zeros(len(features), dtype=float)
             treatment_model = self._make_classifier(random_state=101)
             treatment_model.fit(x_text, t.astype(int))
-            treatment_coef = _model_feature_scores(treatment_model, len(features))
+            return _model_feature_scores(treatment_model, len(features))
 
-        if self.config.outcome_type == "continuous":
-            outcome_model = self._make_regressor(random_state=202)
-            outcome_model.fit(x_text, y)
-            outcome_coef = _model_feature_scores(outcome_model, len(features))
-        else:
+        def fit_outcome() -> np.ndarray:
+            if self.config.outcome_type == "continuous":
+                outcome_model = self._make_regressor(random_state=202)
+                outcome_model.fit(x_text, y)
+                return _model_feature_scores(outcome_model, len(features))
             if len(np.unique(y.astype(int))) < 2:
-                outcome_coef = np.zeros(len(features), dtype=float)
-            else:
-                outcome_model = self._make_classifier(random_state=202)
-                outcome_model.fit(x_text, y.astype(int))
-                outcome_coef = _model_feature_scores(outcome_model, len(features))
+                return np.zeros(len(features), dtype=float)
+            outcome_model = self._make_classifier(random_state=202)
+            outcome_model.fit(x_text, y.astype(int))
+            return _model_feature_scores(outcome_model, len(features))
 
-        effect_model = self._make_regressor(random_state=303)
-        effect_model.fit(x_text, pseudo_target)
-        effect_coef = _model_feature_scores(effect_model, len(features))
+        def fit_effect() -> np.ndarray:
+            effect_model = self._make_regressor(random_state=303)
+            effect_model.fit(x_text, pseudo_target)
+            return _model_feature_scores(effect_model, len(features))
+
+        n_jobs = self._feature_importance_n_jobs()
+        if n_jobs > 1:
+            logger.info(
+                "Non-neural BoW feature-importance parallelism: tasks=3 n_jobs=%s",
+                n_jobs,
+            )
+            treatment_coef, outcome_coef, effect_coef = Parallel(
+                n_jobs=n_jobs,
+                backend="threading",
+                batch_size=1,
+            )(
+                delayed(task)()
+                for task in (fit_treatment, fit_outcome, fit_effect)
+            )
+        else:
+            treatment_coef = fit_treatment()
+            outcome_coef = fit_outcome()
+            effect_coef = fit_effect()
 
         top_n = int(self.nn_config.top_n_features)
         confounder_score = np.abs(treatment_coef) * np.abs(outcome_coef)
@@ -1015,21 +1049,31 @@ class NonNeuralAgenticForestRunner:
 
         logger.info(
             "Non-neural candidate consistency parallelism: outer_fold=%s "
-            "inner_folds=%s n_jobs=%s setting=%s",
+            "inner_folds=%s n_jobs=%s setting=%s backend=%s joblib_backend=%s",
             outer_fold,
             len(split_items),
             n_jobs,
             self.nn_config.candidate_consistency_parallelism,
+            self.nn_config.bow_parallel_backend,
+            self._parallel_backend_name(),
         )
-        return Parallel(n_jobs=n_jobs, prefer="threads")(
-            delayed(self._build_inner_consistency_candidate_bundle_isolated)(
+        return Parallel(
+            n_jobs=n_jobs,
+            backend=self._parallel_backend_name(),
+            batch_size=1,
+            pre_dispatch="all",
+        )(
+            delayed(_build_non_neural_inner_candidate_bundle_worker)(
+                self.dataset,
+                self.config,
+                self.artifact_dir,
                 int(outer_fold),
                 discovery_df,
                 int(inner_fold),
                 fit_pos,
                 heldout_pos,
                 int(fold_count),
-                int(n_jobs),
+                self._inner_workers_for_nested_job(n_jobs),
             )
             for inner_fold, fit_pos, heldout_pos in split_items
         )
@@ -1486,105 +1530,32 @@ class NonNeuralAgenticForestRunner:
             return _dedupe_specs(list(self.config.explicit_features.features))
         return []
 
+    def _vectorizer_params(self) -> Dict[str, Any]:
+        return {
+            "ngram_range_min": int(self.nn_config.ngram_range_min),
+            "ngram_range_max": int(self.nn_config.ngram_range_max),
+            "min_df": int(self.nn_config.min_df),
+            "max_df": float(self.nn_config.max_df),
+            "sublinear_tf": bool(self.nn_config.sublinear_tf),
+            "max_features": int(self.nn_config.max_features),
+        }
+
+    def _model_params(self) -> Dict[str, Any]:
+        return {
+            "bow_model": str(self.nn_config.bow_model).strip().lower(),
+            "logistic_c": float(self.nn_config.logistic_c),
+            "logistic_max_iter": int(self.nn_config.logistic_max_iter),
+            "ridge_alpha": float(self.nn_config.ridge_alpha),
+        }
+
     def _make_vectorizer(self) -> TfidfVectorizer:
-        return TfidfVectorizer(
-            lowercase=False,
-            token_pattern=r"(?u)[a-z0-9%<>+=-]+",
-            ngram_range=(
-                int(self.nn_config.ngram_range_min),
-                int(self.nn_config.ngram_range_max),
-            ),
-            min_df=int(self.nn_config.min_df),
-            max_df=float(self.nn_config.max_df),
-            sublinear_tf=bool(self.nn_config.sublinear_tf),
-            max_features=int(self.nn_config.max_features),
-            dtype=np.float32,
-        )
+        return _make_bow_vectorizer(self._vectorizer_params())
 
     def _make_classifier(self, random_state: int = 17):
-        model_name = str(self.nn_config.bow_model).strip().lower()
-        if model_name == "linear":
-            return self._make_logistic_regression(random_state=random_state)
-        if model_name == "extratrees":
-            return ExtraTreesClassifier(
-                n_estimators=300,
-                max_depth=None,
-                min_samples_leaf=2,
-                max_features="sqrt",
-                random_state=random_state,
-                n_jobs=1,
-            )
-        if model_name == "random_forest":
-            return RandomForestClassifier(
-                n_estimators=300,
-                max_depth=None,
-                min_samples_leaf=2,
-                max_features="sqrt",
-                random_state=random_state,
-                n_jobs=1,
-            )
-        if model_name == "xgboost":
-            try:
-                from xgboost import XGBClassifier
-            except ImportError as exc:
-                raise ImportError(
-                    "bow_model='xgboost' requires the xgboost package"
-                ) from exc
-            return XGBClassifier(
-                n_estimators=300,
-                max_depth=3,
-                learning_rate=0.05,
-                subsample=0.9,
-                colsample_bytree=0.6,
-                objective="binary:logistic",
-                eval_metric="logloss",
-                tree_method="hist",
-                random_state=random_state,
-                n_jobs=1,
-            )
-        raise ValueError(f"Unsupported bow_model: {model_name}")
+        return _make_bow_classifier(self._model_params(), random_state=random_state)
 
     def _make_regressor(self, random_state: int = 17):
-        model_name = str(self.nn_config.bow_model).strip().lower()
-        if model_name == "linear":
-            return self._make_ridge()
-        if model_name == "extratrees":
-            return ExtraTreesRegressor(
-                n_estimators=300,
-                max_depth=None,
-                min_samples_leaf=2,
-                max_features="sqrt",
-                random_state=random_state,
-                n_jobs=1,
-            )
-        if model_name == "random_forest":
-            return RandomForestRegressor(
-                n_estimators=300,
-                max_depth=None,
-                min_samples_leaf=2,
-                max_features="sqrt",
-                random_state=random_state,
-                n_jobs=1,
-            )
-        if model_name == "xgboost":
-            try:
-                from xgboost import XGBRegressor
-            except ImportError as exc:
-                raise ImportError(
-                    "bow_model='xgboost' requires the xgboost package"
-                ) from exc
-            return XGBRegressor(
-                n_estimators=300,
-                max_depth=3,
-                learning_rate=0.05,
-                subsample=0.9,
-                colsample_bytree=0.6,
-                objective="reg:squarederror",
-                tree_method="hist",
-                random_state=random_state,
-                n_jobs=1,
-            )
-        raise ValueError(f"Unsupported bow_model: {model_name}")
+        return _make_bow_regressor(self._model_params(), random_state=random_state)
 
     def _make_logistic_regression(self, random_state: int = 17) -> LogisticRegression:
         return LogisticRegression(
@@ -1636,6 +1607,20 @@ class NonNeuralAgenticForestRunner:
             auto_workers=self.num_workers,
         )
 
+    def _feature_importance_n_jobs(self) -> int:
+        return self._parallel_n_jobs(
+            self.nn_config.fold_parallelism,
+            3,
+            auto_workers=self.num_workers,
+        )
+
+    def _parallel_backend_name(self) -> str:
+        return (
+            "loky"
+            if self.nn_config.bow_parallel_backend == "processes"
+            else "threading"
+        )
+
     def _run_fold_tasks(self, run_fold: Any, split_items: Sequence[Any]) -> List[Any]:
         n_jobs = self._fold_n_jobs(len(split_items))
         if n_jobs <= 1:
@@ -1643,13 +1628,22 @@ class NonNeuralAgenticForestRunner:
                 run_fold(int(fold), np.asarray(fit_pos), np.asarray(heldout_pos))
                 for fold, (fit_pos, heldout_pos) in split_items
             ]
+        backend = self._parallel_backend_name()
         logger.info(
-            "Non-neural BoW cross-fit parallelism: folds=%s n_jobs=%s setting=%s",
+            "Non-neural BoW cross-fit parallelism: folds=%s n_jobs=%s "
+            "setting=%s backend=%s joblib_backend=%s",
             len(split_items),
             n_jobs,
             self.nn_config.fold_parallelism,
+            self.nn_config.bow_parallel_backend,
+            backend,
         )
-        return Parallel(n_jobs=n_jobs, prefer="threads")(
+        return Parallel(
+            n_jobs=n_jobs,
+            backend=backend,
+            batch_size=1,
+            pre_dispatch="all",
+        )(
             delayed(run_fold)(int(fold), np.asarray(fit_pos), np.asarray(heldout_pos))
             for fold, (fit_pos, heldout_pos) in split_items
         )
@@ -1674,6 +1668,80 @@ class NonNeuralAgenticForestRunner:
         with open(self.artifact_dir / "selected_feature_sets.json", "w") as f:
             json.dump(self.feature_set_rows, f, indent=2, default=_json_default)
         logger.info("Non-neural agentic forest artifacts saved to: %s", self.artifact_dir)
+
+
+def _run_non_neural_outer_fold_worker(
+    dataset: pd.DataFrame,
+    config: AppliedInferenceConfig,
+    artifact_dir: Path,
+    outer_fold: int,
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+    num_workers: int,
+) -> Dict[str, Any]:
+    logger.info(
+        "Non-neural agentic isolated fold %s: train=%s test=%s workers=%s",
+        outer_fold,
+        len(train_idx),
+        len(test_idx),
+        num_workers,
+    )
+    fold_runner = NonNeuralAgenticForestRunner(
+        dataset=dataset,
+        config=config,
+        output_path=(
+            Path(artifact_dir)
+            / f"outer_fold_{int(outer_fold):03d}"
+            / "predictions.parquet"
+        ),
+        num_workers=num_workers,
+    )
+    predictions = fold_runner._run_one_analysis_split(
+        outer_fold=outer_fold,
+        train_idx=train_idx,
+        test_idx=test_idx,
+    )
+    return {
+        "outer_fold": int(outer_fold),
+        "predictions": predictions,
+        "bow_prediction_frames": fold_runner.bow_prediction_frames,
+        "importance_rows": fold_runner.importance_rows,
+        "agent_rows": fold_runner.agent_rows,
+        "feature_set_rows": fold_runner.feature_set_rows,
+        "outer_metric_rows": fold_runner.outer_metric_rows,
+    }
+
+
+def _build_non_neural_inner_candidate_bundle_worker(
+    dataset: pd.DataFrame,
+    config: AppliedInferenceConfig,
+    artifact_dir: Path,
+    outer_fold: int,
+    discovery_df: pd.DataFrame,
+    inner_fold: int,
+    fit_pos: np.ndarray,
+    heldout_pos: np.ndarray,
+    total_inner_folds: int,
+    num_workers: int,
+) -> Dict[str, Any]:
+    worker = NonNeuralAgenticForestRunner(
+        dataset=dataset,
+        config=config,
+        output_path=(
+            Path(artifact_dir)
+            / f"outer_{int(outer_fold):03d}_candidate_inner_{int(inner_fold):03d}"
+            / "predictions.parquet"
+        ),
+        num_workers=num_workers,
+    )
+    return worker._build_inner_consistency_candidate_bundle(
+        outer_fold=outer_fold,
+        discovery_df=discovery_df,
+        inner_fold=inner_fold,
+        fit_pos=fit_pos,
+        heldout_pos=heldout_pos,
+        total_inner_folds=total_inner_folds,
+    )
 
 
 def _normalize_texts(values: Sequence[Any]) -> List[str]:
@@ -1801,6 +1869,166 @@ def _proposal_to_dict(proposal: AgenticFeatureProposal) -> Dict[str, Any]:
         "rationale": proposal.rationale,
         "expected_signal": proposal.expected_signal,
     }
+
+
+def _fit_binary_bow_fold(
+    texts: Sequence[str],
+    labels: np.ndarray,
+    fit_pos: np.ndarray,
+    heldout_pos: np.ndarray,
+    vectorizer_params: Dict[str, Any],
+    model_params: Dict[str, Any],
+    *,
+    random_state: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    labels = np.asarray(labels).astype(int)
+    fit_pos = np.asarray(fit_pos)
+    heldout_pos = np.asarray(heldout_pos)
+    if len(np.unique(labels[fit_pos])) < 2:
+        return heldout_pos, np.full(
+            len(heldout_pos),
+            float(np.mean(labels[fit_pos])),
+            dtype=float,
+        )
+    model = Pipeline(
+        [
+            ("tfidf", _make_bow_vectorizer(vectorizer_params)),
+            ("model", _make_bow_classifier(model_params, random_state=random_state)),
+        ]
+    )
+    model.fit([texts[i] for i in fit_pos], labels[fit_pos])
+    return heldout_pos, model.predict_proba([texts[i] for i in heldout_pos])[:, 1]
+
+
+def _fit_regression_bow_fold(
+    texts: Sequence[str],
+    values: np.ndarray,
+    fit_pos: np.ndarray,
+    heldout_pos: np.ndarray,
+    vectorizer_params: Dict[str, Any],
+    model_params: Dict[str, Any],
+    *,
+    random_state: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    values = np.asarray(values, dtype=float)
+    fit_pos = np.asarray(fit_pos)
+    heldout_pos = np.asarray(heldout_pos)
+    model = Pipeline(
+        [
+            ("tfidf", _make_bow_vectorizer(vectorizer_params)),
+            ("model", _make_bow_regressor(model_params, random_state=random_state)),
+        ]
+    )
+    model.fit([texts[i] for i in fit_pos], values[fit_pos])
+    return heldout_pos, model.predict([texts[i] for i in heldout_pos])
+
+
+def _make_bow_vectorizer(params: Dict[str, Any]) -> TfidfVectorizer:
+    return TfidfVectorizer(
+        lowercase=False,
+        token_pattern=r"(?u)[a-z0-9%<>+=-]+",
+        ngram_range=(
+            int(params["ngram_range_min"]),
+            int(params["ngram_range_max"]),
+        ),
+        min_df=int(params["min_df"]),
+        max_df=float(params["max_df"]),
+        sublinear_tf=bool(params["sublinear_tf"]),
+        max_features=int(params["max_features"]),
+        dtype=np.float32,
+    )
+
+
+def _make_bow_classifier(params: Dict[str, Any], *, random_state: int = 17):
+    model_name = str(params["bow_model"]).strip().lower()
+    if model_name == "linear":
+        return LogisticRegression(
+            C=float(params["logistic_c"]),
+            solver="liblinear",
+            max_iter=int(params["logistic_max_iter"]),
+            random_state=random_state,
+        )
+    if model_name == "extratrees":
+        return ExtraTreesClassifier(
+            n_estimators=300,
+            max_depth=None,
+            min_samples_leaf=2,
+            max_features="sqrt",
+            random_state=random_state,
+            n_jobs=1,
+        )
+    if model_name == "random_forest":
+        return RandomForestClassifier(
+            n_estimators=300,
+            max_depth=None,
+            min_samples_leaf=2,
+            max_features="sqrt",
+            random_state=random_state,
+            n_jobs=1,
+        )
+    if model_name == "xgboost":
+        try:
+            from xgboost import XGBClassifier
+        except ImportError as exc:
+            raise ImportError(
+                "bow_model='xgboost' requires the xgboost package"
+            ) from exc
+        return XGBClassifier(
+            n_estimators=300,
+            max_depth=3,
+            learning_rate=0.05,
+            subsample=0.9,
+            colsample_bytree=0.6,
+            objective="binary:logistic",
+            eval_metric="logloss",
+            tree_method="hist",
+            random_state=random_state,
+            n_jobs=1,
+        )
+    raise ValueError(f"Unsupported bow_model: {model_name}")
+
+
+def _make_bow_regressor(params: Dict[str, Any], *, random_state: int = 17):
+    model_name = str(params["bow_model"]).strip().lower()
+    if model_name == "linear":
+        return Ridge(alpha=float(params["ridge_alpha"]), random_state=random_state)
+    if model_name == "extratrees":
+        return ExtraTreesRegressor(
+            n_estimators=300,
+            max_depth=None,
+            min_samples_leaf=2,
+            max_features="sqrt",
+            random_state=random_state,
+            n_jobs=1,
+        )
+    if model_name == "random_forest":
+        return RandomForestRegressor(
+            n_estimators=300,
+            max_depth=None,
+            min_samples_leaf=2,
+            max_features="sqrt",
+            random_state=random_state,
+            n_jobs=1,
+        )
+    if model_name == "xgboost":
+        try:
+            from xgboost import XGBRegressor
+        except ImportError as exc:
+            raise ImportError(
+                "bow_model='xgboost' requires the xgboost package"
+            ) from exc
+        return XGBRegressor(
+            n_estimators=300,
+            max_depth=3,
+            learning_rate=0.05,
+            subsample=0.9,
+            colsample_bytree=0.6,
+            objective="reg:squarederror",
+            tree_method="hist",
+            random_state=random_state,
+            n_jobs=1,
+        )
+    raise ValueError(f"Unsupported bow_model: {model_name}")
 
 
 def _bounded_fold_count(requested: int, n_rows: int) -> int:

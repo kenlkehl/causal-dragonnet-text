@@ -278,6 +278,7 @@ def test_non_neural_agentic_forest_parses_bow_model_option():
                         "candidate_consistency_min_fold_fraction": 0.5,
                         "candidate_consistency_parallelism": "2",
                         "outer_parallelism": "3",
+                        "bow_parallel_backend": "processes",
                     },
                 },
                 "explicit_features": {"enabled": True, "features": []},
@@ -292,6 +293,7 @@ def test_non_neural_agentic_forest_parses_bow_model_option():
     assert nn_cfg.candidate_consistency_min_fold_fraction == 0.5
     assert nn_cfg.candidate_consistency_parallelism == "2"
     assert nn_cfg.outer_parallelism == "3"
+    assert nn_cfg.bow_parallel_backend == "processes"
     cfg.validate()
 
 

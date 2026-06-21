@@ -463,6 +463,7 @@ class NonNeuralAgenticForestConfig:
     candidate_consistency_recovery_max_candidates: int = 12
     candidate_consistency_parallelism: str = "1"
     outer_parallelism: str = "1"
+    bow_parallel_backend: str = "processes"
     # "auto" uses the runner num_workers setting; set a positive integer to
     # parallelize BoW nuisance/effect cross-fit folds explicitly.
     fold_parallelism: str = "auto"
@@ -530,6 +531,13 @@ class NonNeuralAgenticForestConfig:
             self.outer_parallelism,
             "non_neural_agentic_forest.outer_parallelism",
         )
+        bow_backend = str(self.bow_parallel_backend).strip().lower()
+        if bow_backend not in {"processes", "threads"}:
+            raise ValueError(
+                "non_neural_agentic_forest.bow_parallel_backend must be "
+                "'processes' or 'threads'"
+            )
+        self.bow_parallel_backend = bow_backend
         if self.fold_parallelism != "auto":
             try:
                 if int(self.fold_parallelism) < 1:
