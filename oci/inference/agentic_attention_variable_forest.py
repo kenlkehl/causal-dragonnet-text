@@ -42,6 +42,8 @@ from .agentic_explicit_feature_forest import (
     OpenAICompatibleFeatureSearchAgent,
     VLLMExplicitFeatureExtractionProvider,
     _get_agent_response_trace,
+    _proposal_agent_supports_value_harmonization,
+    apply_agentic_value_harmonization,
 )
 from .applied_explicit_feature_forest import _build_features, _hstack_present
 from ..utils.calibration import (
@@ -527,6 +529,7 @@ class AgenticAttentionVariableForestRunner:
         self.confounder_candidate_rows: List[Dict[str, Any]] = []
         self.modifier_candidate_rows: List[Dict[str, Any]] = []
         self.consensus_disambiguation_rows: List[Dict[str, Any]] = []
+        self.value_harmonization_rows: List[Dict[str, Any]] = []
         self.consensus_rows: List[Dict[str, Any]] = []
         self.coverage_filter_rows: List[Dict[str, Any]] = []
         self.association_filter_rows: List[Dict[str, Any]] = []
@@ -4492,6 +4495,12 @@ class AgenticAttentionVariableForestRunner:
             ]
             if not candidates:
                 break
+            candidates = self._harmonize_value_contracts(
+                stage=stage,
+                outer_fold=outer_fold,
+                proposal_attempt=attempt,
+                selected_specs=candidates,
+            )
 
             self.dataset = self.extraction_provider.ensure_features(self.dataset, candidates)
             train_df = self.dataset.iloc[train_idx].copy()
@@ -4557,6 +4566,75 @@ class AgenticAttentionVariableForestRunner:
                     rejected_low_signal.append(row)
 
         return kept_specs
+
+    def _harmonize_value_contracts(
+        self,
+        stage: str,
+        outer_fold: int,
+        proposal_attempt: int,
+        selected_specs: List[ExplicitFeatureSpec],
+    ) -> List[ExplicitFeatureSpec]:
+        if not selected_specs:
+            return selected_specs
+        if not _proposal_agent_supports_value_harmonization(self.proposal_agent):
+            return selected_specs
+
+        context = {
+            "prompt_version": "non_neural_agentic_value_harmonization_v1",
+            "agentic_path": "agentic_attention_variable_forest",
+            "stage": stage,
+            "outer_fold": int(outer_fold),
+            "proposal_attempt": int(proposal_attempt),
+            "selected_features": [_spec_to_dict(spec) for spec in selected_specs],
+            "missing_value_policy": (
+                "Use null for unknown, not reported, not assessed, not tested, "
+                "unavailable, and qualitative-only values that are incompatible "
+                "with a numeric extraction target."
+            ),
+        }
+        base_row: Dict[str, Any] = {
+            "outer_fold": int(outer_fold),
+            "stage": stage,
+            "proposal_attempt": int(proposal_attempt),
+            "selected_features_before": [_spec_to_dict(spec) for spec in selected_specs],
+            "selected_features_after": [_spec_to_dict(spec) for spec in selected_specs],
+            "applied": [],
+        }
+        try:
+            response = self.proposal_agent.propose(context)
+            harmonization_trace = _get_agent_response_trace(self.proposal_agent)
+        except Exception as exc:
+            logger.warning(
+                "Attention-variable value harmonization failed; using unharmonized specs",
+                exc_info=True,
+            )
+            row = {
+                **base_row,
+                "status": "agent_error_fallback",
+                "context": self._stored_agent_context(context),
+                "error": str(exc),
+            }
+            self.value_harmonization_rows.append(row)
+            self._flush_value_harmonization_rows()
+            return selected_specs
+
+        harmonized, applied = apply_agentic_value_harmonization(
+            specs=selected_specs,
+            response=response,
+        )
+        row = {
+            **base_row,
+            "status": "complete",
+            "context": self._stored_agent_context(context),
+            "response": response,
+            "applied": applied,
+            "selected_features_after": [_spec_to_dict(spec) for spec in harmonized],
+        }
+        if getattr(self.agent_search_config, "save_agent_raw_output", False):
+            row["agent_raw_output"] = harmonization_trace
+        self.value_harmonization_rows.append(row)
+        self._flush_value_harmonization_rows()
+        return harmonized
 
     def _stored_agent_context(self, context: Dict[str, Any]) -> Dict[str, Any]:
         if getattr(self.agent_search_config, "save_agent_context", False):
@@ -5311,6 +5389,12 @@ class AgenticAttentionVariableForestRunner:
         _write_jsonl(
             self.artifact_dir / "consensus_disambiguation_by_attempt.jsonl",
             self.consensus_disambiguation_rows,
+        )
+
+    def _flush_value_harmonization_rows(self) -> None:
+        _write_jsonl(
+            self.artifact_dir / "value_harmonization_by_attempt.jsonl",
+            self.value_harmonization_rows,
         )
 
     def _flush_coverage_filter_rows(self) -> None:
@@ -6271,6 +6355,10 @@ class AgenticAttentionVariableForestRunner:
         _write_jsonl(
             self.artifact_dir / "consensus_disambiguation_by_attempt.jsonl",
             self.consensus_disambiguation_rows,
+        )
+        _write_jsonl(
+            self.artifact_dir / "value_harmonization_by_attempt.jsonl",
+            self.value_harmonization_rows,
         )
         with open(self.artifact_dir / "consensus.json", "w") as f:
             json.dump(self.consensus_rows, f, indent=2)

@@ -8,6 +8,7 @@ all feature-set decisions are made with inner CV on each outer-training split.
 import json
 import logging
 import re
+import unicodedata
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -47,6 +48,32 @@ VALID_ROLES = {"confounder", "effect_modifier"}
 VALID_TYPES = {"categorical", "continuous"}
 _AUTO_MODEL_NAME_VALUES = {"", "auto", "discover", "server"}
 _MODEL_NAME_AUTODISCOVERY_ALIASES = {"Qwen/Qwen3.6-27B"}
+_DASH_TRANSLATION = dict.fromkeys(
+    map(ord, "\u2010\u2011\u2012\u2013\u2014\u2212"),
+    "-",
+)
+_MISSING_VALUE_LABELS = {
+    "",
+    "unknown",
+    "unk",
+    "not_reported",
+    "not reported",
+    "not_assessed",
+    "not assessed",
+    "not_tested",
+    "not tested",
+    "unavailable",
+    "not_available",
+    "not available",
+    "na",
+    "n/a",
+    "none",
+    "null",
+    "missing",
+    "not_applicable",
+    "not applicable",
+    "indeterminate",
+}
 
 
 def _is_auto_model_name(model_name: Optional[str]) -> bool:
@@ -254,6 +281,14 @@ class AgenticFeatureSearchRunner:
             selected_specs = selected_by_outer_fold.get(outer_fold)
             if selected_specs is None:
                 selected_specs = self._search_outer_train(outer_fold, train_idx)
+            selected_specs = self._resolve_selected_aliases(
+                outer_fold=outer_fold,
+                selected_specs=selected_specs,
+            )
+            selected_specs = self._harmonize_value_contracts(
+                outer_fold=outer_fold,
+                selected_specs=selected_specs,
+            )
             self.dataset = self.extraction_provider.ensure_features(self.dataset, selected_specs)
 
             train_df = self.dataset.iloc[train_idx].copy()
@@ -929,6 +964,145 @@ class AgenticFeatureSearchRunner:
             ],
         )
 
+    def _resolve_selected_aliases(
+        self,
+        outer_fold: int,
+        selected_specs: List[ExplicitFeatureSpec],
+    ) -> List[ExplicitFeatureSpec]:
+        if not selected_specs:
+            return selected_specs
+        if not _proposal_agent_supports_alias_resolution(self.proposal_agent):
+            return selected_specs
+
+        initial_names = {
+            _normalize_feature_name(spec.name)
+            for spec in self.initial_specs
+            if _normalize_feature_name(spec.name)
+        }
+        known_specs = [
+            spec
+            for spec in selected_specs
+            if _normalize_feature_name(spec.name) in initial_names
+        ]
+        add_specs = [
+            spec
+            for spec in selected_specs
+            if _normalize_feature_name(spec.name) not in initial_names
+        ]
+        add_proposals = [_proposal_from_spec(spec) for spec in add_specs]
+        if not add_proposals:
+            return selected_specs
+        if len(add_proposals) < 2 and not known_specs:
+            return selected_specs
+
+        context = {
+            "prompt_version": "non_neural_agentic_alias_resolution_v1",
+            "agentic_path": "agentic_explicit_feature_forest",
+            "outer_fold": int(outer_fold),
+            "known_canonical_features": [_spec_to_dict(spec) for spec in known_specs],
+            "proposed_features": [
+                {
+                    "name": proposal.name,
+                    "type": proposal.type,
+                    "categories": proposal.categories,
+                    "roles": proposal.roles,
+                    "description": proposal.description,
+                    "rationale": proposal.rationale,
+                    "expected_signal": proposal.expected_signal,
+                }
+                for proposal in add_proposals
+            ],
+        }
+        try:
+            response = self.proposal_agent.propose(context)
+            alias_trace = _get_agent_response_trace(self.proposal_agent)
+        except Exception as exc:
+            logger.warning(
+                "Agentic explicit alias resolution failed; using selected names",
+                exc_info=True,
+            )
+            self._record_decision(
+                outer_fold,
+                0,
+                "alias_resolution",
+                {"error": str(exc), "applied_aliases": []},
+            )
+            return selected_specs
+
+        resolved, applied_aliases = apply_agentic_alias_resolution(
+            proposals=add_proposals,
+            known_specs=known_specs,
+            response=response,
+        )
+        result: Dict[str, Any] = {
+            "context": context,
+            "response": response,
+            "applied_aliases": applied_aliases,
+        }
+        if self.search_config.save_agent_raw_output:
+            result["agent_raw_output"] = alias_trace
+        self._record_decision(outer_fold, 0, "alias_resolution", result)
+
+        if not applied_aliases:
+            return selected_specs
+        resolved_specs = [
+            _proposal_to_spec(proposal)
+            for proposal in resolved
+            if proposal.action == "add"
+        ]
+        return _dedupe_agentic_specs([*known_specs, *resolved_specs])
+
+    def _harmonize_value_contracts(
+        self,
+        outer_fold: int,
+        selected_specs: List[ExplicitFeatureSpec],
+    ) -> List[ExplicitFeatureSpec]:
+        if not selected_specs:
+            return selected_specs
+        if not _proposal_agent_supports_value_harmonization(self.proposal_agent):
+            return selected_specs
+
+        context = {
+            "prompt_version": "non_neural_agentic_value_harmonization_v1",
+            "agentic_path": "agentic_explicit_feature_forest",
+            "outer_fold": int(outer_fold),
+            "selected_features": [_spec_to_dict(spec) for spec in selected_specs],
+            "missing_value_policy": (
+                "Use null for unknown, not reported, not assessed, not tested, "
+                "unavailable, and qualitative-only values that are incompatible "
+                "with a numeric extraction target."
+            ),
+        }
+        try:
+            response = self.proposal_agent.propose(context)
+            harmonization_trace = _get_agent_response_trace(self.proposal_agent)
+        except Exception as exc:
+            logger.warning(
+                "Agentic explicit value harmonization failed; using unharmonized specs",
+                exc_info=True,
+            )
+            self._record_decision(
+                outer_fold,
+                0,
+                "value_harmonization",
+                {"error": str(exc), "applied": []},
+            )
+            return selected_specs
+
+        harmonized, applied = apply_agentic_value_harmonization(
+            specs=selected_specs,
+            response=response,
+        )
+        result: Dict[str, Any] = {
+            "context": context,
+            "response": response,
+            "applied": applied,
+        }
+        if self.search_config.save_agent_raw_output:
+            result["agent_raw_output"] = harmonization_trace
+        self._record_decision(outer_fold, 0, "value_harmonization", result)
+        return harmonized
+
     def _evaluate_inner_cv(
         self,
         outer_fold: int,
@@ -1317,6 +1491,18 @@ class OpenAICompatibleFeatureSearchAgent:
             return proposals
 
         return []
+
+
+def _proposal_agent_supports_value_harmonization(agent: Any) -> bool:
+    return isinstance(agent, OpenAICompatibleFeatureSearchAgent) or bool(
+        getattr(agent, "supports_value_harmonization", False)
+    )
+
+
+def _proposal_agent_supports_alias_resolution(agent: Any) -> bool:
+    return isinstance(agent, OpenAICompatibleFeatureSearchAgent) or bool(
+        getattr(agent, "supports_alias_resolution", False)
+    )
 
 
 class VLLMExplicitFeatureExtractionProvider:
@@ -2718,6 +2904,163 @@ def apply_proposals(
     return specs
 
 
+def apply_agentic_value_harmonization(
+    *,
+    specs: Sequence[ExplicitFeatureSpec],
+    response: Any,
+) -> Tuple[List[ExplicitFeatureSpec], List[Dict[str, Any]]]:
+    """Apply an agent-reviewed value contract to already-selected specs."""
+    if not isinstance(response, dict):
+        return list(specs), [{"error": "response_not_object"}]
+    raw_features = response.get("features")
+    if not isinstance(raw_features, list):
+        return list(specs), [{"error": "missing_features_list"}]
+
+    by_name = {spec.name: spec for spec in specs}
+    harmonized = {spec.name: spec for spec in specs}
+    applied: List[Dict[str, Any]] = []
+    for item in raw_features:
+        if not isinstance(item, dict):
+            applied.append({"ignored": item, "reason": "feature_not_object"})
+            continue
+        name = _normalize_feature_name(item.get("name", ""))
+        spec = by_name.get(name)
+        if spec is None:
+            applied.append({"name": name, "reason": "unknown_feature"})
+            continue
+
+        feature_type = str(item.get("type") or spec.type).strip().lower()
+        if feature_type not in VALID_TYPES:
+            feature_type = spec.type
+
+        description = str(item.get("description") or spec.description or "").strip()
+        if feature_type == "categorical":
+            categories = _canonical_value_categories(
+                item.get("categories") or spec.categories
+            )
+            if not categories:
+                applied.append({"name": name, "reason": "empty_categorical_categories"})
+                continue
+            value_aliases = _canonical_value_aliases(
+                item.get("value_aliases"),
+                categories,
+            )
+            description = _append_value_policy(
+                description,
+                categories=categories,
+                value_aliases=value_aliases,
+                continuous=False,
+            )
+        else:
+            categories = None
+            value_aliases = None
+            description = _append_value_policy(
+                description,
+                categories=None,
+                value_aliases=None,
+                continuous=True,
+            )
+
+        new_spec = ExplicitFeatureSpec(
+            name=spec.name,
+            type=feature_type,
+            categories=categories,
+            description=description or spec.description,
+            value_aliases=value_aliases,
+            roles=spec.roles,
+        )
+        harmonized[spec.name] = new_spec
+        applied.append(
+            {
+                "name": spec.name,
+                "from": _spec_to_dict(spec),
+                "to": _spec_to_dict(new_spec),
+                "rationale": item.get("rationale"),
+            }
+        )
+
+    return _dedupe_agentic_specs(list(harmonized.values())), applied
+
+
+def apply_agentic_alias_resolution(
+    *,
+    proposals: Sequence[AgenticFeatureProposal],
+    known_specs: Sequence[ExplicitFeatureSpec],
+    response: Any,
+) -> Tuple[List[AgenticFeatureProposal], List[Dict[str, str]]]:
+    """Apply agent-reviewed aliases to add proposals, reusing known canonical specs."""
+    if not isinstance(response, dict):
+        return list(proposals), []
+
+    proposal_by_name = {
+        proposal.name: proposal for proposal in proposals if proposal.action == "add"
+    }
+    known_by_name = {spec.name: spec for spec in known_specs}
+    allowed_names = set(proposal_by_name) | set(known_by_name)
+    alias_to_canonical: Dict[str, str] = {}
+    applied_aliases: List[Dict[str, str]] = []
+
+    groups = response.get("groups") or []
+    if not isinstance(groups, list):
+        return list(proposals), []
+
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        canonical = _normalize_feature_name(group.get("canonical_name", ""))
+        raw_members = group.get("member_names") or []
+        if not isinstance(raw_members, list):
+            continue
+        members = [
+            _normalize_feature_name(member)
+            for member in raw_members
+            if _normalize_feature_name(member) in allowed_names
+        ]
+        if canonical not in allowed_names:
+            continue
+        if canonical not in members and canonical not in known_by_name:
+            continue
+        if len(set([canonical, *members])) < 2:
+            continue
+        for member in members:
+            if member in proposal_by_name and member != canonical:
+                alias_to_canonical[member] = canonical
+                applied_aliases.append(
+                    {
+                        "from": member,
+                        "to": canonical,
+                        "rationale": str(group.get("rationale") or ""),
+                    }
+                )
+
+    if not alias_to_canonical:
+        return list(proposals), []
+
+    rewritten: List[AgenticFeatureProposal] = []
+    emitted_add_names: set = set()
+    for proposal in proposals:
+        if proposal.action != "add":
+            rewritten.append(proposal)
+            continue
+        target_name = alias_to_canonical.get(proposal.name, proposal.name)
+        known_spec = known_by_name.get(target_name)
+        retargeted = _retarget_proposal(
+            proposal=proposal,
+            target_name=target_name,
+            known_spec=known_spec,
+        )
+        if target_name in emitted_add_names:
+            for index, existing in enumerate(rewritten):
+                if existing.action == "add" and existing.name == target_name:
+                    rewritten[index] = _merge_proposals(existing, retargeted)
+                    break
+            continue
+        rewritten.append(retargeted)
+        emitted_add_names.add(target_name)
+
+    return rewritten, applied_aliases
+
+
 def _proposal_to_spec(proposal: AgenticFeatureProposal) -> ExplicitFeatureSpec:
     return ExplicitFeatureSpec(
         name=proposal.name,
@@ -2742,6 +3085,265 @@ def _proposal_from_spec(
         rationale=None if source is None else source.rationale,
         expected_signal=None if source is None else source.expected_signal,
     )
+
+
+def _retarget_proposal(
+    *,
+    proposal: AgenticFeatureProposal,
+    target_name: str,
+    known_spec: Optional[ExplicitFeatureSpec],
+) -> AgenticFeatureProposal:
+    if known_spec is None:
+        return AgenticFeatureProposal(
+            action=proposal.action,
+            name=target_name,
+            type=proposal.type,
+            categories=proposal.categories,
+            description=proposal.description,
+            roles=proposal.roles,
+            rationale=proposal.rationale,
+            expected_signal=proposal.expected_signal,
+        )
+
+    categories = _merge_ordered_values(known_spec.categories, proposal.categories) or None
+    feature_type = (
+        "categorical"
+        if known_spec.type == "categorical" or proposal.type == "categorical" or categories
+        else known_spec.type
+    )
+    return AgenticFeatureProposal(
+        action=proposal.action,
+        name=target_name,
+        type=feature_type,
+        categories=categories,
+        description=_merge_text_values(known_spec.description, proposal.description),
+        roles=_merge_ordered_values(known_spec.roles, proposal.roles),
+        rationale=proposal.rationale,
+        expected_signal=proposal.expected_signal,
+    )
+
+
+def _merge_proposals(
+    left: AgenticFeatureProposal,
+    right: AgenticFeatureProposal,
+) -> AgenticFeatureProposal:
+    categories = _merge_ordered_values(left.categories, right.categories) or None
+    feature_type = (
+        "categorical"
+        if left.type == "categorical" or right.type == "categorical" or categories
+        else (left.type or right.type)
+    )
+    return AgenticFeatureProposal(
+        action="add",
+        name=left.name,
+        type=feature_type,
+        categories=categories,
+        description=_merge_text_values(left.description, right.description),
+        roles=_merge_ordered_values(left.roles, right.roles),
+        rationale=_merge_text_values(left.rationale, right.rationale),
+        expected_signal=_merge_text_values(left.expected_signal, right.expected_signal),
+    )
+
+
+def _canonical_value_categories(value: Any) -> Optional[List[str]]:
+    categories: List[str] = []
+    seen = set()
+    for raw in _as_list(value):
+        text = _canonical_category_text(raw)
+        if _is_missing_value_label(text):
+            continue
+        key = _category_equivalence_key(text)
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        categories.append(text)
+    return categories or None
+
+
+def _canonical_value_aliases(
+    value_aliases: Any,
+    categories: Sequence[str],
+) -> Optional[Dict[str, List[str]]]:
+    if not isinstance(value_aliases, dict):
+        return None
+    by_key = {_category_equivalence_key(category): category for category in categories}
+    result: Dict[str, List[str]] = {}
+    for raw_key, raw_aliases in value_aliases.items():
+        category = by_key.get(_category_equivalence_key(raw_key))
+        if category is None:
+            continue
+        aliases = []
+        for alias in _as_list(raw_aliases):
+            text = _canonical_category_text(alias)
+            if text and not _is_missing_value_label(text):
+                aliases.append(text)
+        if aliases:
+            result[category] = list(dict.fromkeys(aliases))
+    return result or None
+
+
+def _canonical_category_text(value: Any) -> str:
+    text = unicodedata.normalize("NFKC", str(value)).translate(_DASH_TRANSLATION)
+    text = text.strip().replace("\u2265", ">=").replace("\u2264", "<=")
+    text = " ".join(text.split())
+    return text
+
+
+def _category_equivalence_key(value: Any) -> str:
+    text = _canonical_category_text(value).lower()
+    text = text.replace("_", " ").replace(" ", "")
+    return text
+
+
+def _is_missing_value_label(value: Any) -> bool:
+    key = _canonical_category_text(value).lower().replace("-", "_")
+    key = " ".join(key.split())
+    return key in _MISSING_VALUE_LABELS or key.replace(" ", "_") in _MISSING_VALUE_LABELS
+
+
+def _append_value_policy(
+    description: str,
+    *,
+    categories: Optional[Sequence[str]],
+    value_aliases: Any,
+    continuous: bool,
+) -> str:
+    base = description.strip()
+    policy_parts: List[str] = []
+    if continuous:
+        policy_parts.append(
+            "Value policy: return a numeric value only; return null for unknown, "
+            "not reported, not assessed, unavailable, or qualitative-only values "
+            "such as high/low without a numeric value."
+        )
+    else:
+        cats = ", ".join(str(cat) for cat in categories or [])
+        policy_parts.append(
+            f"Value policy: return exactly one of [{cats}]; return null for "
+            "unknown, not reported, not assessed, not tested, or unavailable values."
+        )
+        alias_text = _format_value_aliases(value_aliases, categories or [])
+        if alias_text:
+            policy_parts.append(f"Map value aliases as follows: {alias_text}.")
+
+    policy = " ".join(policy_parts)
+    if not base:
+        return policy
+    if "Value policy:" in base:
+        return base
+    return f"{base} {policy}"
+
+
+def _format_value_aliases(value_aliases: Any, categories: Sequence[str]) -> str:
+    if not isinstance(value_aliases, dict):
+        return ""
+    allowed = set(categories)
+    chunks: List[str] = []
+    for category, raw_aliases in value_aliases.items():
+        if category not in allowed:
+            continue
+        aliases = [
+            _canonical_category_text(alias)
+            for alias in _as_list(raw_aliases)
+            if _canonical_category_text(alias)
+            and not _is_missing_value_label(alias)
+        ]
+        if aliases:
+            chunks.append(f"{category}: {', '.join(dict.fromkeys(aliases))}")
+    return "; ".join(chunks)
+
+
+def _as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _normalize_spec(spec: ExplicitFeatureSpec) -> ExplicitFeatureSpec:
+    normalized_name = _normalize_feature_name(spec.name)
+    if normalized_name == spec.name:
+        return spec
+    return ExplicitFeatureSpec(
+        name=normalized_name,
+        type=spec.type,
+        categories=spec.categories,
+        description=spec.description,
+        value_aliases=getattr(spec, "value_aliases", None),
+        roles=spec.roles,
+    )
+
+
+def _dedupe_agentic_specs(
+    specs: Sequence[ExplicitFeatureSpec],
+) -> List[ExplicitFeatureSpec]:
+    by_name: Dict[str, ExplicitFeatureSpec] = {}
+    for spec in specs:
+        spec = _normalize_spec(spec)
+        name = _normalize_feature_name(spec.name)
+        if not name:
+            continue
+        if name not in by_name:
+            by_name[name] = spec
+            continue
+        existing = by_name[name]
+        roles = list(dict.fromkeys([*existing.roles, *spec.roles]))
+        categories = _merge_ordered_values(existing.categories, spec.categories) or None
+        value_aliases = _merge_value_aliases(
+            getattr(existing, "value_aliases", None),
+            getattr(spec, "value_aliases", None),
+        )
+        if existing.type == "categorical" or spec.type == "categorical" or categories:
+            feature_type = "categorical"
+        else:
+            feature_type = existing.type
+        by_name[name] = ExplicitFeatureSpec(
+            name=name,
+            type=feature_type,
+            categories=categories,
+            description=_merge_text_values(existing.description, spec.description),
+            value_aliases=value_aliases,
+            roles=roles,
+        )
+    return list(by_name.values())
+
+
+def _merge_ordered_values(left: Any, right: Any) -> List[str]:
+    values: List[str] = []
+    for item in _as_list(left) + _as_list(right):
+        text = str(item).strip()
+        if text and text not in values:
+            values.append(text)
+    return values
+
+
+def _merge_value_aliases(left: Any, right: Any) -> Optional[Dict[str, List[str]]]:
+    merged: Dict[str, List[str]] = {}
+    for source in [left, right]:
+        if not isinstance(source, dict):
+            continue
+        for category, aliases in source.items():
+            category_text = str(category).strip()
+            if not category_text:
+                continue
+            merged[category_text] = _merge_ordered_values(
+                merged.get(category_text, []),
+                aliases,
+            )
+    return merged or None
+
+
+def _merge_text_values(left: Any, right: Any) -> Optional[str]:
+    left_text = str(left).strip() if left is not None else ""
+    right_text = str(right).strip() if right is not None else ""
+    if not left_text:
+        return right_text or None
+    if not right_text or right_text == left_text:
+        return left_text
+    return f"{left_text} {right_text}"
 
 
 def _screened_spec_to_proposal(

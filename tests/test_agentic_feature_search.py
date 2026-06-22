@@ -16,6 +16,7 @@ from oci.config import (
 )
 from oci.extraction.cache import _compute_config_hash
 from oci.inference.agentic_explicit_feature_forest import (
+    AgenticFeatureSearchRunner,
     AgenticFeatureProposal,
     OpenAICompatibleFeatureSearchAgent,
     SplitEvaluation,
@@ -1078,6 +1079,129 @@ class FakeEvaluator:
             "oracle_true_ite_corr": 0.99,
         }
         return SplitEvaluation(predictions=predictions, metrics=metrics)
+
+
+def test_agentic_runner_resolves_aliases_then_harmonizes_values(tmp_path):
+    class HarmonizationAgent:
+        supports_alias_resolution = True
+        supports_value_harmonization = True
+
+        def __init__(self):
+            self.contexts = []
+
+        def propose(self, context):
+            self.contexts.append(context)
+            if context["prompt_version"] == "non_neural_agentic_alias_resolution_v1":
+                return {
+                    "groups": [
+                        {
+                            "canonical_name": "pd_l1_expression",
+                            "member_names": [
+                                "pd_l1_expression",
+                                "pd_l1_expression_level",
+                            ],
+                            "type": "categorical",
+                            "categories": ["<1%", "1-49%", ">=50%"],
+                            "description": "Pretreatment tumor PD-L1 expression category.",
+                            "roles": ["effect_modifier"],
+                            "rationale": "Both names refer to the same PD-L1 target.",
+                        }
+                    ],
+                    "unmerged": [],
+                }
+            if context["prompt_version"] == "non_neural_agentic_value_harmonization_v1":
+                return {
+                    "features": [
+                        {
+                            "name": "age",
+                            "type": "continuous",
+                            "categories": None,
+                            "description": "Patient age at treatment initiation in years.",
+                        },
+                        {
+                            "name": "pd_l1_expression",
+                            "type": "categorical",
+                            "categories": ["<1%", "1-49%", ">=50%", "unknown"],
+                            "description": "Pretreatment tumor PD-L1 expression category.",
+                            "value_aliases": {
+                                "<1%": ["low negative"],
+                                ">=50%": ["high", "50% or greater"],
+                            },
+                        },
+                    ]
+                }
+            return []
+
+    df = pd.DataFrame(
+        {
+            "clinical_text": ["age 55 pd-l1 high", "age 70 pd-l1 low"],
+            "treatment_indicator": [1, 0],
+            "outcome_indicator": [1, 0],
+        }
+    )
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        architecture=ModelArchitectureConfig(
+            model_type="agentic_explicit_feature_forest",
+            agentic_feature_search=AgenticFeatureSearchConfig(
+                outer_folds=2,
+                inner_folds=2,
+            ),
+        ),
+        explicit_features=ExplicitFeatureExtractionConfig(
+            enabled=True,
+            features=_base_specs(),
+        ),
+    )
+    agent = HarmonizationAgent()
+    runner = AgenticFeatureSearchRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "predictions.parquet",
+        proposal_agent=agent,
+        extraction_provider=FakeExtractionProvider(),
+        evaluator=FakeEvaluator(),
+    )
+    selected = [
+        *_base_specs(),
+        ExplicitFeatureSpec(
+            name="pd_l1_expression",
+            type="categorical",
+            categories=["low", "high", "unknown"],
+            description="Pretreatment PD-L1 expression.",
+            roles=["effect_modifier"],
+        ),
+        ExplicitFeatureSpec(
+            name="pd_l1_expression_level",
+            type="categorical",
+            categories=["<1%", "1-49%", ">=50%"],
+            description="Pretreatment tumor PD-L1 expression category.",
+            roles=["effect_modifier"],
+        ),
+    ]
+
+    resolved = runner._resolve_selected_aliases(outer_fold=1, selected_specs=selected)
+    harmonized = runner._harmonize_value_contracts(
+        outer_fold=1,
+        selected_specs=resolved,
+    )
+
+    assert [spec.name for spec in harmonized] == ["age", "pd_l1_expression"]
+    pdl1 = next(spec for spec in harmonized if spec.name == "pd_l1_expression")
+    assert pdl1.categories == ["<1%", "1-49%", ">=50%"]
+    assert "unknown" not in pdl1.categories
+    assert pdl1.value_aliases[">=50%"] == ["high", "50% or greater"]
+    age = next(spec for spec in harmonized if spec.name == "age")
+    assert age.type == "continuous"
+    assert "numeric value only" in age.description
+    assert [context["prompt_version"] for context in agent.contexts] == [
+        "non_neural_agentic_alias_resolution_v1",
+        "non_neural_agentic_value_harmonization_v1",
+    ]
+    assert [event["event"] for event in runner.decision_events] == [
+        "alias_resolution",
+        "value_harmonization",
+    ]
 
 
 class FeedbackAgent:

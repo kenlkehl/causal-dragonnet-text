@@ -327,6 +327,96 @@ def test_consensus_feature_specs_uses_agentic_alias_groups():
     assert any("at least 2 distinct folds" in error for error in errors)
 
 
+def test_attention_runner_harmonizes_candidate_value_contracts(tmp_path):
+    class ValueAgent:
+        supports_value_harmonization = True
+
+        def __init__(self):
+            self.contexts = []
+
+        def propose(self, context):
+            self.contexts.append(context)
+            assert context["prompt_version"] == "non_neural_agentic_value_harmonization_v1"
+            assert context["agentic_path"] == "agentic_attention_variable_forest"
+            return {
+                "features": [
+                    {
+                        "name": "pd_l1_expression",
+                        "type": "categorical",
+                        "categories": ["<1%", "1-49%", ">=50%", "unknown"],
+                        "description": "Pretreatment tumor PD-L1 expression category.",
+                        "value_aliases": {
+                            "<1%": ["low negative"],
+                            ">=50%": ["high", "50% or greater"],
+                        },
+                    }
+                ]
+            }
+
+    class NoopExtractionProvider:
+        def ensure_features(self, dataset, specs):
+            return dataset
+
+    df = pd.DataFrame(
+        {
+            "clinical_text": ["pd-l1 high", "pd-l1 low"],
+            "treatment_indicator": [1, 0],
+            "outcome_indicator": [1, 0],
+        }
+    )
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        architecture=ModelArchitectureConfig(
+            model_type="agentic_attention_variable_forest",
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=2,
+                effect_folds=2,
+            ),
+        ),
+    )
+    runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "predictions.parquet",
+        device=torch.device("cpu"),
+        num_workers=1,
+        proposal_agent=ValueAgent(),
+        extraction_provider=NoopExtractionProvider(),
+    )
+    specs = [
+        ExplicitFeatureSpec(
+            name="pd_l1_expression",
+            type="categorical",
+            categories=["low", "high", "unknown"],
+            description="Pretreatment PD-L1 expression.",
+            roles=["effect_modifier"],
+        )
+    ]
+
+    harmonized = runner._harmonize_value_contracts(
+        stage="effect_modifier",
+        outer_fold=1,
+        proposal_attempt=1,
+        selected_specs=specs,
+    )
+
+    assert harmonized[0].categories == ["<1%", "1-49%", ">=50%"]
+    assert harmonized[0].value_aliases[">=50%"] == ["high", "50% or greater"]
+    assert "unknown" not in harmonized[0].categories
+    artifact_path = (
+        tmp_path
+        / "agentic_attention_variable_forest"
+        / "value_harmonization_by_attempt.jsonl"
+    )
+    rows = [json.loads(line) for line in artifact_path.read_text().splitlines()]
+    assert rows[0]["status"] == "complete"
+    assert rows[0]["selected_features_after"][0]["categories"] == [
+        "<1%",
+        "1-49%",
+        ">=50%",
+    ]
+
+
 def test_consensus_disambiguation_rejects_unproposed_and_conflicting_groups():
     proposals = {
         1: [
