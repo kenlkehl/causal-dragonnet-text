@@ -1484,6 +1484,17 @@ def test_agent_candidate_output_is_saved_during_discovery(tmp_path):
         last_response_trace = {"raw_content": "{\"proposals\": []}"}
 
         def propose(self, context):
+            if context["prompt_version"] == "agentic_attention_consensus_recovery_v1":
+                return [
+                    {
+                        "action": "add",
+                        "name": "baseline_marker",
+                        "type": "continuous",
+                        "roles": ["confounder"],
+                        "description": "Baseline marker before treatment",
+                        "rationale": "stable enough to keep",
+                    }
+                ]
             assert context["attention_evidence"][0]["evidence_snippet"] == "important note"
             assert "chunk_text" not in context["attention_evidence"][0]
             return [
@@ -1644,6 +1655,233 @@ def test_consensus_disambiguation_prompt_is_alias_only():
     assert "Use only names that appear in proposed_variables_by_fold" in prompt
 
 
+def test_attention_consensus_recovery_prompt_uses_candidate_summaries():
+    prompt = build_agent_prompt(
+        {
+            "prompt_version": "agentic_attention_consensus_recovery_v1",
+            "stage": "confounder",
+            "max_selected_candidates": 2,
+            "candidate_summaries": [
+                {
+                    "name": "patient_age",
+                    "support_folds": [1, 2],
+                    "missing_folds": [3],
+                    "passes_consensus_gate": False,
+                }
+            ],
+        },
+        AgenticFeatureSearchConfig(),
+    )
+
+    assert "candidate_summaries" in prompt
+    assert "Recover plausible real variables" in prompt
+    assert "Choose only names listed in candidate_summaries" in prompt
+
+
+def test_attention_consensus_recovery_can_rescue_missing_fold_candidate(tmp_path):
+    class RecoveryAgent:
+        def __init__(self):
+            self.contexts = []
+
+        def propose(self, context):
+            self.contexts.append(context)
+            if context["prompt_version"] == "agentic_attention_consensus_disambiguation_v1":
+                return {
+                    "groups": [
+                        {
+                            "canonical_name": "patient_age",
+                            "member_names": ["patient_age", "baseline_age"],
+                            "member_folds": [1, 2],
+                            "type": "continuous",
+                            "description": "Patient age before treatment",
+                            "rationale": "Both folds describe baseline age.",
+                        }
+                    ],
+                    "unmerged": [],
+                }
+            if context["prompt_version"] == "agentic_attention_consensus_recovery_v1":
+                patient_age = next(
+                    item
+                    for item in context["candidate_summaries"]
+                    if item["name"] == "patient_age"
+                )
+                assert patient_age["support_folds"] == [1, 2]
+                assert patient_age["missing_folds"] == [3]
+                assert patient_age["passes_consensus_gate"] is False
+                return [
+                    {
+                        "action": "add",
+                        "name": "patient_age",
+                        "type": "continuous",
+                        "roles": ["confounder"],
+                        "description": "Patient age before treatment",
+                        "rationale": "Two folds found age and the missing fold looks unstable.",
+                    }
+                ]
+            if context["fold"] == 1:
+                name = "patient_age"
+            elif context["fold"] == 2:
+                name = "baseline_age"
+            else:
+                return []
+            return [
+                {
+                    "action": "add",
+                    "name": name,
+                    "type": "continuous",
+                    "roles": ["confounder"],
+                    "description": f"{name} before treatment",
+                    "rationale": "age evidence",
+                }
+            ]
+
+    df = pd.DataFrame(
+        {
+            "clinical_text": ["age note", "baseline age note", "weak note"],
+            "treatment_indicator": [0, 1, 0],
+            "outcome_indicator": [0, 1, 0],
+        }
+    )
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        architecture=ModelArchitectureConfig(
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=3,
+                effect_folds=3,
+                candidate_proposals_per_fold=1,
+                consensus_min_folds=3,
+                consensus_recovery_max_candidates=4,
+            ),
+        ),
+    )
+    runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "predictions.parquet",
+        device=torch.device("cpu"),
+        num_workers=1,
+        proposal_agent=RecoveryAgent(),
+        extraction_provider=FakeExtractionProvider(),
+    )
+    attention_rows = [
+        {
+            "row_id": int(runner.dataset.loc[fold - 1, "_oci_row_id"]),
+            "fold": fold,
+            "stage": "nuisance",
+            "chunk_text": f"fold {fold} evidence",
+            "attention": 0.9,
+        }
+        for fold in [1, 2, 3]
+    ]
+
+    selected = runner._discover_variables_from_attention(
+        stage="confounder",
+        outer_fold=1,
+        discovery_df=runner.dataset,
+        attention_rows=attention_rows,
+        existing_specs=[],
+    )
+
+    assert [spec.name for spec in selected] == ["patient_age"]
+    recovery_path = (
+        tmp_path
+        / "agentic_attention_variable_forest"
+        / "consensus_recovery_by_attempt.jsonl"
+    )
+    rows = [json.loads(line) for line in recovery_path.read_text().splitlines()]
+    assert rows[0]["status"] == "complete"
+    assert rows[0]["used_fallback"] is False
+    assert rows[0]["selected_features"][0]["name"] == "patient_age"
+
+
+def test_attention_consensus_recovery_invalid_selection_uses_fallback(tmp_path):
+    class BadRecoveryAgent:
+        def propose(self, context):
+            if context["prompt_version"] == "agentic_attention_consensus_disambiguation_v1":
+                return {"groups": [], "unmerged": []}
+            if context["prompt_version"] == "agentic_attention_consensus_recovery_v1":
+                return [
+                    {
+                        "action": "add",
+                        "name": "invented_marker",
+                        "type": "continuous",
+                        "roles": ["confounder"],
+                        "description": "Not proposed by any fold",
+                    }
+                ]
+            if context["fold"] == 1:
+                return [
+                    {
+                        "action": "add",
+                        "name": "single_fold_marker",
+                        "type": "continuous",
+                        "roles": ["confounder"],
+                        "description": "Only one fold proposed it",
+                    }
+                ]
+            return []
+
+    df = pd.DataFrame(
+        {
+            "clinical_text": ["marker note", "weak note", "weak note"],
+            "treatment_indicator": [0, 1, 0],
+            "outcome_indicator": [0, 1, 0],
+        }
+    )
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        architecture=ModelArchitectureConfig(
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=3,
+                effect_folds=3,
+                candidate_proposals_per_fold=1,
+                consensus_min_folds=2,
+            ),
+        ),
+    )
+    runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "predictions.parquet",
+        device=torch.device("cpu"),
+        num_workers=1,
+        proposal_agent=BadRecoveryAgent(),
+        extraction_provider=FakeExtractionProvider(),
+    )
+    attention_rows = [
+        {
+            "row_id": int(runner.dataset.loc[fold - 1, "_oci_row_id"]),
+            "fold": fold,
+            "stage": "nuisance",
+            "chunk_text": f"fold {fold} evidence",
+            "attention": 0.9,
+        }
+        for fold in [1, 2, 3]
+    ]
+
+    selected = runner._discover_variables_from_attention(
+        stage="confounder",
+        outer_fold=1,
+        discovery_df=runner.dataset,
+        attention_rows=attention_rows,
+        existing_specs=[],
+    )
+
+    assert selected == []
+    rows = [
+        json.loads(line)
+        for line in (
+            tmp_path
+            / "agentic_attention_variable_forest"
+            / "consensus_recovery_by_attempt.jsonl"
+        )
+        .read_text()
+        .splitlines()
+    ]
+    assert rows[0]["used_fallback"] is True
+    assert rows[0]["rejected_proposals"][0]["reason"] == "not_in_consensus_candidates"
+
+
 def test_attention_agent_context_is_compact_and_filters_blank_chunks(tmp_path):
     df = pd.DataFrame(
         {
@@ -1750,6 +1988,21 @@ def test_low_coverage_attention_candidates_trigger_retry(tmp_path):
 
         def propose(self, context):
             self.contexts.append(context)
+            if context["prompt_version"] == "agentic_attention_consensus_recovery_v1":
+                name = context["candidate_summaries"][0]["name"]
+                return [
+                    {
+                        "action": "add",
+                        "name": name,
+                        "type": "categorical",
+                        "categories": ["absent", "present"]
+                        if name == "rare_marker"
+                        else ["younger", "older"],
+                        "roles": ["confounder"],
+                        "description": f"{name} before treatment",
+                        "rationale": "keep current consensus candidate",
+                    }
+                ]
             if context["proposal_attempt"] == 1:
                 return [
                     {
@@ -1847,7 +2100,12 @@ def test_low_coverage_attention_candidates_trigger_retry(tmp_path):
 
     assert [spec.name for spec in selected] == ["age_group"]
     assert {context["proposal_attempt"] for context in agent.contexts} == {1, 2}
-    assert all(context["max_proposals"] == 1 for context in agent.contexts)
+    proposal_contexts = [
+        context
+        for context in agent.contexts
+        if context["prompt_version"] == "agentic_attention_variable_forest_v1"
+    ]
+    assert all(context["max_proposals"] == 1 for context in proposal_contexts)
     coverage_path = (
         tmp_path
         / "agentic_attention_variable_forest"
@@ -1861,6 +2119,19 @@ def test_low_coverage_attention_candidates_trigger_retry(tmp_path):
 def test_attention_candidates_are_filtered_by_association_signal(tmp_path):
     class AssociationAgent:
         def propose(self, context):
+            if context["prompt_version"] == "agentic_attention_consensus_recovery_v1":
+                return [
+                    {
+                        "action": "add",
+                        "name": item["name"],
+                        "type": item["type"],
+                        "categories": item.get("categories"),
+                        "roles": item["roles"],
+                        "description": item["description"],
+                        "rationale": "keep consensus candidate",
+                    }
+                    for item in context["candidate_summaries"]
+                ]
             assert context["max_proposals"] == 2
             return [
                 {
@@ -1996,6 +2267,17 @@ def test_alias_consensus_reaches_coverage_and_association_filtering(tmp_path):
                         {"name": "rare_marker", "reason": "Only one fold proposed it."}
                     ],
                 }
+            if context["prompt_version"] == "agentic_attention_consensus_recovery_v1":
+                return [
+                    {
+                        "action": "add",
+                        "name": "patient_age",
+                        "type": "continuous",
+                        "roles": ["confounder"],
+                        "description": "Patient age before treatment",
+                        "rationale": "aliases recur across folds",
+                    }
+                ]
             names = {
                 1: "patient_age",
                 2: "age_at_diagnosis",

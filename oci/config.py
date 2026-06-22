@@ -648,6 +648,8 @@ class AgenticAttentionVariableForestConfig:
     min_signal_outcome_auroc: float = 0.55
     consensus_min_folds: Optional[int] = 2
     consensus_min_fold_fraction: float = 2.0 / 3.0
+    consensus_recovery_enabled: bool = True
+    consensus_recovery_max_candidates: int = 12
     min_extraction_coverage: float = 0.10
     e_clip: float = 0.01
     r_stage_min_propensity: float = 0.0
@@ -809,6 +811,11 @@ class AgenticAttentionVariableForestConfig:
             raise ValueError(
                 "agentic_attention_variable_forest.consensus_min_fold_fraction "
                 "must be in (0, 1]"
+            )
+        if self.consensus_recovery_max_candidates < 0:
+            raise ValueError(
+                "agentic_attention_variable_forest.consensus_recovery_max_candidates "
+                "must be >= 0"
             )
         if not 0.0 <= self.min_extraction_coverage <= 1.0:
             raise ValueError(

@@ -142,6 +142,8 @@ class AgenticAttentionOracleConfig:
     min_signal_outcome_auroc: float = 0.55
     consensus_min_folds: Optional[int] = 2
     consensus_min_fold_fraction: float = 2.0 / 3.0
+    consensus_recovery_enabled: bool = True
+    consensus_recovery_max_candidates: int = 12
     min_extraction_coverage: float = 0.10
     e_clip: float = 0.01
     r_stage_min_propensity: float = 0.0
@@ -317,6 +319,10 @@ def _make_applied_config(
                 min_signal_outcome_auroc=config.min_signal_outcome_auroc,
                 consensus_min_folds=config.consensus_min_folds,
                 consensus_min_fold_fraction=config.consensus_min_fold_fraction,
+                consensus_recovery_enabled=config.consensus_recovery_enabled,
+                consensus_recovery_max_candidates=(
+                    config.consensus_recovery_max_candidates
+                ),
                 min_extraction_coverage=config.min_extraction_coverage,
                 e_clip=config.e_clip,
                 r_stage_min_propensity=config.r_stage_min_propensity,
@@ -724,6 +730,8 @@ def _result_row(config_hash: str, result: Dict[str, Any]) -> Dict[str, Any]:
         "alpha_propensity",
         "r_stage_min_propensity",
         "r_stage_max_propensity",
+        "consensus_recovery_enabled",
+        "consensus_recovery_max_candidates",
         "effect_objective",
         "neural_stage_mode",
         "joint_rlearner_gamma",
@@ -928,6 +936,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=2,
     )
     parser.add_argument("--consensus-min-fold-fraction", type=float, default=2.0 / 3.0)
+    parser.add_argument("--consensus-recovery-enabled", type=_parse_bool, default=True)
+    parser.add_argument("--consensus-recovery-max-candidates", type=int, default=12)
     parser.add_argument("--min-extraction-coverage", type=float, default=0.10)
     parser.add_argument("--e-clip", type=float, default=0.01)
     parser.add_argument("--r-stage-min-propensity", type=float, default=0.0)
@@ -1162,6 +1172,10 @@ def _make_configs(args: argparse.Namespace) -> List[AgenticAttentionOracleConfig
                     min_signal_outcome_auroc=args.min_signal_outcome_auroc,
                     consensus_min_folds=args.consensus_min_folds,
                     consensus_min_fold_fraction=args.consensus_min_fold_fraction,
+                    consensus_recovery_enabled=args.consensus_recovery_enabled,
+                    consensus_recovery_max_candidates=(
+                        args.consensus_recovery_max_candidates
+                    ),
                     min_extraction_coverage=args.min_extraction_coverage,
                     e_clip=args.e_clip,
                     r_stage_min_propensity=args.r_stage_min_propensity,
@@ -1276,6 +1290,8 @@ def main() -> None:
         parser.error("--consensus-min-folds must be >= 1 or 'none'")
     if not 0.0 < args.consensus_min_fold_fraction <= 1.0:
         parser.error("--consensus-min-fold-fraction must be in (0, 1]")
+    if args.consensus_recovery_max_candidates < 0:
+        parser.error("--consensus-recovery-max-candidates must be >= 0")
     if args.htr_sentence_encoder_batch_size < 1:
         parser.error("--htr-sentence-encoder-batch-size must be >= 1")
     if args.htr_trainable_sentence_encoder_layers < 0:

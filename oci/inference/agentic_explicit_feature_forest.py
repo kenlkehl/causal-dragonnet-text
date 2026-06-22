@@ -1982,6 +1982,9 @@ def build_agent_prompt(
     if context.get("prompt_version") == "agentic_attention_consensus_disambiguation_v1":
         return build_attention_consensus_disambiguation_prompt(context, search_config)
 
+    if context.get("prompt_version") == "agentic_attention_consensus_recovery_v1":
+        return build_attention_consensus_recovery_prompt(context, search_config)
+
     if context.get("prompt_version") == "non_neural_agentic_alias_resolution_v1":
         return build_non_neural_agentic_alias_resolution_prompt(context, search_config)
 
@@ -2147,6 +2150,52 @@ Rules:
 - Leave single-fold or ambiguous concepts unmerged rather than forcing a group.
 
 Current consensus-disambiguation context:
+{context_json}
+"""
+
+
+def build_attention_consensus_recovery_prompt(
+    context: Dict[str, Any],
+    search_config: AgenticFeatureSearchConfig,
+) -> str:
+    """Construct the stability/recovery prompt for attention-variable consensus."""
+    del search_config
+    context_json = json.dumps(context, indent=2, default=_json_default)
+    max_selected = int(context.get("max_selected_candidates", 6))
+    return f"""You are selecting stable explicit variables for a causal forest from candidates proposed by a neural attention-based feature extractor across separate inner folds.
+
+The outer test fold is not included here. All evidence comes from the current outer-train data only.
+
+Your goals:
+- Keep candidates that passed the fold-consensus gate unless they are redundant, likely leakage, or clinically not extractable.
+- Recover plausible real variables that missed one or more folds when the missing-fold pattern looks unstable rather than truly absent.
+- Preserve honest causal inference: use only the supplied candidate_summaries and do not invent new variables.
+
+Return JSON only with this shape:
+{{
+  "proposals": [
+    {{
+      "action": "add|none",
+      "name": "existing_candidate_name",
+      "type": "categorical|continuous",
+      "categories": ["category_a", "category_b"],
+      "roles": ["confounder", "effect_modifier"],
+      "description": "exact pre-treatment extraction target",
+      "rationale": "why this candidate is stable enough or should be recovered",
+      "expected_signal": "treatment, outcome, attention, or pseudo-outcome signal expected"
+    }}
+  ]
+}}
+
+Rules:
+- Choose only names listed in candidate_summaries.
+- Prefer candidates that pass the fold-consensus gate.
+- You may recover a below-threshold candidate only when its supporting folds have coherent names, roles, descriptions, and rationales, and the missing folds look like attention/proposal instability.
+- Do not select variables that are post-treatment, outcome-derived, treatment choice itself, response, survival, or toxicity.
+- Keep roles tied to evidence: nuisance/treatment+outcome support implies confounder; R-stage, residual, interaction, or pseudo-outcome support implies effect_modifier; both signals may justify both roles.
+- Return at most {max_selected} add proposals.
+
+Current attention-consensus recovery context:
 {context_json}
 """
 
