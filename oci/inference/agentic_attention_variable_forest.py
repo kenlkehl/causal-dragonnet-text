@@ -63,16 +63,56 @@ _AGENT_CONTEXT_TOKEN_SPANS_PER_ROW = 4
 _AGENT_CONTEXT_SNIPPET_CHARS = 480
 _AGENT_CONTEXT_SPAN_TEXT_CHARS = 120
 _AGENT_CONTEXT_SUMMARY_CHARS = 360
+EFFECT_OBJECTIVES = {"squared_r_loss", "logistic_r_loss", "pseudo_outcome_mse"}
 
 
 def _effect_objective_name(config: AgenticAttentionVariableForestConfig) -> str:
     value = str(getattr(config, "effect_objective", "squared_r_loss")).strip().lower()
-    if value not in {"squared_r_loss", "logistic_r_loss"}:
+    if value not in EFFECT_OBJECTIVES:
         raise ValueError(
             "agentic_attention_variable_forest.effect_objective must be one of "
-            "'squared_r_loss' or 'logistic_r_loss'"
+            "'squared_r_loss', 'logistic_r_loss', or 'pseudo_outcome_mse'"
         )
     return value
+
+
+def _effect_loss_label(effect_objective: str) -> str:
+    if effect_objective == "logistic_r_loss":
+        return "logistic_r_loss"
+    if effect_objective == "pseudo_outcome_mse":
+        return "pseudo_outcome_mse"
+    return "r_loss"
+
+
+def _r_pseudo_outcome(
+    y_residual: Any,
+    t_residual: Any,
+    *,
+    min_abs_t_residual: float = 1e-8,
+) -> np.ndarray:
+    y_arr = np.asarray(y_residual, dtype=float)
+    t_arr = np.asarray(t_residual, dtype=float)
+    result = np.full_like(y_arr, np.nan, dtype=float)
+    valid = np.isfinite(y_arr) & np.isfinite(t_arr) & (np.abs(t_arr) > min_abs_t_residual)
+    np.divide(y_arr, t_arr, out=result, where=valid)
+    return result
+
+
+def _torch_pseudo_outcome_mse_loss_vector(
+    effect: torch.Tensor,
+    y_residual: torch.Tensor,
+    t_residual: torch.Tensor,
+    *,
+    min_abs_t_residual: float = 1e-8,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    valid = (
+        torch.isfinite(y_residual)
+        & torch.isfinite(t_residual)
+        & (torch.abs(t_residual) > min_abs_t_residual)
+    )
+    pseudo_target = torch.zeros_like(y_residual)
+    pseudo_target[valid] = y_residual[valid] / t_residual[valid]
+    return torch.square(effect - pseudo_target), valid
 
 
 def _probability_logit(prob: Any) -> np.ndarray:
@@ -1014,6 +1054,7 @@ class AgenticAttentionVariableForestRunner:
                 "m_hat_raw": np.nan,
                 "y_residual": np.nan,
                 "t_residual": np.nan,
+                "r_pseudo_outcome": np.nan,
                 "r_loss_at_zero_tau": np.nan,
                 "nuisance_fold": np.nan,
             }
@@ -1271,19 +1312,25 @@ class AgenticAttentionVariableForestRunner:
             & (e >= r_stage_min_propensity)
             & (e <= r_stage_max_propensity)
         )
-        r_df["r_stage_train_eligible"] = train_eligible
         e_clipped = np.clip(e, self.avf_config.e_clip, 1.0 - self.avf_config.e_clip)
         m_clipped = clip_probability(m)
         t_resid = t - e_clipped
         y_resid = y - m
+        r_pseudo_outcome = _r_pseudo_outcome(y_resid, t_resid)
+        if effect_objective == "pseudo_outcome_mse":
+            train_eligible = train_eligible & np.isfinite(r_pseudo_outcome)
+        r_df["r_stage_train_eligible"] = train_eligible
         r_df["effect_objective"] = effect_objective
+        r_df["r_pseudo_outcome"] = r_pseudo_outcome
         if effect_objective == "squared_r_loss":
             r_df["effect_loss_at_zero_tau"] = y_resid**2
-        else:
+        elif effect_objective == "logistic_r_loss":
             r_df["effect_loss_at_zero_tau"] = _binary_log_loss_from_logits(
                 _probability_logit(m_clipped),
                 y,
             )
+        else:
+            r_df["effect_loss_at_zero_tau"] = r_pseudo_outcome**2
 
         split_items = list(
             enumerate(
@@ -1371,6 +1418,7 @@ class AgenticAttentionVariableForestRunner:
                     self._cuda_memory_summary(),
                 )
                 raw_effect = self._predict_effect_model(model, heldout)
+                heldout_pseudo_outcome = r_pseudo_outcome[heldout_pos]
                 if effect_objective == "logistic_r_loss":
                     tau_logit_modifier = raw_effect
                     tau_hat = _logistic_r_tau_from_delta(
@@ -1392,9 +1440,12 @@ class AgenticAttentionVariableForestRunner:
                 else:
                     tau_hat = raw_effect
                     tau_logit_modifier = np.full(len(heldout_pos), np.nan)
-                    heldout_effect_loss = (
-                        y_resid[heldout_pos] - tau_hat * t_resid[heldout_pos]
-                    ) ** 2
+                    if effect_objective == "pseudo_outcome_mse":
+                        heldout_effect_loss = (tau_hat - heldout_pseudo_outcome) ** 2
+                    else:
+                        heldout_effect_loss = (
+                            y_resid[heldout_pos] - tau_hat * t_resid[heldout_pos]
+                        ) ** 2
                 heldout_r_loss = (y_resid[heldout_pos] - tau_hat * t_resid[heldout_pos]) ** 2
                 logger.info(
                     "Outer fold %s effect fold %s/%s: collecting attention evidence",
@@ -1411,6 +1462,7 @@ class AgenticAttentionVariableForestRunner:
                     extra={
                         "tau_hat_r_stage": tau_hat,
                         "tau_logit_modifier": tau_logit_modifier,
+                        "r_pseudo_outcome": heldout_pseudo_outcome,
                         "r_loss": heldout_r_loss,
                         "effect_loss": heldout_effect_loss,
                         "effect_objective": np.asarray(
@@ -1438,6 +1490,7 @@ class AgenticAttentionVariableForestRunner:
                     "heldout_pos": heldout_pos,
                     "tau_hat": tau_hat,
                     "tau_logit_modifier": tau_logit_modifier,
+                    "r_pseudo_outcome": heldout_pseudo_outcome,
                     "r_loss": heldout_r_loss,
                     "effect_loss": heldout_effect_loss,
                     "effect_loss_at_zero_tau": r_df.iloc[heldout_pos][
@@ -2325,11 +2378,14 @@ class AgenticAttentionVariableForestRunner:
                 )
                 y_resid = y - m_hat
                 t_resid = t - e_clipped
+                r_pseudo_outcome = _r_pseudo_outcome(y_resid, t_resid)
                 train_eligible = (
                     np.isfinite(e_hat)
                     & (e_hat >= float(self.avf_config.r_stage_min_propensity))
                     & (e_hat <= float(self.avf_config.r_stage_max_propensity))
                 )
+                if effect_objective == "pseudo_outcome_mse":
+                    train_eligible = train_eligible & np.isfinite(r_pseudo_outcome)
                 if effect_objective == "logistic_r_loss":
                     tau_logit_modifier = raw_effect
                     tau_hat = _logistic_r_tau_from_delta(
@@ -2352,6 +2408,11 @@ class AgenticAttentionVariableForestRunner:
                         _probability_logit(m_for_effect),
                         y,
                     )
+                elif effect_objective == "pseudo_outcome_mse":
+                    tau_hat = raw_effect
+                    tau_logit_modifier = np.full(len(heldout_pos), np.nan)
+                    effect_loss = (tau_hat - r_pseudo_outcome) ** 2
+                    effect_loss_at_zero = r_pseudo_outcome**2
                 else:
                     tau_hat = raw_effect
                     tau_logit_modifier = np.full(len(heldout_pos), np.nan)
@@ -2394,6 +2455,7 @@ class AgenticAttentionVariableForestRunner:
                     extra={
                         "tau_hat_r_stage": tau_hat,
                         "tau_logit_modifier": tau_logit_modifier,
+                        "r_pseudo_outcome": r_pseudo_outcome,
                         "r_loss": r_loss,
                         "effect_loss": effect_loss,
                         "effect_objective": np.asarray(
@@ -2415,6 +2477,7 @@ class AgenticAttentionVariableForestRunner:
                     "m_hat_raw": m_raw,
                     "y_resid": y_resid,
                     "t_resid": t_resid,
+                    "r_pseudo_outcome": r_pseudo_outcome,
                     "tau_hat": tau_hat,
                     "tau_logit_modifier": tau_logit_modifier,
                     "r_loss": r_loss,
@@ -2485,6 +2548,10 @@ class AgenticAttentionVariableForestRunner:
             predictions.loc[heldout_pos, "m_hat_raw"] = result.get("m_hat_raw", result["m_hat"])
             predictions.loc[heldout_pos, "y_residual"] = result["y_resid"]
             predictions.loc[heldout_pos, "t_residual"] = result["t_resid"]
+            predictions.loc[heldout_pos, "r_pseudo_outcome"] = result.get(
+                "r_pseudo_outcome",
+                _r_pseudo_outcome(result["y_resid"], result["t_resid"]),
+            )
             predictions.loc[heldout_pos, "r_loss_at_zero_tau"] = result["y_resid"] ** 2
             predictions.loc[heldout_pos, "nuisance_fold"] = result["fold"]
             predictions.loc[heldout_pos, "tau_hat_r_stage"] = result["tau_hat"]
@@ -3042,14 +3109,28 @@ class AgenticAttentionVariableForestRunner:
                         y,
                         reduction="none",
                     )
+                    effect_mask = train_eligible
+                elif effect_objective == "pseudo_outcome_mse":
+                    y_residual = y - m_for_r
+                    t_residual = t - e_for_r
+                    (
+                        effect_loss_vector,
+                        valid,
+                    ) = _torch_pseudo_outcome_mse_loss_vector(
+                        effect,
+                        y_residual,
+                        t_residual,
+                    )
+                    effect_mask = train_eligible & valid
                 else:
                     y_residual = y - m_for_r
                     t_residual = t - e_for_r
                     effect_loss_vector = torch.square(
                         y_residual - effect * t_residual
                     )
-                if torch.any(train_eligible):
-                    effect_loss = effect_loss_vector[train_eligible].mean()
+                    effect_mask = train_eligible
+                if torch.any(effect_mask):
+                    effect_loss = effect_loss_vector[effect_mask].mean()
                 else:
                     effect_loss = effect_loss_vector.mean()
                 loss = (
@@ -3087,9 +3168,7 @@ class AgenticAttentionVariableForestRunner:
                         loss_value,
                         outcome_value,
                         prop_value,
-                        "logistic_r_loss"
-                        if effect_objective == "logistic_r_loss"
-                        else "r_loss",
+                        _effect_loss_label(effect_objective),
                         effect_value,
                         _current_lr(optimizer),
                         self._cuda_memory_summary(),
@@ -3106,9 +3185,7 @@ class AgenticAttentionVariableForestRunner:
                 loss_sum / denom,
                 outcome_sum / denom,
                 prop_sum / denom,
-                "logistic_r_loss"
-                if effect_objective == "logistic_r_loss"
-                else "r_loss",
+                _effect_loss_label(effect_objective),
                 effect_sum / denom,
                 _current_lr(optimizer),
                 self._cuda_memory_summary(),
@@ -3512,6 +3589,17 @@ class AgenticAttentionVariableForestRunner:
                     baseline_logit = torch.logit(torch.clamp(m_batch, 1e-4, 1.0 - 1e-4))
                     logits = baseline_logit + (t - e_batch) * effect
                     loss = F.binary_cross_entropy_with_logits(logits, y)
+                elif effect_objective == "pseudo_outcome_mse":
+                    loss_vector, valid = _torch_pseudo_outcome_mse_loss_vector(
+                        effect,
+                        y_residual,
+                        t_residual,
+                    )
+                    loss = (
+                        loss_vector[valid].mean()
+                        if torch.any(valid)
+                        else loss_vector.mean()
+                    )
                 else:
                     residual = y_residual - effect * t_residual
                     # Direct R-loss avoids high-variance y_residual / t_residual pseudo-labels.
@@ -3536,9 +3624,7 @@ class AgenticAttentionVariableForestRunner:
                         train_config.epochs,
                         batch_idx,
                         num_batches,
-                        "logistic_r_loss"
-                        if effect_objective == "logistic_r_loss"
-                        else "r_loss",
+                        _effect_loss_label(effect_objective),
                         loss_value,
                         _current_lr(optimizer),
                         self._cuda_memory_summary(),
@@ -3551,9 +3637,7 @@ class AgenticAttentionVariableForestRunner:
                 total_folds,
                 epoch,
                 train_config.epochs,
-                "logistic_r_loss"
-                if effect_objective == "logistic_r_loss"
-                else "r_loss",
+                _effect_loss_label(effect_objective),
                 loss_sum / max(1, batch_count),
                 _current_lr(optimizer),
                 self._cuda_memory_summary(),
@@ -4774,6 +4858,7 @@ class AgenticAttentionVariableForestRunner:
             "y_residual",
             "t_residual",
             "tau_hat_r_stage",
+            "r_pseudo_outcome",
             "r_loss",
             "residual_score",
             "r_score",
@@ -5463,6 +5548,11 @@ class AgenticAttentionVariableForestRunner:
                 else np.full(len(pred_df), np.nan, dtype=float)
             ),
             "r_loss": pred_df["r_loss"].to_numpy(dtype=float),
+            "r_pseudo_outcome": (
+                pred_df["r_pseudo_outcome"].to_numpy(dtype=float)
+                if "r_pseudo_outcome" in pred_df.columns
+                else np.full(len(pred_df), np.nan, dtype=float)
+            ),
             "effect_loss": default_effect_loss,
             "effect_loss_at_zero_tau": default_effect_loss_at_zero,
             "effect_objective": (
@@ -5627,6 +5717,14 @@ class AgenticAttentionVariableForestRunner:
             ),
             "y_resid": pred_df["y_residual"].to_numpy(dtype=float),
             "t_resid": pred_df["t_residual"].to_numpy(dtype=float),
+            "r_pseudo_outcome": (
+                pred_df["r_pseudo_outcome"].to_numpy(dtype=float)
+                if "r_pseudo_outcome" in pred_df.columns
+                else _r_pseudo_outcome(
+                    pred_df["y_residual"].to_numpy(dtype=float),
+                    pred_df["t_residual"].to_numpy(dtype=float),
+                )
+            ),
             "tau_hat": pred_df["tau_hat_r_stage"].to_numpy(dtype=float),
             "tau_logit_modifier": (
                 pred_df["tau_logit_modifier"].to_numpy(dtype=float)
@@ -5699,6 +5797,10 @@ class AgenticAttentionVariableForestRunner:
                         "tau_logit_modifier",
                         np.full(len(heldout_pos), np.nan),
                     ),
+                    dtype=float,
+                ),
+                "r_pseudo_outcome": np.asarray(
+                    result.get("r_pseudo_outcome", np.full(len(heldout_pos), np.nan)),
                     dtype=float,
                 ),
                 "r_loss": np.asarray(result["r_loss"], dtype=float),
@@ -5848,6 +5950,13 @@ class AgenticAttentionVariableForestRunner:
                 "m_hat_raw": np.asarray(result.get("m_hat_raw", result["m_hat"]), dtype=float),
                 "y_residual": np.asarray(result["y_resid"], dtype=float),
                 "t_residual": np.asarray(result["t_resid"], dtype=float),
+                "r_pseudo_outcome": np.asarray(
+                    result.get(
+                        "r_pseudo_outcome",
+                        _r_pseudo_outcome(result["y_resid"], result["t_resid"]),
+                    ),
+                    dtype=float,
+                ),
                 "tau_hat_r_stage": np.asarray(result["tau_hat"], dtype=float),
                 "tau_logit_modifier": np.asarray(
                     result.get(

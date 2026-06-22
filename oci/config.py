@@ -707,10 +707,14 @@ class AgenticAttentionVariableForestConfig:
                 "agentic_attention_variable_forest.attention_top_k_chunks must be >= 1"
             )
         effect_objective = str(self.effect_objective).strip().lower()
-        if effect_objective not in {"squared_r_loss", "logistic_r_loss"}:
+        if effect_objective not in {
+            "squared_r_loss",
+            "logistic_r_loss",
+            "pseudo_outcome_mse",
+        }:
             raise ValueError(
                 "agentic_attention_variable_forest.effect_objective must be one "
-                "of 'squared_r_loss' or 'logistic_r_loss'"
+                "of 'squared_r_loss', 'logistic_r_loss', or 'pseudo_outcome_mse'"
             )
         self.effect_objective = effect_objective
         neural_stage_mode = str(self.neural_stage_mode).strip().lower()

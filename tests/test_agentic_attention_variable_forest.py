@@ -27,6 +27,7 @@ from oci.inference.agentic_attention_variable_forest import (
     _tarnet_offset_heterogeneity_penalty,
     _residual_contrastive_label_frame,
     _tail_attention_positions,
+    _torch_pseudo_outcome_mse_loss_vector,
     _validate_consensus_disambiguation_response,
     _make_linear_lr_scheduler,
     _run_crossfit_fold_tasks,
@@ -569,6 +570,38 @@ def test_agentic_attention_config_accepts_logistic_effect_objective(tmp_path):
     assert avf.effect_objective == "logistic_r_loss"
 
 
+def test_agentic_attention_config_accepts_pseudo_outcome_effect_objective(tmp_path):
+    from oci.config import ExperimentConfig
+
+    dataset_path = tmp_path / "dataset.parquet"
+    pd.DataFrame(
+        {
+            "clinical_text": ["a", "b"],
+            "treatment_indicator": [0, 1],
+            "outcome_indicator": [0, 1],
+        }
+    ).to_parquet(dataset_path, index=False)
+
+    config = ExperimentConfig.from_dict(
+        {
+            "applied_inference": {
+                "dataset_path": str(dataset_path),
+                "architecture": {
+                    "model_type": "agentic_attention_variable_forest",
+                    "agentic_attention_variable_forest": {
+                        "nuisance_folds": 2,
+                        "effect_folds": 2,
+                        "effect_objective": "pseudo_outcome_mse",
+                    },
+                },
+            }
+        }
+    )
+
+    avf = config.applied_inference.architecture.agentic_attention_variable_forest
+    assert avf.effect_objective == "pseudo_outcome_mse"
+
+
 def test_agentic_attention_config_accepts_joint_rlearner_mode(tmp_path):
     from oci.config import ExperimentConfig
 
@@ -968,6 +1001,112 @@ def test_logistic_effect_crossfit_reports_probability_scale_tau(tmp_path, monkey
     )
     assert predictions["effect_loss"].notna().all()
     assert predictions["effect_loss_at_zero_tau"].notna().all()
+
+
+def test_pseudo_outcome_effect_crossfit_reports_pseudo_target_loss(
+    tmp_path,
+    monkeypatch,
+):
+    df = pd.DataFrame(
+        {
+            "clinical_text": [f"patient {i}" for i in range(4)],
+            "treatment_indicator": [0, 1, 0, 1],
+            "outcome_indicator": [0, 1, 1, 0],
+        }
+    )
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        cv_folds=0,
+        architecture=ModelArchitectureConfig(
+            model_type="agentic_attention_variable_forest",
+            feature_extractor_type="hierarchical_transformer",
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=2,
+                effect_folds=2,
+                fold_parallelism="1",
+                effect_objective="pseudo_outcome_mse",
+            ),
+        ),
+        training=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-3),
+        explicit_features=ExplicitFeatureExtractionConfig(enabled=False, features=[]),
+    )
+    runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "predictions.parquet",
+        device=torch.device("cpu"),
+        num_workers=1,
+        proposal_agent=FakeAttentionAgent(),
+        extraction_provider=FakeExtractionProvider(),
+    )
+
+    class TinyExtractor(torch.nn.Module):
+        output_dim = 2
+
+        def forward(self, texts):
+            return torch.zeros(len(texts), self.output_dim)
+
+    nuisance_predictions = pd.DataFrame(
+        {
+            "_oci_row_id": runner.dataset["_oci_row_id"].to_numpy(),
+            "outer_fold": 1,
+            "e_hat": np.full(len(runner.dataset), 0.5),
+            "m_hat": np.full(len(runner.dataset), 0.5),
+            "y_residual": runner.dataset["outcome_indicator"].to_numpy(dtype=float) - 0.5,
+            "t_residual": runner.dataset["treatment_indicator"].to_numpy(dtype=float) - 0.5,
+            "r_loss_at_zero_tau": 0.25,
+            "nuisance_fold": 1,
+        }
+    )
+
+    monkeypatch.setattr(runner, "_create_extractor", lambda: TinyExtractor())
+    monkeypatch.setattr(runner, "_train_effect_model", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        runner,
+        "_predict_effect_model",
+        lambda model, heldout: np.ones(len(heldout)),
+    )
+    monkeypatch.setattr(runner, "_attention_evidence", lambda *args, **kwargs: [])
+
+    result = runner._crossfit_effect(
+        runner.dataset,
+        nuisance_predictions,
+        outer_fold=1,
+    )
+
+    predictions = result["predictions"]
+    pseudo = predictions["y_residual"].to_numpy() / predictions["t_residual"].to_numpy()
+    tau = np.ones(len(df))
+    expected_effect_loss = (tau - pseudo) ** 2
+    expected_r_loss = (
+        predictions["y_residual"].to_numpy()
+        - tau * predictions["t_residual"].to_numpy()
+    ) ** 2
+
+    assert predictions["effect_objective"].unique().tolist() == ["pseudo_outcome_mse"]
+    assert predictions["r_pseudo_outcome"].to_numpy() == pytest.approx(pseudo)
+    assert predictions["tau_hat_r_stage"].to_numpy() == pytest.approx(tau)
+    assert predictions["effect_loss"].to_numpy() == pytest.approx(expected_effect_loss)
+    assert predictions["r_loss"].to_numpy() == pytest.approx(expected_r_loss)
+    assert predictions["effect_loss_at_zero_tau"].to_numpy() == pytest.approx(pseudo**2)
+
+
+def test_pseudo_outcome_tensor_loss_uses_unweighted_r_target():
+    effect = torch.tensor([0.0, 0.0], requires_grad=True)
+    y_residual = torch.tensor([2.0, 2.0])
+    t_residual = torch.tensor([1.0, 2.0])
+
+    loss_vector, valid = _torch_pseudo_outcome_mse_loss_vector(
+        effect,
+        y_residual,
+        t_residual,
+    )
+    loss = loss_vector[valid].mean()
+    loss.backward()
+
+    assert valid.tolist() == [True, True]
+    assert loss.item() == pytest.approx(2.5)
+    assert effect.grad.tolist() == pytest.approx([-2.0, -1.0])
 
 
 def test_residual_contrastive_label_frame_builds_tail_vs_neutral_labels():

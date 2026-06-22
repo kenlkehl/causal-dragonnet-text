@@ -94,7 +94,7 @@ Examples:
     )
     run_parser.add_argument(
         '--effect-objective',
-        choices=['squared_r_loss', 'logistic_r_loss'],
+        choices=['squared_r_loss', 'logistic_r_loss', 'pseudo_outcome_mse'],
         help=(
             "Override neural effect-stage objective for "
             "model_type='agentic_attention_variable_forest'."

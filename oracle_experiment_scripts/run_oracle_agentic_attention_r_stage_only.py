@@ -673,11 +673,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--r-stage-max-propensity", type=float, default=1.0)
     parser.add_argument(
         "--effect-objective",
-        choices=["squared_r_loss", "logistic_r_loss"],
+        choices=["squared_r_loss", "logistic_r_loss", "pseudo_outcome_mse"],
         default="squared_r_loss",
         help=(
             "Neural effect-stage objective. logistic_r_loss trains a Bernoulli "
-            "R-learner logit modifier and reports probability-scale CATE."
+            "R-learner logit modifier and reports probability-scale CATE; "
+            "pseudo_outcome_mse regresses the R pseudo-outcome directly."
         ),
     )
     parser.add_argument(
