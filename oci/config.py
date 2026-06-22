@@ -633,11 +633,17 @@ class AgenticAttentionVariableForestConfig:
     nuisance_label_smoothing: float = 0.02
     nuisance_calibration: str = "temperature_isotonic"
     effect_folds: int = 5
-    # "auto" parallelizes folds on CPU via num_workers and stays serial on CUDA.
-    # Set a positive integer to opt into that many concurrent folds on any device.
+    # "auto" parallelizes folds on CPU via num_workers and across configured
+    # CUDA devices when more than one device is supplied.
     fold_parallelism: str = "auto"
+    # Outer analysis-fold parallelism. "auto" uses num_workers, capped to the
+    # configured CUDA device count when more than one device is supplied.
+    outer_parallelism: str = "1"
     attention_top_k_chunks: int = 5
     candidate_proposals_per_fold: int = 3
+    # Parallelism for per-inner-fold agent candidate proposal calls. Defaults
+    # to serial to avoid surprising endpoint concurrency.
+    candidate_proposal_parallelism: str = "1"
     coverage_retry_attempts: int = 1
     signal_retry_attempts: int = 1
     association_alpha: float = 0.05
@@ -695,6 +701,10 @@ class AgenticAttentionVariableForestConfig:
         self.nuisance_calibration = nuisance_calibration
         if self.effect_folds < 2:
             raise ValueError("agentic_attention_variable_forest.effect_folds must be >= 2")
+        _validate_parallelism_setting(
+            self.candidate_proposal_parallelism,
+            "agentic_attention_variable_forest.candidate_proposal_parallelism",
+        )
         if self.fold_parallelism != "auto":
             try:
                 if int(self.fold_parallelism) < 1:
@@ -702,6 +712,15 @@ class AgenticAttentionVariableForestConfig:
             except ValueError as exc:
                 raise ValueError(
                     "agentic_attention_variable_forest.fold_parallelism must be 'auto' "
+                    "or a positive integer"
+                ) from exc
+        if self.outer_parallelism != "auto":
+            try:
+                if int(self.outer_parallelism) < 1:
+                    raise ValueError
+            except ValueError as exc:
+                raise ValueError(
+                    "agentic_attention_variable_forest.outer_parallelism must be 'auto' "
                     "or a positive integer"
                 ) from exc
         if self.attention_top_k_chunks < 1:

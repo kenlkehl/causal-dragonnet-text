@@ -130,8 +130,10 @@ class AgenticAttentionOracleConfig:
     nuisance_calibration: str = "temperature_isotonic"
     effect_folds: int = 5
     fold_parallelism: str = "auto"
+    outer_parallelism: str = "1"
     attention_top_k_chunks: int = 5
     candidate_proposals_per_fold: int = 3
+    candidate_proposal_parallelism: str = "1"
     coverage_retry_attempts: int = 1
     signal_retry_attempts: int = 1
     association_alpha: float = 0.05
@@ -307,8 +309,10 @@ def _make_applied_config(
                 nuisance_calibration=config.nuisance_calibration,
                 effect_folds=config.effect_folds,
                 fold_parallelism=config.fold_parallelism,
+                outer_parallelism=config.outer_parallelism,
                 attention_top_k_chunks=config.attention_top_k_chunks,
                 candidate_proposals_per_fold=config.candidate_proposals_per_fold,
+                candidate_proposal_parallelism=config.candidate_proposal_parallelism,
                 coverage_retry_attempts=config.coverage_retry_attempts,
                 signal_retry_attempts=config.signal_retry_attempts,
                 association_alpha=config.association_alpha,
@@ -636,6 +640,7 @@ def run_experiment(
     config: AgenticAttentionOracleConfig,
     output_dir: Path,
     device: torch.device,
+    devices: Sequence[torch.device],
     num_workers: int,
 ) -> Dict[str, Any]:
     parquet_file = _resolve_parquet_file(config.dataset_path)
@@ -668,6 +673,7 @@ def run_experiment(
         config=applied_config,
         output_path=prediction_path,
         device=device,
+        devices=devices,
         num_workers=num_workers,
     )
 
@@ -725,6 +731,10 @@ def _result_row(config_hash: str, result: Dict[str, Any]) -> Dict[str, Any]:
         "n_folds",
         "nuisance_folds",
         "effect_folds",
+        "fold_parallelism",
+        "outer_parallelism",
+        "candidate_proposal_parallelism",
+        "candidate_proposals_per_fold",
         "batch_size",
         "effect_batch_size",
         "alpha_propensity",
@@ -831,6 +841,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "parallelism on CPU when --fold-parallelism=auto."
         ),
     )
+    parser.add_argument(
+        "--devices",
+        nargs="+",
+        default=None,
+        help=(
+            "Training devices to use for outer/inner neural fold scheduling, "
+            "e.g. --devices cuda:0 cuda:1 cuda:2 cuda:3. Defaults to --device."
+        ),
+    )
     parser.add_argument("--n-repeats", type=int, default=1)
     parser.add_argument("--n-folds", type=int, default=5)
     parser.add_argument("--max-experiments", type=int, default=None)
@@ -916,12 +935,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="auto",
         help=(
             "Number of cross-fit nuisance/effect folds to train concurrently. "
-            "'auto' uses num_workers on CPU and stays serial on CUDA; an explicit "
-            "integer opts into that many concurrent folds, including on CUDA."
+            "'auto' uses num_workers on CPU, stays serial on single-device CUDA, "
+            "and uses the configured device count when multiple CUDA devices are "
+            "provided."
+        ),
+    )
+    parser.add_argument(
+        "--outer-parallelism",
+        default="1",
+        help=(
+            "Number of outer analysis folds to run concurrently. Use 'auto' or "
+            "a positive integer."
         ),
     )
     parser.add_argument("--attention-top-k-chunks", type=int, default=5)
     parser.add_argument("--candidate-proposals-per-fold", type=int, default=3)
+    parser.add_argument(
+        "--candidate-proposal-parallelism",
+        default="1",
+        help=(
+            "Number of per-inner-fold agent candidate proposal calls to run "
+            "concurrently. Use 'auto' or a positive integer."
+        ),
+    )
     parser.add_argument("--coverage-retry-attempts", type=int, default=1)
     parser.add_argument("--signal-retry-attempts", type=int, default=1)
     parser.add_argument("--association-alpha", type=float, default=0.05)
@@ -1160,8 +1196,10 @@ def _make_configs(args: argparse.Namespace) -> List[AgenticAttentionOracleConfig
                     nuisance_calibration=args.nuisance_calibration,
                     effect_folds=args.effect_folds,
                     fold_parallelism=args.fold_parallelism,
+                    outer_parallelism=args.outer_parallelism,
                     attention_top_k_chunks=args.attention_top_k_chunks,
                     candidate_proposals_per_fold=args.candidate_proposals_per_fold,
+                    candidate_proposal_parallelism=args.candidate_proposal_parallelism,
                     coverage_retry_attempts=args.coverage_retry_attempts,
                     signal_retry_attempts=args.signal_retry_attempts,
                     association_alpha=args.association_alpha,
@@ -1270,6 +1308,26 @@ def main() -> None:
         parser.error("--nuisance-label-smoothing must be in [0, 1)")
     if args.candidate_proposals_per_fold < 1:
         parser.error("--candidate-proposals-per-fold must be >= 1")
+    if str(args.fold_parallelism).strip().lower() != "auto":
+        try:
+            if int(args.fold_parallelism) < 1:
+                raise ValueError
+        except ValueError:
+            parser.error("--fold-parallelism must be 'auto' or a positive integer")
+    if str(args.outer_parallelism).strip().lower() != "auto":
+        try:
+            if int(args.outer_parallelism) < 1:
+                raise ValueError
+        except ValueError:
+            parser.error("--outer-parallelism must be 'auto' or a positive integer")
+    if str(args.candidate_proposal_parallelism).strip().lower() != "auto":
+        try:
+            if int(args.candidate_proposal_parallelism) < 1:
+                raise ValueError
+        except ValueError:
+            parser.error(
+                "--candidate-proposal-parallelism must be 'auto' or a positive integer"
+            )
     if args.coverage_retry_attempts < 0:
         parser.error("--coverage-retry-attempts must be >= 0")
     if args.signal_retry_attempts < 0:
@@ -1336,6 +1394,9 @@ def main() -> None:
     if device_name == "auto":
         device_name = "cuda:0" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_name)
+    devices = [torch.device(name) for name in args.devices] if args.devices else [device]
+    if args.device == "auto" and devices:
+        device = devices[0]
 
     configs = _make_configs(args)
     pending = []
@@ -1348,6 +1409,7 @@ def main() -> None:
     print(f"Agentic attention oracle experiments: {len(pending)} pending / {len(configs)} total")
     print(f"Datasets: {', '.join(sorted({c.dataset_name for c in configs}))}")
     print(f"Device: {device}")
+    print(f"Devices: {', '.join(str(item) for item in devices)}")
     print(f"Output: {output_dir}")
 
     for idx, config in enumerate(pending, start=1):
@@ -1363,7 +1425,7 @@ def main() -> None:
             config_hash,
         )
         try:
-            result = run_experiment(config, output_dir, device, args.num_workers)
+            result = run_experiment(config, output_dir, device, devices, args.num_workers)
         except Exception as exc:
             logger.error("Experiment %s failed: %s\n%s", config_hash, exc, traceback.format_exc())
             result = {

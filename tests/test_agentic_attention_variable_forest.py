@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import threading
+from contextlib import contextmanager
 
 import numpy as np
 import pandas as pd
@@ -2468,6 +2469,171 @@ def test_explicit_fold_parallelism_overrides_cuda_serial_default(tmp_path):
     )
 
     assert runner._fold_n_jobs(5) == 2
+
+
+def test_multi_device_pool_enables_cuda_auto_inner_parallelism(tmp_path):
+    df = pd.DataFrame(
+        {
+            "clinical_text": ["a", "b", "c", "d", "e"],
+            "treatment_indicator": [0, 1, 0, 1, 0],
+            "outcome_indicator": [0, 1, 0, 1, 0],
+        }
+    )
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        architecture=ModelArchitectureConfig(
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=5,
+                effect_folds=5,
+                fold_parallelism="auto",
+            ),
+        ),
+    )
+    runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "cuda.parquet",
+        device=torch.device("cuda:0"),
+        devices=[
+            torch.device("cuda:0"),
+            torch.device("cuda:1"),
+            torch.device("cuda:2"),
+            torch.device("cuda:3"),
+        ],
+        num_workers=1,
+        proposal_agent=FakeAttentionAgent(),
+        extraction_provider=FakeExtractionProvider(),
+    )
+
+    assert runner._fold_n_jobs(5) == 4
+    assert [str(runner._device_for_inner_fold(fold)) for fold in range(1, 6)] == [
+        "cuda:0",
+        "cuda:1",
+        "cuda:2",
+        "cuda:3",
+        "cuda:0",
+    ]
+
+
+def test_outer_parallelism_auto_and_device_partitioning(tmp_path):
+    df = pd.DataFrame(
+        {
+            "clinical_text": ["a", "b", "c", "d", "e"],
+            "treatment_indicator": [0, 1, 0, 1, 0],
+            "outcome_indicator": [0, 1, 0, 1, 0],
+        }
+    )
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        architecture=ModelArchitectureConfig(
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=5,
+                effect_folds=5,
+                outer_parallelism="auto",
+            ),
+        ),
+    )
+    runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "cuda.parquet",
+        device=torch.device("cuda:0"),
+        devices=[
+            torch.device("cuda:0"),
+            torch.device("cuda:1"),
+            torch.device("cuda:2"),
+            torch.device("cuda:3"),
+        ],
+        num_workers=3,
+        proposal_agent=FakeAttentionAgent(),
+        extraction_provider=FakeExtractionProvider(),
+    )
+
+    assert runner._outer_n_jobs(5) == 3
+    assert [str(device) for device in runner._devices_for_outer_job(position=1, outer_n_jobs=2)] == [
+        "cuda:0",
+        "cuda:2",
+    ]
+    assert [str(device) for device in runner._devices_for_outer_job(position=2, outer_n_jobs=2)] == [
+        "cuda:1",
+        "cuda:3",
+    ]
+
+
+def test_agent_candidate_parallelism_defaults_and_custom_agent_guard(tmp_path):
+    df = pd.DataFrame(
+        {
+            "clinical_text": ["a", "b", "c", "d", "e"],
+            "treatment_indicator": [0, 1, 0, 1, 0],
+            "outcome_indicator": [0, 1, 0, 1, 0],
+        }
+    )
+    config = AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "dataset.parquet"),
+        architecture=ModelArchitectureConfig(
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=5,
+                effect_folds=5,
+                candidate_proposal_parallelism="auto",
+            ),
+        ),
+    )
+    default_agent_runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "default_agent.parquet",
+        device=torch.device("cpu"),
+        num_workers=3,
+        extraction_provider=FakeExtractionProvider(),
+    )
+    custom_agent_runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "custom_agent.parquet",
+        device=torch.device("cpu"),
+        num_workers=3,
+        proposal_agent=FakeAttentionAgent(),
+        extraction_provider=FakeExtractionProvider(),
+    )
+
+    assert default_agent_runner._agent_candidate_n_jobs(5) == 3
+    assert custom_agent_runner._agent_candidate_n_jobs(5) == 1
+
+
+def test_crossfit_fold_tasks_apply_device_context():
+    active = threading.local()
+    seen = []
+
+    @contextmanager
+    def device_context(fold):
+        active.fold = fold
+        try:
+            yield
+        finally:
+            delattr(active, "fold")
+
+    def run_fold(fold, fit_pos, heldout_pos):
+        seen.append((fold, getattr(active, "fold", None)))
+        return {
+            "fold": fold,
+            "heldout_pos": heldout_pos,
+            "n_fit": len(fit_pos),
+        }
+
+    split_items = [
+        (1, (np.array([0, 1]), np.array([2]))),
+        (2, (np.array([2, 3]), np.array([0]))),
+    ]
+
+    results = _run_crossfit_fold_tasks(
+        run_fold,
+        split_items,
+        n_jobs=2,
+        device_context=device_context,
+    )
+
+    assert sorted(seen) == [(1, 1), (2, 2)]
+    assert [row["fold"] for row in results] == [1, 2]
 
 
 def test_agentic_attention_config_accepts_inner_fold_parallelism_alias(tmp_path):

@@ -55,6 +55,12 @@ Examples:
         help='Override number of workers from config'
     )
     run_parser.add_argument(
+        '--gpu-ids',
+        nargs='+',
+        type=int,
+        help='Override GPU ids from config, e.g. --gpu-ids 0 1 2 3'
+    )
+    run_parser.add_argument(
         '--output-dir',
         help='Override output directory from config'
     )
@@ -89,6 +95,22 @@ Examples:
         help=(
             "Override inner cross-fit fold parallelism for "
             "agentic_attention_variable_forest or causal_forest R-learner runs. "
+            "Use 'auto' or a positive integer."
+        )
+    )
+    run_parser.add_argument(
+        '--outer-fold-parallelism',
+        help=(
+            "Override outer analysis fold parallelism for "
+            "model_type='agentic_attention_variable_forest'. "
+            "Use 'auto' or a positive integer."
+        )
+    )
+    run_parser.add_argument(
+        '--agent-candidate-parallelism',
+        help=(
+            "Override per-inner-fold agent candidate proposal parallelism for "
+            "model_type='agentic_attention_variable_forest'. "
             "Use 'auto' or a positive integer."
         )
     )
@@ -177,6 +199,8 @@ Examples:
             config.device = args.device
         if args.workers:
             config.num_workers = args.workers
+        if args.gpu_ids is not None:
+            config.gpu_ids = args.gpu_ids
         if args.output_dir:
             config.output_dir = args.output_dir
         if args.skip_pretraining:
@@ -225,6 +249,32 @@ Examples:
                     "model_type='causal_forest'"
                 )
                 return 1
+        if args.outer_fold_parallelism is not None:
+            model_type = getattr(config.applied_inference.architecture, 'model_type', None)
+            if model_type != "agentic_attention_variable_forest":
+                print(
+                    "--outer-fold-parallelism only applies to "
+                    "model_type='agentic_attention_variable_forest'"
+                )
+                return 1
+            (
+                config.applied_inference.architecture
+                .agentic_attention_variable_forest
+                .outer_parallelism
+            ) = str(args.outer_fold_parallelism)
+        if args.agent_candidate_parallelism is not None:
+            model_type = getattr(config.applied_inference.architecture, 'model_type', None)
+            if model_type != "agentic_attention_variable_forest":
+                print(
+                    "--agent-candidate-parallelism only applies to "
+                    "model_type='agentic_attention_variable_forest'"
+                )
+                return 1
+            (
+                config.applied_inference.architecture
+                .agentic_attention_variable_forest
+                .candidate_proposal_parallelism
+            ) = str(args.agent_candidate_parallelism)
         if args.effect_objective is not None:
             model_type = getattr(config.applied_inference.architecture, 'model_type', None)
             if model_type != "agentic_attention_variable_forest":

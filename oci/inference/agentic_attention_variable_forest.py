@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 import gc
 import hashlib
 import json
 import logging
 import os
+import queue
 import re
+import threading
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -211,6 +214,8 @@ def run_agentic_attention_variable_forest(
     output_path: Path,
     device: Optional[torch.device] = None,
     num_workers: int = 1,
+    gpu_ids: Optional[Sequence[int]] = None,
+    devices: Optional[Sequence[torch.device | str]] = None,
     proposal_agent: Optional[Any] = None,
     extraction_provider: Optional[Any] = None,
 ) -> None:
@@ -221,6 +226,8 @@ def run_agentic_attention_variable_forest(
         output_path=output_path,
         device=device or torch.device("cpu"),
         num_workers=num_workers,
+        gpu_ids=gpu_ids,
+        devices=devices,
         proposal_agent=proposal_agent,
         extraction_provider=extraction_provider,
     )
@@ -532,17 +539,31 @@ class AgenticAttentionVariableForestRunner:
         output_path: Path,
         device: torch.device,
         num_workers: int = 1,
+        gpu_ids: Optional[Sequence[int]] = None,
+        devices: Optional[Sequence[torch.device | str]] = None,
         proposal_agent: Optional[Any] = None,
         extraction_provider: Optional[Any] = None,
     ):
+        self._thread_state = threading.local()
+        self._device = torch.device(device)
         self.dataset = dataset.reset_index(drop=True).copy()
         self.dataset["_oci_row_id"] = np.arange(len(self.dataset), dtype=int)
         self.config = config
         self.output_path = Path(output_path)
         self.artifact_dir = self.output_path.parent / "agentic_attention_variable_forest"
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
-        self.device = device
         self.num_workers = 1 if num_workers is None else int(num_workers)
+        self._has_custom_proposal_agent = proposal_agent is not None
+        self._has_custom_extraction_provider = extraction_provider is not None
+        self._has_external_components = (
+            self._has_custom_proposal_agent
+            or self._has_custom_extraction_provider
+        )
+        self.devices = self._resolve_device_pool(
+            base_device=self._device,
+            gpu_ids=gpu_ids,
+            devices=devices,
+        )
         self.avf_config: AgenticAttentionVariableForestConfig = getattr(
             config.architecture,
             "agentic_attention_variable_forest",
@@ -578,29 +599,202 @@ class AgenticAttentionVariableForestRunner:
         self.association_filter_rows: List[Dict[str, Any]] = []
         self.metric_rows: List[Dict[str, Any]] = []
 
+    @property
+    def device(self) -> torch.device:
+        return getattr(self._thread_state, "device", self._device)
+
+    @device.setter
+    def device(self, value: torch.device | str) -> None:
+        self._device = torch.device(value)
+
+    @staticmethod
+    def _resolve_device_pool(
+        *,
+        base_device: torch.device,
+        gpu_ids: Optional[Sequence[int]],
+        devices: Optional[Sequence[torch.device | str]],
+    ) -> List[torch.device]:
+        if devices:
+            return [torch.device(device) for device in devices]
+        if gpu_ids and base_device.type == "cuda":
+            return [torch.device(f"cuda:{int(gpu_id)}") for gpu_id in gpu_ids]
+        return [base_device]
+
+    @contextmanager
+    def _using_device(self, device: torch.device | str):
+        previous = getattr(self._thread_state, "device", None)
+        self._thread_state.device = torch.device(device)
+        try:
+            yield
+        finally:
+            if previous is None:
+                try:
+                    delattr(self._thread_state, "device")
+                except AttributeError:
+                    pass
+            else:
+                self._thread_state.device = previous
+
     def run(self) -> None:
         logger.info("=" * 80)
         logger.info("AGENTIC ATTENTION VARIABLE FOREST")
         logger.info("=" * 80)
-        prediction_frames = []
 
-        for outer_fold, train_idx, test_idx in self._analysis_splits():
+        splits = self._analysis_splits()
+        outer_n_jobs = self._outer_n_jobs(len(splits))
+        if outer_n_jobs > 1 and self._has_external_components:
+            logger.warning(
+                "Outer fold parallelism disabled because custom proposal_agent or "
+                "extraction_provider objects were supplied and may not be thread-safe."
+            )
+            outer_n_jobs = 1
+
+        if outer_n_jobs > 1:
+            device_groups = self._outer_device_groups(outer_n_jobs)
+            device_group_queue = self._outer_device_group_queue(outer_n_jobs)
+
+            def run_with_device_group(
+                outer_fold: int,
+                train_idx: np.ndarray,
+                test_idx: np.ndarray,
+            ) -> Dict[str, Any]:
+                devices = device_group_queue.get()
+                try:
+                    return self._run_one_analysis_split_isolated(
+                        outer_fold=outer_fold,
+                        train_idx=train_idx,
+                        test_idx=test_idx,
+                        devices=devices,
+                        outer_n_jobs=outer_n_jobs,
+                    )
+                finally:
+                    device_group_queue.put(devices)
+
             logger.info(
-                "Attention-variable fold %s: train=%s test=%s",
-                outer_fold,
-                len(train_idx),
-                len(test_idx),
+                "Running %s attention-variable outer fold(s) with "
+                "outer_parallelism=%s device_groups=%s",
+                len(splits),
+                outer_n_jobs,
+                [[str(device) for device in group] for group in device_groups],
             )
-            fold_predictions = self._run_one_analysis_split(
-                outer_fold=outer_fold,
-                train_idx=train_idx,
-                test_idx=test_idx,
-            )
-            prediction_frames.append(fold_predictions)
+            with ThreadPoolExecutor(
+                max_workers=outer_n_jobs,
+                thread_name_prefix="avf-outer",
+            ) as executor:
+                futures = [
+                    executor.submit(
+                        run_with_device_group,
+                        int(outer_fold),
+                        np.asarray(train_idx),
+                        np.asarray(test_idx),
+                    )
+                    for outer_fold, train_idx, test_idx in splits
+                ]
+                fold_results = [future.result() for future in futures]
+            fold_results = sorted(fold_results, key=lambda item: item["outer_fold"])
+            prediction_frames = [item["predictions"] for item in fold_results]
+            for item in fold_results:
+                self.nuisance_rows.extend(item["nuisance_rows"])
+                self.r_stage_rows.extend(item["r_stage_rows"])
+                self.residual_contrastive_rows.extend(
+                    item["residual_contrastive_rows"]
+                )
+                self.nuisance_attention_rows.extend(item["nuisance_attention_rows"])
+                self.effect_attention_rows.extend(item["effect_attention_rows"])
+                self.residual_contrastive_attention_rows.extend(
+                    item["residual_contrastive_attention_rows"]
+                )
+                self.confounder_candidate_rows.extend(
+                    item["confounder_candidate_rows"]
+                )
+                self.modifier_candidate_rows.extend(item["modifier_candidate_rows"])
+                self.consensus_disambiguation_rows.extend(
+                    item["consensus_disambiguation_rows"]
+                )
+                self.consensus_recovery_rows.extend(item["consensus_recovery_rows"])
+                self.value_harmonization_rows.extend(item["value_harmonization_rows"])
+                self.consensus_rows.extend(item["consensus_rows"])
+                self.coverage_filter_rows.extend(item["coverage_filter_rows"])
+                self.association_filter_rows.extend(item["association_filter_rows"])
+                self.metric_rows.extend(item["metric_rows"])
+        else:
+            prediction_frames = []
+            for outer_fold, train_idx, test_idx in splits:
+                logger.info(
+                    "Attention-variable fold %s: train=%s test=%s device=%s",
+                    outer_fold,
+                    len(train_idx),
+                    len(test_idx),
+                    self.device,
+                )
+                fold_predictions = self._run_one_analysis_split(
+                    outer_fold=outer_fold,
+                    train_idx=train_idx,
+                    test_idx=test_idx,
+                )
+                prediction_frames.append(fold_predictions)
 
         results_df = pd.concat(prediction_frames).sort_values("_oci_row_id")
         self._save_predictions(results_df)
         self._save_artifacts(results_df)
+
+    def _run_one_analysis_split_isolated(
+        self,
+        outer_fold: int,
+        train_idx: np.ndarray,
+        test_idx: np.ndarray,
+        devices: Sequence[torch.device],
+        outer_n_jobs: int,
+    ) -> Dict[str, Any]:
+        assigned_devices = [torch.device(device) for device in devices]
+        device = assigned_devices[0]
+        logger.info(
+            "Attention-variable isolated fold %s: train=%s test=%s devices=%s",
+            outer_fold,
+            len(train_idx),
+            len(test_idx),
+            [str(item) for item in assigned_devices],
+        )
+        fold_runner = AgenticAttentionVariableForestRunner(
+            dataset=self.dataset,
+            config=self.config,
+            output_path=(
+                self.artifact_dir
+                / f"outer_fold_{int(outer_fold):03d}"
+                / "predictions.parquet"
+            ),
+            device=device,
+            num_workers=self._inner_workers_for_outer_job(outer_n_jobs),
+            devices=assigned_devices,
+        )
+        predictions = fold_runner._run_one_analysis_split(
+            outer_fold=outer_fold,
+            train_idx=train_idx,
+            test_idx=test_idx,
+        )
+        return {
+            "outer_fold": int(outer_fold),
+            "predictions": predictions,
+            "nuisance_rows": fold_runner.nuisance_rows,
+            "r_stage_rows": fold_runner.r_stage_rows,
+            "residual_contrastive_rows": fold_runner.residual_contrastive_rows,
+            "nuisance_attention_rows": fold_runner.nuisance_attention_rows,
+            "effect_attention_rows": fold_runner.effect_attention_rows,
+            "residual_contrastive_attention_rows": (
+                fold_runner.residual_contrastive_attention_rows
+            ),
+            "confounder_candidate_rows": fold_runner.confounder_candidate_rows,
+            "modifier_candidate_rows": fold_runner.modifier_candidate_rows,
+            "consensus_disambiguation_rows": (
+                fold_runner.consensus_disambiguation_rows
+            ),
+            "consensus_recovery_rows": fold_runner.consensus_recovery_rows,
+            "value_harmonization_rows": fold_runner.value_harmonization_rows,
+            "consensus_rows": fold_runner.consensus_rows,
+            "coverage_filter_rows": fold_runner.coverage_filter_rows,
+            "association_filter_rows": fold_runner.association_filter_rows,
+            "metric_rows": fold_runner.metric_rows,
+        }
 
     def _analysis_splits(self) -> List[Tuple[int, np.ndarray, np.ndarray]]:
         if self.config.cv_folds > 1:
@@ -1263,7 +1457,12 @@ class AgenticAttentionVariableForestRunner:
             self.avf_config.fold_parallelism,
             self.device,
         )
-        fold_results = _run_crossfit_fold_tasks(run_fold, split_items, n_jobs)
+        fold_results = _run_crossfit_fold_tasks(
+            run_fold,
+            split_items,
+            n_jobs,
+            device_context=self._device_context_for_inner_fold,
+        )
 
         for result in fold_results:
             heldout_pos = result["heldout_pos"]
@@ -1542,7 +1741,12 @@ class AgenticAttentionVariableForestRunner:
             self.avf_config.fold_parallelism,
             self.device,
         )
-        fold_results = _run_crossfit_fold_tasks(run_fold, split_items, n_jobs)
+        fold_results = _run_crossfit_fold_tasks(
+            run_fold,
+            split_items,
+            n_jobs,
+            device_context=self._device_context_for_inner_fold,
+        )
 
         for result in fold_results:
             heldout_pos = result["heldout_pos"]
@@ -1852,7 +2056,12 @@ class AgenticAttentionVariableForestRunner:
             self.avf_config.fold_parallelism,
             self.device,
         )
-        fold_results = _run_crossfit_fold_tasks(run_fold, split_items, n_jobs)
+        fold_results = _run_crossfit_fold_tasks(
+            run_fold,
+            split_items,
+            n_jobs,
+            device_context=self._device_context_for_inner_fold,
+        )
 
         for result in fold_results:
             heldout_pos = result["heldout_pos"]
@@ -2179,7 +2388,12 @@ class AgenticAttentionVariableForestRunner:
             self.avf_config.fold_parallelism,
             self.device,
         )
-        fold_results = _run_crossfit_fold_tasks(run_fold, split_items, n_jobs)
+        fold_results = _run_crossfit_fold_tasks(
+            run_fold,
+            split_items,
+            n_jobs,
+            device_context=self._device_context_for_inner_fold,
+        )
 
         for result in fold_results:
             heldout_pos = result["heldout_pos"]
@@ -2541,7 +2755,12 @@ class AgenticAttentionVariableForestRunner:
             self.avf_config.fold_parallelism,
             self.device,
         )
-        fold_results = _run_crossfit_fold_tasks(run_fold, split_items, n_jobs)
+        fold_results = _run_crossfit_fold_tasks(
+            run_fold,
+            split_items,
+            n_jobs,
+            device_context=self._device_context_for_inner_fold,
+        )
 
         for result in fold_results:
             heldout_pos = result["heldout_pos"]
@@ -2836,7 +3055,12 @@ class AgenticAttentionVariableForestRunner:
             self.avf_config.fold_parallelism,
             self.device,
         )
-        fold_results = _run_crossfit_fold_tasks(run_fold, split_items, n_jobs)
+        fold_results = _run_crossfit_fold_tasks(
+            run_fold,
+            split_items,
+            n_jobs,
+            device_context=self._device_context_for_inner_fold,
+        )
         attention_rows: List[Dict[str, Any]] = []
         for result in fold_results:
             heldout_pos = np.asarray(result["heldout_pos"], dtype=int)
@@ -4418,7 +4642,12 @@ class AgenticAttentionVariableForestRunner:
             for name in (excluded_feature_names or [])
             if _normalize_feature_name(name)
         }
-        for fold in sorted({int(row["fold"]) for row in attention_rows if row.get("fold") is not None}):
+        fold_ids = sorted(
+            {int(row["fold"]) for row in attention_rows if row.get("fold") is not None}
+        )
+        candidate_n_jobs = self._agent_candidate_n_jobs(len(fold_ids))
+
+        def propose_for_fold(fold: int) -> Dict[str, Any]:
             fold_rows = [row for row in attention_rows if int(row.get("fold")) == fold]
             context = self._build_agent_context(
                 stage=stage,
@@ -4447,8 +4676,13 @@ class AgenticAttentionVariableForestRunner:
                 outer_fold=outer_fold,
                 fold=fold,
             )
+            proposal_agent = (
+                OpenAICompatibleFeatureSearchAgent(self.agent_search_config)
+                if candidate_n_jobs > 1
+                else self.proposal_agent
+            )
             try:
-                raw = self.proposal_agent.propose(context)
+                raw = proposal_agent.propose(context)
             except Exception as exc:
                 error_row = {
                     "outer_fold": outer_fold,
@@ -4461,7 +4695,7 @@ class AgenticAttentionVariableForestRunner:
                 }
                 if getattr(self.agent_search_config, "save_agent_raw_output", False):
                     error_row["agent_raw_output"] = _get_agent_response_trace(
-                        self.proposal_agent
+                        proposal_agent
                     )
                 self._save_agent_candidate_checkpoint(
                     error_row,
@@ -4477,9 +4711,7 @@ class AgenticAttentionVariableForestRunner:
                 max_specs=proposal_limit,
                 excluded_feature_names=excluded_names,
             )
-            proposals_by_fold[fold] = specs
             proposal_artifacts = _proposal_artifact_dicts(raw_proposals, specs)
-            proposal_artifacts_by_fold[fold] = proposal_artifacts
             row = {
                 "outer_fold": outer_fold,
                 "fold": fold,
@@ -4490,7 +4722,38 @@ class AgenticAttentionVariableForestRunner:
                 "proposals": proposal_artifacts,
             }
             if getattr(self.agent_search_config, "save_agent_raw_output", False):
-                row["agent_raw_output"] = _get_agent_response_trace(self.proposal_agent)
+                row["agent_raw_output"] = _get_agent_response_trace(proposal_agent)
+            return {
+                "fold": fold,
+                "specs": specs,
+                "proposal_artifacts": proposal_artifacts,
+                "row": row,
+            }
+
+        if candidate_n_jobs > 1:
+            logger.info(
+                "Outer fold %s %s proposal attempt %s: running %s inner-fold "
+                "agent proposal calls with candidate_proposal_parallelism=%s",
+                outer_fold,
+                stage,
+                proposal_attempt,
+                candidate_n_jobs,
+                self.avf_config.candidate_proposal_parallelism,
+            )
+            with ThreadPoolExecutor(
+                max_workers=candidate_n_jobs,
+                thread_name_prefix="avf-agent-candidate",
+            ) as executor:
+                futures = [executor.submit(propose_for_fold, fold) for fold in fold_ids]
+                proposal_results = [future.result() for future in futures]
+        else:
+            proposal_results = [propose_for_fold(fold) for fold in fold_ids]
+
+        for result in sorted(proposal_results, key=lambda item: int(item["fold"])):
+            fold = int(result["fold"])
+            proposals_by_fold[fold] = result["specs"]
+            proposal_artifacts_by_fold[fold] = result["proposal_artifacts"]
+            row = result["row"]
             if stage == "confounder":
                 self.confounder_candidate_rows.append(row)
             else:
@@ -5420,12 +5683,101 @@ class AgenticAttentionVariableForestRunner:
             return ""
 
     def _fold_n_jobs(self, folds: int) -> int:
-        setting = str(self.avf_config.fold_parallelism).strip().lower()
-        if setting == "auto":
-            if self.device.type != "cpu":
+        return self._parallel_n_jobs(
+            self.avf_config.fold_parallelism,
+            folds,
+            auto_workers=(
+                len(self.devices)
+                if self.device.type != "cpu" and len(self.devices) > 1
+                else self.num_workers
+            ),
+            cuda_auto_serial=len(self.devices) <= 1,
+        )
+
+    def _outer_n_jobs(self, folds: int) -> int:
+        return self._parallel_n_jobs(
+            self.avf_config.outer_parallelism,
+            folds,
+            auto_workers=(
+                min(max(1, int(self.num_workers)), len(self.devices))
+                if self.device.type != "cpu" and len(self.devices) > 1
+                else self.num_workers
+            ),
+            cuda_auto_serial=False,
+        )
+
+    def _parallel_n_jobs(
+        self,
+        setting: Any,
+        tasks: int,
+        *,
+        auto_workers: int,
+        cuda_auto_serial: bool,
+    ) -> int:
+        if tasks <= 0:
+            return 1
+        setting_text = str(setting).strip().lower()
+        if setting_text == "auto":
+            if cuda_auto_serial and self.device.type != "cpu":
                 return 1
-            return max(1, min(int(self.num_workers), int(folds)))
-        return max(1, min(int(setting), int(folds)))
+            return max(1, min(int(auto_workers), int(tasks)))
+        return max(1, min(int(setting_text), int(tasks)))
+
+    def _inner_workers_for_outer_job(self, outer_n_jobs: int) -> int:
+        if str(self.avf_config.fold_parallelism).strip().lower() != "auto":
+            return self.num_workers
+        return max(1, int(self.num_workers) // max(1, int(outer_n_jobs)))
+
+    def _agent_candidate_n_jobs(self, folds: int) -> int:
+        n_jobs = self._parallel_n_jobs(
+            getattr(self.avf_config, "candidate_proposal_parallelism", "1"),
+            folds,
+            auto_workers=self.num_workers,
+            cuda_auto_serial=False,
+        )
+        if n_jobs > 1 and self._has_custom_proposal_agent:
+            logger.warning(
+                "Agent candidate proposal parallelism disabled because a custom "
+                "proposal_agent object was supplied and may not be thread-safe."
+            )
+            return 1
+        return n_jobs
+
+    def _device_for_inner_fold(self, fold: int) -> torch.device:
+        if not self.devices:
+            return self.device
+        return self.devices[(int(fold) - 1) % len(self.devices)]
+
+    def _device_context_for_inner_fold(self, fold: int):
+        return self._using_device(self._device_for_inner_fold(fold))
+
+    def _outer_device_groups(self, outer_n_jobs: int) -> List[List[torch.device]]:
+        if not self.devices:
+            return [[self.device]]
+        if outer_n_jobs <= 1:
+            return [list(self.devices)]
+        group_count = min(max(1, int(outer_n_jobs)), len(self.devices))
+        groups: List[List[torch.device]] = [[] for _ in range(group_count)]
+        for index, device in enumerate(self.devices):
+            groups[index % group_count].append(device)
+        return [group for group in groups if group]
+
+    def _outer_device_group_queue(self, outer_n_jobs: int):
+        device_group_queue = queue.Queue()
+        for devices in self._outer_device_groups(outer_n_jobs):
+            device_group_queue.put(devices)
+        return device_group_queue
+
+    def _devices_for_outer_job(
+        self,
+        *,
+        position: int,
+        outer_n_jobs: int,
+    ) -> List[torch.device]:
+        groups = self._outer_device_groups(outer_n_jobs)
+        if not groups:
+            return [self.device]
+        return list(groups[(int(position) - 1) % len(groups)])
 
     def _data_loader_workers(self, total_folds: Optional[int] = None) -> int:
         env_workers = os.environ.get("OCI_AVF_DATALOADER_WORKERS")
@@ -7943,10 +8295,21 @@ def _fit_predict_outcome(
     return model.predict_proba(test_x)[:, 1]
 
 
-def _run_crossfit_fold_tasks(run_fold, split_items, n_jobs: int) -> List[Dict[str, Any]]:
+def _run_crossfit_fold_tasks(
+    run_fold,
+    split_items,
+    n_jobs: int,
+    device_context=None,
+) -> List[Dict[str, Any]]:
+    def call_fold(fold, fit_pos, heldout_pos):
+        if device_context is None:
+            return run_fold(fold, fit_pos, heldout_pos)
+        with device_context(fold):
+            return run_fold(fold, fit_pos, heldout_pos)
+
     if n_jobs <= 1:
         return [
-            run_fold(fold, fit_pos, heldout_pos)
+            call_fold(fold, fit_pos, heldout_pos)
             for fold, (fit_pos, heldout_pos) in split_items
         ]
     with ThreadPoolExecutor(
@@ -7954,7 +8317,7 @@ def _run_crossfit_fold_tasks(run_fold, split_items, n_jobs: int) -> List[Dict[st
         thread_name_prefix="avf-fold",
     ) as executor:
         futures = [
-            executor.submit(run_fold, fold, fit_pos, heldout_pos)
+            executor.submit(call_fold, fold, fit_pos, heldout_pos)
             for fold, (fit_pos, heldout_pos) in split_items
         ]
         return [future.result() for future in futures]
