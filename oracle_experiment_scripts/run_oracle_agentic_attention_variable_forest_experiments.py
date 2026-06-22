@@ -831,7 +831,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--output-dir",
         default="../pcori_experiments/oracle_agentic_attention_variable_forest",
     )
-    parser.add_argument("--device", default="auto")
     parser.add_argument(
         "--num-workers",
         type=int,
@@ -844,10 +843,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--devices",
         nargs="+",
-        default=None,
+        default=["auto"],
         help=(
             "Training devices to use for outer/inner neural fold scheduling, "
-            "e.g. --devices cuda:0 cuda:1 cuda:2 cuda:3. Defaults to --device."
+            "e.g. --devices cuda:0 cuda:1 cuda:2 cuda:3. Defaults to auto, "
+            "which uses cuda:0 when available and otherwise cpu."
         ),
     )
     parser.add_argument("--n-repeats", type=int, default=1)
@@ -1390,13 +1390,13 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "command_line.txt").write_text(" ".join(sys.argv) + "\n")
 
-    device_name = args.device
-    if device_name == "auto":
-        device_name = "cuda:0" if torch.cuda.is_available() else "cpu"
-    device = torch.device(device_name)
-    devices = [torch.device(name) for name in args.devices] if args.devices else [device]
-    if args.device == "auto" and devices:
-        device = devices[0]
+    device_names = list(args.devices or ["auto"])
+    if "auto" in {str(name).strip().lower() for name in device_names}:
+        if len(device_names) > 1:
+            parser.error("--devices auto cannot be combined with explicit device names")
+        device_names = ["cuda:0" if torch.cuda.is_available() else "cpu"]
+    devices = [torch.device(name) for name in device_names]
+    device = devices[0]
 
     configs = _make_configs(args)
     pending = []
@@ -1408,7 +1408,6 @@ def main() -> None:
 
     print(f"Agentic attention oracle experiments: {len(pending)} pending / {len(configs)} total")
     print(f"Datasets: {', '.join(sorted({c.dataset_name for c in configs}))}")
-    print(f"Device: {device}")
     print(f"Devices: {', '.join(str(item) for item in devices)}")
     print(f"Output: {output_dir}")
 
