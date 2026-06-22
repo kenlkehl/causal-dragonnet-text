@@ -468,7 +468,7 @@ class NonNeuralAgenticForestConfig:
     min_df: int = 5
     max_df: float = 0.95
     ngram_range_min: int = 1
-    ngram_range_max: int = 2
+    ngram_range_max: int = 3
     sublinear_tf: bool = True
     # Learner family for BoW nuisance and pseudo-target models:
     # "linear", "extratrees", "random_forest", or "xgboost".

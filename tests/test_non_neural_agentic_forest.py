@@ -225,6 +225,9 @@ def test_non_neural_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path: 
     assert agent.contexts[1]["prompt_version"] == "non_neural_agentic_alias_resolution_v1"
     assert agent.contexts[2]["prompt_version"] == "non_neural_agentic_value_harmonization_v1"
     assert "feature_importance" in agent.contexts[0]
+    phrase_features = agent.contexts[0]["feature_importance"]["phrase_features"]
+    assert phrase_features
+    assert all(2 <= len(row["feature"].split()) <= 4 for row in phrase_features)
     assert "canonical_feature_name_guidance" not in agent.contexts[0]
     assert "true_" not in json.dumps(agent.contexts[0])
     seen_names = [[spec.name for spec in specs] for specs in evaluator.seen_specs]
@@ -294,6 +297,7 @@ def test_non_neural_agentic_forest_parses_bow_model_option():
     assert nn_cfg.candidate_consistency_parallelism == "2"
     assert nn_cfg.outer_parallelism == "3"
     assert nn_cfg.bow_parallel_backend == "processes"
+    assert nn_cfg.ngram_range_max == 3
     cfg.validate()
 
 

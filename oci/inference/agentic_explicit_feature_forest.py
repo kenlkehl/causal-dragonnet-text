@@ -2075,6 +2075,9 @@ Your task is to propose at most {max_proposals} extractable pre-treatment patien
 
 Rules:
 - Propose variables, not raw tokens. Convert token patterns into precise extractable patient-level variables.
+- Pay special attention to feature_importance.phrase_features: it summarizes
+  top 2-4 token n-grams with treatment, outcome, confounder-overlap, and
+  pseudo-target scores.
 - Variables supported by both treatment and outcome feature weights should usually be confounders.
 - Variables supported by pseudo-target feature weights should usually be effect modifiers.
 - A variable may have both roles when justified.

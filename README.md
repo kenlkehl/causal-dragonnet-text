@@ -94,6 +94,7 @@ Handles documents up to 50K+ tokens with the pretrained tokenizer. No `fit_token
 | `tfidf_forest` | TF-IDF features + CausalForestDML (no neural network, no GPU) | tau with 95% confidence intervals |
 | `explicit_feature_forest` | Role-tagged explicit features + CausalForestDML (no text model) | tau with 95% confidence intervals |
 | `agentic_explicit_feature_forest` | Nested-CV LLM variable search + explicit-feature CausalForestDML | outer-CV tau, nuisance AUROC, R-loss |
+| `non_neural_agentic_forest` | Sparse BoW variable discovery + LLM extraction + explicit-feature CausalForestDML | outer-CV tau, BoW diagnostics, selected variables |
 
 **Recommended: Causal Forest** -- trains neural features with propensity + outcome losses (optionally with R-learner loss), then fits CausalForestDML on the learned representations for doubly-robust estimation with confidence intervals.
 
@@ -320,6 +321,51 @@ oci run --config example_configs/agentic_explicit_feature_forest_config.json
 Set `explicit_features.features` to a role-tagged starting list if a researcher wants to seed known confounders or effect modifiers; leave it empty to let the proposal LLM choose the first variables. The agent and extractor both use OpenAI-compatible endpoints, so the same running vLLM server can serve `agent_server_url` and `vllm_server_url`.
 
 The agent receives a few train-fold text snippets to ground its proposals, but raw snippets are omitted from `agentic_feature_search/agent_decisions.jsonl` by default. Set `architecture.agentic_feature_search.save_agent_context=true` only for non-sensitive debugging runs. Raw proposal-model output is also omitted by default; set `architecture.agentic_feature_search.save_agent_raw_output=true` to persist the exact chat completion content and any provider-exposed reasoning field on each `agent_proposals` event.
+
+Use `model_type="non_neural_agentic_forest"` for the sparse BoW-guided variant.
+This path does not train a neural text encoder. For each outer training fold, it
+fits cross-fitted TF-IDF treatment and outcome nuisance models, computes an
+R-learner pseudo-target, fits a sparse pseudo-target model, and sends BoW feature
+evidence to the proposal agent. The agent proposes explicit confounders and
+effect modifiers, optional inner-fold consistency checks stabilize the candidate
+set, the extractor materializes selected variables from text, and the final
+estimator is an explicit-feature CausalForestDML.
+
+By default the BoW vectorizer uses 1-3 word n-grams, and the agent context
+includes both the original top-weighted feature lists and a `phrase_features`
+list restricted to 2-4 token n-grams with treatment, outcome,
+confounder-overlap, and pseudo-target scores. Final artifacts are written under
+`non_neural_agentic_forest/`, including `bow_feature_importance_by_fold.jsonl`,
+`agent_candidate_proposals.jsonl`, `selected_feature_sets.json`, and
+`outer_cv_metrics.csv`.
+
+Minimal configuration:
+
+```json
+{
+  "applied_inference": {
+    "dataset_path": "path/to/dataset.parquet",
+    "text_column": "clinical_text",
+    "treatment_column": "treatment_indicator",
+    "outcome_column": "outcome_indicator",
+    "outcome_type": "binary",
+    "cv_folds": 5,
+    "architecture": {
+      "model_type": "non_neural_agentic_forest",
+      "non_neural_agentic_forest": {
+        "ngram_range_min": 1,
+        "ngram_range_max": 3,
+        "top_n_features": 100,
+        "candidate_consistency_enabled": true
+      }
+    },
+    "explicit_features": {
+      "enabled": true,
+      "features": []
+    }
+  }
+}
+```
 
 ## Contrastive Learning
 

@@ -57,7 +57,7 @@ class NonNeuralAgenticOracleConfig:
     min_df: int = 5
     max_df: float = 0.95
     ngram_range_min: int = 1
-    ngram_range_max: int = 2
+    ngram_range_max: int = 3
     bow_model: str = "linear"
     logistic_c: float = 1.0
     ridge_alpha: float = 10.0
@@ -342,6 +342,9 @@ def main() -> None:
     parser.add_argument("--effect-folds", type=int, default=5)
     parser.add_argument("--max-features", type=int, default=30000)
     parser.add_argument("--min-df", type=int, default=5)
+    parser.add_argument("--max-df", type=float, default=0.95)
+    parser.add_argument("--ngram-range-min", type=int, default=1)
+    parser.add_argument("--ngram-range-max", type=int, default=3)
     parser.add_argument(
         "--bow-model",
         default="linear",
@@ -467,6 +470,9 @@ def main() -> None:
         effect_folds=args.effect_folds,
         max_features=args.max_features,
         min_df=args.min_df,
+        max_df=args.max_df,
+        ngram_range_min=args.ngram_range_min,
+        ngram_range_max=args.ngram_range_max,
         bow_model=args.bow_model,
         ridge_alpha=args.ridge_alpha,
         top_n_features=args.top_n_features,

@@ -617,6 +617,14 @@ class NonNeuralAgenticForestRunner:
         confounder_score = np.abs(treatment_coef) * np.abs(outcome_coef)
         return {
             "n_features": int(len(features)),
+            "phrase_features": _top_phrase_feature_rows(
+                features,
+                top_n=top_n,
+                treatment_coef=treatment_coef,
+                outcome_coef=outcome_coef,
+                pseudo_target_coef=effect_coef,
+                confounder_score=confounder_score,
+            ),
             "confounder_overlap": _top_feature_rows(
                 features,
                 confounder_score,
@@ -2099,6 +2107,79 @@ def _top_feature_rows(
             row["abs_outcome_score"] = _finite_or_none(abs(outcome_coef[idx]))
         rows.append(row)
     return rows
+
+
+def _top_phrase_feature_rows(
+    features: np.ndarray,
+    *,
+    top_n: int,
+    treatment_coef: np.ndarray,
+    outcome_coef: np.ndarray,
+    pseudo_target_coef: np.ndarray,
+    confounder_score: np.ndarray,
+) -> List[Dict[str, Any]]:
+    """Return agent-facing phrase evidence from 2-4 token n-grams.
+
+    The predictive models can still use unigrams. This summary gives the
+    proposal agent a phrase-biased view that is easier to map to extractable
+    clinical variables.
+    """
+    if len(features) == 0:
+        return []
+
+    phrase_indices = [
+        idx
+        for idx, feature in enumerate(features)
+        if 2 <= _feature_token_count(str(feature)) <= 4
+    ]
+    if not phrase_indices:
+        return []
+
+    phrase_indices_array = np.asarray(phrase_indices, dtype=int)
+    treatment_abs = np.abs(treatment_coef)
+    outcome_abs = np.abs(outcome_coef)
+    pseudo_abs = np.abs(pseudo_target_coef)
+
+    combined_score = np.maximum.reduce(
+        [
+            _scale_scores_for_phrase_ranking(treatment_abs),
+            _scale_scores_for_phrase_ranking(outcome_abs),
+            _scale_scores_for_phrase_ranking(pseudo_abs),
+            _scale_scores_for_phrase_ranking(confounder_score),
+        ]
+    )
+    order = phrase_indices_array[
+        np.argsort(combined_score[phrase_indices_array])[::-1]
+    ]
+
+    rows: List[Dict[str, Any]] = []
+    for idx in order[:top_n]:
+        row = {
+            "feature": str(features[idx]),
+            "token_count": int(_feature_token_count(str(features[idx]))),
+            "combined_score": _finite_or_none(combined_score[idx]),
+            "confounder_overlap_score": _finite_or_none(confounder_score[idx]),
+            "treatment_score": _finite_or_none(treatment_coef[idx]),
+            "abs_treatment_score": _finite_or_none(treatment_abs[idx]),
+            "outcome_score": _finite_or_none(outcome_coef[idx]),
+            "abs_outcome_score": _finite_or_none(outcome_abs[idx]),
+            "pseudo_target_score": _finite_or_none(pseudo_target_coef[idx]),
+            "abs_pseudo_target_score": _finite_or_none(pseudo_abs[idx]),
+        }
+        rows.append(row)
+    return rows
+
+
+def _feature_token_count(feature: str) -> int:
+    return len([token for token in str(feature).split() if token])
+
+
+def _scale_scores_for_phrase_ranking(scores: np.ndarray) -> np.ndarray:
+    values = np.asarray(scores, dtype=float)
+    max_abs = float(np.nanmax(np.abs(values))) if len(values) else 0.0
+    if not np.isfinite(max_abs) or max_abs <= 0.0:
+        return np.zeros_like(values, dtype=float)
+    return np.abs(values) / max_abs
 
 
 def _model_feature_scores(model: Any, n_features: int) -> np.ndarray:
