@@ -318,14 +318,17 @@ class TestHierarchicalTransformer:
         class BrokenAutoTokenizer:
             @staticmethod
             def from_pretrained(model_name, use_fast=True):
+                calls.append((model_name, use_fast))
                 raise ValueError(f"auto tokenizer failed: {model_name} {use_fast}")
 
+        calls = []
         ext = HierarchicalTransformerExtractor(sentence_encoder_model="prajjwal1/bert-tiny")
         ext._resolved_sentence_encoder_path = str(tmp_path)
         tokenizer = ext._load_tokenizer(BrokenAutoTokenizer)
 
         assert tokenizer.__class__.__name__ == "BertTokenizer"
         assert tokenizer.cls_token == "[CLS]"
+        assert calls == []
 
     def test_model_loader_uses_legacy_bert_snapshot(self, tmp_path):
         import json
@@ -362,7 +365,45 @@ class TestHierarchicalTransformer:
 
         assert isinstance(model, BertModel)
         assert model.config.hidden_size == 8
-        assert calls == [("auto", "prajjwal1/bert-tiny")]
+        assert calls == []
+
+    def test_model_loader_strips_legacy_bert_pretraining_heads(self, tmp_path):
+        import json
+        from transformers import BertConfig, BertForPreTraining, BertModel
+
+        from oci.models.hierarchical_transformer_extractor import (
+            HierarchicalTransformerExtractor,
+        )
+
+        calls = []
+
+        class BrokenAutoModel:
+            @staticmethod
+            def from_pretrained(model_name):
+                calls.append(("auto", model_name))
+                raise ValueError("missing model_type")
+
+        config = BertConfig(
+            vocab_size=6,
+            hidden_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            intermediate_size=16,
+        )
+        BertForPreTraining(config).save_pretrained(tmp_path)
+        config_path = tmp_path / "config.json"
+        config_data = json.loads(config_path.read_text(encoding="utf-8"))
+        config_data.pop("model_type", None)
+        config_path.write_text(json.dumps(config_data), encoding="utf-8")
+
+        ext = HierarchicalTransformerExtractor(sentence_encoder_model="prajjwal1/bert-tiny")
+        ext._resolved_sentence_encoder_path = str(tmp_path)
+        model = ext._load_transformers_model(BrokenAutoModel)
+
+        assert isinstance(model, BertModel)
+        assert model.config.hidden_size == 8
+        assert not any(key.startswith("cls.") for key in model.state_dict())
+        assert calls == []
 
     def test_transformer_encoder_initialization_is_thread_serialized(self, monkeypatch):
         from oci.models.hierarchical_transformer_extractor import (
@@ -635,14 +676,17 @@ class TestNeuralCausalForest:
         class BrokenAutoTokenizer:
             @staticmethod
             def from_pretrained(model_name, use_fast=True):
+                calls.append((model_name, use_fast))
                 raise ValueError(f"auto tokenizer failed: {model_name} {use_fast}")
 
+        calls = []
         encoder = self._tokenizer_test_encoder("prajjwal1/bert-tiny")
         encoder._resolved_encoder_model_path = str(tmp_path)
         tokenizer = encoder._load_tokenizer(BrokenAutoTokenizer)
 
         assert tokenizer.__class__.__name__ == "BertTokenizer"
         assert tokenizer.cls_token == "[CLS]"
+        assert calls == []
 
     def _ncf_hash_config(self):
         from oci.models.neural_causal_forest_extractor import NeuralCausalForestConfig

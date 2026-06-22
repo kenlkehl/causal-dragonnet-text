@@ -45,6 +45,7 @@ from ..utils.calibration import (
 )
 
 logger = logging.getLogger(__name__)
+_LEGACY_BERT_MODEL_PREFIXES = ("prajjwal1/bert-",)
 
 OutcomeType = Literal["binary", "continuous"]
 StageType = Literal["nuisance", "effect_modifier", "cate"]
@@ -550,6 +551,18 @@ class HierarchicalTokenAttentionEncoder(nn.Module):
         return self._tokenizer
 
     def _load_tokenizer(self, auto_tokenizer_cls):
+        if self._should_prefer_legacy_bert_loader():
+            try:
+                tokenizer = self._load_legacy_bert_tokenizer()
+            except Exception as legacy_exc:
+                logger.debug(
+                    "Preferred legacy BERT tokenizer load failed for %s: %s",
+                    self.config.encoder_model_name,
+                    legacy_exc,
+                )
+            else:
+                if tokenizer is not None:
+                    return tokenizer
         try:
             return auto_tokenizer_cls.from_pretrained(
                 self.config.encoder_model_name,
@@ -589,6 +602,18 @@ class HierarchicalTokenAttentionEncoder(nn.Module):
                 ) from slow_exc
 
     def _load_transformers_model(self, auto_model_cls):
+        if self._should_prefer_legacy_bert_loader():
+            try:
+                model = self._load_legacy_bert_model()
+            except Exception as legacy_exc:
+                logger.debug(
+                    "Preferred legacy BERT model load failed for %s: %s",
+                    self.config.encoder_model_name,
+                    legacy_exc,
+                )
+            else:
+                if model is not None:
+                    return model
         try:
             return auto_model_cls.from_pretrained(self.config.encoder_model_name)
         except Exception as auto_exc:
@@ -623,13 +648,20 @@ class HierarchicalTokenAttentionEncoder(nn.Module):
         if not self._should_try_legacy_bert_loader():
             return None
         try:
-            from transformers import BertConfig, BertModel
+            from transformers import BertConfig, BertForPreTraining, BertModel
         except ImportError as exc:
             raise ImportError("transformers is required for BertModel fallback") from exc
 
         resolved_model = self._resolve_encoder_model_path()
         logger.info("Loading legacy BERT model from local snapshot: %s", resolved_model)
         config = BertConfig.from_pretrained(resolved_model, local_files_only=True)
+        if self._legacy_bert_checkpoint_has_pretraining_heads(resolved_model):
+            pretraining_model = BertForPreTraining.from_pretrained(
+                resolved_model,
+                config=config,
+                local_files_only=True,
+            )
+            return pretraining_model.bert
         return BertModel.from_pretrained(
             resolved_model,
             config=config,
@@ -642,6 +674,72 @@ class HierarchicalTokenAttentionEncoder(nn.Module):
             return True
         model_path = Path(str(self.config.encoder_model_name)).expanduser()
         return model_path.exists() and (model_path / "vocab.txt").exists()
+
+    def _should_prefer_legacy_bert_loader(self) -> bool:
+        model_name = str(self.config.encoder_model_name).lower()
+        if any(model_name.startswith(prefix) for prefix in _LEGACY_BERT_MODEL_PREFIXES):
+            return True
+        model_path = Path(str(self.config.encoder_model_name)).expanduser()
+        return model_path.exists() and self._snapshot_looks_like_legacy_bert(model_path)
+
+    @staticmethod
+    def _snapshot_looks_like_legacy_bert(model_path: Path) -> bool:
+        config_path = model_path / "config.json"
+        vocab_path = model_path / "vocab.txt"
+        if not config_path.exists() or not vocab_path.exists():
+            return False
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        model_type = config.get("model_type")
+        if model_type not in {None, "bert"}:
+            return False
+        return all(
+            key in config
+            for key in ("hidden_size", "num_hidden_layers", "num_attention_heads")
+        )
+
+    @staticmethod
+    def _legacy_bert_checkpoint_has_pretraining_heads(resolved_model: str) -> bool:
+        model_path = Path(resolved_model)
+        for index_name in ("pytorch_model.bin.index.json", "model.safetensors.index.json"):
+            index_path = model_path / index_name
+            if not index_path.exists():
+                continue
+            try:
+                index = json.loads(index_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            weight_map = index.get("weight_map", {})
+            if any(str(key).startswith("cls.") for key in weight_map):
+                return True
+
+        safetensors_path = model_path / "model.safetensors"
+        if safetensors_path.exists():
+            try:
+                from safetensors import safe_open
+
+                with safe_open(safetensors_path, framework="pt", device="cpu") as handle:
+                    return any(str(key).startswith("cls.") for key in handle.keys())
+            except Exception:
+                return False
+
+        bin_path = model_path / "pytorch_model.bin"
+        if not bin_path.exists():
+            return False
+        try:
+            try:
+                state = torch.load(bin_path, map_location="cpu", weights_only=True)
+            except TypeError:
+                state = torch.load(bin_path, map_location="cpu")
+        except Exception:
+            return False
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
+        if not isinstance(state, dict):
+            return False
+        return any(str(key).startswith("cls.") for key in state)
 
     @staticmethod
     def _huggingface_offline() -> bool:
