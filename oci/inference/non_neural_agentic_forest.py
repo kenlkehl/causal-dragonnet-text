@@ -10,13 +10,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from scipy import sparse
 from joblib import Parallel, delayed
 from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor, RandomForestClassifier, RandomForestRegressor
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import brier_score_loss, log_loss, mean_squared_error
 from sklearn.model_selection import KFold, StratifiedKFold
-from sklearn.pipeline import Pipeline
 
 from ..config import (
     AgenticFeatureSearchConfig,
@@ -24,7 +24,9 @@ from ..config import (
     ExplicitFeatureForestConfig,
     ExplicitFeatureSpec,
     NonNeuralAgenticForestConfig,
+    load_explicit_feature_specs_json,
 )
+from ..models.explicit_feature_featurizer import get_raw_explicit_features
 from .agentic_explicit_feature_forest import (
     AgenticFeatureProposal,
     CausalForestExplicitEvaluator,
@@ -141,6 +143,7 @@ class NonNeuralAgenticForestRunner:
         logger.info("=" * 80)
         logger.info("NON-NEURAL AGENTIC FEATURE CAUSAL FOREST")
         logger.info("=" * 80)
+        self._ensure_prespecified_features()
 
         splits = self._analysis_splits()
         outer_n_jobs = self._outer_n_jobs(len(splits))
@@ -282,6 +285,7 @@ class NonNeuralAgenticForestRunner:
         train_idx: np.ndarray,
         test_idx: np.ndarray,
     ) -> pd.DataFrame:
+        self._ensure_prespecified_features()
         discovery_df = self.dataset.iloc[train_idx].reset_index(drop=True)
         bow_result = self._fit_bow_discovery(discovery_df, outer_fold)
         self.bow_prediction_frames.append(bow_result["predictions"])
@@ -362,12 +366,38 @@ class NonNeuralAgenticForestRunner:
         texts = _normalize_texts(discovery_df[self.config.text_column].fillna(""))
         y = discovery_df[self.config.outcome_column].to_numpy(dtype=float)
         t = discovery_df[self.config.treatment_column].to_numpy(dtype=float)
+        prespecified_specs = self._initial_specs()
+        explicit_feature_dicts = _columns_to_feature_dicts(
+            discovery_df,
+            prespecified_specs,
+        )
 
-        e_hat = self._crossfit_binary(texts, t, "treatment", outer_fold)
+        e_hat = self._crossfit_binary(
+            texts,
+            t,
+            "treatment",
+            outer_fold,
+            explicit_feature_dicts=explicit_feature_dicts,
+            explicit_specs=prespecified_specs,
+        )
         if self.config.outcome_type == "continuous":
-            m_hat = self._crossfit_continuous(texts, y, "outcome", outer_fold)
+            m_hat = self._crossfit_continuous(
+                texts,
+                y,
+                "outcome",
+                outer_fold,
+                explicit_feature_dicts=explicit_feature_dicts,
+                explicit_specs=prespecified_specs,
+            )
         else:
-            m_hat = self._crossfit_binary(texts, y, "outcome", outer_fold)
+            m_hat = self._crossfit_binary(
+                texts,
+                y,
+                "outcome",
+                outer_fold,
+                explicit_feature_dicts=explicit_feature_dicts,
+                explicit_specs=prespecified_specs,
+            )
 
         e_clipped = np.clip(e_hat, self.nn_config.e_clip, 1.0 - self.nn_config.e_clip)
         t_resid = t - e_clipped
@@ -378,6 +408,8 @@ class NonNeuralAgenticForestRunner:
             texts,
             pseudo_target,
             outer_fold,
+            explicit_feature_dicts=explicit_feature_dicts,
+            explicit_specs=prespecified_specs,
         )
         r_loss = (y_resid - tau_hat * t_resid) ** 2
         r_loss_at_zero = y_resid**2
@@ -415,6 +447,8 @@ class NonNeuralAgenticForestRunner:
             y=y,
             t=t,
             pseudo_target=pseudo_target,
+            explicit_feature_dicts=explicit_feature_dicts,
+            explicit_specs=prespecified_specs,
         )
         context = self._build_agent_context(
             outer_fold=outer_fold,
@@ -435,6 +469,9 @@ class NonNeuralAgenticForestRunner:
         labels: np.ndarray,
         label_name: str,
         outer_fold: int,
+        *,
+        explicit_feature_dicts: Optional[List[Dict[str, Any]]] = None,
+        explicit_specs: Optional[List[ExplicitFeatureSpec]] = None,
     ) -> np.ndarray:
         labels = labels.astype(int)
         oof = np.full(len(labels), np.nan, dtype=float)
@@ -470,6 +507,8 @@ class NonNeuralAgenticForestRunner:
                 heldout_pos,
                 vectorizer_params,
                 model_params,
+                explicit_feature_dicts=explicit_feature_dicts,
+                explicit_specs=explicit_specs,
                 random_state=17 + fold,
             )
 
@@ -484,6 +523,9 @@ class NonNeuralAgenticForestRunner:
         values: np.ndarray,
         label_name: str,
         outer_fold: int,
+        *,
+        explicit_feature_dicts: Optional[List[Dict[str, Any]]] = None,
+        explicit_specs: Optional[List[ExplicitFeatureSpec]] = None,
     ) -> np.ndarray:
         oof = np.full(len(values), np.nan, dtype=float)
         folds = _bounded_fold_count(self.nn_config.nuisance_folds, len(values))
@@ -513,6 +555,8 @@ class NonNeuralAgenticForestRunner:
                 heldout_pos,
                 vectorizer_params,
                 model_params,
+                explicit_feature_dicts=explicit_feature_dicts,
+                explicit_specs=explicit_specs,
                 random_state=17 + fold,
             )
 
@@ -526,6 +570,9 @@ class NonNeuralAgenticForestRunner:
         texts: Sequence[str],
         pseudo_target: np.ndarray,
         outer_fold: int,
+        *,
+        explicit_feature_dicts: Optional[List[Dict[str, Any]]] = None,
+        explicit_specs: Optional[List[ExplicitFeatureSpec]] = None,
     ) -> np.ndarray:
         oof = np.full(len(pseudo_target), np.nan, dtype=float)
         folds = _bounded_fold_count(self.nn_config.effect_folds, len(pseudo_target))
@@ -554,6 +601,8 @@ class NonNeuralAgenticForestRunner:
                 heldout_pos,
                 vectorizer_params,
                 model_params,
+                explicit_feature_dicts=explicit_feature_dicts,
+                explicit_specs=explicit_specs,
                 random_state=17 + fold,
             )
 
@@ -568,32 +617,40 @@ class NonNeuralAgenticForestRunner:
         y: np.ndarray,
         t: np.ndarray,
         pseudo_target: np.ndarray,
+        *,
+        explicit_feature_dicts: Optional[List[Dict[str, Any]]] = None,
+        explicit_specs: Optional[List[ExplicitFeatureSpec]] = None,
     ) -> Dict[str, Any]:
         vectorizer = self._make_vectorizer()
         x_text = vectorizer.fit_transform(texts)
-        features = np.asarray(vectorizer.get_feature_names_out())
+        x_model, features, explicit_feature_names = _append_explicit_features_full(
+            x_text,
+            np.asarray(vectorizer.get_feature_names_out()),
+            explicit_feature_dicts=explicit_feature_dicts,
+            explicit_specs=explicit_specs,
+        )
 
         def fit_treatment() -> np.ndarray:
             if len(np.unique(t.astype(int))) < 2:
                 return np.zeros(len(features), dtype=float)
             treatment_model = self._make_classifier(random_state=101)
-            treatment_model.fit(x_text, t.astype(int))
+            treatment_model.fit(x_model, t.astype(int))
             return _model_feature_scores(treatment_model, len(features))
 
         def fit_outcome() -> np.ndarray:
             if self.config.outcome_type == "continuous":
                 outcome_model = self._make_regressor(random_state=202)
-                outcome_model.fit(x_text, y)
+                outcome_model.fit(x_model, y)
                 return _model_feature_scores(outcome_model, len(features))
             if len(np.unique(y.astype(int))) < 2:
                 return np.zeros(len(features), dtype=float)
             outcome_model = self._make_classifier(random_state=202)
-            outcome_model.fit(x_text, y.astype(int))
+            outcome_model.fit(x_model, y.astype(int))
             return _model_feature_scores(outcome_model, len(features))
 
         def fit_effect() -> np.ndarray:
             effect_model = self._make_regressor(random_state=303)
-            effect_model.fit(x_text, pseudo_target)
+            effect_model.fit(x_model, pseudo_target)
             return _model_feature_scores(effect_model, len(features))
 
         n_jobs = self._feature_importance_n_jobs()
@@ -619,6 +676,10 @@ class NonNeuralAgenticForestRunner:
         confounder_score = np.abs(treatment_coef) * np.abs(outcome_coef)
         return {
             "n_features": int(len(features)),
+            "n_bow_features": int(len(vectorizer.get_feature_names_out())),
+            "n_prespecified_features": int(len(explicit_specs or [])),
+            "n_prespecified_raw_features": int(len(explicit_feature_names)),
+            "prespecified_raw_feature_names": explicit_feature_names,
             "phrase_features": _top_phrase_feature_rows(
                 features,
                 top_n=top_n,
@@ -1535,10 +1596,25 @@ class NonNeuralAgenticForestRunner:
             self.agent_rows.append({"event": "coverage_filter", "dropped": dropped})
         return kept
 
+    def _ensure_prespecified_features(self) -> None:
+        specs = self._initial_specs()
+        if not specs:
+            return
+        self.dataset = self.extraction_provider.ensure_features(self.dataset, specs)
+
     def _initial_specs(self) -> List[ExplicitFeatureSpec]:
+        specs: List[ExplicitFeatureSpec] = []
         if getattr(self.config.explicit_features, "features", None):
-            return _dedupe_specs(list(self.config.explicit_features.features))
-        return []
+            specs.extend(list(self.config.explicit_features.features))
+        specs.extend(list(getattr(self.nn_config, "prespecified_features", []) or []))
+        specs.extend(list(getattr(self.nn_config, "prespecified_confounders", []) or []))
+        specs.extend(
+            list(getattr(self.nn_config, "prespecified_effect_modifiers", []) or [])
+        )
+        json_path = getattr(self.nn_config, "prespecified_features_json", None)
+        if json_path:
+            specs.extend(load_explicit_feature_specs_json(str(json_path)))
+        return _dedupe_specs(specs)
 
     def _vectorizer_params(self) -> Dict[str, Any]:
         return {
@@ -1881,6 +1957,102 @@ def _proposal_to_dict(proposal: AgenticFeatureProposal) -> Dict[str, Any]:
     }
 
 
+def _columns_to_feature_dicts(
+    df: pd.DataFrame,
+    specs: Sequence[ExplicitFeatureSpec],
+) -> Optional[List[Dict[str, Any]]]:
+    if not specs:
+        return None
+    values: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        item: Dict[str, Any] = {}
+        for spec in specs:
+            value_col = f"explicit_feat_{spec.name}"
+            legacy_col = f"explicit_conf_{spec.name}"
+            source_col = value_col if value_col in df.columns else legacy_col
+            value = row.get(source_col)
+            missing_col = f"{source_col}_missing"
+            item[spec.name] = value
+            item[f"{spec.name}_missing"] = bool(row.get(missing_col, pd.isna(value)))
+        values.append(item)
+    return values
+
+
+def _fit_transform_bow_plus_explicit(
+    *,
+    texts: Sequence[str],
+    fit_pos: np.ndarray,
+    heldout_pos: np.ndarray,
+    vectorizer_params: Dict[str, Any],
+    explicit_feature_dicts: Optional[List[Dict[str, Any]]],
+    explicit_specs: Optional[List[ExplicitFeatureSpec]],
+):
+    vectorizer = _make_bow_vectorizer(vectorizer_params)
+    x_fit = vectorizer.fit_transform([texts[i] for i in fit_pos])
+    x_heldout = vectorizer.transform([texts[i] for i in heldout_pos])
+    if not explicit_feature_dicts or not explicit_specs:
+        return x_fit, x_heldout
+
+    means: Dict[str, float] = {}
+    stds: Dict[str, float] = {}
+    fit_dicts = [explicit_feature_dicts[int(i)] for i in fit_pos]
+    heldout_dicts = [explicit_feature_dicts[int(i)] for i in heldout_pos]
+    fit_explicit, _ = get_raw_explicit_features(
+        fit_dicts,
+        explicit_specs,
+        continuous_means=means,
+        continuous_stds=stds,
+        role=None,
+    )
+    heldout_explicit, _ = get_raw_explicit_features(
+        heldout_dicts,
+        explicit_specs,
+        continuous_means=means,
+        continuous_stds=stds,
+        role=None,
+    )
+    return (
+        _hstack_sparse_and_dense(x_fit, fit_explicit),
+        _hstack_sparse_and_dense(x_heldout, heldout_explicit),
+    )
+
+
+def _append_explicit_features_full(
+    x_text,
+    text_feature_names: np.ndarray,
+    *,
+    explicit_feature_dicts: Optional[List[Dict[str, Any]]],
+    explicit_specs: Optional[List[ExplicitFeatureSpec]],
+) -> Tuple[Any, np.ndarray, List[str]]:
+    if not explicit_feature_dicts or not explicit_specs:
+        return x_text, text_feature_names, []
+    means: Dict[str, float] = {}
+    stds: Dict[str, float] = {}
+    explicit_features, explicit_names = get_raw_explicit_features(
+        explicit_feature_dicts,
+        explicit_specs,
+        continuous_means=means,
+        continuous_stds=stds,
+        role=None,
+    )
+    prefixed_names = [f"explicit:{name}" for name in explicit_names]
+    features = np.concatenate(
+        [text_feature_names, np.asarray(prefixed_names, dtype=object)]
+    )
+    return _hstack_sparse_and_dense(x_text, explicit_features), features, prefixed_names
+
+
+def _hstack_sparse_and_dense(x_text: Any, explicit_features: Sequence[Sequence[float]]):
+    explicit_matrix = np.asarray(explicit_features, dtype=np.float32)
+    if explicit_matrix.ndim != 2 or explicit_matrix.shape[1] == 0:
+        return x_text
+    return sparse.hstack(
+        [x_text, sparse.csr_matrix(explicit_matrix)],
+        format="csr",
+        dtype=np.float32,
+    )
+
+
 def _fit_binary_bow_fold(
     texts: Sequence[str],
     labels: np.ndarray,
@@ -1889,6 +2061,8 @@ def _fit_binary_bow_fold(
     vectorizer_params: Dict[str, Any],
     model_params: Dict[str, Any],
     *,
+    explicit_feature_dicts: Optional[List[Dict[str, Any]]] = None,
+    explicit_specs: Optional[List[ExplicitFeatureSpec]] = None,
     random_state: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     labels = np.asarray(labels).astype(int)
@@ -1900,14 +2074,17 @@ def _fit_binary_bow_fold(
             float(np.mean(labels[fit_pos])),
             dtype=float,
         )
-    model = Pipeline(
-        [
-            ("tfidf", _make_bow_vectorizer(vectorizer_params)),
-            ("model", _make_bow_classifier(model_params, random_state=random_state)),
-        ]
+    x_fit, x_heldout = _fit_transform_bow_plus_explicit(
+        texts=texts,
+        fit_pos=fit_pos,
+        heldout_pos=heldout_pos,
+        vectorizer_params=vectorizer_params,
+        explicit_feature_dicts=explicit_feature_dicts,
+        explicit_specs=explicit_specs,
     )
-    model.fit([texts[i] for i in fit_pos], labels[fit_pos])
-    return heldout_pos, model.predict_proba([texts[i] for i in heldout_pos])[:, 1]
+    model = _make_bow_classifier(model_params, random_state=random_state)
+    model.fit(x_fit, labels[fit_pos])
+    return heldout_pos, model.predict_proba(x_heldout)[:, 1]
 
 
 def _fit_regression_bow_fold(
@@ -1918,19 +2095,24 @@ def _fit_regression_bow_fold(
     vectorizer_params: Dict[str, Any],
     model_params: Dict[str, Any],
     *,
+    explicit_feature_dicts: Optional[List[Dict[str, Any]]] = None,
+    explicit_specs: Optional[List[ExplicitFeatureSpec]] = None,
     random_state: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     values = np.asarray(values, dtype=float)
     fit_pos = np.asarray(fit_pos)
     heldout_pos = np.asarray(heldout_pos)
-    model = Pipeline(
-        [
-            ("tfidf", _make_bow_vectorizer(vectorizer_params)),
-            ("model", _make_bow_regressor(model_params, random_state=random_state)),
-        ]
+    x_fit, x_heldout = _fit_transform_bow_plus_explicit(
+        texts=texts,
+        fit_pos=fit_pos,
+        heldout_pos=heldout_pos,
+        vectorizer_params=vectorizer_params,
+        explicit_feature_dicts=explicit_feature_dicts,
+        explicit_specs=explicit_specs,
     )
-    model.fit([texts[i] for i in fit_pos], values[fit_pos])
-    return heldout_pos, model.predict([texts[i] for i in heldout_pos])
+    model = _make_bow_regressor(model_params, random_state=random_state)
+    model.fit(x_fit, values[fit_pos])
+    return heldout_pos, model.predict(x_heldout)
 
 
 def _make_bow_vectorizer(params: Dict[str, Any]) -> TfidfVectorizer:

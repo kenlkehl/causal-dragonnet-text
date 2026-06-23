@@ -119,6 +119,144 @@ class ExplicitFeatureExtractionConfig:
     featurizer_dropout: float = 0.1
 
 
+def parse_explicit_feature_spec_entries(
+    entries: Any,
+    *,
+    default_roles: Optional[List[str]] = None,
+    source: str = "explicit feature specs",
+) -> List[ExplicitFeatureSpec]:
+    """Parse feature-spec entries, optionally applying roles from their container."""
+    if entries is None:
+        return []
+    if not isinstance(entries, list):
+        raise ValueError(f"{source} must be a list of explicit feature spec objects")
+
+    specs: List[ExplicitFeatureSpec] = []
+    for idx, entry in enumerate(entries):
+        specs.append(
+            _parse_explicit_feature_spec_entry(
+                entry,
+                default_roles=default_roles,
+                source=f"{source}[{idx}]",
+            )
+        )
+    return specs
+
+
+def load_explicit_feature_specs_json(path: str) -> List[ExplicitFeatureSpec]:
+    """Load role-tagged feature specs from JSON.
+
+    Accepted shapes:
+      - a list of full feature specs with roles
+      - {"features": [...]} with full role-tagged specs
+      - {"confounders": [...], "effect_modifiers": [...]} where section roles
+        are applied automatically and overlapping names can later be merged
+    """
+    with open(path, "r") as f:
+        data = json.load(f)
+    return parse_explicit_feature_specs_payload(
+        data,
+        source=f"explicit feature specs JSON {path}",
+    )
+
+
+def parse_explicit_feature_specs_payload(
+    data: Any,
+    *,
+    source: str = "explicit feature specs payload",
+) -> List[ExplicitFeatureSpec]:
+    """Parse a feature-spec JSON payload."""
+    if isinstance(data, list):
+        return parse_explicit_feature_spec_entries(data, source=source)
+    if not isinstance(data, dict):
+        raise ValueError(f"{source} must be a list or object")
+
+    specs: List[ExplicitFeatureSpec] = []
+    if "features" in data:
+        specs.extend(
+            parse_explicit_feature_spec_entries(
+                data.get("features"),
+                source=f"{source}.features",
+            )
+        )
+    if "confounders" in data:
+        specs.extend(
+            parse_explicit_feature_spec_entries(
+                data.get("confounders"),
+                default_roles=["confounder"],
+                source=f"{source}.confounders",
+            )
+        )
+    if "effect_modifiers" in data:
+        specs.extend(
+            parse_explicit_feature_spec_entries(
+                data.get("effect_modifiers"),
+                default_roles=["effect_modifier"],
+                source=f"{source}.effect_modifiers",
+            )
+        )
+    if not specs:
+        raise ValueError(
+            f"{source} must contain 'features', 'confounders', or 'effect_modifiers'"
+        )
+    return specs
+
+
+def _parse_explicit_feature_spec_entry(
+    entry: Any,
+    *,
+    default_roles: Optional[List[str]],
+    source: str,
+) -> ExplicitFeatureSpec:
+    if isinstance(entry, ExplicitFeatureSpec):
+        if not default_roles:
+            return entry
+        return ExplicitFeatureSpec(
+            name=entry.name,
+            type=entry.type,
+            categories=entry.categories,
+            description=entry.description,
+            roles=_merge_spec_roles(default_roles, entry.roles),
+            value_aliases=entry.value_aliases,
+        )
+
+    if isinstance(entry, str):
+        try:
+            entry = json.loads(entry)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"{source} must be a JSON object with at least name, type, and roles; "
+                "plain variable names are not enough to define extraction."
+            ) from exc
+
+    if not isinstance(entry, dict):
+        raise ValueError(f"{source} must be an explicit feature spec object")
+
+    spec_data = entry.copy()
+    if default_roles:
+        spec_data["roles"] = _merge_spec_roles(default_roles, spec_data.get("roles"))
+    return ExplicitFeatureSpec(**spec_data)
+
+
+def _merge_spec_roles(left: Any, right: Any) -> List[str]:
+    roles: List[str] = []
+    for value in _as_list(left) + _as_list(right):
+        role = str(value).strip()
+        if role and role not in roles:
+            roles.append(role)
+    return roles
+
+
+def _as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
 # Backward-compatible symbol aliases for older internal imports. Config files
 # using the old explicit_confounders key are rejected in ExperimentConfig.from_dict.
 ExplicitConfounderSpec = ExplicitFeatureSpec
@@ -473,6 +611,14 @@ class NonNeuralAgenticForestConfig:
     # Learner family for BoW nuisance and pseudo-target models:
     # "linear", "extratrees", "random_forest", or "xgboost".
     bow_model: str = "linear"
+    # Optional researcher-provided variables to extract before BoW discovery.
+    # Items must be ExplicitFeatureSpec-shaped dicts. confounder/effect-modifier
+    # section fields apply the corresponding role automatically; duplicate names
+    # are merged downstream, so the same variable can be supplied in both lists.
+    prespecified_features: List[ExplicitFeatureSpec] = field(default_factory=list)
+    prespecified_confounders: List[ExplicitFeatureSpec] = field(default_factory=list)
+    prespecified_effect_modifiers: List[ExplicitFeatureSpec] = field(default_factory=list)
+    prespecified_features_json: Optional[str] = None
     logistic_c: float = 1.0
     logistic_max_iter: int = 1000
     ridge_alpha: float = 10.0
@@ -492,6 +638,26 @@ class NonNeuralAgenticForestConfig:
     fold_parallelism: str = "auto"
 
     def __post_init__(self):
+        self.prespecified_features = parse_explicit_feature_spec_entries(
+            self.prespecified_features,
+            source="non_neural_agentic_forest.prespecified_features",
+        )
+        self.prespecified_confounders = parse_explicit_feature_spec_entries(
+            self.prespecified_confounders,
+            default_roles=["confounder"],
+            source="non_neural_agentic_forest.prespecified_confounders",
+        )
+        self.prespecified_effect_modifiers = parse_explicit_feature_spec_entries(
+            self.prespecified_effect_modifiers,
+            default_roles=["effect_modifier"],
+            source="non_neural_agentic_forest.prespecified_effect_modifiers",
+        )
+        if self.prespecified_features_json:
+            if not Path(str(self.prespecified_features_json)).exists():
+                raise ValueError(
+                    "non_neural_agentic_forest.prespecified_features_json "
+                    f"does not exist: {self.prespecified_features_json}"
+                )
         if self.nuisance_folds < 2:
             raise ValueError("non_neural_agentic_forest.nuisance_folds must be >= 2")
         if self.effect_folds < 2:

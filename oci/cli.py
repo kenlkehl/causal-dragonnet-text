@@ -1,11 +1,17 @@
 """Command-line interface for OCI experiments."""
 
 import argparse
+import json
 import sys
 from pathlib import Path
 import logging
 
-from .config import ExperimentConfig, create_default_config
+from .config import (
+    ExperimentConfig,
+    create_default_config,
+    load_explicit_feature_specs_json,
+    parse_explicit_feature_spec_entries,
+)
 from .experiments.runner import ExperimentRunner
 from .utils.system import setup_logging, limit_threads
 
@@ -63,6 +69,32 @@ Examples:
     run_parser.add_argument(
         '--output-dir',
         help='Override output directory from config'
+    )
+    run_parser.add_argument(
+        '--non-neural-features-json',
+        help=(
+            "Add pre-specified feature specs for "
+            "model_type='non_neural_agentic_forest' from a JSON file. "
+            "Accepted keys: features, confounders, effect_modifiers."
+        )
+    )
+    run_parser.add_argument(
+        '--non-neural-confounder',
+        action='append',
+        default=[],
+        help=(
+            "Add a pre-specified non-neural confounder as a JSON feature spec. "
+            "May be repeated."
+        )
+    )
+    run_parser.add_argument(
+        '--non-neural-effect-modifier',
+        action='append',
+        default=[],
+        help=(
+            "Add a pre-specified non-neural effect modifier as a JSON feature spec. "
+            "May be repeated."
+        )
     )
     run_parser.add_argument(
         '--verbose', '-v',
@@ -203,6 +235,47 @@ Examples:
             config.gpu_ids = args.gpu_ids
         if args.output_dir:
             config.output_dir = args.output_dir
+        if (
+            args.non_neural_features_json
+            or args.non_neural_confounder
+            or args.non_neural_effect_modifier
+        ):
+            model_type = getattr(config.applied_inference.architecture, 'model_type', None)
+            if model_type != "non_neural_agentic_forest":
+                print(
+                    "--non-neural-features-json/--non-neural-confounder/"
+                    "--non-neural-effect-modifier only apply to "
+                    "model_type='non_neural_agentic_forest'"
+                )
+                return 1
+            nn_config = (
+                config.applied_inference.architecture
+                .non_neural_agentic_forest
+            )
+            try:
+                if args.non_neural_features_json:
+                    nn_config.prespecified_features.extend(
+                        load_explicit_feature_specs_json(args.non_neural_features_json)
+                    )
+                if args.non_neural_confounder:
+                    nn_config.prespecified_confounders.extend(
+                        parse_explicit_feature_spec_entries(
+                            args.non_neural_confounder,
+                            default_roles=["confounder"],
+                            source="--non-neural-confounder",
+                        )
+                    )
+                if args.non_neural_effect_modifier:
+                    nn_config.prespecified_effect_modifiers.extend(
+                        parse_explicit_feature_spec_entries(
+                            args.non_neural_effect_modifier,
+                            default_roles=["effect_modifier"],
+                            source="--non-neural-effect-modifier",
+                        )
+                    )
+            except (OSError, json.JSONDecodeError, ValueError) as e:
+                print(f"Error loading non-neural pre-specified features: {e}")
+                return 1
         if args.skip_pretraining:
             config.pretraining.enabled = False
         if args.r_stage_min_propensity is not None or args.r_stage_max_propensity is not None:

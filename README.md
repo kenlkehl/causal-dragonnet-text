@@ -331,6 +331,16 @@ effect modifiers, optional inner-fold consistency checks stabilize the candidate
 set, the extractor materializes selected variables from text, and the final
 estimator is an explicit-feature CausalForestDML.
 
+You can seed this path with known variables using
+`architecture.non_neural_agentic_forest.prespecified_confounders`,
+`prespecified_effect_modifiers`, `prespecified_features`, or
+`prespecified_features_json`. These entries use the same `ExplicitFeatureSpec`
+shape as `explicit_features.features`; `confounders` and `effect_modifiers`
+sections in the JSON file apply those roles automatically. If the same variable
+is supplied in both roles, it is extracted once, included in the BoW nuisance and
+pseudo-target models alongside the text features, and passed to both `W` and `X`
+in the final causal forest.
+
 By default the BoW vectorizer uses 1-3 word n-grams, and the agent context
 includes both the original top-weighted feature lists and a `phrase_features`
 list restricted to 2-4 token n-grams with treatment, outcome,
@@ -356,7 +366,22 @@ Minimal configuration:
         "ngram_range_min": 1,
         "ngram_range_max": 3,
         "top_n_features": 100,
-        "candidate_consistency_enabled": true
+        "candidate_consistency_enabled": true,
+        "prespecified_confounders": [
+          {
+            "name": "age",
+            "type": "continuous",
+            "description": "Patient age at treatment initiation in years."
+          }
+        ],
+        "prespecified_effect_modifiers": [
+          {
+            "name": "pd_l1_expression",
+            "type": "categorical",
+            "categories": ["<1%", "1-49%", ">=50%"],
+            "description": "Pretreatment tumor PD-L1 expression category."
+          }
+        ]
       }
     },
     "explicit_features": {
@@ -364,6 +389,23 @@ Minimal configuration:
       "features": []
     }
   }
+}
+```
+
+An optional `prespecified_features_json` file can contain:
+
+```json
+{
+  "confounders": [
+    {"name": "age", "type": "continuous", "description": "Age in years."}
+  ],
+  "effect_modifiers": [
+    {
+      "name": "pd_l1_expression",
+      "type": "categorical",
+      "categories": ["<1%", "1-49%", ">=50%"]
+    }
+  ]
 }
 ```
 

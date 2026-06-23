@@ -59,6 +59,7 @@ class NonNeuralAgenticOracleConfig:
     ngram_range_min: int = 1
     ngram_range_max: int = 3
     bow_model: str = "linear"
+    prespecified_features_json: Optional[str] = None
     logistic_c: float = 1.0
     ridge_alpha: float = 10.0
     e_clip: float = 0.01
@@ -168,6 +169,7 @@ def _make_applied_config(
                 ngram_range_min=config.ngram_range_min,
                 ngram_range_max=config.ngram_range_max,
                 bow_model=config.bow_model,
+                prespecified_features_json=config.prespecified_features_json,
                 logistic_c=config.logistic_c,
                 ridge_alpha=config.ridge_alpha,
                 e_clip=config.e_clip,
@@ -354,6 +356,14 @@ def main() -> None:
             "linear is sparse logistic/ridge; tree options allow feature interactions."
         ),
     )
+    parser.add_argument(
+        "--prespecified-features-json",
+        default=None,
+        help=(
+            "Optional JSON file with pre-specified variables to extract before "
+            "BoW discovery. Accepted keys: features, confounders, effect_modifiers."
+        ),
+    )
     parser.add_argument("--ridge-alpha", type=float, default=10.0)
     parser.add_argument("--top-n-features", type=int, default=100)
     parser.add_argument("--candidate-proposals-per-fold", type=int, default=30)
@@ -474,6 +484,7 @@ def main() -> None:
         ngram_range_min=args.ngram_range_min,
         ngram_range_max=args.ngram_range_max,
         bow_model=args.bow_model,
+        prespecified_features_json=args.prespecified_features_json,
         ridge_alpha=args.ridge_alpha,
         top_n_features=args.top_n_features,
         candidate_proposals_per_fold=args.candidate_proposals_per_fold,
