@@ -47,7 +47,7 @@ def create_feature_extractor(
     hlm_chat_template_prompt: Optional[str] = None,
     # Hierarchical Transformer args
     htr_sentence_model: str = "prajjwal1/bert-tiny",
-    htr_freeze_sentence_encoder: bool = True,
+    htr_freeze_sentence_encoder: bool = False,
     htr_chunk_size_words: int = 96,
     htr_chunk_overlap_words: int = 24,
     htr_max_chunks: int = 128,
@@ -463,7 +463,7 @@ def create_feature_extractor_from_config(
         hlm_chat_template_prompt=config.get('hlm_chat_template_prompt', None),
         # Hierarchical Transformer args
         htr_sentence_model=config.get('htr_sentence_model', 'prajjwal1/bert-tiny'),
-        htr_freeze_sentence_encoder=config.get('htr_freeze_sentence_encoder', True),
+        htr_freeze_sentence_encoder=config.get('htr_freeze_sentence_encoder', False),
         htr_chunk_size_words=config.get('htr_chunk_size_words', 96),
         htr_chunk_overlap_words=config.get('htr_chunk_overlap_words', 24),
         htr_max_chunks=config.get('htr_max_chunks', 128),

@@ -4,21 +4,28 @@ This repository already contains agentic discovery and causal-forest code. Prefe
 
 ## Required First Pass: BoW-Guided Discovery
 
-Use `model_type="non_neural_agentic_forest"` for the initial evidence pass.
+Use `model_type="non_neural_agentic_forest"` for the initial evidence pass. Run it as a small suite of separate configs rather than relying on one vectorizer setting.
 
 Relevant implementation:
 - `oci/inference/non_neural_agentic_forest.py`
 - Config dataclass: `NonNeuralAgenticForestConfig`
 - README section beginning "Use `model_type=\"non_neural_agentic_forest\"`"
 
-Recommended defaults:
+Recommended defaults for each run:
 - `applied_inference.cv_folds >= 5`
 - `architecture.explicit_feature_forest.honest = true`
 - `architecture.non_neural_agentic_forest.nuisance_folds >= 5`
 - `architecture.non_neural_agentic_forest.effect_folds >= 5`
-- `ngram_range_min = 1`, `ngram_range_max = 3`
 - `candidate_consistency_enabled = true`
 - leave `prespecified_confounders`, `prespecified_effect_modifiers`, and `prespecified_features` empty unless the user supplied variables
+
+Minimum vectorization suite when feasible:
+- unigram-focused: `ngram_range_min = 1`, `ngram_range_max = 1`
+- default broad: `ngram_range_min = 1`, `ngram_range_max = 3`
+- phrase-focused: `ngram_range_min = 2`, `ngram_range_max = 4`
+- rare-signal-friendly: keep broad or phrase n-grams but lower `min_df`, raise `max_features`, or compare `sublinear_tf` settings
+
+Optional learner sensitivity checks can vary `bow_model` among supported values such as `linear`, `extratrees`, `random_forest`, or `xgboost` when runtime allows. Keep fold construction and outcome/treatment definitions fixed across the suite so recurrence and disagreement are interpretable. Record a run label and vectorizer params for every BoW artifact.
 
 Key artifacts usually appear under `non_neural_agentic_forest/`:
 - `bow_feature_importance_by_fold.jsonl`
@@ -26,15 +33,18 @@ Key artifacts usually appear under `non_neural_agentic_forest/`:
 - `selected_feature_sets.json`
 - `outer_cv_metrics.csv`
 
-Use BoW outputs to propose concepts, not as final variables. BoW is mandatory for the first lexical recurrence pass, but it is insufficient by itself for final feature extraction in long longitudinal notes.
+Use BoW outputs to propose concepts, not as final variables. BoW is mandatory for the first lexical recurrence pass, but it is insufficient by itself for final feature extraction in long longitudinal notes. Prefer concepts that recur across folds and across vectorization variants, while preserving variant-specific discoveries for HTR/span follow-up when the evidence is strong.
 
 ## LLM-Based Explicit Feature Extraction
 
-Do not implement primary clinical variable extraction with ad hoc regex. After BoW/attention evidence identifies candidate concepts, materialize variables by having an LLM read each underlying `clinical_text` document and return structured values.
+Do not implement clinical variable extraction with ad hoc regex or pattern-matching fallback logic. After BoW/attention evidence identifies candidate concepts, materialize variables by having an LLM read each underlying `clinical_text` document and return structured values. When no external/model endpoint is available, the coding agent itself is the LLM document-reading extractor.
 
-Prompt the user before extraction unless they already specified a backend:
-- **Coding agent extraction**: Codex reads each document and emits structured values itself. This is acceptable for small datasets or endpoint outages, but it must still be document-by-document LLM extraction, not regex matching.
-- **OpenAI-compatible endpoint extraction**: the user provides `vllm_server_url` or another OpenAI-compatible base URL, model name, API key if needed, batch size/concurrency, and max text length. This is preferred for most datasets.
+Default to coding-agent extraction unless the user supplied an endpoint, requested endpoint extraction, or the dataset is too large for reliable coding-agent extraction after a concrete sharding attempt:
+- **Coding agent extraction**: Codex reads each document, or targeted chunks of each long document, and emits structured values itself. This is required when no repo-native extractor, vLLM server, OpenAI-compatible endpoint, local model, or API key is available. Use BoW/HTR spans, section search, targeted chunk sampling, and subagents when useful, but reconcile all evidence into one patient-level row per concept. For large datasets, shard by patient ranges, folds, concepts, or document chunks and spawn subagents when available; if subagents are unavailable, perform the same sharded passes manually. This must still be document-reading LLM extraction, not regex or pattern matching.
+- **OpenAI-compatible endpoint extraction**: use `vllm_server_url` or another OpenAI-compatible base URL, model name, API key if needed, batch size/concurrency, and max text length when provided, requested, or needed after coding-agent extraction has been attempted or clearly bounded for scale.
+- **Local HF weights on GPUs**: when using cached Hugging Face weights locally, prefer starting a vLLM OpenAI-compatible server and using the endpoint-backed extractor. Select a capable instruction-tuned model with sufficient context, not a small/base model chosen only because it loads quickly. Example preferred class: Google's `gemma-4-e2b-it`/Gemma 4 E2B instruct when cached and supported by vLLM. Reserve direct `transformers` generation with small models such as `Qwen/Qwen3-1.7B` for smoke tests or explicitly documented last-resort extraction.
+
+Do not emit an all-missing explicit-feature table merely because endpoint-backed extraction is unavailable. Missing values are valid only for patient/concept pairs that document-reading extraction could not recover from the text. If extraction is genuinely infeasible even after sharding, stop and report the blocker instead of running downstream causal-forest or final ITE comparisons that require extracted features.
 
 Prefer existing repo code:
 - `oci/extraction/explicit_features.py`: `VLLMFeatureExtractor` and `extract_explicit_features()`.
@@ -51,8 +61,17 @@ Typical config fields:
 - `explicit_features.extraction_batch_size`
 - `explicit_features.extraction_max_retries`
 - `explicit_features.extraction_temperature=0.0`
-- `explicit_features.extraction_max_text_length`
+- `explicit_features.extraction_max_text_length` or equivalent max input/token setting near 200,000 tokens when supported
+- `explicit_features.extraction_max_tokens` / endpoint `max_tokens` / `max_new_tokens` set high enough for reasoning overhead and complete JSON output
 - `explicit_features.cache_enabled=true`
+
+Local vLLM launch guidance:
+- Probe CUDA and GPU memory first, then choose `CUDA_VISIBLE_DEVICES`, `--dtype`, `--tensor-parallel-size`, `--gpu-memory-utilization`, and `--max-model-len` explicitly.
+- Aim for a very long extraction context: `--max-model-len 200000` when the model and hardware support it, or the largest stable value near 200k after smoke testing. Keep room for output tokens by enforcing `input_tokens + max_new_tokens <= max_model_len`.
+- Start an OpenAI-compatible server with a command shaped like:
+  `python -m vllm.entrypoints.openai.api_server --host 127.0.0.1 --port <port> --model <model-or-local-path> --served-model-name <name> --dtype bfloat16 --max-model-len 200000`.
+- Run a JSON-format smoke test through the server before full extraction; the test must include at least one numeric baseline variable and one categorical variable.
+- Record the server command, model name/path, context length, max input/text tokens, max generation tokens, prompt version, smoke-test output, and fallback reasons in `report.txt`.
 
 Use `model_type="non_neural_agentic_forest"`, `agentic_explicit_feature_forest`, or `agentic_attention_variable_forest` to keep proposal, extraction, and forest fitting on the repo-native path. The non-neural BoW path sends text evidence to the proposal agent, then the extractor materializes selected explicit variables from text before fitting the final causal forest.
 
@@ -129,7 +148,13 @@ Recommended screens:
 - Confounder screen: candidate association with both treatment and outcome, plus residual balance or overlap impact.
 - Effect-modifier screen: treatment-by-candidate interaction, subgroup residual slope, R-loss target association, logistic R-loss target association, or pseudo-outcome association.
 
-Report fold recurrence, direction, effect size, missingness, and overlap warnings. Do not select final confounders or modifiers solely from univariable screens; use them to prioritize extraction, diagnose temporal leakage, and decide which multivariable DGP forms to compare.
+Report fold recurrence, direction, standardized effect magnitude or score delta, missingness, overlap warnings, and p values where useful. Put at least as much weight on effect magnitude and fold stability as on p values. Do not select final confounders or modifiers solely from univariable screens; use them to prioritize extraction, diagnose temporal leakage, and decide which multivariable DGP forms to compare.
+
+Before passing final variables to the causal forest:
+- Evaluate plausible confounder transformations or functional relationships inside training folds, not on the reporting fold.
+- Evaluate effect modifiers for differential association with outcome by treatment, using interaction, treatment-stratified, R-loss, or pseudo-outcome diagnostics.
+- Inspect feature-feature correlations, categorical contingency tables, and missingness overlap to merge or reject redundant proxy variables.
+- Iterate on a parsimonious feature list until removing weak or redundant variables no longer harms honest nuisance, heterogeneity, or ITE-stability metrics.
 
 ## Explicit-Feature Causal Forest
 

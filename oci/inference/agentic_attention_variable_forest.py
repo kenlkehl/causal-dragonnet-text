@@ -835,7 +835,28 @@ class AgenticAttentionVariableForestRunner:
     ) -> pd.DataFrame:
         discovery_df = self.dataset.iloc[train_idx].reset_index(drop=True)
         r_stage = None
-        if self._interaction_outcome_enabled():
+        if self._dragonnet_dr_enabled():
+            from .dragonnet_drlearner import DragonNetDRLearnerRunner
+
+            dr_runner = DragonNetDRLearnerRunner(
+                dataset=discovery_df,
+                config=self.config,
+                output_path=self.artifact_dir / f"dragonnet_dr_outer_{outer_fold}.parquet",
+                device=self.device,
+                num_workers=self.num_workers,
+                gpu_ids=None,
+            )
+            nuisance = dr_runner.crossfit_nuisance(discovery_df, outer_fold)
+            r_stage = dr_runner.crossfit_effect(
+                discovery_df,
+                nuisance["predictions"],
+                outer_fold,
+            )
+            self.nuisance_rows.append(nuisance["predictions"])
+            self.r_stage_rows.append(r_stage["predictions"])
+            self.nuisance_attention_rows.extend(nuisance["attention"])
+            self.effect_attention_rows.extend(r_stage["attention"])
+        elif self._interaction_outcome_enabled():
             interaction = self._crossfit_interaction_outcome(discovery_df, outer_fold)
             nuisance = {
                 "predictions": interaction["nuisance_predictions"],
@@ -1105,6 +1126,12 @@ class AgenticAttentionVariableForestRunner:
             == "joint_rlearner"
         )
 
+    def _dragonnet_dr_enabled(self) -> bool:
+        return (
+            str(getattr(self.avf_config, "neural_stage_mode", "staged")).strip().lower()
+            == "dragonnet_dr"
+        )
+
     def _interaction_outcome_enabled(self) -> bool:
         return (
             str(getattr(self.avf_config, "neural_stage_mode", "staged")).strip().lower()
@@ -1167,7 +1194,7 @@ class AgenticAttentionVariableForestRunner:
             extractor_type=extractor_type,
             device=self.device,
             htr_sentence_model=getattr(arch, "htr_sentence_model", "prajjwal1/bert-tiny"),
-            htr_freeze_sentence_encoder=getattr(arch, "htr_freeze_sentence_encoder", True),
+            htr_freeze_sentence_encoder=getattr(arch, "htr_freeze_sentence_encoder", False),
             htr_chunk_size_words=getattr(arch, "htr_chunk_size_words", 96),
             htr_chunk_overlap_words=getattr(arch, "htr_chunk_overlap_words", 24),
             htr_max_chunks=getattr(arch, "htr_max_chunks", 128),

@@ -263,7 +263,7 @@ class HierarchicalTransformerExtractor(nn.Module):
     def __init__(
         self,
         sentence_encoder_model: str = "prajjwal1/bert-tiny",
-        freeze_sentence_encoder: bool = True,
+        freeze_sentence_encoder: bool = False,
         chunk_size_words: int = 96,
         chunk_overlap_words: int = 24,
         max_chunks: int = 128,

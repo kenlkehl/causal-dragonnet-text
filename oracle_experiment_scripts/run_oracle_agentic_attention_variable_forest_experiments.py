@@ -52,6 +52,7 @@ from oci.config import (
     AgenticAttentionVariableForestConfig,
     AgenticFeatureSearchConfig,
     AppliedInferenceConfig,
+    DragonNetDRLearnerConfig,
     ExplicitFeatureExtractionConfig,
     ExplicitFeatureForestConfig,
     ExplicitFeatureSpec,
@@ -98,7 +99,7 @@ class AgenticAttentionOracleConfig:
     text_max_chars: Optional[int] = None
 
     htr_sentence_model: str = "prajjwal1/bert-tiny"
-    htr_freeze_sentence_encoder: bool = True
+    htr_freeze_sentence_encoder: bool = False
     htr_chunk_size_words: int = 96
     htr_chunk_overlap_words: int = 24
     htr_max_chunks: int = 128
@@ -358,6 +359,16 @@ def _make_applied_config(
                     config.residual_contrastive_min_class_count
                 ),
                 neural_only=config.neural_only,
+            ),
+            dragonnet_drlearner=DragonNetDRLearnerConfig(
+                nuisance_folds=config.nuisance_folds,
+                effect_folds=config.effect_folds,
+                nuisance_epochs=config.nuisance_epochs,
+                effect_epochs=config.non_nuisance_epochs,
+                nuisance_calibration=config.nuisance_calibration,
+                e_clip=config.e_clip,
+                effect_loss="huber",
+                attention_top_k_chunks=config.attention_top_k_chunks,
             ),
         ),
         training=TrainingConfig(
@@ -858,7 +869,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text-max-chars", type=int, default=None)
 
     parser.add_argument("--htr-sentence-model", default="prajjwal1/bert-tiny")
-    parser.add_argument("--htr-freeze-sentence-encoder", type=_parse_bool, default=True)
+    parser.add_argument("--htr-freeze-sentence-encoder", type=_parse_bool, default=False)
     parser.add_argument("--htr-chunk-size-words", type=int, default=96)
     parser.add_argument("--htr-chunk-overlap-words", type=int, default=24)
     parser.add_argument("--htr-max-chunks", type=int, default=128)
@@ -990,7 +1001,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--neural-stage-mode",
-        choices=["staged", "joint_rlearner", "interaction_outcome", "tarnet_offset"],
+        choices=[
+            "staged",
+            "joint_rlearner",
+            "interaction_outcome",
+            "tarnet_offset",
+            "dragonnet_dr",
+        ],
         default="staged",
         help=(
             "Neural learning mode. staged trains nuisance and R/effect models "
@@ -998,7 +1015,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "HTR model with detached nuisance predictions inside the R-loss; "
             "interaction_outcome trains a supervised outcome model with an "
             "explicit treatment-interaction branch; tarnet_offset trains "
-            "nuisance first, then treatment-specific outcome-logit offset heads."
+            "nuisance first, then treatment-specific outcome-logit offset heads; "
+            "dragonnet_dr trains DragonNet nuisances, then a direct DR "
+            "pseudo-outcome tau model."
         ),
     )
     parser.add_argument(

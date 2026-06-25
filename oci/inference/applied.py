@@ -224,6 +224,19 @@ def run_applied_inference(
         )
         return
 
+    if hasattr(config, 'architecture') and config.architecture.model_type == "dragonnet_drlearner":
+        logger.info("Routing to DragonNet DR-learner pipeline")
+        from .dragonnet_drlearner import run_dragonnet_drlearner
+        run_dragonnet_drlearner(
+            dataset=dataset,
+            config=config,
+            output_path=output_path,
+            device=device,
+            num_workers=num_workers,
+            gpu_ids=gpu_ids,
+        )
+        return
+
     # Explicit feature extraction (if enabled)
     explicit_feature_columns = None
     if hasattr(config, 'explicit_features') and config.explicit_features.enabled:
@@ -822,6 +835,24 @@ def _train_single_model(
         hlm_skip_llm=_use_cache,
         hlm_cached_hidden_size=_cached_hidden_size,
         hlm_chat_template_prompt=getattr(arch_config, 'hlm_chat_template_prompt', None),
+        # Hierarchical Transformer args
+        htr_sentence_model=getattr(arch_config, 'htr_sentence_model', 'prajjwal1/bert-tiny'),
+        htr_freeze_sentence_encoder=getattr(arch_config, 'htr_freeze_sentence_encoder', False),
+        htr_chunk_size_words=getattr(arch_config, 'htr_chunk_size_words', 96),
+        htr_chunk_overlap_words=getattr(arch_config, 'htr_chunk_overlap_words', 24),
+        htr_max_chunks=getattr(arch_config, 'htr_max_chunks', 128),
+        htr_max_chunk_length=getattr(arch_config, 'htr_max_chunk_length', 128),
+        htr_num_layers=getattr(arch_config, 'htr_num_layers', 2),
+        htr_num_heads=getattr(arch_config, 'htr_num_heads', 4),
+        htr_transformer_dim=getattr(arch_config, 'htr_transformer_dim', 256),
+        htr_dropout=getattr(arch_config, 'htr_dropout', 0.1),
+        htr_projection_dim=getattr(arch_config, 'htr_projection_dim', 128),
+        htr_hash_embedding_dim=getattr(arch_config, 'htr_hash_embedding_dim', 256),
+        htr_sentence_encoder_batch_size=getattr(arch_config, 'htr_sentence_encoder_batch_size', 128),
+        htr_sentence_encoder_backend=getattr(arch_config, 'htr_sentence_encoder_backend', 'auto'),
+        htr_sentence_pooling=getattr(arch_config, 'htr_sentence_pooling', 'auto'),
+        htr_normalize_sentence_embeddings=getattr(arch_config, 'htr_normalize_sentence_embeddings', True),
+        htr_trainable_sentence_encoder_layers=getattr(arch_config, 'htr_trainable_sentence_encoder_layers', 0),
         # Hierarchical CNN args
         hcnn_embedding_dim=getattr(arch_config, 'hcnn_embedding_dim', 256),
         hcnn_conv_dim=getattr(arch_config, 'hcnn_conv_dim', 256),
@@ -974,15 +1005,33 @@ def _train_single_model(
         collate_fn = collate_batch
 
     # Create data loaders
-    # GPU store: num_workers=0 (GPU tensors not accessible from worker processes)
-    # Disk cache or live FLP: parallel workers + pinned memory to overlap I/O with GPU compute
+    # GPU store: num_workers=0 (GPU tensors not accessible from worker processes).
+    # CPU defaults to single-process loading because managed environments may
+    # disallow multiprocessing forkserver sockets.
     use_cached_mode = hidden_state_cache is not None and train_indices is not None
+    requested_workers = getattr(config.training, 'dataloader_workers', None)
+    loader_workers = (
+        (0 if device.type == "cpu" else 2)
+        if requested_workers is None
+        else max(0, int(requested_workers))
+    )
     if gpu_store is not None:
         dl_kwargs = {}  # num_workers=0 (default), no pin_memory needed
+    elif loader_workers == 0:
+        dl_kwargs = {}
     elif use_cached_mode:
-        dl_kwargs = dict(num_workers=2, persistent_workers=True, pin_memory=True)
+        dl_kwargs = dict(
+            num_workers=loader_workers,
+            persistent_workers=True,
+            pin_memory=device.type == "cuda",
+        )
     else:
-        dl_kwargs = dict(num_workers=2, persistent_workers=True, pin_memory=True, prefetch_factor=2)
+        dl_kwargs = dict(
+            num_workers=loader_workers,
+            persistent_workers=True,
+            pin_memory=device.type == "cuda",
+            prefetch_factor=2,
+        )
 
     train_loader = DataLoader(
         train_dataset,
@@ -1117,12 +1166,29 @@ def _predict_dataset(
         predict_collate_fn = collate_batch
 
     use_cached_mode = hidden_state_cache is not None and dataset_indices is not None
+    requested_workers = getattr(config.training, 'dataloader_workers', None)
+    loader_workers = (
+        (0 if device.type == "cpu" else 2)
+        if requested_workers is None
+        else max(0, int(requested_workers))
+    )
     if gpu_store is not None:
         dl_kwargs = {}
+    elif loader_workers == 0:
+        dl_kwargs = {}
     elif use_cached_mode:
-        dl_kwargs = dict(num_workers=2, persistent_workers=True, pin_memory=True)
+        dl_kwargs = dict(
+            num_workers=loader_workers,
+            persistent_workers=True,
+            pin_memory=device.type == "cuda",
+        )
     else:
-        dl_kwargs = dict(num_workers=2, persistent_workers=True, pin_memory=True, prefetch_factor=2)
+        dl_kwargs = dict(
+            num_workers=loader_workers,
+            persistent_workers=True,
+            pin_memory=device.type == "cuda",
+            prefetch_factor=2,
+        )
 
     loader = DataLoader(
         dataset,

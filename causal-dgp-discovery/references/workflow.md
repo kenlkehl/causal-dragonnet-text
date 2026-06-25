@@ -14,14 +14,21 @@
 
 ## 2. Text Evidence Before Feature Extraction
 
-Start with honest cross-fitted text models. The purpose is to learn which concepts the text suggests, not to let clinical priors define the variable list. Run both BoW/TF-IDF and HTR/attention evidence before finalizing candidate features: BoW gives broad lexical recurrence, while HTR/attention localizes the specific spans needed to recover baseline/index-time values in long longitudinal notes.
+Start with honest cross-fitted text models. The purpose is to learn which concepts the text suggests, not to let clinical priors define the variable list. Run both BoW/TF-IDF and HTR/attention evidence before finalizing candidate features: BoW gives broad lexical recurrence, while HTR/attention localizes the specific spans needed to recover baseline/index-time values in long longitudinal notes. BoW evidence should come from multiple vectorization strategies so a signal is not missed merely because one n-gram or document-frequency setting hides it.
 
-Run a BoW/TF-IDF pass:
+Run a BoW/TF-IDF suite:
+- Use the same honest folds across vectorization variants when possible so feature recurrence can be compared directly.
+- Include these variants when feasible:
+  - unigram-focused terms for broad clinical concepts
+  - the default broad `1-3` n-gram setup
+  - phrase-focused `2-4` n-grams for multiword statuses, regimens, and lab names
+  - lower-`min_df` or higher-`max_features` settings for rare but fold-stable signals
 - Fit treatment nuisance models on training folds and predict held-out rows.
 - Fit outcome nuisance models on training folds and predict held-out rows.
 - Compute held-out residuals and R-learner or pseudo-outcome targets.
 - Fit text models for residual/pseudo-outcome signal.
-- Save high-signal n-grams by fold for treatment, outcome, overlap, and effect heterogeneity.
+- Save high-signal n-grams by fold and vectorization run for treatment, outcome, overlap, and effect heterogeneity.
+- Compare consensus, disagreement, and unique discoveries across vectorization runs before translating text evidence into candidate concepts.
 
 Run an HTR/attention evidence pass after the BoW pass:
 - Before launching neural jobs, inspect the local accelerator environment:
@@ -67,11 +74,25 @@ Examples of valid translation logic:
 
 ## 3.5. LLM-Based Candidate Extraction
 
-Do not make regex the primary method for extracting clinical variables from notes. The extraction step must read the patient document and return structured values, missingness flags, and brief evidence/rationale for each requested concept.
+Do not use regex or pattern-matching rules as the method for extracting clinical variables from notes. The extraction step must read the patient document and return structured values, missingness flags, and brief evidence/rationale for each requested concept. The coding agent itself is a valid LLM-based document-reading extractor. Values that cannot be recovered by document reading remain missing/null, but only after the patient text has actually been read for that concept.
 
-Before extraction, prompt the user to choose one backend unless they already provided it:
-- **Coding agent extraction**: the agent reads each `clinical_text` document and produces structured values itself. Use this only when the dataset is small enough or endpoint-backed extraction is unavailable; still preserve the same feature schema and missingness flags.
-- **OpenAI-compatible endpoint extraction**: the user provides a running endpoint such as vLLM, plus model name, API key if needed, batch/concurrency limits, and max text length. Prefer this for nontrivial datasets.
+Default to **coding agent extraction** unless the user supplied an endpoint, requested endpoint-backed extraction, or the dataset is too large for reliable coding-agent extraction after sharding has been attempted or explicitly bounded. Lack of a repo extraction package, local model, vLLM server, OpenAI-compatible endpoint, or API key is not a blocker and must not result in an all-missing feature table; it means the coding agent must perform the document-reading extraction directly.
+
+Supported backends:
+- **Coding agent extraction**: the agent reads the `clinical_text` documents and produces structured values itself. This is the required fallback when no external/model endpoint exists. For long documents, use targeted chunk sampling, section search, BoW/HTR-highlighted spans, and subagents sharded by patient, fold, concept, or document chunk to find relevant passages without loading every full document into one context window. A coordinating pass must reconcile chunk-level findings into one patient-level value per concept with missingness flags and evidence summaries. If subagents are unavailable, perform the same sharded extraction manually across repeated passes.
+- **OpenAI-compatible endpoint extraction**: use a running endpoint such as vLLM, plus model name, API key if needed, batch/concurrency limits, and max text length. Use this when coding-agent extraction is infeasible or when the user explicitly provides or requests it.
+- **Local Hugging Face GPU extraction**: prefer this as an endpoint-backed path, not as an ad hoc `transformers.generate()` loop. If local model weights and CUDA GPUs are available, first attempt to start a vLLM OpenAI-compatible server and use the repository's endpoint-backed extractor. Choose a current instruction-tuned model with enough context and extraction reliability for clinical notes; Google's `gemma-4-e2b-it`/Gemma 4 E2B instruct is an example of a better local extraction candidate when cached and supported by vLLM. Treat small/base models such as `Qwen/Qwen3-1.7B` or `Qwen/Qwen3-0.6B-Base` as smoke-test models only, unless stronger instruction models and server mode are unavailable and the limitation is explicitly documented.
+
+For local vLLM-backed extraction:
+- Probe GPUs as in the HTR section, then choose explicit `CUDA_VISIBLE_DEVICES`, dtype, tensor parallelism, GPU memory utilization, and max model length.
+- Default to very long context for extraction. Aim for about 200,000 tokens of total server context when supported so full or near-full longitudinal patient histories can be included. Set vLLM `--max-model-len 200000` or the largest stable supported value near that target; set the extractor's max text/input token limit near the same value.
+- Set generation `max_tokens`/`max_new_tokens` deliberately high enough for reasoning-model overhead and complete JSON output, not a small value such as a few hundred tokens. For reasoning-capable models, reserve thousands to tens of thousands of output tokens as needed while ensuring `input_tokens + max_new_tokens <= max_model_len`.
+- Start vLLM with an OpenAI-compatible API server, for example adapting the local paths/options:
+  `python -m vllm.entrypoints.openai.api_server --host 127.0.0.1 --port <port> --model <local-or-hf-model> --served-model-name <name> --dtype bfloat16 --max-model-len 200000`.
+- Run a small JSON extraction smoke test against the server before the full pass, including at least one numeric variable and one categorical variable from a long note.
+- Configure the repo extractor with `explicit_features.vllm_mode="server"`, `explicit_features.vllm_server_url`, `explicit_features.vllm_model_name`, deterministic temperature, bounded concurrency, retries, cache enabled, a max input/text length near the 200k-token target, and a generation token cap large enough for reasoning overhead and JSON completion.
+- Record the server command, model, context limit, max input/text tokens, max generation tokens, prompt version, smoke-test result, and any fallback reason in `report.txt` and `candidate_features` metadata.
+- Use direct HF `transformers` generation only when vLLM/server mode is unavailable or incompatible; if used, keep the same model-quality standard and document why direct generation was necessary.
 
 Use the repository's LLM extraction implementation when an endpoint is available:
 - `oci/extraction/explicit_features.py`: `VLLMFeatureExtractor`, `extract_explicit_features()`, JSON parsing, categorical alias handling, retries, batching, and OpenAI-compatible server mode.
@@ -86,26 +107,30 @@ Configure each extraction target as an `ExplicitFeatureSpec`-shaped contract:
 - `description`: exact baseline/pre-treatment extraction target and missingness rule
 - `roles`: `confounder`, `effect_modifier`, or both
 
-Extraction prompts must request baseline/pre-treatment values and instruct the model to return null when the value is not explicitly stated or cannot be inferred from pre-treatment information. Preserve raw LLM responses only when safe and explicitly useful; otherwise record summarized evidence, coverage, and missingness.
+Extraction prompts/instructions must request baseline/pre-treatment values and instruct the extractor to return null when the value is not explicitly stated or cannot be inferred from pre-treatment information. Coding-agent and endpoint-backed extraction must both preserve the same feature schema, missingness flags, temporal labels, and brief evidence summaries. Preserve raw LLM responses only when safe and explicitly useful; otherwise record summarized evidence, coverage, and missingness.
 
-Regex may be used after LLM extraction for type coercion, category canonicalization, sanity checks, or targeted repair of a known formatting issue. If regex is used as a fallback extractor for any variable, record the reason, scope, and validation against LLM-extracted examples in `report.txt`.
+Post-extraction type coercion, category canonicalization, and sanity checks may operate only on values already produced by document-reading extraction. Do not use regex as a fallback extractor, targeted repair extractor, or missing-value filler; unresolved patient/concept values remain missing/null and must be documented in `report.txt`. A run-level failure to find an endpoint is not a valid missingness rationale. If coding-agent extraction is genuinely infeasible after a concrete sharding attempt, stop and report the blocker instead of proceeding as though extraction succeeded.
 
 ## 4. Role Evaluation
 
-Evaluate confounders and modifiers separately. Use univariable screens as fold-aware diagnostics before and during multivariable modeling; they are useful for prioritization and debugging, but not sufficient as final role evidence.
+Evaluate confounders and modifiers separately. Use univariable screens as fold-aware diagnostics before and during multivariable modeling; they are useful for prioritization and debugging, but not sufficient as final role evidence. Run these diagnostics only inside internal training folds for any selection decision.
 
 Univariable nuisance screens:
 - For every extracted candidate, screen association with treatment in training folds or with out-of-fold predictions.
 - For every extracted candidate, screen association with outcome and whether it improves a simple outcome nuisance model.
-- Record effect size/direction, fold recurrence, missingness, and whether the association survives basic adjustment for already selected high-confidence confounders.
+- For plausible confounders, evaluate supported functional relationships such as monotone transforms, ratios, coarse categories, or interactions only when text evidence or diagnostics suggest them.
+- Record standardized effect magnitude, score deltas, direction, fold recurrence, missingness, and whether the association survives basic adjustment for already selected high-confidence confounders.
+- Include p values when useful, but do not rank or retain candidates mainly because a p value is small.
 
 Confounder evidence:
 - Predicts treatment in held-out folds.
 - Predicts outcome or improves held-out outcome nuisance metrics after adjustment.
 - Reduces residual treatment-outcome association or improves overlap diagnostics.
+- Has a magnitude and direction that are stable enough to matter, not merely a nominal p value.
 
 Univariable effect-modification screens:
 - Fit treatment-by-candidate interaction screens for binary outcomes or residualized outcome models.
+- Evaluate differential association with outcome by treatment using treatment-stratified outcome associations or interaction score deltas.
 - Compare subgroup residual slopes or subgroup ATE proxies only when overlap is adequate.
 - Screen candidate association with R-loss targets, logistic R-loss targets, or pseudo-outcomes using out-of-fold nuisance estimates.
 - Require fold-stable direction and interpretable span/value evidence before promoting a modifier.
@@ -118,12 +143,19 @@ Effect-modifier evidence:
 
 Avoid promoting variables based only on marginal outcome association.
 
+Parsimony and redundancy review:
+- Before finalizing a candidate list, compute feature-feature correlations, contingency tables for categorical pairs, and missingness-overlap summaries within training folds.
+- Group highly correlated or semantically duplicate candidates and prefer the most direct baseline variable unless a proxy improves honest treatment/outcome nuisance, heterogeneity, or ITE-stability metrics.
+- Prefer a compact feature set that preserves held-out performance and fold-stable role evidence over a larger set of weakly distinct variables.
+- Revisit role assignments after each review: a variable may be a confounder, an effect modifier, both, or neither.
+
 ## 5. Iteration
 
 After each iteration:
 - Compare fold-level nuisance metrics, R-loss/pseudo-outcome metrics, causal-forest stability, and ITE distribution.
 - Identify unexplained residual text signal and propose a narrow expansion only if metrics or fold evidence justify it.
 - Re-extract or re-role candidates when aliasing, missingness, or temporal leakage is suspected.
+- Mull over the candidate list repeatedly before finalization: merge redundant variables, reject weak proxies, test supported transformations, and rerun role diagnostics on the revised list.
 - Stop when new variables do not improve honest metrics, do not recur across folds, do not stabilize univariable screens, do not resolve temporal anchoring, and do not improve ITE stability.
 
 ## 6. Functional Form and ITEs

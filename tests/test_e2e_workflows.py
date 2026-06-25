@@ -127,7 +127,7 @@ def _make_config(
     }
 
     # Apply architecture overrides (all extractor prefixes + special flags)
-    extractor_prefixes = ('flp_', 'hlm_', 'hcnn_', 'hgru_', 'scnn_')
+    extractor_prefixes = ('flp_', 'hlm_', 'htr_', 'hcnn_', 'hgru_', 'scnn_')
     special_arch_keys = ('feature_extractor_type',)
     for k in list(overrides.keys()):
         if any(k.startswith(p) for p in extractor_prefixes) or k in special_arch_keys:

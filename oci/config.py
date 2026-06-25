@@ -738,6 +738,48 @@ class NonNeuralAgenticForestConfig:
                 ) from exc
 
 
+@dataclass
+class DragonNetDRLearnerConfig:
+    """Configuration for a DragonNet nuisance stage plus DR pseudo-outcome learner."""
+
+    nuisance_folds: int = 5
+    effect_folds: int = 5
+    nuisance_epochs: Optional[int] = None
+    effect_epochs: Optional[int] = None
+    nuisance_calibration: str = "temperature_isotonic"
+    e_clip: float = 0.01
+    effect_loss: str = "huber"
+    huber_beta: float = 0.05
+    attention_top_k_chunks: int = 5
+
+    def __post_init__(self):
+        if self.nuisance_folds < 2:
+            raise ValueError("dragonnet_drlearner.nuisance_folds must be >= 2")
+        if self.effect_folds < 2:
+            raise ValueError("dragonnet_drlearner.effect_folds must be >= 2")
+        if self.nuisance_epochs is not None and self.nuisance_epochs < 1:
+            raise ValueError("dragonnet_drlearner.nuisance_epochs must be >= 1 when set")
+        if self.effect_epochs is not None and self.effect_epochs < 1:
+            raise ValueError("dragonnet_drlearner.effect_epochs must be >= 1 when set")
+        nuisance_calibration = str(self.nuisance_calibration).strip().lower()
+        if nuisance_calibration not in {"none", "temperature", "isotonic", "temperature_isotonic"}:
+            raise ValueError(
+                "dragonnet_drlearner.nuisance_calibration must be one of "
+                "'none', 'temperature', 'isotonic', or 'temperature_isotonic'"
+            )
+        self.nuisance_calibration = nuisance_calibration
+        if not 0.0 < float(self.e_clip) < 0.5:
+            raise ValueError("dragonnet_drlearner.e_clip must be in (0, 0.5)")
+        effect_loss = str(self.effect_loss).strip().lower()
+        if effect_loss not in {"huber", "mse"}:
+            raise ValueError("dragonnet_drlearner.effect_loss must be 'huber' or 'mse'")
+        self.effect_loss = effect_loss
+        if float(self.huber_beta) <= 0.0:
+            raise ValueError("dragonnet_drlearner.huber_beta must be > 0")
+        if self.attention_top_k_chunks < 1:
+            raise ValueError("dragonnet_drlearner.attention_top_k_chunks must be >= 1")
+
+
 EXTRACTOR_ALIASES = {
     "frozen_llm_pooler": {"frozen_llm_pooler", "frozen_llm", "llm_pooler", "llm_pool", "flp"},
     "hierarchical_llm": {"hierarchical_llm", "hier_llm", "hlm"},
@@ -910,11 +952,12 @@ class AgenticAttentionVariableForestConfig:
             "joint_rlearner",
             "interaction_outcome",
             "tarnet_offset",
+            "dragonnet_dr",
         }:
             raise ValueError(
                 "agentic_attention_variable_forest.neural_stage_mode must be "
                 "one of 'staged', 'joint_rlearner', 'interaction_outcome', "
-                "or 'tarnet_offset'"
+                "'tarnet_offset', or 'dragonnet_dr'"
             )
         self.neural_stage_mode = neural_stage_mode
         self.joint_rlearner_gamma = float(self.joint_rlearner_gamma)
@@ -1072,7 +1115,7 @@ def normalize_feature_extractor_type(feature_type: str) -> str:
 @dataclass
 class ModelArchitectureConfig:
     """Configuration for model architecture."""
-    model_type: str = "dragonnet"  # "dragonnet", "rlearner", "causal_forest", "tfidf_forest", "explicit_feature_forest", "agentic_explicit_feature_forest", "agentic_attention_variable_forest", or "non_neural_agentic_forest"
+    model_type: str = "dragonnet"  # "dragonnet", "dragonnet_drlearner", "rlearner", "causal_forest", "tfidf_forest", "explicit_feature_forest", "agentic_explicit_feature_forest", "agentic_attention_variable_forest", or "non_neural_agentic_forest"
 
     # Feature extractor type: "frozen_llm_pooler"
     feature_extractor_type: str = "frozen_llm_pooler"
@@ -1111,7 +1154,7 @@ class ModelArchitectureConfig:
     # Historical hierarchical transformer extractor, revived as short chunks.
     # Used by model_type="agentic_attention_variable_forest" by default.
     htr_sentence_model: str = "prajjwal1/bert-tiny"
-    htr_freeze_sentence_encoder: bool = True
+    htr_freeze_sentence_encoder: bool = False
     htr_chunk_size_words: int = 96
     htr_chunk_overlap_words: int = 24
     htr_max_chunks: int = 128
@@ -1226,6 +1269,11 @@ class ModelArchitectureConfig:
         default_factory=AgenticAttentionVariableForestConfig
     )
 
+    # DragonNet nuisance model + independent DR pseudo-outcome effect learner
+    dragonnet_drlearner: DragonNetDRLearnerConfig = field(
+        default_factory=DragonNetDRLearnerConfig
+    )
+
     # Non-neural BoW-guided variable discovery + explicit-feature causal forest
     non_neural_agentic_forest: NonNeuralAgenticForestConfig = field(
         default_factory=NonNeuralAgenticForestConfig
@@ -1241,6 +1289,7 @@ class TrainingConfig:
     epochs: int = 50
     batch_size: int = 8
     effect_batch_size: Optional[int] = 32
+    dataloader_workers: Optional[int] = None  # None = 0 on CPU, 2 on accelerator devices
     alpha_propensity: float = 1.0
     beta_targreg: float = 0.1
     gamma_rlearner: float = 1.0  # Weight for R-learner loss (when model_type="rlearner")
@@ -1402,6 +1451,13 @@ class ExperimentConfig:
                     avf_data.pop('inner_fold_parallelism', None)
                 arch_data['agentic_attention_variable_forest'] = (
                     AgenticAttentionVariableForestConfig(**avf_data)
+                )
+            if (
+                'dragonnet_drlearner' in arch_data
+                and isinstance(arch_data['dragonnet_drlearner'], dict)
+            ):
+                arch_data['dragonnet_drlearner'] = DragonNetDRLearnerConfig(
+                    **arch_data['dragonnet_drlearner']
                 )
             if (
                 'non_neural_agentic_forest' in arch_data
