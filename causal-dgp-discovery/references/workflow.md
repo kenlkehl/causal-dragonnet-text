@@ -166,4 +166,6 @@ Do not assume the final DGP is linear. Compare:
 - interactions suggested by R-loss or pseudo-outcomes
 - simple parametric summaries only as a compact explanation
 
+After the final confounder and effect-modifier set is settled, fit an honest causal forest as the required final ITE estimator. Use the repository's explicit-feature causal forest path when available, or an installed causal-forest implementation such as `econml.dml.CausalForestDML`. A generic random forest, ExtraTrees, XGBoost model, or R-/S-/T-/X-learner final-stage regressor is not a causal forest and must not be presented as the final causal-forest ITE estimate, though it may be included as a sensitivity diagnostic. If no real causal forest can be run, report the blocker and do not mark final ITE estimation complete.
+
 For every patient, produce counterfactual outcome estimates and ITEs only from models that did not train on that row, or from a final model whose selection was completed using nested honest folds and whose report clearly states the refit convention.

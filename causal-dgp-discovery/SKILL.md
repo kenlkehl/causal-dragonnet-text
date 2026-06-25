@@ -25,6 +25,7 @@ Use this skill to investigate a synthetic patient-level causal inference dataset
 - Keep all model assessment honest: every nuisance prediction, residual, pseudo-outcome, effect estimate, and ITE used for selection or reporting must be out-of-fold for that row.
 - Separate confounder discovery from effect-modifier discovery.
 - Seek parsimonious final feature lists. Before passing variables to the causal forest, inspect feature-feature correlations, missingness overlap, treatment/outcome associations, plausible transformations among confounders, and redundant proxy variables; prefer the smallest evidence-supported set that preserves nuisance, heterogeneity, and ITE stability.
+- After settling on final confounders and effect modifiers, fit a real honest causal forest as the final ITE estimator. R-learners, S/T/X-learners, generic `RandomForestRegressor`/ExtraTrees/XGBoost effect models, or other meta-learners may be used as diagnostics or sensitivity checks, but they do not satisfy the final causal-forest requirement. If no causal-forest implementation is available, use the repo-native explicit-feature forest path or an installed causal-forest library such as `econml`'s `CausalForestDML`; if neither can be made to run, stop and report the blocker rather than emitting complete final ITE artifacts.
 - Evaluate candidate confounders and functional relationships among confounders within internal training folds for association with both treatment and outcome, with effect magnitude and fold stability emphasized at least as much as p value.
 - Evaluate candidate effect modifiers for differential association with outcome by treatment, using treatment-by-feature interactions, treatment-stratified outcome associations, R-loss, or pseudo-outcome evidence.
 - Do not assume a linear parametric DGP. Fit simple equations only as interpretable summaries after flexible/honest evidence supports them.
@@ -74,7 +75,7 @@ Use this skill to investigate a synthetic patient-level causal inference dataset
 9. Expand candidate extraction only when current candidates leave unexplained treatment assignment, outcome prediction, residual structure, heterogeneous effect signal, or unresolved baseline temporal anchoring.
 10. Repeatedly mull over the candidate feature list before finalizing: revise roles, merge redundant variables, reject weak proxies, and compare the revised list against prior iterations.
 11. Compare candidate DGP forms, including nonparametric/tree/forest models and interpretable summaries. Avoid finalizing after one plausible pass.
-12. Estimate ITEs using the best honest DGP and compare them with an honest causal forest using the same cross-fitting discipline.
+12. Estimate final ITEs with an honest causal forest fit on the finalized confounders and effect modifiers, using the same cross-fitting discipline. Other honest DGP, R-learner, or meta-learner estimates may be reported only as sensitivity analyses or comparisons, not as a replacement for the final causal-forest ITEs.
 13. Stop when additional iterations do not improve holdout nuisance metrics, R-loss/pseudo-outcome metrics, fold recurrence, univariable-screen stability, parsimony, or ITE stability. Document remaining uncertainty.
 
 ## References

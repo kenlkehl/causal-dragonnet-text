@@ -158,7 +158,7 @@ Before passing final variables to the causal forest:
 
 ## Explicit-Feature Causal Forest
 
-Use the explicit feature forest to compare final extracted DGP variables against model-based ITEs.
+After the final extracted confounder and effect-modifier roles are settled, use the explicit feature forest as the required final ITE estimator when the repo-native path is available. Model-based ITEs from R-learners, generic random forests, or other meta-learners may be retained as sensitivity comparisons, but they do not replace the causal-forest fit.
 
 Configuration guidance:
 - `architecture.explicit_feature_forest.honest = true`
@@ -166,7 +166,7 @@ Configuration guidance:
 - effect-modifier-role features become `X`
 - use nested or outer folds for all reported metrics
 
-Do not treat causal forest ITEs as ground truth. Use them as a stability and heterogeneity check against the inferred DGP.
+Do not treat causal forest ITEs as ground truth. They are the required final estimator for reported ITEs, and should also be interpreted as a stability and heterogeneity check against the inferred DGP. If the repo-native explicit feature forest is unavailable, use an equivalent honest causal-forest implementation such as `econml.dml.CausalForestDML`; if no real causal forest can be made to run, stop and report the blocker rather than presenting final ITE artifacts as complete.
 
 ## Minimal Config Pattern
 

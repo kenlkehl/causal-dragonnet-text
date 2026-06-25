@@ -81,7 +81,10 @@ Store final patient-level effects:
 - `ite`
 - fold/model provenance
 - missingness reason if ITE is unavailable
-- optional causal-forest ITE for comparison
+- causal-forest implementation/provenance, because final ITEs must come from a real honest causal forest after final confounders and effect modifiers are settled
+- optional non-causal-forest sensitivity estimates, clearly named as such
+
+Do not name a column `causal_forest_*` unless it was produced by a real causal forest implementation, such as the repository's explicit-feature forest path, `econml.dml.CausalForestDML`, or an equivalent honest causal forest. A generic random-forest regressor used inside an R-learner or other meta-learner is not a causal forest.
 
 ## `model_comparison.json` or `.csv`
 
@@ -93,4 +96,4 @@ Store iteration/model diagnostics:
 - fold recurrence of candidate concepts
 - parsimony/redundancy review summary
 - ITE distribution and fold-to-fold correlation
-- causal forest comparison metrics
+- required final causal-forest metrics and any clearly labeled non-causal-forest sensitivity comparisons
