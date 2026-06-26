@@ -73,12 +73,45 @@ class RLearnerNet(nn.Module):
         # Dropout for outcome/effect heads
         self.outcome_dropout = nn.Dropout(dropout)
 
-    def forward(self, features: torch.Tensor):
+    @staticmethod
+    def _role_feature(features, role: str) -> torch.Tensor:
+        if not isinstance(features, dict):
+            return features
+        if role == "w":
+            return features.get("w_features", features.get("features"))
+        if role == "x":
+            return features.get("x_features", features.get("features"))
+        return features.get("features")
+
+    def _shared_representation(self, features: torch.Tensor) -> torch.Tensor:
+        h = F.relu(self.representation_fc1(features))
+        h = self.rep_dropout(h)
+        phi = F.elu(self.representation_fc2(h))
+        phi = self.rep_dropout(phi)
+        return phi
+
+    def _nuisance_from_phi(self, phi: torch.Tensor):
+        w_hidden = F.relu(self.nuisance_fc(phi))
+        w_hidden = self.outcome_dropout(w_hidden)
+        t_logit = self.propensity_fc(w_hidden)
+        m_logit = self.outcome_fc(w_hidden)
+        return m_logit, t_logit, w_hidden
+
+    def _effect_from_phi(self, phi: torch.Tensor):
+        x_hidden = F.relu(self.effect_fc1(phi))
+        tau = self.outcome_dropout(x_hidden)
+        tau = F.elu(self.effect_fc2(tau))
+        tau = self.outcome_dropout(tau)
+        tau_out = self.effect_fc3(tau)
+        return tau_out, x_hidden
+
+    def forward(self, features):
         """
         Forward pass through R-Learner network.
 
         Args:
-            features: Output from feature extractor, shape (batch, input_dim)
+            features: Output from feature extractor, shape (batch, input_dim), or
+                a role-feature dict with ``w_features`` and ``x_features``.
 
         Returns:
             m_logit: Marginal outcome logit E[Y|X], shape (batch, 1)
@@ -86,60 +119,38 @@ class RLearnerNet(nn.Module):
             t_logit: Propensity logit, shape (batch, 1)
             phi: Shared representation, shape (batch, representation_dim)
         """
-        # Shared representation
-        h = F.relu(self.representation_fc1(features))
-        h = self.rep_dropout(h)
-        phi = F.elu(self.representation_fc2(h))
-        phi = self.rep_dropout(phi)
-
-        # Nuisance branch: W is the common hidden state for propensity/outcome.
-        w_hidden = F.relu(self.nuisance_fc(phi))
-        w_hidden = self.outcome_dropout(w_hidden)
-        t_logit = self.propensity_fc(w_hidden)
-        m_logit = self.outcome_fc(w_hidden)
-
-        # Treatment effect head (no final activation - τ can be negative)
-        x_hidden = F.relu(self.effect_fc1(phi))
-        tau = self.outcome_dropout(x_hidden)
-        tau = F.elu(self.effect_fc2(tau))
-        tau = self.outcome_dropout(tau)
-        tau_out = self.effect_fc3(tau)
-
+        w_features = self._role_feature(features, "w")
+        x_features = self._role_feature(features, "x")
+        phi_w = self._shared_representation(w_features)
+        phi_x = self._shared_representation(x_features)
+        m_logit, t_logit, _ = self._nuisance_from_phi(phi_w)
+        tau_out, _ = self._effect_from_phi(phi_x)
+        phi = 0.5 * (phi_w + phi_x)
         return m_logit, tau_out, t_logit, phi
 
-    def forward_with_activations(self, features: torch.Tensor):
+    def forward_with_activations(self, features):
         """Forward pass returning role-specific W/X branch activations."""
-        h = F.relu(self.representation_fc1(features))
-        h = self.rep_dropout(h)
-        phi = F.elu(self.representation_fc2(h))
-        phi = self.rep_dropout(phi)
-
-        w_hidden = F.relu(self.nuisance_fc(phi))
-        w_hidden = self.outcome_dropout(w_hidden)
-        t_logit = self.propensity_fc(w_hidden)
-        m_logit = self.outcome_fc(w_hidden)
-
-        x_hidden = F.relu(self.effect_fc1(phi))
-        tau = self.outcome_dropout(x_hidden)
-        tau = F.elu(self.effect_fc2(tau))
-        tau = self.outcome_dropout(tau)
-        tau_out = self.effect_fc3(tau)
-
+        w_features = self._role_feature(features, "w")
+        x_features = self._role_feature(features, "x")
+        phi_w = self._shared_representation(w_features)
+        phi_x = self._shared_representation(x_features)
+        m_logit, t_logit, w_hidden = self._nuisance_from_phi(phi_w)
+        tau_out, x_hidden = self._effect_from_phi(phi_x)
+        phi = 0.5 * (phi_w + phi_x)
         return m_logit, tau_out, t_logit, phi, w_hidden, x_hidden
 
     def get_representation(self, features):
         """Compute shared representation from input features."""
-        h = F.relu(self.representation_fc1(features))
-        h = self.rep_dropout(h)
-        phi = F.elu(self.representation_fc2(h))
-        phi = self.rep_dropout(phi)
-        return phi
+        return self._shared_representation(self._role_feature(features, "w"))
 
     def propensity_from_representation(self, phi):
         """Compute propensity logit from shared representation."""
-        w_hidden = F.relu(self.nuisance_fc(phi))
-        w_hidden = self.outcome_dropout(w_hidden)
-        return self.propensity_fc(w_hidden)
+        _, t_logit, _ = self._nuisance_from_phi(phi)
+        return t_logit
+
+    def propensity_from_features(self, features):
+        """Compute propensity logit directly from raw or role-specific features."""
+        return self.propensity_from_representation(self.get_representation(features))
 
 
 class RoleGatedSlotRLearner(nn.Module):

@@ -853,6 +853,9 @@ def _train_single_model(
         htr_sentence_pooling=getattr(arch_config, 'htr_sentence_pooling', 'auto'),
         htr_normalize_sentence_embeddings=getattr(arch_config, 'htr_normalize_sentence_embeddings', True),
         htr_trainable_sentence_encoder_layers=getattr(arch_config, 'htr_trainable_sentence_encoder_layers', 0),
+        htr_role_attention=getattr(arch_config, 'htr_role_attention', False),
+        htr_w_attention_heads=getattr(arch_config, 'htr_w_attention_heads', 1),
+        htr_x_attention_heads=getattr(arch_config, 'htr_x_attention_heads', 1),
         # Hierarchical CNN args
         hcnn_embedding_dim=getattr(arch_config, 'hcnn_embedding_dim', 256),
         hcnn_conv_dim=getattr(arch_config, 'hcnn_conv_dim', 256),

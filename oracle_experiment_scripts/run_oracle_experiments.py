@@ -222,6 +222,28 @@ class ExperimentConfig:
     hlm_freeze_llm: bool = True
     hlm_chat_template_prompt: Optional[str] = None
 
+    # Hierarchical Transformer hyperparameters
+    htr_sentence_model: str = "prajjwal1/bert-tiny"
+    htr_freeze_sentence_encoder: bool = False
+    htr_chunk_size_words: int = 128
+    htr_chunk_overlap_words: int = 32
+    htr_max_chunks: int = 256
+    htr_max_chunk_length: int = 192
+    htr_num_layers: int = 2
+    htr_num_heads: int = 4
+    htr_transformer_dim: int = 256
+    htr_projection_dim: int = 128
+    htr_hash_embedding_dim: int = 256
+    htr_sentence_encoder_batch_size: int = 64
+    htr_sentence_encoder_backend: str = "transformers"
+    htr_sentence_pooling: str = "token_attention"
+    htr_normalize_sentence_embeddings: bool = True
+    htr_trainable_sentence_encoder_layers: int = 0
+    htr_dropout: float = 0.1
+    htr_role_attention: bool = False
+    htr_w_attention_heads: int = 1
+    htr_x_attention_heads: int = 1
+
     # Hierarchical CNN hyperparameters
     hcnn_embedding_dim: int = 256
     hcnn_conv_dim: int = 256
@@ -319,6 +341,7 @@ class ExperimentConfig:
     _EXTRACTOR_PREFIXES = {
         "frozen_llm_pooler": {"flp_"},
         "hierarchical_llm": {"hlm_"},
+        "hierarchical_transformer": {"htr_"},
         "hierarchical_cnn": {"hcnn_"},
         "hierarchical_gru": {"hgru_"},
         "simple_cnn": {"scnn_"},
@@ -912,7 +935,11 @@ def _create_datasets_and_loaders(
         dl_kwargs = dict(num_workers=0)
     elif use_cache:
         dl_kwargs = dict(num_workers=2, persistent_workers=True, pin_memory=True)
-    elif feature_extractor_type in {"simple_cnn", "hierarchical_cnn"}:
+    elif feature_extractor_type in {
+        "simple_cnn",
+        "hierarchical_cnn",
+        "hierarchical_transformer",
+    }:
         dl_kwargs = dict(num_workers=0)
     else:
         # Live FLP mode: prefetch batches to keep GPU fed during LLM forward passes
@@ -1063,6 +1090,29 @@ def _common_model_kwargs(config, gpu_store, hidden_state_cache, confounder_specs
         elif hidden_state_cache is not None:
             kwargs['hlm_skip_llm'] = True
             kwargs['hlm_cached_hidden_size'] = hidden_state_cache.hidden_size
+    elif ext_type == "hierarchical_transformer":
+        kwargs.update(
+            htr_sentence_model=config.htr_sentence_model,
+            htr_freeze_sentence_encoder=config.htr_freeze_sentence_encoder,
+            htr_chunk_size_words=config.htr_chunk_size_words,
+            htr_chunk_overlap_words=config.htr_chunk_overlap_words,
+            htr_max_chunks=config.htr_max_chunks,
+            htr_max_chunk_length=config.htr_max_chunk_length,
+            htr_num_layers=config.htr_num_layers,
+            htr_num_heads=config.htr_num_heads,
+            htr_transformer_dim=config.htr_transformer_dim,
+            htr_dropout=config.htr_dropout,
+            htr_projection_dim=config.htr_projection_dim,
+            htr_hash_embedding_dim=config.htr_hash_embedding_dim,
+            htr_sentence_encoder_batch_size=config.htr_sentence_encoder_batch_size,
+            htr_sentence_encoder_backend=config.htr_sentence_encoder_backend,
+            htr_sentence_pooling=config.htr_sentence_pooling,
+            htr_normalize_sentence_embeddings=config.htr_normalize_sentence_embeddings,
+            htr_trainable_sentence_encoder_layers=config.htr_trainable_sentence_encoder_layers,
+            htr_role_attention=config.htr_role_attention,
+            htr_w_attention_heads=config.htr_w_attention_heads,
+            htr_x_attention_heads=config.htr_x_attention_heads,
+        )
     elif ext_type == "hierarchical_cnn":
         kwargs.update(
             hcnn_embedding_dim=config.hcnn_embedding_dim,

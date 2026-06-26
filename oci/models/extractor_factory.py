@@ -63,6 +63,9 @@ def create_feature_extractor(
     htr_sentence_pooling: str = "auto",
     htr_normalize_sentence_embeddings: bool = True,
     htr_trainable_sentence_encoder_layers: int = 0,
+    htr_role_attention: bool = False,
+    htr_w_attention_heads: int = 1,
+    htr_x_attention_heads: int = 1,
     # Hierarchical CNN args
     hcnn_embedding_dim: int = 256,
     hcnn_conv_dim: int = 256,
@@ -231,11 +234,15 @@ def create_feature_extractor(
             sentence_pooling=htr_sentence_pooling,
             normalize_sentence_embeddings=htr_normalize_sentence_embeddings,
             trainable_sentence_encoder_layers=htr_trainable_sentence_encoder_layers,
+            role_attention=htr_role_attention,
+            w_attention_heads=htr_w_attention_heads,
+            x_attention_heads=htr_x_attention_heads,
             device=device,
         )
         logger.info(
             "Created Hierarchical Transformer extractor: model=%s, chunks=%d/%d/%d, "
-            "projection_dim=%d, sentence_encoder_batch_size=%d, backend=%s",
+            "projection_dim=%d, sentence_encoder_batch_size=%d, backend=%s, "
+            "role_attention=%s W_heads=%d X_heads=%d",
             htr_sentence_model,
             htr_chunk_size_words,
             htr_chunk_overlap_words,
@@ -243,6 +250,9 @@ def create_feature_extractor(
             htr_projection_dim,
             htr_sentence_encoder_batch_size,
             htr_sentence_encoder_backend,
+            htr_role_attention,
+            htr_w_attention_heads,
+            htr_x_attention_heads,
         )
         return extractor
 
@@ -482,6 +492,9 @@ def create_feature_extractor_from_config(
             'htr_trainable_sentence_encoder_layers',
             0,
         ),
+        htr_role_attention=config.get('htr_role_attention', False),
+        htr_w_attention_heads=config.get('htr_w_attention_heads', 1),
+        htr_x_attention_heads=config.get('htr_x_attention_heads', 1),
         # Hierarchical CNN args
         hcnn_embedding_dim=config.get('hcnn_embedding_dim', 256),
         hcnn_conv_dim=config.get('hcnn_conv_dim', 256),

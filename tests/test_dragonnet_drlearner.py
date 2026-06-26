@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import sys
 import torch
 import torch.nn as nn
 
@@ -84,6 +85,9 @@ def test_causal_text_passes_htr_kwargs(monkeypatch):
         htr_num_heads=1,
         htr_transformer_dim=8,
         htr_hash_embedding_dim=8,
+        htr_role_attention=True,
+        htr_w_attention_heads=2,
+        htr_x_attention_heads=3,
         causal_head_representation_dim=8,
         causal_head_hidden_outcome_dim=4,
         device="cpu",
@@ -92,6 +96,96 @@ def test_causal_text_passes_htr_kwargs(monkeypatch):
     assert captured["htr_sentence_model"] == "hash"
     assert captured["htr_projection_dim"] == 7
     assert captured["htr_num_layers"] == 1
+    assert captured["htr_role_attention"] is True
+    assert captured["htr_w_attention_heads"] == 2
+    assert captured["htr_x_attention_heads"] == 3
+
+
+def test_direct_rlearner_trains_with_htr_role_attention():
+    from oci.models.causal_text import CausalText
+
+    model = CausalText(
+        model_type="rlearner",
+        feature_extractor_type="hierarchical_transformer",
+        htr_sentence_model="hash",
+        htr_role_attention=True,
+        htr_w_attention_heads=2,
+        htr_x_attention_heads=1,
+        htr_chunk_size_words=4,
+        htr_chunk_overlap_words=0,
+        htr_max_chunks=3,
+        htr_num_layers=1,
+        htr_num_heads=2,
+        htr_transformer_dim=8,
+        htr_projection_dim=6,
+        htr_hash_embedding_dim=8,
+        htr_dropout=0.0,
+        causal_head_representation_dim=8,
+        causal_head_hidden_outcome_dim=4,
+        causal_head_dropout=0.0,
+        device="cpu",
+    )
+    batch = {
+        "texts": [
+            "alpha beta gamma delta epsilon",
+            "one two three four five",
+            "patient improves after treatment",
+        ],
+        "treatment": torch.tensor([1.0, 0.0, 1.0]),
+        "outcome": torch.tensor([1.0, 0.0, 1.0]),
+    }
+
+    losses = model.train_step(batch, gamma_rlearner=1.0, stop_grad_propensity=True)
+    assert losses["loss"].ndim == 0
+    assert losses["tau"].shape == (3, 1)
+
+    predictions = model.predict(batch["texts"])
+    assert predictions["tau_pred"].shape == (3,)
+    assert model.feature_extractor.has_role_features is True
+    assert model.feature_extractor._w_chunk_pooling.num_heads == 2
+    assert model.feature_extractor._x_chunk_pooling.num_heads == 1
+
+
+def test_htr_role_attention_oneoff_defaults_are_not_tiny(monkeypatch):
+    from oracle_experiment_scripts.run_one_off_htr_role_attention_rlearner import (
+        _effective_word_capacity,
+        build_config,
+        parse_args,
+    )
+    from oracle_experiment_scripts.run_oracle_experiments import _common_model_kwargs
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_one_off_htr_role_attention_rlearner.py",
+            "--dataset",
+            "/tmp/example_oracle_dataset",
+            "--device",
+            "cpu",
+            "--dry-run",
+        ],
+    )
+    args = parse_args()
+    config = build_config(args)
+    kwargs = _common_model_kwargs(config, None, None, None, torch.device("cpu"))
+
+    assert config.feature_extractor_type == "hierarchical_transformer"
+    assert config.model_type == "rlearner"
+    assert config.htr_role_attention is True
+    assert config.htr_w_attention_heads == 4
+    assert config.htr_x_attention_heads == 4
+    assert config.htr_max_chunks == 256
+    assert config.htr_chunk_size_words == 128
+    assert config.htr_max_chunk_length == 192
+    assert _effective_word_capacity(
+        config.htr_chunk_size_words,
+        config.htr_chunk_overlap_words,
+        config.htr_max_chunks,
+    ) >= 20000
+    assert kwargs["htr_role_attention"] is True
+    assert kwargs["htr_w_attention_heads"] == 4
+    assert kwargs["htr_x_attention_heads"] == 4
 
 
 def test_applied_route_dispatches_dragonnet_drlearner(monkeypatch, tmp_path):

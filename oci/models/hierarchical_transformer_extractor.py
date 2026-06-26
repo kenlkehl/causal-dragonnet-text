@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .gated_attention_pooling import GatedAttentionPooling
+from .gated_attention_pooling import GatedAttentionPooling, MultiHeadGatedAttentionPooling
 
 logger = logging.getLogger(__name__)
 _TRANSFORMERS_ENCODER_INIT_LOCK = threading.Lock()
@@ -279,6 +279,9 @@ class HierarchicalTransformerExtractor(nn.Module):
         sentence_pooling: str = "auto",
         normalize_sentence_embeddings: bool = True,
         trainable_sentence_encoder_layers: int = 0,
+        role_attention: bool = False,
+        w_attention_heads: int = 1,
+        x_attention_heads: int = 1,
         device: Optional[torch.device] = None,
     ):
         super().__init__()
@@ -318,11 +321,18 @@ class HierarchicalTransformerExtractor(nn.Module):
             )
         if trainable_sentence_encoder_layers < 0:
             raise ValueError("trainable_sentence_encoder_layers must be >= 0")
+        if w_attention_heads < 1:
+            raise ValueError("w_attention_heads must be >= 1")
+        if x_attention_heads < 1:
+            raise ValueError("x_attention_heads must be >= 1")
         self._sentence_encoder_batch_size = int(sentence_encoder_batch_size)
         self._sentence_encoder_backend = sentence_encoder_backend
         self._sentence_pooling = sentence_pooling
         self._normalize_sentence_embeddings = bool(normalize_sentence_embeddings)
         self._trainable_sentence_encoder_layers = int(trainable_sentence_encoder_layers)
+        self._role_attention = bool(role_attention)
+        self._w_attention_heads = int(w_attention_heads)
+        self._x_attention_heads = int(x_attention_heads)
         self._encoder_has_trainable_params = False
         self._hash_backend = str(sentence_encoder_model).lower() in {
             "hash",
@@ -337,6 +347,10 @@ class HierarchicalTransformerExtractor(nn.Module):
         self._sentence_encoder = None
         self._sentence_transformer_encoder = None
         self._token_pooling: Optional[GatedAttentionPooling] = None
+        self._w_token_pooling: Optional[MultiHeadGatedAttentionPooling] = None
+        self._x_token_pooling: Optional[MultiHeadGatedAttentionPooling] = None
+        self._w_chunk_pooling: Optional[MultiHeadGatedAttentionPooling] = None
+        self._x_chunk_pooling: Optional[MultiHeadGatedAttentionPooling] = None
         self._resolved_sentence_encoder_path: Optional[str] = None
         self._sentence_dim = self._hash_embedding_dim if self._hash_backend else None
         self._encoder_initialized = self._hash_backend
@@ -381,16 +395,34 @@ class HierarchicalTransformerExtractor(nn.Module):
             nn.Linear(transformer_dim, projection_dim),
             nn.LayerNorm(projection_dim),
         )
+        if self._role_attention:
+            self._w_chunk_pooling = MultiHeadGatedAttentionPooling(
+                hidden_dim=transformer_dim,
+                attention_dim=transformer_dim,
+                num_heads=self._w_attention_heads,
+            )
+            self._x_chunk_pooling = MultiHeadGatedAttentionPooling(
+                hidden_dim=transformer_dim,
+                attention_dim=transformer_dim,
+                num_heads=self._x_attention_heads,
+            )
         self._last_chunks: List[List[str]] = []
         self._last_chunk_weights: Optional[torch.Tensor] = None
+        self._last_role_chunk_weights: Dict[str, torch.Tensor] = {}
         self._last_token_weights_by_chunk: List[torch.Tensor] = []
+        self._last_role_token_weights_by_chunk: Dict[str, List[torch.Tensor]] = {}
         self._capture_token_attention = False
         self._token_weight_capture_buffer: List[torch.Tensor] = []
+        self._role_token_weight_capture_buffer: Dict[str, List[torch.Tensor]] = {}
         self.to(self._device)
 
     @property
     def output_dim(self) -> int:
         return self._projection_dim
+
+    @property
+    def has_role_features(self) -> bool:
+        return self._role_attention
 
     @staticmethod
     def _make_positional_encoding(max_len: int, d_model: int) -> torch.Tensor:
@@ -751,6 +783,20 @@ class HierarchicalTransformerExtractor(nn.Module):
             return
         if self._sentence_dim is None:
             raise RuntimeError("token_attention pooling requires an initialized encoder")
+        if self._role_attention:
+            if self._w_token_pooling is None:
+                self._w_token_pooling = MultiHeadGatedAttentionPooling(
+                    hidden_dim=int(self._sentence_dim),
+                    attention_dim=int(self._transformer_dim),
+                    num_heads=self._w_attention_heads,
+                ).to(self._device)
+            if self._x_token_pooling is None:
+                self._x_token_pooling = MultiHeadGatedAttentionPooling(
+                    hidden_dim=int(self._sentence_dim),
+                    attention_dim=int(self._transformer_dim),
+                    num_heads=self._x_attention_heads,
+                ).to(self._device)
+            return
         if self._token_pooling is None:
             self._token_pooling = GatedAttentionPooling(
                 hidden_dim=int(self._sentence_dim),
@@ -847,8 +893,39 @@ class HierarchicalTransformerExtractor(nn.Module):
         self,
         last_hidden_state: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ):
         pooling = self._effective_sentence_pooling()
+        if self._role_attention and pooling == "token_attention":
+            self._ensure_token_pooling_initialized()
+            if self._w_token_pooling is None or self._x_token_pooling is None:
+                raise RuntimeError("role token_attention pooling was not initialized")
+            w_by_head, w_token_weights = self._w_token_pooling(
+                last_hidden_state,
+                attention_mask=attention_mask.to(last_hidden_state.dtype),
+            )
+            x_by_head, x_token_weights = self._x_token_pooling(
+                last_hidden_state,
+                attention_mask=attention_mask.to(last_hidden_state.dtype),
+            )
+            w_pooled = w_by_head.mean(dim=1)
+            x_pooled = x_by_head.mean(dim=1)
+            if self._normalize_sentence_embeddings:
+                w_pooled = F.normalize(w_pooled, p=2, dim=1)
+                x_pooled = F.normalize(x_pooled, p=2, dim=1)
+            shared = 0.5 * (w_pooled + x_pooled)
+            return (
+                {
+                    "features": shared,
+                    "w_features": w_pooled,
+                    "x_features": x_pooled,
+                },
+                {
+                    "w": w_token_weights.mean(dim=1),
+                    "x": x_token_weights.mean(dim=1),
+                    "w_heads": w_token_weights,
+                    "x_heads": x_token_weights,
+                },
+            )
         if pooling == "last":
             pooled = self._last_token_pool(last_hidden_state, attention_mask)
             token_weights = None
@@ -869,14 +946,35 @@ class HierarchicalTransformerExtractor(nn.Module):
             token_weights = None
         if self._normalize_sentence_embeddings:
             pooled = F.normalize(pooled, p=2, dim=1)
+        if self._role_attention:
+            return (
+                {
+                    "features": pooled,
+                    "w_features": pooled,
+                    "x_features": pooled,
+                },
+                None,
+            )
         return pooled, token_weights
 
     def _capture_token_weights(
         self,
-        token_weights: Optional[torch.Tensor],
+        token_weights,
         attention_mask: torch.Tensor,
     ) -> None:
         if not self._capture_token_attention or token_weights is None:
+            return
+        if isinstance(token_weights, dict):
+            mask_cpu = attention_mask.detach().cpu()
+            for role in ("w", "x"):
+                role_weights = token_weights.get(role)
+                if role_weights is None:
+                    continue
+                weights_cpu = role_weights.detach().cpu()
+                target = self._role_token_weight_capture_buffer.setdefault(role, [])
+                for row in range(weights_cpu.shape[0]):
+                    valid_len = int(mask_cpu[row].sum().item())
+                    target.append(weights_cpu[row, :valid_len].clone())
             return
         weights_cpu = token_weights.detach().cpu()
         mask_cpu = attention_mask.detach().cpu()
@@ -895,12 +993,24 @@ class HierarchicalTransformerExtractor(nn.Module):
         self._ensure_encoder_initialized()
         if self._hash_backend:
             embeddings = torch.stack([self._hash_chunk_embedding(chunk) for chunk in chunks])
+            if self._role_attention:
+                embeddings = {
+                    "features": embeddings,
+                    "w_features": embeddings,
+                    "x_features": embeddings,
+                }
             if return_attention_tensors:
                 return embeddings, None
             return embeddings
 
         if self._effective_sentence_encoder_backend() == "sentence_transformers":
             embeddings = self._encode_chunks_with_sentence_transformer(chunks)
+            if self._role_attention:
+                embeddings = {
+                    "features": embeddings,
+                    "w_features": embeddings,
+                    "x_features": embeddings,
+                }
             if return_attention_tensors:
                 return embeddings, None
             return embeddings
@@ -935,7 +1045,13 @@ class HierarchicalTransformerExtractor(nn.Module):
     ):
         chunk_list = list(chunks)
         outputs_by_batch = []
+        role_outputs_by_batch: Dict[str, List[torch.Tensor]] = {
+            "features": [],
+            "w_features": [],
+            "x_features": [],
+        }
         token_weights_by_batch: List[torch.Tensor] = []
+        role_token_weights_by_batch: Dict[str, List[torch.Tensor]] = {"w": [], "x": []}
         input_ids_by_batch: List[torch.Tensor] = []
         attention_mask_by_batch: List[torch.Tensor] = []
         offset_mapping_by_batch: List[torch.Tensor] = []
@@ -967,9 +1083,22 @@ class HierarchicalTransformerExtractor(nn.Module):
                 attention_mask,
             )
             self._capture_token_weights(token_weights, attention_mask)
-            outputs_by_batch.append(pooled.float())
+            if isinstance(pooled, dict):
+                for key, value in pooled.items():
+                    role_outputs_by_batch[key].append(value.float())
+            else:
+                outputs_by_batch.append(pooled.float())
             if return_attention_tensors:
-                if token_weights is not None:
+                if isinstance(token_weights, dict):
+                    for role in ("w", "x"):
+                        role_weights = token_weights.get(role)
+                        if role_weights is not None:
+                            role_token_weights_by_batch[role].append(role_weights)
+                    if token_weights.get("w") is not None and token_weights.get("x") is not None:
+                        token_weights_by_batch.append(
+                            0.5 * (token_weights["w"] + token_weights["x"])
+                        )
+                elif token_weights is not None:
                     token_weights_by_batch.append(token_weights)
                 input_ids_by_batch.append(input_ids)
                 attention_mask_by_batch.append(attention_mask)
@@ -983,7 +1112,14 @@ class HierarchicalTransformerExtractor(nn.Module):
                 else:
                     offset_mapping = offset_mapping.to(self._device)
                 offset_mapping_by_batch.append(offset_mapping)
-        embeddings = torch.cat(outputs_by_batch, dim=0)
+        if role_outputs_by_batch["features"]:
+            embeddings = {
+                key: torch.cat(value, dim=0)
+                for key, value in role_outputs_by_batch.items()
+                if value
+            }
+        else:
+            embeddings = torch.cat(outputs_by_batch, dim=0)
         if not return_attention_tensors:
             return embeddings
         token_info: Dict[str, Any] = {
@@ -993,6 +1129,14 @@ class HierarchicalTransformerExtractor(nn.Module):
                 else None
             ),
             "token_alpha_sources": token_weights_by_batch,
+            "role_token_alpha": {
+                role: (
+                    self._pad_and_cat_token_batches(values, pad_value=0.0)
+                    if values
+                    else None
+                )
+                for role, values in role_token_weights_by_batch.items()
+            },
             "input_ids": self._pad_and_cat_token_batches(input_ids_by_batch, pad_value=0),
             "attention_mask": self._pad_and_cat_token_batches(attention_mask_by_batch, pad_value=0),
             "offset_mapping": self._pad_and_cat_offset_batches(offset_mapping_by_batch),
@@ -1011,7 +1155,13 @@ class HierarchicalTransformerExtractor(nn.Module):
         if self._sentence_encoder is not None and not self._encoder_has_trainable_params:
             self._sentence_encoder.eval()
         outputs_by_batch = []
+        role_outputs_by_batch: Dict[str, List[torch.Tensor]] = {
+            "features": [],
+            "w_features": [],
+            "x_features": [],
+        }
         token_weights_by_batch: List[torch.Tensor] = []
+        role_token_weights_by_batch: Dict[str, List[torch.Tensor]] = {"w": [], "x": []}
         input_ids_by_batch: List[torch.Tensor] = []
         attention_mask_by_batch: List[torch.Tensor] = []
         for start in range(0, input_ids.shape[0], self._sentence_encoder_batch_size):
@@ -1034,13 +1184,33 @@ class HierarchicalTransformerExtractor(nn.Module):
                 batch_attention_mask,
             )
             self._capture_token_weights(token_weights, batch_attention_mask)
-            outputs_by_batch.append(pooled.float())
+            if isinstance(pooled, dict):
+                for key, value in pooled.items():
+                    role_outputs_by_batch[key].append(value.float())
+            else:
+                outputs_by_batch.append(pooled.float())
             if return_attention_tensors:
-                if token_weights is not None:
+                if isinstance(token_weights, dict):
+                    for role in ("w", "x"):
+                        role_weights = token_weights.get(role)
+                        if role_weights is not None:
+                            role_token_weights_by_batch[role].append(role_weights)
+                    if token_weights.get("w") is not None and token_weights.get("x") is not None:
+                        token_weights_by_batch.append(
+                            0.5 * (token_weights["w"] + token_weights["x"])
+                        )
+                elif token_weights is not None:
                     token_weights_by_batch.append(token_weights)
                 input_ids_by_batch.append(batch_input_ids)
                 attention_mask_by_batch.append(batch_attention_mask)
-        embeddings = torch.cat(outputs_by_batch, dim=0)
+        if role_outputs_by_batch["features"]:
+            embeddings = {
+                key: torch.cat(value, dim=0)
+                for key, value in role_outputs_by_batch.items()
+                if value
+            }
+        else:
+            embeddings = torch.cat(outputs_by_batch, dim=0)
         if not return_attention_tensors:
             return embeddings
         token_info: Dict[str, Any] = {
@@ -1050,6 +1220,14 @@ class HierarchicalTransformerExtractor(nn.Module):
                 else None
             ),
             "token_alpha_sources": token_weights_by_batch,
+            "role_token_alpha": {
+                role: (
+                    self._pad_and_cat_token_batches(values, pad_value=0.0)
+                    if values
+                    else None
+                )
+                for role, values in role_token_weights_by_batch.items()
+            },
             "input_ids": self._pad_and_cat_token_batches(input_ids_by_batch, pad_value=0),
             "attention_mask": self._pad_and_cat_token_batches(attention_mask_by_batch, pad_value=0),
             "offset_mapping": torch.full(
@@ -1208,7 +1386,134 @@ class HierarchicalTransformerExtractor(nn.Module):
     def prepare_batch(self, texts: Sequence[str]) -> Dict[str, Any]:
         return self.make_batch_preprocessor()(texts)
 
-    def forward(self, texts_or_batch, *, return_attention_tensors: bool = False):
+    def forward_role_features(self, texts_or_batch):
+        """Return shared, W-role, and X-role document features."""
+        if not self._role_attention:
+            features = self.forward(texts_or_batch)
+            return {
+                "features": features,
+                "w_features": features,
+                "x_features": features,
+            }
+        return self.forward(texts_or_batch, return_role_features=True)
+
+    def _pack_chunk_tensor(
+        self,
+        flat_embeddings: torch.Tensor,
+        batch_chunks: Sequence[Sequence[str]],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size = len(batch_chunks)
+        max_chunks = max(len(chunks) for chunks in batch_chunks)
+        chunk_tensor = torch.zeros(
+            batch_size,
+            max_chunks,
+            self._transformer_dim,
+            device=self._device,
+        )
+        chunk_mask = torch.zeros(batch_size, max_chunks, dtype=torch.bool, device=self._device)
+        offset = 0
+        for row, chunks in enumerate(batch_chunks):
+            count = len(chunks)
+            chunk_tensor[row, :count] = flat_embeddings[offset:offset + count]
+            chunk_mask[row, :count] = True
+            offset += count
+        return chunk_tensor, chunk_mask
+
+    def _run_chunk_transformer(
+        self,
+        chunk_tensor: torch.Tensor,
+        chunk_mask: torch.Tensor,
+        *,
+        return_attention_tensors: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        batch_size = chunk_tensor.shape[0]
+        pool = self._pool_token.to(self._device).expand(batch_size, 1, -1)
+        sequence = torch.cat([pool, chunk_tensor], dim=1)
+        sequence = sequence + self._positional_encoding[: sequence.shape[1]].to(self._device)
+        sequence_input = sequence
+        if return_attention_tensors and sequence_input.requires_grad:
+            sequence_input.retain_grad()
+
+        valid_mask = torch.cat(
+            [
+                torch.ones(batch_size, 1, dtype=torch.bool, device=self._device),
+                chunk_mask,
+            ],
+            dim=1,
+        )
+        key_padding_mask = ~valid_mask
+        attn_weights = None
+        for layer in self._transformer_layers:
+            sequence, attn_weights = layer(
+                sequence,
+                key_padding_mask=key_padding_mask,
+                return_attention=True,
+            )
+        return sequence, sequence_input, attn_weights
+
+    def _role_document_features(
+        self,
+        flat_embeddings_by_role: Dict[str, torch.Tensor],
+        batch_chunks: Sequence[Sequence[str]],
+        *,
+        return_attention_tensors: bool = False,
+    ):
+        if self._w_chunk_pooling is None or self._x_chunk_pooling is None:
+            raise RuntimeError("role chunk attention pooling was not initialized")
+
+        role_outputs: Dict[str, torch.Tensor] = {}
+        role_chunk_alpha: Dict[str, torch.Tensor] = {}
+        role_sequence_inputs: Dict[str, torch.Tensor] = {}
+        chunk_mask = None
+        for feature_key, role, pooling in (
+            ("w_features", "w", self._w_chunk_pooling),
+            ("x_features", "x", self._x_chunk_pooling),
+        ):
+            flat_embeddings = self._input_projection(flat_embeddings_by_role[feature_key])
+            chunk_tensor, chunk_mask = self._pack_chunk_tensor(flat_embeddings, batch_chunks)
+            sequence, sequence_input, _ = self._run_chunk_transformer(
+                chunk_tensor,
+                chunk_mask,
+                return_attention_tensors=return_attention_tensors,
+            )
+            chunk_context = sequence[:, 1: 1 + chunk_tensor.shape[1], :]
+            pooled_by_head, weights_by_head = pooling(
+                chunk_context,
+                attention_mask=chunk_mask,
+            )
+            role_hidden = pooled_by_head.mean(dim=1)
+            role_outputs[feature_key] = self._output_projection(role_hidden)
+            role_chunk_alpha[role] = weights_by_head.mean(dim=1)
+            role_sequence_inputs[role] = sequence_input
+
+        role_outputs["features"] = 0.5 * (
+            role_outputs["w_features"] + role_outputs["x_features"]
+        )
+        self._last_role_chunk_weights = {
+            role: weights.detach()
+            for role, weights in role_chunk_alpha.items()
+        }
+        self._last_chunk_weights = 0.5 * (
+            self._last_role_chunk_weights["w"] + self._last_role_chunk_weights["x"]
+        )
+        if not return_attention_tensors:
+            return role_outputs, chunk_mask, None
+        return (
+            role_outputs,
+            chunk_mask,
+            {
+                "role_chunk_alpha": role_chunk_alpha,
+                "role_sequence_input": role_sequence_inputs,
+            },
+        )
+
+    def forward(
+        self,
+        texts_or_batch,
+        *,
+        return_attention_tensors: bool = False,
+        return_role_features: bool = False,
+    ):
         prepared_batch = texts_or_batch if isinstance(texts_or_batch, dict) else None
         if prepared_batch is not None:
             texts = prepared_batch.get("texts")
@@ -1229,8 +1534,13 @@ class HierarchicalTransformerExtractor(nn.Module):
             batch_chunks = self._chunks_for_texts(texts)
         if not texts:
             features = torch.zeros(0, self._projection_dim, device=self._device)
+            output = (
+                {"features": features, "w_features": features, "x_features": features}
+                if return_role_features
+                else features
+            )
             if return_attention_tensors:
-                return features, {
+                return output, {
                     "token_alpha": None,
                     "chunk_alpha": None,
                     "input_ids": None,
@@ -1239,11 +1549,12 @@ class HierarchicalTransformerExtractor(nn.Module):
                     "token_alpha_sources": [],
                     "batch_chunks": [],
                 }
-            return features
+            return output
 
         flat_chunks = [chunk for chunks in batch_chunks for chunk in chunks]
         if self._capture_token_attention:
             self._token_weight_capture_buffer = []
+            self._role_token_weight_capture_buffer = {"w": [], "x": []}
         token_info = None
         if (
             prepared_batch is not None
@@ -1269,61 +1580,47 @@ class HierarchicalTransformerExtractor(nn.Module):
             flat_embeddings = encoded_chunks
         if self._capture_token_attention:
             self._last_token_weights_by_chunk = list(self._token_weight_capture_buffer)
+            self._last_role_token_weights_by_chunk = {
+                role: list(values)
+                for role, values in self._role_token_weight_capture_buffer.items()
+            }
         else:
             self._last_token_weights_by_chunk = []
-        flat_embeddings = self._input_projection(flat_embeddings)
+            self._last_role_token_weights_by_chunk = {}
 
-        batch_size = len(batch_chunks)
-        max_chunks = max(len(chunks) for chunks in batch_chunks)
-        chunk_tensor = torch.zeros(
-            batch_size,
-            max_chunks,
-            self._transformer_dim,
-            device=self._device,
-        )
-        chunk_mask = torch.zeros(batch_size, max_chunks, dtype=torch.bool, device=self._device)
-        offset = 0
-        for row, chunks in enumerate(batch_chunks):
-            count = len(chunks)
-            chunk_tensor[row, :count] = flat_embeddings[offset:offset + count]
-            chunk_mask[row, :count] = True
-            offset += count
-
-        pool = self._pool_token.to(self._device).expand(batch_size, 1, -1)
-        sequence = torch.cat([pool, chunk_tensor], dim=1)
-        sequence = sequence + self._positional_encoding[: sequence.shape[1]].to(self._device)
-        sequence_input = sequence
-        if return_attention_tensors and sequence_input.requires_grad:
-            sequence_input.retain_grad()
-
-        valid_mask = torch.cat(
-            [
-                torch.ones(batch_size, 1, dtype=torch.bool, device=self._device),
-                chunk_mask,
-            ],
-            dim=1,
-        )
-        key_padding_mask = ~valid_mask
-        attn_weights = None
-        for layer in self._transformer_layers:
-            sequence, attn_weights = layer(
-                sequence,
-                key_padding_mask=key_padding_mask,
-                return_attention=True,
+        if isinstance(flat_embeddings, dict):
+            role_outputs, chunk_mask, role_attention_info = self._role_document_features(
+                flat_embeddings,
+                batch_chunks,
+                return_attention_tensors=return_attention_tensors,
             )
-
-        pool_output = sequence[:, 0, :]
-        features = self._output_projection(pool_output)
-
-        if attn_weights is not None:
-            pool_attention = attn_weights[:, 0, 1: 1 + max_chunks]
-            pool_attention = pool_attention.masked_fill(~chunk_mask, 0.0)
-            denom = pool_attention.sum(dim=1, keepdim=True).clamp_min(1e-9)
-            chunk_alpha = pool_attention / denom
-            self._last_chunk_weights = chunk_alpha.detach()
+            features = role_outputs["features"]
+            chunk_alpha = self._last_chunk_weights
+            sequence_input = None
+            output = role_outputs if return_role_features else features
         else:
-            chunk_alpha = None
-            self._last_chunk_weights = None
+            flat_embeddings = self._input_projection(flat_embeddings)
+            chunk_tensor, chunk_mask = self._pack_chunk_tensor(flat_embeddings, batch_chunks)
+            sequence, sequence_input, attn_weights = self._run_chunk_transformer(
+                chunk_tensor,
+                chunk_mask,
+                return_attention_tensors=return_attention_tensors,
+            )
+            pool_output = sequence[:, 0, :]
+            features = self._output_projection(pool_output)
+
+            if attn_weights is not None:
+                pool_attention = attn_weights[:, 0, 1: 1 + chunk_tensor.shape[1]]
+                pool_attention = pool_attention.masked_fill(~chunk_mask, 0.0)
+                denom = pool_attention.sum(dim=1, keepdim=True).clamp_min(1e-9)
+                chunk_alpha = pool_attention / denom
+                self._last_chunk_weights = chunk_alpha.detach()
+            else:
+                chunk_alpha = None
+                self._last_chunk_weights = None
+            self._last_role_chunk_weights = {}
+            role_attention_info = None
+            output = features
         self._last_chunks = batch_chunks
         if return_attention_tensors:
             if token_info is None:
@@ -1342,34 +1639,64 @@ class HierarchicalTransformerExtractor(nn.Module):
                 token_alpha.retain_grad()
             if chunk_alpha is not None and chunk_alpha.requires_grad:
                 chunk_alpha.retain_grad()
-            return features, {
+            role_token_alpha = token_info.get("role_token_alpha", {})
+            for role_alpha in role_token_alpha.values():
+                if role_alpha is not None and role_alpha.requires_grad:
+                    role_alpha.retain_grad()
+            if role_attention_info is not None:
+                for role_alpha in role_attention_info.get("role_chunk_alpha", {}).values():
+                    if role_alpha is not None and role_alpha.requires_grad:
+                        role_alpha.retain_grad()
+            attention_payload = {
                 "token_alpha": token_alpha,
                 "chunk_alpha": chunk_alpha,
                 "input_ids": token_info.get("input_ids"),
                 "attention_mask": token_info.get("attention_mask"),
                 "offset_mapping": token_info.get("offset_mapping"),
                 "token_alpha_sources": token_info.get("token_alpha_sources") or [],
+                "role_token_alpha": role_token_alpha,
                 "batch_chunks": batch_chunks,
                 "sequence_input": sequence_input,
                 "chunk_mask": chunk_mask,
             }
-        return features
+            if role_attention_info is not None:
+                attention_payload.update(role_attention_info)
+            return output, attention_payload
+        return output
 
     def fit_tokenizer(self, texts: List[str]) -> None:
         self._populate_chunk_cache(texts)
         self._ensure_encoder_initialized()
         logger.info(
             "HierarchicalTransformerExtractor ready: backend=%s pooling=%s "
-            "device=%s trainable_params=%s chunk_cache=%s token_cache=%s",
+            "role_attention=%s W_heads=%s X_heads=%s device=%s "
+            "trainable_params=%s chunk_cache=%s token_cache=%s",
             self._effective_sentence_encoder_backend(),
             self._effective_sentence_pooling(),
+            self._role_attention,
+            self._w_attention_heads,
+            self._x_attention_heads,
             self._device,
             self.get_num_parameters(),
             len(self._chunk_cache),
             len(self._tokenization_cache),
         )
 
-    def interpret_attention(self, texts: List[str], top_k: int = 5) -> List[Dict[str, Any]]:
+    @staticmethod
+    def _attention_role_from_stage(stage: Optional[str]) -> Optional[str]:
+        normalized = str(stage or "").strip().lower()
+        if normalized in {"nuisance", "w", "confounder", "propensity", "outcome"}:
+            return "w"
+        if normalized in {"effect_modifier", "effect", "x", "tau", "r_stage"}:
+            return "x"
+        return None
+
+    def interpret_attention(
+        self,
+        texts: List[str],
+        top_k: int = 5,
+        role: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         self.eval()
         previous_capture = self._capture_token_attention
         self._capture_token_attention = True
@@ -1378,7 +1705,17 @@ class HierarchicalTransformerExtractor(nn.Module):
                 self.forward(texts)
             finally:
                 self._capture_token_attention = previous_capture
-        weights = self._last_chunk_weights
+        role = self._attention_role_from_stage(role) or role
+        weights = (
+            self._last_role_chunk_weights.get(role)
+            if role in {"w", "x"}
+            else self._last_chunk_weights
+        )
+        token_weights_by_chunk = (
+            self._last_role_token_weights_by_chunk.get(role, [])
+            if role in {"w", "x"}
+            else self._last_token_weights_by_chunk
+        )
         results = []
         flat_offsets = []
         offset = 0
@@ -1400,10 +1737,10 @@ class HierarchicalTransformerExtractor(nn.Module):
                     "attention": float(row_weights[idx]),
                 }
                 flat_idx = flat_offsets[row] + idx
-                if flat_idx < len(self._last_token_weights_by_chunk):
+                if flat_idx < len(token_weights_by_chunk):
                     token_spans = self._top_token_spans(
                         chunks[idx],
-                        self._last_token_weights_by_chunk[flat_idx],
+                        token_weights_by_chunk[flat_idx],
                     )
                     if token_spans:
                         item["top_token_spans"] = token_spans
@@ -1433,7 +1770,8 @@ class HierarchicalTransformerExtractor(nn.Module):
         top_k: int = 5,
         metadata: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
-        interpretations = self.interpret_attention(texts, top_k=top_k)
+        role = self._attention_role_from_stage(stage)
+        interpretations = self.interpret_attention(texts, top_k=top_k, role=role)
         if row_ids is None:
             row_ids = list(range(len(texts)))
         if metadata is None:
@@ -1445,6 +1783,7 @@ class HierarchicalTransformerExtractor(nn.Module):
                     "row_id": row_id,
                     "fold": fold,
                     "stage": stage,
+                    "attention_role": role,
                     "chunk_index": item["chunk_index"],
                     "chunk_text": item["chunk"],
                     "attention": item["attention"],
@@ -1658,6 +1997,9 @@ class HierarchicalTransformerExtractor(nn.Module):
             "transformer_dropout": self._dropout,
             "projection_dim": self._projection_dim,
             "hash_embedding_dim": self._hash_embedding_dim,
+            "role_attention": self._role_attention,
+            "w_attention_heads": self._w_attention_heads,
+            "x_attention_heads": self._x_attention_heads,
             "output_dim": self._projection_dim,
         }
 

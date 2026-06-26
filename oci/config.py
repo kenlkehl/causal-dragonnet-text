@@ -814,8 +814,13 @@ EXTRACTOR_ALIASES = {
 
 VALID_EXTRACTOR_TYPES = set(EXTRACTOR_ALIASES.keys())
 
-# Extractors that require fit_tokenizer() before training
-TRAINABLE_EXTRACTOR_TYPES = {"hierarchical_cnn", "hierarchical_gru", "simple_cnn"}
+# Extractors that require fit_tokenizer() before training or optimizer setup.
+TRAINABLE_EXTRACTOR_TYPES = {
+    "hierarchical_cnn",
+    "hierarchical_gru",
+    "hierarchical_transformer",
+    "simple_cnn",
+}
 
 # Extractors that support hidden state caching
 CACHEABLE_EXTRACTOR_TYPES = {
@@ -1170,6 +1175,9 @@ class ModelArchitectureConfig:
     htr_sentence_pooling: str = "auto"
     htr_normalize_sentence_embeddings: bool = True
     htr_trainable_sentence_encoder_layers: int = 0
+    htr_role_attention: bool = False
+    htr_w_attention_heads: int = 1
+    htr_x_attention_heads: int = 1
 
     # Hierarchical CNN extractor (dilated CNN on chunks + two-level pooling, trains from scratch)
     hcnn_embedding_dim: int = 256

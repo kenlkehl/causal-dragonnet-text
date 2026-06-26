@@ -637,6 +637,115 @@ class TestHierarchicalTransformer:
         features.square().sum().backward()
         assert attention_info["token_alpha_sources"][0].grad is not None
 
+    def test_role_attention_has_distinct_token_and_chunk_heads(self):
+        import re
+        from types import SimpleNamespace
+
+        from oci.models.hierarchical_transformer_extractor import (
+            HierarchicalTransformerExtractor,
+        )
+
+        class FakeTokenizer:
+            pad_token_id = 0
+            padding_side = "right"
+            is_fast = True
+            all_special_ids = [0, 101, 102]
+            all_special_tokens = ["[PAD]", "[CLS]", "[SEP]"]
+
+            def __call__(
+                self,
+                text,
+                padding=False,
+                truncation=True,
+                max_length=None,
+                return_offsets_mapping=False,
+            ):
+                del padding, truncation
+                words = list(re.finditer(r"\S+", text))
+                input_ids = [101] + list(range(10, 10 + len(words))) + [102]
+                attention_mask = [1] * len(input_ids)
+                offsets = [(0, 0)] + [
+                    (int(match.start()), int(match.end())) for match in words
+                ] + [(0, 0)]
+                if max_length is not None:
+                    input_ids = input_ids[:max_length]
+                    attention_mask = attention_mask[:max_length]
+                    offsets = offsets[:max_length]
+                result = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                }
+                if return_offsets_mapping:
+                    result["offset_mapping"] = offsets
+                return result
+
+            def convert_ids_to_tokens(self, input_ids):
+                return [f"tok{token_id}" for token_id in input_ids]
+
+        class FakeEncoder(torch.nn.Module):
+            def forward(self, input_ids, attention_mask):
+                del attention_mask
+                hidden = input_ids.float().unsqueeze(-1)
+                hidden = torch.cat(
+                    [
+                        hidden,
+                        hidden / 10.0,
+                        torch.sin(hidden),
+                        torch.cos(hidden),
+                    ],
+                    dim=-1,
+                )
+                return SimpleNamespace(last_hidden_state=hidden)
+
+        ext = HierarchicalTransformerExtractor(
+            sentence_encoder_model="some-bert",
+            sentence_pooling="token_attention",
+            role_attention=True,
+            w_attention_heads=2,
+            x_attention_heads=3,
+            chunk_size_words=3,
+            chunk_overlap_words=0,
+            max_chunks=4,
+            max_chunk_length=8,
+            num_transformer_layers=1,
+            num_attention_heads=2,
+            transformer_dim=8,
+            projection_dim=5,
+            transformer_dropout=0.0,
+        )
+        ext._encoder_initialized = True
+        ext._tokenizer = FakeTokenizer()
+        ext._sentence_encoder = FakeEncoder()
+        ext._sentence_dim = 4
+        ext._input_projection = torch.nn.Linear(4, 8)
+        ext._ensure_token_pooling_initialized()
+
+        texts = ["alpha beta gamma delta epsilon zeta"]
+        role_features, attention_info = ext(
+            texts,
+            return_role_features=True,
+            return_attention_tensors=True,
+        )
+
+        assert set(role_features) == {"features", "w_features", "x_features"}
+        assert role_features["features"].shape == (1, 5)
+        assert role_features["w_features"].shape == (1, 5)
+        assert role_features["x_features"].shape == (1, 5)
+        assert ext._w_token_pooling.num_heads == 2
+        assert ext._x_token_pooling.num_heads == 3
+        assert ext._w_chunk_pooling.num_heads == 2
+        assert ext._x_chunk_pooling.num_heads == 3
+        assert attention_info["role_token_alpha"]["w"].shape[0] == 2
+        assert attention_info["role_token_alpha"]["x"].shape[0] == 2
+        assert attention_info["role_chunk_alpha"]["w"].shape == (1, 2)
+        assert attention_info["role_chunk_alpha"]["x"].shape == (1, 2)
+
+        nuisance = ext.get_attention_evidence(texts, stage="nuisance", top_k=1)
+        effect = ext.get_attention_evidence(texts, stage="effect_modifier", top_k=1)
+
+        assert nuisance and nuisance[0]["attention_role"] == "w"
+        assert effect and effect[0]["attention_role"] == "x"
+
 
 class TestNeuralCausalForest:
     def _tokenizer_test_encoder(self, model_name="some-bert"):

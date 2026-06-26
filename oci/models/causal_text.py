@@ -79,6 +79,9 @@ class CausalText(nn.Module):
         htr_sentence_pooling: str = "auto",
         htr_normalize_sentence_embeddings: bool = True,
         htr_trainable_sentence_encoder_layers: int = 0,
+        htr_role_attention: bool = False,
+        htr_w_attention_heads: int = 1,
+        htr_x_attention_heads: int = 1,
         # Hierarchical CNN args
         hcnn_embedding_dim: int = 256,
         hcnn_conv_dim: int = 256,
@@ -264,6 +267,9 @@ class CausalText(nn.Module):
             'htr_sentence_pooling': htr_sentence_pooling,
             'htr_normalize_sentence_embeddings': htr_normalize_sentence_embeddings,
             'htr_trainable_sentence_encoder_layers': htr_trainable_sentence_encoder_layers,
+            'htr_role_attention': htr_role_attention,
+            'htr_w_attention_heads': htr_w_attention_heads,
+            'htr_x_attention_heads': htr_x_attention_heads,
             'hcnn_embedding_dim': hcnn_embedding_dim,
             'hcnn_conv_dim': hcnn_conv_dim,
             'hcnn_kernel_size': hcnn_kernel_size,
@@ -407,6 +413,9 @@ class CausalText(nn.Module):
             htr_sentence_pooling=htr_sentence_pooling,
             htr_normalize_sentence_embeddings=htr_normalize_sentence_embeddings,
             htr_trainable_sentence_encoder_layers=htr_trainable_sentence_encoder_layers,
+            htr_role_attention=htr_role_attention,
+            htr_w_attention_heads=htr_w_attention_heads,
+            htr_x_attention_heads=htr_x_attention_heads,
             # Hierarchical CNN args
             hcnn_embedding_dim=hcnn_embedding_dim,
             hcnn_conv_dim=hcnn_conv_dim,
@@ -610,16 +619,54 @@ class CausalText(nn.Module):
 
     def _append_explicit_features(
         self,
-        features: torch.Tensor,
+        features,
         explicit_feature_values: Optional[List[Dict[str, Any]]],
-    ) -> torch.Tensor:
+    ):
         """Append explicit feature embeddings when configured and present."""
         if self.explicit_feature_featurizer is None:
             return features
         if explicit_feature_values is None:
             return features
         explicit_features = self.explicit_feature_featurizer(explicit_feature_values)
-        return torch.cat([features, explicit_features], dim=1)
+        return self._append_to_feature_tensors(features, explicit_features)
+
+    @staticmethod
+    def _feature_tensor_keys(features) -> Tuple[str, ...]:
+        if not isinstance(features, dict):
+            return tuple()
+        return tuple(
+            key
+            for key in ("features", "w_features", "x_features")
+            if key in features and torch.is_tensor(features[key])
+        )
+
+    @classmethod
+    def _map_feature_tensors(cls, features, fn):
+        if not isinstance(features, dict):
+            return fn(features)
+        mapped = dict(features)
+        for key in cls._feature_tensor_keys(features):
+            mapped[key] = fn(features[key])
+        return mapped
+
+    @classmethod
+    def _append_to_feature_tensors(cls, features, extra: torch.Tensor):
+        return cls._map_feature_tensors(
+            features,
+            lambda tensor: torch.cat(
+                [tensor, extra.to(device=tensor.device, dtype=tensor.dtype)],
+                dim=1,
+            ),
+        )
+
+    @classmethod
+    def _detach_feature_tensors(cls, features):
+        return cls._map_feature_tensors(features, lambda tensor: tensor.detach())
+
+    def _extract_features(self, extractor_input, *, role_features: bool = False):
+        if role_features and getattr(self.feature_extractor, "has_role_features", False):
+            return self.feature_extractor.forward_role_features(extractor_input)
+        return self.feature_extractor(extractor_input)
 
     def forward(
         self,
@@ -643,12 +690,12 @@ class CausalText(nn.Module):
             final_common_layer: (batch, representation_dim) - shared representation
         """
         # Extract features from texts
-        features = self.feature_extractor(texts)
+        features = self._extract_features(texts, role_features=self.model_type == "rlearner")
 
         # Concatenate auxiliary features if provided
         if self.auxiliary_projection is not None and auxiliary_features is not None:
             aux_projected = self.auxiliary_projection(auxiliary_features.to(self._device))
-            features = torch.cat([features, aux_projected], dim=1)
+            features = self._append_to_feature_tensors(features, aux_projected)
 
         explicit_feature_values = explicit_feature_values or explicit_confounder_values
         features = self._append_explicit_features(features, explicit_feature_values)
@@ -750,12 +797,12 @@ class CausalText(nn.Module):
             outcomes_smooth = outcomes
 
         # Extract features
-        features = self.feature_extractor(extractor_input)
+        features = self._extract_features(extractor_input)
 
         # Concatenate auxiliary features if provided
         if self.auxiliary_projection is not None and auxiliary_features is not None:
             aux_projected = self.auxiliary_projection(auxiliary_features.to(self._device))
-            features = torch.cat([features, aux_projected], dim=1)
+            features = self._append_to_feature_tensors(features, aux_projected)
 
         features = self._append_explicit_features(features, explicit_feature_values)
 
@@ -890,7 +937,7 @@ class CausalText(nn.Module):
             outcomes_smooth = outcomes
 
         # Extract features
-        features = self.feature_extractor(extractor_input)
+        features = self._extract_features(extractor_input, role_features=True)
 
         # Compute attention entropy loss if enabled and extractor supports it
         entropy_loss = torch.tensor(0.0, device=self._device)
@@ -901,15 +948,18 @@ class CausalText(nn.Module):
         # Concatenate auxiliary features if provided
         if self.auxiliary_projection is not None and auxiliary_features is not None:
             aux_projected = self.auxiliary_projection(auxiliary_features.to(self._device))
-            features = torch.cat([features, aux_projected], dim=1)
+            features = self._append_to_feature_tensors(features, aux_projected)
 
         features = self._append_explicit_features(features, explicit_feature_values)
 
         if stop_grad_propensity:
-            features_detached = features.detach()
+            features_detached = self._detach_feature_tensors(features)
             m_logit, tau, t_logit, phi = self.net(features)
-            phi_detached = self.net.get_representation(features_detached)
-            t_logit_for_loss = self.net.propensity_from_representation(phi_detached)
+            if hasattr(self.net, "propensity_from_features"):
+                t_logit_for_loss = self.net.propensity_from_features(features_detached)
+            else:
+                phi_detached = self.net.get_representation(features_detached)
+                t_logit_for_loss = self.net.propensity_from_representation(phi_detached)
             propensity_loss = F.binary_cross_entropy_with_logits(
                 t_logit_for_loss.squeeze(-1),
                 treatments_smooth
@@ -1013,12 +1063,15 @@ class CausalText(nn.Module):
                 extractor_input = texts
                 explicit_feature_values = explicit_feature_values or explicit_confounder_values
 
-            features = self.feature_extractor(extractor_input)
+            features = self._extract_features(
+                extractor_input,
+                role_features=self.model_type == "rlearner",
+            )
 
             # Concatenate auxiliary features if provided
             if self.auxiliary_projection is not None and auxiliary_features is not None:
                 aux_projected = self.auxiliary_projection(auxiliary_features.to(self._device))
-                features = torch.cat([features, aux_projected], dim=1)
+                features = self._append_to_feature_tensors(features, aux_projected)
 
             features = self._append_explicit_features(features, explicit_feature_values)
 
@@ -1101,7 +1154,7 @@ class CausalText(nn.Module):
                 extractor_input = texts_or_batch
                 explicit_feature_values = explicit_feature_values or explicit_confounder_values
 
-            features = self.feature_extractor(extractor_input)
+            features = self._extract_features(extractor_input)
 
             features = self._append_explicit_features(features, explicit_feature_values)
 
