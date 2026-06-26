@@ -71,28 +71,28 @@ Examples:
         help='Override output directory from config'
     )
     run_parser.add_argument(
-        '--non-neural-features-json',
+        '--multi-model-features-json',
         help=(
             "Add pre-specified feature specs for "
-            "model_type='non_neural_agentic_forest' from a JSON file. "
+            "model_type='multi_model_agentic_forest' from a JSON file. "
             "Accepted keys: features, confounders, effect_modifiers."
         )
     )
     run_parser.add_argument(
-        '--non-neural-confounder',
+        '--multi-model-confounder',
         action='append',
         default=[],
         help=(
-            "Add a pre-specified non-neural confounder as a JSON feature spec. "
+            "Add a pre-specified multi-model confounder as a JSON feature spec. "
             "May be repeated."
         )
     )
     run_parser.add_argument(
-        '--non-neural-effect-modifier',
+        '--multi-model-effect-modifier',
         action='append',
         default=[],
         help=(
-            "Add a pre-specified non-neural effect modifier as a JSON feature spec. "
+            "Add a pre-specified multi-model effect modifier as a JSON feature spec. "
             "May be repeated."
         )
     )
@@ -236,45 +236,45 @@ Examples:
         if args.output_dir:
             config.output_dir = args.output_dir
         if (
-            args.non_neural_features_json
-            or args.non_neural_confounder
-            or args.non_neural_effect_modifier
+            args.multi_model_features_json
+            or args.multi_model_confounder
+            or args.multi_model_effect_modifier
         ):
             model_type = getattr(config.applied_inference.architecture, 'model_type', None)
-            if model_type != "non_neural_agentic_forest":
+            if model_type != "multi_model_agentic_forest":
                 print(
-                    "--non-neural-features-json/--non-neural-confounder/"
-                    "--non-neural-effect-modifier only apply to "
-                    "model_type='non_neural_agentic_forest'"
+                    "--multi-model-features-json/--multi-model-confounder/"
+                    "--multi-model-effect-modifier only apply to "
+                    "model_type='multi_model_agentic_forest'"
                 )
                 return 1
-            nn_config = (
+            mm_config = (
                 config.applied_inference.architecture
-                .non_neural_agentic_forest
+                .multi_model_agentic_forest
             )
             try:
-                if args.non_neural_features_json:
-                    nn_config.prespecified_features.extend(
-                        load_explicit_feature_specs_json(args.non_neural_features_json)
+                if args.multi_model_features_json:
+                    mm_config.prespecified_features.extend(
+                        load_explicit_feature_specs_json(args.multi_model_features_json)
                     )
-                if args.non_neural_confounder:
-                    nn_config.prespecified_confounders.extend(
+                if args.multi_model_confounder:
+                    mm_config.prespecified_confounders.extend(
                         parse_explicit_feature_spec_entries(
-                            args.non_neural_confounder,
+                            args.multi_model_confounder,
                             default_roles=["confounder"],
-                            source="--non-neural-confounder",
+                            source="--multi-model-confounder",
                         )
                     )
-                if args.non_neural_effect_modifier:
-                    nn_config.prespecified_effect_modifiers.extend(
+                if args.multi_model_effect_modifier:
+                    mm_config.prespecified_effect_modifiers.extend(
                         parse_explicit_feature_spec_entries(
-                            args.non_neural_effect_modifier,
+                            args.multi_model_effect_modifier,
                             default_roles=["effect_modifier"],
-                            source="--non-neural-effect-modifier",
+                            source="--multi-model-effect-modifier",
                         )
                     )
             except (OSError, json.JSONDecodeError, ValueError) as e:
-                print(f"Error loading non-neural pre-specified features: {e}")
+                print(f"Error loading multi-model pre-specified features: {e}")
                 return 1
         if args.skip_pretraining:
             config.pretraining.enabled = False

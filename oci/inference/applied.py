@@ -212,10 +212,10 @@ def run_applied_inference(
         )
         return
 
-    if hasattr(config, 'architecture') and config.architecture.model_type == "non_neural_agentic_forest":
-        logger.info("Routing to Non-Neural Agentic Causal Forest pipeline")
-        from .non_neural_agentic_forest import run_non_neural_agentic_forest
-        run_non_neural_agentic_forest(
+    if hasattr(config, 'architecture') and config.architecture.model_type == "multi_model_agentic_forest":
+        logger.info("Routing to Multi-Model Agentic Causal Forest pipeline")
+        from .multi_model_agentic_forest import run_multi_model_agentic_forest
+        run_multi_model_agentic_forest(
             dataset=dataset,
             config=config,
             output_path=output_path,

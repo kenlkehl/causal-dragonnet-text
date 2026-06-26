@@ -338,7 +338,7 @@ def test_attention_runner_harmonizes_candidate_value_contracts(tmp_path):
 
         def propose(self, context):
             self.contexts.append(context)
-            assert context["prompt_version"] == "non_neural_agentic_value_harmonization_v1"
+            assert context["prompt_version"] == "multi_model_agentic_value_harmonization_v1"
             assert context["agentic_path"] == "agentic_attention_variable_forest"
             return {
                 "features": [

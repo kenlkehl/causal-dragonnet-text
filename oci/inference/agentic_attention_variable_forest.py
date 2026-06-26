@@ -5351,7 +5351,7 @@ class AgenticAttentionVariableForestRunner:
             return selected_specs
 
         context = {
-            "prompt_version": "non_neural_agentic_value_harmonization_v1",
+            "prompt_version": "multi_model_agentic_value_harmonization_v1",
             "agentic_path": "agentic_attention_variable_forest",
             "stage": stage,
             "outer_fold": int(outer_fold),

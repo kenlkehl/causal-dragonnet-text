@@ -4,7 +4,7 @@
 This script uses true_<feature_name> columns from a synthetic dataset and
 role-tagged feature specs from metadata.json. It reports cross-fitted treatment
 and outcome nuisance performance, plus the same unweighted R pseudo-target
-diagnostics used by the non-neural agentic BoW path.
+diagnostics used by the multi-model agentic BoW path.
 """
 
 from __future__ import annotations

@@ -14,6 +14,7 @@ def chunk_text_words(
     chunk_size_words: int,
     chunk_overlap_words: int,
     max_chunks: int,
+    chunk_selection: str = "first",
 ) -> List[str]:
     """Split text into overlapping word chunks.
 
@@ -31,6 +32,9 @@ def chunk_text_words(
         )
     if chunk_overlap_words < 0:
         raise ValueError("chunk_overlap_words must be >= 0")
+    selection = str(chunk_selection).strip().lower()
+    if selection not in {"first", "last"}:
+        raise ValueError("chunk_selection must be 'first' or 'last'")
 
     words = [match.group(0) for match in _WORD_RE.finditer(text or "")]
     if not words:
@@ -39,10 +43,13 @@ def chunk_text_words(
     stride = chunk_size_words - chunk_overlap_words
     chunks: List[str] = []
     start = 0
-    while start < len(words) and len(chunks) < max_chunks:
+    while start < len(words):
         chunk_words = words[start:start + chunk_size_words]
         if chunk_words:
             chunks.append(" ".join(chunk_words))
         start += stride
+
+    if len(chunks) > max_chunks:
+        chunks = chunks[:max_chunks] if selection == "first" else chunks[-max_chunks:]
 
     return chunks or [""]

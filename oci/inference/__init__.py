@@ -22,11 +22,11 @@ def run_agentic_attention_variable_forest(*args, **kwargs):
     return _run_attention_forest(*args, **kwargs)
 
 
-def run_non_neural_agentic_forest(*args, **kwargs):
-    from .non_neural_agentic_forest import (
-        run_non_neural_agentic_forest as _run_non_neural,
+def run_multi_model_agentic_forest(*args, **kwargs):
+    from .multi_model_agentic_forest import (
+        run_multi_model_agentic_forest as _run_multi_model,
     )
-    return _run_non_neural(*args, **kwargs)
+    return _run_multi_model(*args, **kwargs)
 
 
 __all__ = [
@@ -34,5 +34,5 @@ __all__ = [
     'run_applied_inference_forest',
     'run_agentic_explicit_feature_forest',
     'run_agentic_attention_variable_forest',
-    'run_non_neural_agentic_forest',
+    'run_multi_model_agentic_forest',
 ]

@@ -126,7 +126,7 @@ In short:
     feature discovery: unweighted or softened pseudo-target regression can be
     defensible because sensitivity may matter more than formal optimality
 
-This is the motivation for a non-neural agentic forest path that uses simple
+This is the motivation for a multi-model agentic forest path that uses simple
 bag-of-words nuisance models and an unweighted pseudo-target model for variable
 discovery, then delegates the actual CATE estimation to an explicit-variable
 causal forest.

@@ -591,17 +591,73 @@ class AgenticFeatureSearchConfig:
 
 
 @dataclass
-class NonNeuralAgenticForestConfig:
-    """Configuration for BoW-guided agentic variable discovery.
+class EmbeddingContrastDiscoveryConfig:
+    """Configuration for embedding-contrast evidence in multi-model agentic search."""
 
-    This pathway uses cross-fitted sparse text models to produce nuisance
-    predictions and an unweighted R pseudo-target. The proposal agent receives
-    feature-importance summaries from those models and selects explicit
-    variables for downstream extraction and CausalForestDML fitting.
-    """
+    enabled: bool = False
+    model_name: str = "Qwen/Qwen3-Embedding-8B"
+    cache_dir: Optional[str] = None
+    device: Optional[str] = None
+    batch_size: int = 16
+    chunk_size_words: int = 256
+    chunk_overlap_words: int = 64
+    max_chunks: int = 64
+    chunk_selection: str = "last"
+    normalize_embeddings: bool = True
+    top_k_chunks_per_tail: int = 12
+    max_chunks_per_patient: int = 2
+    min_probe_auc: float = 0.0
+    pseudo_target_quantile: float = 0.20
+    pseudo_target_weighted: bool = True
+    residualize_columns: List[str] = field(default_factory=list)
+    concept_phrases: List[str] = field(default_factory=list)
+    include_bow_phrases_as_concepts: bool = True
+    max_concept_phrases: int = 80
+    concept_probe_top_k: int = 20
 
-    nuisance_folds: int = 5
-    effect_folds: int = 5
+    def __post_init__(self):
+        if self.batch_size < 1:
+            raise ValueError("embedding_contrast.batch_size must be >= 1")
+        if self.chunk_size_words < 1:
+            raise ValueError("embedding_contrast.chunk_size_words must be >= 1")
+        if self.chunk_overlap_words < 0:
+            raise ValueError("embedding_contrast.chunk_overlap_words must be >= 0")
+        if self.chunk_overlap_words >= self.chunk_size_words:
+            raise ValueError(
+                "embedding_contrast.chunk_overlap_words must be smaller than "
+                "chunk_size_words"
+            )
+        if self.max_chunks < 1:
+            raise ValueError("embedding_contrast.max_chunks must be >= 1")
+        chunk_selection = str(self.chunk_selection).strip().lower()
+        if chunk_selection not in {"first", "last"}:
+            raise ValueError("embedding_contrast.chunk_selection must be 'first' or 'last'")
+        self.chunk_selection = chunk_selection
+        if self.top_k_chunks_per_tail < 1:
+            raise ValueError("embedding_contrast.top_k_chunks_per_tail must be >= 1")
+        if self.max_chunks_per_patient < 1:
+            raise ValueError("embedding_contrast.max_chunks_per_patient must be >= 1")
+        if not 0.0 <= self.min_probe_auc <= 1.0:
+            raise ValueError("embedding_contrast.min_probe_auc must be in [0, 1]")
+        if not 0.0 < self.pseudo_target_quantile < 0.5:
+            raise ValueError("embedding_contrast.pseudo_target_quantile must be in (0, 0.5)")
+        if self.max_concept_phrases < 0:
+            raise ValueError("embedding_contrast.max_concept_phrases must be >= 0")
+        if self.concept_probe_top_k < 1:
+            raise ValueError("embedding_contrast.concept_probe_top_k must be >= 1")
+        self.residualize_columns = [str(col) for col in self.residualize_columns]
+        self.concept_phrases = [
+            str(phrase).strip()
+            for phrase in self.concept_phrases
+            if str(phrase).strip()
+        ]
+
+
+@dataclass
+class BoWViewConfig:
+    """One sparse text-model view used by multi-model agentic discovery."""
+
+    name: str = ""
     max_features: int = 30000
     min_df: int = 5
     max_df: float = 0.95
@@ -611,6 +667,102 @@ class NonNeuralAgenticForestConfig:
     # Learner family for BoW nuisance and pseudo-target models:
     # "linear", "extratrees", "random_forest", or "xgboost".
     bow_model: str = "linear"
+    logistic_c: float = 1.0
+    logistic_max_iter: int = 1000
+    ridge_alpha: float = 10.0
+
+    def __post_init__(self):
+        self.name = str(self.name or "").strip()
+        if self.max_features < 1:
+            raise ValueError("bow view max_features must be >= 1")
+        if self.min_df < 1:
+            raise ValueError("bow view min_df must be >= 1")
+        if not 0.0 < self.max_df <= 1.0:
+            raise ValueError("bow view max_df must be in (0, 1]")
+        if self.ngram_range_min < 1 or self.ngram_range_max < self.ngram_range_min:
+            raise ValueError(
+                "bow view ngram range must satisfy "
+                "1 <= ngram_range_min <= ngram_range_max"
+            )
+        bow_model = str(self.bow_model).strip().lower()
+        if bow_model not in {"linear", "extratrees", "random_forest", "xgboost"}:
+            raise ValueError(
+                "bow view bow_model must be one of "
+                "'linear', 'extratrees', 'random_forest', or 'xgboost'"
+            )
+        self.bow_model = bow_model
+        if self.logistic_c <= 0:
+            raise ValueError("bow view logistic_c must be > 0")
+        if self.logistic_max_iter < 1:
+            raise ValueError("bow view logistic_max_iter must be >= 1")
+        if self.ridge_alpha < 0:
+            raise ValueError("bow view ridge_alpha must be >= 0")
+
+
+def default_multi_model_bow_views() -> List[BoWViewConfig]:
+    """Broad default sparse-model grid for multi-model agentic discovery."""
+    return [
+        BoWViewConfig(
+            name="linear_unigram_c0p5",
+            bow_model="linear",
+            ngram_range_min=1,
+            ngram_range_max=1,
+            logistic_c=0.5,
+            ridge_alpha=20.0,
+        ),
+        BoWViewConfig(
+            name="linear_1_2",
+            bow_model="linear",
+            ngram_range_min=1,
+            ngram_range_max=2,
+            logistic_c=1.0,
+            ridge_alpha=10.0,
+        ),
+        BoWViewConfig(
+            name="linear_1_3",
+            bow_model="linear",
+            ngram_range_min=1,
+            ngram_range_max=3,
+            logistic_c=1.0,
+            ridge_alpha=10.0,
+        ),
+        BoWViewConfig(
+            name="linear_2_4_min_df3",
+            bow_model="linear",
+            ngram_range_min=2,
+            ngram_range_max=4,
+            min_df=3,
+            logistic_c=1.0,
+            ridge_alpha=10.0,
+        ),
+        BoWViewConfig(
+            name="extratrees_1_3",
+            bow_model="extratrees",
+            ngram_range_min=1,
+            ngram_range_max=3,
+        ),
+        BoWViewConfig(
+            name="random_forest_1_2",
+            bow_model="random_forest",
+            ngram_range_min=1,
+            ngram_range_max=2,
+        ),
+    ]
+
+
+@dataclass
+class MultiModelAgenticForestConfig:
+    """Configuration for BoW-guided agentic variable discovery.
+
+    This pathway uses multiple cross-fitted sparse text-model views plus
+    optional embedding-contrast retrieval to produce agent-facing evidence.
+    The proposal agent still defines explicit patient-level variables for
+    downstream extraction and CausalForestDML fitting.
+    """
+
+    nuisance_folds: int = 5
+    effect_folds: int = 5
+    bow_views: List[BoWViewConfig] = field(default_factory=list)
     # Optional researcher-provided variables to extract before BoW discovery.
     # Items must be ExplicitFeatureSpec-shaped dicts. confounder/effect-modifier
     # section fields apply the corresponding role automatically; duplicate names
@@ -619,9 +771,6 @@ class NonNeuralAgenticForestConfig:
     prespecified_confounders: List[ExplicitFeatureSpec] = field(default_factory=list)
     prespecified_effect_modifiers: List[ExplicitFeatureSpec] = field(default_factory=list)
     prespecified_features_json: Optional[str] = None
-    logistic_c: float = 1.0
-    logistic_max_iter: int = 1000
-    ridge_alpha: float = 10.0
     e_clip: float = 0.01
     top_n_features: int = 100
     candidate_proposals_per_fold: int = 30
@@ -636,94 +785,96 @@ class NonNeuralAgenticForestConfig:
     # "auto" uses the runner num_workers setting; set a positive integer to
     # parallelize BoW nuisance/effect cross-fit folds explicitly.
     fold_parallelism: str = "auto"
+    embedding_contrast: EmbeddingContrastDiscoveryConfig = field(
+        default_factory=EmbeddingContrastDiscoveryConfig
+    )
 
     def __post_init__(self):
+        if isinstance(self.embedding_contrast, dict):
+            self.embedding_contrast = EmbeddingContrastDiscoveryConfig(
+                **self.embedding_contrast
+            )
+        if self.bow_views:
+            self.bow_views = [
+                view if isinstance(view, BoWViewConfig) else BoWViewConfig(**view)
+                for view in self.bow_views
+            ]
+        else:
+            self.bow_views = default_multi_model_bow_views()
+        seen_view_names = set()
+        for idx, view in enumerate(self.bow_views, start=1):
+            if not view.name:
+                view.name = (
+                    f"{view.bow_model}_{view.ngram_range_min}_"
+                    f"{view.ngram_range_max}_{idx}"
+                )
+            if view.name in seen_view_names:
+                raise ValueError(
+                    "multi_model_agentic_forest.bow_views names must be unique"
+                )
+            seen_view_names.add(view.name)
         self.prespecified_features = parse_explicit_feature_spec_entries(
             self.prespecified_features,
-            source="non_neural_agentic_forest.prespecified_features",
+            source="multi_model_agentic_forest.prespecified_features",
         )
         self.prespecified_confounders = parse_explicit_feature_spec_entries(
             self.prespecified_confounders,
             default_roles=["confounder"],
-            source="non_neural_agentic_forest.prespecified_confounders",
+            source="multi_model_agentic_forest.prespecified_confounders",
         )
         self.prespecified_effect_modifiers = parse_explicit_feature_spec_entries(
             self.prespecified_effect_modifiers,
             default_roles=["effect_modifier"],
-            source="non_neural_agentic_forest.prespecified_effect_modifiers",
+            source="multi_model_agentic_forest.prespecified_effect_modifiers",
         )
         if self.prespecified_features_json:
             if not Path(str(self.prespecified_features_json)).exists():
                 raise ValueError(
-                    "non_neural_agentic_forest.prespecified_features_json "
+                    "multi_model_agentic_forest.prespecified_features_json "
                     f"does not exist: {self.prespecified_features_json}"
                 )
         if self.nuisance_folds < 2:
-            raise ValueError("non_neural_agentic_forest.nuisance_folds must be >= 2")
+            raise ValueError("multi_model_agentic_forest.nuisance_folds must be >= 2")
         if self.effect_folds < 2:
-            raise ValueError("non_neural_agentic_forest.effect_folds must be >= 2")
-        if self.max_features < 1:
-            raise ValueError("non_neural_agentic_forest.max_features must be >= 1")
-        if self.min_df < 1:
-            raise ValueError("non_neural_agentic_forest.min_df must be >= 1")
-        if not 0.0 < self.max_df <= 1.0:
-            raise ValueError("non_neural_agentic_forest.max_df must be in (0, 1]")
-        if self.ngram_range_min < 1 or self.ngram_range_max < self.ngram_range_min:
-            raise ValueError(
-                "non_neural_agentic_forest ngram range must satisfy "
-                "1 <= ngram_range_min <= ngram_range_max"
-            )
-        bow_model = str(self.bow_model).strip().lower()
-        if bow_model not in {"linear", "extratrees", "random_forest", "xgboost"}:
-            raise ValueError(
-                "non_neural_agentic_forest.bow_model must be one of "
-                "'linear', 'extratrees', 'random_forest', or 'xgboost'"
-            )
-        self.bow_model = bow_model
-        if self.logistic_c <= 0:
-            raise ValueError("non_neural_agentic_forest.logistic_c must be > 0")
-        if self.logistic_max_iter < 1:
-            raise ValueError("non_neural_agentic_forest.logistic_max_iter must be >= 1")
-        if self.ridge_alpha < 0:
-            raise ValueError("non_neural_agentic_forest.ridge_alpha must be >= 0")
+            raise ValueError("multi_model_agentic_forest.effect_folds must be >= 2")
         if not 0.0 < self.e_clip < 0.5:
-            raise ValueError("non_neural_agentic_forest.e_clip must be in (0, 0.5)")
+            raise ValueError("multi_model_agentic_forest.e_clip must be in (0, 0.5)")
         if self.top_n_features < 1:
-            raise ValueError("non_neural_agentic_forest.top_n_features must be >= 1")
+            raise ValueError("multi_model_agentic_forest.top_n_features must be >= 1")
         if self.candidate_proposals_per_fold < 1:
             raise ValueError(
-                "non_neural_agentic_forest.candidate_proposals_per_fold must be >= 1"
+                "multi_model_agentic_forest.candidate_proposals_per_fold must be >= 1"
             )
         if self.candidate_consistency_inner_folds < 2:
             raise ValueError(
-                "non_neural_agentic_forest.candidate_consistency_inner_folds must be >= 2"
+                "multi_model_agentic_forest.candidate_consistency_inner_folds must be >= 2"
             )
         if self.candidate_consistency_min_folds < 1:
             raise ValueError(
-                "non_neural_agentic_forest.candidate_consistency_min_folds must be >= 1"
+                "multi_model_agentic_forest.candidate_consistency_min_folds must be >= 1"
             )
         if not 0.0 < self.candidate_consistency_min_fold_fraction <= 1.0:
             raise ValueError(
-                "non_neural_agentic_forest.candidate_consistency_min_fold_fraction "
+                "multi_model_agentic_forest.candidate_consistency_min_fold_fraction "
                 "must be in (0, 1]"
             )
         if self.candidate_consistency_recovery_max_candidates < 0:
             raise ValueError(
-                "non_neural_agentic_forest.candidate_consistency_recovery_max_candidates "
+                "multi_model_agentic_forest.candidate_consistency_recovery_max_candidates "
                 "must be >= 0"
             )
         _validate_parallelism_setting(
             self.candidate_consistency_parallelism,
-            "non_neural_agentic_forest.candidate_consistency_parallelism",
+            "multi_model_agentic_forest.candidate_consistency_parallelism",
         )
         _validate_parallelism_setting(
             self.outer_parallelism,
-            "non_neural_agentic_forest.outer_parallelism",
+            "multi_model_agentic_forest.outer_parallelism",
         )
         bow_backend = str(self.bow_parallel_backend).strip().lower()
         if bow_backend not in {"processes", "threads"}:
             raise ValueError(
-                "non_neural_agentic_forest.bow_parallel_backend must be "
+                "multi_model_agentic_forest.bow_parallel_backend must be "
                 "'processes' or 'threads'"
             )
         self.bow_parallel_backend = bow_backend
@@ -733,7 +884,7 @@ class NonNeuralAgenticForestConfig:
                     raise ValueError
             except ValueError as exc:
                 raise ValueError(
-                    "non_neural_agentic_forest.fold_parallelism must be 'auto' "
+                    "multi_model_agentic_forest.fold_parallelism must be 'auto' "
                     "or a positive integer"
                 ) from exc
 
@@ -1120,7 +1271,7 @@ def normalize_feature_extractor_type(feature_type: str) -> str:
 @dataclass
 class ModelArchitectureConfig:
     """Configuration for model architecture."""
-    model_type: str = "dragonnet"  # "dragonnet", "dragonnet_drlearner", "rlearner", "causal_forest", "tfidf_forest", "explicit_feature_forest", "agentic_explicit_feature_forest", "agentic_attention_variable_forest", or "non_neural_agentic_forest"
+    model_type: str = "dragonnet"  # "dragonnet", "dragonnet_drlearner", "rlearner", "causal_forest", "tfidf_forest", "explicit_feature_forest", "agentic_explicit_feature_forest", "agentic_attention_variable_forest", or "multi_model_agentic_forest"
 
     # Feature extractor type: "frozen_llm_pooler"
     feature_extractor_type: str = "frozen_llm_pooler"
@@ -1282,9 +1433,9 @@ class ModelArchitectureConfig:
         default_factory=DragonNetDRLearnerConfig
     )
 
-    # Non-neural BoW-guided variable discovery + explicit-feature causal forest
-    non_neural_agentic_forest: NonNeuralAgenticForestConfig = field(
-        default_factory=NonNeuralAgenticForestConfig
+    # Multi-model BoW-guided variable discovery + explicit-feature causal forest
+    multi_model_agentic_forest: MultiModelAgenticForestConfig = field(
+        default_factory=MultiModelAgenticForestConfig
     )
 
 
@@ -1439,6 +1590,11 @@ class ExperimentConfig:
                     "architecture.confounder_forest has been removed. "
                     "Use architecture.explicit_feature_forest."
                 )
+            if 'non_neural_agentic_forest' in arch_data:
+                raise ValueError(
+                    "architecture.non_neural_agentic_forest has been removed. "
+                    "Use architecture.multi_model_agentic_forest."
+                )
             if 'explicit_feature_forest' in arch_data and isinstance(arch_data['explicit_feature_forest'], dict):
                 arch_data['explicit_feature_forest'] = ExplicitFeatureForestConfig(**arch_data['explicit_feature_forest'])
             if (
@@ -1468,12 +1624,12 @@ class ExperimentConfig:
                     **arch_data['dragonnet_drlearner']
                 )
             if (
-                'non_neural_agentic_forest' in arch_data
-                and isinstance(arch_data['non_neural_agentic_forest'], dict)
+                'multi_model_agentic_forest' in arch_data
+                and isinstance(arch_data['multi_model_agentic_forest'], dict)
             ):
-                arch_data['non_neural_agentic_forest'] = (
-                    NonNeuralAgenticForestConfig(
-                        **arch_data['non_neural_agentic_forest']
+                arch_data['multi_model_agentic_forest'] = (
+                    MultiModelAgenticForestConfig(
+                        **arch_data['multi_model_agentic_forest']
                     )
                 )
             return ModelArchitectureConfig(**arch_data)
@@ -1541,6 +1697,11 @@ class ExperimentConfig:
                 "model_type='confounder_forest' has been removed. "
                 "Use model_type='explicit_feature_forest'."
             )
+        if self.applied_inference.architecture.model_type == "non_neural_agentic_forest":
+            raise ValueError(
+                "model_type='non_neural_agentic_forest' has been removed. "
+                "Use model_type='multi_model_agentic_forest'."
+            )
         if self.applied_inference.architecture.model_type == "agentic_attention_variable_forest":
             avf_config = self.applied_inference.architecture.agentic_attention_variable_forest
             if not (
@@ -1580,7 +1741,7 @@ class ExperimentConfig:
             and self.applied_inference.architecture.model_type not in {
                 "agentic_explicit_feature_forest",
                 "agentic_attention_variable_forest",
-                "non_neural_agentic_forest",
+                "multi_model_agentic_forest",
             }
         ):
             raise ValueError(

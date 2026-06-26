@@ -1091,7 +1091,7 @@ def test_agentic_runner_resolves_aliases_then_harmonizes_values(tmp_path):
 
         def propose(self, context):
             self.contexts.append(context)
-            if context["prompt_version"] == "non_neural_agentic_alias_resolution_v1":
+            if context["prompt_version"] == "multi_model_agentic_alias_resolution_v1":
                 return {
                     "groups": [
                         {
@@ -1109,7 +1109,7 @@ def test_agentic_runner_resolves_aliases_then_harmonizes_values(tmp_path):
                     ],
                     "unmerged": [],
                 }
-            if context["prompt_version"] == "non_neural_agentic_value_harmonization_v1":
+            if context["prompt_version"] == "multi_model_agentic_value_harmonization_v1":
                 return {
                     "features": [
                         {
@@ -1195,8 +1195,8 @@ def test_agentic_runner_resolves_aliases_then_harmonizes_values(tmp_path):
     assert age.type == "continuous"
     assert "numeric value only" in age.description
     assert [context["prompt_version"] for context in agent.contexts] == [
-        "non_neural_agentic_alias_resolution_v1",
-        "non_neural_agentic_value_harmonization_v1",
+        "multi_model_agentic_alias_resolution_v1",
+        "multi_model_agentic_value_harmonization_v1",
     ]
     assert [event["event"] for event in runner.decision_events] == [
         "alias_resolution",

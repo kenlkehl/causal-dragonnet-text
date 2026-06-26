@@ -118,6 +118,7 @@ class ConceptEmbeddingCache:
         chunk_overlap_words: int,
         max_chunks: int,
         normalize_embeddings: bool = True,
+        chunk_selection: str = "first",
     ):
         self._cache_dir = Path(cache_dir)
         self._sentence_model_name = sentence_model_name
@@ -126,6 +127,7 @@ class ConceptEmbeddingCache:
         self._chunk_overlap_words = chunk_overlap_words
         self._max_chunks = max_chunks
         self._normalize_embeddings = normalize_embeddings
+        self._chunk_selection = str(chunk_selection).strip().lower()
         self._cache_hash = self.compute_cache_hash(
             sentence_model_name=sentence_model_name,
             dataset_path=dataset_path,
@@ -133,6 +135,7 @@ class ConceptEmbeddingCache:
             chunk_overlap_words=chunk_overlap_words,
             max_chunks=max_chunks,
             normalize_embeddings=normalize_embeddings,
+            chunk_selection=self._chunk_selection,
         )
         self._cache_path = self._cache_dir / f"cecnn_chunk_embeddings_{self._cache_hash}"
         self._flat_mmap = None
@@ -149,6 +152,7 @@ class ConceptEmbeddingCache:
         chunk_overlap_words: int,
         max_chunks: int,
         normalize_embeddings: bool = True,
+        chunk_selection: str = "first",
     ) -> str:
         key = "|".join(
             [
@@ -158,6 +162,7 @@ class ConceptEmbeddingCache:
                 f"overlap{chunk_overlap_words}",
                 f"max{max_chunks}",
                 f"norm{int(normalize_embeddings)}",
+                f"select{str(chunk_selection).strip().lower()}",
             ]
         )
         return hashlib.md5(key.encode()).hexdigest()[:12]
@@ -267,6 +272,7 @@ class ConceptEmbeddingCache:
                 self._chunk_size_words,
                 self._chunk_overlap_words,
                 self._max_chunks,
+                self._chunk_selection,
             )
             for text in texts
         ]
@@ -420,6 +426,7 @@ class ConceptEmbeddingCache:
                 self._chunk_size_words,
                 self._chunk_overlap_words,
                 self._max_chunks,
+                self._chunk_selection,
             )
             for text in texts
         ]

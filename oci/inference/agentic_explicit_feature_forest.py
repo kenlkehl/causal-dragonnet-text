@@ -996,7 +996,7 @@ class AgenticFeatureSearchRunner:
             return selected_specs
 
         context = {
-            "prompt_version": "non_neural_agentic_alias_resolution_v1",
+            "prompt_version": "multi_model_agentic_alias_resolution_v1",
             "agentic_path": "agentic_explicit_feature_forest",
             "outer_fold": int(outer_fold),
             "known_canonical_features": [_spec_to_dict(spec) for spec in known_specs],
@@ -1063,7 +1063,7 @@ class AgenticFeatureSearchRunner:
             return selected_specs
 
         context = {
-            "prompt_version": "non_neural_agentic_value_harmonization_v1",
+            "prompt_version": "multi_model_agentic_value_harmonization_v1",
             "agentic_path": "agentic_explicit_feature_forest",
             "outer_fold": int(outer_fold),
             "selected_features": [_spec_to_dict(spec) for spec in selected_specs],
@@ -1409,10 +1409,10 @@ class OpenAICompatibleFeatureSearchAgent:
         )
         is_consensus_disambiguation = context.get("prompt_version") in {
             "agentic_attention_consensus_disambiguation_v1",
-            "non_neural_agentic_alias_resolution_v1",
+            "multi_model_agentic_alias_resolution_v1",
         }
         is_value_harmonization = (
-            context.get("prompt_version") == "non_neural_agentic_value_harmonization_v1"
+            context.get("prompt_version") == "multi_model_agentic_value_harmonization_v1"
         )
 
         for attempt_idx in range(max_repair_attempts + 1):
@@ -1985,22 +1985,22 @@ def build_agent_prompt(
     if context.get("prompt_version") == "agentic_attention_consensus_recovery_v1":
         return build_attention_consensus_recovery_prompt(context, search_config)
 
-    if context.get("prompt_version") == "non_neural_agentic_alias_resolution_v1":
-        return build_non_neural_agentic_alias_resolution_prompt(context, search_config)
+    if context.get("prompt_version") == "multi_model_agentic_alias_resolution_v1":
+        return build_multi_model_agentic_alias_resolution_prompt(context, search_config)
 
-    if context.get("prompt_version") == "non_neural_agentic_value_harmonization_v1":
-        return build_non_neural_agentic_value_harmonization_prompt(
+    if context.get("prompt_version") == "multi_model_agentic_value_harmonization_v1":
+        return build_multi_model_agentic_value_harmonization_prompt(
             context, search_config
         )
 
-    if context.get("prompt_version") == "non_neural_agentic_consistency_v1":
-        return build_non_neural_agentic_consistency_prompt(context, search_config)
+    if context.get("prompt_version") == "multi_model_agentic_consistency_v1":
+        return build_multi_model_agentic_consistency_prompt(context, search_config)
 
     if context.get("prompt_version") == "agentic_attention_variable_forest_v1":
         return build_attention_variable_agent_prompt(context, search_config)
 
-    if context.get("prompt_version") == "non_neural_agentic_forest_v1":
-        return build_non_neural_agentic_forest_prompt(context, search_config)
+    if context.get("prompt_version") == "multi_model_agentic_forest_v1":
+        return build_multi_model_agentic_forest_prompt(context, search_config)
 
     if context.get("search_mode") == "broad_screen":
         if context.get("broad_screen_stage") == "selection":
@@ -2200,11 +2200,11 @@ Current attention-consensus recovery context:
 """
 
 
-def build_non_neural_agentic_alias_resolution_prompt(
+def build_multi_model_agentic_alias_resolution_prompt(
     context: Dict[str, Any],
     search_config: AgenticFeatureSearchConfig,
 ) -> str:
-    """Construct a generic alias-resolution prompt for non-neural proposals."""
+    """Construct a generic alias-resolution prompt for multi-model proposals."""
     del search_config
     context_json = json.dumps(context, indent=2, default=_json_default)
     return f"""You are resolving aliases among explicit patient-level variables proposed for causal inference.
@@ -2244,7 +2244,7 @@ Current alias-resolution context:
 """
 
 
-def build_non_neural_agentic_value_harmonization_prompt(
+def build_multi_model_agentic_value_harmonization_prompt(
     context: Dict[str, Any],
     search_config: AgenticFeatureSearchConfig,
 ) -> str:
@@ -2287,11 +2287,11 @@ Current value-harmonization context:
 """
 
 
-def build_non_neural_agentic_forest_prompt(
+def build_multi_model_agentic_forest_prompt(
     context: Dict[str, Any],
     search_config: AgenticFeatureSearchConfig,
 ) -> str:
-    """Construct the proposal prompt for sparse BoW feature review."""
+    """Construct the proposal prompt for sparse BoW and embedding evidence review."""
     context_json = json.dumps(context, indent=2, default=_json_default)
     max_proposals = int(
         context.get(
@@ -2299,20 +2299,30 @@ def build_non_neural_agentic_forest_prompt(
             max(1, int(getattr(search_config, "max_additions_per_iter", 6))),
         )
     )
-    return f"""You are helping convert sparse bag-of-words model evidence into explicit variables for causal inference.
+    return f"""You are helping convert multi-view sparse bag-of-words and embedding-retrieval evidence into explicit variables for causal inference.
 
-The upstream models are non-neural:
-- cross-fitted bag-of-words treatment and outcome models produce honest nuisance predictions;
-- an unweighted R pseudo-target is computed as (Y - m_hat) / (T - e_hat);
-- a bag-of-words regression model predicts that pseudo-target.
+The upstream models are multi-model:
+- each configured bag-of-words view has its own vectorizer/model settings;
+- each view cross-fits treatment and outcome nuisance models;
+- each view computes its own R pseudo-target as (Y - m_hat) / (T - e_hat);
+- each view fits a bag-of-words regression model for that pseudo-target;
+- feature_importance.views contains the per-view outputs, and
+  feature_importance.phrase_consensus summarizes repeated phrase evidence.
+- optional embedding contrasts rank real text chunks and concept phrases by
+  alignment with treatment, outcome, and per-view R-pseudo-target directions.
 
 Your task is to propose at most {max_proposals} extractable pre-treatment patient-level variables for a downstream causal forest.
 
 Rules:
 - Propose variables, not raw tokens. Convert token patterns into precise extractable patient-level variables.
-- Pay special attention to feature_importance.phrase_features: it summarizes
-  top 2-4 token n-grams with treatment, outcome, confounder-overlap, and
-  pseudo-target scores.
+- Review all feature_importance.views. Repeated support across views is stronger,
+  but a clinically coherent single-view signal can still be worth proposing.
+- Pay special attention to feature_importance.phrase_consensus: it summarizes
+  repeated 2-4 token n-gram signals with treatment, outcome,
+  confounder-overlap, and pseudo-target evidence.
+- When embedding_contrast_evidence is present, use the retrieved real text chunks
+  and concept_probe_scores as supporting examples. Do not claim that the vector
+  difference itself has a directly decoded meaning.
 - Variables supported by both treatment and outcome feature weights should usually be confounders.
 - Variables supported by pseudo-target feature weights should usually be effect modifiers.
 - A variable may have both roles when justified.
@@ -2337,16 +2347,16 @@ Return JSON only with this shape:
   ]
 }}
 
-Current BoW feature-review context:
+Current feature-review context:
 {context_json}
 """
 
 
-def build_non_neural_agentic_consistency_prompt(
+def build_multi_model_agentic_consistency_prompt(
     context: Dict[str, Any],
     search_config: AgenticFeatureSearchConfig,
 ) -> str:
-    """Construct the consistency-selection prompt for non-neural candidates."""
+    """Construct the consistency-selection prompt for multi-model candidates."""
     del search_config
     context_json = json.dumps(context, indent=2, default=_json_default)
     return f"""You are selecting stable explicit variables for a causal forest from candidates proposed on separate inner folds.

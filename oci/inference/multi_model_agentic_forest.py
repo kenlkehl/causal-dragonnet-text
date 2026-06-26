@@ -1,4 +1,4 @@
-"""Non-neural BoW-guided agentic variable discovery plus causal forest."""
+"""Multi-model BoW-guided agentic variable discovery plus causal forest."""
 
 from __future__ import annotations
 
@@ -21,9 +21,10 @@ from sklearn.model_selection import KFold, StratifiedKFold
 from ..config import (
     AgenticFeatureSearchConfig,
     AppliedInferenceConfig,
+    BoWViewConfig,
     ExplicitFeatureForestConfig,
     ExplicitFeatureSpec,
-    NonNeuralAgenticForestConfig,
+    MultiModelAgenticForestConfig,
     load_explicit_feature_specs_json,
 )
 from ..models.explicit_feature_featurizer import get_raw_explicit_features
@@ -44,6 +45,10 @@ from .agentic_explicit_feature_forest import (
     apply_agentic_value_harmonization,
     validate_agentic_proposals,
 )
+from .embedding_contrast_discovery import (
+    EmbeddingContrastEvidenceGenerator,
+    redact_embedding_contrast_evidence,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -55,7 +60,7 @@ _DASH_TRANSLATION = dict.fromkeys(
 )
 
 
-def run_non_neural_agentic_forest(
+def run_multi_model_agentic_forest(
     dataset: pd.DataFrame,
     config: AppliedInferenceConfig,
     output_path: Path,
@@ -64,10 +69,11 @@ def run_non_neural_agentic_forest(
     proposal_agent: Optional[Any] = None,
     extraction_provider: Optional[Any] = None,
     evaluator: Optional[Any] = None,
+    embedding_provider: Optional[Any] = None,
 ) -> None:
     """Run BoW-guided agentic variable discovery and final explicit-feature forest."""
     del device
-    runner = NonNeuralAgenticForestRunner(
+    runner = MultiModelAgenticForestRunner(
         dataset=dataset,
         config=config,
         output_path=output_path,
@@ -75,11 +81,12 @@ def run_non_neural_agentic_forest(
         proposal_agent=proposal_agent,
         extraction_provider=extraction_provider,
         evaluator=evaluator,
+        embedding_provider=embedding_provider,
     )
     runner.run()
 
 
-class NonNeuralAgenticForestRunner:
+class MultiModelAgenticForestRunner:
     """Sparse-text discovery path for explicit-variable causal forests."""
 
     def __init__(
@@ -91,24 +98,26 @@ class NonNeuralAgenticForestRunner:
         proposal_agent: Optional[Any] = None,
         extraction_provider: Optional[Any] = None,
         evaluator: Optional[Any] = None,
+        embedding_provider: Optional[Any] = None,
     ) -> None:
         self.dataset = dataset.reset_index(drop=True).copy()
         self.dataset["_oci_row_id"] = np.arange(len(self.dataset), dtype=int)
         self.config = config
         self.output_path = Path(output_path)
-        self.artifact_dir = self.output_path.parent / "non_neural_agentic_forest"
+        self.artifact_dir = self.output_path.parent / "multi_model_agentic_forest"
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self.num_workers = 1 if num_workers is None else int(num_workers)
         self._has_external_components = (
             proposal_agent is not None
             or extraction_provider is not None
             or evaluator is not None
+            or embedding_provider is not None
         )
 
-        self.nn_config: NonNeuralAgenticForestConfig = getattr(
+        self.nn_config: MultiModelAgenticForestConfig = getattr(
             config.architecture,
-            "non_neural_agentic_forest",
-            NonNeuralAgenticForestConfig(),
+            "multi_model_agentic_forest",
+            MultiModelAgenticForestConfig(),
         )
         self.search_config: AgenticFeatureSearchConfig = getattr(
             config.architecture,
@@ -131,9 +140,14 @@ class NonNeuralAgenticForestRunner:
             config=config,
             cf_config=self.cf_config,
         )
+        self.embedding_provider = embedding_provider
+        self.embedding_evidence_generator: Optional[
+            EmbeddingContrastEvidenceGenerator
+        ] = None
 
         self.bow_prediction_frames: List[pd.DataFrame] = []
         self.importance_rows: List[Dict[str, Any]] = []
+        self.embedding_evidence_rows: List[Dict[str, Any]] = []
         self.agent_rows: List[Dict[str, Any]] = []
         self.feature_set_rows: List[Dict[str, Any]] = []
         self.outer_metric_rows: List[Dict[str, Any]] = []
@@ -141,11 +155,13 @@ class NonNeuralAgenticForestRunner:
 
     def run(self) -> None:
         logger.info("=" * 80)
-        logger.info("NON-NEURAL AGENTIC FEATURE CAUSAL FOREST")
+        logger.info("MULTI-MODEL AGENTIC FEATURE CAUSAL FOREST")
         logger.info("=" * 80)
         self._ensure_prespecified_features()
 
         splits = self._analysis_splits()
+        if self._embedding_contrast_enabled() and self.embedding_provider is None:
+            self._embedding_contrast_generator().prepare(self.dataset)
         outer_n_jobs = self._outer_n_jobs(len(splits))
         if outer_n_jobs > 1 and self._has_external_components:
             logger.warning(
@@ -157,7 +173,7 @@ class NonNeuralAgenticForestRunner:
         if outer_n_jobs > 1:
             backend = self._parallel_backend_name()
             logger.info(
-                "Running %s non-neural outer fold(s) with outer_parallelism=%s "
+                "Running %s multi-model outer fold(s) with outer_parallelism=%s "
                 "backend=%s joblib_backend=%s",
                 len(splits),
                 outer_n_jobs,
@@ -170,7 +186,7 @@ class NonNeuralAgenticForestRunner:
                 batch_size=1,
                 pre_dispatch="all",
             )(
-                delayed(_run_non_neural_outer_fold_worker)(
+                delayed(_run_multi_model_outer_fold_worker)(
                     self.dataset,
                     self.config,
                     self.artifact_dir,
@@ -186,6 +202,7 @@ class NonNeuralAgenticForestRunner:
             for item in fold_results:
                 self.bow_prediction_frames.extend(item["bow_prediction_frames"])
                 self.importance_rows.extend(item["importance_rows"])
+                self.embedding_evidence_rows.extend(item["embedding_evidence_rows"])
                 self.agent_rows.extend(item["agent_rows"])
                 self.feature_set_rows.extend(item["feature_set_rows"])
                 self.outer_metric_rows.extend(item["outer_metric_rows"])
@@ -193,7 +210,7 @@ class NonNeuralAgenticForestRunner:
             prediction_frames: List[pd.DataFrame] = []
             for outer_fold, train_idx, test_idx in splits:
                 logger.info(
-                    "Non-neural agentic fold %s: train=%s test=%s",
+                    "Multi-model agentic fold %s: train=%s test=%s",
                     outer_fold,
                     len(train_idx),
                     len(test_idx),
@@ -218,12 +235,12 @@ class NonNeuralAgenticForestRunner:
         outer_n_jobs: int,
     ) -> Dict[str, Any]:
         logger.info(
-            "Non-neural agentic isolated fold %s: train=%s test=%s",
+            "Multi-model agentic isolated fold %s: train=%s test=%s",
             outer_fold,
             len(train_idx),
             len(test_idx),
         )
-        fold_runner = NonNeuralAgenticForestRunner(
+        fold_runner = MultiModelAgenticForestRunner(
             dataset=self.dataset,
             config=self.config,
             output_path=(
@@ -243,6 +260,7 @@ class NonNeuralAgenticForestRunner:
             "predictions": predictions,
             "bow_prediction_frames": fold_runner.bow_prediction_frames,
             "importance_rows": fold_runner.importance_rows,
+            "embedding_evidence_rows": fold_runner.embedding_evidence_rows,
             "agent_rows": fold_runner.agent_rows,
             "feature_set_rows": fold_runner.feature_set_rows,
             "outer_metric_rows": fold_runner.outer_metric_rows,
@@ -274,7 +292,7 @@ class NonNeuralAgenticForestRunner:
 
         all_idx = np.arange(len(self.dataset))
         logger.warning(
-            "No held-out split configured for non_neural_agentic_forest; "
+            "No held-out split configured for multi_model_agentic_forest; "
             "variable discovery and final estimates will use the full dataset."
         )
         return [(1, all_idx, all_idx)]
@@ -289,12 +307,44 @@ class NonNeuralAgenticForestRunner:
         discovery_df = self.dataset.iloc[train_idx].reset_index(drop=True)
         bow_result = self._fit_bow_discovery(discovery_df, outer_fold)
         self.bow_prediction_frames.append(bow_result["predictions"])
+        artifact_context = self._artifact_agent_context(bow_result["context"])
+        for view in bow_result["importance"].get("views", []) or []:
+            feature_importance = {
+                key: value
+                for key, value in view.items()
+                if key not in {"view_name", "view_index", "view_config", "metrics"}
+            }
+            self.importance_rows.append(
+                {
+                    "record_type": "view",
+                    "outer_fold": int(outer_fold),
+                    "view_index": int(view.get("view_index", -1)),
+                    "view_name": view.get("view_name"),
+                    "view_config": view.get("view_config"),
+                    "metrics": view.get("metrics"),
+                    "feature_importance": feature_importance,
+                }
+            )
         self.importance_rows.append(
             {
+                "record_type": "consensus",
                 "outer_fold": int(outer_fold),
-                "context": bow_result["context"],
+                "phrase_consensus": bow_result["importance"].get("phrase_consensus", []),
+                "context": artifact_context,
             }
         )
+        embedding_evidence = bow_result.get("embedding_contrast_evidence") or {}
+        if embedding_evidence:
+            self.embedding_evidence_rows.append(
+                {
+                    "outer_fold": int(outer_fold),
+                    "embedding_contrast_evidence": (
+                        embedding_evidence
+                        if self.search_config.save_agent_context
+                        else redact_embedding_contrast_evidence(embedding_evidence)
+                    ),
+                }
+            )
 
         selected_specs = self._propose_selected_specs(
             outer_fold=outer_fold,
@@ -372,13 +422,80 @@ class NonNeuralAgenticForestRunner:
             prespecified_specs,
         )
 
+        view_results: List[Dict[str, Any]] = []
+        for view_index, view in enumerate(self.nn_config.bow_views):
+            view_results.append(
+                self._fit_one_bow_view(
+                    discovery_df=discovery_df,
+                    texts=texts,
+                    y=y,
+                    t=t,
+                    outer_fold=outer_fold,
+                    view=view,
+                    view_index=view_index,
+                    explicit_feature_dicts=explicit_feature_dicts,
+                    explicit_specs=prespecified_specs,
+                )
+            )
+
+        predictions = pd.concat(
+            [result["predictions"] for result in view_results],
+            ignore_index=True,
+        )
+        metrics = _multi_view_metrics(view_results)
+        importance = _multi_view_importance(
+            view_results,
+            top_n=int(self.nn_config.top_n_features),
+        )
+        embedding_evidence = self._build_embedding_contrast_evidence(
+            discovery_df=discovery_df,
+            y=y,
+            t=t,
+            pseudo_target=[
+                result["pseudo_target"] for result in view_results
+            ],
+            t_resid=[
+                result["t_resid"] for result in view_results
+            ],
+            importance=importance,
+        )
+        context = self._build_agent_context(
+            outer_fold=outer_fold,
+            discovery_df=discovery_df,
+            metrics=metrics,
+            importance=importance,
+            embedding_evidence=embedding_evidence,
+        )
+        return {
+            "predictions": predictions,
+            "metrics": metrics,
+            "importance": importance,
+            "embedding_contrast_evidence": embedding_evidence,
+            "context": context,
+        }
+
+    def _fit_one_bow_view(
+        self,
+        *,
+        discovery_df: pd.DataFrame,
+        texts: Sequence[str],
+        y: np.ndarray,
+        t: np.ndarray,
+        outer_fold: int,
+        view: BoWViewConfig,
+        view_index: int,
+        explicit_feature_dicts: Optional[List[Dict[str, Any]]] = None,
+        explicit_specs: Optional[List[ExplicitFeatureSpec]] = None,
+    ) -> Dict[str, Any]:
         e_hat = self._crossfit_binary(
             texts,
             t,
             "treatment",
             outer_fold,
+            view=view,
+            view_index=view_index,
             explicit_feature_dicts=explicit_feature_dicts,
-            explicit_specs=prespecified_specs,
+            explicit_specs=explicit_specs,
         )
         if self.config.outcome_type == "continuous":
             m_hat = self._crossfit_continuous(
@@ -386,8 +503,10 @@ class NonNeuralAgenticForestRunner:
                 y,
                 "outcome",
                 outer_fold,
+                view=view,
+                view_index=view_index,
                 explicit_feature_dicts=explicit_feature_dicts,
-                explicit_specs=prespecified_specs,
+                explicit_specs=explicit_specs,
             )
         else:
             m_hat = self._crossfit_binary(
@@ -395,8 +514,10 @@ class NonNeuralAgenticForestRunner:
                 y,
                 "outcome",
                 outer_fold,
+                view=view,
+                view_index=view_index,
                 explicit_feature_dicts=explicit_feature_dicts,
-                explicit_specs=prespecified_specs,
+                explicit_specs=explicit_specs,
             )
 
         e_clipped = np.clip(e_hat, self.nn_config.e_clip, 1.0 - self.nn_config.e_clip)
@@ -408,8 +529,10 @@ class NonNeuralAgenticForestRunner:
             texts,
             pseudo_target,
             outer_fold,
+            view=view,
+            view_index=view_index,
             explicit_feature_dicts=explicit_feature_dicts,
-            explicit_specs=prespecified_specs,
+            explicit_specs=explicit_specs,
         )
         r_loss = (y_resid - tau_hat * t_resid) ** 2
         r_loss_at_zero = y_resid**2
@@ -418,12 +541,14 @@ class NonNeuralAgenticForestRunner:
             {
                 "_oci_row_id": discovery_df["_oci_row_id"].to_numpy(),
                 "outer_fold": int(outer_fold),
+                "view_index": int(view_index),
+                "view_name": str(view.name),
                 "e_hat": e_hat,
                 "m_hat": m_hat,
                 "y_residual": y_resid,
                 "t_residual": t_resid,
                 "pseudo_target": pseudo_target,
-                "tau_hat_non_neural": tau_hat,
+                "tau_hat_multi_model": tau_hat,
                 "r_loss": r_loss,
                 "r_loss_at_zero_tau": r_loss_at_zero,
             }
@@ -447,20 +572,18 @@ class NonNeuralAgenticForestRunner:
             y=y,
             t=t,
             pseudo_target=pseudo_target,
+            view=view,
             explicit_feature_dicts=explicit_feature_dicts,
-            explicit_specs=prespecified_specs,
-        )
-        context = self._build_agent_context(
-            outer_fold=outer_fold,
-            discovery_df=discovery_df,
-            metrics=metrics,
-            importance=importance,
+            explicit_specs=explicit_specs,
         )
         return {
             "predictions": predictions,
             "metrics": metrics,
             "importance": importance,
-            "context": context,
+            "pseudo_target": pseudo_target,
+            "t_resid": t_resid,
+            "view": view,
+            "view_index": int(view_index),
         }
 
     def _crossfit_binary(
@@ -470,12 +593,19 @@ class NonNeuralAgenticForestRunner:
         label_name: str,
         outer_fold: int,
         *,
+        view: BoWViewConfig,
+        view_index: int,
         explicit_feature_dicts: Optional[List[Dict[str, Any]]] = None,
         explicit_specs: Optional[List[ExplicitFeatureSpec]] = None,
     ) -> np.ndarray:
         labels = labels.astype(int)
         oof = np.full(len(labels), np.nan, dtype=float)
-        random_state = 11_000 + 100 * outer_fold + (1 if label_name == "outcome" else 2)
+        random_state = (
+            11_000
+            + 100 * outer_fold
+            + 1_000 * int(view_index)
+            + (1 if label_name == "outcome" else 2)
+        )
         split_items = list(
             enumerate(
                 _binary_split_items(
@@ -487,13 +617,14 @@ class NonNeuralAgenticForestRunner:
             )
         )
         folds = len(split_items)
-        vectorizer_params = self._vectorizer_params()
-        model_params = self._model_params()
+        vectorizer_params = self._vectorizer_params(view)
+        model_params = self._model_params(view)
 
         def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
             logger.info(
-                "Outer fold %s BoW %s nuisance fold %s/%s: train=%s heldout=%s",
+                "Outer fold %s BoW view=%s %s nuisance fold %s/%s: train=%s heldout=%s",
                 outer_fold,
+                view.name,
                 label_name,
                 fold,
                 folds,
@@ -524,6 +655,8 @@ class NonNeuralAgenticForestRunner:
         label_name: str,
         outer_fold: int,
         *,
+        view: BoWViewConfig,
+        view_index: int,
         explicit_feature_dicts: Optional[List[Dict[str, Any]]] = None,
         explicit_specs: Optional[List[ExplicitFeatureSpec]] = None,
     ) -> np.ndarray:
@@ -532,16 +665,17 @@ class NonNeuralAgenticForestRunner:
         splitter = KFold(
             n_splits=folds,
             shuffle=True,
-            random_state=12_000 + 100 * outer_fold,
+            random_state=12_000 + 100 * outer_fold + 1_000 * int(view_index),
         )
         split_items = list(enumerate(splitter.split(texts), start=1))
-        vectorizer_params = self._vectorizer_params()
-        model_params = self._model_params()
+        vectorizer_params = self._vectorizer_params(view)
+        model_params = self._model_params(view)
 
         def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
             logger.info(
-                "Outer fold %s BoW %s nuisance fold %s/%s: train=%s heldout=%s",
+                "Outer fold %s BoW view=%s %s nuisance fold %s/%s: train=%s heldout=%s",
                 outer_fold,
+                view.name,
                 label_name,
                 fold,
                 folds,
@@ -571,6 +705,8 @@ class NonNeuralAgenticForestRunner:
         pseudo_target: np.ndarray,
         outer_fold: int,
         *,
+        view: BoWViewConfig,
+        view_index: int,
         explicit_feature_dicts: Optional[List[Dict[str, Any]]] = None,
         explicit_specs: Optional[List[ExplicitFeatureSpec]] = None,
     ) -> np.ndarray:
@@ -579,16 +715,17 @@ class NonNeuralAgenticForestRunner:
         splitter = KFold(
             n_splits=folds,
             shuffle=True,
-            random_state=13_000 + outer_fold,
+            random_state=13_000 + outer_fold + 1_000 * int(view_index),
         )
         split_items = list(enumerate(splitter.split(texts), start=1))
-        vectorizer_params = self._vectorizer_params()
-        model_params = self._model_params()
+        vectorizer_params = self._vectorizer_params(view)
+        model_params = self._model_params(view)
 
         def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
             logger.info(
-                "Outer fold %s BoW pseudo-target fold %s/%s: train=%s heldout=%s",
+                "Outer fold %s BoW view=%s pseudo-target fold %s/%s: train=%s heldout=%s",
                 outer_fold,
+                view.name,
                 fold,
                 folds,
                 len(fit_pos),
@@ -618,10 +755,11 @@ class NonNeuralAgenticForestRunner:
         t: np.ndarray,
         pseudo_target: np.ndarray,
         *,
+        view: BoWViewConfig,
         explicit_feature_dicts: Optional[List[Dict[str, Any]]] = None,
         explicit_specs: Optional[List[ExplicitFeatureSpec]] = None,
     ) -> Dict[str, Any]:
-        vectorizer = self._make_vectorizer()
+        vectorizer = self._make_vectorizer(view)
         x_text = vectorizer.fit_transform(texts)
         x_model, features, explicit_feature_names = _append_explicit_features_full(
             x_text,
@@ -633,30 +771,30 @@ class NonNeuralAgenticForestRunner:
         def fit_treatment() -> np.ndarray:
             if len(np.unique(t.astype(int))) < 2:
                 return np.zeros(len(features), dtype=float)
-            treatment_model = self._make_classifier(random_state=101)
+            treatment_model = self._make_classifier(view, random_state=101)
             treatment_model.fit(x_model, t.astype(int))
             return _model_feature_scores(treatment_model, len(features))
 
         def fit_outcome() -> np.ndarray:
             if self.config.outcome_type == "continuous":
-                outcome_model = self._make_regressor(random_state=202)
+                outcome_model = self._make_regressor(view, random_state=202)
                 outcome_model.fit(x_model, y)
                 return _model_feature_scores(outcome_model, len(features))
             if len(np.unique(y.astype(int))) < 2:
                 return np.zeros(len(features), dtype=float)
-            outcome_model = self._make_classifier(random_state=202)
+            outcome_model = self._make_classifier(view, random_state=202)
             outcome_model.fit(x_model, y.astype(int))
             return _model_feature_scores(outcome_model, len(features))
 
         def fit_effect() -> np.ndarray:
-            effect_model = self._make_regressor(random_state=303)
+            effect_model = self._make_regressor(view, random_state=303)
             effect_model.fit(x_model, pseudo_target)
             return _model_feature_scores(effect_model, len(features))
 
         n_jobs = self._feature_importance_n_jobs()
         if n_jobs > 1:
             logger.info(
-                "Non-neural BoW feature-importance parallelism: tasks=3 n_jobs=%s",
+                "Multi-model BoW feature-importance parallelism: tasks=3 n_jobs=%s",
                 n_jobs,
             )
             treatment_coef, outcome_coef, effect_coef = Parallel(
@@ -675,6 +813,8 @@ class NonNeuralAgenticForestRunner:
         top_n = int(self.nn_config.top_n_features)
         confounder_score = np.abs(treatment_coef) * np.abs(outcome_coef)
         return {
+            "view_name": str(view.name),
+            "view_config": _bow_view_to_dict(view),
             "n_features": int(len(features)),
             "n_bow_features": int(len(vectorizer.get_feature_names_out())),
             "n_prespecified_features": int(len(explicit_specs or [])),
@@ -795,9 +935,10 @@ class NonNeuralAgenticForestRunner:
         discovery_df: pd.DataFrame,
         metrics: Dict[str, Any],
         importance: Dict[str, Any],
+        embedding_evidence: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        return {
-            "prompt_version": "non_neural_agentic_forest_v1",
+        context = {
+            "prompt_version": "multi_model_agentic_forest_v1",
             "outer_fold": int(outer_fold),
             "max_proposals": int(self.nn_config.candidate_proposals_per_fold),
             "clinical_question": self.config.clinical_question,
@@ -807,11 +948,20 @@ class NonNeuralAgenticForestRunner:
                 "outcome_type": self.config.outcome_type,
             },
             "instructions": [
-                "Review sparse bag-of-words feature weights from honest nuisance models and an unweighted R pseudo-target model.",
+                "Review every sparse bag-of-words model view. Each view has its "
+                "own honest nuisance predictions, R pseudo-target, metrics, and "
+                "feature-importance summaries.",
+                "Use feature_importance.phrase_consensus as a cross-view summary, "
+                "but also inspect feature_importance.views for useful signals that "
+                "appear in only one model or n-gram setting.",
+                "When embedding_contrast_evidence is present, use aligned real-text "
+                "chunks and concept scores as retrieval evidence, not as direct "
+                "vector interpretations.",
                 "Suggest explicit pre-treatment patient-level variables, not raw text tokens.",
                 "Use variables predictive of both treatment and outcome as confounders.",
                 "Use variables predictive of the pseudo-target as effect modifiers.",
-                "Avoid near-duplicate aliases for the same extraction target; a separate alias-resolution pass may merge proposal names.",
+                "Avoid near-duplicate aliases for the same extraction target; a "
+                "separate alias-resolution pass may merge proposal names.",
             ],
             "current_features": [_spec_to_dict(spec) for spec in self._initial_specs()],
             "model_diagnostics": _agent_visible_metrics(metrics),
@@ -837,6 +987,65 @@ class NonNeuralAgenticForestRunner:
                 ]
             },
         }
+        if embedding_evidence:
+            context["embedding_contrast_evidence"] = embedding_evidence
+        return context
+
+    def _embedding_contrast_enabled(self) -> bool:
+        embedding_config = getattr(self.nn_config, "embedding_contrast", None)
+        return bool(getattr(embedding_config, "enabled", False))
+
+    def _embedding_contrast_generator(self) -> EmbeddingContrastEvidenceGenerator:
+        if self.embedding_evidence_generator is None:
+            self.embedding_evidence_generator = EmbeddingContrastEvidenceGenerator(
+                config=self.config,
+                output_dir=self.artifact_dir,
+                embedding_provider=self.embedding_provider,
+            )
+        return self.embedding_evidence_generator
+
+    def _build_embedding_contrast_evidence(
+        self,
+        *,
+        discovery_df: pd.DataFrame,
+        y: np.ndarray,
+        t: np.ndarray,
+        pseudo_target: Any,
+        t_resid: Any,
+        importance: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not self._embedding_contrast_enabled():
+            return {}
+        try:
+            generator = self._embedding_contrast_generator()
+            generator.prepare(self.dataset)
+            return generator.build_evidence(
+                discovery_df=discovery_df,
+                y=y,
+                t=t,
+                pseudo_target=pseudo_target,
+                t_resid=t_resid,
+                pseudo_target_names=[view.name for view in self.nn_config.bow_views],
+                importance=importance,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Embedding contrast evidence generation failed; continuing with BoW evidence: %s",
+                exc,
+                exc_info=True,
+            )
+            return {"enabled": True, "error": str(exc)}
+
+    def _artifact_agent_context(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        if self.search_config.save_agent_context:
+            return context
+        if "embedding_contrast_evidence" not in context:
+            return context
+        artifact_context = dict(context)
+        artifact_context["embedding_contrast_evidence"] = (
+            redact_embedding_contrast_evidence(context["embedding_contrast_evidence"])
+        )
+        return artifact_context
 
     def _propose_selected_specs(
         self,
@@ -1119,7 +1328,7 @@ class NonNeuralAgenticForestRunner:
             ]
 
         logger.info(
-            "Non-neural candidate consistency parallelism: outer_fold=%s "
+            "Multi-model candidate consistency parallelism: outer_fold=%s "
             "inner_folds=%s n_jobs=%s setting=%s backend=%s joblib_backend=%s",
             outer_fold,
             len(split_items),
@@ -1134,7 +1343,7 @@ class NonNeuralAgenticForestRunner:
             batch_size=1,
             pre_dispatch="all",
         )(
-            delayed(_build_non_neural_inner_candidate_bundle_worker)(
+            delayed(_build_multi_model_inner_candidate_bundle_worker)(
                 self.dataset,
                 self.config,
                 self.artifact_dir,
@@ -1159,7 +1368,7 @@ class NonNeuralAgenticForestRunner:
         total_inner_folds: int,
         candidate_n_jobs: int,
     ) -> Dict[str, Any]:
-        worker = NonNeuralAgenticForestRunner(
+        worker = MultiModelAgenticForestRunner(
             dataset=self.dataset,
             config=self.config,
             output_path=(
@@ -1212,7 +1421,7 @@ class NonNeuralAgenticForestRunner:
             )
         except Exception as exc:
             logger.warning(
-                "Skipping non-neural candidate consistency inner fold %s/%s "
+                "Skipping multi-model candidate consistency inner fold %s/%s "
                 "for outer fold %s: %s",
                 inner_fold,
                 total_inner_folds,
@@ -1357,7 +1566,7 @@ class NonNeuralAgenticForestRunner:
             if item.get("passes_consistency_gate")
         ]
         return {
-            "prompt_version": "non_neural_agentic_consistency_v1",
+            "prompt_version": "multi_model_agentic_consistency_v1",
             "outer_fold": int(outer_fold),
             "max_selected_candidates": int(self.nn_config.candidate_proposals_per_fold),
             "inner_fold_count": int(inner_fold_count),
@@ -1428,7 +1637,7 @@ class NonNeuralAgenticForestRunner:
             return filtered, result
         except Exception as exc:
             logger.warning(
-                "Non-neural candidate consistency selection failed; using gate fallback",
+                "Multi-model candidate consistency selection failed; using gate fallback",
                 exc_info=True,
             )
             return fallback, {
@@ -1472,7 +1681,7 @@ class NonNeuralAgenticForestRunner:
             return proposals, {"skipped": "fewer_than_two_additions_and_no_known_features"}
 
         context = {
-            "prompt_version": "non_neural_agentic_alias_resolution_v1",
+            "prompt_version": "multi_model_agentic_alias_resolution_v1",
             "outer_fold": int(outer_fold),
             "known_canonical_features": [_spec_to_dict(spec) for spec in known_specs],
             "proposed_features": [
@@ -1494,7 +1703,7 @@ class NonNeuralAgenticForestRunner:
             alias_trace = _get_agent_response_trace(self.proposal_agent)
         except Exception as exc:
             logger.warning(
-                "Non-neural alias resolution failed; using unmerged proposal names",
+                "Multi-model alias resolution failed; using unmerged proposal names",
                 exc_info=True,
             )
             return proposals, {"error": str(exc), "applied_aliases": []}
@@ -1522,7 +1731,7 @@ class NonNeuralAgenticForestRunner:
             return selected_specs, {"skipped": "no_selected_features"}
 
         context = {
-            "prompt_version": "non_neural_agentic_value_harmonization_v1",
+            "prompt_version": "multi_model_agentic_value_harmonization_v1",
             "outer_fold": int(outer_fold),
             "selected_features": [_spec_to_dict(spec) for spec in selected_specs],
             "missing_value_policy": (
@@ -1536,7 +1745,7 @@ class NonNeuralAgenticForestRunner:
             harmonization_trace = _get_agent_response_trace(self.proposal_agent)
         except Exception as exc:
             logger.warning(
-                "Non-neural value harmonization failed; using unharmonized specs",
+                "Multi-model value harmonization failed; using unharmonized specs",
                 exc_info=True,
             )
             return selected_specs, {"error": str(exc), "applied": []}
@@ -1592,7 +1801,7 @@ class NonNeuralAgenticForestRunner:
             else:
                 dropped.append({"name": spec.name, "coverage": coverage})
         if dropped:
-            logger.info("Dropped low-coverage non-neural agentic features: %s", dropped)
+            logger.info("Dropped low-coverage multi-model agentic features: %s", dropped)
             self.agent_rows.append({"event": "coverage_filter", "dropped": dropped})
         return kept
 
@@ -1616,43 +1825,47 @@ class NonNeuralAgenticForestRunner:
             specs.extend(load_explicit_feature_specs_json(str(json_path)))
         return _dedupe_specs(specs)
 
-    def _vectorizer_params(self) -> Dict[str, Any]:
+    def _vectorizer_params(self, view: BoWViewConfig) -> Dict[str, Any]:
         return {
-            "ngram_range_min": int(self.nn_config.ngram_range_min),
-            "ngram_range_max": int(self.nn_config.ngram_range_max),
-            "min_df": int(self.nn_config.min_df),
-            "max_df": float(self.nn_config.max_df),
-            "sublinear_tf": bool(self.nn_config.sublinear_tf),
-            "max_features": int(self.nn_config.max_features),
+            "ngram_range_min": int(view.ngram_range_min),
+            "ngram_range_max": int(view.ngram_range_max),
+            "min_df": int(view.min_df),
+            "max_df": float(view.max_df),
+            "sublinear_tf": bool(view.sublinear_tf),
+            "max_features": int(view.max_features),
         }
 
-    def _model_params(self) -> Dict[str, Any]:
+    def _model_params(self, view: BoWViewConfig) -> Dict[str, Any]:
         return {
-            "bow_model": str(self.nn_config.bow_model).strip().lower(),
-            "logistic_c": float(self.nn_config.logistic_c),
-            "logistic_max_iter": int(self.nn_config.logistic_max_iter),
-            "ridge_alpha": float(self.nn_config.ridge_alpha),
+            "bow_model": str(view.bow_model).strip().lower(),
+            "logistic_c": float(view.logistic_c),
+            "logistic_max_iter": int(view.logistic_max_iter),
+            "ridge_alpha": float(view.ridge_alpha),
         }
 
-    def _make_vectorizer(self) -> TfidfVectorizer:
-        return _make_bow_vectorizer(self._vectorizer_params())
+    def _make_vectorizer(self, view: BoWViewConfig) -> TfidfVectorizer:
+        return _make_bow_vectorizer(self._vectorizer_params(view))
 
-    def _make_classifier(self, random_state: int = 17):
-        return _make_bow_classifier(self._model_params(), random_state=random_state)
+    def _make_classifier(self, view: BoWViewConfig, random_state: int = 17):
+        return _make_bow_classifier(self._model_params(view), random_state=random_state)
 
-    def _make_regressor(self, random_state: int = 17):
-        return _make_bow_regressor(self._model_params(), random_state=random_state)
+    def _make_regressor(self, view: BoWViewConfig, random_state: int = 17):
+        return _make_bow_regressor(self._model_params(view), random_state=random_state)
 
-    def _make_logistic_regression(self, random_state: int = 17) -> LogisticRegression:
+    def _make_logistic_regression(
+        self,
+        view: BoWViewConfig,
+        random_state: int = 17,
+    ) -> LogisticRegression:
         return LogisticRegression(
-            C=float(self.nn_config.logistic_c),
+            C=float(view.logistic_c),
             solver="liblinear",
-            max_iter=int(self.nn_config.logistic_max_iter),
+            max_iter=int(view.logistic_max_iter),
             random_state=random_state,
         )
 
-    def _make_ridge(self) -> Ridge:
-        return Ridge(alpha=float(self.nn_config.ridge_alpha), random_state=17)
+    def _make_ridge(self, view: BoWViewConfig) -> Ridge:
+        return Ridge(alpha=float(view.ridge_alpha), random_state=17)
 
     def _parallel_n_jobs(self, setting: Any, tasks: int, *, auto_workers: int) -> int:
         if tasks <= 0:
@@ -1716,7 +1929,7 @@ class NonNeuralAgenticForestRunner:
             ]
         backend = self._parallel_backend_name()
         logger.info(
-            "Non-neural BoW cross-fit parallelism: folds=%s n_jobs=%s "
+            "Multi-model BoW cross-fit parallelism: folds=%s n_jobs=%s "
             "setting=%s backend=%s joblib_backend=%s",
             len(split_items),
             n_jobs,
@@ -1737,26 +1950,34 @@ class NonNeuralAgenticForestRunner:
     def _save_predictions(self, results_df: pd.DataFrame) -> None:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         results_df.to_parquet(self.output_path, index=False)
-        logger.info("Non-neural agentic forest predictions saved to: %s", self.output_path)
+        logger.info("Multi-model agentic forest predictions saved to: %s", self.output_path)
 
     def _save_artifacts(self) -> None:
         if self.bow_prediction_frames:
             pd.concat(self.bow_prediction_frames).to_parquet(
-                self.artifact_dir / "bow_oof_predictions.parquet",
+                self.artifact_dir / "bow_view_oof_predictions.parquet",
                 index=False,
             )
         pd.DataFrame(self.outer_metric_rows).to_csv(
             self.artifact_dir / "outer_cv_metrics.csv",
             index=False,
         )
-        _write_jsonl(self.artifact_dir / "bow_feature_importance_by_fold.jsonl", self.importance_rows)
+        _write_jsonl(
+            self.artifact_dir / "bow_view_feature_importance_by_fold.jsonl",
+            self.importance_rows,
+        )
+        if self.embedding_evidence_rows:
+            _write_jsonl(
+                self.artifact_dir / "embedding_contrast_evidence_by_fold.jsonl",
+                self.embedding_evidence_rows,
+            )
         _write_jsonl(self.artifact_dir / "agent_candidate_proposals.jsonl", self.agent_rows)
         with open(self.artifact_dir / "selected_feature_sets.json", "w") as f:
             json.dump(self.feature_set_rows, f, indent=2, default=_json_default)
-        logger.info("Non-neural agentic forest artifacts saved to: %s", self.artifact_dir)
+        logger.info("Multi-model agentic forest artifacts saved to: %s", self.artifact_dir)
 
 
-def _run_non_neural_outer_fold_worker(
+def _run_multi_model_outer_fold_worker(
     dataset: pd.DataFrame,
     config: AppliedInferenceConfig,
     artifact_dir: Path,
@@ -1766,13 +1987,13 @@ def _run_non_neural_outer_fold_worker(
     num_workers: int,
 ) -> Dict[str, Any]:
     logger.info(
-        "Non-neural agentic isolated fold %s: train=%s test=%s workers=%s",
+        "Multi-model agentic isolated fold %s: train=%s test=%s workers=%s",
         outer_fold,
         len(train_idx),
         len(test_idx),
         num_workers,
     )
-    fold_runner = NonNeuralAgenticForestRunner(
+    fold_runner = MultiModelAgenticForestRunner(
         dataset=dataset,
         config=config,
         output_path=(
@@ -1792,13 +2013,14 @@ def _run_non_neural_outer_fold_worker(
         "predictions": predictions,
         "bow_prediction_frames": fold_runner.bow_prediction_frames,
         "importance_rows": fold_runner.importance_rows,
+        "embedding_evidence_rows": fold_runner.embedding_evidence_rows,
         "agent_rows": fold_runner.agent_rows,
         "feature_set_rows": fold_runner.feature_set_rows,
         "outer_metric_rows": fold_runner.outer_metric_rows,
     }
 
 
-def _build_non_neural_inner_candidate_bundle_worker(
+def _build_multi_model_inner_candidate_bundle_worker(
     dataset: pd.DataFrame,
     config: AppliedInferenceConfig,
     artifact_dir: Path,
@@ -1810,7 +2032,7 @@ def _build_non_neural_inner_candidate_bundle_worker(
     total_inner_folds: int,
     num_workers: int,
 ) -> Dict[str, Any]:
-    worker = NonNeuralAgenticForestRunner(
+    worker = MultiModelAgenticForestRunner(
         dataset=dataset,
         config=config,
         output_path=(
@@ -2522,6 +2744,169 @@ def _finite_or_none(value: Any) -> Optional[float]:
     if not np.isfinite(numeric):
         return None
     return numeric
+
+
+def _bow_view_to_dict(view: BoWViewConfig) -> Dict[str, Any]:
+    return {
+        "name": str(view.name),
+        "bow_model": str(view.bow_model),
+        "ngram_range_min": int(view.ngram_range_min),
+        "ngram_range_max": int(view.ngram_range_max),
+        "min_df": int(view.min_df),
+        "max_df": float(view.max_df),
+        "max_features": int(view.max_features),
+        "sublinear_tf": bool(view.sublinear_tf),
+        "logistic_c": float(view.logistic_c),
+        "logistic_max_iter": int(view.logistic_max_iter),
+        "ridge_alpha": float(view.ridge_alpha),
+    }
+
+
+def _multi_view_metrics(view_results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    if not view_results:
+        return {"n_bow_views": 0}
+    primary = _select_primary_bow_view(view_results)
+    primary_metrics = primary.get("metrics", {})
+    metrics: Dict[str, Any] = {
+        "n_bow_views": int(len(view_results)),
+        "primary_view": str(primary["view"].name),
+        "primary_view_index": int(primary["view_index"]),
+        "views": [
+            {
+                "view_name": str(result["view"].name),
+                "view_index": int(result["view_index"]),
+                "view_config": _bow_view_to_dict(result["view"]),
+                "metrics": _agent_visible_metrics(result.get("metrics", {})),
+            }
+            for result in view_results
+        ],
+    }
+    for key, value in _scalar_metrics(primary_metrics).items():
+        metrics[f"primary_{key}"] = value
+    best_improvement = max(
+        (
+            value
+            for value in (
+                _finite_or_none(result.get("metrics", {}).get("r_loss_relative_improvement"))
+                for result in view_results
+            )
+            if value is not None
+        ),
+        default=None,
+    )
+    metrics["best_r_loss_relative_improvement"] = best_improvement
+    return metrics
+
+
+def _select_primary_bow_view(view_results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    def score(result: Dict[str, Any]) -> Tuple[float, float]:
+        metrics = result.get("metrics", {})
+        improvement = _finite_or_none(metrics.get("r_loss_relative_improvement"))
+        tau_corr = _finite_or_none(metrics.get("tau_hat_pseudo_target_corr"))
+        return (
+            float("-inf") if improvement is None else improvement,
+            float("-inf") if tau_corr is None else abs(tau_corr),
+        )
+
+    return max(view_results, key=score)
+
+
+def _multi_view_importance(
+    view_results: Sequence[Dict[str, Any]],
+    *,
+    top_n: int,
+) -> Dict[str, Any]:
+    views = []
+    for result in view_results:
+        importance = dict(result.get("importance", {}))
+        importance["view_name"] = str(result["view"].name)
+        importance["view_index"] = int(result["view_index"])
+        importance["view_config"] = _bow_view_to_dict(result["view"])
+        importance["metrics"] = _agent_visible_metrics(result.get("metrics", {}))
+        views.append(importance)
+    consensus = _consensus_phrase_feature_rows(views, top_n=top_n)
+    return {
+        "n_views": int(len(views)),
+        "views": views,
+        "phrase_features": consensus,
+        "phrase_consensus": consensus,
+    }
+
+
+def _consensus_phrase_feature_rows(
+    view_importances: Sequence[Dict[str, Any]],
+    *,
+    top_n: int,
+) -> List[Dict[str, Any]]:
+    accumulator: Dict[str, Dict[str, Any]] = {}
+    for view in view_importances:
+        view_name = str(view.get("view_name", "view"))
+        for row in view.get("phrase_features", []) or []:
+            feature = str(row.get("feature", "")).strip()
+            if not feature:
+                continue
+            key = _normalize_text(feature)
+            entry = accumulator.setdefault(
+                key,
+                {
+                    "feature": feature,
+                    "supporting_views": set(),
+                    "view_scores": [],
+                    "abs_confounder_scores": [],
+                    "abs_effect_scores": [],
+                },
+            )
+            entry["supporting_views"].add(view_name)
+            confounder_score = abs(
+                float(row.get("confounder_overlap_score") or 0.0)
+            )
+            effect_score = abs(float(row.get("abs_pseudo_target_score") or 0.0))
+            entry["abs_confounder_scores"].append(confounder_score)
+            entry["abs_effect_scores"].append(effect_score)
+            entry["view_scores"].append(
+                {
+                    "view_name": view_name,
+                    "combined_score": row.get("combined_score"),
+                    "confounder_overlap_score": row.get("confounder_overlap_score"),
+                    "treatment_score": row.get("treatment_score"),
+                    "outcome_score": row.get("outcome_score"),
+                    "pseudo_target_score": row.get("pseudo_target_score"),
+                }
+            )
+
+    rows: List[Dict[str, Any]] = []
+    for entry in accumulator.values():
+        confounder_scores = entry["abs_confounder_scores"]
+        effect_scores = entry["abs_effect_scores"]
+        supporting_views = sorted(entry["supporting_views"])
+        best_confounder = max(confounder_scores) if confounder_scores else 0.0
+        best_effect = max(effect_scores) if effect_scores else 0.0
+        mean_confounder = float(np.mean(confounder_scores)) if confounder_scores else 0.0
+        mean_effect = float(np.mean(effect_scores)) if effect_scores else 0.0
+        rows.append(
+            {
+                "feature": entry["feature"],
+                "supporting_view_count": int(len(supporting_views)),
+                "supporting_views": supporting_views,
+                "best_abs_confounder_score": _finite_or_none(best_confounder),
+                "mean_abs_confounder_score": _finite_or_none(mean_confounder),
+                "best_abs_effect_score": _finite_or_none(best_effect),
+                "mean_abs_effect_score": _finite_or_none(mean_effect),
+                "view_scores": entry["view_scores"],
+            }
+        )
+
+    rows.sort(
+        key=lambda row: (
+            int(row["supporting_view_count"]),
+            float(row.get("best_abs_confounder_score") or 0.0),
+            float(row.get("best_abs_effect_score") or 0.0),
+            float(row.get("mean_abs_confounder_score") or 0.0),
+            float(row.get("mean_abs_effect_score") or 0.0),
+        ),
+        reverse=True,
+    )
+    return rows[:top_n]
 
 
 def _agent_visible_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:

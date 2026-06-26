@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Oracle runner for the non-neural BoW-guided agentic forest path."""
+"""Oracle runner for the multi-model BoW-guided agentic forest path."""
 
 from __future__ import annotations
 
@@ -9,9 +9,9 @@ import json
 import logging
 import sys
 import traceback
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -23,13 +23,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from oci.config import (  # noqa: E402
     AgenticFeatureSearchConfig,
     AppliedInferenceConfig,
+    BoWViewConfig,
+    EmbeddingContrastDiscoveryConfig,
     ExplicitFeatureExtractionConfig,
     ExplicitFeatureForestConfig,
     ModelArchitectureConfig,
-    NonNeuralAgenticForestConfig,
+    MultiModelAgenticForestConfig,
 )
-from oci.inference.non_neural_agentic_forest import (  # noqa: E402
-    run_non_neural_agentic_forest,
+from oci.inference.multi_model_agentic_forest import (  # noqa: E402
+    run_multi_model_agentic_forest,
 )
 from run_oracle_experiments import _resolve_parquet_file  # noqa: E402
 
@@ -42,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class NonNeuralAgenticOracleConfig:
+class MultiModelAgenticOracleConfig:
     dataset_path: str
     dataset_name: str
     n_folds: int = 5
@@ -53,6 +55,8 @@ class NonNeuralAgenticOracleConfig:
 
     nuisance_folds: int = 5
     effect_folds: int = 5
+    bow_view_grid: str = "default_broad"
+    bow_views_json: Optional[str] = None
     max_features: int = 30000
     min_df: int = 5
     max_df: float = 0.95
@@ -74,6 +78,23 @@ class NonNeuralAgenticOracleConfig:
     outer_parallelism: str = "1"
     bow_parallel_backend: str = "processes"
     fold_parallelism: str = "auto"
+
+    embedding_contrast_enabled: bool = False
+    embedding_model_name: str = "Qwen/Qwen3-Embedding-8B"
+    embedding_cache_dir: Optional[str] = None
+    embedding_device: Optional[str] = None
+    embedding_batch_size: int = 16
+    embedding_chunk_size_words: int = 256
+    embedding_chunk_overlap_words: int = 64
+    embedding_max_chunks: int = 64
+    embedding_chunk_selection: str = "last"
+    embedding_top_k_chunks_per_tail: int = 12
+    embedding_max_chunks_per_patient: int = 2
+    embedding_min_probe_auc: float = 0.0
+    embedding_pseudo_target_quantile: float = 0.20
+    embedding_pseudo_target_weighted: bool = True
+    embedding_concept_phrases: List[str] = field(default_factory=list)
+    embedding_residualize_columns: List[str] = field(default_factory=list)
 
     cf_n_estimators: int = 200
     cf_min_samples_leaf: int = 10
@@ -116,9 +137,10 @@ class NonNeuralAgenticOracleConfig:
 
 
 def _make_applied_config(
-    config: NonNeuralAgenticOracleConfig,
+    config: MultiModelAgenticOracleConfig,
     parquet_file: Path,
 ) -> AppliedInferenceConfig:
+    bow_views = _bow_views_for_config(config)
     return AppliedInferenceConfig(
         clinical_question=(
             "Estimate heterogeneous treatment effects from clinical text and "
@@ -131,7 +153,7 @@ def _make_applied_config(
         treatment_column="treatment_indicator",
         cv_folds=config.n_folds,
         architecture=ModelArchitectureConfig(
-            model_type="non_neural_agentic_forest",
+            model_type="multi_model_agentic_forest",
             explicit_feature_forest=ExplicitFeatureForestConfig(
                 n_estimators=config.cf_n_estimators,
                 max_depth=config.cf_max_depth,
@@ -160,18 +182,11 @@ def _make_applied_config(
                 save_agent_raw_output=config.agent_save_raw_output,
                 random_state=config.seed,
             ),
-            non_neural_agentic_forest=NonNeuralAgenticForestConfig(
+            multi_model_agentic_forest=MultiModelAgenticForestConfig(
                 nuisance_folds=config.nuisance_folds,
                 effect_folds=config.effect_folds,
-                max_features=config.max_features,
-                min_df=config.min_df,
-                max_df=config.max_df,
-                ngram_range_min=config.ngram_range_min,
-                ngram_range_max=config.ngram_range_max,
-                bow_model=config.bow_model,
+                bow_views=bow_views,
                 prespecified_features_json=config.prespecified_features_json,
-                logistic_c=config.logistic_c,
-                ridge_alpha=config.ridge_alpha,
                 e_clip=config.e_clip,
                 top_n_features=config.top_n_features,
                 candidate_proposals_per_fold=config.candidate_proposals_per_fold,
@@ -184,6 +199,24 @@ def _make_applied_config(
                 outer_parallelism=config.outer_parallelism,
                 bow_parallel_backend=config.bow_parallel_backend,
                 fold_parallelism=config.fold_parallelism,
+                embedding_contrast=EmbeddingContrastDiscoveryConfig(
+                    enabled=config.embedding_contrast_enabled,
+                    model_name=config.embedding_model_name,
+                    cache_dir=config.embedding_cache_dir,
+                    device=config.embedding_device,
+                    batch_size=config.embedding_batch_size,
+                    chunk_size_words=config.embedding_chunk_size_words,
+                    chunk_overlap_words=config.embedding_chunk_overlap_words,
+                    max_chunks=config.embedding_max_chunks,
+                    chunk_selection=config.embedding_chunk_selection,
+                    top_k_chunks_per_tail=config.embedding_top_k_chunks_per_tail,
+                    max_chunks_per_patient=config.embedding_max_chunks_per_patient,
+                    min_probe_auc=config.embedding_min_probe_auc,
+                    pseudo_target_quantile=config.embedding_pseudo_target_quantile,
+                    pseudo_target_weighted=config.embedding_pseudo_target_weighted,
+                    concept_phrases=config.embedding_concept_phrases,
+                    residualize_columns=config.embedding_residualize_columns,
+                ),
             ),
         ),
         explicit_features=ExplicitFeatureExtractionConfig(
@@ -207,7 +240,88 @@ def _make_applied_config(
     )
 
 
-def _load_dataset(config: NonNeuralAgenticOracleConfig, parquet_file: Path) -> pd.DataFrame:
+def _bow_views_for_config(config: MultiModelAgenticOracleConfig) -> List[BoWViewConfig]:
+    if config.bow_views_json:
+        with open(config.bow_views_json) as f:
+            payload = json.load(f)
+        entries = payload.get("bow_views", payload) if isinstance(payload, dict) else payload
+        if not isinstance(entries, list):
+            raise ValueError("--bow-views-json must contain a list or {'bow_views': [...]}")
+        return [
+            entry if isinstance(entry, BoWViewConfig) else BoWViewConfig(**entry)
+            for entry in entries
+        ]
+
+    grid = str(config.bow_view_grid).strip().lower()
+    if grid == "default_broad":
+        return []
+    if grid == "linear_sweep":
+        return [
+            BoWViewConfig(
+                name="linear_unigram_c0p5",
+                bow_model="linear",
+                ngram_range_min=1,
+                ngram_range_max=1,
+                max_features=config.max_features,
+                min_df=config.min_df,
+                max_df=config.max_df,
+                logistic_c=0.5,
+                ridge_alpha=max(config.ridge_alpha, 20.0),
+            ),
+            BoWViewConfig(
+                name="linear_1_2",
+                bow_model="linear",
+                ngram_range_min=1,
+                ngram_range_max=2,
+                max_features=config.max_features,
+                min_df=config.min_df,
+                max_df=config.max_df,
+                logistic_c=config.logistic_c,
+                ridge_alpha=config.ridge_alpha,
+            ),
+            BoWViewConfig(
+                name="linear_1_3",
+                bow_model="linear",
+                ngram_range_min=1,
+                ngram_range_max=3,
+                max_features=config.max_features,
+                min_df=config.min_df,
+                max_df=config.max_df,
+                logistic_c=config.logistic_c,
+                ridge_alpha=config.ridge_alpha,
+            ),
+            BoWViewConfig(
+                name="linear_2_4_min_df3",
+                bow_model="linear",
+                ngram_range_min=2,
+                ngram_range_max=4,
+                max_features=config.max_features,
+                min_df=min(config.min_df, 3),
+                max_df=config.max_df,
+                logistic_c=config.logistic_c,
+                ridge_alpha=config.ridge_alpha,
+            ),
+        ]
+    if grid == "cli_single":
+        return [
+            BoWViewConfig(
+                name="cli_view",
+                max_features=config.max_features,
+                min_df=config.min_df,
+                max_df=config.max_df,
+                ngram_range_min=config.ngram_range_min,
+                ngram_range_max=config.ngram_range_max,
+                bow_model=config.bow_model,
+                logistic_c=config.logistic_c,
+                ridge_alpha=config.ridge_alpha,
+            )
+        ]
+    raise ValueError(
+        "--bow-view-grid must be one of default_broad, linear_sweep, or cli_single"
+    )
+
+
+def _load_dataset(config: MultiModelAgenticOracleConfig, parquet_file: Path) -> pd.DataFrame:
     df = pd.read_parquet(parquet_file).reset_index(drop=True)
     if config.sample_size is not None and config.sample_size < len(df):
         df = (
@@ -270,22 +384,22 @@ def _metrics(results_df: pd.DataFrame) -> Dict[str, Any]:
     return metrics
 
 
-def _run_one(config: NonNeuralAgenticOracleConfig, output_dir: Path) -> Dict[str, Any]:
+def _run_one(config: MultiModelAgenticOracleConfig, output_dir: Path) -> Dict[str, Any]:
     parquet_file = _resolve_parquet_file(config.dataset_path)
     df = _load_dataset(config, parquet_file)
     applied = _make_applied_config(config, parquet_file)
     run_hash = config.config_hash()
-    prediction_dir = output_dir / "non_neural_agentic_predictions" / run_hash
+    prediction_dir = output_dir / "multi_model_agentic_predictions" / run_hash
     prediction_dir.mkdir(parents=True, exist_ok=True)
     prediction_path = prediction_dir / "predictions.parquet"
 
     logger.info(
-        "Running non-neural agentic forest dataset=%s rows=%s hash=%s",
+        "Running multi-model agentic forest dataset=%s rows=%s hash=%s",
         config.dataset_name,
         len(df),
         run_hash,
     )
-    run_non_neural_agentic_forest(
+    run_multi_model_agentic_forest(
         df,
         applied,
         prediction_path,
@@ -325,7 +439,7 @@ def _append_results(output_dir: Path, result_rows: Sequence[Dict[str, Any]]) -> 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run non-neural BoW-guided agentic explicit-feature causal forest"
+        description="Run multi-model BoW-guided agentic explicit-feature causal forest"
     )
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -342,6 +456,21 @@ def main() -> None:
 
     parser.add_argument("--nuisance-folds", type=int, default=5)
     parser.add_argument("--effect-folds", type=int, default=5)
+    parser.add_argument(
+        "--bow-view-grid",
+        default="default_broad",
+        choices=["default_broad", "linear_sweep", "cli_single"],
+        help=(
+            "BoW view preset. default_broad uses the library's multi-view grid; "
+            "linear_sweep uses linear TF-IDF views only; cli_single uses the "
+            "single view defined by --bow-model and n-gram/vectorizer flags."
+        ),
+    )
+    parser.add_argument(
+        "--bow-views-json",
+        default=None,
+        help="Optional JSON list, or {'bow_views': [...]}, of BoWViewConfig-shaped views.",
+    )
     parser.add_argument("--max-features", type=int, default=30000)
     parser.add_argument("--min-df", type=int, default=5)
     parser.add_argument("--max-df", type=float, default=0.95)
@@ -356,6 +485,7 @@ def main() -> None:
             "linear is sparse logistic/ridge; tree options allow feature interactions."
         ),
     )
+    parser.add_argument("--logistic-c", type=float, default=1.0)
     parser.add_argument(
         "--prespecified-features-json",
         default=None,
@@ -392,6 +522,46 @@ def main() -> None:
             "Parallelism for inner-fold agentic consistency candidate proposal: "
             "'auto' uses runner workers, or pass a positive integer."
         ),
+    )
+
+    parser.add_argument(
+        "--enable-embedding-contrast",
+        action="store_true",
+        help="Add patient-level embedding contrast retrieval evidence for the proposal agent.",
+    )
+    parser.add_argument("--embedding-model-name", default="Qwen/Qwen3-Embedding-8B")
+    parser.add_argument("--embedding-cache-dir", default=None)
+    parser.add_argument("--embedding-device", default=None)
+    parser.add_argument("--embedding-batch-size", type=int, default=16)
+    parser.add_argument("--embedding-chunk-size-words", type=int, default=256)
+    parser.add_argument("--embedding-chunk-overlap-words", type=int, default=64)
+    parser.add_argument("--embedding-max-chunks", type=int, default=64)
+    parser.add_argument(
+        "--embedding-chunk-selection",
+        default="last",
+        choices=["first", "last"],
+        help="Which chunks to keep when a patient has more than --embedding-max-chunks.",
+    )
+    parser.add_argument("--embedding-top-k-chunks-per-tail", type=int, default=12)
+    parser.add_argument("--embedding-max-chunks-per-patient", type=int, default=2)
+    parser.add_argument("--embedding-min-probe-auc", type=float, default=0.58)
+    parser.add_argument("--embedding-pseudo-target-quantile", type=float, default=0.20)
+    parser.add_argument(
+        "--embedding-unweighted-pseudo-target",
+        action="store_true",
+        help="Use unweighted R-pseudo contrasts instead of treatment-residual squared weights.",
+    )
+    parser.add_argument(
+        "--embedding-concept-phrase",
+        action="append",
+        default=[],
+        help="Concept phrase to probe against embedding contrast directions. May be repeated.",
+    )
+    parser.add_argument(
+        "--embedding-residualize-column",
+        action="append",
+        default=[],
+        help="Column to residualize out of patient embeddings before contrasts. May be repeated.",
     )
     parser.add_argument(
         "--outer-parallelism",
@@ -468,7 +638,7 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    config = NonNeuralAgenticOracleConfig(
+    config = MultiModelAgenticOracleConfig(
         dataset_path=args.dataset,
         dataset_name=Path(args.dataset).name,
         n_folds=args.n_folds,
@@ -478,12 +648,15 @@ def main() -> None:
         num_workers=args.num_workers,
         nuisance_folds=args.nuisance_folds,
         effect_folds=args.effect_folds,
+        bow_view_grid=args.bow_view_grid,
+        bow_views_json=args.bow_views_json,
         max_features=args.max_features,
         min_df=args.min_df,
         max_df=args.max_df,
         ngram_range_min=args.ngram_range_min,
         ngram_range_max=args.ngram_range_max,
         bow_model=args.bow_model,
+        logistic_c=args.logistic_c,
         prespecified_features_json=args.prespecified_features_json,
         ridge_alpha=args.ridge_alpha,
         top_n_features=args.top_n_features,
@@ -499,6 +672,22 @@ def main() -> None:
         outer_parallelism=args.outer_parallelism,
         bow_parallel_backend=args.bow_parallel_backend,
         fold_parallelism=args.fold_parallelism,
+        embedding_contrast_enabled=args.enable_embedding_contrast,
+        embedding_model_name=args.embedding_model_name,
+        embedding_cache_dir=args.embedding_cache_dir,
+        embedding_device=args.embedding_device,
+        embedding_batch_size=args.embedding_batch_size,
+        embedding_chunk_size_words=args.embedding_chunk_size_words,
+        embedding_chunk_overlap_words=args.embedding_chunk_overlap_words,
+        embedding_max_chunks=args.embedding_max_chunks,
+        embedding_chunk_selection=args.embedding_chunk_selection,
+        embedding_top_k_chunks_per_tail=args.embedding_top_k_chunks_per_tail,
+        embedding_max_chunks_per_patient=args.embedding_max_chunks_per_patient,
+        embedding_min_probe_auc=args.embedding_min_probe_auc,
+        embedding_pseudo_target_quantile=args.embedding_pseudo_target_quantile,
+        embedding_pseudo_target_weighted=not args.embedding_unweighted_pseudo_target,
+        embedding_concept_phrases=args.embedding_concept_phrase,
+        embedding_residualize_columns=args.embedding_residualize_column,
         cf_n_estimators=args.cf_n_estimators,
         cf_min_samples_leaf=args.cf_min_samples_leaf,
         cf_max_depth=args.cf_max_depth,
@@ -531,9 +720,9 @@ def main() -> None:
     try:
         result = _run_one(config, output_dir)
         _append_results(output_dir, [result])
-        logger.info("Completed non-neural agentic forest: %s", result["metrics"])
+        logger.info("Completed multi-model agentic forest: %s", result["metrics"])
     except Exception:
-        logger.error("Non-neural agentic forest run failed")
+        logger.error("Multi-model agentic forest run failed")
         traceback.print_exc()
         raise
 

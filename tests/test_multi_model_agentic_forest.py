@@ -7,23 +7,44 @@ import pandas as pd
 from oci.config import (
     AgenticFeatureSearchConfig,
     AppliedInferenceConfig,
+    BoWViewConfig,
+    EmbeddingContrastDiscoveryConfig,
     ExperimentConfig,
     ExplicitFeatureExtractionConfig,
     ExplicitFeatureForestConfig,
     ExplicitFeatureSpec,
     ModelArchitectureConfig,
-    NonNeuralAgenticForestConfig,
+    MultiModelAgenticForestConfig,
 )
 from oci.inference.agentic_explicit_feature_forest import (
     AgenticFeatureProposal,
     SplitEvaluation,
 )
-from oci.inference.non_neural_agentic_forest import (
+from oci.inference.embedding_contrast_discovery import (
+    EmbeddingContrastEvidenceGenerator,
+    _informative_chunk_text,
+    redact_embedding_contrast_evidence,
+)
+from oci.inference.multi_model_agentic_forest import (
     _candidate_consistency_threshold,
     _fallback_consistency_proposals,
     _fit_binary_bow_fold,
-    run_non_neural_agentic_forest,
+    run_multi_model_agentic_forest,
 )
+from oci.models.concept_embedding_utils import chunk_text_words
+
+
+def _linear_test_bow_views() -> list[BoWViewConfig]:
+    return [
+        BoWViewConfig(
+            name="linear_test",
+            max_features=1000,
+            min_df=1,
+            max_df=1.0,
+            ngram_range_min=1,
+            ngram_range_max=3,
+        )
+    ]
 
 
 class FakeProposalAgent:
@@ -32,7 +53,7 @@ class FakeProposalAgent:
 
     def propose(self, context):
         self.contexts.append(context)
-        if context.get("prompt_version") == "non_neural_agentic_alias_resolution_v1":
+        if context.get("prompt_version") == "multi_model_agentic_alias_resolution_v1":
             return {
                 "groups": [
                     {
@@ -50,7 +71,7 @@ class FakeProposalAgent:
                 ],
                 "unmerged": [{"name": "age", "reason": "No alias proposed."}],
             }
-        if context.get("prompt_version") == "non_neural_agentic_value_harmonization_v1":
+        if context.get("prompt_version") == "multi_model_agentic_value_harmonization_v1":
             return {
                 "features": [
                     {
@@ -157,7 +178,7 @@ class EmptyProposalAgent:
 
     def propose(self, context):
         self.contexts.append(context)
-        if context.get("prompt_version") == "non_neural_agentic_value_harmonization_v1":
+        if context.get("prompt_version") == "multi_model_agentic_value_harmonization_v1":
             return {"features": context.get("selected_features", [])}
         return []
 
@@ -187,7 +208,124 @@ class RecordingExtractionProvider:
         return dataset
 
 
-def test_non_neural_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path: Path):
+class KeywordEmbeddingProvider:
+    def encode_chunks(self, texts):
+        rows = []
+        for text in texts:
+            lower = str(text).lower()
+            row = np.zeros(8, dtype=np.float32)
+            for token, index in {
+                "brain": 0,
+                "liver": 1,
+                "cachexia": 2,
+                "pd-l1": 3,
+                "pdl1": 3,
+                "high": 4,
+                "low": 5,
+                "age": 6,
+            }.items():
+                if token in lower:
+                    row[index] += 1.0
+            row[7] = 0.1
+            rows.append(row)
+        return np.vstack(rows)
+
+
+def test_embedding_contrast_retrieval_filters_low_content_chunks():
+    assert not _informative_chunk_text("")
+    assert not _informative_chunk_text("--- ### <new_note> ---")
+    assert _informative_chunk_text("Brain MRI shows enhancing metastases.")
+
+
+def test_embedding_contrast_chunk_selection_keeps_last_chunks():
+    text = " ".join(f"w{i}" for i in range(1, 11))
+    first = chunk_text_words(text, chunk_size_words=3, chunk_overlap_words=0, max_chunks=2)
+    last = chunk_text_words(
+        text,
+        chunk_size_words=3,
+        chunk_overlap_words=0,
+        max_chunks=2,
+        chunk_selection="last",
+    )
+    assert first == ["w1 w2 w3", "w4 w5 w6"]
+    assert last == ["w7 w8 w9", "w10"]
+
+
+def test_embedding_contrast_evidence_retrieves_aligned_chunks(tmp_path: Path):
+    dataset = pd.DataFrame(
+        {
+            "_oci_row_id": np.arange(8),
+            "clinical_text": [
+                "brain metastases pd-l1 high",
+                "brain metastases pd-l1 high",
+                "liver lesion pd-l1 low",
+                "liver lesion pd-l1 low",
+                "brain metastases cachexia pd-l1 high",
+                "liver lesion stable disease",
+                "brain metastases cachexia",
+                "liver lesion stable disease",
+            ],
+            "site": ["a", "a", "b", "b", "a", "b", "a", "b"],
+        }
+    )
+    config = AppliedInferenceConfig(
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        architecture=ModelArchitectureConfig(
+            model_type="multi_model_agentic_forest",
+            multi_model_agentic_forest=MultiModelAgenticForestConfig(
+                embedding_contrast=EmbeddingContrastDiscoveryConfig(
+                    enabled=True,
+                    model_name="fake-keyword",
+                    chunk_size_words=4,
+                    chunk_overlap_words=0,
+                    max_chunks=2,
+                    min_probe_auc=0.0,
+                    top_k_chunks_per_tail=3,
+                    max_chunks_per_patient=1,
+                    concept_phrases=["brain metastases", "liver lesion"],
+                )
+            ),
+        ),
+    )
+    generator = EmbeddingContrastEvidenceGenerator(
+        config=config,
+        output_dir=tmp_path,
+        embedding_provider=KeywordEmbeddingProvider(),
+    )
+    generator.prepare(dataset)
+    evidence = generator.build_evidence(
+        discovery_df=dataset,
+        y=np.asarray([0, 1, 0, 0, 1, 0, 1, 0], dtype=float),
+        t=np.asarray([1, 1, 0, 0, 1, 0, 1, 0], dtype=float),
+        pseudo_target=np.asarray([1, 1, -1, -1, 1, -1, 1, -1], dtype=float),
+        t_resid=np.ones(8, dtype=float),
+        importance={"phrase_features": [{"feature": "pd-l1 high"}]},
+    )
+
+    treatment = next(item for item in evidence["contrasts"] if item["name"] == "treatment")
+    assert treatment["direction_source"] == "mean_difference"
+    assert treatment["probe_auc_role"] == "diagnostic_only"
+    assert any("brain" in row["text"] for row in treatment["positive_aligned_chunks"])
+    assert any("liver" in row["text"] for row in treatment["negative_aligned_chunks"])
+    assert any(
+        row["concept"] == "brain metastases"
+        for row in treatment["concept_probe_scores"]
+    )
+
+    redacted = redact_embedding_contrast_evidence(evidence)
+    redacted_treatment = next(
+        item for item in redacted["contrasts"] if item["name"] == "treatment"
+    )
+    assert all(row["text"] is None for row in redacted_treatment["positive_aligned_chunks"])
+    assert all(
+        row["text_redacted"] is True
+        for row in redacted_treatment["positive_aligned_chunks"]
+    )
+
+
+def test_multi_model_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path: Path):
     dataset = pd.DataFrame(
         {
             "clinical_text": [
@@ -212,7 +350,7 @@ def test_non_neural_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path: 
         outcome_column="outcome_indicator",
         cv_folds=2,
         architecture=ModelArchitectureConfig(
-            model_type="non_neural_agentic_forest",
+            model_type="multi_model_agentic_forest",
             explicit_feature_forest=ExplicitFeatureForestConfig(inference=False),
             agentic_feature_search=AgenticFeatureSearchConfig(
                 outer_folds=2,
@@ -222,11 +360,10 @@ def test_non_neural_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path: 
                 min_feature_coverage=0.1,
                 clinical_text_examples_per_prompt=0,
             ),
-            non_neural_agentic_forest=NonNeuralAgenticForestConfig(
+            multi_model_agentic_forest=MultiModelAgenticForestConfig(
                 nuisance_folds=2,
                 effect_folds=2,
-                max_features=1000,
-                min_df=1,
+                bow_views=_linear_test_bow_views(),
                 top_n_features=5,
                 candidate_consistency_enabled=False,
                 fold_parallelism="2",
@@ -238,7 +375,7 @@ def test_non_neural_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path: 
     evaluator = FakeEvaluator()
     output_path = tmp_path / "predictions.parquet"
 
-    run_non_neural_agentic_forest(
+    run_multi_model_agentic_forest(
         dataset,
         config,
         output_path,
@@ -259,9 +396,9 @@ def test_non_neural_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path: 
     assert set(predictions["selected_confounder_names"]) == {"age"}
     assert set(predictions["selected_effect_modifier_names"]) == {"pd_l1_expression"}
     assert agent.contexts
-    assert agent.contexts[0]["prompt_version"] == "non_neural_agentic_forest_v1"
-    assert agent.contexts[1]["prompt_version"] == "non_neural_agentic_alias_resolution_v1"
-    assert agent.contexts[2]["prompt_version"] == "non_neural_agentic_value_harmonization_v1"
+    assert agent.contexts[0]["prompt_version"] == "multi_model_agentic_forest_v1"
+    assert agent.contexts[1]["prompt_version"] == "multi_model_agentic_alias_resolution_v1"
+    assert agent.contexts[2]["prompt_version"] == "multi_model_agentic_value_harmonization_v1"
     assert "feature_importance" in agent.contexts[0]
     phrase_features = agent.contexts[0]["feature_importance"]["phrase_features"]
     assert phrase_features
@@ -293,12 +430,113 @@ def test_non_neural_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path: 
     assert age_specs
     assert all(spec.type == "continuous" and spec.categories is None for spec in age_specs)
     assert all("numeric value only" in (spec.description or "") for spec in age_specs)
-    artifact_dir = output_path.parent / "non_neural_agentic_forest"
-    assert (artifact_dir / "bow_oof_predictions.parquet").exists()
+    artifact_dir = output_path.parent / "multi_model_agentic_forest"
+    assert (artifact_dir / "bow_view_oof_predictions.parquet").exists()
+    assert (artifact_dir / "bow_view_feature_importance_by_fold.jsonl").exists()
     assert (artifact_dir / "agent_candidate_proposals.jsonl").exists()
 
 
-def test_non_neural_bow_fold_uses_prespecified_explicit_features():
+def test_multi_model_agentic_forest_adds_embedding_contrast_context(
+    tmp_path: Path,
+):
+    dataset = pd.DataFrame(
+        {
+            "clinical_text": [
+                "age 55 baseline note brain metastases pd-l1 high",
+                "age 78 baseline note liver lesion pd-l1 low",
+                "age 57 baseline note brain metastases pd-l1 high",
+                "age 76 baseline note liver lesion pd-l1 low",
+                "age 61 baseline note brain metastases cachexia",
+                "age 81 baseline note liver lesion stable",
+                "age 54 baseline note brain metastases cachexia",
+                "age 70 baseline note liver lesion stable",
+            ],
+            "treatment_indicator": [1, 0, 1, 0, 1, 0, 1, 0],
+            "outcome_indicator": [1, 0, 1, 0, 1, 0, 1, 0],
+        }
+    )
+    config = AppliedInferenceConfig(
+        outcome_type="binary",
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        cv_folds=0,
+        architecture=ModelArchitectureConfig(
+            model_type="multi_model_agentic_forest",
+            explicit_feature_forest=ExplicitFeatureForestConfig(inference=False),
+            agentic_feature_search=AgenticFeatureSearchConfig(
+                outer_folds=2,
+                inner_folds=2,
+                max_iterations=1,
+                max_additions_per_iter=4,
+                min_feature_coverage=0.1,
+                clinical_text_examples_per_prompt=0,
+            ),
+            multi_model_agentic_forest=MultiModelAgenticForestConfig(
+                nuisance_folds=2,
+                effect_folds=2,
+                bow_views=_linear_test_bow_views(),
+                top_n_features=5,
+                candidate_consistency_enabled=False,
+                fold_parallelism="1",
+                embedding_contrast=EmbeddingContrastDiscoveryConfig(
+                    enabled=True,
+                    model_name="fake-keyword",
+                    chunk_size_words=8,
+                    chunk_overlap_words=0,
+                    max_chunks=2,
+                    min_probe_auc=0.0,
+                    top_k_chunks_per_tail=2,
+                    max_chunks_per_patient=1,
+                    concept_phrases=["brain metastases", "liver lesion"],
+                ),
+            ),
+        ),
+        explicit_features=ExplicitFeatureExtractionConfig(enabled=True, features=[]),
+    )
+    agent = FakeProposalAgent()
+    output_path = tmp_path / "predictions.parquet"
+
+    run_multi_model_agentic_forest(
+        dataset,
+        config,
+        output_path,
+        proposal_agent=agent,
+        extraction_provider=FakeExtractionProvider(),
+        evaluator=FakeEvaluator(),
+        embedding_provider=KeywordEmbeddingProvider(),
+    )
+
+    first_context = agent.contexts[0]
+    assert "embedding_contrast_evidence" in first_context
+    treatment = next(
+        item
+        for item in first_context["embedding_contrast_evidence"]["contrasts"]
+        if item["name"] == "treatment"
+    )
+    assert any("brain" in row["text"] for row in treatment["positive_aligned_chunks"])
+
+    artifact_dir = output_path.parent / "multi_model_agentic_forest"
+    evidence_rows = [
+        json.loads(line)
+        for line in (artifact_dir / "embedding_contrast_evidence_by_fold.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert evidence_rows
+    artifact_treatment = next(
+        item
+        for item in evidence_rows[0]["embedding_contrast_evidence"]["contrasts"]
+        if item["name"] == "treatment"
+    )
+    assert all(row["text"] is None for row in artifact_treatment["positive_aligned_chunks"])
+    assert all(
+        row["text_redacted"] is True
+        for row in artifact_treatment["positive_aligned_chunks"]
+    )
+
+
+def test_multi_model_bow_fold_uses_prespecified_explicit_features():
     texts = ["same baseline note"] * 6
     labels = np.asarray([0, 0, 0, 1, 1, 1], dtype=float)
     explicit_values = [
@@ -342,7 +580,7 @@ def test_non_neural_bow_fold_uses_prespecified_explicit_features():
     assert pred[1] > pred[0]
 
 
-def test_non_neural_prespecified_features_extract_before_bow_and_merge_roles(
+def test_multi_model_prespecified_features_extract_before_bow_and_merge_roles(
     tmp_path: Path,
 ):
     dataset = pd.DataFrame(
@@ -368,7 +606,7 @@ def test_non_neural_prespecified_features_extract_before_bow_and_merge_roles(
         outcome_column="outcome_indicator",
         cv_folds=2,
         architecture=ModelArchitectureConfig(
-            model_type="non_neural_agentic_forest",
+            model_type="multi_model_agentic_forest",
             explicit_feature_forest=ExplicitFeatureForestConfig(inference=False),
             agentic_feature_search=AgenticFeatureSearchConfig(
                 outer_folds=2,
@@ -378,11 +616,10 @@ def test_non_neural_prespecified_features_extract_before_bow_and_merge_roles(
                 min_feature_coverage=0.1,
                 clinical_text_examples_per_prompt=0,
             ),
-            non_neural_agentic_forest=NonNeuralAgenticForestConfig(
+            multi_model_agentic_forest=MultiModelAgenticForestConfig(
                 nuisance_folds=2,
                 effect_folds=2,
-                max_features=1000,
-                min_df=1,
+                bow_views=_linear_test_bow_views(),
                 top_n_features=5,
                 candidate_consistency_enabled=False,
                 fold_parallelism="1",
@@ -413,7 +650,7 @@ def test_non_neural_prespecified_features_extract_before_bow_and_merge_roles(
     extractor = RecordingExtractionProvider()
     evaluator = FakeEvaluator()
 
-    run_non_neural_agentic_forest(
+    run_multi_model_agentic_forest(
         dataset,
         config,
         tmp_path / "predictions.parquet",
@@ -428,7 +665,7 @@ def test_non_neural_prespecified_features_extract_before_bow_and_merge_roles(
         ("biomarker", ("confounder", "effect_modifier")),
     ]
     first_context = agent.contexts[0]
-    assert first_context["prompt_version"] == "non_neural_agentic_forest_v1"
+    assert first_context["prompt_version"] == "multi_model_agentic_forest_v1"
     assert first_context["current_features"] == [
         {
             "name": "age",
@@ -448,9 +685,11 @@ def test_non_neural_prespecified_features_extract_before_bow_and_merge_roles(
         },
     ]
     importance = first_context["feature_importance"]
-    assert importance["n_prespecified_features"] == 2
-    assert "explicit:age_normalized" in importance["prespecified_raw_feature_names"]
-    assert "explicit:biomarker_positive" in importance["prespecified_raw_feature_names"]
+    assert importance["n_views"] == 1
+    first_view = importance["views"][0]
+    assert first_view["n_prespecified_features"] == 2
+    assert "explicit:age_normalized" in first_view["prespecified_raw_feature_names"]
+    assert "explicit:biomarker_positive" in first_view["prespecified_raw_feature_names"]
     seen_roles = {
         spec.name: spec.roles
         for specs in evaluator.seen_specs
@@ -462,7 +701,7 @@ def test_non_neural_prespecified_features_extract_before_bow_and_merge_roles(
     }
 
 
-def test_non_neural_agentic_forest_parses_bow_model_option():
+def test_multi_model_agentic_forest_parses_bow_views_and_embedding_option():
     cfg = ExperimentConfig.from_dict(
         {
             "applied_inference": {
@@ -472,9 +711,17 @@ def test_non_neural_agentic_forest_parses_bow_model_option():
                     "dataset.parquet"
                 ),
                 "architecture": {
-                    "model_type": "non_neural_agentic_forest",
-                    "non_neural_agentic_forest": {
-                        "bow_model": "extratrees",
+                    "model_type": "multi_model_agentic_forest",
+                    "multi_model_agentic_forest": {
+                        "bow_views": [
+                            {
+                                "name": "trees",
+                                "bow_model": "extratrees",
+                                "ngram_range_min": 1,
+                                "ngram_range_max": 3,
+                                "min_df": 1,
+                            }
+                        ],
                         "nuisance_folds": 2,
                         "effect_folds": 2,
                         "candidate_consistency_enabled": True,
@@ -484,14 +731,27 @@ def test_non_neural_agentic_forest_parses_bow_model_option():
                         "candidate_consistency_parallelism": "2",
                         "outer_parallelism": "3",
                         "bow_parallel_backend": "processes",
+                        "embedding_contrast": {
+                            "enabled": True,
+                            "model_name": "Qwen/Qwen3-Embedding-8B",
+                            "chunk_size_words": 128,
+                            "chunk_overlap_words": 32,
+                            "max_chunks": 16,
+                            "chunk_selection": "last",
+                            "min_probe_auc": 0.55,
+                            "concept_phrases": ["brain metastases"],
+                        },
                     },
                 },
                 "explicit_features": {"enabled": True, "features": []},
             }
         }
     )
-    nn_cfg = cfg.applied_inference.architecture.non_neural_agentic_forest
-    assert nn_cfg.bow_model == "extratrees"
+    nn_cfg = cfg.applied_inference.architecture.multi_model_agentic_forest
+    assert len(nn_cfg.bow_views) == 1
+    assert nn_cfg.bow_views[0].name == "trees"
+    assert nn_cfg.bow_views[0].bow_model == "extratrees"
+    assert nn_cfg.bow_views[0].ngram_range_max == 3
     assert nn_cfg.candidate_consistency_enabled is True
     assert nn_cfg.candidate_consistency_inner_folds == 4
     assert nn_cfg.candidate_consistency_min_folds == 2
@@ -499,11 +759,85 @@ def test_non_neural_agentic_forest_parses_bow_model_option():
     assert nn_cfg.candidate_consistency_parallelism == "2"
     assert nn_cfg.outer_parallelism == "3"
     assert nn_cfg.bow_parallel_backend == "processes"
-    assert nn_cfg.ngram_range_max == 3
+    assert nn_cfg.embedding_contrast.enabled is True
+    assert nn_cfg.embedding_contrast.model_name == "Qwen/Qwen3-Embedding-8B"
+    assert nn_cfg.embedding_contrast.chunk_size_words == 128
+    assert nn_cfg.embedding_contrast.chunk_overlap_words == 32
+    assert nn_cfg.embedding_contrast.max_chunks == 16
+    assert nn_cfg.embedding_contrast.chunk_selection == "last"
+    assert nn_cfg.embedding_contrast.min_probe_auc == 0.55
+    assert nn_cfg.embedding_contrast.concept_phrases == ["brain metastases"]
     cfg.validate()
 
 
-def test_non_neural_agentic_forest_parses_prespecified_feature_sources(tmp_path):
+def test_multi_model_agentic_forest_default_bow_view_grid():
+    cfg = MultiModelAgenticForestConfig(nuisance_folds=2, effect_folds=2)
+    names = [view.name for view in cfg.bow_views]
+    assert names == [
+        "linear_unigram_c0p5",
+        "linear_1_2",
+        "linear_1_3",
+        "linear_2_4_min_df3",
+        "extratrees_1_3",
+        "random_forest_1_2",
+    ]
+    assert {view.bow_model for view in cfg.bow_views} == {
+        "linear",
+        "extratrees",
+        "random_forest",
+    }
+
+
+def test_old_non_neural_agentic_forest_model_type_rejected():
+    cfg = ExperimentConfig.from_dict(
+        {
+            "applied_inference": {
+                "dataset_path": (
+                    "synthetic_data/example_synthetic_datasets/"
+                    "one_confounder_one_effect_modifier_nsclc_with_structured/"
+                    "dataset.parquet"
+                ),
+                "architecture": {"model_type": "non_neural_agentic_forest"},
+            }
+        }
+    )
+    try:
+        cfg.validate()
+    except ValueError as exc:
+        assert "multi_model_agentic_forest" in str(exc)
+    else:
+        raise AssertionError("old non_neural_agentic_forest model_type was accepted")
+
+
+def test_oracle_multi_model_script_builds_default_and_cli_bow_views():
+    from oracle_experiment_scripts import run_oracle_multi_model_agentic_forest as script
+
+    dataset_path = Path(
+        "synthetic_data/example_synthetic_datasets/"
+        "one_confounder_one_effect_modifier_nsclc_with_structured/dataset.parquet"
+    )
+    cfg = script.MultiModelAgenticOracleConfig(
+        dataset_path=str(dataset_path),
+        dataset_name="smoke",
+    )
+    applied = script._make_applied_config(cfg, dataset_path)
+    mm_cfg = applied.architecture.multi_model_agentic_forest
+    assert len(mm_cfg.bow_views) == 6
+    assert mm_cfg.embedding_contrast.enabled is False
+
+    cfg.bow_view_grid = "cli_single"
+    cfg.bow_model = "extratrees"
+    cfg.embedding_contrast_enabled = True
+    cfg.embedding_concept_phrases = ["brain metastases"]
+    applied = script._make_applied_config(cfg, dataset_path)
+    mm_cfg = applied.architecture.multi_model_agentic_forest
+    assert [view.name for view in mm_cfg.bow_views] == ["cli_view"]
+    assert mm_cfg.bow_views[0].bow_model == "extratrees"
+    assert mm_cfg.embedding_contrast.enabled is True
+    assert mm_cfg.embedding_contrast.concept_phrases == ["brain metastases"]
+
+
+def test_multi_model_agentic_forest_parses_prespecified_feature_sources(tmp_path):
     features_json = tmp_path / "features.json"
     features_json.write_text(
         json.dumps(
@@ -534,8 +868,8 @@ def test_non_neural_agentic_forest_parses_prespecified_feature_sources(tmp_path)
                     "dataset.parquet"
                 ),
                 "architecture": {
-                    "model_type": "non_neural_agentic_forest",
-                    "non_neural_agentic_forest": {
+                    "model_type": "multi_model_agentic_forest",
+                    "multi_model_agentic_forest": {
                         "prespecified_confounders": [
                             {
                                 "name": "age",
@@ -558,13 +892,13 @@ def test_non_neural_agentic_forest_parses_prespecified_feature_sources(tmp_path)
             }
         }
     )
-    nn_cfg = cfg.applied_inference.architecture.non_neural_agentic_forest
+    nn_cfg = cfg.applied_inference.architecture.multi_model_agentic_forest
     assert nn_cfg.prespecified_confounders[0].roles == ["confounder"]
     assert nn_cfg.prespecified_effect_modifiers[0].roles == ["effect_modifier"]
     assert nn_cfg.prespecified_features_json == str(features_json)
 
 
-def test_non_neural_candidate_consistency_fallback_prefers_stable_candidates():
+def test_multi_model_candidate_consistency_fallback_prefers_stable_candidates():
     assert _candidate_consistency_threshold(
         3,
         min_folds=2,

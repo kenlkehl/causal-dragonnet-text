@@ -4,36 +4,38 @@ This repository already contains agentic discovery and causal-forest code. Prefe
 
 ## Required First Pass: BoW-Guided Discovery
 
-Use `model_type="non_neural_agentic_forest"` for the initial evidence pass. Run it as a small suite of separate configs rather than relying on one vectorizer setting.
+Use `model_type="multi_model_agentic_forest"` for the initial evidence pass. Configure multiple `bow_views` in one run rather than relying on one vectorizer setting.
 
 Relevant implementation:
-- `oci/inference/non_neural_agentic_forest.py`
-- Config dataclass: `NonNeuralAgenticForestConfig`
-- README section beginning "Use `model_type=\"non_neural_agentic_forest\"`"
+- `oci/inference/multi_model_agentic_forest.py`
+- Config dataclass: `MultiModelAgenticForestConfig`
+- README section beginning "Use `model_type=\"multi_model_agentic_forest\"`"
 
 Recommended defaults for each run:
 - `applied_inference.cv_folds >= 5`
 - `architecture.explicit_feature_forest.honest = true`
-- `architecture.non_neural_agentic_forest.nuisance_folds >= 5`
-- `architecture.non_neural_agentic_forest.effect_folds >= 5`
+- `architecture.multi_model_agentic_forest.nuisance_folds >= 5`
+- `architecture.multi_model_agentic_forest.effect_folds >= 5`
 - `candidate_consistency_enabled = true`
 - leave `prespecified_confounders`, `prespecified_effect_modifiers`, and `prespecified_features` empty unless the user supplied variables
 
-Minimum vectorization suite when feasible:
+Minimum `bow_views` suite when feasible:
 - unigram-focused: `ngram_range_min = 1`, `ngram_range_max = 1`
 - default broad: `ngram_range_min = 1`, `ngram_range_max = 3`
 - phrase-focused: `ngram_range_min = 2`, `ngram_range_max = 4`
 - rare-signal-friendly: keep broad or phrase n-grams but lower `min_df`, raise `max_features`, or compare `sublinear_tf` settings
 
-Optional learner sensitivity checks can vary `bow_model` among supported values such as `linear`, `extratrees`, `random_forest`, or `xgboost` when runtime allows. Keep fold construction and outcome/treatment definitions fixed across the suite so recurrence and disagreement are interpretable. Record a run label and vectorizer params for every BoW artifact.
+Optional learner sensitivity checks can vary `bow_model` among supported values such as `linear`, `extratrees`, `random_forest`, or `xgboost` when runtime allows. Keep fold construction and outcome/treatment definitions fixed across views so recurrence and disagreement are interpretable. Record a view name and vectorizer params for every BoW artifact.
 
-Key artifacts usually appear under `non_neural_agentic_forest/`:
-- `bow_feature_importance_by_fold.jsonl`
+Key artifacts usually appear under `multi_model_agentic_forest/`:
+- `bow_view_oof_predictions.parquet`
+- `bow_view_feature_importance_by_fold.jsonl`
+- `embedding_contrast_evidence_by_fold.jsonl`
 - `agent_candidate_proposals.jsonl`
 - `selected_feature_sets.json`
 - `outer_cv_metrics.csv`
 
-Use BoW outputs to propose concepts, not as final variables. BoW is mandatory for the first lexical recurrence pass, but it is insufficient by itself for final feature extraction in long longitudinal notes. Prefer concepts that recur across folds and across vectorization variants, while preserving variant-specific discoveries for HTR/span follow-up when the evidence is strong.
+Use BoW and embedding outputs to propose concepts, not as final variables. BoW is mandatory for the first lexical recurrence pass, but it is insufficient by itself for final feature extraction in long longitudinal notes. Prefer concepts that recur across folds and across views, while preserving view-specific discoveries when the evidence is strong.
 
 ## LLM-Based Explicit Feature Extraction
 
@@ -73,7 +75,7 @@ Local vLLM launch guidance:
 - Run a JSON-format smoke test through the server before full extraction; the test must include at least one numeric baseline variable and one categorical variable.
 - Record the server command, model name/path, context length, max input/text tokens, max generation tokens, prompt version, smoke-test output, and fallback reasons in `report.txt`.
 
-Use `model_type="non_neural_agentic_forest"`, `agentic_explicit_feature_forest`, or `agentic_attention_variable_forest` to keep proposal, extraction, and forest fitting on the repo-native path. The non-neural BoW path sends text evidence to the proposal agent, then the extractor materializes selected explicit variables from text before fitting the final causal forest.
+Use `model_type="multi_model_agentic_forest"`, `agentic_explicit_feature_forest`, or `agentic_attention_variable_forest` to keep proposal, extraction, and forest fitting on the repo-native path. The multi-model BoW path sends text evidence to the proposal agent, then the extractor materializes selected explicit variables from text before fitting the final causal forest.
 
 ## Required Second Pass: Attention/HTR Evidence Path
 
