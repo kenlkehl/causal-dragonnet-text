@@ -59,6 +59,12 @@ _DASH_TRANSLATION = dict.fromkeys(
     "-",
 )
 
+_AGENT_PROMPT_CONSENSUS_TOP_N = 40
+_AGENT_PROMPT_VIEW_TOP_N = 12
+_AGENT_PROMPT_EMBEDDING_CHUNKS_PER_TAIL = 3
+_AGENT_PROMPT_EMBEDDING_CHUNK_CHARS = 600
+_AGENT_PROMPT_CONCEPT_TOP_N = 8
+
 
 def run_multi_model_agentic_forest(
     dataset: pd.DataFrame,
@@ -989,7 +995,16 @@ class MultiModelAgenticForestRunner:
         }
         if embedding_evidence:
             context["embedding_contrast_evidence"] = embedding_evidence
-        return context
+        compact_context = _compact_multi_model_agent_context(context)
+        prompt_chars = len(
+            json.dumps(compact_context, separators=(",", ":"), default=_json_default)
+        )
+        logger.info(
+            "Multi-model agent prompt context outer_fold=%s: %.1fK JSON chars",
+            outer_fold,
+            prompt_chars / 1000.0,
+        )
+        return compact_context
 
     def _embedding_contrast_enabled(self) -> bool:
         embedding_config = getattr(self.nn_config, "embedding_contrast", None)
@@ -2760,6 +2775,235 @@ def _bow_view_to_dict(view: BoWViewConfig) -> Dict[str, Any]:
         "logistic_max_iter": int(view.logistic_max_iter),
         "ridge_alpha": float(view.ridge_alpha),
     }
+
+
+def _compact_multi_model_agent_context(context: Dict[str, Any]) -> Dict[str, Any]:
+    compact = dict(context)
+    if isinstance(context.get("feature_importance"), dict):
+        compact["feature_importance"] = _compact_multi_model_importance(
+            context["feature_importance"]
+        )
+    if isinstance(context.get("embedding_contrast_evidence"), dict):
+        compact["embedding_contrast_evidence"] = _compact_embedding_contrast_evidence(
+            context["embedding_contrast_evidence"]
+        )
+    compact["prompt_compaction"] = {
+        "feature_importance": (
+            f"per-view feature lists capped at {_AGENT_PROMPT_VIEW_TOP_N}; "
+            f"consensus capped at {_AGENT_PROMPT_CONSENSUS_TOP_N}"
+        ),
+        "embedding_contrast_evidence": (
+            f"retrieved chunks capped at {_AGENT_PROMPT_EMBEDDING_CHUNKS_PER_TAIL} "
+            f"per tail and {_AGENT_PROMPT_EMBEDDING_CHUNK_CHARS} chars each"
+        ),
+    }
+    return compact
+
+
+def _compact_multi_model_importance(importance: Dict[str, Any]) -> Dict[str, Any]:
+    consensus = _compact_feature_rows(
+        importance.get("phrase_consensus")
+        or importance.get("phrase_features")
+        or [],
+        _AGENT_PROMPT_CONSENSUS_TOP_N,
+    )
+    compact_views = []
+    for view in importance.get("views", []) or []:
+        if not isinstance(view, dict):
+            continue
+        compact_view: Dict[str, Any] = {
+            "view_name": view.get("view_name"),
+            "view_index": view.get("view_index"),
+            "view_config": view.get("view_config"),
+            "metrics": view.get("metrics"),
+            "n_features": view.get("n_features"),
+            "n_bow_features": view.get("n_bow_features"),
+            "n_prespecified_features": view.get("n_prespecified_features"),
+            "n_prespecified_raw_features": view.get("n_prespecified_raw_features"),
+            "prespecified_raw_feature_names": _clip_list(
+                view.get("prespecified_raw_feature_names", []),
+                50,
+            ),
+        }
+        for key in [
+            "phrase_features",
+            "confounder_overlap",
+            "treatment_positive",
+            "treatment_negative",
+            "outcome_positive",
+            "outcome_negative",
+            "pseudo_target_positive",
+            "pseudo_target_negative",
+        ]:
+            compact_view[key] = _compact_feature_rows(
+                view.get(key, []) or [],
+                _AGENT_PROMPT_VIEW_TOP_N,
+            )
+        compact_views.append(compact_view)
+
+    return {
+        "n_views": importance.get("n_views", len(compact_views)),
+        "views": compact_views,
+        "phrase_features": consensus,
+        "phrase_consensus": consensus,
+        "prompt_compaction": {
+            "consensus_top_n": _AGENT_PROMPT_CONSENSUS_TOP_N,
+            "per_view_list_top_n": _AGENT_PROMPT_VIEW_TOP_N,
+        },
+    }
+
+
+def _compact_embedding_contrast_evidence(evidence: Dict[str, Any]) -> Dict[str, Any]:
+    compact: Dict[str, Any] = {
+        key: evidence.get(key)
+        for key in [
+            "enabled",
+            "model_name",
+            "unit",
+            "chunking",
+            "residualized_columns",
+            "n_patients",
+            "n_concept_phrases",
+            "skipped",
+            "error",
+        ]
+        if key in evidence
+    }
+    contrasts = []
+    for contrast in evidence.get("contrasts", []) or []:
+        if not isinstance(contrast, dict):
+            continue
+        compact_contrast = {
+            key: _round_floats(contrast.get(key))
+            for key in [
+                "name",
+                "positive_label",
+                "negative_label",
+                "role_hint",
+                "n_positive",
+                "n_negative",
+                "mean_difference_norm",
+                "probe_auc",
+                "min_probe_auc",
+                "direction_source",
+                "probe_auc_role",
+                "direction_norm",
+                "retrieval_skipped",
+            ]
+            if key in contrast
+        }
+        compact_contrast["positive_aligned_chunks"] = _compact_embedding_chunks(
+            contrast.get("positive_aligned_chunks", []) or []
+        )
+        compact_contrast["negative_aligned_chunks"] = _compact_embedding_chunks(
+            contrast.get("negative_aligned_chunks", []) or []
+        )
+        compact_contrast["concept_probe_scores"] = _compact_concept_scores(
+            contrast.get("concept_probe_scores", []) or []
+        )
+        contrasts.append(compact_contrast)
+    compact["contrasts"] = contrasts
+    compact["prompt_compaction"] = {
+        "chunks_per_tail": _AGENT_PROMPT_EMBEDDING_CHUNKS_PER_TAIL,
+        "chunk_text_chars": _AGENT_PROMPT_EMBEDDING_CHUNK_CHARS,
+        "concept_top_n": _AGENT_PROMPT_CONCEPT_TOP_N,
+    }
+    return compact
+
+
+def _compact_feature_rows(rows: Sequence[Dict[str, Any]], top_n: int) -> List[Dict[str, Any]]:
+    compact = []
+    for row in list(rows)[: max(0, int(top_n))]:
+        if not isinstance(row, dict):
+            continue
+        compact.append(
+            {
+                key: _round_floats(value)
+                for key, value in row.items()
+                if key
+                in {
+                    "feature",
+                    "token_count",
+                    "score",
+                    "combined_score",
+                    "confounder_overlap_score",
+                    "treatment_score",
+                    "abs_treatment_score",
+                    "outcome_score",
+                    "abs_outcome_score",
+                    "pseudo_target_score",
+                    "abs_pseudo_target_score",
+                    "supporting_view_count",
+                    "supporting_views",
+                    "best_abs_confounder_score",
+                    "mean_abs_confounder_score",
+                    "best_abs_effect_score",
+                    "mean_abs_effect_score",
+                }
+            }
+        )
+    return compact
+
+
+def _compact_embedding_chunks(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    compact = []
+    for row in list(rows)[:_AGENT_PROMPT_EMBEDDING_CHUNKS_PER_TAIL]:
+        if not isinstance(row, dict):
+            continue
+        compact.append(
+            {
+                "row_id": row.get("row_id"),
+                "chunk_index": row.get("chunk_index"),
+                "score": _round_floats(row.get("score")),
+                "text": _clip_text(row.get("text"), _AGENT_PROMPT_EMBEDDING_CHUNK_CHARS),
+            }
+        )
+    return compact
+
+
+def _compact_concept_scores(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    compact = []
+    for row in list(rows)[:_AGENT_PROMPT_CONCEPT_TOP_N]:
+        if not isinstance(row, dict):
+            continue
+        compact.append(
+            {
+                "concept": row.get("concept"),
+                "score": _round_floats(row.get("score")),
+            }
+        )
+    return compact
+
+
+def _clip_list(values: Any, max_items: int) -> List[Any]:
+    if not isinstance(values, list):
+        return []
+    return values[: max(0, int(max_items))]
+
+
+def _clip_text(value: Any, max_chars: int) -> str:
+    text = " ".join(str(value or "").split())
+    limit = max(0, int(max_chars))
+    if limit <= 0 or len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _round_floats(value: Any) -> Any:
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            return None
+        return round(float(value), 5)
+    if isinstance(value, np.floating):
+        numeric = float(value)
+        if not np.isfinite(numeric):
+            return None
+        return round(numeric, 5)
+    if isinstance(value, dict):
+        return {key: _round_floats(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_round_floats(item) for item in value]
+    return value
 
 
 def _multi_view_metrics(view_results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:

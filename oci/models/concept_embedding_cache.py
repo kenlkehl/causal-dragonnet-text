@@ -71,6 +71,10 @@ def clear_sentence_transformer_cache(
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            logger.debug("torch.cuda.ipc_collect failed", exc_info=True)
 
 
 def _coerce_embedding_matrix(

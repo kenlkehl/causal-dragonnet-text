@@ -155,6 +155,12 @@ class ExplicitFeatureValue:
     is_missing: bool  # True if extraction failed after retries
 
 
+@dataclass
+class _ExtractionParseResult:
+    values: Dict[str, ExplicitFeatureValue]
+    issues: List[str]
+
+
 def build_extraction_prompt(
     clinical_text: str,
     specs: List[ExplicitFeatureSpec],
@@ -223,6 +229,41 @@ Respond with JSON only, no other text:
     return prompt
 
 
+def build_extraction_repair_prompt(
+    issues: List[str],
+    specs: List[ExplicitFeatureSpec],
+) -> str:
+    """Build a follow-up prompt for malformed extraction JSON."""
+    issue_text = "\n".join(f"- {issue}" for issue in issues[:10])
+    fields = []
+    instructions = []
+    for spec in specs:
+        if spec.type == "categorical":
+            categories = ", ".join(f'"{category}"' for category in (spec.categories or []))
+            fields.append(f'"{spec.name}": "<category-or-null>"')
+            instructions.append(
+                f'- "{spec.name}" must be one of [{categories}] or null.'
+            )
+        else:
+            fields.append(f'"{spec.name}": <number-or-null>')
+            instructions.append(f'- "{spec.name}" must be a number or null.')
+    shape = "{" + ", ".join(fields) + "}"
+    instruction_text = "\n".join(instructions)
+    return f"""The previous extraction response could not be used.
+
+Problems:
+{issue_text}
+
+Repair the response using the original clinical note and extraction instructions already in this conversation.
+Return JSON only. Do not include markdown, prose, comments, or reasoning text.
+Return exactly one JSON object with exactly these keys:
+{shape}
+
+Field rules:
+{instruction_text}
+Use null when a value is unknown, not stated, or cannot be inferred from pre-treatment information."""
+
+
 def parse_extraction_response(
     response: str,
     specs: List[ExplicitFeatureSpec]
@@ -238,35 +279,44 @@ def parse_extraction_response(
         Categorical values are validated; invalid ones are marked as missing.
         Continuous values that fail parsing are marked as missing.
     """
-    response = strip_reasoning_trace(response)
+    return _parse_extraction_response_with_issues(response, specs).values
+
+
+def _parse_extraction_response_with_issues(
+    response: str,
+    specs: List[ExplicitFeatureSpec],
+) -> _ExtractionParseResult:
+    response = strip_reasoning_trace(response or "")
 
     # Try to extract JSON from response (handle markdown code blocks)
-    json_match = re.search(r'\{[^{}]*\}', response, re.DOTALL)
-    if json_match:
-        json_str = json_match.group(0)
-    else:
-        json_str = response
-
+    json_str = _extract_json_object_text(response)
     try:
         parsed = json.loads(json_str)
-    except json.JSONDecodeError:
+    except (TypeError, json.JSONDecodeError):
         logger.debug(f"Could not parse JSON response: {response[:200]}")
-        # Return missing for all features
-        result = {}
-        for spec in specs:
-            result[spec.name] = ExplicitFeatureValue(
-                name=spec.name,
-                type=spec.type,
-                value=None,
-                is_missing=True
-            )
-        return result
+        return _ExtractionParseResult(
+            values=_missing_values_for_specs(specs),
+            issues=["malformed JSON response; expected one JSON object"],
+        )
+
+    if not isinstance(parsed, dict):
+        return _ExtractionParseResult(
+            values=_missing_values_for_specs(specs),
+            issues=[f"top-level JSON must be an object, got {type(parsed).__name__}"],
+        )
 
     # Validate and extract each feature
     result = {}
+    issues: List[str] = []
     for spec in specs:
         name = spec.name
         conf_type = spec.type
+        if name not in parsed:
+            issues.append(f'missing required key "{name}"')
+            result[name] = ExplicitFeatureValue(
+                name=name, type=conf_type, value=None, is_missing=True
+            )
+            continue
         value = parsed.get(name)
 
         if conf_type == "categorical":
@@ -284,6 +334,10 @@ def parse_extraction_response(
                     )
                 else:
                     logger.debug(f"Invalid category '{value}' for {name}, valid: {categories}")
+                    issues.append(
+                        f'"{name}" has invalid category {value!r}; '
+                        f"expected one of {categories} or null"
+                    )
                     result[name] = ExplicitFeatureValue(
                         name=name, type=conf_type, value=None, is_missing=True
                     )
@@ -300,11 +354,68 @@ def parse_extraction_response(
                     )
                 except (ValueError, TypeError):
                     logger.debug(f"Could not parse continuous value '{value}' for {name}")
+                    issues.append(
+                        f'"{name}" has non-numeric value {value!r}; expected number or null'
+                    )
                     result[name] = ExplicitFeatureValue(
                         name=name, type=conf_type, value=None, is_missing=True
                     )
 
-    return result
+    extra_keys = sorted(str(key) for key in parsed.keys() if key not in {spec.name for spec in specs})
+    if extra_keys:
+        issues.append(f"unexpected extra key(s): {extra_keys}")
+
+    return _ExtractionParseResult(values=result, issues=issues)
+
+
+def _missing_values_for_specs(
+    specs: List[ExplicitFeatureSpec],
+) -> Dict[str, ExplicitFeatureValue]:
+    return {
+        spec.name: ExplicitFeatureValue(
+            name=spec.name,
+            type=spec.type,
+            value=None,
+            is_missing=True,
+        )
+        for spec in specs
+    }
+
+
+def _extract_json_object_text(response: str) -> str:
+    text = str(response or "").strip()
+    code_match = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+    if code_match:
+        candidate = code_match.group(1).strip()
+        if candidate:
+            return candidate
+
+    start = text.find("{")
+    if start < 0:
+        return text
+    depth = 0
+    in_string = False
+    escape = False
+    for idx in range(start, len(text)):
+        char = text[idx]
+        if escape:
+            escape = False
+            continue
+        if char == "\\":
+            escape = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:idx + 1]
+    return text[start:]
 
 
 class VLLMFeatureExtractor:
@@ -487,6 +598,7 @@ class VLLMFeatureExtractor:
     def _extract_single_server(self, text: str) -> Dict[str, ExplicitFeatureValue]:
         """Extract features from single text using server API."""
         prompt = build_extraction_prompt(text, self.specs, max_text_length=self.max_text_length)
+        messages = [{"role": "user", "content": prompt}]
         best_result = None
         max_attempts = max(1, int(self.max_retries))
         start_index = (
@@ -507,18 +619,43 @@ class VLLMFeatureExtractor:
                     client = self._client
                 response = client.chat.completions.create(
                     model=self.model_name,
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=messages,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                 )
                 content = response.choices[0].message.content
                 if content:
-                    result = parse_extraction_response(content, self.specs)
+                    parsed = _parse_extraction_response_with_issues(
+                        content,
+                        self.specs,
+                    )
+                    result = parsed.values
                     # Track best partial result (fewest missing values)
                     if best_result is None or sum(
                         1 for v in result.values() if not v.is_missing
                     ) > sum(1 for v in best_result.values() if not v.is_missing):
                         best_result = result
+                    if parsed.issues and attempt < max_attempts - 1:
+                        logger.warning(
+                            "Explicit feature extraction response had schema issues "
+                            "on attempt %s/%s: %s. Asking model to repair JSON.",
+                            attempt + 1,
+                            max_attempts,
+                            "; ".join(parsed.issues[:3]),
+                        )
+                        messages.extend(
+                            [
+                                {"role": "assistant", "content": content},
+                                {
+                                    "role": "user",
+                                    "content": build_extraction_repair_prompt(
+                                        parsed.issues,
+                                        self.specs,
+                                    ),
+                                },
+                            ]
+                        )
+                        continue
                     # Return immediately if all values extracted
                     if all(not v.is_missing for v in result.values()):
                         return result
@@ -549,12 +686,7 @@ class VLLMFeatureExtractor:
 
     def _missing_result(self) -> Dict[str, ExplicitFeatureValue]:
         """Return a missing-value result for every requested feature."""
-        return {
-            spec.name: ExplicitFeatureValue(
-                name=spec.name, type=spec.type, value=None, is_missing=True
-            )
-            for spec in self.specs
-        }
+        return _missing_values_for_specs(self.specs)
 
     def _extract_batch_python_api(
         self,

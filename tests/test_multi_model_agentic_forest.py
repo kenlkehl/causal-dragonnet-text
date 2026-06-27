@@ -22,11 +22,13 @@ from oci.inference.agentic_explicit_feature_forest import (
 )
 from oci.inference.embedding_contrast_discovery import (
     EmbeddingContrastEvidenceGenerator,
+    _default_embedding_cache_dir,
     _informative_chunk_text,
     redact_embedding_contrast_evidence,
 )
 from oci.inference.multi_model_agentic_forest import (
     _candidate_consistency_threshold,
+    _compact_multi_model_agent_context,
     _fallback_consistency_proposals,
     _fit_binary_bow_fold,
     run_multi_model_agentic_forest,
@@ -249,6 +251,20 @@ def test_embedding_contrast_chunk_selection_keeps_last_chunks():
     )
     assert first == ["w1 w2 w3", "w4 w5 w6"]
     assert last == ["w7 w8 w9", "w10"]
+
+
+def test_embedding_contrast_default_cache_dir_is_dataset_scoped(tmp_path: Path):
+    dataset_dir = tmp_path / "dataset"
+    dataset_dir.mkdir()
+    parquet_path = dataset_dir / "cohort.parquet"
+    assert _default_embedding_cache_dir(
+        str(parquet_path),
+        tmp_path / "run",
+    ) == dataset_dir / ".oci_cache" / "embedding_contrast"
+    assert _default_embedding_cache_dir(
+        str(dataset_dir),
+        tmp_path / "run",
+    ) == dataset_dir / ".oci_cache" / "embedding_contrast"
 
 
 def test_embedding_contrast_evidence_retrieves_aligned_chunks(tmp_path: Path):
@@ -534,6 +550,81 @@ def test_multi_model_agentic_forest_adds_embedding_contrast_context(
         row["text_redacted"] is True
         for row in artifact_treatment["positive_aligned_chunks"]
     )
+
+
+def test_multi_model_agent_context_compacts_large_evidence_payload():
+    long_rows = [
+        {
+            "feature": f"feature phrase {idx}",
+            "score": 0.123456789,
+            "combined_score": 0.987654321,
+            "confounder_overlap_score": 0.25,
+            "treatment_score": 0.5,
+            "outcome_score": 0.5,
+            "pseudo_target_score": 0.1,
+            "abs_pseudo_target_score": 0.1,
+            "supporting_views": ["v1"],
+        }
+        for idx in range(100)
+    ]
+    long_text = "brain metastases " * 200
+    context = {
+        "prompt_version": "multi_model_agentic_forest_v1",
+        "feature_importance": {
+            "n_views": 1,
+            "phrase_consensus": long_rows,
+            "views": [
+                {
+                    "view_name": "v1",
+                    "view_index": 0,
+                    "view_config": {"name": "v1"},
+                    "metrics": {},
+                    "n_features": 1000,
+                    "n_bow_features": 1000,
+                    "n_prespecified_features": 0,
+                    "phrase_features": long_rows,
+                    "confounder_overlap": long_rows,
+                    "treatment_positive": long_rows,
+                    "treatment_negative": long_rows,
+                    "outcome_positive": long_rows,
+                    "outcome_negative": long_rows,
+                    "pseudo_target_positive": long_rows,
+                    "pseudo_target_negative": long_rows,
+                }
+            ],
+        },
+        "embedding_contrast_evidence": {
+            "enabled": True,
+            "contrasts": [
+                {
+                    "name": "treatment",
+                    "positive_label": "treated",
+                    "negative_label": "untreated",
+                    "role_hint": "confounder",
+                    "positive_aligned_chunks": [
+                        {"row_id": idx, "chunk_index": idx, "score": 0.123456, "text": long_text}
+                        for idx in range(10)
+                    ],
+                    "negative_aligned_chunks": [
+                        {"row_id": idx, "chunk_index": idx, "score": -0.123456, "text": long_text}
+                        for idx in range(10)
+                    ],
+                    "concept_probe_scores": [
+                        {"concept": f"concept {idx}", "score": 0.111111}
+                        for idx in range(20)
+                    ],
+                }
+            ],
+        },
+    }
+    compact = _compact_multi_model_agent_context(context)
+    assert len(compact["feature_importance"]["phrase_consensus"]) == 40
+    compact_view = compact["feature_importance"]["views"][0]
+    assert len(compact_view["treatment_positive"]) == 12
+    contrast = compact["embedding_contrast_evidence"]["contrasts"][0]
+    assert len(contrast["positive_aligned_chunks"]) == 3
+    assert len(contrast["concept_probe_scores"]) == 8
+    assert len(contrast["positive_aligned_chunks"][0]["text"]) <= 600
 
 
 def test_multi_model_bow_fold_uses_prespecified_explicit_features():

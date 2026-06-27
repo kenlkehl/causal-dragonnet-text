@@ -2292,7 +2292,11 @@ def build_multi_model_agentic_forest_prompt(
     search_config: AgenticFeatureSearchConfig,
 ) -> str:
     """Construct the proposal prompt for sparse BoW and embedding evidence review."""
-    context_json = json.dumps(context, indent=2, default=_json_default)
+    context_json = json.dumps(
+        context,
+        separators=(",", ":"),
+        default=_json_default,
+    )
     max_proposals = int(
         context.get(
             "max_proposals",
@@ -2358,7 +2362,11 @@ def build_multi_model_agentic_consistency_prompt(
 ) -> str:
     """Construct the consistency-selection prompt for multi-model candidates."""
     del search_config
-    context_json = json.dumps(context, indent=2, default=_json_default)
+    context_json = json.dumps(
+        context,
+        separators=(",", ":"),
+        default=_json_default,
+    )
     return f"""You are selecting stable explicit variables for a causal forest from candidates proposed on separate inner folds.
 
 The outer test fold is not included here. All evidence comes from the current outer-train data only.

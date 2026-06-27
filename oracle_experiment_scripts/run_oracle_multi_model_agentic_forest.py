@@ -530,7 +530,14 @@ def main() -> None:
         help="Add patient-level embedding contrast retrieval evidence for the proposal agent.",
     )
     parser.add_argument("--embedding-model-name", default="Qwen/Qwen3-Embedding-8B")
-    parser.add_argument("--embedding-cache-dir", default=None)
+    parser.add_argument(
+        "--embedding-cache-dir",
+        default=None,
+        help=(
+            "Directory for embedding chunk cache. Default: "
+            "{dataset_dir}/.oci_cache/embedding_contrast."
+        ),
+    )
     parser.add_argument("--embedding-device", default=None)
     parser.add_argument("--embedding-batch-size", type=int, default=16)
     parser.add_argument("--embedding-chunk-size-words", type=int, default=256)
@@ -544,7 +551,7 @@ def main() -> None:
     )
     parser.add_argument("--embedding-top-k-chunks-per-tail", type=int, default=12)
     parser.add_argument("--embedding-max-chunks-per-patient", type=int, default=2)
-    parser.add_argument("--embedding-min-probe-auc", type=float, default=0.58)
+    parser.add_argument("--embedding-min-probe-auc", type=float, default=0.0)
     parser.add_argument("--embedding-pseudo-target-quantile", type=float, default=0.20)
     parser.add_argument(
         "--embedding-unweighted-pseudo-target",

@@ -14,7 +14,11 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
 from ..config import AppliedInferenceConfig, EmbeddingContrastDiscoveryConfig
-from ..models.concept_embedding_cache import ConceptEmbeddingCache, load_sentence_transformer
+from ..models.concept_embedding_cache import (
+    ConceptEmbeddingCache,
+    clear_sentence_transformer_cache,
+    load_sentence_transformer,
+)
 from ..models.concept_embedding_utils import chunk_text_words
 
 
@@ -113,6 +117,9 @@ class EmbeddingContrastEvidenceGenerator:
         patient_embeddings = _normalize_rows(patient_embeddings)
 
         concept_phrases = self._concept_phrases(importance or {})
+        concept_embeddings = (
+            self._encode_concepts(concept_phrases) if concept_phrases else None
+        )
         contrasts = []
         for contrast in self._contrast_specs(
             y=np.asarray(y, dtype=float),
@@ -128,6 +135,7 @@ class EmbeddingContrastEvidenceGenerator:
                     positions=positions,
                     patient_embeddings=patient_embeddings,
                     concept_phrases=concept_phrases,
+                    concept_embeddings=concept_embeddings,
                     **contrast,
                 )
             )
@@ -167,13 +175,13 @@ class EmbeddingContrastEvidenceGenerator:
         self._offsets = offsets
 
     def _prepare_from_sentence_transformer_cache(self, texts: Sequence[str]) -> None:
+        dataset_path = self.config.dataset_path or str(self.output_dir / "in_memory_dataset")
         cache_dir = (
             Path(str(self.embedding_config.cache_dir))
             if self.embedding_config.cache_dir
-            else self.output_dir / "embedding_cache"
+            else _default_embedding_cache_dir(dataset_path, self.output_dir)
         )
         cache_dir.mkdir(parents=True, exist_ok=True)
-        dataset_path = self.config.dataset_path or str(self.output_dir / "in_memory_dataset")
         cache = ConceptEmbeddingCache(
             cache_dir=str(cache_dir),
             sentence_model_name=str(self.embedding_config.model_name),
@@ -184,12 +192,20 @@ class EmbeddingContrastEvidenceGenerator:
             normalize_embeddings=bool(self.embedding_config.normalize_embeddings),
             chunk_selection=str(self.embedding_config.chunk_selection),
         )
-        if not cache.is_valid(expected_num_samples=len(texts)):
-            cache.precompute(
-                list(texts),
-                device=_torch_device_or_none(self.embedding_config.device),
-                batch_size=int(self.embedding_config.batch_size),
-            )
+        logger.info("Embedding contrast chunk cache: %s", cache.cache_path)
+        cache_valid = cache.is_valid(expected_num_samples=len(texts))
+        if cache_valid:
+            logger.info("Reusing embedding contrast chunk cache")
+        else:
+            logger.info("Building embedding contrast chunk cache")
+            try:
+                cache.precompute(
+                    list(texts),
+                    device=_torch_device_or_none(self.embedding_config.device),
+                    batch_size=int(self.embedding_config.batch_size),
+                )
+            finally:
+                _release_sentence_transformer_model(str(self.embedding_config.model_name))
         cache.open()
         self._cache = cache
         self._flat_embeddings = cache.hidden_states_array.flat
@@ -295,6 +311,7 @@ class EmbeddingContrastEvidenceGenerator:
         positions: Sequence[int],
         patient_embeddings: np.ndarray,
         concept_phrases: Sequence[str],
+        concept_embeddings: Optional[np.ndarray],
         name: str,
         positive_label: str,
         negative_label: str,
@@ -367,7 +384,11 @@ class EmbeddingContrastEvidenceGenerator:
             direction,
             descending=False,
         )
-        record["concept_probe_scores"] = self._score_concepts(concept_phrases, direction)
+        record["concept_probe_scores"] = self._score_concepts(
+            concept_phrases,
+            concept_embeddings,
+            direction,
+        )
         return record
 
     def _retrieve_chunks(
@@ -428,12 +449,12 @@ class EmbeddingContrastEvidenceGenerator:
     def _score_concepts(
         self,
         concept_phrases: Sequence[str],
+        concept_embeddings: Optional[np.ndarray],
         direction: np.ndarray,
     ) -> List[Dict[str, Any]]:
-        if not concept_phrases:
+        if not concept_phrases or concept_embeddings is None:
             return []
-        embeddings = self._encode_concepts(concept_phrases)
-        embeddings = _normalize_rows(embeddings)
+        embeddings = _normalize_rows(concept_embeddings)
         scores = np.asarray(embeddings @ direction, dtype=float)
         order = np.argsort(np.abs(scores))[::-1]
         rows = []
@@ -450,17 +471,23 @@ class EmbeddingContrastEvidenceGenerator:
         if self.embedding_provider is not None:
             embeddings = self._encode_with_provider(list(phrases))
         else:
-            encoder = load_sentence_transformer(
-                str(self.embedding_config.model_name),
-                device=_torch_device_or_none(self.embedding_config.device),
-            )
-            embeddings = encoder.encode(
-                list(phrases),
-                batch_size=max(1, min(int(self.embedding_config.batch_size), len(phrases))),
-                convert_to_numpy=True,
-                normalize_embeddings=bool(self.embedding_config.normalize_embeddings),
-                show_progress_bar=False,
-            )
+            try:
+                encoder = load_sentence_transformer(
+                    str(self.embedding_config.model_name),
+                    device=_torch_device_or_none(self.embedding_config.device),
+                )
+                embeddings = encoder.encode(
+                    list(phrases),
+                    batch_size=max(
+                        1,
+                        min(int(self.embedding_config.batch_size), len(phrases)),
+                    ),
+                    convert_to_numpy=True,
+                    normalize_embeddings=bool(self.embedding_config.normalize_embeddings),
+                    show_progress_bar=False,
+                )
+            finally:
+                _release_sentence_transformer_model(str(self.embedding_config.model_name))
         return _coerce_embedding_matrix(embeddings, expected_rows=len(phrases))
 
     def _encode_with_provider(self, texts: Sequence[str]) -> np.ndarray:
@@ -700,6 +727,32 @@ def _torch_device_or_none(device: Optional[str]):
     import torch
 
     return torch.device(str(device))
+
+
+def _release_sentence_transformer_model(model_name: str) -> None:
+    try:
+        clear_sentence_transformer_cache(model_name=model_name)
+        logger.info("Released sentence-transformer model cache for %s", model_name)
+    except Exception:
+        logger.warning(
+            "Failed to release sentence-transformer model cache for %s",
+            model_name,
+            exc_info=True,
+        )
+
+
+def _default_embedding_cache_dir(dataset_path: str, output_dir: Path) -> Path:
+    path = Path(str(dataset_path))
+    if str(path).endswith("in_memory_dataset"):
+        return Path(output_dir) / "embedding_cache"
+    try:
+        resolved = path.expanduser().resolve()
+    except OSError:
+        resolved = path.expanduser().absolute()
+    dataset_dir = resolved if resolved.is_dir() else resolved.parent
+    if not str(dataset_dir):
+        return Path(output_dir) / "embedding_cache"
+    return dataset_dir / ".oci_cache" / "embedding_contrast"
 
 
 def _finite_or_none(value: Optional[float]) -> Optional[float]:

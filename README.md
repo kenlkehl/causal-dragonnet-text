@@ -370,9 +370,19 @@ When a patient has more chunks than `max_chunks`, embedding contrast keeps the
 last chunks by default because later notes are often more recent.
 
 The default local embedding model is `Qwen/Qwen3-Embedding-8B`, loaded through
-`sentence-transformers` and cached on disk under the run artifact directory.
+`sentence-transformers` and cached on disk under
+`{dataset_dir}/.oci_cache/embedding_contrast` unless `cache_dir` or
+`--embedding-cache-dir` is supplied. The cache is keyed by dataset path, model,
+chunking settings, normalization, and chunk-selection mode, so different folds
+and repeated runs share the same chunk embeddings.
 Use a smaller model or pre-populated local Hugging Face cache for constrained
 hardware.
+
+The proposal-agent prompt receives a compact evidence payload: BoW rows are
+capped per view, embedding retrieval chunks are clipped, and JSON is serialized
+compactly. This keeps prompt length controlled while leaving
+`agent_max_tokens` high enough for reasoning models to think before emitting
+the final JSON.
 
 Minimal configuration:
 

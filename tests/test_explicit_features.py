@@ -269,6 +269,56 @@ def test_vllm_feature_extractor_request_does_not_set_timeout():
     assert result["age"].is_missing is False
 
 
+def test_vllm_feature_extractor_repairs_malformed_extraction_json():
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+
+            class Message:
+                content = "age: 41"
+
+            if len(calls) == 2:
+                Message.content = '{"age": 41}'
+
+            class Choice:
+                message = Message()
+
+            class Response:
+                choices = [Choice()]
+
+            return Response()
+
+    class FakeClient:
+        class Chat:
+            completions = FakeCompletions()
+
+        chat = Chat()
+
+    extractor = VLLMFeatureExtractor(
+        specs=[
+            ExplicitFeatureSpec(name="age", type="continuous", roles=["confounder"]),
+        ],
+        mode="server",
+        max_retries=2,
+    )
+    extractor._client = FakeClient()
+
+    result = extractor._extract_single_server("Age: 41")
+
+    assert result["age"].value == 41.0
+    assert result["age"].is_missing is False
+    assert len(calls) == 2
+    repair_messages = calls[1]["messages"]
+    assert repair_messages[1]["role"] == "assistant"
+    assert repair_messages[1]["content"] == "age: 41"
+    assert repair_messages[2]["role"] == "user"
+    assert "could not be used" in repair_messages[2]["content"]
+    assert "malformed JSON" in repair_messages[2]["content"]
+    assert '"age": <number-or-null>' in repair_messages[2]["content"]
+
+
 def test_vllm_feature_extractor_retries_next_server(monkeypatch):
     calls = []
 
