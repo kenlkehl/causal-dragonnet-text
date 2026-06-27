@@ -331,6 +331,32 @@ class MultiModelAgenticForestRunner:
                     "feature_importance": feature_importance,
                 }
             )
+        ensemble_importance = bow_result["importance"].get("ensemble_r")
+        if isinstance(ensemble_importance, dict):
+            for view in ensemble_importance.get("views", []) or []:
+                feature_importance = {
+                    key: value
+                    for key, value in view.items()
+                    if key not in {"view_name", "view_index", "view_config", "metrics"}
+                }
+                self.importance_rows.append(
+                    {
+                        "record_type": "ensemble_r_view",
+                        "outer_fold": int(outer_fold),
+                        "view_index": int(view.get("view_index", -1)),
+                        "view_name": view.get("view_name"),
+                        "view_config": view.get("view_config"),
+                        "metrics": view.get("metrics"),
+                        "feature_importance": feature_importance,
+                    }
+                )
+            self.importance_rows.append(
+                {
+                    "record_type": "ensemble_r_consensus",
+                    "outer_fold": int(outer_fold),
+                    "phrase_consensus": ensemble_importance.get("phrase_consensus", []),
+                }
+            )
         self.importance_rows.append(
             {
                 "record_type": "consensus",
@@ -444,25 +470,50 @@ class MultiModelAgenticForestRunner:
                 )
             )
 
-        predictions = pd.concat(
-            [result["predictions"] for result in view_results],
-            ignore_index=True,
+        ensemble_result = self._fit_ensemble_r_discovery(
+            discovery_df=discovery_df,
+            texts=texts,
+            y=y,
+            t=t,
+            outer_fold=outer_fold,
+            view_results=view_results,
+            explicit_feature_dicts=explicit_feature_dicts,
+            explicit_specs=prespecified_specs,
         )
+
+        prediction_frames = [result["predictions"] for result in view_results]
+        if ensemble_result is not None:
+            prediction_frames.extend(
+                result["predictions"]
+                for result in ensemble_result.get("view_results", [])
+            )
+        predictions = pd.concat(prediction_frames, ignore_index=True)
         metrics = _multi_view_metrics(view_results)
+        if ensemble_result is not None:
+            metrics["ensemble_r"] = ensemble_result["metrics"]
+            for key, value in _scalar_metrics(ensemble_result["metrics"]).items():
+                metrics[f"ensemble_{key}"] = value
         importance = _multi_view_importance(
             view_results,
             top_n=int(self.nn_config.top_n_features),
         )
+        if ensemble_result is not None:
+            importance["ensemble_r"] = ensemble_result["importance"]
+
+        pseudo_targets = [result["pseudo_target"] for result in view_results]
+        t_resids = [result["t_resid"] for result in view_results]
+        pseudo_target_names = [view.name for view in self.nn_config.bow_views]
+        if ensemble_result is not None:
+            pseudo_targets.append(ensemble_result["pseudo_target"])
+            t_resids.append(ensemble_result["t_resid"])
+            pseudo_target_names.append("ensemble_mean_nuisance")
         embedding_evidence = self._build_embedding_contrast_evidence(
             discovery_df=discovery_df,
             y=y,
             t=t,
-            pseudo_target=[
-                result["pseudo_target"] for result in view_results
-            ],
-            t_resid=[
-                result["t_resid"] for result in view_results
-            ],
+            pseudo_target=pseudo_targets,
+            t_resid=t_resids,
+            pseudo_target_names=pseudo_target_names,
             importance=importance,
         )
         context = self._build_agent_context(
@@ -534,6 +585,7 @@ class MultiModelAgenticForestRunner:
         tau_hat = self._crossfit_pseudo_target(
             texts,
             pseudo_target,
+            t_resid**2,
             outer_fold,
             view=view,
             view_index=view_index,
@@ -578,6 +630,7 @@ class MultiModelAgenticForestRunner:
             y=y,
             t=t,
             pseudo_target=pseudo_target,
+            pseudo_target_sample_weight=t_resid**2,
             view=view,
             explicit_feature_dicts=explicit_feature_dicts,
             explicit_specs=explicit_specs,
@@ -586,10 +639,134 @@ class MultiModelAgenticForestRunner:
             "predictions": predictions,
             "metrics": metrics,
             "importance": importance,
+            "e_hat": e_hat,
+            "m_hat": m_hat,
             "pseudo_target": pseudo_target,
             "t_resid": t_resid,
             "view": view,
             "view_index": int(view_index),
+        }
+
+    def _fit_ensemble_r_discovery(
+        self,
+        *,
+        discovery_df: pd.DataFrame,
+        texts: Sequence[str],
+        y: np.ndarray,
+        t: np.ndarray,
+        outer_fold: int,
+        view_results: Sequence[Dict[str, Any]],
+        explicit_feature_dicts: Optional[List[Dict[str, Any]]] = None,
+        explicit_specs: Optional[List[ExplicitFeatureSpec]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if len(view_results) < 2:
+            return None
+
+        e_hat = np.nanmean(
+            np.vstack([np.asarray(result["e_hat"], dtype=float) for result in view_results]),
+            axis=0,
+        )
+        m_hat = np.nanmean(
+            np.vstack([np.asarray(result["m_hat"], dtype=float) for result in view_results]),
+            axis=0,
+        )
+        e_clipped = np.clip(e_hat, self.nn_config.e_clip, 1.0 - self.nn_config.e_clip)
+        t_resid = t - e_clipped
+        y_resid = y - m_hat
+        pseudo_target = y_resid / t_resid
+        sample_weight = t_resid**2
+        r_loss_at_zero = y_resid**2
+
+        ensemble_view_results: List[Dict[str, Any]] = []
+        for result in view_results:
+            view = result["view"]
+            view_index = int(result["view_index"])
+            tau_hat = self._crossfit_pseudo_target(
+                texts,
+                pseudo_target,
+                sample_weight,
+                outer_fold,
+                view=view,
+                view_index=view_index,
+                explicit_feature_dicts=explicit_feature_dicts,
+                explicit_specs=explicit_specs,
+                random_seed_offset=50_000,
+            )
+            r_loss = (y_resid - tau_hat * t_resid) ** 2
+            view_name = f"ensemble_r__{view.name}"
+            predictions = pd.DataFrame(
+                {
+                    "_oci_row_id": discovery_df["_oci_row_id"].to_numpy(),
+                    "outer_fold": int(outer_fold),
+                    "view_index": view_index,
+                    "view_name": view_name,
+                    "e_hat": e_hat,
+                    "m_hat": m_hat,
+                    "y_residual": y_resid,
+                    "t_residual": t_resid,
+                    "pseudo_target": pseudo_target,
+                    "tau_hat_multi_model": tau_hat,
+                    "r_loss": r_loss,
+                    "r_loss_at_zero_tau": r_loss_at_zero,
+                    "target_source": "ensemble_mean_nuisance",
+                }
+            )
+            metrics = self._bow_metrics(
+                y=y,
+                t=t,
+                e_hat=e_hat,
+                m_hat=m_hat,
+                pseudo_target=pseudo_target,
+                tau_hat=tau_hat,
+                y_resid=y_resid,
+                t_resid=t_resid,
+                r_loss=r_loss,
+                r_loss_at_zero=r_loss_at_zero,
+                discovery_df=discovery_df,
+            )
+            importance = self._fit_feature_importance_models(
+                texts=texts,
+                y=y,
+                t=t,
+                pseudo_target=pseudo_target,
+                pseudo_target_sample_weight=sample_weight,
+                view=view,
+                explicit_feature_dicts=explicit_feature_dicts,
+                explicit_specs=explicit_specs,
+            )
+            ensemble_view_results.append(
+                {
+                    "predictions": predictions,
+                    "metrics": metrics,
+                    "importance": importance,
+                    "pseudo_target": pseudo_target,
+                    "t_resid": t_resid,
+                    "view": view,
+                    "view_name": view_name,
+                    "view_index": view_index,
+                }
+            )
+
+        metrics = _multi_view_metrics(ensemble_view_results)
+        metrics["target_source"] = "ensemble_mean_nuisance"
+        metrics["pseudo_target_construction"] = (
+            "mean nuisance predictions across BoW views, then "
+            "(Y - mean_m_hat) / (T - mean_e_hat)"
+        )
+        importance = _multi_view_importance(
+            ensemble_view_results,
+            top_n=int(self.nn_config.top_n_features),
+        )
+        importance["target_source"] = "ensemble_mean_nuisance"
+        importance["pseudo_target_construction"] = metrics[
+            "pseudo_target_construction"
+        ]
+        return {
+            "view_results": ensemble_view_results,
+            "metrics": metrics,
+            "importance": importance,
+            "pseudo_target": pseudo_target,
+            "t_resid": t_resid,
         }
 
     def _crossfit_binary(
@@ -709,19 +886,26 @@ class MultiModelAgenticForestRunner:
         self,
         texts: Sequence[str],
         pseudo_target: np.ndarray,
+        sample_weight: Optional[np.ndarray],
         outer_fold: int,
         *,
         view: BoWViewConfig,
         view_index: int,
         explicit_feature_dicts: Optional[List[Dict[str, Any]]] = None,
         explicit_specs: Optional[List[ExplicitFeatureSpec]] = None,
+        random_seed_offset: int = 0,
     ) -> np.ndarray:
         oof = np.full(len(pseudo_target), np.nan, dtype=float)
         folds = _bounded_fold_count(self.nn_config.effect_folds, len(pseudo_target))
         splitter = KFold(
             n_splits=folds,
             shuffle=True,
-            random_state=13_000 + outer_fold + 1_000 * int(view_index),
+            random_state=(
+                13_000
+                + int(random_seed_offset)
+                + outer_fold
+                + 1_000 * int(view_index)
+            ),
         )
         split_items = list(enumerate(splitter.split(texts), start=1))
         vectorizer_params = self._vectorizer_params(view)
@@ -746,7 +930,8 @@ class MultiModelAgenticForestRunner:
                 model_params,
                 explicit_feature_dicts=explicit_feature_dicts,
                 explicit_specs=explicit_specs,
-                random_state=17 + fold,
+                sample_weight=sample_weight,
+                random_state=17 + int(random_seed_offset) + fold,
             )
 
         results = self._run_fold_tasks(run_fold, split_items)
@@ -760,6 +945,7 @@ class MultiModelAgenticForestRunner:
         y: np.ndarray,
         t: np.ndarray,
         pseudo_target: np.ndarray,
+        pseudo_target_sample_weight: Optional[np.ndarray],
         *,
         view: BoWViewConfig,
         explicit_feature_dicts: Optional[List[Dict[str, Any]]] = None,
@@ -794,7 +980,12 @@ class MultiModelAgenticForestRunner:
 
         def fit_effect() -> np.ndarray:
             effect_model = self._make_regressor(view, random_state=303)
-            effect_model.fit(x_model, pseudo_target)
+            _fit_regressor(
+                effect_model,
+                x_model,
+                pseudo_target,
+                sample_weight=pseudo_target_sample_weight,
+            )
             return _model_feature_scores(effect_model, len(features))
 
         n_jobs = self._feature_importance_n_jobs()
@@ -1027,6 +1218,7 @@ class MultiModelAgenticForestRunner:
         t: np.ndarray,
         pseudo_target: Any,
         t_resid: Any,
+        pseudo_target_names: Optional[Sequence[str]] = None,
         importance: Dict[str, Any],
     ) -> Dict[str, Any]:
         if not self._embedding_contrast_enabled():
@@ -1040,7 +1232,11 @@ class MultiModelAgenticForestRunner:
                 t=t,
                 pseudo_target=pseudo_target,
                 t_resid=t_resid,
-                pseudo_target_names=[view.name for view in self.nn_config.bow_views],
+                pseudo_target_names=(
+                    pseudo_target_names
+                    if pseudo_target_names is not None
+                    else [view.name for view in self.nn_config.bow_views]
+                ),
                 importance=importance,
             )
         except Exception as exc:
@@ -1604,62 +1800,30 @@ class MultiModelAgenticForestRunner:
         candidate_summaries: Sequence[Dict[str, Any]],
         canonical_proposals: Dict[str, AgenticFeatureProposal],
     ) -> Tuple[List[AgenticFeatureProposal], Dict[str, Any]]:
-        allowed_names = {str(item.get("name")) for item in candidate_summaries}
-        fallback = _fallback_consistency_proposals(
+        del context
+        selected = _fallback_consistency_proposals(
             candidate_summaries,
             canonical_proposals,
         )
-        try:
-            raw_selection = self.proposal_agent.propose(context)
-            selection_trace = _get_agent_response_trace(self.proposal_agent)
-            selected, rejected = validate_agentic_proposals(
-                raw_selection,
-                current_specs=self._initial_specs(),
-                search_config=self.search_config,
-                allow_removals=False,
-                max_additions=self.nn_config.candidate_proposals_per_fold,
+        max_selected = int(self.nn_config.candidate_proposals_per_fold)
+        capped = selected[:max_selected]
+        selection_method = (
+            "deterministic_consistency_gate"
+            if any(
+                item.get("passes_consistency_gate")
+                for item in candidate_summaries
+                if item.get("name") in {proposal.name for proposal in capped}
             )
-            filtered = [
-                proposal
-                for proposal in selected
-                if proposal.action == "add" and proposal.name in allowed_names
-            ]
-            rejected.extend(
-                {
-                    "proposal": _proposal_to_dict(proposal),
-                    "reason": "not_in_consistency_candidates",
-                }
-                for proposal in selected
-                if proposal.action == "add" and proposal.name not in allowed_names
-            )
-            if not filtered:
-                filtered = fallback
-                used_fallback = True
-            else:
-                filtered = [
-                    _merge_proposals(canonical_proposals.get(p.name, p), p)
-                    for p in filtered
-                ]
-                used_fallback = False
-            result: Dict[str, Any] = {
-                "raw_selection": raw_selection,
-                "valid_proposals": [_proposal_to_dict(p) for p in filtered],
-                "rejected_proposals": rejected,
-                "used_fallback": used_fallback,
-            }
-            if self.search_config.save_agent_raw_output:
-                result["agent_raw_output"] = selection_trace
-            return filtered, result
-        except Exception as exc:
-            logger.warning(
-                "Multi-model candidate consistency selection failed; using gate fallback",
-                exc_info=True,
-            )
-            return fallback, {
-                "error": str(exc),
-                "valid_proposals": [_proposal_to_dict(p) for p in fallback],
-                "used_fallback": True,
-            }
+            else "deterministic_full_outer_train_fallback"
+        )
+        return capped, {
+            "selection_method": selection_method,
+            "agent_selection_used": False,
+            "max_selected_candidates": max_selected,
+            "valid_proposals": [_proposal_to_dict(p) for p in capped],
+            "rejected_proposals": [],
+            "used_fallback": False,
+        }
 
     def _selected_specs_from_proposals(
         self,
@@ -2140,14 +2304,14 @@ def _fallback_consistency_proposals(
 ) -> List[AgenticFeatureProposal]:
     selected = [
         canonical_proposals[item["name"]]
-        for item in candidate_summaries
+        for item in _rank_consistency_summaries(candidate_summaries)
         if item.get("passes_consistency_gate") and item.get("name") in canonical_proposals
     ]
     if selected:
         return selected
     full_supported = [
         canonical_proposals[item["name"]]
-        for item in candidate_summaries
+        for item in _rank_consistency_summaries(candidate_summaries)
         if item.get("proposed_on_full_outer_train")
         and item.get("name") in canonical_proposals
     ]
@@ -2334,6 +2498,7 @@ def _fit_regression_bow_fold(
     *,
     explicit_feature_dicts: Optional[List[Dict[str, Any]]] = None,
     explicit_specs: Optional[List[ExplicitFeatureSpec]] = None,
+    sample_weight: Optional[np.ndarray] = None,
     random_state: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     values = np.asarray(values, dtype=float)
@@ -2348,8 +2513,37 @@ def _fit_regression_bow_fold(
         explicit_specs=explicit_specs,
     )
     model = _make_bow_regressor(model_params, random_state=random_state)
-    model.fit(x_fit, values[fit_pos])
+    fold_weight = None
+    if sample_weight is not None:
+        weights = np.asarray(sample_weight, dtype=float)
+        fold_weight = weights[fit_pos]
+    _fit_regressor(model, x_fit, values[fit_pos], sample_weight=fold_weight)
     return heldout_pos, model.predict(x_heldout)
+
+
+def _fit_regressor(
+    model: Any,
+    x: Any,
+    y: np.ndarray,
+    *,
+    sample_weight: Optional[np.ndarray] = None,
+) -> Any:
+    if sample_weight is None:
+        return model.fit(x, y)
+    weights = np.asarray(sample_weight, dtype=float)
+    if weights.shape[0] != len(y):
+        raise ValueError("sample_weight must have one value per training row")
+    weights = np.where(np.isfinite(weights) & (weights > 0.0), weights, 0.0)
+    if float(np.sum(weights)) <= 0.0:
+        return model.fit(x, y)
+    try:
+        return model.fit(x, y, sample_weight=weights)
+    except TypeError:
+        logger.warning(
+            "BoW regressor %s does not accept sample_weight; fitting unweighted",
+            type(model).__name__,
+        )
+        return model.fit(x, y)
 
 
 def _make_bow_vectorizer(params: Dict[str, Any]) -> TfidfVectorizer:
@@ -2841,7 +3035,7 @@ def _compact_multi_model_importance(importance: Dict[str, Any]) -> Dict[str, Any
             )
         compact_views.append(compact_view)
 
-    return {
+    compact_importance = {
         "n_views": importance.get("n_views", len(compact_views)),
         "views": compact_views,
         "phrase_features": consensus,
@@ -2851,6 +3045,14 @@ def _compact_multi_model_importance(importance: Dict[str, Any]) -> Dict[str, Any
             "per_view_list_top_n": _AGENT_PROMPT_VIEW_TOP_N,
         },
     }
+    if isinstance(importance.get("ensemble_r"), dict):
+        compact_importance["ensemble_r"] = _compact_multi_model_importance(
+            importance["ensemble_r"]
+        )
+    for key in ["target_source", "pseudo_target_construction"]:
+        if key in importance:
+            compact_importance[key] = importance[key]
+    return compact_importance
 
 
 def _compact_embedding_contrast_evidence(evidence: Dict[str, Any]) -> Dict[str, Any]:
@@ -3017,7 +3219,7 @@ def _multi_view_metrics(view_results: Sequence[Dict[str, Any]]) -> Dict[str, Any
         "primary_view_index": int(primary["view_index"]),
         "views": [
             {
-                "view_name": str(result["view"].name),
+                "view_name": str(result.get("view_name") or result["view"].name),
                 "view_index": int(result["view_index"]),
                 "view_config": _bow_view_to_dict(result["view"]),
                 "metrics": _agent_visible_metrics(result.get("metrics", {})),
@@ -3063,7 +3265,7 @@ def _multi_view_importance(
     views = []
     for result in view_results:
         importance = dict(result.get("importance", {}))
-        importance["view_name"] = str(result["view"].name)
+        importance["view_name"] = str(result.get("view_name") or result["view"].name)
         importance["view_index"] = int(result["view_index"])
         importance["view_config"] = _bow_view_to_dict(result["view"])
         importance["metrics"] = _agent_visible_metrics(result.get("metrics", {}))

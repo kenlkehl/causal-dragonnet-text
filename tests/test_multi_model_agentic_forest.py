@@ -27,6 +27,7 @@ from oci.inference.embedding_contrast_discovery import (
     redact_embedding_contrast_evidence,
 )
 from oci.inference.multi_model_agentic_forest import (
+    MultiModelAgenticForestRunner,
     _candidate_consistency_threshold,
     _compact_multi_model_agent_context,
     _fallback_consistency_proposals,
@@ -46,6 +47,27 @@ def _linear_test_bow_views() -> list[BoWViewConfig]:
             ngram_range_min=1,
             ngram_range_max=3,
         )
+    ]
+
+
+def _two_linear_test_bow_views() -> list[BoWViewConfig]:
+    return [
+        BoWViewConfig(
+            name="linear_test_unigram",
+            max_features=1000,
+            min_df=1,
+            max_df=1.0,
+            ngram_range_min=1,
+            ngram_range_max=1,
+        ),
+        BoWViewConfig(
+            name="linear_test_bigram",
+            max_features=1000,
+            min_df=1,
+            max_df=1.0,
+            ngram_range_min=1,
+            ngram_range_max=2,
+        ),
     ]
 
 
@@ -182,6 +204,13 @@ class EmptyProposalAgent:
         self.contexts.append(context)
         if context.get("prompt_version") == "multi_model_agentic_value_harmonization_v1":
             return {"features": context.get("selected_features", [])}
+        return []
+
+
+class FailingConsistencyAgent:
+    def propose(self, context):
+        if context.get("prompt_version") == "multi_model_agentic_consistency_v1":
+            raise AssertionError("consistency agent should not select features")
         return []
 
 
@@ -550,6 +579,85 @@ def test_multi_model_agentic_forest_adds_embedding_contrast_context(
         row["text_redacted"] is True
         for row in artifact_treatment["positive_aligned_chunks"]
     )
+
+
+def test_multi_model_agentic_forest_adds_ensemble_r_target_context(tmp_path: Path):
+    dataset = pd.DataFrame(
+        {
+            "clinical_text": [
+                "age 55 baseline note pd-l1 high brain metastases",
+                "age 78 baseline note pd-l1 low liver lesion",
+                "age 57 baseline note pd-l1 high brain metastases",
+                "age 76 baseline note pd-l1 low liver lesion",
+                "age 61 baseline note pd-l1 high cachexia",
+                "age 81 baseline note pd-l1 low stable",
+                "age 54 baseline note pd-l1 high cachexia",
+                "age 70 baseline note pd-l1 low stable",
+            ],
+            "treatment_indicator": [1, 0, 1, 0, 1, 0, 1, 0],
+            "outcome_indicator": [1, 0, 1, 0, 1, 0, 1, 0],
+        }
+    )
+    config = AppliedInferenceConfig(
+        outcome_type="binary",
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        cv_folds=0,
+        architecture=ModelArchitectureConfig(
+            model_type="multi_model_agentic_forest",
+            explicit_feature_forest=ExplicitFeatureForestConfig(inference=False),
+            agentic_feature_search=AgenticFeatureSearchConfig(
+                outer_folds=2,
+                inner_folds=2,
+                max_iterations=1,
+                max_additions_per_iter=4,
+                min_feature_coverage=0.1,
+                clinical_text_examples_per_prompt=0,
+            ),
+            multi_model_agentic_forest=MultiModelAgenticForestConfig(
+                nuisance_folds=2,
+                effect_folds=2,
+                bow_views=_two_linear_test_bow_views(),
+                top_n_features=5,
+                candidate_consistency_enabled=False,
+                fold_parallelism="1",
+            ),
+        ),
+        explicit_features=ExplicitFeatureExtractionConfig(enabled=True, features=[]),
+    )
+    agent = FakeProposalAgent()
+    output_path = tmp_path / "predictions.parquet"
+
+    run_multi_model_agentic_forest(
+        dataset,
+        config,
+        output_path,
+        proposal_agent=agent,
+        extraction_provider=FakeExtractionProvider(),
+        evaluator=FakeEvaluator(),
+    )
+
+    importance = agent.contexts[0]["feature_importance"]
+    assert "ensemble_r" in importance
+    assert importance["ensemble_r"]["target_source"] == "ensemble_mean_nuisance"
+    assert all(
+        str(view["view_name"]).startswith("ensemble_r__")
+        for view in importance["ensemble_r"]["views"]
+    )
+
+    artifact_dir = output_path.parent / "multi_model_agentic_forest"
+    bow_oof = pd.read_parquet(artifact_dir / "bow_view_oof_predictions.parquet")
+    assert "target_source" in bow_oof.columns
+    assert "ensemble_mean_nuisance" in set(bow_oof["target_source"].dropna())
+    importance_rows = [
+        json.loads(line)
+        for line in (artifact_dir / "bow_view_feature_importance_by_fold.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert any(row["record_type"] == "ensemble_r_view" for row in importance_rows)
+    assert any(row["record_type"] == "ensemble_r_consensus" for row in importance_rows)
 
 
 def test_multi_model_agent_context_compacts_large_evidence_payload():
@@ -1024,3 +1132,66 @@ def test_multi_model_candidate_consistency_fallback_prefers_stable_candidates():
         {"patient_age": age, "rare_noise": noise},
     )
     assert selected == [age]
+
+
+def test_multi_model_consistency_selection_is_deterministic_gate(tmp_path):
+    runner = MultiModelAgenticForestRunner(
+        dataset=pd.DataFrame(
+            {
+                "clinical_text": ["ecog 0", "ecog 2"],
+                "treatment_indicator": [1, 0],
+                "outcome_indicator": [1, 0],
+            }
+        ),
+        config=AppliedInferenceConfig(
+            text_column="clinical_text",
+            treatment_column="treatment_indicator",
+            outcome_column="outcome_indicator",
+            architecture=ModelArchitectureConfig(
+                model_type="multi_model_agentic_forest",
+                agentic_feature_search=AgenticFeatureSearchConfig(),
+                multi_model_agentic_forest=MultiModelAgenticForestConfig(
+                    candidate_proposals_per_fold=5
+                ),
+            ),
+        ),
+        output_path=tmp_path / "predictions.parquet",
+        proposal_agent=FailingConsistencyAgent(),
+        extraction_provider=FakeExtractionProvider(),
+        evaluator=FakeEvaluator(),
+    )
+    ecog = AgenticFeatureProposal(
+        action="add",
+        name="ecog_performance_status",
+        type="categorical",
+        categories=[
+            "0",
+            "1",
+            "2",
+            "3",
+            "4",
+            "ECOG 0",
+            "ECOG 1",
+            "ECOG 2",
+            "ECOG 3",
+        ],
+        roles=["confounder"],
+        description="Baseline ECOG performance status.",
+    )
+
+    selected, artifact = runner._select_consistent_proposals(
+        context={"prompt_version": "multi_model_agentic_consistency_v1"},
+        candidate_summaries=[
+            {
+                "name": "ecog_performance_status",
+                "passes_consistency_gate": True,
+                "inner_support_count": 3,
+                "proposed_on_full_outer_train": True,
+            }
+        ],
+        canonical_proposals={"ecog_performance_status": ecog},
+    )
+
+    assert selected == [ecog]
+    assert artifact["selection_method"] == "deterministic_consistency_gate"
+    assert artifact["agent_selection_used"] is False
