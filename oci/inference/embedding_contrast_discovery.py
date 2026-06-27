@@ -257,6 +257,10 @@ class EmbeddingContrastEvidenceGenerator:
                 "mask": treatment_mask,
                 "sample_weights": None,
                 "role_hint": "confounder",
+                "metadata": {
+                    "contrast_family": "marginal",
+                    "direction_formula": "mean_embedding(T=1) - mean_embedding(T=0)",
+                },
             }
         )
 
@@ -277,8 +281,27 @@ class EmbeddingContrastEvidenceGenerator:
                 "mask": mask,
                 "sample_weights": None,
                 "role_hint": "confounder",
+                "metadata": {
+                    "contrast_family": "marginal",
+                    "direction_formula": (
+                        f"mean_embedding({positive_label}) - "
+                        f"mean_embedding({negative_label})"
+                    ),
+                },
             }
         )
+
+        if bool(getattr(self.embedding_config, "include_cell_contrasts", True)):
+            specs.extend(
+                self._cell_contrast_specs(
+                    treatment_labels=treatment_labels,
+                    treatment_mask=treatment_mask,
+                    outcome_labels=labels,
+                    outcome_mask=mask,
+                    outcome_positive_label=positive_label,
+                    outcome_negative_label=negative_label,
+                )
+            )
 
         multiple_pseudo_targets = len(pseudo_targets) > 1
         for pseudo_name, pseudo_target, t_resid in pseudo_targets:
@@ -301,8 +324,166 @@ class EmbeddingContrastEvidenceGenerator:
                     "mask": pseudo_mask,
                     "sample_weights": pseudo_weights,
                     "role_hint": "effect_modifier",
+                    "metadata": {
+                        "contrast_family": "r_pseudo_target",
+                        "direction_formula": (
+                            "weighted_mean_embedding(high R pseudo-target) - "
+                            "weighted_mean_embedding(low R pseudo-target)"
+                            if pseudo_weights is not None
+                            else "mean_embedding(high R pseudo-target) - "
+                            "mean_embedding(low R pseudo-target)"
+                        ),
+                        "score_formula": "(Y - m_hat) / (T - e_hat)",
+                    },
                 }
             )
+            if bool(
+                getattr(
+                    self.embedding_config,
+                    "include_orthogonal_r_score_contrasts",
+                    True,
+                )
+            ):
+                score = np.asarray(pseudo_target, dtype=float) * np.square(
+                    np.asarray(t_resid, dtype=float)
+                )
+                score_labels, score_mask = _tail_labels(
+                    score,
+                    float(self.embedding_config.pseudo_target_quantile),
+                )
+                score_name = "orthogonal_r_score"
+                if multiple_pseudo_targets:
+                    score_name = (
+                        f"orthogonal_r_score__{_safe_contrast_suffix(pseudo_name)}"
+                    )
+                specs.append(
+                    {
+                        "name": score_name,
+                        "positive_label": f"higher_orthogonal_r_score:{pseudo_name}",
+                        "negative_label": f"lower_orthogonal_r_score:{pseudo_name}",
+                        "labels": score_labels,
+                        "mask": score_mask,
+                        "sample_weights": None,
+                        "role_hint": "effect_modifier",
+                        "metadata": {
+                            "contrast_family": "orthogonal_r_score",
+                            "direction_formula": (
+                                "mean_embedding(high orthogonal R-score) - "
+                                "mean_embedding(low orthogonal R-score)"
+                            ),
+                            "score_formula": (
+                                "(Y - m_hat) * (T - e_hat), computed as "
+                                "R pseudo-target * (T - e_hat)^2"
+                            ),
+                        },
+                    }
+                )
+        return specs
+
+    def _cell_contrast_specs(
+        self,
+        *,
+        treatment_labels: np.ndarray,
+        treatment_mask: np.ndarray,
+        outcome_labels: np.ndarray,
+        outcome_mask: np.ndarray,
+        outcome_positive_label: str,
+        outcome_negative_label: str,
+    ) -> List[Dict[str, Any]]:
+        """Return within-arm outcome and 2x2 interaction contrast specs."""
+        treatment_labels = np.asarray(treatment_labels, dtype=int)
+        outcome_labels = np.asarray(outcome_labels, dtype=int)
+        base_mask = np.asarray(treatment_mask, dtype=bool) & np.asarray(
+            outcome_mask,
+            dtype=bool,
+        )
+        specs: List[Dict[str, Any]] = []
+        for treatment_value, treatment_name in [(1, "treated"), (0, "untreated")]:
+            arm_mask = base_mask & (treatment_labels == treatment_value)
+            specs.append(
+                {
+                    "name": f"{treatment_name}_outcome",
+                    "positive_label": f"{treatment_name}_{outcome_positive_label}",
+                    "negative_label": f"{treatment_name}_{outcome_negative_label}",
+                    "labels": outcome_labels,
+                    "mask": arm_mask,
+                    "sample_weights": None,
+                    "role_hint": "effect_modifier",
+                    "metadata": {
+                        "contrast_family": "within_treatment_arm_outcome",
+                        "direction_formula": (
+                            f"mean_embedding(T={treatment_value}, "
+                            f"{outcome_positive_label}) - "
+                            f"mean_embedding(T={treatment_value}, "
+                            f"{outcome_negative_label})"
+                        ),
+                    },
+                }
+            )
+
+        treated_positive = (
+            base_mask & (treatment_labels == 1) & (outcome_labels == 1)
+        )
+        treated_negative = (
+            base_mask & (treatment_labels == 1) & (outcome_labels == 0)
+        )
+        untreated_positive = (
+            base_mask & (treatment_labels == 0) & (outcome_labels == 1)
+        )
+        untreated_negative = (
+            base_mask & (treatment_labels == 0) & (outcome_labels == 0)
+        )
+        interaction_labels = np.zeros(len(treatment_labels), dtype=int)
+        interaction_labels[treated_positive | untreated_negative] = 1
+        specs.append(
+            {
+                "name": "treatment_outcome_interaction",
+                "positive_label": "higher_treatment_effect_cells",
+                "negative_label": "lower_treatment_effect_cells",
+                "labels": interaction_labels,
+                "mask": base_mask,
+                "sample_weights": None,
+                "role_hint": "effect_modifier",
+                "direction_components": [
+                    {
+                        "label": f"treated_{outcome_positive_label}",
+                        "coefficient": 1.0,
+                        "mask": treated_positive,
+                    },
+                    {
+                        "label": f"treated_{outcome_negative_label}",
+                        "coefficient": -1.0,
+                        "mask": treated_negative,
+                    },
+                    {
+                        "label": f"untreated_{outcome_positive_label}",
+                        "coefficient": -1.0,
+                        "mask": untreated_positive,
+                    },
+                    {
+                        "label": f"untreated_{outcome_negative_label}",
+                        "coefficient": 1.0,
+                        "mask": untreated_negative,
+                    },
+                ],
+                "direction_source": "cell_mean_difference_in_differences",
+                "metadata": {
+                    "contrast_family": "treatment_outcome_cell_interaction",
+                    "direction_formula": (
+                        "mean(T=1,Y=high/present) - mean(T=1,Y=low/absent) "
+                        "- mean(T=0,Y=high/present) + mean(T=0,Y=low/absent)"
+                    ),
+                    "positive_cell_labels": [
+                        f"treated_{outcome_positive_label}",
+                        f"untreated_{outcome_negative_label}",
+                    ],
+                    "negative_cell_labels": [
+                        f"treated_{outcome_negative_label}",
+                        f"untreated_{outcome_positive_label}",
+                    ],
+                },
+            }
+        )
         return specs
 
     def _build_one_contrast(
@@ -319,6 +500,9 @@ class EmbeddingContrastEvidenceGenerator:
         mask: np.ndarray,
         sample_weights: Optional[np.ndarray],
         role_hint: str,
+        direction_components: Optional[Sequence[Dict[str, Any]]] = None,
+        direction_source: str = "mean_difference",
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         labels = np.asarray(labels, dtype=int)
         mask = np.asarray(mask, dtype=bool)
@@ -336,6 +520,8 @@ class EmbeddingContrastEvidenceGenerator:
             "n_negative": n_neg,
             "min_probe_auc": float(self.embedding_config.min_probe_auc),
         }
+        if metadata:
+            record.update(copy.deepcopy(metadata))
         if n_pos < 2 or n_neg < 2:
             record["retrieval_skipped"] = "too_few_examples_per_group"
             return record
@@ -345,8 +531,38 @@ class EmbeddingContrastEvidenceGenerator:
             weights = np.asarray(sample_weights, dtype=float)
             weights = np.where(np.isfinite(weights) & (weights > 0.0), weights, 0.0)
 
-        mean_direction = _weighted_mean(patient_embeddings[pos_mask], _subset(weights, pos_mask))
-        mean_direction -= _weighted_mean(patient_embeddings[neg_mask], _subset(weights, neg_mask))
+        if direction_components:
+            component_counts = []
+            mean_direction = np.zeros(patient_embeddings.shape[1], dtype=np.float32)
+            for component in direction_components:
+                component_mask = usable & np.asarray(component["mask"], dtype=bool)
+                component_count = int(np.sum(component_mask))
+                coefficient = float(component.get("coefficient", 1.0))
+                component_counts.append(
+                    {
+                        "label": str(component.get("label", "")),
+                        "coefficient": _finite_or_none(coefficient),
+                        "n": component_count,
+                    }
+                )
+                if component_count < 2:
+                    record["component_counts"] = component_counts
+                    record["retrieval_skipped"] = "too_few_examples_per_component"
+                    return record
+                mean_direction += coefficient * _weighted_mean(
+                    patient_embeddings[component_mask],
+                    _subset(weights, component_mask),
+                )
+            record["component_counts"] = component_counts
+        else:
+            mean_direction = _weighted_mean(
+                patient_embeddings[pos_mask],
+                _subset(weights, pos_mask),
+            )
+            mean_direction -= _weighted_mean(
+                patient_embeddings[neg_mask],
+                _subset(weights, neg_mask),
+            )
         mean_norm = float(np.linalg.norm(mean_direction))
         record["mean_difference_norm"] = _finite_or_none(mean_norm)
 
@@ -369,7 +585,7 @@ class EmbeddingContrastEvidenceGenerator:
             return record
 
         direction = _normalize_vector(mean_direction)
-        record["direction_source"] = "mean_difference"
+        record["direction_source"] = direction_source
         record["probe_auc_role"] = (
             "diagnostic_gate_only" if min_auc > 0.0 else "diagnostic_only"
         )

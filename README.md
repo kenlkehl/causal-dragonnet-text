@@ -357,10 +357,11 @@ Final artifacts are written under `multi_model_agentic_forest/`, including
 This path can also add embedding-contrast retrieval evidence. Set
 `architecture.multi_model_agentic_forest.embedding_contrast.enabled=true` to
 pool document chunks into patient-level embeddings, build train-fold treatment,
-outcome, and per-view R-pseudo-target contrast directions, and retrieve real text chunks
-and concept phrases aligned with those directions. The proposal agent sees the
-retrieved chunks as hypothesis-generation evidence; saved artifacts redact raw
-retrieved chunk text by default unless
+outcome, per-view R-pseudo-target, within-arm outcome, 2x2 treatment-outcome
+interaction, and orthogonal R-score contrast directions, and retrieve real text
+chunks and concept phrases aligned with those directions. The proposal agent
+sees the retrieved chunks as hypothesis-generation evidence; saved artifacts
+redact raw retrieved chunk text by default unless
 `architecture.agentic_feature_search.save_agent_context=true`.
 Contrast directions use weighted patient-level mean differences, for example
 mean treated embedding minus mean untreated embedding. Linear-probe AUC is
@@ -368,6 +369,9 @@ recorded as a diagnostic by default; set `min_probe_auc > 0` only if you want
 to use it as an opt-in retrieval gate. It is not used as the retrieval direction.
 When a patient has more chunks than `max_chunks`, embedding contrast keeps the
 last chunks by default because later notes are often more recent.
+Set `include_cell_contrasts=false` or
+`include_orthogonal_r_score_contrasts=false` to disable the richer contrast
+families.
 
 The default local embedding model is `Qwen/Qwen3-Embedding-8B`, loaded through
 `sentence-transformers` and cached on disk under
@@ -617,6 +621,9 @@ python oracle_experiment_scripts/run_oracle_multi_model_agentic_forest.py \
 
 Add `--enable-embedding-contrast --embedding-model-name Qwen/Qwen3-Embedding-8B`
 to include the embedding-delta retrieval evidence in the same oracle run.
+Use `--embedding-disable-cell-contrasts` or
+`--embedding-disable-orthogonal-r-score-contrasts` to fall back to the smaller
+contrast set.
 
 Agentic attention-variable forest smoke test, assuming a Qwen vLLM server is
 already running with `--reasoning-parser qwen3`:

@@ -370,6 +370,94 @@ def test_embedding_contrast_evidence_retrieves_aligned_chunks(tmp_path: Path):
     )
 
 
+def test_embedding_contrast_adds_cell_and_orthogonal_r_score_contrasts(
+    tmp_path: Path,
+):
+    dataset = pd.DataFrame(
+        {
+            "_oci_row_id": np.arange(8),
+            "clinical_text": [
+                "brain metastases pd-l1 high",
+                "brain metastases pd-l1 high",
+                "liver lesion pd-l1 low",
+                "liver lesion pd-l1 low",
+                "liver lesion pd-l1 low",
+                "liver lesion pd-l1 low",
+                "brain metastases pd-l1 high",
+                "brain metastases pd-l1 high",
+            ],
+        }
+    )
+    config = AppliedInferenceConfig(
+        outcome_type="binary",
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        architecture=ModelArchitectureConfig(
+            model_type="multi_model_agentic_forest",
+            multi_model_agentic_forest=MultiModelAgenticForestConfig(
+                embedding_contrast=EmbeddingContrastDiscoveryConfig(
+                    enabled=True,
+                    model_name="fake-keyword",
+                    chunk_size_words=4,
+                    chunk_overlap_words=0,
+                    max_chunks=1,
+                    min_probe_auc=0.0,
+                    top_k_chunks_per_tail=3,
+                    max_chunks_per_patient=1,
+                    concept_phrases=["brain metastases", "liver lesion"],
+                )
+            ),
+        ),
+    )
+    generator = EmbeddingContrastEvidenceGenerator(
+        config=config,
+        output_dir=tmp_path,
+        embedding_provider=KeywordEmbeddingProvider(),
+    )
+    generator.prepare(dataset)
+    evidence = generator.build_evidence(
+        discovery_df=dataset,
+        y=np.asarray([1, 1, 0, 0, 1, 1, 0, 0], dtype=float),
+        t=np.asarray([1, 1, 1, 1, 0, 0, 0, 0], dtype=float),
+        pseudo_target=np.asarray([2, 2, -2, -2, -2, -2, 2, 2], dtype=float),
+        t_resid=np.ones(8, dtype=float),
+        importance={},
+    )
+
+    contrast_names = {item["name"] for item in evidence["contrasts"]}
+    assert {
+        "treated_outcome",
+        "untreated_outcome",
+        "treatment_outcome_interaction",
+        "orthogonal_r_score",
+    }.issubset(contrast_names)
+
+    interaction = next(
+        item
+        for item in evidence["contrasts"]
+        if item["name"] == "treatment_outcome_interaction"
+    )
+    assert interaction["contrast_family"] == "treatment_outcome_cell_interaction"
+    assert interaction["direction_source"] == "cell_mean_difference_in_differences"
+    assert {row["n"] for row in interaction["component_counts"]} == {2}
+    assert any(
+        "brain" in row["text"] for row in interaction["positive_aligned_chunks"]
+    )
+    assert any(
+        "liver" in row["text"] for row in interaction["negative_aligned_chunks"]
+    )
+
+    orthogonal = next(
+        item for item in evidence["contrasts"] if item["name"] == "orthogonal_r_score"
+    )
+    assert orthogonal["contrast_family"] == "orthogonal_r_score"
+    assert "(Y - m_hat) * (T - e_hat)" in orthogonal["score_formula"]
+    assert any(
+        "brain" in row["text"] for row in orthogonal["positive_aligned_chunks"]
+    )
+
+
 def test_multi_model_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path: Path):
     dataset = pd.DataFrame(
         {
@@ -938,6 +1026,8 @@ def test_multi_model_agentic_forest_parses_bow_views_and_embedding_option():
                             "max_chunks": 16,
                             "chunk_selection": "last",
                             "min_probe_auc": 0.55,
+                            "include_cell_contrasts": False,
+                            "include_orthogonal_r_score_contrasts": False,
                             "concept_phrases": ["brain metastases"],
                         },
                     },
@@ -965,6 +1055,8 @@ def test_multi_model_agentic_forest_parses_bow_views_and_embedding_option():
     assert nn_cfg.embedding_contrast.max_chunks == 16
     assert nn_cfg.embedding_contrast.chunk_selection == "last"
     assert nn_cfg.embedding_contrast.min_probe_auc == 0.55
+    assert nn_cfg.embedding_contrast.include_cell_contrasts is False
+    assert nn_cfg.embedding_contrast.include_orthogonal_r_score_contrasts is False
     assert nn_cfg.embedding_contrast.concept_phrases == ["brain metastases"]
     cfg.validate()
 

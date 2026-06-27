@@ -1154,6 +1154,9 @@ class MultiModelAgenticForestRunner:
                 "When embedding_contrast_evidence is present, use aligned real-text "
                 "chunks and concept scores as retrieval evidence, not as direct "
                 "vector interpretations.",
+                "Treat within-arm outcome, treatment-outcome cell interaction, "
+                "and orthogonal R-score embedding contrasts as effect-modifier "
+                "hypothesis evidence when their retrieved chunks recur coherently.",
                 "Suggest explicit pre-treatment patient-level variables, not raw text tokens.",
                 "Use variables predictive of both treatment and outcome as confounders.",
                 "Use variables predictive of the pseudo-target as effect modifiers.",
@@ -3082,15 +3085,21 @@ def _compact_embedding_contrast_evidence(evidence: Dict[str, Any]) -> Dict[str, 
                 "positive_label",
                 "negative_label",
                 "role_hint",
+                "contrast_family",
                 "n_positive",
                 "n_negative",
                 "mean_difference_norm",
                 "probe_auc",
                 "min_probe_auc",
                 "direction_source",
+                "direction_formula",
+                "score_formula",
                 "probe_auc_role",
                 "direction_norm",
                 "retrieval_skipped",
+                "component_counts",
+                "positive_cell_labels",
+                "negative_cell_labels",
             ]
             if key in contrast
         }

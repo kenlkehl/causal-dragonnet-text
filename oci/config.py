@@ -609,6 +609,8 @@ class EmbeddingContrastDiscoveryConfig:
     min_probe_auc: float = 0.0
     pseudo_target_quantile: float = 0.20
     pseudo_target_weighted: bool = True
+    include_cell_contrasts: bool = True
+    include_orthogonal_r_score_contrasts: bool = True
     residualize_columns: List[str] = field(default_factory=list)
     concept_phrases: List[str] = field(default_factory=list)
     include_bow_phrases_as_concepts: bool = True

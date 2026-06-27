@@ -93,6 +93,8 @@ class MultiModelAgenticOracleConfig:
     embedding_min_probe_auc: float = 0.0
     embedding_pseudo_target_quantile: float = 0.20
     embedding_pseudo_target_weighted: bool = True
+    embedding_include_cell_contrasts: bool = True
+    embedding_include_orthogonal_r_score_contrasts: bool = True
     embedding_concept_phrases: List[str] = field(default_factory=list)
     embedding_residualize_columns: List[str] = field(default_factory=list)
 
@@ -214,6 +216,10 @@ def _make_applied_config(
                     min_probe_auc=config.embedding_min_probe_auc,
                     pseudo_target_quantile=config.embedding_pseudo_target_quantile,
                     pseudo_target_weighted=config.embedding_pseudo_target_weighted,
+                    include_cell_contrasts=config.embedding_include_cell_contrasts,
+                    include_orthogonal_r_score_contrasts=(
+                        config.embedding_include_orthogonal_r_score_contrasts
+                    ),
                     concept_phrases=config.embedding_concept_phrases,
                     residualize_columns=config.embedding_residualize_columns,
                 ),
@@ -559,6 +565,16 @@ def main() -> None:
         help="Use unweighted R-pseudo contrasts instead of treatment-residual squared weights.",
     )
     parser.add_argument(
+        "--embedding-disable-cell-contrasts",
+        action="store_true",
+        help="Disable within-arm outcome and treatment-outcome 2x2 interaction contrasts.",
+    )
+    parser.add_argument(
+        "--embedding-disable-orthogonal-r-score-contrasts",
+        action="store_true",
+        help="Disable high-vs-low orthogonal R-score embedding contrasts.",
+    )
+    parser.add_argument(
         "--embedding-concept-phrase",
         action="append",
         default=[],
@@ -693,6 +709,10 @@ def main() -> None:
         embedding_min_probe_auc=args.embedding_min_probe_auc,
         embedding_pseudo_target_quantile=args.embedding_pseudo_target_quantile,
         embedding_pseudo_target_weighted=not args.embedding_unweighted_pseudo_target,
+        embedding_include_cell_contrasts=not args.embedding_disable_cell_contrasts,
+        embedding_include_orthogonal_r_score_contrasts=(
+            not args.embedding_disable_orthogonal_r_score_contrasts
+        ),
         embedding_concept_phrases=args.embedding_concept_phrase,
         embedding_residualize_columns=args.embedding_residualize_column,
         cf_n_estimators=args.cf_n_estimators,
