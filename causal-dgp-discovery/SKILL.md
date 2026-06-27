@@ -1,6 +1,6 @@
 ---
 name: causal-dgp-discovery
-description: Use when Codex needs to reverse engineer a synthetic clinical causal inference dataset from patient-level clinical text, treatment, and outcome columns; discover confounders and effect modifiers from empirical BoW/HTR/attention evidence rather than upfront variable lists; avoid assuming clinical realism or a linear DGP; run honest cross-fitted nuisance, R-loss, pseudo-outcome, and causal-forest analyses; estimate patient-level ITEs; and write a reproducible report.
+description: Use when Codex needs to reverse engineer a synthetic clinical causal inference dataset from patient-level clinical text, treatment, and outcome columns; discover confounders and effect modifiers from empirical BoW/HTR/attention evidence rather than upfront variable lists; orchestrate the repo-native multi_model_agentic_forest path or an equivalent coding-agent workflow; avoid assuming clinical realism or a linear DGP; run honest cross-fitted nuisance, R-loss, pseudo-outcome, extracted-feature review, and causal-forest analyses; estimate patient-level ITEs; and write a reproducible report.
 ---
 
 # Causal DGP Discovery
@@ -13,6 +13,7 @@ Use this skill to investigate a synthetic patient-level causal inference dataset
 - Start with empirical text-model evidence. Do not begin with a broad hand-built clinical feature list.
 - Run both BoW/TF-IDF evidence and HTR/attention/span evidence before finalizing candidate features. Treat BoW as broad lexical discovery and HTR/attention as the span-localization step needed to recover baseline/index-time values inside longitudinal notes.
 - For BoW discovery, train a small suite of vectorization strategies instead of relying on one n-gram setup. Compare fold recurrence across unigram-focused, default broad, phrase-focused, and rare-signal-friendly variants when feasible.
+- In this repository, prefer `model_type="multi_model_agentic_forest"` as the default sparse-discovery orchestrator: multi-view BoW nuisance/effect evidence, optional embedding-contrast evidence, candidate consistency checks, explicit feature extraction, extracted-feature review, and final explicit-feature causal forest.
 - Before running HTR/attention models, inspect the local GPU environment and current GPU load, then choose an explicit parallelization plan for folds, objectives, chunks, and devices. Record the hardware inventory and plan in `report.txt`.
 - If shell-level GPU tools work but Python/PyTorch reports no CUDA, treat it as a likely agent sandbox or environment mismatch. Verify the intended interpreter/venv and rerun the CUDA probe, smoke test, and neural HTR job with escalated permissions before falling back to CPU.
 - Use fold-aware univariable screens as supporting diagnostics for candidate discovery: feature-treatment association, feature-outcome association for nuisance modeling, and treatment-by-feature/effect-modification association. Emphasize effect magnitude, direction, stability, and missingness at least as much as p values. Do not promote variables from univariable screens alone.
@@ -23,6 +24,7 @@ Use this skill to investigate a synthetic patient-level causal inference dataset
 - For endpoint-backed extraction, use very long context by default when the model and hardware support it. Aim for roughly a 200,000-token extraction context budget so the extractor can see as much patient history as possible; set vLLM `--max-model-len` near `200000`, set the extractor's max input/text tokens to a similarly large value, and set `max_tokens`/`max_new_tokens` high enough for reasoning-model overhead and complete structured JSON output rather than a few hundred tokens. If a shorter context or output cap is required, document the exact limit and why.
 - Do not treat "no LLM extraction backend" as a reason to skip candidate extraction, emit an all-missing `candidate_features` table, or proceed to final causal-forest/ITE claims. In that situation, the coding agent must perform the document-reading extraction itself, preferably with subagents; if the extraction is genuinely infeasible even after sharding, stop and report the blocker instead of finalizing downstream causal results that depend on extracted features.
 - Keep all model assessment honest: every nuisance prediction, residual, pseudo-outcome, effect estimate, and ITE used for selection or reporting must be out-of-fold for that row.
+- Do not assume extracted concepts remain valid confounders or effect modifiers after materialization. Before final causal-forest fitting, train relatively simple fold-honest nuisance and R-loss/pseudo-target/effect-modifier diagnostics on the extracted features, compare them with upstream BoW and embedding-contrast benchmarks, and make the agent reconsider variables, aliases, roles, and extraction when extracted-feature models materially underperform.
 - Separate confounder discovery from effect-modifier discovery.
 - Seek parsimonious final feature lists. Before passing variables to the causal forest, inspect feature-feature correlations, missingness overlap, treatment/outcome associations, plausible transformations among confounders, and redundant proxy variables; prefer the smallest evidence-supported set that preserves nuisance, heterogeneity, and ITE stability.
 - After settling on final confounders and effect modifiers, fit a real honest causal forest as the final ITE estimator. R-learners, S/T/X-learners, generic `RandomForestRegressor`/ExtraTrees/XGBoost effect models, or other meta-learners may be used as diagnostics or sensitivity checks, but they do not satisfy the final causal-forest requirement. If no causal-forest implementation is available, use the repo-native explicit-feature forest path or an installed causal-forest library such as `econml`'s `CausalForestDML`; if neither can be made to run, stop and report the blocker rather than emitting complete final ITE artifacts.
@@ -58,25 +60,30 @@ Use this skill to investigate a synthetic patient-level causal inference dataset
    - For coding-agent extraction, use subagents or targeted chunk review when useful: search or sample likely relevant chunks, inspect nearby context, reconcile patient-level values, and emit the same structured feature table and missingness flags; do not use regex or pattern matching to extract or fill clinical values.
    - Do not create an all-missing feature table merely because no endpoint exists. Missingness is a patient/concept-level conclusion from reading the text, not a run-level substitute for extraction.
    - Record extraction backend, model/endpoint if used, prompt/version, missingness, and extraction rationale.
-6. Run fold-aware univariable screens on extracted candidates:
+6. Run a post-extraction feature review before accepting candidates for the final forest:
+   - Train simple extracted-feature treatment nuisance, outcome nuisance, and R-loss/pseudo-target or effect-modifier diagnostics inside the same honest fold structure.
+   - Compare extracted-feature performance with the upstream BoW/TF-IDF and embedding-contrast benchmarks. Use margins, fold recurrence, missingness, and role-specific failures rather than a single score.
+   - If extracted features underperform, ask the agent to revise candidate specs, merge aliases, fix category/value harmonization, re-role variables, add narrow evidence-supported concepts, and re-extract only what changed.
+   - Record the review rounds, diagnostics, revision rationale, and any stop reason.
+7. Run fold-aware univariable screens on extracted candidates:
    - Screen each candidate for treatment association to support treatment nuisance/confounder discovery.
    - Screen each candidate for outcome association or improvement in outcome nuisance prediction.
    - Screen each candidate for effect modification using treatment-by-feature interaction, subgroup residual slopes, R-loss, or pseudo-outcome association.
    - Screen plausible transformations or functional relationships among confounders when supported by text evidence or diagnostics.
    - Record standardized effect sizes, score deltas, fold recurrence, direction, missingness, and p values; do not rank candidates by p value alone.
    - Treat screens as prioritization and debugging tools; require cross-fitted multivariable/nuisance evidence before final role assignment.
-7. Evaluate roles honestly:
+8. Evaluate roles honestly:
    - Confounder candidates should improve treatment and outcome nuisance performance or residual balance across folds.
    - Effect-modifier candidates should improve treatment-by-feature interaction, treatment-stratified outcome association, R-loss, pseudo-outcome, or fold-stable heterogeneity objectives.
-8. Run a parsimony and redundancy review before causal-forest fitting:
+9. Run a parsimony and redundancy review before causal-forest fitting:
    - Explore correlations, missingness overlap, and surrogate relationships among extracted features.
    - Prefer direct, stable, baseline variables over redundant proxies or broad composite variables unless the composite clearly improves honest metrics.
    - Revisit candidate transformations and interactions among confounders only when they improve held-out nuisance or balance diagnostics.
-9. Expand candidate extraction only when current candidates leave unexplained treatment assignment, outcome prediction, residual structure, heterogeneous effect signal, or unresolved baseline temporal anchoring.
-10. Repeatedly mull over the candidate feature list before finalizing: revise roles, merge redundant variables, reject weak proxies, and compare the revised list against prior iterations.
-11. Compare candidate DGP forms, including nonparametric/tree/forest models and interpretable summaries. Avoid finalizing after one plausible pass.
-12. Estimate final ITEs with an honest causal forest fit on the finalized confounders and effect modifiers, using the same cross-fitting discipline. Other honest DGP, R-learner, or meta-learner estimates may be reported only as sensitivity analyses or comparisons, not as a replacement for the final causal-forest ITEs.
-13. Stop when additional iterations do not improve holdout nuisance metrics, R-loss/pseudo-outcome metrics, fold recurrence, univariable-screen stability, parsimony, or ITE stability. Document remaining uncertainty.
+10. Expand candidate extraction only when current candidates leave unexplained treatment assignment, outcome prediction, residual structure, heterogeneous effect signal, post-extraction benchmark gaps, or unresolved baseline temporal anchoring.
+11. Repeatedly mull over the candidate feature list before finalizing: revise roles, merge redundant variables, reject weak proxies, and compare the revised list against prior iterations.
+12. Compare candidate DGP forms, including nonparametric/tree/forest models and interpretable summaries. Avoid finalizing after one plausible pass.
+13. Estimate final ITEs with an honest causal forest fit on the finalized confounders and effect modifiers, using the same cross-fitting discipline. Other honest DGP, R-learner, or meta-learner estimates may be reported only as sensitivity analyses or comparisons, not as a replacement for the final causal-forest ITEs.
+14. Stop when additional iterations do not improve holdout nuisance metrics, R-loss/pseudo-outcome metrics, extracted-feature benchmark gaps, fold recurrence, univariable-screen stability, parsimony, or ITE stability. Document remaining uncertainty.
 
 ## References
 

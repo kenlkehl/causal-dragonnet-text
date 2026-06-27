@@ -1996,6 +1996,11 @@ def build_agent_prompt(
     if context.get("prompt_version") == "multi_model_agentic_consistency_v1":
         return build_multi_model_agentic_consistency_prompt(context, search_config)
 
+    if context.get("prompt_version") == "multi_model_agentic_extracted_feature_review_v1":
+        return build_multi_model_agentic_extracted_feature_review_prompt(
+            context, search_config
+        )
+
     if context.get("prompt_version") == "agentic_attention_variable_forest_v1":
         return build_attention_variable_agent_prompt(context, search_config)
 
@@ -2401,6 +2406,60 @@ Rules:
 - Return at most max_selected_candidates add proposals.
 
 Current consistency-selection context:
+{context_json}
+"""
+
+
+def build_multi_model_agentic_extracted_feature_review_prompt(
+    context: Dict[str, Any],
+    search_config: AgenticFeatureSearchConfig,
+) -> str:
+    """Construct the post-extraction diagnostic review prompt."""
+    context_json = json.dumps(
+        context,
+        separators=(",", ":"),
+        default=_json_default,
+    )
+    max_proposals = int(
+        context.get(
+            "max_proposals",
+            max(1, int(getattr(search_config, "max_additions_per_iter", 6))),
+        )
+    )
+    max_removals = int(getattr(search_config, "max_removals_per_iter", 3))
+    return f"""You are reviewing extracted explicit variables before a downstream causal forest is fit.
+
+The outer test fold is not included here. All diagnostics come from cross-fitted models on the current outer-training fold only.
+
+The selected variables have already been extracted from clinical text. Simple nuisance and R/pseudo-target models were trained on those extracted values and compared with the original multi-view BoW and embedding-contrast evidence. Your task is to revise the explicit feature set when the extracted variables do not preserve the confounder or effect-modifier signal seen upstream.
+
+Return JSON only with this shape:
+{{
+  "proposals": [
+    {{
+      "action": "add|remove|update_role|none",
+      "name": "snake_case_variable_name",
+      "type": "categorical|continuous",
+      "categories": ["category_a", "category_b"],
+      "roles": ["confounder", "effect_modifier"],
+      "description": "exact pre-treatment extraction target",
+      "rationale": "why this change addresses the diagnostic failure",
+      "expected_signal": "treatment, outcome, or pseudo-target signal expected"
+    }}
+  ]
+}}
+
+Rules:
+- Return at most {max_proposals} add proposals and at most {max_removals} remove proposals.
+- Use update_role when a feature was extracted correctly but assigned to the wrong causal role.
+- Use remove when an agent-added feature is too sparse, constant, redundant, post-treatment, or unsupported by diagnostics.
+- Do not remove required_features; propose role updates for them only when diagnostics justify it.
+- Add a replacement only when the BoW/embedding evidence points to a clearer extractable pre-treatment patient-level variable.
+- For categorical variables, provide 2-8 mutually exclusive categories.
+- Do not use treatment choice, post-treatment response, toxicity after treatment, survival, or outcome-derived variables.
+- Use "none" if the current extracted feature set is the best defensible set despite the diagnostic gap.
+
+Current extracted-feature review context:
 {context_json}
 """
 

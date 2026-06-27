@@ -11,12 +11,30 @@ Relevant implementation:
 - Config dataclass: `MultiModelAgenticForestConfig`
 - README section beginning "Use `model_type=\"multi_model_agentic_forest\"`"
 
+Current multi-model stages:
+- Build shared honest folds, then fit every configured `bow_view` for treatment nuisance, outcome nuisance, and R-loss/pseudo-target evidence.
+- Use the default broad BoW grid when feasible: linear 1-1, 1-2, 1-3, and 2-4 n-gram TF-IDF views plus ExtraTrees and RandomForest views. Supported `bow_model` values are `linear`, `extratrees`, `random_forest`, and `xgboost`.
+- Add an ensemble R target from the cross-view nuisance predictions so the proposal agent can see a signal that is less tied to one vectorizer or learner.
+- Optionally add embedding-contrast evidence: treatment, outcome, per-view R-pseudo-target, ensemble R, within-arm outcome, treatment-outcome cell, orthogonal R-score, and concept-probe contrasts from real text chunks.
+- Merge researcher-supplied `prespecified_features`, `prespecified_confounders`, `prespecified_effect_modifiers`, and `prespecified_features_json` into the same `ExplicitFeatureSpec` contract as agent-proposed features. Duplicate names are harmonized and role lists are merged.
+- Run inner-fold candidate consistency checks before extraction when enabled. Use these checks to stabilize proposed concepts, recover strong fold-local candidates, and reject unstable aliases without peeking at held-out reporting rows.
+- Canonicalize aliases, categorical categories, and `value_aliases` before extraction so the extractor produces one patient-level column per concept rather than multiple synonymous variables.
+- Extract selected features with the repo extractor or with coding-agent document reading, then run the extracted-feature review loop before final causal-forest fitting. Underperforming extracted-feature nuisance or R/pseudo-target diagnostics should trigger agent revision and targeted re-extraction, capped by `extracted_feature_review_max_rounds`.
+
 Recommended defaults for each run:
 - `applied_inference.cv_folds >= 5`
 - `architecture.explicit_feature_forest.honest = true`
 - `architecture.multi_model_agentic_forest.nuisance_folds >= 5`
 - `architecture.multi_model_agentic_forest.effect_folds >= 5`
 - `candidate_consistency_enabled = true`
+- `candidate_consistency_inner_folds = 3`
+- `candidate_consistency_min_folds = 2`
+- `candidate_consistency_min_fold_fraction = 0.5`
+- `extracted_feature_review_enabled = true`
+- `extracted_feature_review_max_rounds = 3`
+- `extracted_feature_review_auc_margin = 0.02`
+- `extracted_feature_review_loss_relative_margin = 0.05`
+- `extracted_feature_review_min_benchmark_auc = 0.55`
 - leave `prespecified_confounders`, `prespecified_effect_modifiers`, and `prespecified_features` empty unless the user supplied variables
 
 Minimum `bow_views` suite when feasible:
@@ -32,6 +50,7 @@ Key artifacts usually appear under `multi_model_agentic_forest/`:
 - `bow_view_feature_importance_by_fold.jsonl`
 - `embedding_contrast_evidence_by_fold.jsonl`
 - `agent_candidate_proposals.jsonl`
+- `extracted_feature_diagnostics_by_fold.jsonl`
 - `selected_feature_sets.json`
 - `outer_cv_metrics.csv`
 
@@ -75,7 +94,20 @@ Local vLLM launch guidance:
 - Run a JSON-format smoke test through the server before full extraction; the test must include at least one numeric baseline variable and one categorical variable.
 - Record the server command, model name/path, context length, max input/text tokens, max generation tokens, prompt version, smoke-test output, and fallback reasons in `report.txt`.
 
-Use `model_type="multi_model_agentic_forest"`, `agentic_explicit_feature_forest`, or `agentic_attention_variable_forest` to keep proposal, extraction, and forest fitting on the repo-native path. The multi-model BoW path sends text evidence to the proposal agent, then the extractor materializes selected explicit variables from text before fitting the final causal forest.
+Use `model_type="multi_model_agentic_forest"`, `agentic_explicit_feature_forest`, or `agentic_attention_variable_forest` to keep proposal, extraction, and forest fitting on the repo-native path. The multi-model BoW path sends text evidence to the proposal agent, then the extractor materializes selected explicit variables from text before the extracted-feature review loop and final causal forest.
+
+## Post-Extraction Feature Review
+
+Do not treat a successfully extracted feature table as proof that the variables are useful confounders or effect modifiers. After extraction, run relatively simple fold-honest diagnostics on the extracted variables and compare them with the upstream BoW and embedding evidence that motivated the variables.
+
+The repo-native `multi_model_agentic_forest` path performs this review when `extracted_feature_review_enabled=true`:
+- Fit extracted-feature treatment nuisance and outcome nuisance models on training folds and score only held-out rows.
+- Fit extracted-feature R-loss, logistic R-loss, pseudo-target, or interaction-style effect-modifier diagnostics using out-of-fold nuisance quantities.
+- Compare extracted-feature treatment/outcome AUROC or losses against BoW/embedding benchmarks. The default gate allows a small AUROC gap (`extracted_feature_review_auc_margin=0.02`) and a small relative loss gap (`extracted_feature_review_loss_relative_margin=0.05`) before treating the extraction as underperforming; `extracted_feature_review_min_benchmark_auc=0.55` prevents weak benchmarks from forcing revisions.
+- Send failed gates, missingness, weak role evidence, alias/category problems, and upstream evidence back to the agent. The agent may drop variables, re-role them, merge aliases, improve categorical `value_aliases`, add narrow evidence-supported concepts, or request targeted re-extraction.
+- Cap revisions with `extracted_feature_review_max_rounds`. If the cap is reached, document the remaining benchmark gaps and whether the final forest is exploratory or blocked.
+
+For a custom coding-agent orchestrator, mirror the same discipline: all diagnostics used to accept, reject, or revise features must be computed inside training folds or out-of-fold for the scored rows. Never compare extracted features to BoW or embedding models using in-sample predictions.
 
 ## Required Second Pass: Attention/HTR Evidence Path
 

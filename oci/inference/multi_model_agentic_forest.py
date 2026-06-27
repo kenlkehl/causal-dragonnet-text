@@ -43,6 +43,7 @@ from .agentic_explicit_feature_forest import (
     _spec_to_dict,
     apply_agentic_alias_resolution,
     apply_agentic_value_harmonization,
+    apply_proposals,
     validate_agentic_proposals,
 )
 from .embedding_contrast_discovery import (
@@ -155,6 +156,7 @@ class MultiModelAgenticForestRunner:
         self.importance_rows: List[Dict[str, Any]] = []
         self.embedding_evidence_rows: List[Dict[str, Any]] = []
         self.agent_rows: List[Dict[str, Any]] = []
+        self.extracted_feature_diagnostic_rows: List[Dict[str, Any]] = []
         self.feature_set_rows: List[Dict[str, Any]] = []
         self.outer_metric_rows: List[Dict[str, Any]] = []
         self.alias_reference_specs: List[ExplicitFeatureSpec] = self._initial_specs()
@@ -210,6 +212,9 @@ class MultiModelAgenticForestRunner:
                 self.importance_rows.extend(item["importance_rows"])
                 self.embedding_evidence_rows.extend(item["embedding_evidence_rows"])
                 self.agent_rows.extend(item["agent_rows"])
+                self.extracted_feature_diagnostic_rows.extend(
+                    item["extracted_feature_diagnostic_rows"]
+                )
                 self.feature_set_rows.extend(item["feature_set_rows"])
                 self.outer_metric_rows.extend(item["outer_metric_rows"])
         else:
@@ -268,6 +273,9 @@ class MultiModelAgenticForestRunner:
             "importance_rows": fold_runner.importance_rows,
             "embedding_evidence_rows": fold_runner.embedding_evidence_rows,
             "agent_rows": fold_runner.agent_rows,
+            "extracted_feature_diagnostic_rows": (
+                fold_runner.extracted_feature_diagnostic_rows
+            ),
             "feature_set_rows": fold_runner.feature_set_rows,
             "outer_metric_rows": fold_runner.outer_metric_rows,
         }
@@ -394,6 +402,16 @@ class MultiModelAgenticForestRunner:
             train_df,
             selected_specs,
         )
+        review_result = self._review_extracted_features_if_needed(
+            outer_fold=outer_fold,
+            train_idx=train_idx,
+            selected_specs=selected_specs,
+            bow_result=bow_result,
+            embedding_evidence=embedding_evidence,
+        )
+        selected_specs = review_result["selected_specs"]
+        train_df = self.dataset.iloc[train_idx].copy()
+        test_df = self.dataset.iloc[test_idx].copy()
         self.feature_set_rows.append(
             {
                 "outer_fold": int(outer_fold),
@@ -406,6 +424,7 @@ class MultiModelAgenticForestRunner:
                     for spec in selected_specs
                     if "effect_modifier" in spec.roles
                 ],
+                "extracted_feature_review": review_result["summary"],
             }
         )
 
@@ -434,6 +453,10 @@ class MultiModelAgenticForestRunner:
             {
                 "outer_fold": int(outer_fold),
                 "n_selected_features": int(len(selected_specs)),
+                **_prefix_metrics(
+                    "extracted_feature_review_",
+                    _scalar_metrics(review_result["summary"]),
+                ),
                 **_scalar_metrics(final_eval.metrics),
                 **_prefix_metrics("bow_", bow_result["metrics"]),
             }
@@ -1987,6 +2010,277 @@ class MultiModelAgenticForestRunner:
             self.agent_rows.append({"event": "coverage_filter", "dropped": dropped})
         return kept
 
+    def _review_extracted_features_if_needed(
+        self,
+        *,
+        outer_fold: int,
+        train_idx: np.ndarray,
+        selected_specs: List[ExplicitFeatureSpec],
+        bow_result: Dict[str, Any],
+        embedding_evidence: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not bool(getattr(self.nn_config, "extracted_feature_review_enabled", True)):
+            return {
+                "selected_specs": selected_specs,
+                "summary": {
+                    "enabled": False,
+                    "review_passed": None,
+                    "review_rounds": 0,
+                },
+            }
+
+        max_rounds = int(getattr(self.nn_config, "extracted_feature_review_max_rounds", 3))
+        if max_rounds <= 0:
+            return {
+                "selected_specs": selected_specs,
+                "summary": {
+                    "enabled": True,
+                    "review_passed": None,
+                    "review_rounds": 0,
+                    "skipped": "max_rounds_zero",
+                },
+            }
+
+        required_names = {spec.name for spec in self._initial_specs()}
+        current_specs = list(selected_specs)
+        best_specs = list(current_specs)
+        best_diagnostic: Optional[Dict[str, Any]] = None
+        best_score: Optional[Tuple[int, float, float, float]] = None
+        final_status = "max_rounds_reached"
+        final_passed = False
+
+        for round_index in range(max_rounds + 1):
+            train_df = self.dataset.iloc[train_idx].copy()
+            current_specs = self._filter_specs_by_extraction_coverage(
+                train_df,
+                current_specs,
+            )
+            diagnostic = _evaluate_extracted_feature_set_diagnostic(
+                train_df=train_df,
+                specs=current_specs,
+                config=self.config,
+                nn_config=self.nn_config,
+                bow_metrics=bow_result.get("metrics", {}),
+                embedding_evidence=embedding_evidence,
+                random_state=71_000 + 100 * int(outer_fold) + int(round_index),
+            )
+            benchmark = diagnostic.get("benchmark", {})
+            gate = _extracted_feature_review_gate(
+                diagnostic=diagnostic,
+                nn_config=self.nn_config,
+            )
+            diagnostic["outer_fold"] = int(outer_fold)
+            diagnostic["round"] = int(round_index)
+            diagnostic["selected_features"] = [
+                _spec_to_dict(spec) for spec in current_specs
+            ]
+            diagnostic["gate"] = gate
+            self.extracted_feature_diagnostic_rows.append(
+                _redact_review_artifact(diagnostic, self.search_config)
+            )
+
+            score = _extracted_review_selection_score(diagnostic, gate)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_specs = list(current_specs)
+                best_diagnostic = diagnostic
+
+            if gate.get("passed"):
+                final_status = "passed"
+                final_passed = True
+                best_specs = list(current_specs)
+                best_diagnostic = diagnostic
+                break
+
+            if round_index >= max_rounds:
+                break
+
+            context = self._build_extracted_feature_review_context(
+                outer_fold=outer_fold,
+                round_index=round_index,
+                current_specs=current_specs,
+                diagnostic=diagnostic,
+                gate=gate,
+                benchmark=benchmark,
+                bow_context=bow_result["context"],
+                embedding_evidence=embedding_evidence,
+                required_names=required_names,
+            )
+            try:
+                raw_proposals = self.proposal_agent.propose(context)
+                review_agent_trace = _get_agent_response_trace(self.proposal_agent)
+                proposals, rejected = validate_agentic_proposals(
+                    raw_proposals,
+                    current_specs=current_specs,
+                    search_config=self.search_config,
+                    allow_removals=True,
+                    max_additions=self.nn_config.candidate_proposals_per_fold,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Multi-model extracted-feature review agent failed; "
+                    "using best available feature set",
+                    exc_info=True,
+                )
+                self.agent_rows.append(
+                    {
+                        "outer_fold": int(outer_fold),
+                        "event": "extracted_feature_review",
+                        "round": int(round_index),
+                        "error": str(exc),
+                    }
+                )
+                final_status = "agent_error"
+                break
+
+            proposals, protected_rejections = _protect_required_feature_proposals(
+                proposals,
+                required_names,
+            )
+            rejected.extend(protected_rejections)
+            proposals, alias_resolution = self._resolve_proposal_aliases(
+                outer_fold=outer_fold,
+                proposals=proposals,
+            )
+            revised_specs = _dedupe_specs(apply_proposals(current_specs, proposals))
+            revised_specs, value_harmonization = self._harmonize_value_contracts(
+                outer_fold=outer_fold,
+                selected_specs=revised_specs,
+            )
+            self._remember_alias_reference_specs(revised_specs)
+
+            review_row: Dict[str, Any] = {
+                "outer_fold": int(outer_fold),
+                "event": "extracted_feature_review",
+                "round": int(round_index),
+                "raw_proposals": raw_proposals,
+                "valid_proposals": [_proposal_to_dict(proposal) for proposal in proposals],
+                "rejected_proposals": rejected,
+                "alias_resolution": alias_resolution,
+                "value_harmonization": value_harmonization,
+                "selected_features_before": [
+                    _spec_to_dict(spec) for spec in current_specs
+                ],
+                "selected_features_after": [
+                    _spec_to_dict(spec) for spec in revised_specs
+                ],
+                "gate": gate,
+            }
+            if self.search_config.save_agent_context:
+                review_row["context"] = context
+            if self.search_config.save_agent_raw_output:
+                review_row["agent_raw_output"] = review_agent_trace
+            self.agent_rows.append(review_row)
+
+            if not _spec_sets_differ(current_specs, revised_specs):
+                final_status = "no_review_changes"
+                break
+
+            current_specs = revised_specs
+            self.dataset = self.extraction_provider.ensure_features(
+                self.dataset,
+                current_specs,
+            )
+
+        selected = best_specs
+        if best_diagnostic is not None and not final_passed:
+            selected = best_specs
+        summary = _extracted_review_summary(
+            diagnostic=best_diagnostic,
+            status=final_status,
+            passed=final_passed,
+            rounds=len(
+                [
+                    row
+                    for row in self.extracted_feature_diagnostic_rows
+                    if row.get("outer_fold") == int(outer_fold)
+                ]
+            ),
+        )
+        return {"selected_specs": selected, "summary": summary}
+
+    def _build_extracted_feature_review_context(
+        self,
+        *,
+        outer_fold: int,
+        round_index: int,
+        current_specs: Sequence[ExplicitFeatureSpec],
+        diagnostic: Dict[str, Any],
+        gate: Dict[str, Any],
+        benchmark: Dict[str, Any],
+        bow_context: Dict[str, Any],
+        embedding_evidence: Dict[str, Any],
+        required_names: set,
+    ) -> Dict[str, Any]:
+        context = {
+            "prompt_version": "multi_model_agentic_extracted_feature_review_v1",
+            "outer_fold": int(outer_fold),
+            "review_round": int(round_index),
+            "max_proposals": int(self.nn_config.candidate_proposals_per_fold),
+            "clinical_question": self.config.clinical_question,
+            "estimand": {
+                "treatment_column": self.config.treatment_column,
+                "outcome_column": self.config.outcome_column,
+                "outcome_type": self.config.outcome_type,
+            },
+            "required_features": [
+                _spec_to_dict(spec)
+                for spec in current_specs
+                if spec.name in required_names
+            ],
+            "current_features": [_spec_to_dict(spec) for spec in current_specs],
+            "extraction_summary": diagnostic.get("extraction_summary", []),
+            "extracted_feature_diagnostics": _agent_visible_metrics(
+                diagnostic.get("metrics", {})
+            ),
+            "benchmarks": benchmark,
+            "failed_criteria": gate.get("failed_criteria", []),
+            "review_policy": {
+                "auc_margin": float(
+                    getattr(self.nn_config, "extracted_feature_review_auc_margin", 0.02)
+                ),
+                "loss_relative_margin": float(
+                    getattr(
+                        self.nn_config,
+                        "extracted_feature_review_loss_relative_margin",
+                        0.05,
+                    )
+                ),
+                "min_benchmark_auc": float(
+                    getattr(
+                        self.nn_config,
+                        "extracted_feature_review_min_benchmark_auc",
+                        0.55,
+                    )
+                ),
+            },
+            "original_bow_context": {
+                "model_diagnostics": bow_context.get("model_diagnostics"),
+                "feature_importance": bow_context.get("feature_importance"),
+            },
+            "response_contract": {
+                "proposals": [
+                    {
+                        "action": "add|remove|update_role|none",
+                        "name": "snake_case_variable_name",
+                        "type": "categorical|continuous",
+                        "categories": ["category_a", "category_b"],
+                        "roles": ["confounder", "effect_modifier"],
+                        "description": "exact pre-treatment extraction target",
+                        "rationale": "why this change addresses the diagnostic failure",
+                        "expected_signal": "treatment, outcome, or pseudo-target signal expected",
+                    }
+                ]
+            },
+        }
+        if embedding_evidence:
+            context["embedding_contrast_evidence"] = (
+                embedding_evidence
+                if self.search_config.save_agent_context
+                else redact_embedding_contrast_evidence(embedding_evidence)
+            )
+        return _compact_extracted_feature_review_context(context)
+
     def _ensure_prespecified_features(self) -> None:
         specs = self._initial_specs()
         if not specs:
@@ -2153,6 +2447,11 @@ class MultiModelAgenticForestRunner:
                 self.artifact_dir / "embedding_contrast_evidence_by_fold.jsonl",
                 self.embedding_evidence_rows,
             )
+        if self.extracted_feature_diagnostic_rows:
+            _write_jsonl(
+                self.artifact_dir / "extracted_feature_diagnostics_by_fold.jsonl",
+                self.extracted_feature_diagnostic_rows,
+            )
         _write_jsonl(self.artifact_dir / "agent_candidate_proposals.jsonl", self.agent_rows)
         with open(self.artifact_dir / "selected_feature_sets.json", "w") as f:
             json.dump(self.feature_set_rows, f, indent=2, default=_json_default)
@@ -2197,6 +2496,9 @@ def _run_multi_model_outer_fold_worker(
         "importance_rows": fold_runner.importance_rows,
         "embedding_evidence_rows": fold_runner.embedding_evidence_rows,
         "agent_rows": fold_runner.agent_rows,
+        "extracted_feature_diagnostic_rows": (
+            fold_runner.extracted_feature_diagnostic_rows
+        ),
         "feature_set_rows": fold_runner.feature_set_rows,
         "outer_metric_rows": fold_runner.outer_metric_rows,
     }
@@ -2380,6 +2682,603 @@ def _columns_to_feature_dicts(
             item[f"{spec.name}_missing"] = bool(row.get(missing_col, pd.isna(value)))
         values.append(item)
     return values
+
+
+def _evaluate_extracted_feature_set_diagnostic(
+    *,
+    train_df: pd.DataFrame,
+    specs: Sequence[ExplicitFeatureSpec],
+    config: AppliedInferenceConfig,
+    nn_config: MultiModelAgenticForestConfig,
+    bow_metrics: Dict[str, Any],
+    embedding_evidence: Dict[str, Any],
+    random_state: int,
+) -> Dict[str, Any]:
+    y = train_df[config.outcome_column].to_numpy(dtype=float)
+    t = train_df[config.treatment_column].to_numpy(dtype=float)
+    specs = list(specs)
+    extraction_summary = _summarize_multi_model_extractions(train_df, specs)
+    x_full, x_names = _explicit_matrix_full(train_df, specs, role="effect_modifier")
+    w_full, w_names = _explicit_matrix_full(train_df, specs, role="confounder")
+
+    status = "ok"
+    if not specs:
+        status = "no_selected_features"
+    elif x_full.shape[1] == 0 and w_full.shape[1] == 0:
+        status = "no_usable_feature_columns"
+
+    e_hat = _crossfit_explicit_binary(
+        train_df=train_df,
+        labels=t,
+        specs=specs,
+        role="confounder",
+        requested_folds=int(nn_config.nuisance_folds),
+        random_state=random_state + 11,
+    )
+    if str(config.outcome_type).lower() == "continuous":
+        m_hat = _crossfit_explicit_regression(
+            train_df=train_df,
+            values=y,
+            specs=specs,
+            role="confounder",
+            requested_folds=int(nn_config.nuisance_folds),
+            sample_weight=None,
+            random_state=random_state + 23,
+        )
+    else:
+        m_hat = _crossfit_explicit_binary(
+            train_df=train_df,
+            labels=y,
+            specs=specs,
+            role="confounder",
+            requested_folds=int(nn_config.nuisance_folds),
+            random_state=random_state + 23,
+        )
+
+    e_clipped = np.clip(e_hat, float(nn_config.e_clip), 1.0 - float(nn_config.e_clip))
+    t_resid = t - e_clipped
+    y_resid = y - m_hat
+    pseudo_target = y_resid / t_resid
+    pseudo_weight = np.square(t_resid)
+    tau_hat = _crossfit_explicit_regression(
+        train_df=train_df,
+        values=pseudo_target,
+        specs=specs,
+        role="effect_modifier",
+        requested_folds=int(nn_config.effect_folds),
+        sample_weight=pseudo_weight,
+        random_state=random_state + 37,
+    )
+    r_loss = np.square(y_resid - tau_hat * t_resid)
+    r_loss_at_zero = np.square(y_resid)
+
+    metrics: Dict[str, Any] = {
+        "status": status,
+        "n_rows": int(len(train_df)),
+        "n_selected_features": int(len(specs)),
+        "n_w_features": int(w_full.shape[1]),
+        "n_x_features": int(x_full.shape[1]),
+        "w_feature_names": w_names,
+        "x_feature_names": x_names,
+        "treatment_auroc": _safe_roc_auc(t, e_hat),
+        "treatment_brier": _safe_brier_score(t, e_hat),
+        "treatment_log_loss": _safe_log_loss(t, e_hat),
+        "pseudo_target_mean": _finite_or_none(np.mean(pseudo_target)),
+        "pseudo_target_std": _finite_or_none(np.std(pseudo_target)),
+        "tau_hat_mean": _finite_or_none(np.mean(tau_hat)),
+        "tau_hat_std": _finite_or_none(np.std(tau_hat)),
+        "tau_hat_pseudo_target_corr": _safe_corr(tau_hat, pseudo_target),
+        "r_loss_mean": _finite_or_none(np.mean(r_loss)),
+        "r_loss_at_zero_tau_mean": _finite_or_none(np.mean(r_loss_at_zero)),
+    }
+    zero = metrics["r_loss_at_zero_tau_mean"]
+    loss = metrics["r_loss_mean"]
+    if zero is not None and zero > 0.0 and loss is not None:
+        metrics["r_loss_relative_improvement"] = float(1.0 - loss / zero)
+    if str(config.outcome_type).lower() == "continuous":
+        metrics["outcome_rmse"] = _finite_or_none(np.sqrt(mean_squared_error(y, m_hat)))
+    else:
+        metrics["outcome_auroc"] = _safe_roc_auc(y, m_hat)
+        metrics["outcome_brier"] = _safe_brier_score(y, m_hat)
+        metrics["outcome_log_loss"] = _safe_log_loss(y, m_hat)
+
+    return {
+        "metrics": metrics,
+        "benchmark": _extracted_feature_review_benchmarks(
+            bow_metrics,
+            embedding_evidence,
+        ),
+        "extraction_summary": extraction_summary,
+    }
+
+
+def _crossfit_explicit_binary(
+    *,
+    train_df: pd.DataFrame,
+    labels: np.ndarray,
+    specs: Sequence[ExplicitFeatureSpec],
+    role: Optional[str],
+    requested_folds: int,
+    random_state: int,
+) -> np.ndarray:
+    labels = np.asarray(labels, dtype=float)
+    oof = np.full(len(labels), np.nan, dtype=float)
+    if len(labels) == 0:
+        return oof
+    if len(np.unique(labels.astype(int))) < 2:
+        return np.full(len(labels), float(np.nanmean(labels)), dtype=float)
+    try:
+        split_items = _binary_split_items(
+            labels.astype(int),
+            requested_folds=requested_folds,
+            random_state=random_state,
+        )
+    except ValueError:
+        return np.full(len(labels), float(np.nanmean(labels)), dtype=float)
+
+    for fold, (fit_pos, heldout_pos) in enumerate(split_items, start=1):
+        del fold
+        fit_pos = np.asarray(fit_pos)
+        heldout_pos = np.asarray(heldout_pos)
+        fit_y = labels[fit_pos].astype(int)
+        if len(np.unique(fit_y)) < 2:
+            oof[heldout_pos] = float(np.mean(fit_y))
+            continue
+        x_fit, x_heldout = _explicit_matrix_split(
+            train_df=train_df,
+            fit_pos=fit_pos,
+            heldout_pos=heldout_pos,
+            specs=specs,
+            role=role,
+        )
+        x_fit = _ensure_model_matrix(x_fit)
+        x_heldout = _ensure_model_matrix(x_heldout)
+        model = LogisticRegression(
+            C=1.0,
+            solver="liblinear",
+            max_iter=1000,
+            random_state=random_state,
+        )
+        try:
+            model.fit(x_fit, fit_y)
+            oof[heldout_pos] = model.predict_proba(x_heldout)[:, 1]
+        except ValueError:
+            oof[heldout_pos] = float(np.mean(fit_y))
+    return _fill_nonfinite_predictions(oof, labels)
+
+
+def _crossfit_explicit_regression(
+    *,
+    train_df: pd.DataFrame,
+    values: np.ndarray,
+    specs: Sequence[ExplicitFeatureSpec],
+    role: Optional[str],
+    requested_folds: int,
+    sample_weight: Optional[np.ndarray],
+    random_state: int,
+) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    oof = np.full(len(values), np.nan, dtype=float)
+    if len(values) == 0:
+        return oof
+    try:
+        folds = _bounded_fold_count(requested_folds, len(values))
+    except ValueError:
+        return np.full(len(values), float(np.nanmean(values)), dtype=float)
+    splitter = KFold(n_splits=folds, shuffle=True, random_state=random_state)
+    weights = None if sample_weight is None else np.asarray(sample_weight, dtype=float)
+    for fit_pos, heldout_pos in splitter.split(train_df):
+        fit_pos = np.asarray(fit_pos)
+        heldout_pos = np.asarray(heldout_pos)
+        x_fit, x_heldout = _explicit_matrix_split(
+            train_df=train_df,
+            fit_pos=fit_pos,
+            heldout_pos=heldout_pos,
+            specs=specs,
+            role=role,
+        )
+        x_fit = _ensure_model_matrix(x_fit)
+        x_heldout = _ensure_model_matrix(x_heldout)
+        model = Ridge(alpha=1.0, random_state=random_state)
+        fit_weight = None
+        if weights is not None and len(weights) == len(values):
+            fit_weight = weights[fit_pos]
+            fit_weight = np.where(
+                np.isfinite(fit_weight) & (fit_weight > 0.0),
+                fit_weight,
+                0.0,
+            )
+            if float(np.sum(fit_weight)) <= 0.0:
+                fit_weight = None
+        finite = np.isfinite(values[fit_pos])
+        if np.sum(finite) < 1:
+            oof[heldout_pos] = float(np.nanmean(values))
+            continue
+        _fit_regressor(
+            model,
+            x_fit[finite],
+            values[fit_pos][finite],
+            sample_weight=None if fit_weight is None else fit_weight[finite],
+        )
+        oof[heldout_pos] = model.predict(x_heldout)
+    return _fill_nonfinite_predictions(oof, values)
+
+
+def _explicit_matrix_split(
+    *,
+    train_df: pd.DataFrame,
+    fit_pos: np.ndarray,
+    heldout_pos: np.ndarray,
+    specs: Sequence[ExplicitFeatureSpec],
+    role: Optional[str],
+) -> Tuple[np.ndarray, np.ndarray]:
+    fit_df = train_df.iloc[np.asarray(fit_pos)]
+    heldout_df = train_df.iloc[np.asarray(heldout_pos)]
+    fit_dicts = _columns_to_feature_dicts(fit_df, specs) or []
+    heldout_dicts = _columns_to_feature_dicts(heldout_df, specs) or []
+    means: Dict[str, float] = {}
+    stds: Dict[str, float] = {}
+    fit_features, _ = get_raw_explicit_features(
+        fit_dicts,
+        list(specs),
+        continuous_means=means,
+        continuous_stds=stds,
+        role=role,
+    )
+    heldout_features, _ = get_raw_explicit_features(
+        heldout_dicts,
+        list(specs),
+        continuous_means=means,
+        continuous_stds=stds,
+        role=role,
+    )
+    return (
+        _as_2d_feature_matrix(fit_features, len(fit_df)),
+        _as_2d_feature_matrix(heldout_features, len(heldout_df)),
+    )
+
+
+def _explicit_matrix_full(
+    df: pd.DataFrame,
+    specs: Sequence[ExplicitFeatureSpec],
+    *,
+    role: Optional[str],
+) -> Tuple[np.ndarray, List[str]]:
+    feature_dicts = _columns_to_feature_dicts(df, specs) or []
+    features, names = get_raw_explicit_features(
+        feature_dicts,
+        list(specs),
+        continuous_means={},
+        continuous_stds={},
+        role=role,
+    )
+    return _as_2d_feature_matrix(features, len(df)), list(names)
+
+
+def _as_2d_feature_matrix(values: Sequence[Sequence[float]], n_rows: int) -> np.ndarray:
+    matrix = np.asarray(values, dtype=np.float32)
+    if matrix.ndim != 2:
+        return np.zeros((n_rows, 0), dtype=np.float32)
+    if matrix.shape[0] != n_rows:
+        return np.zeros((n_rows, 0), dtype=np.float32)
+    return np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _ensure_model_matrix(matrix: np.ndarray) -> np.ndarray:
+    if matrix.ndim != 2 or matrix.shape[1] == 0:
+        return np.zeros((matrix.shape[0], 1), dtype=np.float32)
+    return matrix
+
+
+def _fill_nonfinite_predictions(pred: np.ndarray, fallback_values: np.ndarray) -> np.ndarray:
+    filled = np.asarray(pred, dtype=float).copy()
+    finite = np.isfinite(filled)
+    if np.all(finite):
+        return filled
+    fallback = float(np.nanmean(fallback_values)) if len(fallback_values) else 0.0
+    if not np.isfinite(fallback):
+        fallback = 0.0
+    filled[~finite] = fallback
+    return filled
+
+
+def _safe_log_loss(y_true: np.ndarray, y_pred: np.ndarray) -> Optional[float]:
+    try:
+        return _finite_or_none(
+            log_loss(
+                np.asarray(y_true, dtype=int),
+                np.clip(np.asarray(y_pred, dtype=float), 1e-6, 1.0 - 1e-6),
+                labels=[0, 1],
+            )
+        )
+    except ValueError:
+        return None
+
+
+def _safe_brier_score(y_true: np.ndarray, y_pred: np.ndarray) -> Optional[float]:
+    try:
+        return _finite_or_none(
+            brier_score_loss(
+                np.asarray(y_true, dtype=int),
+                np.clip(np.asarray(y_pred, dtype=float), 0.0, 1.0),
+            )
+        )
+    except ValueError:
+        return None
+
+
+def _summarize_multi_model_extractions(
+    df: pd.DataFrame,
+    specs: Sequence[ExplicitFeatureSpec],
+) -> List[Dict[str, Any]]:
+    summaries: List[Dict[str, Any]] = []
+    for spec in specs:
+        value_col = f"explicit_feat_{spec.name}"
+        missing_col = f"{value_col}_missing"
+        if value_col not in df.columns:
+            summaries.append(
+                {
+                    "name": spec.name,
+                    "roles": list(spec.roles),
+                    "coverage": 0.0,
+                    "top_values": {},
+                }
+            )
+            continue
+        if missing_col in df.columns:
+            missing = df[missing_col].astype(bool)
+        else:
+            missing = df[value_col].isna()
+        observed = df.loc[~missing, value_col]
+        summaries.append(
+            {
+                "name": spec.name,
+                "roles": list(spec.roles),
+                "coverage": float(1.0 - missing.mean()),
+                "n_unique_observed": int(observed.nunique(dropna=True)),
+                "top_values": observed.astype(str).value_counts().head(8).to_dict(),
+            }
+        )
+    return summaries
+
+
+def _extracted_feature_review_benchmarks(
+    bow_metrics: Dict[str, Any],
+    embedding_evidence: Dict[str, Any],
+) -> Dict[str, Any]:
+    treatment_auc_values = _collect_metric_values(bow_metrics, "treatment_auroc")
+    outcome_auc_values = _collect_metric_values(bow_metrics, "outcome_auroc")
+    treatment_log_losses = _collect_metric_values(bow_metrics, "treatment_log_loss")
+    outcome_log_losses = _collect_metric_values(bow_metrics, "outcome_log_loss")
+    outcome_rmses = _collect_metric_values(bow_metrics, "outcome_rmse")
+    r_losses = _collect_metric_values(bow_metrics, "r_loss_mean")
+
+    embedding_probe_auc = _embedding_probe_auc_benchmarks(embedding_evidence)
+    if embedding_probe_auc.get("treatment_probe_auc") is not None:
+        treatment_auc_values.append(float(embedding_probe_auc["treatment_probe_auc"]))
+    if embedding_probe_auc.get("outcome_probe_auc") is not None:
+        outcome_auc_values.append(float(embedding_probe_auc["outcome_probe_auc"]))
+
+    return {
+        "treatment_auroc": _max_or_none(treatment_auc_values),
+        "outcome_auroc": _max_or_none(outcome_auc_values),
+        "treatment_log_loss": _min_or_none(treatment_log_losses),
+        "outcome_log_loss": _min_or_none(outcome_log_losses),
+        "outcome_rmse": _min_or_none(outcome_rmses),
+        "r_loss_mean": _min_or_none(r_losses),
+        "embedding_probe_auc": embedding_probe_auc,
+    }
+
+
+def _collect_metric_values(payload: Any, metric_name: str) -> List[float]:
+    values: List[float] = []
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if key == metric_name or str(key).endswith(f"_{metric_name}"):
+                numeric = _finite_or_none(value)
+                if numeric is not None:
+                    values.append(float(numeric))
+            values.extend(_collect_metric_values(value, metric_name))
+    elif isinstance(payload, list):
+        for item in payload:
+            values.extend(_collect_metric_values(item, metric_name))
+    return values
+
+
+def _embedding_probe_auc_benchmarks(evidence: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(evidence, dict):
+        return {}
+    treatment_values: List[float] = []
+    outcome_values: List[float] = []
+    effect_values: List[float] = []
+    for contrast in evidence.get("contrasts", []) or []:
+        if not isinstance(contrast, dict):
+            continue
+        auc = _finite_or_none(contrast.get("probe_auc"))
+        if auc is None:
+            continue
+        name = str(contrast.get("name", ""))
+        family = str(contrast.get("contrast_family", ""))
+        role_hint = str(contrast.get("role_hint", ""))
+        if name == "treatment":
+            treatment_values.append(float(auc))
+        elif name == "outcome":
+            outcome_values.append(float(auc))
+        elif role_hint == "effect_modifier" or "r_pseudo" in family:
+            effect_values.append(float(auc))
+    return {
+        "treatment_probe_auc": _max_or_none(treatment_values),
+        "outcome_probe_auc": _max_or_none(outcome_values),
+        "effect_modifier_probe_auc": _max_or_none(effect_values),
+    }
+
+
+def _extracted_feature_review_gate(
+    *,
+    diagnostic: Dict[str, Any],
+    nn_config: MultiModelAgenticForestConfig,
+) -> Dict[str, Any]:
+    metrics = diagnostic.get("metrics", {})
+    benchmark = diagnostic.get("benchmark", {})
+    failures: List[Dict[str, Any]] = []
+    if metrics.get("status") != "ok":
+        failures.append(
+            {
+                "metric": "status",
+                "observed": metrics.get("status"),
+                "benchmark": "ok",
+                "reason": "diagnostic_status_not_ok",
+            }
+        )
+
+    auc_margin = float(getattr(nn_config, "extracted_feature_review_auc_margin", 0.02))
+    loss_margin = float(
+        getattr(nn_config, "extracted_feature_review_loss_relative_margin", 0.05)
+    )
+    min_auc = float(
+        getattr(nn_config, "extracted_feature_review_min_benchmark_auc", 0.55)
+    )
+
+    for metric in ["treatment_auroc", "outcome_auroc"]:
+        observed = _finite_or_none(metrics.get(metric))
+        target = _finite_or_none(benchmark.get(metric))
+        if target is None or target < min_auc:
+            continue
+        if observed is None or observed < target - auc_margin:
+            failures.append(
+                {
+                    "metric": metric,
+                    "observed": observed,
+                    "benchmark": target,
+                    "required_min": target - auc_margin,
+                    "reason": "auc_under_benchmark",
+                }
+            )
+
+    for metric in ["treatment_log_loss", "outcome_log_loss", "outcome_rmse", "r_loss_mean"]:
+        observed = _finite_or_none(metrics.get(metric))
+        target = _finite_or_none(benchmark.get(metric))
+        if target is None or target <= 0.0:
+            continue
+        max_allowed = target * (1.0 + loss_margin)
+        if observed is None or observed > max_allowed:
+            failures.append(
+                {
+                    "metric": metric,
+                    "observed": observed,
+                    "benchmark": target,
+                    "required_max": max_allowed,
+                    "reason": "loss_over_benchmark",
+                }
+            )
+
+    return {
+        "passed": not failures,
+        "failed_criteria": failures,
+        "n_failed_criteria": int(len(failures)),
+    }
+
+
+def _extracted_review_selection_score(
+    diagnostic: Dict[str, Any],
+    gate: Dict[str, Any],
+) -> Tuple[int, float, float, float]:
+    metrics = diagnostic.get("metrics", {})
+    fail_count = int(gate.get("n_failed_criteria", 0))
+    r_loss = _finite_or_none(metrics.get("r_loss_mean"))
+    treatment_auc = _finite_or_none(metrics.get("treatment_auroc"))
+    outcome_auc = _finite_or_none(metrics.get("outcome_auroc"))
+    return (
+        fail_count,
+        float("inf") if r_loss is None else float(r_loss),
+        float("inf") if treatment_auc is None else -float(treatment_auc),
+        float("inf") if outcome_auc is None else -float(outcome_auc),
+    )
+
+
+def _extracted_review_summary(
+    *,
+    diagnostic: Optional[Dict[str, Any]],
+    status: str,
+    passed: bool,
+    rounds: int,
+) -> Dict[str, Any]:
+    metrics = diagnostic.get("metrics", {}) if diagnostic else {}
+    gate = diagnostic.get("gate", {}) if diagnostic else {}
+    return {
+        "enabled": True,
+        "review_status": status,
+        "review_passed": bool(passed),
+        "review_rounds": int(rounds),
+        "n_failed_criteria": int(gate.get("n_failed_criteria", 0) or 0),
+        "failed_criteria": gate.get("failed_criteria", []),
+        "treatment_auroc": metrics.get("treatment_auroc"),
+        "outcome_auroc": metrics.get("outcome_auroc"),
+        "outcome_rmse": metrics.get("outcome_rmse"),
+        "r_loss_mean": metrics.get("r_loss_mean"),
+        "r_loss_relative_improvement": metrics.get("r_loss_relative_improvement"),
+    }
+
+
+def _protect_required_feature_proposals(
+    proposals: Sequence[AgenticFeatureProposal],
+    required_names: set,
+) -> Tuple[List[AgenticFeatureProposal], List[Dict[str, Any]]]:
+    kept: List[AgenticFeatureProposal] = []
+    rejected: List[Dict[str, Any]] = []
+    for proposal in proposals:
+        if proposal.action == "remove" and proposal.name in required_names:
+            rejected.append(
+                {
+                    "proposal": _proposal_to_dict(proposal),
+                    "reason": "cannot_remove_required_feature",
+                }
+            )
+            continue
+        kept.append(proposal)
+    return kept, rejected
+
+
+def _spec_sets_differ(
+    left: Sequence[ExplicitFeatureSpec],
+    right: Sequence[ExplicitFeatureSpec],
+) -> bool:
+    return [_spec_to_dict(spec) for spec in left] != [_spec_to_dict(spec) for spec in right]
+
+
+def _redact_review_artifact(
+    diagnostic: Dict[str, Any],
+    search_config: AgenticFeatureSearchConfig,
+) -> Dict[str, Any]:
+    del search_config
+    return diagnostic
+
+
+def _compact_extracted_feature_review_context(context: Dict[str, Any]) -> Dict[str, Any]:
+    compact = dict(context)
+    original = compact.get("original_bow_context")
+    if isinstance(original, dict) and isinstance(original.get("feature_importance"), dict):
+        compact["original_bow_context"] = {
+            **original,
+            "feature_importance": _compact_multi_model_importance(
+                original["feature_importance"]
+            ),
+        }
+    if isinstance(compact.get("embedding_contrast_evidence"), dict):
+        compact["embedding_contrast_evidence"] = _compact_embedding_contrast_evidence(
+            compact["embedding_contrast_evidence"]
+        )
+    return _round_floats(compact)
+
+
+def _max_or_none(values: Sequence[float]) -> Optional[float]:
+    finite = [float(value) for value in values if np.isfinite(value)]
+    return max(finite) if finite else None
+
+
+def _min_or_none(values: Sequence[float]) -> Optional[float]:
+    finite = [float(value) for value in values if np.isfinite(value)]
+    return min(finite) if finite else None
 
 
 def _fit_transform_bow_plus_explicit(

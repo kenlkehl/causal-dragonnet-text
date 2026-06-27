@@ -330,8 +330,12 @@ models, computes its own R-learner pseudo-target, fits a sparse pseudo-target
 model, and sends the per-view outputs plus a cross-view phrase consensus summary
 to the proposal agent. The agent proposes explicit confounders and effect
 modifiers, optional inner-fold consistency checks stabilize the candidate set,
-the extractor materializes selected variables from text, and the final estimator
-is an explicit-feature CausalForestDML.
+the extractor materializes selected variables from text, and a post-extraction
+review step trains simple fold-honest nuisance and R-pseudo-target models on the
+extracted variables. If those extracted-variable models underperform the BoW or
+embedding evidence, the agent receives the diagnostics and can revise roles,
+replace weak variables, and trigger re-extraction before the final
+explicit-feature CausalForestDML is fit.
 
 You can seed this path with known variables using
 `architecture.multi_model_agentic_forest.prespecified_confounders`,
@@ -352,7 +356,8 @@ Final artifacts are written under `multi_model_agentic_forest/`, including
 `bow_view_oof_predictions.parquet`,
 `bow_view_feature_importance_by_fold.jsonl`,
 `embedding_contrast_evidence_by_fold.jsonl`, `agent_candidate_proposals.jsonl`,
-`selected_feature_sets.json`, and `outer_cv_metrics.csv`.
+`extracted_feature_diagnostics_by_fold.jsonl`, `selected_feature_sets.json`, and
+`outer_cv_metrics.csv`.
 
 This path can also add embedding-contrast retrieval evidence. Set
 `architecture.multi_model_agentic_forest.embedding_contrast.enabled=true` to

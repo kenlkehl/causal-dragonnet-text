@@ -30,6 +30,8 @@ from oci.inference.multi_model_agentic_forest import (
     MultiModelAgenticForestRunner,
     _candidate_consistency_threshold,
     _compact_multi_model_agent_context,
+    _evaluate_extracted_feature_set_diagnostic,
+    _extracted_feature_review_gate,
     _fallback_consistency_proposals,
     _fit_binary_bow_fold,
     run_multi_model_agentic_forest,
@@ -153,6 +155,42 @@ class FakeProposalAgent:
         ]
 
 
+class ReviewRevisionAgent:
+    def __init__(self):
+        self.contexts = []
+
+    def propose(self, context):
+        self.contexts.append(context)
+        prompt_version = context.get("prompt_version")
+        if prompt_version == "multi_model_agentic_value_harmonization_v1":
+            return {"features": context.get("selected_features", [])}
+        if prompt_version == "multi_model_agentic_extracted_feature_review_v1":
+            return [
+                {
+                    "action": "add",
+                    "name": "signal_marker",
+                    "type": "categorical",
+                    "categories": ["negative", "positive"],
+                    "roles": ["confounder", "effect_modifier"],
+                    "description": "Pretreatment signal marker status.",
+                    "rationale": "BoW diagnostics show signal marker text captures the missed treatment and outcome signal.",
+                    "expected_signal": "treatment, outcome, and pseudo-target",
+                }
+            ]
+        return [
+            {
+                "action": "add",
+                "name": "noise_marker",
+                "type": "categorical",
+                "categories": ["absent", "present"],
+                "roles": ["confounder"],
+                "description": "Pretreatment noise marker status.",
+                "rationale": "Initial weak candidate.",
+                "expected_signal": "treatment and outcome",
+            }
+        ]
+
+
 class FakeExtractionProvider:
     def ensure_features(self, dataset, specs):
         dataset = dataset.copy()
@@ -167,6 +205,31 @@ class FakeExtractionProvider:
                     text.str.contains(">=50%"),
                     ">=50%",
                     np.where(text.str.contains("1-49%"), "1-49%", "<1%"),
+                )
+            else:
+                dataset[value_col] = np.nan
+            dataset[missing_col] = dataset[value_col].isna()
+        return dataset
+
+
+class ReviewExtractionProvider:
+    def __init__(self):
+        self.calls = []
+
+    def ensure_features(self, dataset, specs):
+        self.calls.append([spec.name for spec in specs])
+        dataset = dataset.copy()
+        text = dataset["clinical_text"].astype(str)
+        for spec in specs:
+            value_col = f"explicit_feat_{spec.name}"
+            missing_col = f"{value_col}_missing"
+            if spec.name == "noise_marker":
+                dataset[value_col] = "present"
+            elif spec.name == "signal_marker":
+                dataset[value_col] = np.where(
+                    text.str.contains("signal positive"),
+                    "positive",
+                    "negative",
                 )
             else:
                 dataset[value_col] = np.nan
@@ -262,6 +325,82 @@ class KeywordEmbeddingProvider:
         return np.vstack(rows)
 
 
+class KeywordSentenceTransformer:
+    def encode(
+        self,
+        texts,
+        batch_size=128,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    ):
+        del batch_size, convert_to_numpy, show_progress_bar
+        embeddings = KeywordEmbeddingProvider().encode_chunks(texts)
+        if normalize_embeddings:
+            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+            embeddings = embeddings / np.maximum(norms, 1e-12)
+        return embeddings.astype(np.float32, copy=False)
+
+
+def _embedding_contrast_cache_test_config(tmp_path: Path) -> AppliedInferenceConfig:
+    return AppliedInferenceConfig(
+        dataset_path=str(tmp_path / "cohort.parquet"),
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        architecture=ModelArchitectureConfig(
+            model_type="multi_model_agentic_forest",
+            multi_model_agentic_forest=MultiModelAgenticForestConfig(
+                embedding_contrast=EmbeddingContrastDiscoveryConfig(
+                    enabled=True,
+                    model_name="fake-keyword",
+                    cache_dir=str(tmp_path / "embedding_cache"),
+                    chunk_size_words=4,
+                    chunk_overlap_words=0,
+                    max_chunks=2,
+                    min_probe_auc=0.0,
+                    top_k_chunks_per_tail=3,
+                    max_chunks_per_patient=1,
+                    concept_phrases=["brain metastases", "liver lesion"],
+                    include_bow_phrases_as_concepts=False,
+                )
+            ),
+        ),
+    )
+
+
+def _embedding_contrast_cache_test_dataset() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "_oci_row_id": np.arange(8),
+            "clinical_text": [
+                "brain metastases pd-l1 high",
+                "brain metastases pd-l1 high",
+                "liver lesion pd-l1 low",
+                "liver lesion pd-l1 low",
+                "brain metastases cachexia pd-l1 high",
+                "liver lesion stable disease",
+                "brain metastases cachexia",
+                "liver lesion stable disease",
+            ],
+        }
+    )
+
+
+def _build_embedding_contrast_cache_test_evidence(
+    generator: EmbeddingContrastEvidenceGenerator,
+    dataset: pd.DataFrame,
+):
+    return generator.build_evidence(
+        discovery_df=dataset,
+        y=np.asarray([0, 1, 0, 0, 1, 0, 1, 0], dtype=float),
+        t=np.asarray([1, 1, 0, 0, 1, 0, 1, 0], dtype=float),
+        pseudo_target=np.asarray([1, 1, -1, -1, 1, -1, 1, -1], dtype=float),
+        t_resid=np.ones(8, dtype=float),
+        importance={},
+    )
+
+
 def test_embedding_contrast_retrieval_filters_low_content_chunks():
     assert not _informative_chunk_text("")
     assert not _informative_chunk_text("--- ### <new_note> ---")
@@ -294,6 +433,111 @@ def test_embedding_contrast_default_cache_dir_is_dataset_scoped(tmp_path: Path):
         str(dataset_dir),
         tmp_path / "run",
     ) == dataset_dir / ".oci_cache" / "embedding_contrast"
+
+
+def test_embedding_contrast_reuses_warm_chunk_and_concept_phrase_caches_without_model_load(
+    tmp_path: Path,
+    monkeypatch,
+):
+    dataset = _embedding_contrast_cache_test_dataset()
+    config = _embedding_contrast_cache_test_config(tmp_path)
+    load_calls = []
+
+    def fake_load_sentence_transformer(model_name, device=None):
+        load_calls.append((model_name, str(device)))
+        return KeywordSentenceTransformer()
+
+    monkeypatch.setattr(
+        "oci.models.concept_embedding_cache.load_sentence_transformer",
+        fake_load_sentence_transformer,
+    )
+    monkeypatch.setattr(
+        "oci.inference.embedding_contrast_discovery.load_sentence_transformer",
+        fake_load_sentence_transformer,
+    )
+
+    generator = EmbeddingContrastEvidenceGenerator(config=config, output_dir=tmp_path)
+    generator.prepare(dataset)
+    evidence = _build_embedding_contrast_cache_test_evidence(generator, dataset)
+    assert "concept_probe_skipped" not in evidence
+    treatment = next(item for item in evidence["contrasts"] if item["name"] == "treatment")
+    assert treatment["concept_probe_scores"]
+    assert load_calls
+
+    def fail_load_sentence_transformer(model_name, device=None):
+        del model_name, device
+        raise AssertionError("sentence-transformer should not load on warm caches")
+
+    monkeypatch.setattr(
+        "oci.models.concept_embedding_cache.load_sentence_transformer",
+        fail_load_sentence_transformer,
+    )
+    monkeypatch.setattr(
+        "oci.inference.embedding_contrast_discovery.load_sentence_transformer",
+        fail_load_sentence_transformer,
+    )
+
+    warm_generator = EmbeddingContrastEvidenceGenerator(
+        config=config,
+        output_dir=tmp_path,
+    )
+    warm_generator.prepare(dataset)
+    warm_evidence = _build_embedding_contrast_cache_test_evidence(
+        warm_generator,
+        dataset,
+    )
+    assert "concept_probe_skipped" not in warm_evidence
+    warm_treatment = next(
+        item for item in warm_evidence["contrasts"] if item["name"] == "treatment"
+    )
+    assert warm_treatment["concept_probe_scores"]
+
+
+def test_embedding_contrast_skips_concept_probe_load_when_only_chunk_cache_is_warm(
+    tmp_path: Path,
+    monkeypatch,
+):
+    dataset = _embedding_contrast_cache_test_dataset()
+    config = _embedding_contrast_cache_test_config(tmp_path)
+    load_calls = []
+
+    def fake_load_sentence_transformer(model_name, device=None):
+        load_calls.append((model_name, str(device)))
+        return KeywordSentenceTransformer()
+
+    monkeypatch.setattr(
+        "oci.models.concept_embedding_cache.load_sentence_transformer",
+        fake_load_sentence_transformer,
+    )
+    generator = EmbeddingContrastEvidenceGenerator(config=config, output_dir=tmp_path)
+    generator.prepare(dataset)
+    assert load_calls
+
+    def fail_load_sentence_transformer(model_name, device=None):
+        del model_name, device
+        raise AssertionError("sentence-transformer should not load for optional probes")
+
+    monkeypatch.setattr(
+        "oci.models.concept_embedding_cache.load_sentence_transformer",
+        fail_load_sentence_transformer,
+    )
+    monkeypatch.setattr(
+        "oci.inference.embedding_contrast_discovery.load_sentence_transformer",
+        fail_load_sentence_transformer,
+    )
+
+    warm_generator = EmbeddingContrastEvidenceGenerator(
+        config=config,
+        output_dir=tmp_path,
+    )
+    warm_generator.prepare(dataset)
+    evidence = _build_embedding_contrast_cache_test_evidence(warm_generator, dataset)
+    assert (
+        evidence["concept_probe_skipped"]
+        == "concept_phrase_cache_miss_on_warm_chunk_cache"
+    )
+    treatment = next(item for item in evidence["contrasts"] if item["name"] == "treatment")
+    assert treatment["concept_probe_scores"] == []
 
 
 def test_embedding_contrast_evidence_retrieves_aligned_chunks(tmp_path: Path):
@@ -867,6 +1111,153 @@ def test_multi_model_bow_fold_uses_prespecified_explicit_features():
     assert pred[1] > pred[0]
 
 
+def test_extracted_feature_review_gate_flags_underperforming_features():
+    dataset = pd.DataFrame(
+        {
+            "clinical_text": ["signal positive", "signal negative"] * 6,
+            "treatment_indicator": [1, 0] * 6,
+            "outcome_indicator": [1, 0] * 6,
+            "explicit_feat_noise_marker": ["present"] * 12,
+            "explicit_feat_noise_marker_missing": [False] * 12,
+        }
+    )
+    config = AppliedInferenceConfig(
+        outcome_type="binary",
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+    )
+    nn_config = MultiModelAgenticForestConfig(
+        nuisance_folds=2,
+        effect_folds=2,
+        bow_views=_linear_test_bow_views(),
+        extracted_feature_review_auc_margin=0.01,
+        extracted_feature_review_loss_relative_margin=0.01,
+        extracted_feature_review_min_benchmark_auc=0.55,
+    )
+    diagnostic = _evaluate_extracted_feature_set_diagnostic(
+        train_df=dataset,
+        specs=[
+            ExplicitFeatureSpec(
+                name="noise_marker",
+                type="categorical",
+                categories=["absent", "present"],
+                roles=["confounder"],
+            )
+        ],
+        config=config,
+        nn_config=nn_config,
+        bow_metrics={
+            "views": [
+                {
+                    "metrics": {
+                        "treatment_auroc": 1.0,
+                        "outcome_auroc": 1.0,
+                        "r_loss_mean": 0.01,
+                    }
+                }
+            ]
+        },
+        embedding_evidence={},
+        random_state=123,
+    )
+    gate = _extracted_feature_review_gate(
+        diagnostic=diagnostic,
+        nn_config=nn_config,
+    )
+    failed_metrics = {item["metric"] for item in gate["failed_criteria"]}
+    assert gate["passed"] is False
+    assert {"treatment_auroc", "outcome_auroc"}.issubset(failed_metrics)
+
+
+def test_multi_model_extracted_feature_review_revises_underperforming_specs(
+    tmp_path: Path,
+):
+    dataset = pd.DataFrame(
+        {
+            "clinical_text": [
+                "signal positive baseline note",
+                "signal negative baseline note",
+                "signal positive baseline note",
+                "signal negative baseline note",
+                "signal positive baseline note",
+                "signal negative baseline note",
+                "signal positive baseline note",
+                "signal negative baseline note",
+                "signal positive baseline note",
+                "signal negative baseline note",
+                "signal positive baseline note",
+                "signal negative baseline note",
+            ],
+            "treatment_indicator": [1, 0] * 6,
+            "outcome_indicator": [1, 0] * 6,
+        }
+    )
+    config = AppliedInferenceConfig(
+        outcome_type="binary",
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        cv_folds=0,
+        architecture=ModelArchitectureConfig(
+            model_type="multi_model_agentic_forest",
+            explicit_feature_forest=ExplicitFeatureForestConfig(inference=False),
+            agentic_feature_search=AgenticFeatureSearchConfig(
+                max_removals_per_iter=2,
+                min_feature_coverage=0.1,
+                clinical_text_examples_per_prompt=0,
+            ),
+            multi_model_agentic_forest=MultiModelAgenticForestConfig(
+                nuisance_folds=2,
+                effect_folds=2,
+                bow_views=_linear_test_bow_views(),
+                top_n_features=5,
+                candidate_consistency_enabled=False,
+                extracted_feature_review_enabled=True,
+                extracted_feature_review_max_rounds=1,
+                extracted_feature_review_auc_margin=0.0,
+                extracted_feature_review_loss_relative_margin=0.0,
+                extracted_feature_review_min_benchmark_auc=0.55,
+                fold_parallelism="1",
+            ),
+        ),
+        explicit_features=ExplicitFeatureExtractionConfig(enabled=True, features=[]),
+    )
+    agent = ReviewRevisionAgent()
+    extractor = ReviewExtractionProvider()
+    evaluator = FakeEvaluator()
+    output_path = tmp_path / "predictions.parquet"
+
+    run_multi_model_agentic_forest(
+        dataset,
+        config,
+        output_path,
+        proposal_agent=agent,
+        extraction_provider=extractor,
+        evaluator=evaluator,
+    )
+
+    assert any(
+        context.get("prompt_version")
+        == "multi_model_agentic_extracted_feature_review_v1"
+        for context in agent.contexts
+    )
+    assert ["noise_marker"] in extractor.calls
+    assert any("signal_marker" in call for call in extractor.calls)
+    final_names = [spec.name for spec in evaluator.seen_specs[-1]]
+    assert "signal_marker" in final_names
+    artifact_dir = output_path.parent / "multi_model_agentic_forest"
+    diagnostics = [
+        json.loads(line)
+        for line in (artifact_dir / "extracted_feature_diagnostics_by_fold.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert diagnostics
+    selected_sets = json.loads((artifact_dir / "selected_feature_sets.json").read_text())
+    assert selected_sets[0]["extracted_feature_review"]["review_rounds"] >= 1
+
+
 def test_multi_model_prespecified_features_extract_before_bow_and_merge_roles(
     tmp_path: Path,
 ):
@@ -1018,6 +1409,11 @@ def test_multi_model_agentic_forest_parses_bow_views_and_embedding_option():
                         "candidate_consistency_parallelism": "2",
                         "outer_parallelism": "3",
                         "bow_parallel_backend": "processes",
+                        "extracted_feature_review_enabled": False,
+                        "extracted_feature_review_max_rounds": 2,
+                        "extracted_feature_review_auc_margin": 0.03,
+                        "extracted_feature_review_loss_relative_margin": 0.07,
+                        "extracted_feature_review_min_benchmark_auc": 0.6,
                         "embedding_contrast": {
                             "enabled": True,
                             "model_name": "Qwen/Qwen3-Embedding-8B",
@@ -1048,6 +1444,11 @@ def test_multi_model_agentic_forest_parses_bow_views_and_embedding_option():
     assert nn_cfg.candidate_consistency_parallelism == "2"
     assert nn_cfg.outer_parallelism == "3"
     assert nn_cfg.bow_parallel_backend == "processes"
+    assert nn_cfg.extracted_feature_review_enabled is False
+    assert nn_cfg.extracted_feature_review_max_rounds == 2
+    assert nn_cfg.extracted_feature_review_auc_margin == 0.03
+    assert nn_cfg.extracted_feature_review_loss_relative_margin == 0.07
+    assert nn_cfg.extracted_feature_review_min_benchmark_auc == 0.6
     assert nn_cfg.embedding_contrast.enabled is True
     assert nn_cfg.embedding_contrast.model_name == "Qwen/Qwen3-Embedding-8B"
     assert nn_cfg.embedding_contrast.chunk_size_words == 128
@@ -1120,12 +1521,16 @@ def test_oracle_multi_model_script_builds_default_and_cli_bow_views():
     cfg.bow_model = "extratrees"
     cfg.embedding_contrast_enabled = True
     cfg.embedding_concept_phrases = ["brain metastases"]
+    cfg.extracted_feature_review_enabled = False
+    cfg.extracted_feature_review_max_rounds = 1
     applied = script._make_applied_config(cfg, dataset_path)
     mm_cfg = applied.architecture.multi_model_agentic_forest
     assert [view.name for view in mm_cfg.bow_views] == ["cli_view"]
     assert mm_cfg.bow_views[0].bow_model == "extratrees"
     assert mm_cfg.embedding_contrast.enabled is True
     assert mm_cfg.embedding_contrast.concept_phrases == ["brain metastases"]
+    assert mm_cfg.extracted_feature_review_enabled is False
+    assert mm_cfg.extracted_feature_review_max_rounds == 1
 
 
 def test_multi_model_agentic_forest_parses_prespecified_feature_sources(tmp_path):

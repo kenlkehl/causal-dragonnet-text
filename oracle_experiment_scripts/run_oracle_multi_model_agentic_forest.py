@@ -75,6 +75,11 @@ class MultiModelAgenticOracleConfig:
     candidate_consistency_min_fold_fraction: float = 0.5
     candidate_consistency_recovery_max_candidates: int = 12
     candidate_consistency_parallelism: str = "1"
+    extracted_feature_review_enabled: bool = True
+    extracted_feature_review_max_rounds: int = 3
+    extracted_feature_review_auc_margin: float = 0.02
+    extracted_feature_review_loss_relative_margin: float = 0.05
+    extracted_feature_review_min_benchmark_auc: float = 0.55
     outer_parallelism: str = "1"
     bow_parallel_backend: str = "processes"
     fold_parallelism: str = "auto"
@@ -198,6 +203,15 @@ def _make_applied_config(
                 candidate_consistency_min_fold_fraction=config.candidate_consistency_min_fold_fraction,
                 candidate_consistency_recovery_max_candidates=config.candidate_consistency_recovery_max_candidates,
                 candidate_consistency_parallelism=config.candidate_consistency_parallelism,
+                extracted_feature_review_enabled=config.extracted_feature_review_enabled,
+                extracted_feature_review_max_rounds=config.extracted_feature_review_max_rounds,
+                extracted_feature_review_auc_margin=config.extracted_feature_review_auc_margin,
+                extracted_feature_review_loss_relative_margin=(
+                    config.extracted_feature_review_loss_relative_margin
+                ),
+                extracted_feature_review_min_benchmark_auc=(
+                    config.extracted_feature_review_min_benchmark_auc
+                ),
                 outer_parallelism=config.outer_parallelism,
                 bow_parallel_backend=config.bow_parallel_backend,
                 fold_parallelism=config.fold_parallelism,
@@ -529,6 +543,30 @@ def main() -> None:
             "'auto' uses runner workers, or pass a positive integer."
         ),
     )
+    parser.add_argument(
+        "--no-extracted-feature-review",
+        action="store_true",
+        help="Disable post-extraction simple-model review and agent revision.",
+    )
+    parser.add_argument("--extracted-feature-review-max-rounds", type=int, default=3)
+    parser.add_argument(
+        "--extracted-feature-review-auc-margin",
+        type=float,
+        default=0.02,
+        help="Allowed AUC gap below BoW/embedding benchmarks before review fails.",
+    )
+    parser.add_argument(
+        "--extracted-feature-review-loss-relative-margin",
+        type=float,
+        default=0.05,
+        help="Allowed relative loss/R-loss excess over BoW benchmarks.",
+    )
+    parser.add_argument(
+        "--extracted-feature-review-min-benchmark-auc",
+        type=float,
+        default=0.55,
+        help="Minimum benchmark AUC before an AUC comparison is enforced.",
+    )
 
     parser.add_argument(
         "--enable-embedding-contrast",
@@ -692,6 +730,15 @@ def main() -> None:
             args.candidate_consistency_recovery_max_candidates
         ),
         candidate_consistency_parallelism=args.candidate_consistency_parallelism,
+        extracted_feature_review_enabled=not args.no_extracted_feature_review,
+        extracted_feature_review_max_rounds=args.extracted_feature_review_max_rounds,
+        extracted_feature_review_auc_margin=args.extracted_feature_review_auc_margin,
+        extracted_feature_review_loss_relative_margin=(
+            args.extracted_feature_review_loss_relative_margin
+        ),
+        extracted_feature_review_min_benchmark_auc=(
+            args.extracted_feature_review_min_benchmark_auc
+        ),
         outer_parallelism=args.outer_parallelism,
         bow_parallel_backend=args.bow_parallel_backend,
         fold_parallelism=args.fold_parallelism,

@@ -782,6 +782,11 @@ class MultiModelAgenticForestConfig:
     candidate_consistency_min_fold_fraction: float = 0.5
     candidate_consistency_recovery_max_candidates: int = 12
     candidate_consistency_parallelism: str = "1"
+    extracted_feature_review_enabled: bool = True
+    extracted_feature_review_max_rounds: int = 3
+    extracted_feature_review_auc_margin: float = 0.02
+    extracted_feature_review_loss_relative_margin: float = 0.05
+    extracted_feature_review_min_benchmark_auc: float = 0.55
     outer_parallelism: str = "1"
     bow_parallel_backend: str = "processes"
     # "auto" uses the runner num_workers setting; set a positive integer to
@@ -864,6 +869,26 @@ class MultiModelAgenticForestConfig:
             raise ValueError(
                 "multi_model_agentic_forest.candidate_consistency_recovery_max_candidates "
                 "must be >= 0"
+            )
+        if self.extracted_feature_review_max_rounds < 0:
+            raise ValueError(
+                "multi_model_agentic_forest.extracted_feature_review_max_rounds "
+                "must be >= 0"
+            )
+        if self.extracted_feature_review_auc_margin < 0.0:
+            raise ValueError(
+                "multi_model_agentic_forest.extracted_feature_review_auc_margin "
+                "must be >= 0"
+            )
+        if self.extracted_feature_review_loss_relative_margin < 0.0:
+            raise ValueError(
+                "multi_model_agentic_forest.extracted_feature_review_loss_relative_margin "
+                "must be >= 0"
+            )
+        if not 0.0 <= self.extracted_feature_review_min_benchmark_auc <= 1.0:
+            raise ValueError(
+                "multi_model_agentic_forest.extracted_feature_review_min_benchmark_auc "
+                "must be in [0, 1]"
             )
         _validate_parallelism_setting(
             self.candidate_consistency_parallelism,

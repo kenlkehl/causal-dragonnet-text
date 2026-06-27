@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -48,6 +50,9 @@ class EmbeddingContrastEvidenceGenerator:
         self._flat_embeddings = None
         self._offsets = None
         self._cache = None
+        self._cache_dir: Optional[Path] = None
+        self._chunk_cache_reused = False
+        self._concept_probe_skip_reason: Optional[str] = None
 
     @property
     def enabled(self) -> bool:
@@ -117,6 +122,7 @@ class EmbeddingContrastEvidenceGenerator:
         patient_embeddings = _normalize_rows(patient_embeddings)
 
         concept_phrases = self._concept_phrases(importance or {})
+        self._concept_probe_skip_reason = None
         concept_embeddings = (
             self._encode_concepts(concept_phrases) if concept_phrases else None
         )
@@ -140,7 +146,7 @@ class EmbeddingContrastEvidenceGenerator:
                 )
             )
 
-        return {
+        evidence = {
             "enabled": True,
             "model_name": self.embedding_config.model_name,
             "unit": "patient_row",
@@ -159,6 +165,9 @@ class EmbeddingContrastEvidenceGenerator:
             "n_concept_phrases": int(len(concept_phrases)),
             "contrasts": contrasts,
         }
+        if self._concept_probe_skip_reason:
+            evidence["concept_probe_skipped"] = self._concept_probe_skip_reason
+        return evidence
 
     def _prepare_from_provider(self) -> None:
         flat_chunks = [chunk for chunks in self._chunks_by_position for chunk in chunks]
@@ -182,6 +191,7 @@ class EmbeddingContrastEvidenceGenerator:
             else _default_embedding_cache_dir(dataset_path, self.output_dir)
         )
         cache_dir.mkdir(parents=True, exist_ok=True)
+        self._cache_dir = cache_dir
         cache = ConceptEmbeddingCache(
             cache_dir=str(cache_dir),
             sentence_model_name=str(self.embedding_config.model_name),
@@ -194,6 +204,7 @@ class EmbeddingContrastEvidenceGenerator:
         )
         logger.info("Embedding contrast chunk cache: %s", cache.cache_path)
         cache_valid = cache.is_valid(expected_num_samples=len(texts))
+        self._chunk_cache_reused = bool(cache_valid)
         if cache_valid:
             logger.info("Reusing embedding contrast chunk cache")
         else:
@@ -683,20 +694,34 @@ class EmbeddingContrastEvidenceGenerator:
             )
         return rows
 
-    def _encode_concepts(self, phrases: Sequence[str]) -> np.ndarray:
+    def _encode_concepts(self, phrases: Sequence[str]) -> Optional[np.ndarray]:
+        phrase_list = [str(phrase) for phrase in phrases]
         if self.embedding_provider is not None:
-            embeddings = self._encode_with_provider(list(phrases))
+            embeddings = self._encode_with_provider(phrase_list)
         else:
+            cached = self._load_concept_embedding_cache(phrase_list)
+            if cached is not None:
+                return cached
+            if self._chunk_cache_reused:
+                self._concept_probe_skip_reason = (
+                    "concept_phrase_cache_miss_on_warm_chunk_cache"
+                )
+                logger.info(
+                    "Skipping embedding concept probes because chunk embeddings "
+                    "were reused from cache and concept phrase embeddings are not "
+                    "cached; avoiding a sentence-transformer load."
+                )
+                return None
             try:
                 encoder = load_sentence_transformer(
                     str(self.embedding_config.model_name),
                     device=_torch_device_or_none(self.embedding_config.device),
                 )
                 embeddings = encoder.encode(
-                    list(phrases),
+                    phrase_list,
                     batch_size=max(
                         1,
-                        min(int(self.embedding_config.batch_size), len(phrases)),
+                        min(int(self.embedding_config.batch_size), len(phrase_list)),
                     ),
                     convert_to_numpy=True,
                     normalize_embeddings=bool(self.embedding_config.normalize_embeddings),
@@ -704,7 +729,76 @@ class EmbeddingContrastEvidenceGenerator:
                 )
             finally:
                 _release_sentence_transformer_model(str(self.embedding_config.model_name))
-        return _coerce_embedding_matrix(embeddings, expected_rows=len(phrases))
+        matrix = _coerce_embedding_matrix(embeddings, expected_rows=len(phrase_list))
+        if self.embedding_provider is None:
+            self._write_concept_embedding_cache(phrase_list, matrix)
+        return matrix
+
+    def _concept_embedding_cache_path(self, phrases: Sequence[str]) -> Optional[Path]:
+        if self._cache_dir is None:
+            return None
+        payload = {
+            "model_name": str(self.embedding_config.model_name),
+            "normalize_embeddings": bool(self.embedding_config.normalize_embeddings),
+            "phrases": [str(phrase) for phrase in phrases],
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        digest = hashlib.sha256(encoded).hexdigest()[:16]
+        return self._cache_dir / f"embedding_concept_phrases_{digest}.npz"
+
+    def _load_concept_embedding_cache(
+        self,
+        phrases: Sequence[str],
+    ) -> Optional[np.ndarray]:
+        cache_path = self._concept_embedding_cache_path(phrases)
+        if cache_path is None or not cache_path.exists():
+            return None
+        try:
+            with np.load(str(cache_path), allow_pickle=False) as payload:
+                cached_phrases = [str(item) for item in payload["phrases"].tolist()]
+                if cached_phrases != [str(phrase) for phrase in phrases]:
+                    return None
+                embeddings = np.asarray(payload["embeddings"], dtype=np.float32)
+            logger.info("Reusing embedding concept phrase cache: %s", cache_path)
+            return _coerce_embedding_matrix(embeddings, expected_rows=len(phrases))
+        except Exception as exc:
+            logger.warning(
+                "Failed to read embedding concept phrase cache %s: %s",
+                cache_path,
+                exc,
+            )
+            return None
+
+    def _write_concept_embedding_cache(
+        self,
+        phrases: Sequence[str],
+        embeddings: np.ndarray,
+    ) -> None:
+        cache_path = self._concept_embedding_cache_path(phrases)
+        if cache_path is None:
+            return
+        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        try:
+            with open(tmp_path, "wb") as f:
+                np.savez_compressed(
+                    f,
+                    phrases=np.asarray([str(phrase) for phrase in phrases], dtype=str),
+                    embeddings=np.asarray(embeddings, dtype=np.float32),
+                )
+            tmp_path.replace(cache_path)
+            logger.info("Wrote embedding concept phrase cache: %s", cache_path)
+        except Exception as exc:
+            logger.warning(
+                "Failed to write embedding concept phrase cache %s: %s",
+                cache_path,
+                exc,
+            )
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _encode_with_provider(self, texts: Sequence[str]) -> np.ndarray:
         provider = self.embedding_provider

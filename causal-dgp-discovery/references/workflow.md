@@ -111,6 +111,21 @@ Extraction prompts/instructions must request baseline/pre-treatment values and i
 
 Post-extraction type coercion, category canonicalization, and sanity checks may operate only on values already produced by document-reading extraction. Do not use regex as a fallback extractor, targeted repair extractor, or missing-value filler; unresolved patient/concept values remain missing/null and must be documented in `report.txt`. A run-level failure to find an endpoint is not a valid missingness rationale. If coding-agent extraction is genuinely infeasible after a concrete sharding attempt, stop and report the blocker instead of proceeding as though extraction succeeded.
 
+## 3.6. Coding-Agent Orchestrator Equivalent
+
+When the repo-native `multi_model_agentic_forest` runner is unavailable or the user asks a general coding agent to orchestrate the analysis, mirror the same stages explicitly:
+
+1. Create the outer and inner folds first and reuse them across all evidence, extraction-review, and final-forest decisions.
+2. Fit multiple BoW/TF-IDF views for treatment nuisance, outcome nuisance, residual, R-loss, and pseudo-target evidence. Include the default broad view, phrase-focused view, rare-signal-friendly view, and a learner-family sensitivity check when runtime permits.
+3. Optionally fit embedding-contrast evidence on training-fold text chunks only, including treatment, outcome, per-view R-pseudo-target, ensemble R, within-arm outcome, cell, orthogonal R-score, and concept-probe contrasts when feasible.
+4. Convert recurring text/span evidence into `ExplicitFeatureSpec`-shaped concepts with roles, categories, aliases, `value_aliases`, temporal windows, and missingness rules. Merge prespecified and agent-proposed specs by name and role rather than extracting duplicates.
+5. Extract the selected concepts by document-reading LLM or coding-agent extraction, preserving one patient-level value, missingness flag, and evidence summary per concept.
+6. Train simple extracted-feature treatment nuisance, outcome nuisance, and R-loss/pseudo-target or effect-modifier diagnostics honestly within folds. Compare them with the upstream BoW and embedding benchmarks that motivated the variables.
+7. If extracted-feature diagnostics materially underperform, revise the candidate specs: merge aliases, fix categorical values, re-role variables, reject weak proxies, add narrow evidence-supported concepts, and re-extract only the changed concepts. Repeat until the extracted features pass the benchmark review or a documented review-round cap is reached.
+8. Fit the final explicit-feature causal forest only after the candidate list has passed extraction, benchmark review, role diagnostics, and parsimony review.
+
+This manual route must preserve the same honesty rule as the repo path: no row may influence a feature-selection, nuisance, pseudo-target, or ITE decision through a model prediction trained on that row.
+
 ## 4. Role Evaluation
 
 Evaluate confounders and modifiers separately. Use univariable screens as fold-aware diagnostics before and during multivariable modeling; they are useful for prioritization and debugging, but not sufficient as final role evidence. Run these diagnostics only inside internal training folds for any selection decision.
@@ -143,6 +158,12 @@ Effect-modifier evidence:
 
 Avoid promoting variables based only on marginal outcome association.
 
+Post-extraction benchmark review:
+- Compare extracted-feature nuisance and effect-modifier diagnostics against the BoW/TF-IDF and embedding-contrast benchmarks that generated the candidate concepts.
+- Treat large treatment-nuisance gaps as evidence that important confounding text signal was not extracted, was mis-typed, or was collapsed into a lossy category.
+- Treat large outcome-nuisance or R/pseudo-target gaps as evidence that prognostic or heterogeneity-relevant concepts, transformations, temporal anchoring, or aliases need revision.
+- If the extracted-feature table fails the review, return to concept translation or extraction before fitting the final causal forest.
+
 Parsimony and redundancy review:
 - Before finalizing a candidate list, compute feature-feature correlations, contingency tables for categorical pairs, and missingness-overlap summaries within training folds.
 - Group highly correlated or semantically duplicate candidates and prefer the most direct baseline variable unless a proxy improves honest treatment/outcome nuisance, heterogeneity, or ITE-stability metrics.
@@ -153,6 +174,7 @@ Parsimony and redundancy review:
 
 After each iteration:
 - Compare fold-level nuisance metrics, R-loss/pseudo-outcome metrics, causal-forest stability, and ITE distribution.
+- Compare extracted-feature nuisance and R/pseudo-target diagnostics with the upstream BoW and embedding benchmarks, and inspect any failed extracted-feature review gates.
 - Identify unexplained residual text signal and propose a narrow expansion only if metrics or fold evidence justify it.
 - Re-extract or re-role candidates when aliasing, missingness, or temporal leakage is suspected.
 - Mull over the candidate list repeatedly before finalization: merge redundant variables, reject weak proxies, test supported transformations, and rerun role diagnostics on the revised list.
