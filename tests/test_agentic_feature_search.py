@@ -21,6 +21,7 @@ from oci.inference.agentic_explicit_feature_forest import (
     OpenAICompatibleFeatureSearchAgent,
     SplitEvaluation,
     VLLMExplicitFeatureExtractionProvider,
+    _chat_completion_trace,
     apply_proposals,
     build_iteration_feedback,
     compare_candidate_to_baseline,
@@ -878,6 +879,32 @@ def test_openai_agent_autodiscovers_legacy_oracle_default_model_name():
 
     assert client.models.calls == 1
     assert client.completions.calls[0]["model"] == "served-agent-model"
+
+
+def test_openai_agent_trace_captures_both_reasoning_fields():
+    message = SimpleNamespace(
+        content='{"proposals": []}',
+        reasoning_content="legacy separated reasoning",
+        reasoning="vllm separated reasoning",
+    )
+    choice = SimpleNamespace(message=message, finish_reason="stop")
+    response = SimpleNamespace(
+        model="served-agent-model",
+        id="response-1",
+        created=123,
+        usage=None,
+    )
+
+    trace = _chat_completion_trace(
+        response=response,
+        choice=choice,
+        message=message,
+        content=message.content,
+    )
+
+    assert trace["raw_content"] == '{"proposals": []}'
+    assert trace["reasoning_content"] == "legacy separated reasoning"
+    assert trace["reasoning"] == "vllm separated reasoning"
 
 
 def test_openai_agent_retries_next_server(monkeypatch):

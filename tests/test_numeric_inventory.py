@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -6,6 +7,7 @@ from oci.extraction.numeric_inventory import (
     AgenticNumericInventoryExtractor,
     CompletionResult,
     NumericInventoryConfig,
+    _chat_completion_trace,
     parse_numeric_values_response,
     parse_ontology_mapping_response,
     split_text_into_all_word_chunks,
@@ -58,6 +60,32 @@ def test_parse_numeric_values_response_validates_schema():
         "non_numeric_value",
         "missing_concept",
     ]
+
+
+def test_numeric_inventory_trace_captures_both_reasoning_fields():
+    message = SimpleNamespace(
+        content='{"values": []}',
+        reasoning_content="legacy separated reasoning",
+        reasoning="vllm separated reasoning",
+    )
+    choice = SimpleNamespace(message=message, finish_reason="stop")
+    response = SimpleNamespace(
+        model="served-inventory-model",
+        id="response-1",
+        created=123,
+        usage=None,
+    )
+
+    trace = _chat_completion_trace(
+        response=response,
+        choice=choice,
+        message=message,
+        content=message.content,
+    )
+
+    assert trace["raw_content"] == '{"values": []}'
+    assert trace["reasoning_content"] == "legacy separated reasoning"
+    assert trace["reasoning"] == "vllm separated reasoning"
 
 
 def test_patient_reconciliation_drops_invented_values():

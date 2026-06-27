@@ -2805,15 +2805,20 @@ def _chat_completion_trace(
     content: str,
 ) -> Dict[str, Any]:
     """Build a JSON-serializable trace of the proposal agent response."""
+    reasoning_content = _message_field(message, "reasoning_content")
+    reasoning = _message_field(message, "reasoning")
     trace = {
         "raw_content": content,
-        "reasoning_content": _message_field(message, "reasoning_content"),
         "finish_reason": getattr(choice, "finish_reason", None),
         "model": getattr(response, "model", None),
         "response_id": getattr(response, "id", None),
         "created": getattr(response, "created", None),
         "usage": _to_jsonable(getattr(response, "usage", None)),
     }
+    if reasoning_content is not None:
+        trace["reasoning_content"] = reasoning_content
+    if reasoning is not None:
+        trace["reasoning"] = reasoning
     return {key: value for key, value in trace.items() if value is not None}
 
 

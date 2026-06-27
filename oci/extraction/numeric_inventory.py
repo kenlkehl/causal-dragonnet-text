@@ -1224,7 +1224,10 @@ def _chat_completion_trace(
             trace["usage"] = usage.dict()
         else:
             trace["usage"] = str(usage)
-    reasoning = getattr(message, "reasoning_content", None)
+    reasoning_content = getattr(message, "reasoning_content", None)
+    if reasoning_content is not None:
+        trace["reasoning_content"] = reasoning_content
+    reasoning = getattr(message, "reasoning", None)
     if reasoning is not None:
-        trace["reasoning_content"] = reasoning
+        trace["reasoning"] = reasoning
     return {key: value for key, value in trace.items() if value is not None}
