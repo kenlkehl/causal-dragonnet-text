@@ -14,7 +14,7 @@
 
 ## 2. Text Evidence Before Feature Extraction
 
-Start with honest cross-fitted text models. The purpose is to learn which concepts the text suggests, not to let clinical priors define the variable list. Run both BoW/TF-IDF and HTR/attention evidence before finalizing candidate features: BoW gives broad lexical recurrence, while HTR/attention localizes the specific spans needed to recover baseline/index-time values in long longitudinal notes. BoW evidence should come from multiple vectorization strategies so a signal is not missed merely because one n-gram or document-frequency setting hides it.
+Start with honest cross-fitted text models. The purpose is to learn which concepts the text suggests, not to let clinical priors define the variable list. Run BoW/TF-IDF, embedding-contrast retrieval, and HTR/attention evidence before finalizing candidate features: BoW gives broad lexical recurrence, embedding contrast retrieves real text chunks and concept probes for treatment/outcome/R-score contrasts, and HTR/attention localizes the specific spans needed to recover baseline/index-time values in long longitudinal notes. BoW evidence should come from multiple vectorization strategies so a signal is not missed merely because one n-gram or document-frequency setting hides it.
 
 Run a BoW/TF-IDF suite:
 - Use the same honest folds across vectorization variants when possible so feature recurrence can be compared directly.
@@ -30,7 +30,13 @@ Run a BoW/TF-IDF suite:
 - Save high-signal n-grams by fold and vectorization run for treatment, outcome, overlap, and effect heterogeneity.
 - Compare consensus, disagreement, and unique discoveries across vectorization runs before translating text evidence into candidate concepts.
 
-Run an HTR/attention evidence pass after the BoW pass:
+Run embedding-contrast retrieval as a required companion to BoW:
+- Build training-fold text chunks only, preserving patient/fold provenance.
+- Retrieve treatment, outcome, per-view R-pseudo-target, ensemble R, within-arm outcome, treatment-outcome cell, orthogonal R-score, and concept-probe contrasts when feasible.
+- Treat retrieved chunks as real-text evidence for candidate concepts, not as direct vector interpretations.
+- Keep embedding evidence active alongside BoW and HTR unless it is explicitly disabled with a documented reason.
+
+Run an HTR/attention evidence pass as an integrated part of feature finding:
 - Before launching neural jobs, inspect the local accelerator environment:
   - `nvidia-smi` or equivalent GPU inventory, free/used memory, and active processes.
   - `which python`, `sys.executable`, `sys.prefix`, `VIRTUAL_ENV`, `PATH`, `LD_LIBRARY_PATH`, `CUDA_VISIBLE_DEVICES`, available device count, and framework CUDA support from the intended Python environment.
@@ -49,6 +55,7 @@ Run an HTR/attention evidence pass after the BoW pass:
   - Stagger startup or run a small fold/chunk smoke test before launching all jobs.
   - If no usable GPU is available after the mismatch escalation path above, document the limitation and run the smallest honest HTR pass feasible, or explain why the HTR pass is blocked.
 - Train cross-fitted nuisance/effect models with attention or span evidence.
+- In the repo-native multi-model path, add HTR nuisance treatment/outcome predictions to the row-level nuisance ensemble used to compute R-loss and pseudo-target signals. This augments the existing BoW ensemble; it does not replace BoW modeling or embedding contrast.
 - Inspect top spans for treatment, outcome, and heterogeneity objectives.
 - Localize the note section, timepoint, and nearby value/assertion for each candidate concept.
 - Use HTR spans to determine whether a signal is baseline/pre-treatment, current-regimen/index-time, historical, post-treatment, or a report-template artifact.
@@ -117,12 +124,13 @@ When the repo-native `multi_model_agentic_forest` runner is unavailable or the u
 
 1. Create the outer and inner folds first and reuse them across all evidence, extraction-review, and final-forest decisions.
 2. Fit multiple BoW/TF-IDF views for treatment nuisance, outcome nuisance, residual, R-loss, and pseudo-target evidence. Include the default broad view, phrase-focused view, rare-signal-friendly view, and a learner-family sensitivity check when runtime permits.
-3. Optionally fit embedding-contrast evidence on training-fold text chunks only, including treatment, outcome, per-view R-pseudo-target, ensemble R, within-arm outcome, cell, orthogonal R-score, and concept-probe contrasts when feasible.
-4. Convert recurring text/span evidence into `ExplicitFeatureSpec`-shaped concepts with roles, categories, aliases, `value_aliases`, temporal windows, and missingness rules. Merge prespecified and agent-proposed specs by name and role rather than extracting duplicates.
-5. Extract the selected concepts by document-reading LLM or coding-agent extraction, preserving one patient-level value, missingness flag, and evidence summary per concept.
-6. Train simple extracted-feature treatment nuisance, outcome nuisance, and R-loss/pseudo-target or effect-modifier diagnostics honestly within folds. Compare them with the upstream BoW and embedding benchmarks that motivated the variables.
-7. If extracted-feature diagnostics materially underperform, revise the candidate specs: merge aliases, fix categorical values, re-role variables, reject weak proxies, add narrow evidence-supported concepts, and re-extract only the changed concepts. Repeat until the extracted features pass the benchmark review or a documented review-round cap is reached.
-8. Fit the final explicit-feature causal forest only after the candidate list has passed extraction, benchmark review, role diagnostics, and parsimony review.
+3. Fit embedding-contrast evidence on training-fold text chunks only, including treatment, outcome, per-view R-pseudo-target, ensemble R, within-arm outcome, cell, orthogonal R-score, and concept-probe contrasts when feasible.
+4. Fit HTR nuisance and R-stage/effect models. Add HTR nuisance predictions to the ensemble treatment/outcome predictions used for R-loss and pseudo-target construction, and expose highly attended tokens/spans to the feature proposal agent.
+5. Convert recurring text/span evidence into `ExplicitFeatureSpec`-shaped concepts with roles, categories, aliases, `value_aliases`, temporal windows, and missingness rules. Merge prespecified and agent-proposed specs by name and role rather than extracting duplicates.
+6. Extract the selected concepts by document-reading LLM or coding-agent extraction, preserving one patient-level value, missingness flag, and evidence summary per concept.
+7. Train simple extracted-feature treatment nuisance, outcome nuisance, and R-loss/pseudo-target or effect-modifier diagnostics honestly within folds. Compare them with the upstream BoW, embedding, and HTR benchmarks that motivated the variables.
+8. If extracted-feature diagnostics materially underperform, revise the candidate specs: merge aliases, fix categorical values, re-role variables, reject weak proxies, add narrow evidence-supported concepts, and re-extract only the changed concepts. Repeat until the extracted features pass the benchmark review or a documented review-round cap is reached.
+9. Fit the final explicit-feature causal forest only after the candidate list has passed extraction, benchmark review, role diagnostics, and parsimony review.
 
 This manual route must preserve the same honesty rule as the repo path: no row may influence a feature-selection, nuisance, pseudo-target, or ITE decision through a model prediction trained on that row.
 
@@ -159,7 +167,7 @@ Effect-modifier evidence:
 Avoid promoting variables based only on marginal outcome association.
 
 Post-extraction benchmark review:
-- Compare extracted-feature nuisance and effect-modifier diagnostics against the BoW/TF-IDF and embedding-contrast benchmarks that generated the candidate concepts.
+- Compare extracted-feature nuisance and effect-modifier diagnostics against the BoW/TF-IDF, embedding-contrast, and HTR benchmarks that generated the candidate concepts.
 - Treat large treatment-nuisance gaps as evidence that important confounding text signal was not extracted, was mis-typed, or was collapsed into a lossy category.
 - Treat large outcome-nuisance or R/pseudo-target gaps as evidence that prognostic or heterogeneity-relevant concepts, transformations, temporal anchoring, or aliases need revision.
 - If the extracted-feature table fails the review, return to concept translation or extraction before fitting the final causal forest.
@@ -174,7 +182,7 @@ Parsimony and redundancy review:
 
 After each iteration:
 - Compare fold-level nuisance metrics, R-loss/pseudo-outcome metrics, causal-forest stability, and ITE distribution.
-- Compare extracted-feature nuisance and R/pseudo-target diagnostics with the upstream BoW and embedding benchmarks, and inspect any failed extracted-feature review gates.
+- Compare extracted-feature nuisance and R/pseudo-target diagnostics with the upstream BoW, embedding, and HTR benchmarks, and inspect any failed extracted-feature review gates.
 - Identify unexplained residual text signal and propose a narrow expansion only if metrics or fold evidence justify it.
 - Re-extract or re-role candidates when aliasing, missingness, or temporal leakage is suspected.
 - Mull over the candidate list repeatedly before finalization: merge redundant variables, reject weak proxies, test supported transformations, and rerun role diagnostics on the revised list.

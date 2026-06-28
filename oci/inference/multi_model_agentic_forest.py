@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+import torch
 from scipy import sparse
 from joblib import Parallel, delayed
 from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor, RandomForestClassifier, RandomForestRegressor
@@ -50,6 +51,13 @@ from .embedding_contrast_discovery import (
     EmbeddingContrastEvidenceGenerator,
     redact_embedding_contrast_evidence,
 )
+from .agentic_attention_variable_forest import (
+    AgenticAttentionVariableForestRunner,
+    _attention_evidence_snippet,
+    _attention_row_has_usable_text,
+    _compact_token_spans,
+    _parse_top_token_spans,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -65,6 +73,9 @@ _AGENT_PROMPT_VIEW_TOP_N = 12
 _AGENT_PROMPT_EMBEDDING_CHUNKS_PER_TAIL = 3
 _AGENT_PROMPT_EMBEDDING_CHUNK_CHARS = 600
 _AGENT_PROMPT_CONCEPT_TOP_N = 8
+_AGENT_PROMPT_HTR_ROWS_PER_STAGE = 36
+_AGENT_PROMPT_HTR_SNIPPET_CHARS = 500
+_AGENT_PROMPT_HTR_SUMMARY_CHARS = 320
 
 
 def run_multi_model_agentic_forest(
@@ -72,25 +83,78 @@ def run_multi_model_agentic_forest(
     config: AppliedInferenceConfig,
     output_path: Path,
     device=None,
+    gpu_ids: Optional[Sequence[int]] = None,
     num_workers: int = 1,
     proposal_agent: Optional[Any] = None,
     extraction_provider: Optional[Any] = None,
     evaluator: Optional[Any] = None,
     embedding_provider: Optional[Any] = None,
+    htr_evidence_provider: Optional[Any] = None,
 ) -> None:
     """Run BoW-guided agentic variable discovery and final explicit-feature forest."""
-    del device
     runner = MultiModelAgenticForestRunner(
         dataset=dataset,
         config=config,
         output_path=output_path,
+        device=device,
+        gpu_ids=gpu_ids,
         num_workers=num_workers,
         proposal_agent=proposal_agent,
         extraction_provider=extraction_provider,
         evaluator=evaluator,
         embedding_provider=embedding_provider,
+        htr_evidence_provider=htr_evidence_provider,
     )
     runner.run()
+
+
+class MultiModelHTREvidenceProvider:
+    """Adapter that reuses the attention runner's HTR cross-fit stages."""
+
+    def __init__(
+        self,
+        *,
+        config: AppliedInferenceConfig,
+        output_dir: Path,
+        device: Optional[Any] = None,
+        gpu_ids: Optional[Sequence[int]] = None,
+        num_workers: int = 1,
+    ) -> None:
+        self.config = config
+        self.output_dir = Path(output_dir)
+        self.device = torch.device(device or "cpu")
+        self.gpu_ids = list(gpu_ids) if gpu_ids is not None else None
+        self.num_workers = 1 if num_workers is None else int(num_workers)
+        self._runner: Optional[AgenticAttentionVariableForestRunner] = None
+
+    def _ensure_runner(self, discovery_df: pd.DataFrame) -> AgenticAttentionVariableForestRunner:
+        if self._runner is None:
+            self._runner = AgenticAttentionVariableForestRunner(
+                dataset=discovery_df,
+                config=self.config,
+                output_path=self.output_dir / "htr_evidence" / "predictions.parquet",
+                device=self.device,
+                gpu_ids=self.gpu_ids,
+                num_workers=self.num_workers,
+            )
+        return self._runner
+
+    def fit_nuisance(
+        self,
+        discovery_df: pd.DataFrame,
+        outer_fold: int,
+    ) -> Dict[str, Any]:
+        runner = self._ensure_runner(discovery_df)
+        return runner._crossfit_nuisance(discovery_df, outer_fold)
+
+    def fit_effect(
+        self,
+        discovery_df: pd.DataFrame,
+        nuisance_predictions: pd.DataFrame,
+        outer_fold: int,
+    ) -> Dict[str, Any]:
+        runner = self._ensure_runner(discovery_df)
+        return runner._crossfit_effect(discovery_df, nuisance_predictions, outer_fold)
 
 
 class MultiModelAgenticForestRunner:
@@ -101,11 +165,14 @@ class MultiModelAgenticForestRunner:
         dataset: pd.DataFrame,
         config: AppliedInferenceConfig,
         output_path: Path,
+        device: Optional[Any] = None,
+        gpu_ids: Optional[Sequence[int]] = None,
         num_workers: int = 1,
         proposal_agent: Optional[Any] = None,
         extraction_provider: Optional[Any] = None,
         evaluator: Optional[Any] = None,
         embedding_provider: Optional[Any] = None,
+        htr_evidence_provider: Optional[Any] = None,
     ) -> None:
         self.dataset = dataset.reset_index(drop=True).copy()
         self.dataset["_oci_row_id"] = np.arange(len(self.dataset), dtype=int)
@@ -113,12 +180,15 @@ class MultiModelAgenticForestRunner:
         self.output_path = Path(output_path)
         self.artifact_dir = self.output_path.parent / "multi_model_agentic_forest"
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
+        self.device = torch.device(device or "cpu")
+        self.gpu_ids = list(gpu_ids) if gpu_ids is not None else None
         self.num_workers = 1 if num_workers is None else int(num_workers)
         self._has_external_components = (
             proposal_agent is not None
             or extraction_provider is not None
             or evaluator is not None
             or embedding_provider is not None
+            or htr_evidence_provider is not None
         )
 
         self.nn_config: MultiModelAgenticForestConfig = getattr(
@@ -148,11 +218,16 @@ class MultiModelAgenticForestRunner:
             cf_config=self.cf_config,
         )
         self.embedding_provider = embedding_provider
+        self.htr_evidence_provider = htr_evidence_provider
         self.embedding_evidence_generator: Optional[
             EmbeddingContrastEvidenceGenerator
         ] = None
+        self._default_htr_evidence_provider: Optional[MultiModelHTREvidenceProvider] = None
 
         self.bow_prediction_frames: List[pd.DataFrame] = []
+        self.htr_nuisance_prediction_frames: List[pd.DataFrame] = []
+        self.htr_effect_prediction_frames: List[pd.DataFrame] = []
+        self.htr_attention_rows: List[Dict[str, Any]] = []
         self.importance_rows: List[Dict[str, Any]] = []
         self.embedding_evidence_rows: List[Dict[str, Any]] = []
         self.agent_rows: List[Dict[str, Any]] = []
@@ -165,12 +240,20 @@ class MultiModelAgenticForestRunner:
         logger.info("=" * 80)
         logger.info("MULTI-MODEL AGENTIC FEATURE CAUSAL FOREST")
         logger.info("=" * 80)
+        self._validate_required_evidence_sources()
         self._ensure_prespecified_features()
 
         splits = self._analysis_splits()
         if self._embedding_contrast_enabled() and self.embedding_provider is None:
             self._embedding_contrast_generator().prepare(self.dataset)
         outer_n_jobs = self._outer_n_jobs(len(splits))
+        if outer_n_jobs > 1 and self._htr_evidence_enabled():
+            logger.warning(
+                "Outer fold parallelism disabled because integrated HTR evidence "
+                "loads neural models; use BoW fold parallelism or disable HTR with "
+                "a documented reason for lightweight runs."
+            )
+            outer_n_jobs = 1
         if outer_n_jobs > 1 and self._has_external_components:
             logger.warning(
                 "Outer fold parallelism disabled because custom agent/extractor/"
@@ -209,6 +292,13 @@ class MultiModelAgenticForestRunner:
             prediction_frames = [item["predictions"] for item in fold_results]
             for item in fold_results:
                 self.bow_prediction_frames.extend(item["bow_prediction_frames"])
+                self.htr_nuisance_prediction_frames.extend(
+                    item.get("htr_nuisance_prediction_frames", [])
+                )
+                self.htr_effect_prediction_frames.extend(
+                    item.get("htr_effect_prediction_frames", [])
+                )
+                self.htr_attention_rows.extend(item.get("htr_attention_rows", []))
                 self.importance_rows.extend(item["importance_rows"])
                 self.embedding_evidence_rows.extend(item["embedding_evidence_rows"])
                 self.agent_rows.extend(item["agent_rows"])
@@ -270,6 +360,9 @@ class MultiModelAgenticForestRunner:
             "outer_fold": int(outer_fold),
             "predictions": predictions,
             "bow_prediction_frames": fold_runner.bow_prediction_frames,
+            "htr_nuisance_prediction_frames": fold_runner.htr_nuisance_prediction_frames,
+            "htr_effect_prediction_frames": fold_runner.htr_effect_prediction_frames,
+            "htr_attention_rows": fold_runner.htr_attention_rows,
             "importance_rows": fold_runner.importance_rows,
             "embedding_evidence_rows": fold_runner.embedding_evidence_rows,
             "agent_rows": fold_runner.agent_rows,
@@ -493,6 +586,23 @@ class MultiModelAgenticForestRunner:
                 )
             )
 
+        htr_nuisance_result = self._fit_htr_nuisance_discovery(
+            discovery_df,
+            outer_fold,
+        )
+        htr_evidence = None
+        if htr_nuisance_result is not None:
+            self.htr_nuisance_prediction_frames.append(
+                htr_nuisance_result["predictions"]
+            )
+            self.htr_attention_rows.extend(htr_nuisance_result.get("attention", []))
+            htr_evidence = {
+                "nuisance": {
+                    "metrics": htr_nuisance_result.get("metrics", {}),
+                    "attention": htr_nuisance_result.get("attention", []),
+                }
+            }
+
         ensemble_result = self._fit_ensemble_r_discovery(
             discovery_df=discovery_df,
             texts=texts,
@@ -500,20 +610,55 @@ class MultiModelAgenticForestRunner:
             t=t,
             outer_fold=outer_fold,
             view_results=view_results,
+            nuisance_results=(
+                [*view_results, htr_nuisance_result]
+                if htr_nuisance_result is not None
+                else view_results
+            ),
             explicit_feature_dicts=explicit_feature_dicts,
             explicit_specs=prespecified_specs,
         )
 
+        if ensemble_result is not None and htr_nuisance_result is not None:
+            htr_effect_result = self._fit_htr_effect_discovery(
+                discovery_df=discovery_df,
+                outer_fold=outer_fold,
+                nuisance_predictions=ensemble_result["nuisance_predictions"],
+            )
+            if htr_effect_result is not None:
+                ensemble_result["htr_effect_result"] = htr_effect_result
+                self.htr_effect_prediction_frames.append(
+                    htr_effect_result["predictions"]
+                )
+                self.htr_attention_rows.extend(htr_effect_result.get("attention", []))
+                assert htr_evidence is not None
+                htr_evidence["effect"] = {
+                    "metrics": htr_effect_result.get("metrics", {}),
+                    "attention": htr_effect_result.get("attention", []),
+                }
+
         prediction_frames = [result["predictions"] for result in view_results]
+        if htr_nuisance_result is not None:
+            prediction_frames.append(htr_nuisance_result["predictions"])
         if ensemble_result is not None:
             prediction_frames.extend(
                 result["predictions"]
                 for result in ensemble_result.get("view_results", [])
             )
+            htr_effect_result = ensemble_result.get("htr_effect_result")
+            if htr_effect_result is not None:
+                prediction_frames.append(htr_effect_result["predictions"])
         predictions = pd.concat(prediction_frames, ignore_index=True)
         metrics = _multi_view_metrics(view_results)
+        if htr_nuisance_result is not None:
+            metrics["htr_nuisance"] = htr_nuisance_result.get("metrics", {})
         if ensemble_result is not None:
             metrics["ensemble_r"] = ensemble_result["metrics"]
+            if ensemble_result.get("htr_effect_result") is not None:
+                metrics["htr_effect"] = ensemble_result["htr_effect_result"].get(
+                    "metrics",
+                    {},
+                )
             for key, value in _scalar_metrics(ensemble_result["metrics"]).items():
                 metrics[f"ensemble_{key}"] = value
         importance = _multi_view_importance(
@@ -529,7 +674,12 @@ class MultiModelAgenticForestRunner:
         if ensemble_result is not None:
             pseudo_targets.append(ensemble_result["pseudo_target"])
             t_resids.append(ensemble_result["t_resid"])
-            pseudo_target_names.append("ensemble_mean_nuisance")
+            pseudo_target_names.append(
+                str(
+                    ensemble_result.get("target_source")
+                    or "ensemble_mean_nuisance"
+                )
+            )
         embedding_evidence = self._build_embedding_contrast_evidence(
             discovery_df=discovery_df,
             y=y,
@@ -545,12 +695,14 @@ class MultiModelAgenticForestRunner:
             metrics=metrics,
             importance=importance,
             embedding_evidence=embedding_evidence,
+            htr_evidence=htr_evidence,
         )
         return {
             "predictions": predictions,
             "metrics": metrics,
             "importance": importance,
             "embedding_contrast_evidence": embedding_evidence,
+            "htr_evidence": htr_evidence or {},
             "context": context,
         }
 
@@ -679,18 +831,28 @@ class MultiModelAgenticForestRunner:
         t: np.ndarray,
         outer_fold: int,
         view_results: Sequence[Dict[str, Any]],
+        nuisance_results: Optional[Sequence[Dict[str, Any]]] = None,
         explicit_feature_dicts: Optional[List[Dict[str, Any]]] = None,
         explicit_specs: Optional[List[ExplicitFeatureSpec]] = None,
     ) -> Optional[Dict[str, Any]]:
-        if len(view_results) < 2:
+        if len(view_results) < 1:
+            return None
+        nuisance_results = [
+            result for result in (nuisance_results or view_results) if result is not None
+        ]
+        if len(nuisance_results) < 2:
             return None
 
         e_hat = np.nanmean(
-            np.vstack([np.asarray(result["e_hat"], dtype=float) for result in view_results]),
+            np.vstack(
+                [np.asarray(result["e_hat"], dtype=float) for result in nuisance_results]
+            ),
             axis=0,
         )
         m_hat = np.nanmean(
-            np.vstack([np.asarray(result["m_hat"], dtype=float) for result in view_results]),
+            np.vstack(
+                [np.asarray(result["m_hat"], dtype=float) for result in nuisance_results]
+            ),
             axis=0,
         )
         e_clipped = np.clip(e_hat, self.nn_config.e_clip, 1.0 - self.nn_config.e_clip)
@@ -699,6 +861,30 @@ class MultiModelAgenticForestRunner:
         pseudo_target = y_resid / t_resid
         sample_weight = t_resid**2
         r_loss_at_zero = y_resid**2
+        nuisance_source_names = [
+            str(result.get("view_name") or getattr(result.get("view"), "name", "model"))
+            for result in nuisance_results
+        ]
+        target_source = (
+            "ensemble_mean_nuisance_with_htr"
+            if any(str(name).startswith("htr") for name in nuisance_source_names)
+            else "ensemble_mean_nuisance"
+        )
+        nuisance_predictions = pd.DataFrame(
+            {
+                "_oci_row_id": discovery_df["_oci_row_id"].to_numpy(),
+                "outer_fold": int(outer_fold),
+                "e_hat": e_hat,
+                "m_hat": m_hat,
+                "y_residual": y_resid,
+                "t_residual": t_resid,
+                "r_pseudo_outcome": pseudo_target,
+                "pseudo_target": pseudo_target,
+                "r_loss_at_zero_tau": r_loss_at_zero,
+                "nuisance_fold": -1,
+                "target_source": target_source,
+            }
+        )
 
         ensemble_view_results: List[Dict[str, Any]] = []
         for result in view_results:
@@ -731,7 +917,7 @@ class MultiModelAgenticForestRunner:
                     "tau_hat_multi_model": tau_hat,
                     "r_loss": r_loss,
                     "r_loss_at_zero_tau": r_loss_at_zero,
-                    "target_source": "ensemble_mean_nuisance",
+                    "target_source": target_source,
                 }
             )
             metrics = self._bow_metrics(
@@ -771,16 +957,22 @@ class MultiModelAgenticForestRunner:
             )
 
         metrics = _multi_view_metrics(ensemble_view_results)
-        metrics["target_source"] = "ensemble_mean_nuisance"
+        metrics["target_source"] = target_source
+        metrics["n_nuisance_sources"] = int(len(nuisance_source_names))
+        metrics["nuisance_sources"] = nuisance_source_names
         metrics["pseudo_target_construction"] = (
-            "mean nuisance predictions across BoW views, then "
+            "mean nuisance predictions across BoW and HTR models, then "
+            "(Y - mean_m_hat) / (T - mean_e_hat)"
+            if target_source == "ensemble_mean_nuisance_with_htr"
+            else "mean nuisance predictions across BoW views, then "
             "(Y - mean_m_hat) / (T - mean_e_hat)"
         )
         importance = _multi_view_importance(
             ensemble_view_results,
             top_n=int(self.nn_config.top_n_features),
         )
-        importance["target_source"] = "ensemble_mean_nuisance"
+        importance["target_source"] = target_source
+        importance["nuisance_sources"] = nuisance_source_names
         importance["pseudo_target_construction"] = metrics[
             "pseudo_target_construction"
         ]
@@ -790,6 +982,8 @@ class MultiModelAgenticForestRunner:
             "importance": importance,
             "pseudo_target": pseudo_target,
             "t_resid": t_resid,
+            "nuisance_predictions": nuisance_predictions,
+            "target_source": target_source,
         }
 
     def _crossfit_binary(
@@ -1156,6 +1350,7 @@ class MultiModelAgenticForestRunner:
         metrics: Dict[str, Any],
         importance: Dict[str, Any],
         embedding_evidence: Optional[Dict[str, Any]] = None,
+        htr_evidence: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         context = {
             "prompt_version": "multi_model_agentic_forest_v1",
@@ -1180,6 +1375,13 @@ class MultiModelAgenticForestRunner:
                 "Treat within-arm outcome, treatment-outcome cell interaction, "
                 "and orthogonal R-score embedding contrasts as effect-modifier "
                 "hypothesis evidence when their retrieved chunks recur coherently.",
+                "When htr_attention_evidence is present, use the highly attended "
+                "tokens/spans from HTR nuisance and R-stage models as neural text "
+                "evidence for variables that may explain treatment assignment, "
+                "baseline outcome risk, or heterogeneous treatment effect.",
+                "Treat ensemble_mean_nuisance_with_htr diagnostics as the R-loss "
+                "signal built from BoW nuisance predictions plus HTR nuisance "
+                "predictions, not as a replacement for the BoW views.",
                 "Suggest explicit pre-treatment patient-level variables, not raw text tokens.",
                 "Use variables predictive of both treatment and outcome as confounders.",
                 "Use variables predictive of the pseudo-target as effect modifiers.",
@@ -1212,6 +1414,8 @@ class MultiModelAgenticForestRunner:
         }
         if embedding_evidence:
             context["embedding_contrast_evidence"] = embedding_evidence
+        if htr_evidence:
+            context["htr_attention_evidence"] = htr_evidence
         compact_context = _compact_multi_model_agent_context(context)
         prompt_chars = len(
             json.dumps(compact_context, separators=(",", ":"), default=_json_default)
@@ -1227,6 +1431,30 @@ class MultiModelAgenticForestRunner:
         embedding_config = getattr(self.nn_config, "embedding_contrast", None)
         return bool(getattr(embedding_config, "enabled", False))
 
+    def _htr_evidence_enabled(self) -> bool:
+        return bool(getattr(self.nn_config, "htr_evidence_enabled", True))
+
+    def _validate_required_evidence_sources(self) -> None:
+        embedding_config = getattr(self.nn_config, "embedding_contrast", None)
+        if not bool(getattr(embedding_config, "enabled", False)):
+            reason = str(getattr(embedding_config, "disable_reason", "") or "").strip()
+            if not reason:
+                raise ValueError(
+                    "multi_model_agentic_forest requires embedding contrast evidence; "
+                    "set embedding_contrast.disable_reason when intentionally disabling it"
+                )
+            logger.warning("Embedding contrast evidence disabled: %s", reason)
+        if not self._htr_evidence_enabled():
+            reason = str(
+                getattr(self.nn_config, "htr_evidence_disable_reason", "") or ""
+            ).strip()
+            if not reason:
+                raise ValueError(
+                    "multi_model_agentic_forest requires HTR attention/span evidence; "
+                    "set htr_evidence_disable_reason when intentionally disabling it"
+                )
+            logger.warning("HTR attention/span evidence disabled: %s", reason)
+
     def _embedding_contrast_generator(self) -> EmbeddingContrastEvidenceGenerator:
         if self.embedding_evidence_generator is None:
             self.embedding_evidence_generator = EmbeddingContrastEvidenceGenerator(
@@ -1235,6 +1463,99 @@ class MultiModelAgenticForestRunner:
                 embedding_provider=self.embedding_provider,
             )
         return self.embedding_evidence_generator
+
+    def _htr_provider(self) -> Any:
+        if self.htr_evidence_provider is not None:
+            return self.htr_evidence_provider
+        if self._default_htr_evidence_provider is None:
+            self._default_htr_evidence_provider = MultiModelHTREvidenceProvider(
+                config=self.config,
+                output_dir=self.artifact_dir,
+                device=self.device,
+                gpu_ids=self.gpu_ids,
+                num_workers=self.num_workers,
+            )
+        return self._default_htr_evidence_provider
+
+    def _fit_htr_nuisance_discovery(
+        self,
+        discovery_df: pd.DataFrame,
+        outer_fold: int,
+    ) -> Optional[Dict[str, Any]]:
+        if not self._htr_evidence_enabled():
+            return None
+        try:
+            result = self._htr_provider().fit_nuisance(discovery_df, outer_fold)
+        except Exception as exc:
+            raise RuntimeError(
+                "Required HTR nuisance evidence generation failed"
+            ) from exc
+        predictions = _align_htr_prediction_frame(
+            result.get("predictions"),
+            discovery_df,
+            required_columns=["e_hat", "m_hat"],
+            source="htr_nuisance",
+        )
+        attention = [dict(row) for row in result.get("attention", []) or []]
+        for row in attention:
+            row.setdefault("model_family", "htr")
+        predictions["model_family"] = "htr"
+        predictions["view_name"] = "htr_nuisance"
+        predictions["target_source"] = "htr_nuisance"
+        metrics = _htr_nuisance_metrics(
+            discovery_df=discovery_df,
+            predictions=predictions,
+            treatment_column=self.config.treatment_column,
+            outcome_column=self.config.outcome_column,
+            outcome_type=self.config.outcome_type,
+        )
+        return {
+            "model_family": "htr",
+            "view_name": "htr_nuisance",
+            "predictions": predictions,
+            "attention": attention,
+            "metrics": metrics,
+            "e_hat": predictions["e_hat"].to_numpy(dtype=float),
+            "m_hat": predictions["m_hat"].to_numpy(dtype=float),
+        }
+
+    def _fit_htr_effect_discovery(
+        self,
+        discovery_df: pd.DataFrame,
+        outer_fold: int,
+        nuisance_predictions: pd.DataFrame,
+    ) -> Optional[Dict[str, Any]]:
+        if not self._htr_evidence_enabled():
+            return None
+        try:
+            result = self._htr_provider().fit_effect(
+                discovery_df,
+                nuisance_predictions,
+                outer_fold,
+            )
+        except Exception as exc:
+            raise RuntimeError("Required HTR effect evidence generation failed") from exc
+        predictions = _align_htr_prediction_frame(
+            result.get("predictions"),
+            discovery_df,
+            required_columns=["tau_hat_r_stage"],
+            source="htr_effect",
+        )
+        attention = [dict(row) for row in result.get("attention", []) or []]
+        for row in attention:
+            row.setdefault("model_family", "htr")
+        predictions["model_family"] = "htr"
+        predictions["view_name"] = "htr_effect"
+        predictions["target_source"] = "ensemble_mean_nuisance_with_htr"
+        metrics = _htr_effect_metrics(predictions)
+        return {
+            "model_family": "htr",
+            "view_name": "htr_effect",
+            "predictions": predictions,
+            "attention": attention,
+            "metrics": metrics,
+            "tau_hat": predictions["tau_hat_r_stage"].to_numpy(dtype=float),
+        }
 
     def _build_embedding_contrast_evidence(
         self,
@@ -1248,7 +1569,10 @@ class MultiModelAgenticForestRunner:
         importance: Dict[str, Any],
     ) -> Dict[str, Any]:
         if not self._embedding_contrast_enabled():
-            return {}
+            reason = str(
+                getattr(self.nn_config.embedding_contrast, "disable_reason", "") or ""
+            ).strip()
+            return {"enabled": False, "disabled_reason": reason}
         try:
             generator = self._embedding_contrast_generator()
             generator.prepare(self.dataset)
@@ -1266,22 +1590,27 @@ class MultiModelAgenticForestRunner:
                 importance=importance,
             )
         except Exception as exc:
-            logger.warning(
-                "Embedding contrast evidence generation failed; continuing with BoW evidence: %s",
-                exc,
-                exc_info=True,
-            )
-            return {"enabled": True, "error": str(exc)}
+            raise RuntimeError(
+                "Required embedding contrast evidence generation failed"
+            ) from exc
 
     def _artifact_agent_context(self, context: Dict[str, Any]) -> Dict[str, Any]:
         if self.search_config.save_agent_context:
             return context
-        if "embedding_contrast_evidence" not in context:
+        if (
+            "embedding_contrast_evidence" not in context
+            and "htr_attention_evidence" not in context
+        ):
             return context
         artifact_context = dict(context)
-        artifact_context["embedding_contrast_evidence"] = (
-            redact_embedding_contrast_evidence(context["embedding_contrast_evidence"])
-        )
+        if "embedding_contrast_evidence" in context:
+            artifact_context["embedding_contrast_evidence"] = (
+                redact_embedding_contrast_evidence(context["embedding_contrast_evidence"])
+            )
+        if "htr_attention_evidence" in context:
+            artifact_context["htr_attention_evidence"] = _redact_htr_attention_evidence(
+                context["htr_attention_evidence"]
+            )
         return artifact_context
 
     def _propose_selected_specs(
@@ -2434,6 +2763,31 @@ class MultiModelAgenticForestRunner:
                 self.artifact_dir / "bow_view_oof_predictions.parquet",
                 index=False,
             )
+        text_prediction_frames = list(self.bow_prediction_frames)
+        if self.htr_nuisance_prediction_frames:
+            htr_nuisance = pd.concat(self.htr_nuisance_prediction_frames)
+            htr_nuisance.to_parquet(
+                self.artifact_dir / "htr_nuisance_oof_predictions.parquet",
+                index=False,
+            )
+            text_prediction_frames.append(htr_nuisance)
+        if self.htr_effect_prediction_frames:
+            htr_effect = pd.concat(self.htr_effect_prediction_frames)
+            htr_effect.to_parquet(
+                self.artifact_dir / "htr_effect_oof_predictions.parquet",
+                index=False,
+            )
+            text_prediction_frames.append(htr_effect)
+        if text_prediction_frames:
+            pd.concat(text_prediction_frames, ignore_index=True).to_parquet(
+                self.artifact_dir / "text_model_oof_predictions.parquet",
+                index=False,
+            )
+        if self.htr_attention_rows:
+            pd.DataFrame(self.htr_attention_rows).to_parquet(
+                self.artifact_dir / "htr_attention_evidence.parquet",
+                index=False,
+            )
         pd.DataFrame(self.outer_metric_rows).to_csv(
             self.artifact_dir / "outer_cv_metrics.csv",
             index=False,
@@ -2493,6 +2847,9 @@ def _run_multi_model_outer_fold_worker(
         "outer_fold": int(outer_fold),
         "predictions": predictions,
         "bow_prediction_frames": fold_runner.bow_prediction_frames,
+        "htr_nuisance_prediction_frames": fold_runner.htr_nuisance_prediction_frames,
+        "htr_effect_prediction_frames": fold_runner.htr_effect_prediction_frames,
+        "htr_attention_rows": fold_runner.htr_attention_rows,
         "importance_rows": fold_runner.importance_rows,
         "embedding_evidence_rows": fold_runner.embedding_evidence_rows,
         "agent_rows": fold_runner.agent_rows,
@@ -3007,6 +3364,131 @@ def _safe_brier_score(y_true: np.ndarray, y_pred: np.ndarray) -> Optional[float]
         return None
 
 
+def _align_htr_prediction_frame(
+    frame: Any,
+    discovery_df: pd.DataFrame,
+    *,
+    required_columns: Sequence[str],
+    source: str,
+) -> pd.DataFrame:
+    if not isinstance(frame, pd.DataFrame):
+        raise ValueError(f"{source} did not return a predictions DataFrame")
+    if "_oci_row_id" not in frame.columns:
+        raise ValueError(f"{source} predictions must include _oci_row_id")
+    missing = [column for column in required_columns if column not in frame.columns]
+    if missing:
+        raise ValueError(f"{source} predictions missing required columns: {missing}")
+    if frame["_oci_row_id"].duplicated().any():
+        raise ValueError(f"{source} predictions contain duplicate _oci_row_id values")
+
+    aligned = discovery_df[["_oci_row_id"]].merge(
+        frame.copy(),
+        on="_oci_row_id",
+        how="left",
+        sort=False,
+    )
+    if len(aligned) != len(discovery_df):
+        raise ValueError(f"{source} predictions could not be aligned to discovery rows")
+    for column in required_columns:
+        values = pd.to_numeric(aligned[column], errors="coerce").to_numpy(dtype=float)
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"{source} predictions contain non-finite {column} values")
+        aligned[column] = values
+    return aligned
+
+
+def _htr_nuisance_metrics(
+    *,
+    discovery_df: pd.DataFrame,
+    predictions: pd.DataFrame,
+    treatment_column: str,
+    outcome_column: str,
+    outcome_type: str,
+) -> Dict[str, Any]:
+    metrics: Dict[str, Any] = {"n_rows": int(len(predictions))}
+    e_hat = predictions["e_hat"].to_numpy(dtype=float)
+    m_hat = predictions["m_hat"].to_numpy(dtype=float)
+    metrics.update(
+        {
+            "e_hat_mean": _finite_or_none(np.mean(e_hat)),
+            "e_hat_std": _finite_or_none(np.std(e_hat)),
+            "m_hat_mean": _finite_or_none(np.mean(m_hat)),
+            "m_hat_std": _finite_or_none(np.std(m_hat)),
+        }
+    )
+    if treatment_column in discovery_df.columns:
+        t = discovery_df[treatment_column].to_numpy(dtype=float)
+        metrics.update(
+            {
+                "treatment_auroc": _safe_roc_auc(t, e_hat),
+                "treatment_brier": _safe_brier_score(t, e_hat),
+                "treatment_log_loss": _safe_log_loss(t, e_hat),
+            }
+        )
+    if outcome_column in discovery_df.columns:
+        y = discovery_df[outcome_column].to_numpy(dtype=float)
+        if str(outcome_type).lower() == "continuous":
+            metrics["outcome_rmse"] = _finite_or_none(np.sqrt(mean_squared_error(y, m_hat)))
+        else:
+            metrics.update(
+                {
+                    "outcome_auroc": _safe_roc_auc(y, m_hat),
+                    "outcome_brier": _safe_brier_score(y, m_hat),
+                    "outcome_log_loss": _safe_log_loss(y, m_hat),
+                }
+            )
+    for column in ["y_residual", "t_residual", "r_pseudo_outcome"]:
+        if column in predictions.columns:
+            values = pd.to_numeric(predictions[column], errors="coerce").to_numpy(dtype=float)
+            finite = values[np.isfinite(values)]
+            metrics[f"{column}_mean"] = (
+                _finite_or_none(np.mean(finite)) if len(finite) else None
+            )
+            metrics[f"{column}_std"] = (
+                _finite_or_none(np.std(finite)) if len(finite) else None
+            )
+    return metrics
+
+
+def _htr_effect_metrics(predictions: pd.DataFrame) -> Dict[str, Any]:
+    metrics: Dict[str, Any] = {"n_rows": int(len(predictions))}
+    for column in [
+        "tau_hat_r_stage",
+        "tau_logit_modifier",
+        "r_pseudo_outcome",
+        "r_loss",
+        "effect_loss",
+        "effect_loss_at_zero_tau",
+    ]:
+        if column not in predictions.columns:
+            continue
+        values = pd.to_numeric(predictions[column], errors="coerce").to_numpy(dtype=float)
+        finite = values[np.isfinite(values)]
+        metrics[f"{column}_mean"] = (
+            _finite_or_none(np.mean(finite)) if len(finite) else None
+        )
+        metrics[f"{column}_std"] = (
+            _finite_or_none(np.std(finite)) if len(finite) else None
+        )
+    loss = metrics.get("r_loss_mean")
+    zero = metrics.get("effect_loss_at_zero_tau_mean")
+    if zero is not None and zero > 0.0 and loss is not None:
+        metrics["r_loss_relative_improvement"] = float(1.0 - loss / zero)
+    if "effect_objective" in predictions.columns:
+        objectives = sorted(
+            {str(value) for value in predictions["effect_objective"].dropna() if str(value)}
+        )
+        if objectives:
+            metrics["effect_objectives"] = objectives
+    if "target_source" in predictions.columns:
+        target_sources = sorted(
+            {str(value) for value in predictions["target_source"].dropna() if str(value)}
+        )
+        if target_sources:
+            metrics["target_sources"] = target_sources
+    return metrics
+
+
 def _summarize_multi_model_extractions(
     df: pd.DataFrame,
     specs: Sequence[ExplicitFeatureSpec],
@@ -3267,6 +3749,10 @@ def _compact_extracted_feature_review_context(context: Dict[str, Any]) -> Dict[s
     if isinstance(compact.get("embedding_contrast_evidence"), dict):
         compact["embedding_contrast_evidence"] = _compact_embedding_contrast_evidence(
             compact["embedding_contrast_evidence"]
+        )
+    if isinstance(compact.get("htr_attention_evidence"), dict):
+        compact["htr_attention_evidence"] = _compact_htr_attention_evidence(
+            compact["htr_attention_evidence"]
         )
     return _round_floats(compact)
 
@@ -3883,6 +4369,10 @@ def _compact_multi_model_agent_context(context: Dict[str, Any]) -> Dict[str, Any
         compact["embedding_contrast_evidence"] = _compact_embedding_contrast_evidence(
             context["embedding_contrast_evidence"]
         )
+    if isinstance(context.get("htr_attention_evidence"), dict):
+        compact["htr_attention_evidence"] = _compact_htr_attention_evidence(
+            context["htr_attention_evidence"]
+        )
     compact["prompt_compaction"] = {
         "feature_importance": (
             f"per-view feature lists capped at {_AGENT_PROMPT_VIEW_TOP_N}; "
@@ -3891,6 +4381,10 @@ def _compact_multi_model_agent_context(context: Dict[str, Any]) -> Dict[str, Any
         "embedding_contrast_evidence": (
             f"retrieved chunks capped at {_AGENT_PROMPT_EMBEDDING_CHUNKS_PER_TAIL} "
             f"per tail and {_AGENT_PROMPT_EMBEDDING_CHUNK_CHARS} chars each"
+        ),
+        "htr_attention_evidence": (
+            f"attention rows capped at {_AGENT_PROMPT_HTR_ROWS_PER_STAGE} per stage; "
+            f"snippets capped at {_AGENT_PROMPT_HTR_SNIPPET_CHARS} chars"
         ),
     }
     return compact
@@ -3951,7 +4445,7 @@ def _compact_multi_model_importance(importance: Dict[str, Any]) -> Dict[str, Any
         compact_importance["ensemble_r"] = _compact_multi_model_importance(
             importance["ensemble_r"]
         )
-    for key in ["target_source", "pseudo_target_construction"]:
+    for key in ["target_source", "pseudo_target_construction", "nuisance_sources"]:
         if key in importance:
             compact_importance[key] = importance[key]
     return compact_importance
@@ -3967,11 +4461,12 @@ def _compact_embedding_contrast_evidence(evidence: Dict[str, Any]) -> Dict[str, 
             "chunking",
             "residualized_columns",
             "n_patients",
-            "n_concept_phrases",
-            "skipped",
-            "error",
-        ]
-        if key in evidence
+                "n_concept_phrases",
+                "skipped",
+                "error",
+                "disabled_reason",
+            ]
+            if key in evidence
     }
     contrasts = []
     for contrast in evidence.get("contrasts", []) or []:
@@ -4018,6 +4513,131 @@ def _compact_embedding_contrast_evidence(evidence: Dict[str, Any]) -> Dict[str, 
         "chunk_text_chars": _AGENT_PROMPT_EMBEDDING_CHUNK_CHARS,
         "concept_top_n": _AGENT_PROMPT_CONCEPT_TOP_N,
     }
+    return compact
+
+
+def _compact_htr_attention_evidence(evidence: Dict[str, Any]) -> Dict[str, Any]:
+    compact: Dict[str, Any] = {}
+    for stage_key in ["nuisance", "effect"]:
+        stage_evidence = evidence.get(stage_key)
+        if not isinstance(stage_evidence, dict):
+            continue
+        compact[stage_key] = {
+            "metrics": _round_floats(stage_evidence.get("metrics", {})),
+            "attention": _compact_htr_attention_rows(
+                stage_evidence.get("attention", []) or [],
+                max_rows=_AGENT_PROMPT_HTR_ROWS_PER_STAGE,
+            ),
+        }
+    if compact:
+        compact["prompt_compaction"] = {
+            "rows_per_stage": _AGENT_PROMPT_HTR_ROWS_PER_STAGE,
+            "snippet_chars": _AGENT_PROMPT_HTR_SNIPPET_CHARS,
+            "summary_chars": _AGENT_PROMPT_HTR_SUMMARY_CHARS,
+        }
+    return compact
+
+
+def _compact_htr_attention_rows(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    max_rows: int,
+) -> List[Dict[str, Any]]:
+    compact: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        already_compact_text = bool(
+            row.get("evidence_snippet")
+            or row.get("top_token_spans")
+            or row.get("attended_token_summary")
+        )
+        if not _attention_row_has_usable_text(row) and not already_compact_text:
+            continue
+        spans = _parse_top_token_spans(
+            row.get("top_token_spans") or row.get("top_token_spans_json")
+        )
+        item: Dict[str, Any] = {}
+        for key in [
+            "row_id",
+            "_oci_row_id",
+            "outer_fold",
+            "fold",
+            "stage",
+            "model_family",
+            "chunk_index",
+            "effect_objective",
+            "target_source",
+            "view_name",
+        ]:
+            if key in row:
+                item[key] = _round_floats(row[key])
+        for key in [
+            "attention",
+            "attention_score",
+            "chunk_attention",
+            "e_hat",
+            "m_hat",
+            "e_hat_raw",
+            "m_hat_raw",
+            "y_residual",
+            "t_residual",
+            "tau_hat_r_stage",
+            "tau_logit_modifier",
+            "r_pseudo_outcome",
+            "r_loss",
+            "effect_loss",
+            "effect_loss_at_zero_tau",
+        ]:
+            if key in row:
+                item[key] = _round_floats(row[key])
+        snippet = _clip_text(row.get("evidence_snippet"), _AGENT_PROMPT_HTR_SNIPPET_CHARS)
+        if not snippet:
+            snippet = _attention_evidence_snippet(
+                row.get("chunk_text"),
+                spans,
+                row.get("highlighted_chunk_text"),
+            )
+        if snippet:
+            item["evidence_snippet"] = _clip_text(snippet, _AGENT_PROMPT_HTR_SNIPPET_CHARS)
+        if spans:
+            item["top_token_spans"] = _compact_token_spans(spans)
+        summary = _clip_text(
+            row.get("attended_token_summary"),
+            _AGENT_PROMPT_HTR_SUMMARY_CHARS,
+        )
+        if summary:
+            item["attended_token_summary"] = summary
+        if item:
+            compact.append(item)
+        if len(compact) >= max(0, int(max_rows)):
+            break
+    return compact
+
+
+def _redact_htr_attention_evidence(evidence: Dict[str, Any]) -> Dict[str, Any]:
+    compact = _compact_htr_attention_evidence(evidence)
+    for stage_key in ["nuisance", "effect"]:
+        stage_evidence = compact.get(stage_key)
+        if not isinstance(stage_evidence, dict):
+            continue
+        redacted_rows = []
+        for row in stage_evidence.get("attention", []) or []:
+            if not isinstance(row, dict):
+                continue
+            redacted = {
+                key: value
+                for key, value in row.items()
+                if key
+                not in {
+                    "evidence_snippet",
+                    "top_token_spans",
+                    "attended_token_summary",
+                }
+            }
+            redacted["text_redacted"] = True
+            redacted_rows.append(redacted)
+        stage_evidence["attention"] = redacted_rows
     return compact
 
 

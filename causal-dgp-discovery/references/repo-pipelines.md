@@ -2,9 +2,9 @@
 
 This repository already contains agentic discovery and causal-forest code. Prefer these paths before writing custom modeling loops.
 
-## Required First Pass: BoW-Guided Discovery
+## Required Integrated Text-Evidence Pass
 
-Use `model_type="multi_model_agentic_forest"` for the initial evidence pass. Configure multiple `bow_views` in one run rather than relying on one vectorizer setting.
+Use `model_type="multi_model_agentic_forest"` for the initial evidence pass. Configure multiple `bow_views` in one run rather than relying on one vectorizer setting, and keep embedding-contrast retrieval plus HTR attention/span evidence enabled unless a run has a documented opt-out reason.
 
 Relevant implementation:
 - `oci/inference/multi_model_agentic_forest.py`
@@ -14,8 +14,10 @@ Relevant implementation:
 Current multi-model stages:
 - Build shared honest folds, then fit every configured `bow_view` for treatment nuisance, outcome nuisance, and R-loss/pseudo-target evidence.
 - Use the default broad BoW grid when feasible: linear 1-1, 1-2, 1-3, and 2-4 n-gram TF-IDF views plus ExtraTrees and RandomForest views. Supported `bow_model` values are `linear`, `extratrees`, `random_forest`, and `xgboost`.
-- Add an ensemble R target from the cross-view nuisance predictions so the proposal agent can see a signal that is less tied to one vectorizer or learner.
-- Optionally add embedding-contrast evidence: treatment, outcome, per-view R-pseudo-target, ensemble R, within-arm outcome, treatment-outcome cell, orthogonal R-score, and concept-probe contrasts from real text chunks.
+- Add HTR nuisance treatment/outcome models and attention/span evidence. HTR nuisance predictions join the row-level ensemble treatment/outcome predictions used for R-loss and pseudo-target construction.
+- Add an ensemble R target from BoW plus HTR nuisance predictions so the proposal agent can see a signal that is less tied to one vectorizer, learner, or neural architecture.
+- Add embedding-contrast evidence: treatment, outcome, per-view R-pseudo-target, ensemble R, within-arm outcome, treatment-outcome cell, orthogonal R-score, and concept-probe contrasts from real text chunks.
+- Expose highly attended HTR tokens/spans from nuisance and R-stage/effect models to the proposal agent as evidence for confounders and effect modifiers.
 - Merge researcher-supplied `prespecified_features`, `prespecified_confounders`, `prespecified_effect_modifiers`, and `prespecified_features_json` into the same `ExplicitFeatureSpec` contract as agent-proposed features. Duplicate names are harmonized and role lists are merged.
 - Run inner-fold candidate consistency checks before extraction when enabled. Use these checks to stabilize proposed concepts, recover strong fold-local candidates, and reject unstable aliases without peeking at held-out reporting rows.
 - Canonicalize aliases, categorical categories, and `value_aliases` before extraction so the extractor produces one patient-level column per concept rather than multiple synonymous variables.
@@ -47,6 +49,10 @@ Optional learner sensitivity checks can vary `bow_model` among supported values 
 
 Key artifacts usually appear under `multi_model_agentic_forest/`:
 - `bow_view_oof_predictions.parquet`
+- `htr_nuisance_oof_predictions.parquet`
+- `htr_effect_oof_predictions.parquet`
+- `htr_attention_evidence.parquet`
+- `text_model_oof_predictions.parquet`
 - `bow_view_feature_importance_by_fold.jsonl`
 - `embedding_contrast_evidence_by_fold.jsonl`
 - `agent_candidate_proposals.jsonl`
@@ -54,7 +60,7 @@ Key artifacts usually appear under `multi_model_agentic_forest/`:
 - `selected_feature_sets.json`
 - `outer_cv_metrics.csv`
 
-Use BoW and embedding outputs to propose concepts, not as final variables. BoW is mandatory for the first lexical recurrence pass, but it is insufficient by itself for final feature extraction in long longitudinal notes. Prefer concepts that recur across folds and across views, while preserving view-specific discoveries when the evidence is strong.
+Use BoW, embedding, and HTR outputs to propose concepts, not as final variables. BoW is mandatory for the broad lexical recurrence pass, embedding contrast is mandatory retrieval evidence for real text chunks and contrastive concept probes, and HTR is mandatory neural attention/span evidence for localization and row-level nuisance stabilization. Prefer concepts that recur across folds and across evidence sources, while preserving source-specific discoveries when the evidence is strong.
 
 ## LLM-Based Explicit Feature Extraction
 
@@ -98,20 +104,20 @@ Use `model_type="multi_model_agentic_forest"`, `agentic_explicit_feature_forest`
 
 ## Post-Extraction Feature Review
 
-Do not treat a successfully extracted feature table as proof that the variables are useful confounders or effect modifiers. After extraction, run relatively simple fold-honest diagnostics on the extracted variables and compare them with the upstream BoW and embedding evidence that motivated the variables.
+Do not treat a successfully extracted feature table as proof that the variables are useful confounders or effect modifiers. After extraction, run relatively simple fold-honest diagnostics on the extracted variables and compare them with the upstream BoW, embedding, and HTR evidence that motivated the variables.
 
 The repo-native `multi_model_agentic_forest` path performs this review when `extracted_feature_review_enabled=true`:
 - Fit extracted-feature treatment nuisance and outcome nuisance models on training folds and score only held-out rows.
 - Fit extracted-feature R-loss, logistic R-loss, pseudo-target, or interaction-style effect-modifier diagnostics using out-of-fold nuisance quantities.
-- Compare extracted-feature treatment/outcome AUROC or losses against BoW/embedding benchmarks. The default gate allows a small AUROC gap (`extracted_feature_review_auc_margin=0.02`) and a small relative loss gap (`extracted_feature_review_loss_relative_margin=0.05`) before treating the extraction as underperforming; `extracted_feature_review_min_benchmark_auc=0.55` prevents weak benchmarks from forcing revisions.
+- Compare extracted-feature treatment/outcome AUROC or losses against BoW, embedding, and HTR benchmarks. The default gate allows a small AUROC gap (`extracted_feature_review_auc_margin=0.02`) and a small relative loss gap (`extracted_feature_review_loss_relative_margin=0.05`) before treating the extraction as underperforming; `extracted_feature_review_min_benchmark_auc=0.55` prevents weak benchmarks from forcing revisions.
 - Send failed gates, missingness, weak role evidence, alias/category problems, and upstream evidence back to the agent. The agent may drop variables, re-role them, merge aliases, improve categorical `value_aliases`, add narrow evidence-supported concepts, or request targeted re-extraction.
 - Cap revisions with `extracted_feature_review_max_rounds`. If the cap is reached, document the remaining benchmark gaps and whether the final forest is exploratory or blocked.
 
-For a custom coding-agent orchestrator, mirror the same discipline: all diagnostics used to accept, reject, or revise features must be computed inside training folds or out-of-fold for the scored rows. Never compare extracted features to BoW or embedding models using in-sample predictions.
+For a custom coding-agent orchestrator, mirror the same discipline: all diagnostics used to accept, reject, or revise features must be computed inside training folds or out-of-fold for the scored rows. Never compare extracted features to BoW, embedding, or HTR models using in-sample predictions.
 
-## Required Second Pass: Attention/HTR Evidence Path
+## Integrated Attention/HTR Evidence Path
 
-Use `model_type="agentic_attention_variable_forest"` after the BoW pass. This is a standard part of the discovery workflow, not only a fallback. It is especially important when:
+`multi_model_agentic_forest` now incorporates HTR nuisance/effect training and attention/span evidence directly. Use `model_type="agentic_attention_variable_forest"` as a deeper standalone or sensitivity pass when additional neural objectives, consensus passes, or residual contrastive attention are needed. HTR is especially important when:
 - BoW terms are mostly template artifacts.
 - Long notes require localization to baseline/index-time spans.
 - Candidate values must be extracted from repeated longitudinal mentions.

@@ -594,7 +594,8 @@ class AgenticFeatureSearchConfig:
 class EmbeddingContrastDiscoveryConfig:
     """Configuration for embedding-contrast evidence in multi-model agentic search."""
 
-    enabled: bool = False
+    enabled: bool = True
+    disable_reason: Optional[str] = None
     model_name: str = "Qwen/Qwen3-Embedding-8B"
     cache_dir: Optional[str] = None
     device: Optional[str] = None
@@ -618,6 +619,11 @@ class EmbeddingContrastDiscoveryConfig:
     concept_probe_top_k: int = 20
 
     def __post_init__(self):
+        if not bool(self.enabled) and not str(self.disable_reason or "").strip():
+            raise ValueError(
+                "embedding_contrast.enabled=False requires disable_reason because "
+                "embedding contrast is a required multi-model evidence source"
+            )
         if self.batch_size < 1:
             raise ValueError("embedding_contrast.batch_size must be >= 1")
         if self.chunk_size_words < 1:
@@ -756,8 +762,9 @@ def default_multi_model_bow_views() -> List[BoWViewConfig]:
 class MultiModelAgenticForestConfig:
     """Configuration for BoW-guided agentic variable discovery.
 
-    This pathway uses multiple cross-fitted sparse text-model views plus
-    optional embedding-contrast retrieval to produce agent-facing evidence.
+    This pathway uses multiple cross-fitted sparse text-model views,
+    embedding-contrast retrieval, and HTR attention/span evidence to produce
+    agent-facing evidence.
     The proposal agent still defines explicit patient-level variables for
     downstream extraction and CausalForestDML fitting.
     """
@@ -795,11 +802,21 @@ class MultiModelAgenticForestConfig:
     embedding_contrast: EmbeddingContrastDiscoveryConfig = field(
         default_factory=EmbeddingContrastDiscoveryConfig
     )
+    htr_evidence_enabled: bool = True
+    htr_evidence_disable_reason: Optional[str] = None
 
     def __post_init__(self):
         if isinstance(self.embedding_contrast, dict):
             self.embedding_contrast = EmbeddingContrastDiscoveryConfig(
                 **self.embedding_contrast
+            )
+        if not bool(self.htr_evidence_enabled) and not str(
+            self.htr_evidence_disable_reason or ""
+        ).strip():
+            raise ValueError(
+                "multi_model_agentic_forest.htr_evidence_enabled=False requires "
+                "htr_evidence_disable_reason because HTR attention/span evidence is "
+                "a required multi-model evidence source"
             )
         if self.bow_views:
             self.bow_views = [
@@ -1750,6 +1767,23 @@ class ExperimentConfig:
                         "agentic_attention_variable_forest.fold_parallelism must "
                         "be 'auto' or a positive integer"
                     ) from exc
+        if self.applied_inference.architecture.model_type == "multi_model_agentic_forest":
+            mm_config = self.applied_inference.architecture.multi_model_agentic_forest
+            embedding_config = mm_config.embedding_contrast
+            if not bool(getattr(embedding_config, "enabled", False)) and not str(
+                getattr(embedding_config, "disable_reason", "") or ""
+            ).strip():
+                raise ValueError(
+                    "multi_model_agentic_forest requires embedding contrast evidence; "
+                    "set embedding_contrast.disable_reason when intentionally disabling it"
+                )
+            if not bool(getattr(mm_config, "htr_evidence_enabled", True)) and not str(
+                getattr(mm_config, "htr_evidence_disable_reason", "") or ""
+            ).strip():
+                raise ValueError(
+                    "multi_model_agentic_forest requires HTR attention/span evidence; "
+                    "set htr_evidence_disable_reason when intentionally disabling it"
+                )
         if self.applied_inference.architecture.model_type == "causal_forest":
             cf_config = self.applied_inference.architecture.causal_forest
             if str(cf_config.rlearner_inner_fold_parallelism).strip().lower() != "auto":

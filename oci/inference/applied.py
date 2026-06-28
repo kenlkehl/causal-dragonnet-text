@@ -220,6 +220,7 @@ def run_applied_inference(
             config=config,
             output_path=output_path,
             device=device,
+            gpu_ids=gpu_ids,
             num_workers=num_workers,
         )
         return

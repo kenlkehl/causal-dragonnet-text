@@ -84,7 +84,7 @@ class MultiModelAgenticOracleConfig:
     bow_parallel_backend: str = "processes"
     fold_parallelism: str = "auto"
 
-    embedding_contrast_enabled: bool = False
+    embedding_contrast_enabled: bool = True
     embedding_model_name: str = "Qwen/Qwen3-Embedding-8B"
     embedding_cache_dir: Optional[str] = None
     embedding_device: Optional[str] = None
@@ -217,6 +217,11 @@ def _make_applied_config(
                 fold_parallelism=config.fold_parallelism,
                 embedding_contrast=EmbeddingContrastDiscoveryConfig(
                     enabled=config.embedding_contrast_enabled,
+                    disable_reason=(
+                        None
+                        if config.embedding_contrast_enabled
+                        else "disabled by oracle multi-model script CLI"
+                    ),
                     model_name=config.embedding_model_name,
                     cache_dir=config.embedding_cache_dir,
                     device=config.embedding_device,
@@ -553,7 +558,7 @@ def main() -> None:
         "--extracted-feature-review-auc-margin",
         type=float,
         default=0.02,
-        help="Allowed AUC gap below BoW/embedding benchmarks before review fails.",
+        help="Allowed AUC gap below BoW/embedding/HTR benchmarks before review fails.",
     )
     parser.add_argument(
         "--extracted-feature-review-loss-relative-margin",
@@ -570,9 +575,17 @@ def main() -> None:
 
     parser.add_argument(
         "--enable-embedding-contrast",
+        dest="enable_embedding_contrast",
         action="store_true",
-        help="Add patient-level embedding contrast retrieval evidence for the proposal agent.",
+        help="Keep patient-level embedding contrast retrieval evidence enabled.",
     )
+    parser.add_argument(
+        "--disable-embedding-contrast",
+        dest="enable_embedding_contrast",
+        action="store_false",
+        help="Disable required embedding contrast retrieval evidence for this run.",
+    )
+    parser.set_defaults(enable_embedding_contrast=True)
     parser.add_argument("--embedding-model-name", default="Qwen/Qwen3-Embedding-8B")
     parser.add_argument(
         "--embedding-cache-dir",

@@ -7,6 +7,7 @@ Write outputs into the task dataset folder unless the user requests another loca
 Maintain this throughout the run. Include:
 - dataset schema and basic rates
 - text-model evidence, BoW vectorization-suite settings, and fold recurrence
+- embedding-contrast retrieval evidence and HTR attention/span evidence, including any disable reasons
 - candidate concepts and why each was proposed
 - extraction rules and missingness
 - post-extraction extracted-feature diagnostics and benchmark-review decisions
@@ -23,13 +24,13 @@ Maintain this throughout the run. Include:
 Store fold-specific evidence:
 - fold id
 - vectorization run label and vectorizer params when source is BoW/TF-IDF
-- evidence source (`bow`, `attention`, `residual`, `pseudo_outcome`, `r_loss`)
+- evidence source (`bow`, `embedding_contrast`, `htr_attention`, `residual`, `pseudo_outcome`, `r_loss`)
 - term or span
 - direction and score
 - mapped candidate concept if any
 - whether it recurred across folds
 - whether it recurred across vectorization strategies
-- embedding-contrast or ensemble-R provenance when relevant
+- embedding-contrast, HTR nuisance/effect, or ensemble-R provenance when relevant
 
 ## `candidate_features.parquet` or `.csv`
 
@@ -58,7 +59,7 @@ Store each candidate-list review iteration:
 - feature-feature correlations, categorical contingency summaries, and missingness overlap
 - variables merged, rejected, re-roled, or retained, with rationale
 - parsimony decision and impact on honest nuisance, R-loss/pseudo-outcome, heterogeneity, or ITE-stability metrics
-- upstream BoW/embedding benchmark gaps and whether the candidate list requires revision or re-extraction
+- upstream BoW/embedding/HTR benchmark gaps and whether the candidate list requires revision or re-extraction
 
 ## `extracted_feature_diagnostics_by_fold.jsonl`
 
@@ -67,7 +68,7 @@ Store the post-extraction feature-review records that decide whether extracted v
 - extracted feature specs, roles, categories, aliases, and missingness summaries
 - extracted-feature treatment nuisance metrics, outcome nuisance metrics, and overlap warnings
 - extracted-feature R-loss, logistic R-loss, pseudo-target, interaction, or treatment-stratified effect-modifier diagnostics
-- upstream BoW/TF-IDF and embedding-contrast benchmark metrics used for comparison
+- upstream BoW/TF-IDF, embedding-contrast, and HTR benchmark metrics used for comparison
 - gate thresholds, pass/fail status, and margin by role/objective
 - agent revision decision: retained, dropped, re-roled, merged, alias-harmonized, value-harmonized, newly added, or targeted for re-extraction
 - stop reason when review rounds are capped or no evidence-supported revision remains
@@ -85,6 +86,7 @@ Store honest fold predictions:
 - outcome residual
 - pseudo-outcome or R-loss target
 - model family and iteration
+- nuisance/effect source such as BoW view, HTR nuisance/effect, or ensemble nuisance
 - any fold-specific ITE estimate
 
 No row in this file should contain a prediction from a model trained on that same row.
@@ -110,7 +112,8 @@ Store iteration/model diagnostics:
 - treatment nuisance AUROC/Brier/log loss
 - outcome nuisance AUROC/Brier/log loss or RMSE
 - R-loss, logistic R-loss, or pseudo-outcome MSE
-- extracted-feature nuisance and R/pseudo-target metrics versus BoW/embedding benchmarks
+- extracted-feature nuisance and R/pseudo-target metrics versus BoW/embedding/HTR benchmarks
+- HTR nuisance/effect metrics and attention/span evidence coverage when available
 - extracted-feature review pass/fail status and review-round count
 - fold recurrence of candidate concepts
 - parsimony/redundancy review summary

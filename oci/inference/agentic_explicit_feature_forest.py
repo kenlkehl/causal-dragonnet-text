@@ -2296,7 +2296,7 @@ def build_multi_model_agentic_forest_prompt(
     context: Dict[str, Any],
     search_config: AgenticFeatureSearchConfig,
 ) -> str:
-    """Construct the proposal prompt for sparse BoW and embedding evidence review."""
+    """Construct the proposal prompt for BoW, embedding, and HTR evidence review."""
     context_json = json.dumps(
         context,
         separators=(",", ":"),
@@ -2308,7 +2308,7 @@ def build_multi_model_agentic_forest_prompt(
             max(1, int(getattr(search_config, "max_additions_per_iter", 6))),
         )
     )
-    return f"""You are helping convert multi-view sparse bag-of-words and embedding-retrieval evidence into explicit variables for causal inference.
+    return f"""You are helping convert multi-view sparse bag-of-words, embedding-retrieval, and HTR attention/span evidence into explicit variables for causal inference.
 
 The upstream models are multi-model:
 - each configured bag-of-words view has its own vectorizer/model settings;
@@ -2317,8 +2317,11 @@ The upstream models are multi-model:
 - each view fits a bag-of-words regression model for that pseudo-target;
 - feature_importance.views contains the per-view outputs, and
   feature_importance.phrase_consensus summarizes repeated phrase evidence.
-- optional embedding contrasts rank real text chunks and concept phrases by
-  alignment with treatment, outcome, and per-view R-pseudo-target directions.
+- embedding contrasts rank real text chunks and concept phrases by alignment
+  with treatment, outcome, and per-view or ensemble R-pseudo-target directions.
+- HTR evidence, when present, contributes nuisance predictions to the ensemble
+  R signal and highlights attended tokens/spans for treatment, outcome, and
+  effect-modifier hypotheses.
 
 Your task is to propose at most {max_proposals} extractable pre-treatment patient-level variables for a downstream causal forest.
 
@@ -2431,7 +2434,7 @@ def build_multi_model_agentic_extracted_feature_review_prompt(
 
 The outer test fold is not included here. All diagnostics come from cross-fitted models on the current outer-training fold only.
 
-The selected variables have already been extracted from clinical text. Simple nuisance and R/pseudo-target models were trained on those extracted values and compared with the original multi-view BoW and embedding-contrast evidence. Your task is to revise the explicit feature set when the extracted variables do not preserve the confounder or effect-modifier signal seen upstream.
+The selected variables have already been extracted from clinical text. Simple nuisance and R/pseudo-target models were trained on those extracted values and compared with the original multi-view BoW, embedding-contrast, and HTR evidence. Your task is to revise the explicit feature set when the extracted variables do not preserve the confounder or effect-modifier signal seen upstream.
 
 Return JSON only with this shape:
 {{
@@ -2454,7 +2457,7 @@ Rules:
 - Use update_role when a feature was extracted correctly but assigned to the wrong causal role.
 - Use remove when an agent-added feature is too sparse, constant, redundant, post-treatment, or unsupported by diagnostics.
 - Do not remove required_features; propose role updates for them only when diagnostics justify it.
-- Add a replacement only when the BoW/embedding evidence points to a clearer extractable pre-treatment patient-level variable.
+- Add a replacement only when the BoW/embedding/HTR evidence points to a clearer extractable pre-treatment patient-level variable.
 - For categorical variables, provide 2-8 mutually exclusive categories.
 - Do not use treatment choice, post-treatment response, toxicity after treatment, survival, or outcome-derived variables.
 - Use "none" if the current extracted feature set is the best defensible set despite the diagnostic gap.

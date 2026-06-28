@@ -94,7 +94,7 @@ Handles documents up to 50K+ tokens with the pretrained tokenizer. No `fit_token
 | `tfidf_forest` | TF-IDF features + CausalForestDML (no neural network, no GPU) | tau with 95% confidence intervals |
 | `explicit_feature_forest` | Role-tagged explicit features + CausalForestDML (no text model) | tau with 95% confidence intervals |
 | `agentic_explicit_feature_forest` | Nested-CV LLM variable search + explicit-feature CausalForestDML | outer-CV tau, nuisance AUROC, R-loss |
-| `multi_model_agentic_forest` | Multi-view BoW/embedding evidence + LLM extraction + explicit-feature CausalForestDML | outer-CV tau, per-view BoW diagnostics, selected variables |
+| `multi_model_agentic_forest` | Multi-view BoW + embedding contrast + HTR attention/span evidence + LLM extraction + explicit-feature CausalForestDML | outer-CV tau, per-view text diagnostics, selected variables |
 
 **Recommended: Causal Forest** -- trains neural features with propensity + outcome losses (optionally with R-learner loss), then fits CausalForestDML on the learned representations for doubly-robust estimation with confidence intervals.
 
@@ -328,13 +328,16 @@ training fold, it fits several configured TF-IDF/BoW views with different
 learner and n-gram settings. Each view cross-fits treatment and outcome nuisance
 models, computes its own R-learner pseudo-target, fits a sparse pseudo-target
 model, and sends the per-view outputs plus a cross-view phrase consensus summary
-to the proposal agent. The agent proposes explicit confounders and effect
+to the proposal agent. The same path also adds embedding-contrast retrieval and
+HTR nuisance/effect models: HTR nuisance predictions join the ensemble nuisance
+signal used for R-loss/pseudo-target construction, and attended tokens/spans are
+shown to the proposal agent. The agent proposes explicit confounders and effect
 modifiers, optional inner-fold consistency checks stabilize the candidate set,
 the extractor materializes selected variables from text, and a post-extraction
 review step trains simple fold-honest nuisance and R-pseudo-target models on the
-extracted variables. If those extracted-variable models underperform the BoW or
-embedding evidence, the agent receives the diagnostics and can revise roles,
-replace weak variables, and trigger re-extraction before the final
+extracted variables. If those extracted-variable models underperform the BoW,
+embedding, or HTR evidence, the agent receives the diagnostics and can revise
+roles, replace weak variables, and trigger re-extraction before the final
 explicit-feature CausalForestDML is fit.
 
 You can seed this path with known variables using
@@ -354,19 +357,20 @@ agent context includes `feature_importance.views` for every view and
 `feature_importance.phrase_consensus` for repeated 2-4 token n-gram signals.
 Final artifacts are written under `multi_model_agentic_forest/`, including
 `bow_view_oof_predictions.parquet`,
+`htr_nuisance_oof_predictions.parquet`, `htr_effect_oof_predictions.parquet`,
+`htr_attention_evidence.parquet`, `text_model_oof_predictions.parquet`,
 `bow_view_feature_importance_by_fold.jsonl`,
 `embedding_contrast_evidence_by_fold.jsonl`, `agent_candidate_proposals.jsonl`,
 `extracted_feature_diagnostics_by_fold.jsonl`, `selected_feature_sets.json`, and
 `outer_cv_metrics.csv`.
 
-This path can also add embedding-contrast retrieval evidence. Set
-`architecture.multi_model_agentic_forest.embedding_contrast.enabled=true` to
-pool document chunks into patient-level embeddings, build train-fold treatment,
-outcome, per-view R-pseudo-target, within-arm outcome, 2x2 treatment-outcome
-interaction, and orthogonal R-score contrast directions, and retrieve real text
-chunks and concept phrases aligned with those directions. The proposal agent
-sees the retrieved chunks as hypothesis-generation evidence; saved artifacts
-redact raw retrieved chunk text by default unless
+This path includes embedding-contrast retrieval evidence by default. It pools
+document chunks into patient-level embeddings, builds train-fold treatment,
+outcome, per-view and ensemble R-pseudo-target, within-arm outcome, 2x2
+treatment-outcome interaction, and orthogonal R-score contrast directions, and
+retrieves real text chunks and concept phrases aligned with those directions.
+The proposal agent sees the retrieved chunks as hypothesis-generation evidence;
+saved artifacts redact raw retrieved chunk text by default unless
 `architecture.agentic_feature_search.save_agent_context=true`.
 Contrast directions use weighted patient-level mean differences, for example
 mean treated embedding minus mean untreated embedding. Linear-probe AUC is
@@ -624,8 +628,9 @@ python oracle_experiment_scripts/run_oracle_multi_model_agentic_forest.py \
   --extraction-reasoning-parser qwen3
 ```
 
-Add `--enable-embedding-contrast --embedding-model-name Qwen/Qwen3-Embedding-8B`
-to include the embedding-delta retrieval evidence in the same oracle run.
+Embedding-delta retrieval evidence is enabled by default in the oracle run. Use
+`--embedding-model-name Qwen/Qwen3-Embedding-8B` to choose the embedding model,
+or `--disable-embedding-contrast` only for a documented lightweight run.
 Use `--embedding-disable-cell-contrasts` or
 `--embedding-disable-orthogonal-r-score-contrasts` to fall back to the smaller
 contrast set.

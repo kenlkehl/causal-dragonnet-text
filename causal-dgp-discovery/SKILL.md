@@ -1,6 +1,6 @@
 ---
 name: causal-dgp-discovery
-description: Use when Codex needs to reverse engineer a synthetic clinical causal inference dataset from patient-level clinical text, treatment, and outcome columns; discover confounders and effect modifiers from empirical BoW/HTR/attention evidence rather than upfront variable lists; orchestrate the repo-native multi_model_agentic_forest path or an equivalent coding-agent workflow; avoid assuming clinical realism or a linear DGP; run honest cross-fitted nuisance, R-loss, pseudo-outcome, extracted-feature review, and causal-forest analyses; estimate patient-level ITEs; and write a reproducible report.
+description: Use when Codex needs to reverse engineer a synthetic clinical causal inference dataset from patient-level clinical text, treatment, and outcome columns; discover confounders and effect modifiers from empirical BoW, embedding-contrast, HTR, attention, and span evidence rather than upfront variable lists; orchestrate the repo-native multi_model_agentic_forest path or an equivalent coding-agent workflow; avoid assuming clinical realism or a linear DGP; run honest cross-fitted nuisance, R-loss, pseudo-outcome, extracted-feature review, and causal-forest analyses; estimate patient-level ITEs; and write a reproducible report.
 ---
 
 # Causal DGP Discovery
@@ -11,9 +11,9 @@ Use this skill to investigate a synthetic patient-level causal inference dataset
 
 - Treat the true DGP, metadata, generation config, oracle columns, and parent-folder benchmark files as off-limits unless the user explicitly asks for evaluation against them.
 - Start with empirical text-model evidence. Do not begin with a broad hand-built clinical feature list.
-- Run both BoW/TF-IDF evidence and HTR/attention/span evidence before finalizing candidate features. Treat BoW as broad lexical discovery and HTR/attention as the span-localization step needed to recover baseline/index-time values inside longitudinal notes.
+- Run BoW/TF-IDF evidence, embedding-contrast retrieval, and HTR/attention/span evidence before finalizing candidate features. Treat BoW as broad lexical discovery, embedding contrast as real-text chunk/concept retrieval for treatment/outcome/R-score contrasts, and HTR/attention as the span-localization step needed to recover baseline/index-time values inside longitudinal notes.
 - For BoW discovery, train a small suite of vectorization strategies instead of relying on one n-gram setup. Compare fold recurrence across unigram-focused, default broad, phrase-focused, and rare-signal-friendly variants when feasible.
-- In this repository, prefer `model_type="multi_model_agentic_forest"` as the default sparse-discovery orchestrator: multi-view BoW nuisance/effect evidence, optional embedding-contrast evidence, candidate consistency checks, explicit feature extraction, extracted-feature review, and final explicit-feature causal forest.
+- In this repository, prefer `model_type="multi_model_agentic_forest"` as the default discovery orchestrator: multi-view BoW nuisance/effect evidence, embedding-contrast retrieval, HTR nuisance/effect modeling with attention/span evidence, candidate consistency checks, explicit feature extraction, extracted-feature review, and final explicit-feature causal forest.
 - Before running HTR/attention models, inspect the local GPU environment and current GPU load, then choose an explicit parallelization plan for folds, objectives, chunks, and devices. Record the hardware inventory and plan in `report.txt`.
 - If shell-level GPU tools work but Python/PyTorch reports no CUDA, treat it as a likely agent sandbox or environment mismatch. Verify the intended interpreter/venv and rerun the CUDA probe, smoke test, and neural HTR job with escalated permissions before falling back to CPU.
 - Use fold-aware univariable screens as supporting diagnostics for candidate discovery: feature-treatment association, feature-outcome association for nuisance modeling, and treatment-by-feature/effect-modification association. Emphasize effect magnitude, direction, stability, and missingness at least as much as p values. Do not promote variables from univariable screens alone.
@@ -24,7 +24,7 @@ Use this skill to investigate a synthetic patient-level causal inference dataset
 - For endpoint-backed extraction, use very long context by default when the model and hardware support it. Aim for roughly a 200,000-token extraction context budget so the extractor can see as much patient history as possible; set vLLM `--max-model-len` near `200000`, set the extractor's max input/text tokens to a similarly large value, and set `max_tokens`/`max_new_tokens` high enough for reasoning-model overhead and complete structured JSON output rather than a few hundred tokens. If a shorter context or output cap is required, document the exact limit and why.
 - Do not treat "no LLM extraction backend" as a reason to skip candidate extraction, emit an all-missing `candidate_features` table, or proceed to final causal-forest/ITE claims. In that situation, the coding agent must perform the document-reading extraction itself, preferably with subagents; if the extraction is genuinely infeasible even after sharding, stop and report the blocker instead of finalizing downstream causal results that depend on extracted features.
 - Keep all model assessment honest: every nuisance prediction, residual, pseudo-outcome, effect estimate, and ITE used for selection or reporting must be out-of-fold for that row.
-- Do not assume extracted concepts remain valid confounders or effect modifiers after materialization. Before final causal-forest fitting, train relatively simple fold-honest nuisance and R-loss/pseudo-target/effect-modifier diagnostics on the extracted features, compare them with upstream BoW and embedding-contrast benchmarks, and make the agent reconsider variables, aliases, roles, and extraction when extracted-feature models materially underperform.
+- Do not assume extracted concepts remain valid confounders or effect modifiers after materialization. Before final causal-forest fitting, train relatively simple fold-honest nuisance and R-loss/pseudo-target/effect-modifier diagnostics on the extracted features, compare them with upstream BoW, embedding-contrast, and HTR benchmarks, and make the agent reconsider variables, aliases, roles, and extraction when extracted-feature models materially underperform.
 - Separate confounder discovery from effect-modifier discovery.
 - Seek parsimonious final feature lists. Before passing variables to the causal forest, inspect feature-feature correlations, missingness overlap, treatment/outcome associations, plausible transformations among confounders, and redundant proxy variables; prefer the smallest evidence-supported set that preserves nuisance, heterogeneity, and ITE stability.
 - After settling on final confounders and effect modifiers, fit a real honest causal forest as the final ITE estimator. R-learners, S/T/X-learners, generic `RandomForestRegressor`/ExtraTrees/XGBoost effect models, or other meta-learners may be used as diagnostics or sensitivity checks, but they do not satisfy the final causal-forest requirement. If no causal-forest implementation is available, use the repo-native explicit-feature forest path or an installed causal-forest library such as `econml`'s `CausalForestDML`; if neither can be made to run, stop and report the blocker rather than emitting complete final ITE artifacts.
@@ -37,16 +37,18 @@ Use this skill to investigate a synthetic patient-level causal inference dataset
 ## Workflow
 
 1. Inspect the dataset schema, row count, note length, missingness, treatment/outcome rates, and note chronology. Write these facts to `report.txt`.
-2. Run honest cross-fitted text-model discovery before structured extraction:
-   - Fit a suite of BoW/TF-IDF treatment and outcome nuisance models with distinct vectorization settings. When feasible, include unigram-focused, default `1-3` n-gram, phrase-focused `2-4` n-gram, and lower-`min_df`/higher-`max_features` variants for rare but stable signals.
-   - Fit residual, R-loss, or pseudo-outcome models from out-of-fold nuisance predictions.
-   - Collect fold-specific high-signal terms and phrases for treatment, outcome, confounder overlap, residuals, and pseudo-outcomes by vectorization run, then compare consensus and disagreement across runs.
-3. Run HTR/attention evidence modeling as a standard second pass, not only as a fallback:
+	2. Run honest cross-fitted text-model discovery before structured extraction:
+	   - Fit a suite of BoW/TF-IDF treatment and outcome nuisance models with distinct vectorization settings. When feasible, include unigram-focused, default `1-3` n-gram, phrase-focused `2-4` n-gram, and lower-`min_df`/higher-`max_features` variants for rare but stable signals.
+	   - Fit residual, R-loss, or pseudo-outcome models from out-of-fold nuisance predictions.
+	   - Run embedding-contrast retrieval on training-fold text chunks, including treatment, outcome, per-view R-pseudo-target, ensemble R, within-arm outcome, cell, orthogonal R-score, and concept-probe contrasts when feasible.
+	   - Collect fold-specific high-signal terms and phrases for treatment, outcome, confounder overlap, residuals, and pseudo-outcomes by vectorization run, then compare consensus and disagreement across runs.
+	3. Run HTR/attention evidence modeling as an integrated feature-finding component, not only as a fallback:
    - Inspect available GPUs, memory, CUDA visibility, framework CUDA support, and active GPU processes before launching neural jobs.
    - Record `which python`, `sys.executable`, `sys.prefix`, `VIRTUAL_ENV`, `CUDA_VISIBLE_DEVICES`, `LD_LIBRARY_PATH`, `nvidia-smi`, `torch.__file__`, `torch.__version__`, `torch.cuda.is_available()`, device count, and device names.
    - If the intended Python environment is a user-active venv and sandboxed PyTorch cannot see CUDA while shell `nvidia-smi` can, rerun the same probe with `sandbox_permissions="require_escalated"` and document both results. Run neural HTR under the escalated context if CUDA becomes available.
    - Decide whether to parallelize by CV fold, effect objective, signal type, chunk shard, or dataset shard; avoid oversubscribing GPU memory.
-   - Localize fold-specific high-signal spans for treatment, outcome nuisance, residuals, R-loss, and pseudo-outcome objectives.
+	   - Localize fold-specific high-signal spans for treatment, outcome nuisance, residuals, R-loss, and pseudo-outcome objectives.
+	   - In the repo-native multi-model path, include HTR nuisance predictions in the row-level ensemble treatment/outcome nuisance predictions used for R-loss and pseudo-target construction, while keeping the BoW and embedding-contrast evidence active.
    - Use HTR spans to distinguish baseline/index-time facts from post-treatment outcomes, repeated history, and report-template artifacts.
    - Prefer concepts whose aliases recur in both BoW and HTR evidence, while allowing HTR-only numeric or temporal slots when BoW cannot represent them.
 4. Translate recurring text/span signals into a small first candidate set of extractable baseline concepts.
@@ -62,7 +64,7 @@ Use this skill to investigate a synthetic patient-level causal inference dataset
    - Record extraction backend, model/endpoint if used, prompt/version, missingness, and extraction rationale.
 6. Run a post-extraction feature review before accepting candidates for the final forest:
    - Train simple extracted-feature treatment nuisance, outcome nuisance, and R-loss/pseudo-target or effect-modifier diagnostics inside the same honest fold structure.
-   - Compare extracted-feature performance with the upstream BoW/TF-IDF and embedding-contrast benchmarks. Use margins, fold recurrence, missingness, and role-specific failures rather than a single score.
+	   - Compare extracted-feature performance with the upstream BoW/TF-IDF, embedding-contrast, and HTR benchmarks. Use margins, fold recurrence, missingness, and role-specific failures rather than a single score.
    - If extracted features underperform, ask the agent to revise candidate specs, merge aliases, fix category/value harmonization, re-role variables, add narrow evidence-supported concepts, and re-extract only what changed.
    - Record the review rounds, diagnostics, revision rationale, and any stop reason.
 7. Run fold-aware univariable screens on extracted candidates:

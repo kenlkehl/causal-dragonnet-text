@@ -73,6 +73,23 @@ def _two_linear_test_bow_views() -> list[BoWViewConfig]:
     ]
 
 
+def _disable_htr_test_kwargs() -> dict:
+    return {
+        "htr_evidence_enabled": False,
+        "htr_evidence_disable_reason": "unit test without HTR training",
+    }
+
+
+def _disable_required_evidence_test_kwargs() -> dict:
+    return {
+        "embedding_contrast": EmbeddingContrastDiscoveryConfig(
+            enabled=False,
+            disable_reason="unit test without embedding contrast",
+        ),
+        **_disable_htr_test_kwargs(),
+    }
+
+
 class FakeProposalAgent:
     def __init__(self):
         self.contexts = []
@@ -259,6 +276,86 @@ class FakeEvaluator:
         return SplitEvaluation(predictions=predictions, metrics=metrics)
 
 
+class FakeHTREvidenceProvider:
+    def __init__(self):
+        self.seen_effect_nuisance_predictions = []
+
+    def fit_nuisance(self, discovery_df, outer_fold):
+        y = discovery_df["outcome_indicator"].to_numpy(dtype=float)
+        t = discovery_df["treatment_indicator"].to_numpy(dtype=float)
+        e_hat = np.clip(0.25 + 0.45 * t, 0.05, 0.95)
+        m_hat = np.clip(0.20 + 0.50 * y, 0.05, 0.95)
+        y_resid = y - m_hat
+        t_resid = t - e_hat
+        predictions = pd.DataFrame(
+            {
+                "_oci_row_id": discovery_df["_oci_row_id"].to_numpy(),
+                "outer_fold": int(outer_fold),
+                "e_hat": e_hat,
+                "m_hat": m_hat,
+                "y_residual": y_resid,
+                "t_residual": t_resid,
+                "r_pseudo_outcome": y_resid / np.where(np.abs(t_resid) < 1e-6, 1e-6, t_resid),
+                "r_loss_at_zero_tau": y_resid**2,
+                "nuisance_fold": 1,
+            }
+        )
+        return {
+            "predictions": predictions,
+            "attention": self._attention_rows(discovery_df, outer_fold, "nuisance", e_hat=e_hat, m_hat=m_hat),
+        }
+
+    def fit_effect(self, discovery_df, nuisance_predictions, outer_fold):
+        self.seen_effect_nuisance_predictions.append(nuisance_predictions.copy())
+        predictions = nuisance_predictions.copy()
+        tau_hat = np.linspace(0.10, 0.35, len(predictions))
+        y_resid = predictions["y_residual"].to_numpy(dtype=float)
+        t_resid = predictions["t_residual"].to_numpy(dtype=float)
+        predictions["tau_hat_r_stage"] = tau_hat
+        predictions["tau_logit_modifier"] = np.nan
+        predictions["r_loss"] = (y_resid - tau_hat * t_resid) ** 2
+        predictions["effect_loss"] = predictions["r_loss"]
+        predictions["effect_loss_at_zero_tau"] = y_resid**2
+        predictions["effect_fold"] = 1
+        predictions["effect_objective"] = "squared_r_loss"
+        predictions["r_stage_train_eligible"] = True
+        return {
+            "predictions": predictions,
+            "attention": self._attention_rows(discovery_df, outer_fold, "effect_modifier", tau_hat_r_stage=tau_hat),
+        }
+
+    def _attention_rows(self, discovery_df, outer_fold, stage, **extra):
+        rows = []
+        for offset, row in discovery_df.head(4).reset_index(drop=True).iterrows():
+            text = str(row["clinical_text"])
+            token = text.split()[0] if text.split() else "note"
+            start = max(0, text.find(token))
+            evidence = {
+                "row_id": int(row["_oci_row_id"]),
+                "outer_fold": int(outer_fold),
+                "fold": 1,
+                "stage": stage,
+                "chunk_index": 0,
+                "chunk_text": text,
+                "attended_token_summary": token,
+                "top_token_spans_json": json.dumps(
+                    [
+                        {
+                            "text": token,
+                            "focus_token": token,
+                            "char_start": start,
+                            "char_end": start + len(token),
+                            "salience": 0.9,
+                        }
+                    ]
+                ),
+            }
+            for key, values in extra.items():
+                evidence[key] = values[offset]
+            rows.append(evidence)
+        return rows
+
+
 class EmptyProposalAgent:
     def __init__(self):
         self.contexts = []
@@ -363,7 +460,8 @@ def _embedding_contrast_cache_test_config(tmp_path: Path) -> AppliedInferenceCon
                     max_chunks_per_patient=1,
                     concept_phrases=["brain metastases", "liver lesion"],
                     include_bow_phrases_as_concepts=False,
-                )
+                ),
+                **_disable_htr_test_kwargs(),
             ),
         ),
     )
@@ -574,7 +672,8 @@ def test_embedding_contrast_evidence_retrieves_aligned_chunks(tmp_path: Path):
                     top_k_chunks_per_tail=3,
                     max_chunks_per_patient=1,
                     concept_phrases=["brain metastases", "liver lesion"],
-                )
+                ),
+                **_disable_htr_test_kwargs(),
             ),
         ),
     )
@@ -650,7 +749,8 @@ def test_embedding_contrast_adds_cell_and_orthogonal_r_score_contrasts(
                     top_k_chunks_per_tail=3,
                     max_chunks_per_patient=1,
                     concept_phrases=["brain metastases", "liver lesion"],
-                )
+                ),
+                **_disable_htr_test_kwargs(),
             ),
         ),
     )
@@ -744,6 +844,7 @@ def test_multi_model_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path:
                 top_n_features=5,
                 candidate_consistency_enabled=False,
                 fold_parallelism="2",
+                **_disable_required_evidence_test_kwargs(),
             ),
         ),
         explicit_features=ExplicitFeatureExtractionConfig(enabled=True, features=[]),
@@ -867,6 +968,7 @@ def test_multi_model_agentic_forest_adds_embedding_contrast_context(
                     max_chunks_per_patient=1,
                     concept_phrases=["brain metastases", "liver lesion"],
                 ),
+                **_disable_htr_test_kwargs(),
             ),
         ),
         explicit_features=ExplicitFeatureExtractionConfig(enabled=True, features=[]),
@@ -913,6 +1015,103 @@ def test_multi_model_agentic_forest_adds_embedding_contrast_context(
     )
 
 
+def test_multi_model_agentic_forest_adds_htr_to_ensemble_and_agent_context(
+    tmp_path: Path,
+):
+    dataset = pd.DataFrame(
+        {
+            "clinical_text": [
+                "age 55 baseline note brain metastases pd-l1 high",
+                "age 78 baseline note liver lesion pd-l1 low",
+                "age 57 baseline note brain metastases pd-l1 high",
+                "age 76 baseline note liver lesion pd-l1 low",
+                "age 61 baseline note brain metastases cachexia",
+                "age 81 baseline note liver lesion stable",
+                "age 54 baseline note brain metastases cachexia",
+                "age 70 baseline note liver lesion stable",
+            ],
+            "treatment_indicator": [1, 0, 1, 0, 1, 0, 1, 0],
+            "outcome_indicator": [1, 0, 1, 0, 1, 0, 1, 0],
+        }
+    )
+    config = AppliedInferenceConfig(
+        outcome_type="binary",
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        cv_folds=0,
+        architecture=ModelArchitectureConfig(
+            model_type="multi_model_agentic_forest",
+            explicit_feature_forest=ExplicitFeatureForestConfig(inference=False),
+            agentic_feature_search=AgenticFeatureSearchConfig(
+                max_iterations=1,
+                max_additions_per_iter=4,
+                min_feature_coverage=0.1,
+                clinical_text_examples_per_prompt=0,
+            ),
+            multi_model_agentic_forest=MultiModelAgenticForestConfig(
+                nuisance_folds=2,
+                effect_folds=2,
+                bow_views=_linear_test_bow_views(),
+                top_n_features=5,
+                candidate_consistency_enabled=False,
+                fold_parallelism="1",
+                embedding_contrast=EmbeddingContrastDiscoveryConfig(
+                    enabled=False,
+                    disable_reason="unit test focuses on HTR evidence",
+                ),
+            ),
+        ),
+        explicit_features=ExplicitFeatureExtractionConfig(enabled=True, features=[]),
+    )
+    agent = FakeProposalAgent()
+    htr_provider = FakeHTREvidenceProvider()
+    output_path = tmp_path / "predictions.parquet"
+
+    run_multi_model_agentic_forest(
+        dataset,
+        config,
+        output_path,
+        proposal_agent=agent,
+        extraction_provider=FakeExtractionProvider(),
+        evaluator=FakeEvaluator(),
+        htr_evidence_provider=htr_provider,
+    )
+
+    assert htr_provider.seen_effect_nuisance_predictions
+    effect_nuisance = htr_provider.seen_effect_nuisance_predictions[0]
+    assert set(effect_nuisance["target_source"]) == {"ensemble_mean_nuisance_with_htr"}
+    first_context = agent.contexts[0]
+    assert first_context["feature_importance"]["ensemble_r"]["target_source"] == (
+        "ensemble_mean_nuisance_with_htr"
+    )
+    htr_evidence = first_context["htr_attention_evidence"]
+    assert htr_evidence["nuisance"]["attention"][0]["evidence_snippet"]
+    assert htr_evidence["effect"]["attention"][0]["top_token_spans"]
+
+    artifact_dir = output_path.parent / "multi_model_agentic_forest"
+    assert (artifact_dir / "htr_nuisance_oof_predictions.parquet").exists()
+    assert (artifact_dir / "htr_effect_oof_predictions.parquet").exists()
+    assert (artifact_dir / "htr_attention_evidence.parquet").exists()
+    text_predictions = pd.read_parquet(artifact_dir / "text_model_oof_predictions.parquet")
+    assert {"htr_nuisance", "htr_effect"}.issubset(
+        set(text_predictions["view_name"].dropna())
+    )
+    importance_rows = [
+        json.loads(line)
+        for line in (artifact_dir / "bow_view_feature_importance_by_fold.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    consensus_row = next(row for row in importance_rows if row["record_type"] == "consensus")
+    artifact_htr_row = consensus_row["context"]["htr_attention_evidence"]["nuisance"][
+        "attention"
+    ][0]
+    assert artifact_htr_row["text_redacted"] is True
+    assert "evidence_snippet" not in artifact_htr_row
+    assert "top_token_spans" not in artifact_htr_row
+
+
 def test_multi_model_agentic_forest_adds_ensemble_r_target_context(tmp_path: Path):
     dataset = pd.DataFrame(
         {
@@ -954,6 +1153,7 @@ def test_multi_model_agentic_forest_adds_ensemble_r_target_context(tmp_path: Pat
                 top_n_features=5,
                 candidate_consistency_enabled=False,
                 fold_parallelism="1",
+                **_disable_required_evidence_test_kwargs(),
             ),
         ),
         explicit_features=ExplicitFeatureExtractionConfig(enabled=True, features=[]),
@@ -1134,6 +1334,7 @@ def test_extracted_feature_review_gate_flags_underperforming_features():
         extracted_feature_review_auc_margin=0.01,
         extracted_feature_review_loss_relative_margin=0.01,
         extracted_feature_review_min_benchmark_auc=0.55,
+        **_disable_required_evidence_test_kwargs(),
     )
     diagnostic = _evaluate_extracted_feature_set_diagnostic(
         train_df=dataset,
@@ -1219,6 +1420,7 @@ def test_multi_model_extracted_feature_review_revises_underperforming_specs(
                 extracted_feature_review_loss_relative_margin=0.0,
                 extracted_feature_review_min_benchmark_auc=0.55,
                 fold_parallelism="1",
+                **_disable_required_evidence_test_kwargs(),
             ),
         ),
         explicit_features=ExplicitFeatureExtractionConfig(enabled=True, features=[]),
@@ -1320,6 +1522,7 @@ def test_multi_model_prespecified_features_extract_before_bow_and_merge_roles(
                         "categories": ["negative", "positive"],
                     },
                 ],
+                **_disable_required_evidence_test_kwargs(),
             ),
         ),
         explicit_features=ExplicitFeatureExtractionConfig(enabled=True, features=[]),
@@ -1515,7 +1718,7 @@ def test_oracle_multi_model_script_builds_default_and_cli_bow_views():
     applied = script._make_applied_config(cfg, dataset_path)
     mm_cfg = applied.architecture.multi_model_agentic_forest
     assert len(mm_cfg.bow_views) == 6
-    assert mm_cfg.embedding_contrast.enabled is False
+    assert mm_cfg.embedding_contrast.enabled is True
 
     cfg.bow_view_grid = "cli_single"
     cfg.bow_model = "extratrees"
@@ -1648,7 +1851,8 @@ def test_multi_model_consistency_selection_is_deterministic_gate(tmp_path):
                 model_type="multi_model_agentic_forest",
                 agentic_feature_search=AgenticFeatureSearchConfig(),
                 multi_model_agentic_forest=MultiModelAgenticForestConfig(
-                    candidate_proposals_per_fold=5
+                    candidate_proposals_per_fold=5,
+                    **_disable_required_evidence_test_kwargs(),
                 ),
             ),
         ),
