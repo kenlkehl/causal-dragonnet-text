@@ -1,6 +1,6 @@
 # Repository Pipelines
 
-This repository already contains agentic discovery and causal-forest code. Prefer these paths before writing custom modeling loops.
+This repository already contains `agentic` discovery and causal-forest code. Treat `agentic` as a repository workflow label: Codex remains the reasoning agent, and repo or vLLM LLM hooks must not be used as autonomous feature-proposal/review agents unless the user explicitly asks for that.
 
 ## Required Integrated Text-Evidence Pass
 
@@ -15,13 +15,13 @@ Current multi-model stages:
 - Build shared honest folds, then fit every configured `bow_view` for treatment nuisance, outcome nuisance, and R-loss/pseudo-target evidence.
 - Use the default broad BoW grid when feasible: linear 1-1, 1-2, 1-3, and 2-4 n-gram TF-IDF views plus ExtraTrees and RandomForest views. Supported `bow_model` values are `linear`, `extratrees`, `random_forest`, and `xgboost`.
 - Add HTR nuisance treatment/outcome models and attention/span evidence. HTR nuisance predictions join the row-level ensemble treatment/outcome predictions used for R-loss and pseudo-target construction.
-- Add an ensemble R target from BoW plus HTR nuisance predictions so the proposal agent can see a signal that is less tied to one vectorizer, learner, or neural architecture.
+- Add an ensemble R target from BoW plus HTR nuisance predictions so Codex can inspect a signal that is less tied to one vectorizer, learner, or neural architecture.
 - Add embedding-contrast evidence: treatment, outcome, per-view R-pseudo-target, ensemble R, within-arm outcome, treatment-outcome cell, orthogonal R-score, and concept-probe contrasts from real text chunks.
-- Expose highly attended HTR tokens/spans from nuisance and R-stage/effect models to the proposal agent as evidence for confounders and effect modifiers.
-- Merge researcher-supplied `prespecified_features`, `prespecified_confounders`, `prespecified_effect_modifiers`, and `prespecified_features_json` into the same `ExplicitFeatureSpec` contract as agent-proposed features. Duplicate names are harmonized and role lists are merged.
+- Expose highly attended HTR tokens/spans from nuisance and R-stage/effect models to Codex as evidence for confounders and effect modifiers.
+- Merge researcher-supplied `prespecified_features`, `prespecified_confounders`, `prespecified_effect_modifiers`, and `prespecified_features_json` into the same `ExplicitFeatureSpec` contract as Codex-proposed features. Duplicate names are harmonized and role lists are merged.
 - Run inner-fold candidate consistency checks before extraction when enabled. Use these checks to stabilize proposed concepts, recover strong fold-local candidates, and reject unstable aliases without peeking at held-out reporting rows.
 - Canonicalize aliases, categorical categories, and `value_aliases` before extraction so the extractor produces one patient-level column per concept rather than multiple synonymous variables.
-- Extract selected features with the repo extractor or with coding-agent document reading, then run the extracted-feature review loop before final causal-forest fitting. Underperforming extracted-feature nuisance or R/pseudo-target diagnostics should trigger agent revision and targeted re-extraction, capped by `extracted_feature_review_max_rounds`.
+- Extract selected features with the repo extractor or with coding-agent document reading, then run the extracted-feature review loop before final causal-forest fitting. Underperforming extracted-feature nuisance or R/pseudo-target diagnostics should trigger Codex revision and targeted re-extraction, capped by `extracted_feature_review_max_rounds`.
 
 Recommended defaults for each run:
 - `applied_inference.cv_folds >= 5`
@@ -68,7 +68,7 @@ Do not implement clinical variable extraction with ad hoc regex or pattern-match
 
 Default to coding-agent extraction unless the user supplied an endpoint, requested endpoint extraction, or the dataset is too large for reliable coding-agent extraction after a concrete sharding attempt:
 - **Coding agent extraction**: Codex reads each document, or targeted chunks of each long document, and emits structured values itself. This is required when no repo-native extractor, vLLM server, OpenAI-compatible endpoint, local model, or API key is available. Use BoW/HTR spans, section search, targeted chunk sampling, and subagents when useful, but reconcile all evidence into one patient-level row per concept. For large datasets, shard by patient ranges, folds, concepts, or document chunks and spawn subagents when available; if subagents are unavailable, perform the same sharded passes manually. This must still be document-reading LLM extraction, not regex or pattern matching.
-- **OpenAI-compatible endpoint extraction**: use `vllm_server_url` or another OpenAI-compatible base URL, model name, API key if needed, batch size/concurrency, and max text length when provided, requested, or needed after coding-agent extraction has been attempted or clearly bounded for scale.
+- **OpenAI-compatible endpoint extraction**: use `vllm_server_url` or another OpenAI-compatible base URL, model name, API key if needed, batch size/concurrency, and max text length when provided, requested, or needed after coding-agent extraction has been attempted or clearly bounded for scale. This endpoint is an extraction backend, not a feature-discovery, review, or synthesis agent.
 - **Local HF weights on GPUs**: when using cached Hugging Face weights locally, prefer starting a vLLM OpenAI-compatible server and using the endpoint-backed extractor. Select a capable instruction-tuned model with sufficient context, not a small/base model chosen only because it loads quickly. Example preferred class: Google's `gemma-4-e2b-it`/Gemma 4 E2B instruct when cached and supported by vLLM. Reserve direct `transformers` generation with small models such as `Qwen/Qwen3-1.7B` for smoke tests or explicitly documented last-resort extraction.
 
 Do not emit an all-missing explicit-feature table merely because endpoint-backed extraction is unavailable. Missing values are valid only for patient/concept pairs that document-reading extraction could not recover from the text. If extraction is genuinely infeasible even after sharding, stop and report the blocker instead of running downstream causal-forest or final ITE comparisons that require extracted features.
@@ -100,7 +100,7 @@ Local vLLM launch guidance:
 - Run a JSON-format smoke test through the server before full extraction; the test must include at least one numeric baseline variable and one categorical variable.
 - Record the server command, model name/path, context length, max input/text tokens, max generation tokens, prompt version, smoke-test output, and fallback reasons in `report.txt`.
 
-Use `model_type="multi_model_agentic_forest"`, `agentic_explicit_feature_forest`, or `agentic_attention_variable_forest` to keep proposal, extraction, and forest fitting on the repo-native path. The multi-model BoW path sends text evidence to the proposal agent, then the extractor materializes selected explicit variables from text before the extracted-feature review loop and final causal forest.
+Use `model_type="multi_model_agentic_forest"`, `agentic_explicit_feature_forest`, or `agentic_attention_variable_forest` to keep evidence generation, extraction, and forest fitting on the repo-native path. Do not use the path's LLM proposal/review hooks as the discovery agent by default: Codex should inspect the text evidence, author or revise the `ExplicitFeatureSpec` set, and use endpoint-backed models only for bounded document-reading extraction when allowed.
 
 ## Post-Extraction Feature Review
 
@@ -110,7 +110,7 @@ The repo-native `multi_model_agentic_forest` path performs this review when `ext
 - Fit extracted-feature treatment nuisance and outcome nuisance models on training folds and score only held-out rows.
 - Fit extracted-feature R-loss, logistic R-loss, pseudo-target, or interaction-style effect-modifier diagnostics using out-of-fold nuisance quantities.
 - Compare extracted-feature treatment/outcome AUROC or losses against BoW, embedding, and HTR benchmarks. The default gate allows a small AUROC gap (`extracted_feature_review_auc_margin=0.02`) and a small relative loss gap (`extracted_feature_review_loss_relative_margin=0.05`) before treating the extraction as underperforming; `extracted_feature_review_min_benchmark_auc=0.55` prevents weak benchmarks from forcing revisions.
-- Send failed gates, missingness, weak role evidence, alias/category problems, and upstream evidence back to the agent. The agent may drop variables, re-role them, merge aliases, improve categorical `value_aliases`, add narrow evidence-supported concepts, or request targeted re-extraction.
+- Review failed gates, missingness, weak role evidence, alias/category problems, and upstream evidence directly in Codex. Codex may drop variables, re-role them, merge aliases, improve categorical `value_aliases`, add narrow evidence-supported concepts, or request targeted re-extraction.
 - Cap revisions with `extracted_feature_review_max_rounds`. If the cap is reached, document the remaining benchmark gaps and whether the final forest is exploratory or blocked.
 
 For a custom coding-agent orchestrator, mirror the same discipline: all diagnostics used to accept, reject, or revise features must be computed inside training folds or out-of-fold for the scored rows. Never compare extracted features to BoW, embedding, or HTR models using in-sample predictions.

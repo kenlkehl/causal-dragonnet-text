@@ -70,7 +70,7 @@ Store the post-extraction feature-review records that decide whether extracted v
 - extracted-feature R-loss, logistic R-loss, pseudo-target, interaction, or treatment-stratified effect-modifier diagnostics
 - upstream BoW/TF-IDF, embedding-contrast, and HTR benchmark metrics used for comparison
 - gate thresholds, pass/fail status, and margin by role/objective
-- agent revision decision: retained, dropped, re-roled, merged, alias-harmonized, value-harmonized, newly added, or targeted for re-extraction
+- Codex revision decision: retained, dropped, re-roled, merged, alias-harmonized, value-harmonized, newly added, or targeted for re-extraction
 - stop reason when review rounds are capped or no evidence-supported revision remains
 
 No diagnostic in this artifact should be based on in-sample predictions for the scored rows.
