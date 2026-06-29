@@ -172,11 +172,13 @@ Post-extraction benchmark review:
 - Treat large outcome-nuisance or R/pseudo-target gaps as evidence that prognostic or heterogeneity-relevant concepts, transformations, temporal anchoring, or aliases need revision.
 - If the extracted-feature table fails the review, return to concept translation or extraction before fitting the final causal forest.
 
-Parsimony and redundancy review:
+Mandatory parsimony and redundancy review:
 - Before finalizing a candidate list, compute feature-feature correlations, contingency tables for categorical pairs, and missingness-overlap summaries within training folds.
+- Run explicit removal or grouped-ablation diagnostics for plausible weak, redundant, or proxy variables when more than a minimal feature set remains. Compare against the current set using honest treatment/outcome nuisance, R-loss/pseudo-outcome, heterogeneity, and ITE-stability metrics.
 - Group highly correlated or semantically duplicate candidates and prefer the most direct baseline variable unless a proxy improves honest treatment/outcome nuisance, heterogeneity, or ITE-stability metrics.
 - Prefer a compact feature set that preserves held-out performance and fold-stable role evidence over a larger set of weakly distinct variables.
 - Revisit role assignments after each review: a variable may be a confounder, an effect modifier, both, or neither.
+- The stage must record `retain_all`, `prune`, or `blocked`. `retain_all` is a valid outcome when the initial candidate set is already parsimonious or all tested removals violate diagnostic tolerances; it is not a failure to prune.
 
 ## 5. Iteration
 
@@ -185,7 +187,7 @@ After each iteration:
 - Compare extracted-feature nuisance and R/pseudo-target diagnostics with the upstream BoW, embedding, and HTR benchmarks, and inspect any failed extracted-feature review gates.
 - Identify unexplained residual text signal and propose a narrow expansion only if metrics or fold evidence justify it.
 - Re-extract or re-role candidates when aliasing, missingness, or temporal leakage is suspected.
-- Mull over the candidate list repeatedly before finalization: merge redundant variables, reject weak proxies, test supported transformations, and rerun role diagnostics on the revised list.
+- Mull over the candidate list repeatedly before finalization: merge redundant variables, reject weak proxies, test supported transformations, and rerun role diagnostics on the revised list. If no revision is accepted, record why `retain_all` is the parsimonious decision.
 - Stop when new variables do not improve honest metrics, do not recur across folds, do not stabilize univariable screens, do not resolve temporal anchoring, and do not improve ITE stability.
 
 ## 6. Functional Form and ITEs

@@ -361,8 +361,10 @@ Final artifacts are written under `multi_model_agentic_forest/`, including
 `htr_attention_evidence.parquet`, `text_model_oof_predictions.parquet`,
 `bow_view_feature_importance_by_fold.jsonl`,
 `embedding_contrast_evidence_by_fold.jsonl`, `agent_candidate_proposals.jsonl`,
-`extracted_feature_diagnostics_by_fold.jsonl`, `selected_feature_sets.json`, and
-`outer_cv_metrics.csv`.
+`extracted_feature_diagnostics_by_fold.jsonl`, `parsimony_review_by_fold.jsonl`,
+`selected_feature_sets.json`, and `outer_cv_metrics.csv`. The parsimony review is
+mandatory before final forest fitting; it may record `retain_all` when ablations
+do not justify pruning.
 
 This path includes embedding-contrast retrieval evidence by default. It pools
 document chunks into patient-level embeddings, builds train-fold treatment,

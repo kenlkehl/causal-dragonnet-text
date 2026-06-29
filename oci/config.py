@@ -794,6 +794,13 @@ class MultiModelAgenticForestConfig:
     extracted_feature_review_auc_margin: float = 0.02
     extracted_feature_review_loss_relative_margin: float = 0.05
     extracted_feature_review_min_benchmark_auc: float = 0.55
+    # Mandatory parsimony review before final forest fitting. The stage must run
+    # and write artifacts, but pruning is optional: retaining all features is a
+    # valid outcome when ablations or redundancy checks do not justify removal.
+    parsimony_review_auc_tolerance: float = 0.01
+    parsimony_review_loss_relative_tolerance: float = 0.03
+    parsimony_review_corr_threshold: float = 0.75
+    parsimony_review_max_single_feature_ablations: int = 30
     outer_parallelism: str = "1"
     bow_parallel_backend: str = "processes"
     # "auto" uses the runner num_workers setting; set a positive integer to
@@ -906,6 +913,26 @@ class MultiModelAgenticForestConfig:
             raise ValueError(
                 "multi_model_agentic_forest.extracted_feature_review_min_benchmark_auc "
                 "must be in [0, 1]"
+            )
+        if self.parsimony_review_auc_tolerance < 0.0:
+            raise ValueError(
+                "multi_model_agentic_forest.parsimony_review_auc_tolerance "
+                "must be >= 0"
+            )
+        if self.parsimony_review_loss_relative_tolerance < 0.0:
+            raise ValueError(
+                "multi_model_agentic_forest.parsimony_review_loss_relative_tolerance "
+                "must be >= 0"
+            )
+        if not 0.0 <= self.parsimony_review_corr_threshold <= 1.0:
+            raise ValueError(
+                "multi_model_agentic_forest.parsimony_review_corr_threshold "
+                "must be in [0, 1]"
+            )
+        if self.parsimony_review_max_single_feature_ablations < 0:
+            raise ValueError(
+                "multi_model_agentic_forest.parsimony_review_max_single_feature_ablations "
+                "must be >= 0"
             )
         _validate_parallelism_setting(
             self.candidate_consistency_parallelism,

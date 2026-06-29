@@ -193,8 +193,9 @@ Report fold recurrence, direction, standardized effect magnitude or score delta,
 Before passing final variables to the causal forest:
 - Evaluate plausible confounder transformations or functional relationships inside training folds, not on the reporting fold.
 - Evaluate effect modifiers for differential association with outcome by treatment, using interaction, treatment-stratified, R-loss, or pseudo-outcome diagnostics.
-- Inspect feature-feature correlations, categorical contingency tables, and missingness overlap to merge or reject redundant proxy variables.
-- Iterate on a parsimonious feature list until removing weak or redundant variables no longer harms honest nuisance, heterogeneity, or ITE-stability metrics.
+- Run the mandatory parsimony gate after extracted-feature review and before final forest fitting. Inspect feature-feature correlations, categorical contingency tables, and missingness overlap to merge or reject redundant proxy variables.
+- Test weak or redundant variables with honest removal/group-ablation diagnostics where feasible. Iterate on a parsimonious feature list until removing weak or redundant variables no longer preserves honest nuisance, heterogeneity, or ITE-stability metrics.
+- Record `retain_all`, `prune`, or `blocked`. `retain_all` is valid when the current list is already compact enough or every tested removal violates tolerances; the pipeline must still write the parsimony artifact.
 
 ## Explicit-Feature Causal Forest
 
@@ -204,6 +205,7 @@ Configuration guidance:
 - `architecture.explicit_feature_forest.honest = true`
 - confounder-role features become `W`
 - effect-modifier-role features become `X`
+- `multi_model_agentic_forest` must write `parsimony_review_by_fold.jsonl` and include the parsimony decision in `selected_feature_sets.json` before fitting the final forest.
 - use nested or outer folds for all reported metrics
 
 Do not treat causal forest ITEs as ground truth. They are the required final estimator for reported ITEs, and should also be interpreted as a stability and heterogeneity check against the inferred DGP. If the repo-native explicit feature forest is unavailable, use an equivalent honest causal-forest implementation such as `econml.dml.CausalForestDML`; if no real causal forest can be made to run, stop and report the blocker rather than presenting final ITE artifacts as complete.

@@ -32,6 +32,7 @@ from oci.inference.multi_model_agentic_forest import (
     _compact_multi_model_agent_context,
     _evaluate_extracted_feature_set_diagnostic,
     _extracted_feature_review_gate,
+    _feature_redundancy_review,
     _fallback_consistency_proposals,
     _fit_binary_bow_fold,
     run_multi_model_agentic_forest,
@@ -1371,6 +1372,47 @@ def test_extracted_feature_review_gate_flags_underperforming_features():
     assert {"treatment_auroc", "outcome_auroc"}.issubset(failed_metrics)
 
 
+def test_multi_model_parsimony_redundancy_review_records_required_summaries():
+    df = pd.DataFrame(
+        {
+            "explicit_feat_age": [50.0, 60.0, 70.0, 80.0],
+            "explicit_feat_age_copy": [51.0, 61.0, 71.0, 81.0],
+            "explicit_feat_marker": ["low", "low", "high", "high"],
+            "explicit_feat_marker_copy": ["low", "low", "high", "high"],
+            "explicit_feat_age_missing": [False, False, False, False],
+            "explicit_feat_age_copy_missing": [False, False, False, False],
+            "explicit_feat_marker_missing": [False, False, False, False],
+            "explicit_feat_marker_copy_missing": [False, False, False, False],
+        }
+    )
+    specs = [
+        ExplicitFeatureSpec(name="age", type="continuous", roles=["confounder"]),
+        ExplicitFeatureSpec(name="age_copy", type="continuous", roles=["confounder"]),
+        ExplicitFeatureSpec(
+            name="marker",
+            type="categorical",
+            categories=["low", "high"],
+            roles=["effect_modifier"],
+        ),
+        ExplicitFeatureSpec(
+            name="marker_copy",
+            type="categorical",
+            categories=["low", "high"],
+            roles=["effect_modifier"],
+        ),
+    ]
+
+    review = _feature_redundancy_review(
+        train_df=df,
+        specs=specs,
+        corr_threshold=0.75,
+    )
+
+    assert review["continuous_correlations_abs_ge_threshold"]
+    assert review["categorical_contingency"]
+    assert len(review["missingness_overlap"]) == 6
+
+
 def test_multi_model_extracted_feature_review_revises_underperforming_specs(
     tmp_path: Path,
 ):
@@ -1458,6 +1500,18 @@ def test_multi_model_extracted_feature_review_revises_underperforming_specs(
     assert diagnostics
     selected_sets = json.loads((artifact_dir / "selected_feature_sets.json").read_text())
     assert selected_sets[0]["extracted_feature_review"]["review_rounds"] >= 1
+    assert selected_sets[0]["parsimony_review"]["mandatory"] is True
+    assert selected_sets[0]["parsimony_review"]["decision"] in {"retain_all", "prune"}
+    parsimony_rows = [
+        json.loads(line)
+        for line in (artifact_dir / "parsimony_review_by_fold.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert parsimony_rows
+    assert parsimony_rows[0]["event"] == "mandatory_parsimony_review"
+    assert "redundancy_review" in parsimony_rows[0]
+    assert "ablations" in parsimony_rows[0]
 
 
 def test_multi_model_prespecified_features_extract_before_bow_and_merge_roles(
@@ -1617,6 +1671,10 @@ def test_multi_model_agentic_forest_parses_bow_views_and_embedding_option():
                         "extracted_feature_review_auc_margin": 0.03,
                         "extracted_feature_review_loss_relative_margin": 0.07,
                         "extracted_feature_review_min_benchmark_auc": 0.6,
+                        "parsimony_review_auc_tolerance": 0.02,
+                        "parsimony_review_loss_relative_tolerance": 0.04,
+                        "parsimony_review_corr_threshold": 0.8,
+                        "parsimony_review_max_single_feature_ablations": 7,
                         "embedding_contrast": {
                             "enabled": True,
                             "model_name": "Qwen/Qwen3-Embedding-8B",
@@ -1652,6 +1710,10 @@ def test_multi_model_agentic_forest_parses_bow_views_and_embedding_option():
     assert nn_cfg.extracted_feature_review_auc_margin == 0.03
     assert nn_cfg.extracted_feature_review_loss_relative_margin == 0.07
     assert nn_cfg.extracted_feature_review_min_benchmark_auc == 0.6
+    assert nn_cfg.parsimony_review_auc_tolerance == 0.02
+    assert nn_cfg.parsimony_review_loss_relative_tolerance == 0.04
+    assert nn_cfg.parsimony_review_corr_threshold == 0.8
+    assert nn_cfg.parsimony_review_max_single_feature_ablations == 7
     assert nn_cfg.embedding_contrast.enabled is True
     assert nn_cfg.embedding_contrast.model_name == "Qwen/Qwen3-Embedding-8B"
     assert nn_cfg.embedding_contrast.chunk_size_words == 128

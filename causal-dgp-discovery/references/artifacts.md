@@ -13,7 +13,7 @@ Maintain this throughout the run. Include:
 - post-extraction extracted-feature diagnostics and benchmark-review decisions
 - rejected hypotheses
 - confounder/modifier role evidence
-- feature-correlation, redundancy, and parsimony reviews
+- feature-correlation, redundancy, and mandatory parsimony reviews, including the explicit `retain_all`, `prune`, or `blocked` decision
 - repeated candidate-list revision decisions
 - model comparison table
 - final inferred DGP, including uncertainty
@@ -58,7 +58,7 @@ Store each candidate-list review iteration:
 - effect magnitude, score delta, direction, fold recurrence, missingness, and p value when applicable
 - feature-feature correlations, categorical contingency summaries, and missingness overlap
 - variables merged, rejected, re-roled, or retained, with rationale
-- parsimony decision and impact on honest nuisance, R-loss/pseudo-outcome, heterogeneity, or ITE-stability metrics
+- parsimony decision (`retain_all`, `prune`, or `blocked`) and impact on honest nuisance, R-loss/pseudo-outcome, heterogeneity, or ITE-stability metrics. `retain_all` is acceptable when ablations do not justify pruning.
 - upstream BoW/embedding/HTR benchmark gaps and whether the candidate list requires revision or re-extraction
 
 ## `extracted_feature_diagnostics_by_fold.jsonl`
@@ -72,6 +72,18 @@ Store the post-extraction feature-review records that decide whether extracted v
 - gate thresholds, pass/fail status, and margin by role/objective
 - Codex revision decision: retained, dropped, re-roled, merged, alias-harmonized, value-harmonized, newly added, or targeted for re-extraction
 - stop reason when review rounds are capped or no evidence-supported revision remains
+
+## `parsimony_review_by_fold.jsonl`
+
+Store the mandatory pre-forest parsimony gate:
+- outer fold, selected features before review, and selected features after review
+- continuous feature-feature correlations above threshold
+- categorical contingency summaries and missingness-overlap summaries
+- tested single-feature or grouped ablations, including metric deltas and whether each removal stayed within tolerance
+- protected/user-supplied features that were not eligible for automatic removal
+- final decision: `retain_all`, `prune`, or `blocked`, plus the stop reason
+
+The artifact is required even when no variables are pruned. In that case it should explain why the current set was considered parsimonious enough or why tested removals harmed honest diagnostics.
 
 No diagnostic in this artifact should be based on in-sample predictions for the scored rows.
 
@@ -116,6 +128,6 @@ Store iteration/model diagnostics:
 - HTR nuisance/effect metrics and attention/span evidence coverage when available
 - extracted-feature review pass/fail status and review-round count
 - fold recurrence of candidate concepts
-- parsimony/redundancy review summary
+- mandatory parsimony/redundancy review summary, including whether the final decision was `retain_all`, `prune`, or `blocked`
 - ITE distribution and fold-to-fold correlation
 - required final causal-forest metrics and any clearly labeled non-causal-forest sensitivity comparisons

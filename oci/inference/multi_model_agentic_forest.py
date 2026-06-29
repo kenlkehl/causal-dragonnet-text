@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import unicodedata
+from itertools import combinations
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -232,6 +233,7 @@ class MultiModelAgenticForestRunner:
         self.embedding_evidence_rows: List[Dict[str, Any]] = []
         self.agent_rows: List[Dict[str, Any]] = []
         self.extracted_feature_diagnostic_rows: List[Dict[str, Any]] = []
+        self.parsimony_review_rows: List[Dict[str, Any]] = []
         self.feature_set_rows: List[Dict[str, Any]] = []
         self.outer_metric_rows: List[Dict[str, Any]] = []
         self.alias_reference_specs: List[ExplicitFeatureSpec] = self._initial_specs()
@@ -305,6 +307,9 @@ class MultiModelAgenticForestRunner:
                 self.extracted_feature_diagnostic_rows.extend(
                     item["extracted_feature_diagnostic_rows"]
                 )
+                self.parsimony_review_rows.extend(
+                    item.get("parsimony_review_rows", [])
+                )
                 self.feature_set_rows.extend(item["feature_set_rows"])
                 self.outer_metric_rows.extend(item["outer_metric_rows"])
         else:
@@ -369,6 +374,7 @@ class MultiModelAgenticForestRunner:
             "extracted_feature_diagnostic_rows": (
                 fold_runner.extracted_feature_diagnostic_rows
             ),
+            "parsimony_review_rows": fold_runner.parsimony_review_rows,
             "feature_set_rows": fold_runner.feature_set_rows,
             "outer_metric_rows": fold_runner.outer_metric_rows,
         }
@@ -505,6 +511,16 @@ class MultiModelAgenticForestRunner:
         selected_specs = review_result["selected_specs"]
         train_df = self.dataset.iloc[train_idx].copy()
         test_df = self.dataset.iloc[test_idx].copy()
+        parsimony_result = self._run_mandatory_parsimony_review(
+            outer_fold=outer_fold,
+            train_idx=train_idx,
+            selected_specs=selected_specs,
+            bow_result=bow_result,
+            embedding_evidence=embedding_evidence,
+        )
+        selected_specs = parsimony_result["selected_specs"]
+        train_df = self.dataset.iloc[train_idx].copy()
+        test_df = self.dataset.iloc[test_idx].copy()
         self.feature_set_rows.append(
             {
                 "outer_fold": int(outer_fold),
@@ -518,6 +534,7 @@ class MultiModelAgenticForestRunner:
                     if "effect_modifier" in spec.roles
                 ],
                 "extracted_feature_review": review_result["summary"],
+                "parsimony_review": parsimony_result["summary"],
             }
         )
 
@@ -549,6 +566,10 @@ class MultiModelAgenticForestRunner:
                 **_prefix_metrics(
                     "extracted_feature_review_",
                     _scalar_metrics(review_result["summary"]),
+                ),
+                **_prefix_metrics(
+                    "parsimony_review_",
+                    _scalar_metrics(parsimony_result["summary"]),
                 ),
                 **_scalar_metrics(final_eval.metrics),
                 **_prefix_metrics("bow_", bow_result["metrics"]),
@@ -2528,6 +2549,183 @@ class MultiModelAgenticForestRunner:
         )
         return {"selected_specs": selected, "summary": summary}
 
+    def _run_mandatory_parsimony_review(
+        self,
+        *,
+        outer_fold: int,
+        train_idx: np.ndarray,
+        selected_specs: List[ExplicitFeatureSpec],
+        bow_result: Dict[str, Any],
+        embedding_evidence: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Run the mandatory parsimony gate before final forest fitting.
+
+        The gate must always execute and write artifacts. It may validly retain
+        all features when redundancy/ablation evidence does not justify pruning.
+        """
+        before_specs = list(selected_specs)
+        current_specs = list(selected_specs)
+        train_df = self.dataset.iloc[train_idx].copy()
+        required_names = {spec.name for spec in self._initial_specs()}
+        max_ablations = int(
+            getattr(self.nn_config, "parsimony_review_max_single_feature_ablations", 30)
+        )
+        redundancy = _feature_redundancy_review(
+            train_df=train_df,
+            specs=current_specs,
+            corr_threshold=float(
+                getattr(self.nn_config, "parsimony_review_corr_threshold", 0.75)
+            ),
+        )
+        base_diagnostic = _evaluate_extracted_feature_set_diagnostic(
+            train_df=train_df,
+            specs=current_specs,
+            config=self.config,
+            nn_config=self.nn_config,
+            bow_metrics=bow_result.get("metrics", {}),
+            embedding_evidence=embedding_evidence,
+            random_state=91_000 + 100 * int(outer_fold),
+        )
+        base_gate = _extracted_feature_review_gate(
+            diagnostic=base_diagnostic,
+            nn_config=self.nn_config,
+        )
+        base_diagnostic["gate"] = base_gate
+
+        ablations: List[Dict[str, Any]] = []
+        removed: List[str] = []
+        stop_reason = "no_prunable_feature_improved_or_preserved_metrics"
+        n_ablations = 0
+        if not current_specs:
+            stop_reason = "no_selected_features"
+        elif max_ablations <= 0:
+            stop_reason = "max_single_feature_ablations_zero"
+        else:
+            while n_ablations < max_ablations and len(current_specs) > 1:
+                removable = [
+                    spec for spec in current_specs if spec.name not in required_names
+                ]
+                if not removable:
+                    stop_reason = "all_remaining_features_are_required"
+                    break
+
+                best_removal: Optional[Dict[str, Any]] = None
+                for spec in removable:
+                    if n_ablations >= max_ablations:
+                        stop_reason = "max_single_feature_ablations_reached"
+                        break
+                    trial_specs = [s for s in current_specs if s.name != spec.name]
+                    role_guard = _parsimony_role_guard(current_specs, trial_specs)
+                    if role_guard is not None:
+                        ablations.append(
+                            {
+                                "feature": spec.name,
+                                "allowed": False,
+                                "reasons": [role_guard],
+                                "n_features_after": int(len(trial_specs)),
+                            }
+                        )
+                        n_ablations += 1
+                        continue
+                    trial_diagnostic = _evaluate_extracted_feature_set_diagnostic(
+                        train_df=train_df,
+                        specs=trial_specs,
+                        config=self.config,
+                        nn_config=self.nn_config,
+                        bow_metrics=bow_result.get("metrics", {}),
+                        embedding_evidence=embedding_evidence,
+                        random_state=91_000
+                        + 100 * int(outer_fold)
+                        + 17 * (n_ablations + 1),
+                    )
+                    trial_gate = _extracted_feature_review_gate(
+                        diagnostic=trial_diagnostic,
+                        nn_config=self.nn_config,
+                    )
+                    trial_diagnostic["gate"] = trial_gate
+                    allowed, reasons, deltas = _parsimony_removal_decision(
+                        base_diagnostic=base_diagnostic,
+                        trial_diagnostic=trial_diagnostic,
+                        base_gate=base_gate,
+                        trial_gate=trial_gate,
+                        nn_config=self.nn_config,
+                    )
+                    ablation_row = {
+                        "feature": spec.name,
+                        "allowed": bool(allowed),
+                        "reasons": reasons,
+                        "n_features_after": int(len(trial_specs)),
+                        "metric_deltas": deltas,
+                        "metrics_after": _parsimony_metric_snapshot(trial_diagnostic),
+                        "gate_after": trial_gate,
+                    }
+                    ablations.append(ablation_row)
+                    n_ablations += 1
+                    if allowed:
+                        score = _extracted_review_selection_score(
+                            trial_diagnostic,
+                            trial_gate,
+                        )
+                        candidate = {
+                            "feature": spec.name,
+                            "trial_specs": trial_specs,
+                            "diagnostic": trial_diagnostic,
+                            "gate": trial_gate,
+                            "score": score,
+                        }
+                        if best_removal is None or score < best_removal["score"]:
+                            best_removal = candidate
+
+                if best_removal is None:
+                    break
+                removed.append(str(best_removal["feature"]))
+                current_specs = list(best_removal["trial_specs"])
+                base_diagnostic = best_removal["diagnostic"]
+                base_gate = best_removal["gate"]
+                stop_reason = "greedy_removal_completed"
+
+        decision = "prune" if removed else "retain_all"
+        summary = {
+            "enabled": True,
+            "mandatory": True,
+            "decision": decision,
+            "stop_reason": stop_reason,
+            "n_features_before": int(len(before_specs)),
+            "n_features_after": int(len(current_specs)),
+            "n_removed": int(len(removed)),
+            "removed_features": removed,
+            "n_single_feature_ablations": int(n_ablations),
+            **_prefix_metrics("final_", _parsimony_metric_snapshot(base_diagnostic)),
+        }
+        review_row = {
+            "outer_fold": int(outer_fold),
+            "event": "mandatory_parsimony_review",
+            "decision": decision,
+            "stop_reason": stop_reason,
+            "required_features": sorted(required_names),
+            "selected_features_before": [_spec_to_dict(spec) for spec in before_specs],
+            "selected_features_after": [_spec_to_dict(spec) for spec in current_specs],
+            "base_metrics": _parsimony_metric_snapshot(base_diagnostic),
+            "base_gate": base_gate,
+            "redundancy_review": redundancy,
+            "ablations": ablations,
+            "summary": summary,
+        }
+        self.parsimony_review_rows.append(review_row)
+        self.agent_rows.append(
+            {
+                "outer_fold": int(outer_fold),
+                "event": "mandatory_parsimony_review",
+                "decision": decision,
+                "stop_reason": stop_reason,
+                "n_features_before": int(len(before_specs)),
+                "n_features_after": int(len(current_specs)),
+                "removed_features": removed,
+                "artifact": "parsimony_review_by_fold.jsonl",
+            }
+        )
+        return {"selected_specs": current_specs, "summary": summary}
+
     def _build_extracted_feature_review_context(
         self,
         *,
@@ -2806,6 +3004,11 @@ class MultiModelAgenticForestRunner:
                 self.artifact_dir / "extracted_feature_diagnostics_by_fold.jsonl",
                 self.extracted_feature_diagnostic_rows,
             )
+        if self.parsimony_review_rows:
+            _write_jsonl(
+                self.artifact_dir / "parsimony_review_by_fold.jsonl",
+                self.parsimony_review_rows,
+            )
         _write_jsonl(self.artifact_dir / "agent_candidate_proposals.jsonl", self.agent_rows)
         with open(self.artifact_dir / "selected_feature_sets.json", "w") as f:
             json.dump(self.feature_set_rows, f, indent=2, default=_json_default)
@@ -2856,6 +3059,7 @@ def _run_multi_model_outer_fold_worker(
         "extracted_feature_diagnostic_rows": (
             fold_runner.extracted_feature_diagnostic_rows
         ),
+        "parsimony_review_rows": fold_runner.parsimony_review_rows,
         "feature_set_rows": fold_runner.feature_set_rows,
         "outer_metric_rows": fold_runner.outer_metric_rows,
     }
@@ -3522,6 +3726,170 @@ def _summarize_multi_model_extractions(
             }
         )
     return summaries
+
+
+def _feature_redundancy_review(
+    *,
+    train_df: pd.DataFrame,
+    specs: Sequence[ExplicitFeatureSpec],
+    corr_threshold: float,
+) -> Dict[str, Any]:
+    specs = list(specs)
+    continuous_correlations: List[Dict[str, Any]] = []
+    categorical_contingency: List[Dict[str, Any]] = []
+    missingness_overlap: List[Dict[str, Any]] = []
+    for left, right in combinations(specs, 2):
+        left_values = _explicit_feature_series(train_df, left)
+        right_values = _explicit_feature_series(train_df, right)
+        left_missing = _explicit_feature_missing_mask(train_df, left, left_values)
+        right_missing = _explicit_feature_missing_mask(train_df, right, right_values)
+        missingness_overlap.append(
+            {
+                "a": left.name,
+                "b": right.name,
+                "both_missing": float(np.mean(left_missing & right_missing)),
+                "either_missing": float(np.mean(left_missing | right_missing)),
+            }
+        )
+        if left.type == "continuous" and right.type == "continuous":
+            x = pd.to_numeric(left_values, errors="coerce").to_numpy(dtype=float)
+            y = pd.to_numeric(right_values, errors="coerce").to_numpy(dtype=float)
+            mask = np.isfinite(x) & np.isfinite(y)
+            corr = None
+            if int(np.sum(mask)) >= 3 and np.std(x[mask]) > 0.0 and np.std(y[mask]) > 0.0:
+                corr = _finite_or_none(np.corrcoef(x[mask], y[mask])[0, 1])
+            if corr is not None and abs(corr) >= float(corr_threshold):
+                continuous_correlations.append(
+                    {
+                        "a": left.name,
+                        "b": right.name,
+                        "correlation": float(corr),
+                        "n_pairwise_complete": int(np.sum(mask)),
+                    }
+                )
+        elif left.type == "categorical" and right.type == "categorical":
+            left_cat = left_values.astype("object").where(~left_missing, "__MISSING__")
+            right_cat = right_values.astype("object").where(~right_missing, "__MISSING__")
+            table = pd.crosstab(left_cat, right_cat, dropna=False)
+            total = float(table.to_numpy().sum())
+            max_cell_fraction = None if total <= 0 else float(table.to_numpy().max() / total)
+            categorical_contingency.append(
+                {
+                    "a": left.name,
+                    "b": right.name,
+                    "shape": [int(table.shape[0]), int(table.shape[1])],
+                    "max_cell_fraction": max_cell_fraction,
+                }
+            )
+    return {
+        "continuous_correlations_abs_ge_threshold": continuous_correlations,
+        "categorical_contingency": categorical_contingency,
+        "missingness_overlap": missingness_overlap,
+        "corr_threshold": float(corr_threshold),
+    }
+
+
+def _explicit_feature_series(df: pd.DataFrame, spec: ExplicitFeatureSpec) -> pd.Series:
+    value_col = f"explicit_feat_{spec.name}"
+    legacy_col = f"explicit_conf_{spec.name}"
+    if value_col in df.columns:
+        return df[value_col]
+    if legacy_col in df.columns:
+        return df[legacy_col]
+    return pd.Series([np.nan] * len(df), index=df.index, dtype="object")
+
+
+def _explicit_feature_missing_mask(
+    df: pd.DataFrame,
+    spec: ExplicitFeatureSpec,
+    values: Optional[pd.Series] = None,
+) -> np.ndarray:
+    value_col = f"explicit_feat_{spec.name}"
+    legacy_col = f"explicit_conf_{spec.name}"
+    source_col = value_col if value_col in df.columns else legacy_col
+    missing_col = f"{source_col}_missing"
+    if missing_col in df.columns:
+        return df[missing_col].astype(bool).to_numpy()
+    if values is None:
+        values = _explicit_feature_series(df, spec)
+    return values.isna().to_numpy()
+
+
+def _parsimony_role_guard(
+    current_specs: Sequence[ExplicitFeatureSpec],
+    trial_specs: Sequence[ExplicitFeatureSpec],
+) -> Optional[str]:
+    if not trial_specs:
+        return "would_remove_all_features"
+    for role in ["confounder", "effect_modifier"]:
+        had_role = any(role in spec.roles for spec in current_specs)
+        keeps_role = any(role in spec.roles for spec in trial_specs)
+        if had_role and not keeps_role:
+            return f"would_remove_all_{role}_features"
+    return None
+
+
+def _parsimony_metric_snapshot(diagnostic: Dict[str, Any]) -> Dict[str, Any]:
+    metrics = diagnostic.get("metrics", {}) if isinstance(diagnostic, dict) else {}
+    keys = [
+        "n_selected_features",
+        "n_w_features",
+        "n_x_features",
+        "treatment_auroc",
+        "treatment_brier",
+        "treatment_log_loss",
+        "outcome_auroc",
+        "outcome_brier",
+        "outcome_log_loss",
+        "outcome_rmse",
+        "r_loss_mean",
+        "r_loss_relative_improvement",
+        "tau_hat_pseudo_target_corr",
+    ]
+    return {key: metrics.get(key) for key in keys if key in metrics}
+
+
+def _parsimony_removal_decision(
+    *,
+    base_diagnostic: Dict[str, Any],
+    trial_diagnostic: Dict[str, Any],
+    base_gate: Dict[str, Any],
+    trial_gate: Dict[str, Any],
+    nn_config: MultiModelAgenticForestConfig,
+) -> Tuple[bool, List[str], Dict[str, Any]]:
+    base_metrics = base_diagnostic.get("metrics", {})
+    trial_metrics = trial_diagnostic.get("metrics", {})
+    auc_tolerance = float(getattr(nn_config, "parsimony_review_auc_tolerance", 0.01))
+    loss_tolerance = float(
+        getattr(nn_config, "parsimony_review_loss_relative_tolerance", 0.03)
+    )
+    reasons: List[str] = []
+    base_failures = int(base_gate.get("n_failed_criteria", 0) or 0)
+    trial_failures = int(trial_gate.get("n_failed_criteria", 0) or 0)
+    if trial_failures > base_failures:
+        reasons.append("review_gate_would_worsen")
+    deltas: Dict[str, Any] = {}
+    for metric in ["treatment_auroc", "outcome_auroc"]:
+        base_value = _finite_or_none(base_metrics.get(metric))
+        trial_value = _finite_or_none(trial_metrics.get(metric))
+        if base_value is None or trial_value is None:
+            continue
+        delta = float(trial_value - base_value)
+        deltas[metric] = delta
+        if delta < -auc_tolerance:
+            reasons.append(f"{metric}_drop_exceeds_tolerance")
+    for metric in ["treatment_log_loss", "outcome_log_loss", "outcome_rmse", "r_loss_mean"]:
+        base_value = _finite_or_none(base_metrics.get(metric))
+        trial_value = _finite_or_none(trial_metrics.get(metric))
+        if base_value is None or trial_value is None or base_value <= 0.0:
+            continue
+        relative_change = float((trial_value - base_value) / base_value)
+        deltas[f"{metric}_relative_change"] = relative_change
+        if relative_change > loss_tolerance:
+            reasons.append(f"{metric}_increase_exceeds_tolerance")
+    if not reasons:
+        reasons.append("within_parsimony_tolerances")
+    return reasons == ["within_parsimony_tolerances"], reasons, deltas
 
 
 def _extracted_feature_review_benchmarks(
