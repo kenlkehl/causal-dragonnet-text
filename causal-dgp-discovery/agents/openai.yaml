@@ -1,4 +1,4 @@
 interface:
   display_name: "Causal DGP Discovery"
   short_description: "Honest clinical causal-DGP discovery"
-  default_prompt: "Use $causal-dgp-discovery to discover honest text evidence, extract and review candidate variables, revise weak features, and estimate causal-forest ITEs."
+  default_prompt: "Use $causal-dgp-discovery for the lean honest workflow: text evidence, full-document extraction, feature review/iteration, and causal-forest ITEs."

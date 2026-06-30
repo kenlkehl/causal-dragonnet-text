@@ -1,86 +1,92 @@
 ---
 name: causal-dgp-discovery
-description: Use when a coding agent needs to reverse engineer a synthetic clinical causal inference dataset from patient-level clinical text, treatment, and outcome columns; discover confounders and effect modifiers from empirical BoW, embedding-contrast, HTR, attention, attribution, and span evidence rather than upfront variable lists; extract and review candidate variables; run honest nuisance, R-loss, pseudo-outcome, parsimony, and causal-forest analyses; estimate patient-level ITEs; and write a reproducible report.
+description: Use when a coding agent needs to infer confounders and effect modifiers from patient-level clinical text, treatment, and outcome columns; train honest BoW, HTR, embedding-contrast, explicit-feature, and causal-forest models; extract full-document feature values without shortcuts; and produce reproducible patient-level ITEs.
 ---
 
 # Causal DGP Discovery
 
-Use this skill to investigate a synthetic patient-level causal inference dataset with clinical text, treatment, and outcome columns. The goal is to infer the data-generating process: confounders, effect modifiers, functional form, uncertainty, and honest patient-level ITEs.
+Use this skill for clinical-text causal discovery tasks where each row has patient text, treatment, and outcome. The goal is to derive explicit confounders and effect modifiers from empirical text evidence, extract those variables from the complete notes, refine them until they are stable and useful, then fit an honest causal forest.
 
-This skill is harness-agnostic. The invoking agent owns the evidence review, candidate translation, extraction decisions, role assignment, revision loop, and final synthesis. Repository modules with names such as `agentic` are implementation labels, not permission to delegate causal reasoning or final judgment to autonomous proposal/review prompts.
+The coding agent owns the causal reasoning. Repository modules named `agentic` are tools, not authorities. Do not delegate final feature definitions, role decisions, or causal claims to an autonomous proposal prompt.
 
-## Core Rules
 
-- Treat the true DGP, metadata, generation config, oracle columns, and parent-folder benchmark files as off-limits unless the user explicitly asks for evaluation against them.
-- Treat input `clinical_text` in these synthetic causal-discovery tasks as pre-treatment and pre-outcome unless the user explicitly says otherwise. Do not reject evidence-supported concepts merely because they mention treatment planning, regimen history, treatment eligibility, response risk, prognosis, or outcome-associated severity; those are candidate baseline covariates/modifiers, not leakage, when they appear in the provided text. Still do not use the treatment or outcome label columns themselves as features.
-- Start with empirical text-model evidence. Do not begin with a broad hand-built clinical feature inventory.
-- Run BoW/TF-IDF evidence, embedding-contrast retrieval, and HTR/attention evidence before finalizing candidate features.
-- Every workflow step and every gate in the references is mandatory. If a required step cannot run as written, mark its gate `retrying`, record a targeted retry, use only a fallback that still satisfies that gate's evidence type, and leave the gate blocked after retries if the required evidence still cannot be produced. Do not silently skip steps or pass a gate with a partial substitute.
-- Use BoW as broad lexical discovery, embedding contrast as real-text chunk/concept retrieval, and HTR attention/attribution as the span-localization step for baseline or index-time values inside longitudinal notes.
-- In each discovery iteration, run text evidence in this order: nuisance discovery with BoW, embedding contrasts, and HTR; translate confounder candidates; effect-modification discovery with BoW, embedding contrasts, and a separate HTR effect/R-stage attribution pass; translate effect-modifier candidates; harmonize the confounder and effect-modifier candidate lists for one efficient extraction plan; then extract, review, harmonize values, run parsimony, and fit/evaluate efficacy/ITE models.
-- HTR must happen twice per discovery iteration: first for nuisance/confounding evidence, then again for effect-modification/R-stage evidence. A nuisance-only HTR/localization pass does not satisfy the HTR evidence gate.
-- HTR evidence must come from an actual HTR/neural attention or hidden-state attribution workflow, such as `AgenticAttentionVariableForestRunner`, `MultiModelHTREvidenceProvider`, cached hidden-state attribution from a neural text model, or a smaller CPU/GPU run of the same class of neural HTR model. Sparse BoW/TF-IDF models, linear/logistic/Ridge coefficient chunk scoring, dense TF-IDF/SVD chunk retrieval, embedding/concept-probe retrieval, generic chunk localization, or any other lexical/sparse-text substitute must never be labeled HTR and must never pass `htr_evidence_gate`.
-- When GPU access is unavailable or inconsistent, especially when system tools such as `nvidia-smi` see GPUs but the active framework reports no CUDA devices, treat this as a likely harness/sandbox access issue. Follow the active harness approval/escalation mechanism for the GPU probe and HTR command before declaring GPU unavailable. If real HTR evidence still cannot be produced after documented escalation and narrow neural retries, mark `htr_evidence_gate` `blocked_after_retries`; do not proceed to final preflight or final causal-forest claims.
-- For BoW discovery, compare multiple vectorization views when feasible: unigram-focused, default broad, phrase-focused, and rare-signal-friendly variants.
-- Keep discovery context and extraction context distinct: BoW terms, embedding-contrast chunks, and HTR spans are required evidence for considering candidate features, aliases, temporal anchors, and audit targets; they are not sufficient context for accepted downstream feature values.
-- Use clinical knowledge only to translate recurring high-signal text evidence into extractable baseline concepts.
-- Separate confounder discovery from effect-modifier discovery.
-- Keep all model assessment honest: every nuisance prediction, residual, pseudo-outcome, effect estimate, and ITE used for selection or reporting must be out-of-fold for that row.
-- Maintain `workflow_gate_status.json` from the start of the run. Every required gate must be `pass` before final ITE fitting; a failed gate must trigger a targeted retry and `gate_retry_log.jsonl` entry before it can be marked `blocked_after_retries`.
-- Gate failures are repair signals, not stopping points. Diagnose the failed condition, retry the narrowest responsible stage, and re-run the gate. Declare a run blocked only after documented retries at a small enough scope that further progress is infeasible without user input or external access.
-- Use fold-aware univariable screens as supporting diagnostics, not final selection rules. Emphasize effect magnitude, direction, stability, overlap, and missingness at least as much as p values.
-- Do not assume a linear parametric DGP. Fit simple equations only as interpretable summaries after flexible/honest evidence supports them.
-- Keep continuous variables continuous unless fold-level diagnostics justify thresholds.
-- When BoW, embedding, or HTR evidence repeatedly points to laboratory panels, numeric slots, treatment-history/regimen terms, derived quantities, status categories, or eligibility markers, translate the underlying extractable concept before closing the candidate list. Generic phrases such as routine monitoring or broad lab-panel names are audit prompts: inspect the retrieved chunks/spans for specific continuous values, counts, ratios, and clinically meaningful derived quantities instead of dismissing them as nonspecific.
-- Do not use regex, short-window parsers, nearby-number rules, category heuristics, or other shortcut logic as a clinical variable extractor, fallback extractor, or value filler. These brittle rules are especially unsafe for numeric/categorical concepts embedded in dense clinical text, such as biomarker scores, lab values, stages, grades, and treatment regimens.
-- Extraction must be document reading. Agent-based extraction must read each patient's complete `clinical_text` wholesale for the requested concepts, or use a recursive reading strategy whose passes cover the complete note before reconciling to one patient-level value. Evidence-highlighted chunks, BoW terms, HTR spans, or retrieved snippets may guide attention, candidate selection, temporal anchoring, and auditing, but they must not be the only context used to extract a downstream modeling value.
-- Extraction must return structured patient-level values, missingness flags, temporal labels, and brief evidence that is consistent with the full patient note. Endpoint-backed models are extraction backends, not discovery agents.
-- Before starting candidate extraction, ask the user how they want extraction performed. Present exactly these two routes: (1) the invoking agent performs full-document-reading extraction itself and acts as the LLM, using patient, fold, concept, or concept-family shards as needed while preserving complete-note coverage; or (2) the user provides a URL for a running vLLM server or other OpenAI-compatible endpoint to use as the document-reading extraction backend. Do not launch or use a local endpoint, vLLM process, or OpenAI-compatible server unless the user selects route (2) or explicitly authorizes that backend.
-- If no endpoint-backed extractor is available, perform full-document-reading extraction directly with the available agent/harness. For larger datasets, shard by patient, fold, concept, or concept family, but every patient/concept extraction must be based on the complete note or a recursive complete-note pass. Do not shard extraction down to isolated snippets or short windows unless those snippets are only audit aids and the final value is verified against the full note.
-- Audit extraction shards before accepting them. Check that each structured value is consistent with its evidence summary and source text, especially numeric values, categories, temporal anchors, and missingness flags. Audits must include stratified checks across categorical levels and suspicious boundary values, not only random rows.
-- A failed or inconsistent shard is not a run-level blocker by itself. Quarantine the bad shard, diagnose the inconsistency, narrow the shard or concept scope, clarify the extraction prompt/spec, and retry. Escalate from large shards to small shards to single-patient or single-concept retries before declaring extraction blocked.
-- Do not create an all-missing candidate table merely because an extraction endpoint is unavailable. Stop only if extraction remains genuinely infeasible after concrete retry attempts, including smaller shards and inconsistency-focused re-reads. Report the blocker instead of running downstream causal-forest claims.
-- Build `ensemble_nuisance_predictions.parquet` after BoW, HTR, and extracted-feature nuisance predictions are available. Final pseudo-outcomes, R-loss diagnostics, candidate R-signal review, and role decisions must use this full out-of-fold nuisance ensemble. BoW-only R signals are allowed for early discovery, not final review.
-- Before final causal-forest fitting, compare extracted-feature nuisance and effect diagnostics with upstream BoW, embedding-contrast, and HTR evidence. Revise specs, aliases, values, roles, or extraction when extracted features materially underperform.
-- Run `candidate_signal_review.jsonl` before parsimony. Every candidate must have fold-honest treatment nuisance, outcome nuisance, R-pseudo-outcome/R-loss, interaction or treatment-stratified diagnostics, missingness/overlap, and a role decision. Missing candidate-level R diagnostics fail the gate and require retry.
-- Run a mandatory parsimony review before passing variables to the causal forest. Record `retain_all`, `prune`, or `blocked`; `retain_all` is valid when the set is already compact or removals harm honest diagnostics.
-- After final confounders and effect modifiers are settled, fit a real honest causal forest as the final ITE estimator. R-learners, S/T/X-learners, generic random forests, ExtraTrees, XGBoost, or other meta-learners may be diagnostics, but they do not satisfy the final causal-forest requirement.
-- Maintain a running `report.txt` in the task folder with attempts, results, rejected hypotheses, revision decisions, and final outputs.
+## Core Workflow
 
-## Repository Components
+1. **Inspect the dataset.** Identify patient id, clinical text, treatment, outcome, row count, missingness, treatment/outcome rates, treatment-outcome table, note lengths, and chronology assumptions.
+2. **Create folds.** Define external/outer folds and internal/inner folds. Record the split provenance.
+3. **Run nuisance text evidence.** Train cross-fitted BoW/TF-IDF and HTR nuisance models for treatment and outcome. Run embedding contrasts for treatment, outcome, and nuisance residual evidence.
+4. **Interpret confounding evidence.** Review high-signal BoW terms, embedding chunks, and HTR spans. Translate recurring evidence into candidate confounder definitions.
+5. **Build nuisance ensembles.** For each patient, compute a mean out-of-fold treatment prediction and a mean out-of-fold outcome prediction from available BoW, HTR, and later extracted-feature nuisance models. Record source predictions and the averaging rule.
+6. **Compute R signals.** Use the mean ensemble predictions to compute treatment residuals, outcome residuals, R-loss terms, and pseudo-outcomes for each patient. These signals drive effect-modifier discovery and candidate review.
+7. **Run effect-modification evidence.** Use BoW R/pseudo-outcome/interaction views, embedding contrasts for R/orthogonal/within-arm/treatment-outcome signals, and a separate HTR effect/R-stage attribution pass.
+8. **Interpret effect evidence.** Translate highly attended, relevant, or contrasting text into candidate effect-modifier definitions. Keep dual-role variables when evidence supports both confounding and modification.
+9. **Deduplicate and harmonize candidates.** Merge aliases and near-duplicates, define type, categories, units, temporal anchor, missingness rule, value aliases, and roles. Keep continuous variables continuous unless fold-honest diagnostics justify a category.
+10. **Extract feature values.** Extract only the harmonized evidence-supported concepts. Each patient/concept value must come from complete-document reading or complete-document recursive reading. An LLM endpoint may be used as a document-reading backend when explicitly provided or authorized; otherwise the coding agent can shard by patient, fold, concept, or concept family while preserving complete-note coverage.
+11. **Audit and harmonize values.** Check sampled rows, suspicious values, boundary values, missingness, and category levels against the source text. Quarantine bad shards, narrow the scope, re-read the full note, and retry before downstream modeling.
+12. **Review feature signal.** Train fold-honest extracted-feature treatment and outcome nuisance models. Update the nuisance ensemble and R signals. For each candidate, record treatment signal, outcome signal, R-loss/pseudo-outcome or interaction signal, missingness/overlap, upstream text evidence, and role decision.
+13. **Check parsimony.** Inspect inter-feature correlations, categorical contingency, missingness overlap, semantic duplicates, and ablation impact. Retain all only when the set is compact or removals hurt honest diagnostics.
+14. **Iterate.** If nuisance prediction, R-loss, pseudo-outcome, extracted-feature benchmarks, parsimony, overlap, or ITE stability are weak, return to the relevant text evidence. Revise only evidence-supported concepts, re-extract changed concepts, re-harmonize values, and rerun review.
+15. **Fit the causal forest.** Once features and ontologies are stable, fit an honest causal forest using confounder-role features as controls and effect-modifier-role features as heterogeneity features. Save patient-level counterfactual predictions and ITEs with fold/model provenance.
 
-Use these components directly or through any runner that exposes them without giving the runner responsibility for discovery decisions:
+Stop when additional evidence-supported revisions no longer improve honest diagnostics, parsimony, or ITE stability. Document remaining uncertainty instead of forcing a precise DGP.
 
-- **BoW modeling:** `BoWViewConfig`, `default_multi_model_bow_views()`, and sparse cross-fitted BoW helpers in `oci/inference/multi_model_agentic_forest.py`. Inspect fold-specific nuisance, residual, pseudo-target, R-loss, and feature-importance outputs.
-- **Embedding contrasts:** `EmbeddingContrastEvidenceGenerator` in `oci/inference/embedding_contrast_discovery.py`, with chunking and cache helpers in `oci/models/concept_embedding_utils.py` and `oci/models/concept_embedding_cache.py`.
-- **HTR modeling:** `AgenticAttentionVariableForestRunner` in `oci/inference/agentic_attention_variable_forest.py`, and `MultiModelHTREvidenceProvider` when a sparse-text workflow needs reusable HTR nuisance/effect predictions.
-- **Feature attribution:** BoW feature importances, embedding-contrast retrieved chunks/concept probes, and HTR attention/token-span attribution outputs such as nuisance/effect attention evidence.
-- **Extraction:** `ExplicitFeatureSpec`, `ExplicitFeatureExtractionConfig`, `VLLMFeatureExtractor`, `extract_explicit_features()`, `VLLMExplicitFeatureExtractionProvider`, and `oci/extraction/llm_routing.py`.
-- **Final ITEs:** `CausalForestHead` and explicit-feature forest evaluators built on honest `CausalForestDML`.
+## Interpreting Text Evidence
 
-## Workflow
+- **BoW/TF-IDF:** broad lexical discovery for treatment prediction, outcome prediction, residual structure, R targets, and feature recurrence. Compare multiple vectorization views when feasible.
+- **Embedding contrasts:** retrieve real chunks for treatment, outcome, residual, R, within-arm, treatment-outcome cell, orthogonal, and concept-probe contrasts. Chunks are evidence for concepts, not extracted values.
+- **HTR/neural attention:** localize spans for nuisance/confounding and separately for effect/R-stage heterogeneity. HTR must be a real neural attention, hidden-state, or attribution workflow. Sparse BoW chunk scoring, dense TF-IDF/SVD retrieval, embedding retrieval, or generic chunk localization is not HTR.
+- Use clinical knowledge only to translate recurring evidence into extractable baseline concepts. Do not invent variables unsupported by the text evidence.
+- When evidence points to broad families such as labs, monitoring, molecular markers, status labels, regimen history, eligibility, counts, ratios, or derived quantities, inspect the actual chunks/spans and define the specific extractable value.
 
-1. Inspect the dataset schema, row count, note length, missingness, treatment/outcome rates, and note chronology. Write these facts to `report.txt`.
-2. Build honest folds and reuse them across text evidence, extraction review, role evaluation, parsimony, and final reporting.
-3. Start discovery iteration 1 and write its sequence to `discovery_iteration_trace.jsonl`.
-4. Run nuisance/confounder discovery with all three text sources: BoW/TF-IDF nuisance views, embedding contrasts for treatment/outcome/nuisance residuals, and HTR nuisance attention/span attribution.
-5. Translate nuisance evidence into confounder-role candidate specs, recording mapped, merged, and rejected evidence.
-6. Run effect-modification discovery with all three text sources: BoW R/pseudo-outcome/interaction views, embedding contrasts for R, orthogonal R-score, within-arm outcome, treatment-outcome cell, and concept probes, and a separate HTR effect/R-stage attention or attribution pass.
-7. Translate effect evidence into effect-modifier-role candidate specs, recording mapped, merged, and rejected evidence.
-8. Harmonize confounder and effect-modifier candidates before extraction: merge duplicate aliases, preserve dual-role variables, define common value schemas, keep continuous variables continuous, and prepare one efficient extraction plan.
-9. Before extracting evidence-supported concepts, ask the user to choose the extraction route: agent-as-LLM direct document reading, or a user-provided running vLLM/OpenAI-compatible endpoint URL. Then extract only the harmonized evidence-supported concepts by the selected document-reading route. For agent-as-LLM extraction, read complete patient notes wholesale or use a recursive complete-note strategy; do not extract from short windows, regex matches, or rule-generated snippets.
-10. Audit extraction shards, harmonize values/categories/units, and retry only failed rows, concepts, or shards before accepting candidate features.
-11. Review extracted features honestly. Train extracted-feature treatment and outcome nuisance models inside folds, then build or update the full `ensemble_nuisance_predictions.parquet` using all available BoW, HTR, and extracted-feature out-of-fold nuisance predictions.
-12. Run `candidate_signal_review.jsonl` using the full ensemble R signal. For every candidate, record treatment nuisance signal, outcome nuisance signal, R-pseudo-outcome/R-loss signal, interaction or treatment-stratified signal, missingness/overlap, role decision, and retry decision. If any candidate lacks this review, retry the review stage before parsimony.
-13. Run value harmonization review, fold-aware univariable screens, parsimony/redundancy review, and efficacy/ITE modeling diagnostics.
-14. If intra-fold nuisance, R-loss/pseudo-outcome, effect-modification, extracted-feature benchmark, parsimony, overlap, or ITE-stability diagnostics are suboptimal, loop back to the text evidence for a new discovery iteration: re-examine BoW, embedding, and HTR nuisance/effect evidence; add or revise only evidence-supported candidates; re-extract only changed concepts; then repeat value harmonization, parsimony, and efficacy/ITE modeling.
-15. Run the final preflight gate only after the latest iteration has passed extraction audit, candidate signal review, candidate-translation coverage, value harmonization, parsimony, nuisance ensemble, HTR nuisance/effect, and causal-forest configuration checks.
-16. Estimate final ITEs with an honest causal forest fit on finalized confounders and effect modifiers only after all gates pass. Label any non-causal-forest estimates as sensitivity diagnostics.
-17. Stop when additional iterations no longer improve honest nuisance metrics, R-loss/pseudo-outcome metrics, extracted-feature benchmark gaps, fold recurrence, parsimony, or ITE stability. Document remaining uncertainty.
+## Non-Negotiables
 
-## References
+- Do not inspect true DGP files, oracle columns, generation configs, benchmark parent folders, or other answer keys unless the user explicitly asks.
+- Treat supplied `clinical_text` as baseline/pre-treatment/pre-outcome unless the user says otherwise. Treatment planning, prior regimen history, prognosis, eligibility, and severity can be valid baseline signals. The treatment and outcome label columns themselves are never features.
+- Start from empirical text-model evidence. Do not begin with a broad hand-built clinical inventory.
+- Use three text evidence families before finalizing candidates: BoW/TF-IDF, embedding contrasts, and HTR/neural attention or attribution.
+- Keep confounder discovery separate from effect-modifier discovery, then harmonize both candidate lists before extraction.
+- Every prediction, residual, pseudo-outcome, R-loss value, diagnostic, and ITE used for selection or reporting must be out-of-fold for that patient.
+- Clinical variable extraction must read the complete patient document, or a recursive pass that covers the complete document. Do not extract final feature values from regex, short windows, nearby-number rules, isolated snippets, category heuristics, or BoW/HTR/embedding highlights alone.
+- If extracted features underperform the text evidence or R-signal, revise feature definitions, aliases, categories, roles, or extraction. Do not just tune the final forest around weak variables.
+- The final ITE estimator must be a real honest causal forest, such as `CausalForestDML` through `CausalForestHead` or the explicit-feature forest evaluator. Other learners are diagnostics only.
 
-- Read [references/workflow.md](references/workflow.md) for the evidence-first procedure.
-- Read [references/gates.md](references/gates.md) for mandatory gates, retry behavior, and preflight rules.
-- Read [references/repo-pipelines.md](references/repo-pipelines.md) for the reusable repository component map.
-- Read [references/artifacts.md](references/artifacts.md) before writing final outputs.
+## Honest Fold Strategy
+
+Use nested honesty whenever final performance or patient-level ITEs are reported.
+
+- **External/outer folds:** hold out rows for final evaluation and reported ITE predictions. Do not use outer-held-out outcomes, treatment labels, or text evidence to choose features, ontologies, extraction fixes, parsimony decisions, tuning, or stopping rules for that fold.
+- **Internal/inner folds:** run inside each outer-training split. Use them for text evidence, nuisance fitting, candidate decisions, extraction review, value harmonization, parsimony, and model tuning.
+- **Out-of-fold nuisance predictions:** for each row being scored inside the current training split, `e_hat = E[T | text/features]` and `m_hat = E[Y | text/features]` must come from models that did not train on that row.
+- **Final row estimates:** report one prediction per patient from a model that held the row out, or clearly label any post-selection full-data refit as a refit and do not use it as honest performance evidence.
+- Reuse the same fold assignments across BoW, HTR, embedding evidence, extraction review, nuisance ensembles, parsimony, and final reporting whenever possible.
+
+## Extraction Standard
+
+Extraction is document reading, not pattern matching.
+
+- The final value for each patient/concept must be based on the complete note or a recursive pass covering the complete note.
+- Evidence highlights can guide attention, temporal anchoring, aliases, and audits, but they cannot be the only context for accepted values.
+- Return structured values, missingness flags, temporal labels, and brief evidence summaries.
+- Null is valid only when complete-document reading cannot recover the value.
+- Endpoint absence is not a reason to create an all-missing table. Use direct agent reading, smaller shards, or report a blocker after concrete retries.
+- Post-processing may canonicalize values already extracted by document reading; it must not create clinical values from regex or nearby-number rules.
+
+## Minimal Artifacts
+
+Write artifacts in the task folder unless the user asks otherwise.
+
+- `report.txt`: running summary of dataset facts, folds, evidence, feature decisions, retries, final variables, model results, and uncertainty.
+- `text_evidence.*`: fold-specific BoW, embedding, and HTR evidence with source/objective/provenance.
+- `candidate_features.*`: extracted patient-level values, missingness, feature specs, backend, and evidence summaries.
+- `ensemble_nuisance_predictions.*`: source-specific and mean out-of-fold `e_hat` and `m_hat`, residuals, pseudo-outcomes, and R-loss inputs.
+- `candidate_signal_review.*`: per-candidate confounding/modification diagnostics and role decisions.
+- `parsimony_review.*`: redundancy, correlation, missingness, and ablation decisions.
+- `ite_estimates.*`: final causal-forest counterfactual predictions and ITEs with fold/model provenance.
+
+## Useful Repository Components
+
+- BoW and multi-model text evidence: `oci/inference/multi_model_agentic_forest.py`, `BoWViewConfig`, `default_multi_model_bow_views()`.
+- Embedding contrasts: `oci/inference/embedding_contrast_discovery.py`, `oci/models/concept_embedding_utils.py`, `oci/models/concept_embedding_cache.py`.
+- HTR evidence: `oci/inference/agentic_attention_variable_forest.py`, `MultiModelHTREvidenceProvider`.
+- Feature specs and extraction: `ExplicitFeatureSpec`, `ExplicitFeatureExtractionConfig`, `VLLMFeatureExtractor`, `extract_explicit_features()`, `VLLMExplicitFeatureExtractionProvider`, `oci/extraction/llm_routing.py`.
+- Final causal forest: `CausalForestHead`, `CausalForestDML`, and explicit-feature forest evaluators.
