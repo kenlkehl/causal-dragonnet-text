@@ -10,6 +10,7 @@ Maintain this throughout the run. Include:
 - BoW vectorization-suite settings, nuisance/effect metrics, and fold recurrence
 - embedding-contrast retrieval settings and evidence
 - HTR modeling, attention/span attribution evidence, hardware plan, and disable reasons if any
+- discovery iteration trace showing nuisance discovery, confounder translation, effect-modification discovery, effect-modifier translation, harmonized extraction, value harmonization, parsimony, efficacy/ITE diagnostics, and loop-back decisions
 - candidate concepts and why each was proposed from text evidence
 - extraction backend, feature specs, missingness, and extraction rationale
 - post-extraction diagnostics and benchmark-review decisions
@@ -20,6 +21,24 @@ Maintain this throughout the run. Include:
 - final inferred DGP and remaining uncertainty
 - workflow gate status, failed-gate retries, final preflight result, and whether any gate required retry before passing
 - final causal-forest ITE summary and sensitivity comparisons
+
+## `discovery_iteration_trace.jsonl`
+
+Store one record per discovery/review iteration. This artifact makes the temporal order auditable and is required before final preflight.
+
+Each record should include:
+- iteration id and fold context
+- nuisance/confounder discovery artifacts from BoW, embedding contrasts, and HTR nuisance attribution
+- confounder candidate decisions from nuisance evidence
+- effect-modification discovery artifacts from BoW R/interaction evidence, embedding R/orthogonal/within-arm/treatment-outcome/concept-probe contrasts, and HTR effect/R-stage attribution
+- effect-modifier candidate decisions from effect evidence
+- harmonized extraction plan after merging confounder and effect-modifier candidates
+- extraction delta: new concepts, changed concepts, retried concepts, and unchanged concepts reused from prior iterations
+- value harmonization decisions
+- candidate signal review, parsimony, nuisance ensemble, efficacy/ITE diagnostic summaries
+- loop-back trigger when diagnostics are suboptimal, or stop reason when no evidence-supported revision remains
+
+The first extraction in an iteration must happen after both nuisance and effect-modification candidate batches are translated and harmonized. Later iterations should re-extract only changed or newly added concepts unless an audit failure requires a broader retry.
 
 
 ## `workflow_gate_status.json`
@@ -90,14 +109,32 @@ Store one or more records per candidate before parsimony:
 
 This artifact is required before `parsimony_review_by_fold.jsonl`.
 
+## `candidate_translation_coverage.jsonl`
+
+Store a pre-extraction coverage review that proves candidate translation did not silently skip high-signal evidence. This artifact is required before extraction and is referenced by `candidate_signal_review_gate`.
+
+Each record should include:
+- evidence source: `bow`, `embedding_contrast`, `htr_attention`, `htr_attribution`, `ensemble`, or another documented source
+- fold, contrast/objective, rank, score, and evidence identifier or row pointer
+- evidence family: numeric value, laboratory panel, treatment-history/regimen evidence, status category, derived quantity, molecular marker, staging/anatomic finding, functional status, comorbidity, or another explicit family
+- extracted concept decision: `mapped_to_candidate`, `merged_with_candidate`, `rejected`, or `needs_retry`
+- candidate name when mapped or merged
+- rejection reason when rejected
+- reviewer note explaining why the concept is or is not an extractable baseline covariate or effect modifier under the task-level pre-treatment/pre-outcome text assumption
+
+At minimum, cover high-rank/recurrent evidence from outcome, R-pseudo-outcome, orthogonal R-score, within-arm outcome, treatment-outcome cell, and HTR effect/R-stage attribution targets. Generic evidence labels such as routine monitoring or broad lab-panel names should be traced to the specific extractable value, count, ratio, category, or derived quantity present in the retrieved chunks/spans.
+
 ## `final_preflight_check.json`
 
 Before final causal forest fitting, record:
 - all required gates and statuses
+- whether `discovery_iteration_trace.jsonl` exists and shows the required order: nuisance discovery, confounder translation, effect-modification discovery, effect-modifier translation, candidate harmonization, extraction, value harmonization, parsimony, efficacy/ITE diagnostics, and any loop-back iterations
 - whether `ensemble_nuisance_predictions.parquet` exists and contains the final R signal
 - whether every retained candidate appears in `candidate_signal_review.jsonl`
+- whether `candidate_translation_coverage.jsonl` exists and covers high-rank/recurrent numeric, laboratory, treatment-history/regimen, status, and derived-quantity evidence from BoW, embedding, and HTR effect/R-stage outputs
 - whether extraction audit failures were retried or quarantined
 - whether parsimony ran after candidate signal review
+- whether HTR effect/R-stage attribution exists from an accepted HTR/neural attention or hidden-state attribution workflow; nuisance-only HTR evidence is not sufficient, and BoW/TF-IDF chunk scoring, coefficient-based sparse attribution, embedding/concept-probe retrieval, or generic chunk localization must not satisfy this requirement
 - whether the final estimator is a real honest causal forest
 - `decision`: `pass`, `retry_required`, or `blocked_after_retries`
 

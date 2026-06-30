@@ -72,11 +72,11 @@ Useful evidence fields:
 - concept-probe AUC or similarity when available
 - embedding model, chunking, cache, and residualization settings
 
-Use embedding chunks to confirm whether text evidence names a baseline value, a copied historical statement, a post-treatment outcome, or a template artifact.
+Use embedding chunks to identify extractable baseline concepts from real text. Under the default synthetic-task assumption, supplied clinical text is pre-treatment/pre-outcome unless the user states otherwise, so do not reject chunks merely because they mention treatment planning, regimen history, prognosis, or outcome-associated severity. For outcome, R, orthogonal, within-arm, and treatment-outcome contrasts, explicitly inspect chunks for numeric values, laboratory panels, counts, ratios, treatment-history/regimen evidence, status categories, eligibility markers, and derived quantities.
 
 ## HTR Modeling And Attribution
 
-Use HTR modeling to localize the specific spans that drive nuisance or heterogeneity signals in long notes. HTR evidence is especially useful for temporal anchoring, numeric slots, nearby value labels, and repeated longitudinal mentions.
+Use HTR modeling twice in each discovery iteration: first to localize spans that drive nuisance/confounding structure, then again to localize spans that drive effect/R-stage heterogeneity. HTR evidence is especially useful for numeric slots, nearby value labels, treatment-history/regimen spans, status categories, derived quantities, and repeated longitudinal mentions. Both nuisance and effect/R-stage HTR evidence are required by the skill gates.
 
 Relevant repo pieces:
 - `oci/inference/agentic_attention_variable_forest.py`
@@ -97,13 +97,15 @@ Useful HTR outputs:
 - token/span attribution scores and attribution target labels
 
 Use HTR outputs to:
-- separate baseline or index-time facts from post-treatment outcomes
+- localize baseline/index-time facts under the task-level pre-treatment/pre-outcome text assumption
 - locate the note section and local context for a candidate value
 - identify lab labels, values, categories, and temporal qualifiers
-- distinguish true clinical signals from note templates or copied histories
+- distinguish true clinical signals from note templates, copied histories, or broad family labels that need more specific candidate translation
 - support effect-modifier candidates when BoW evidence is unstable
 
-Before GPU-backed HTR runs, record the interpreter, CUDA visibility, device inventory, memory headroom, and worker/device mapping. If GPU access is unavailable, document the limitation and run the smallest honest HTR pass that still produces useful evidence.
+Before GPU-backed HTR runs, record the interpreter, CUDA visibility, device inventory, memory headroom, and worker/device mapping. If GPU access is unavailable or inconsistent, especially when `nvidia-smi` or equivalent system probes show devices but the framework reports no CUDA devices, use the active harness approval/escalation mechanism for the GPU probe and HTR command before declaring GPU unavailable. If GPU remains unavailable, run the smallest honest HTR/neural attention or hidden-state attribution pass that still produces both nuisance and effect/R-stage evidence, using CPU only for the same class of neural HTR workflow. A nuisance-only pass is a failed HTR gate, not a completed HTR stage.
+
+Do not substitute sparse-text evidence for HTR. BoW/TF-IDF models, linear/logistic/Ridge coefficient chunk scoring, dense TF-IDF/SVD chunk retrieval, embedding/concept probes, or generic chunk localization are not HTR modeling or HTR attribution, even when fold-honest and targeted at R-pseudo-outcomes. Record those artifacts under BoW or embedding evidence. If actual HTR/neural attention or hidden-state attribution cannot be produced after documented escalation and narrow neural retries, mark `htr_evidence_gate` `blocked_after_retries` and do not pass final preflight.
 
 ## Feature Extraction
 
@@ -139,6 +141,7 @@ Agent/harness extraction:
 - If no endpoint is available, the invoking agent may perform extraction directly by reading complete patient documents, or by a recursive reading strategy whose sections cover each complete patient document.
 - For larger datasets, shard by patient, fold, concept, or concept family and reconcile findings into one patient-level table. Evidence-highlighted chunks may guide candidate selection, attention, and audit targets, but they must not be the only context for accepted extracted values.
 - Do not proceed to downstream causal-forest claims with an all-missing table caused by backend absence.
+- Extract only after the nuisance/confounder candidate batch and the effect-modifier candidate batch have been harmonized into one extraction specification. In later iterations, re-extract only changed or newly added concepts unless audits require broader retry.
 
 ## Post-Extraction Review
 
@@ -156,6 +159,8 @@ Run fold-honest diagnostics:
 - missingness, category/value coverage, overlap warnings, and role-specific failures
 
 Compare extracted-feature performance to BoW, embedding-contrast, and HTR benchmarks. Large gaps should trigger spec revision, alias/value harmonization, re-role decisions, targeted additions, or targeted re-extraction before final causal-forest fitting.
+
+When gaps remain after extracted-feature review, loop back to the responsible evidence stage rather than only tuning the final model: nuisance gaps go back to BoW/embedding/HTR nuisance evidence, and effect-modifier gaps go back to BoW R/interaction evidence, embedding R/orthogonal/within-arm evidence, and HTR effect/R-stage attribution.
 
 ## Parsimony And Role Review
 
