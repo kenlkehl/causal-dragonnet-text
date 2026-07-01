@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from oci.config import (
     AgenticFeatureSearchConfig,
@@ -869,6 +870,8 @@ def test_multi_model_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path:
     assert "selected_feature_roles" in predictions.columns
     assert "selected_confounder_names" in predictions.columns
     assert "selected_effect_modifier_names" in predictions.columns
+    assert set(predictions["honest_outer_holdout"]) == {True}
+    assert set(predictions["estimation_provenance"]) == {"honest_outer_fold"}
     assert set(predictions["selected_feature_roles"]) == {
         "age[confounder],pd_l1_expression[effect_modifier]"
     }
@@ -913,6 +916,118 @@ def test_multi_model_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path:
     assert (artifact_dir / "bow_view_oof_predictions.parquet").exists()
     assert (artifact_dir / "bow_view_feature_importance_by_fold.jsonl").exists()
     assert (artifact_dir / "agent_candidate_proposals.jsonl").exists()
+    assert (artifact_dir / "report.txt").exists()
+    assert (artifact_dir / "dataset_summary.json").exists()
+    assert (artifact_dir / "split_provenance.jsonl").exists()
+    assert (artifact_dir / "text_evidence.bow.jsonl").exists()
+    assert (artifact_dir / "candidate_features.parquet").exists()
+    assert (artifact_dir / "candidate_signal_review.jsonl").exists()
+    assert (artifact_dir / "ite_estimates.parquet").exists()
+    split_rows = [
+        json.loads(line)
+        for line in (artifact_dir / "split_provenance.jsonl").read_text().splitlines()
+    ]
+    assert split_rows
+    assert all(row["honest_outer_holdout"] for row in split_rows)
+
+
+def test_multi_model_agentic_forest_strict_honest_split_requires_holdout(
+    tmp_path: Path,
+):
+    dataset = pd.DataFrame(
+        {
+            "clinical_text": ["age 55", "age 78", "age 57", "age 76"],
+            "treatment_indicator": [1, 0, 1, 0],
+            "outcome_indicator": [1, 0, 1, 0],
+        }
+    )
+    config = AppliedInferenceConfig(
+        outcome_type="binary",
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        cv_folds=0,
+        architecture=ModelArchitectureConfig(
+            model_type="multi_model_agentic_forest",
+            explicit_feature_forest=ExplicitFeatureForestConfig(inference=False),
+            agentic_feature_search=AgenticFeatureSearchConfig(
+                clinical_text_examples_per_prompt=0,
+            ),
+            multi_model_agentic_forest=MultiModelAgenticForestConfig(
+                nuisance_folds=2,
+                effect_folds=2,
+                bow_views=_linear_test_bow_views(),
+                candidate_consistency_enabled=False,
+                require_honest_outer_split=True,
+                **_disable_required_evidence_test_kwargs(),
+            ),
+        ),
+        explicit_features=ExplicitFeatureExtractionConfig(enabled=True, features=[]),
+    )
+
+    with pytest.raises(ValueError, match="require_honest_outer_split"):
+        run_multi_model_agentic_forest(
+            dataset,
+            config,
+            tmp_path / "predictions.parquet",
+            proposal_agent=EmptyProposalAgent(),
+            extraction_provider=FakeExtractionProvider(),
+            evaluator=FakeEvaluator(),
+        )
+
+
+def test_multi_model_agentic_forest_builtin_extraction_rejects_truncation(
+    tmp_path: Path,
+):
+    dataset = pd.DataFrame(
+        {
+            "clinical_text": [
+                "age 55 baseline marker long note",
+                "age 78 baseline marker long note",
+                "age 57 baseline marker long note",
+                "age 76 baseline marker long note",
+            ],
+            "treatment_indicator": [1, 0, 1, 0],
+            "outcome_indicator": [1, 0, 1, 0],
+        }
+    )
+    config = AppliedInferenceConfig(
+        outcome_type="binary",
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        cv_folds=0,
+        architecture=ModelArchitectureConfig(
+            model_type="multi_model_agentic_forest",
+            explicit_feature_forest=ExplicitFeatureForestConfig(inference=False),
+            agentic_feature_search=AgenticFeatureSearchConfig(
+                clinical_text_examples_per_prompt=0,
+                min_feature_coverage=0.0,
+            ),
+            multi_model_agentic_forest=MultiModelAgenticForestConfig(
+                nuisance_folds=2,
+                effect_folds=2,
+                bow_views=_linear_test_bow_views(),
+                candidate_consistency_enabled=False,
+                extracted_feature_review_enabled=False,
+                **_disable_required_evidence_test_kwargs(),
+            ),
+        ),
+        explicit_features=ExplicitFeatureExtractionConfig(
+            enabled=True,
+            features=[],
+            extraction_max_text_length=10,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="complete-document reading"):
+        run_multi_model_agentic_forest(
+            dataset,
+            config,
+            tmp_path / "predictions.parquet",
+            proposal_agent=FakeProposalAgent(),
+            evaluator=FakeEvaluator(),
+        )
 
 
 def test_multi_model_agentic_forest_adds_embedding_contrast_context(
@@ -1098,6 +1213,15 @@ def test_multi_model_agentic_forest_adds_htr_to_ensemble_and_agent_context(
     assert {"htr_nuisance", "htr_effect"}.issubset(
         set(text_predictions["view_name"].dropna())
     )
+    assert int((text_predictions["view_name"] == "htr_nuisance").sum()) == len(dataset)
+    assert int((text_predictions["view_name"] == "htr_effect").sum()) == len(dataset)
+    ensemble_nuisance = pd.read_parquet(
+        artifact_dir / "ensemble_nuisance_predictions.parquet"
+    )
+    assert {"source", "ensemble_mean"}.issubset(
+        set(ensemble_nuisance["nuisance_record_type"])
+    )
+    assert "htr_effect" not in set(ensemble_nuisance["source_name"].dropna())
     importance_rows = [
         json.loads(line)
         for line in (artifact_dir / "bow_view_feature_importance_by_fold.jsonl")
@@ -1675,6 +1799,8 @@ def test_multi_model_agentic_forest_parses_bow_views_and_embedding_option():
                         "parsimony_review_loss_relative_tolerance": 0.04,
                         "parsimony_review_corr_threshold": 0.8,
                         "parsimony_review_max_single_feature_ablations": 7,
+                        "require_honest_outer_split": True,
+                        "fail_on_extraction_truncation": False,
                         "embedding_contrast": {
                             "enabled": True,
                             "model_name": "Qwen/Qwen3-Embedding-8B",
@@ -1714,6 +1840,8 @@ def test_multi_model_agentic_forest_parses_bow_views_and_embedding_option():
     assert nn_cfg.parsimony_review_loss_relative_tolerance == 0.04
     assert nn_cfg.parsimony_review_corr_threshold == 0.8
     assert nn_cfg.parsimony_review_max_single_feature_ablations == 7
+    assert nn_cfg.require_honest_outer_split is True
+    assert nn_cfg.fail_on_extraction_truncation is False
     assert nn_cfg.embedding_contrast.enabled is True
     assert nn_cfg.embedding_contrast.model_name == "Qwen/Qwen3-Embedding-8B"
     assert nn_cfg.embedding_contrast.chunk_size_words == 128
@@ -1773,6 +1901,13 @@ def test_oracle_multi_model_script_builds_default_and_cli_bow_views():
         "synthetic_data/example_synthetic_datasets/"
         "one_confounder_one_effect_modifier_nsclc_with_structured/dataset.parquet"
     )
+    extracted_dataset_path = dataset_path.parent / "dataset_with_extraction.parquet"
+    assert script._resolve_oracle_parquet_file(str(dataset_path)) == dataset_path
+    assert (
+        script._resolve_oracle_parquet_file(str(dataset_path.parent))
+        == extracted_dataset_path
+    )
+
     cfg = script.MultiModelAgenticOracleConfig(
         dataset_path=str(dataset_path),
         dataset_name="smoke",
@@ -1781,6 +1916,10 @@ def test_oracle_multi_model_script_builds_default_and_cli_bow_views():
     mm_cfg = applied.architecture.multi_model_agentic_forest
     assert len(mm_cfg.bow_views) == 6
     assert mm_cfg.embedding_contrast.enabled is True
+    assert mm_cfg.require_honest_outer_split is True
+    assert mm_cfg.fail_on_extraction_truncation is True
+    assert applied.architecture.agentic_feature_search.agent_model_name == "auto"
+    assert applied.explicit_features.vllm_model_name == "auto"
 
     cfg.bow_view_grid = "cli_single"
     cfg.bow_model = "extratrees"
@@ -1788,6 +1927,8 @@ def test_oracle_multi_model_script_builds_default_and_cli_bow_views():
     cfg.embedding_concept_phrases = ["brain metastases"]
     cfg.extracted_feature_review_enabled = False
     cfg.extracted_feature_review_max_rounds = 1
+    cfg.require_honest_outer_split = False
+    cfg.fail_on_extraction_truncation = False
     applied = script._make_applied_config(cfg, dataset_path)
     mm_cfg = applied.architecture.multi_model_agentic_forest
     assert [view.name for view in mm_cfg.bow_views] == ["cli_view"]
@@ -1796,6 +1937,8 @@ def test_oracle_multi_model_script_builds_default_and_cli_bow_views():
     assert mm_cfg.embedding_contrast.concept_phrases == ["brain metastases"]
     assert mm_cfg.extracted_feature_review_enabled is False
     assert mm_cfg.extracted_feature_review_max_rounds == 1
+    assert mm_cfg.require_honest_outer_split is False
+    assert mm_cfg.fail_on_extraction_truncation is False
 
 
 def test_multi_model_agentic_forest_parses_prespecified_feature_sources(tmp_path):

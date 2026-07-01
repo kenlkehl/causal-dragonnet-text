@@ -328,12 +328,15 @@ training fold, it fits several configured TF-IDF/BoW views with different
 learner and n-gram settings. Each view cross-fits treatment and outcome nuisance
 models, computes its own R-learner pseudo-target, fits a sparse pseudo-target
 model, and sends the per-view outputs plus a cross-view phrase consensus summary
-to the proposal agent. The same path also adds embedding-contrast retrieval and
+to the proposal agent as candidate-generation evidence. The same path also adds
+embedding-contrast retrieval and
 HTR nuisance/effect models: HTR nuisance predictions join the ensemble nuisance
 signal used for R-loss/pseudo-target construction, and attended tokens/spans are
-shown to the proposal agent. The agent proposes explicit confounders and effect
+shown to the proposal agent. The proposal agent is not treated as the causal
+authority: it proposes evidence-supported candidate confounders and effect
 modifiers, optional inner-fold consistency checks stabilize the candidate set,
-the extractor materializes selected variables from text, and a post-extraction
+the extractor materializes selected variables from complete patient notes, and a
+post-extraction
 review step trains simple fold-honest nuisance and R-pseudo-target models on the
 extracted variables. If those extracted-variable models underperform the BoW,
 embedding, or HTR evidence, the agent receives the diagnostics and can revise
@@ -364,7 +367,20 @@ Final artifacts are written under `multi_model_agentic_forest/`, including
 `extracted_feature_diagnostics_by_fold.jsonl`, `parsimony_review_by_fold.jsonl`,
 `selected_feature_sets.json`, and `outer_cv_metrics.csv`. The parsimony review is
 mandatory before final forest fitting; it may record `retain_all` when ablations
-do not justify pruning.
+do not justify pruning. The same run also writes skill-compatible aliases:
+`report.txt`, `text_evidence.bow.jsonl`, `text_evidence.embedding.jsonl`,
+`text_evidence.htr.parquet`, `ensemble_nuisance_predictions.parquet`,
+`candidate_features.parquet`, `candidate_signal_review.jsonl`,
+`parsimony_review.by_fold.jsonl`, and `ite_estimates.parquet`.
+
+Set `architecture.multi_model_agentic_forest.require_honest_outer_split=true`
+to reject runs without cross-validation or an explicit held-out `test` split.
+By default legacy full-data runs are still allowed, but prediction rows are
+labeled `estimation_provenance="full_data_refit_non_honest"`. The built-in
+vLLM extraction provider also refuses to silently truncate notes in this path;
+increase `explicit_features.extraction_max_text_length`, set it to `null`, or
+use a complete-document recursive provider for notes longer than the prompt
+limit.
 
 This path includes embedding-contrast retrieval evidence by default. It pools
 document chunks into patient-level embeddings, builds train-fold treatment,

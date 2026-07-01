@@ -228,14 +228,18 @@ class MultiModelAgenticForestRunner:
         self.bow_prediction_frames: List[pd.DataFrame] = []
         self.htr_nuisance_prediction_frames: List[pd.DataFrame] = []
         self.htr_effect_prediction_frames: List[pd.DataFrame] = []
+        self.ensemble_nuisance_prediction_frames: List[pd.DataFrame] = []
         self.htr_attention_rows: List[Dict[str, Any]] = []
         self.importance_rows: List[Dict[str, Any]] = []
         self.embedding_evidence_rows: List[Dict[str, Any]] = []
         self.agent_rows: List[Dict[str, Any]] = []
         self.extracted_feature_diagnostic_rows: List[Dict[str, Any]] = []
+        self.candidate_signal_review_rows: List[Dict[str, Any]] = []
         self.parsimony_review_rows: List[Dict[str, Any]] = []
         self.feature_set_rows: List[Dict[str, Any]] = []
         self.outer_metric_rows: List[Dict[str, Any]] = []
+        self.split_provenance_rows: List[Dict[str, Any]] = []
+        self.prediction_results: Optional[pd.DataFrame] = None
         self.alias_reference_specs: List[ExplicitFeatureSpec] = self._initial_specs()
 
     def run(self) -> None:
@@ -246,6 +250,7 @@ class MultiModelAgenticForestRunner:
         self._ensure_prespecified_features()
 
         splits = self._analysis_splits()
+        self.split_provenance_rows = self._split_provenance_rows(splits)
         if self._embedding_contrast_enabled() and self.embedding_provider is None:
             self._embedding_contrast_generator().prepare(self.dataset)
         outer_n_jobs = self._outer_n_jobs(len(splits))
@@ -300,12 +305,18 @@ class MultiModelAgenticForestRunner:
                 self.htr_effect_prediction_frames.extend(
                     item.get("htr_effect_prediction_frames", [])
                 )
+                self.ensemble_nuisance_prediction_frames.extend(
+                    item.get("ensemble_nuisance_prediction_frames", [])
+                )
                 self.htr_attention_rows.extend(item.get("htr_attention_rows", []))
                 self.importance_rows.extend(item["importance_rows"])
                 self.embedding_evidence_rows.extend(item["embedding_evidence_rows"])
                 self.agent_rows.extend(item["agent_rows"])
                 self.extracted_feature_diagnostic_rows.extend(
                     item["extracted_feature_diagnostic_rows"]
+                )
+                self.candidate_signal_review_rows.extend(
+                    item.get("candidate_signal_review_rows", [])
                 )
                 self.parsimony_review_rows.extend(
                     item.get("parsimony_review_rows", [])
@@ -367,6 +378,9 @@ class MultiModelAgenticForestRunner:
             "bow_prediction_frames": fold_runner.bow_prediction_frames,
             "htr_nuisance_prediction_frames": fold_runner.htr_nuisance_prediction_frames,
             "htr_effect_prediction_frames": fold_runner.htr_effect_prediction_frames,
+            "ensemble_nuisance_prediction_frames": (
+                fold_runner.ensemble_nuisance_prediction_frames
+            ),
             "htr_attention_rows": fold_runner.htr_attention_rows,
             "importance_rows": fold_runner.importance_rows,
             "embedding_evidence_rows": fold_runner.embedding_evidence_rows,
@@ -374,6 +388,7 @@ class MultiModelAgenticForestRunner:
             "extracted_feature_diagnostic_rows": (
                 fold_runner.extracted_feature_diagnostic_rows
             ),
+            "candidate_signal_review_rows": fold_runner.candidate_signal_review_rows,
             "parsimony_review_rows": fold_runner.parsimony_review_rows,
             "feature_set_rows": fold_runner.feature_set_rows,
             "outer_metric_rows": fold_runner.outer_metric_rows,
@@ -404,11 +419,52 @@ class MultiModelAgenticForestRunner:
             ]
 
         all_idx = np.arange(len(self.dataset))
+        if bool(getattr(self.nn_config, "require_honest_outer_split", False)):
+            raise ValueError(
+                "multi_model_agentic_forest.require_honest_outer_split=True "
+                "requires cv_folds > 1 or a split column with a held-out 'test' split"
+            )
         logger.warning(
             "No held-out split configured for multi_model_agentic_forest; "
             "variable discovery and final estimates will use the full dataset."
         )
         return [(1, all_idx, all_idx)]
+
+    def _split_provenance_rows(
+        self,
+        splits: Sequence[Tuple[int, np.ndarray, np.ndarray]],
+    ) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        if self.config.cv_folds > 1:
+            split_source = "kfold_cv"
+        elif (
+            self.config.split_column in self.dataset.columns
+            and "test" in set(self.dataset[self.config.split_column])
+        ):
+            split_source = "configured_split_column"
+        else:
+            split_source = "full_data_refit"
+        for outer_fold, train_idx, test_idx in splits:
+            train_idx = np.asarray(train_idx, dtype=int)
+            test_idx = np.asarray(test_idx, dtype=int)
+            honest = _split_is_honest(train_idx, test_idx)
+            rows.append(
+                {
+                    "outer_fold": int(outer_fold),
+                    "split_source": split_source,
+                    "train_rows": int(len(train_idx)),
+                    "test_rows": int(len(test_idx)),
+                    "train_row_ids": train_idx.astype(int).tolist(),
+                    "test_row_ids": test_idx.astype(int).tolist(),
+                    "honest_outer_holdout": bool(honest),
+                    "estimation_provenance": (
+                        "honest_outer_fold"
+                        if honest
+                        else "full_data_refit_non_honest"
+                    ),
+                }
+            )
+        return rows
 
     def _run_one_analysis_split(
         self,
@@ -419,7 +475,9 @@ class MultiModelAgenticForestRunner:
         self._ensure_prespecified_features()
         discovery_df = self.dataset.iloc[train_idx].reset_index(drop=True)
         bow_result = self._fit_bow_discovery(discovery_df, outer_fold)
-        self.bow_prediction_frames.append(bow_result["predictions"])
+        self.bow_prediction_frames.append(
+            _non_htr_prediction_frame(bow_result["predictions"])
+        )
         artifact_context = self._artifact_agent_context(bow_result["context"])
         for view in bow_result["importance"].get("views", []) or []:
             feature_importance = {
@@ -491,6 +549,7 @@ class MultiModelAgenticForestRunner:
             bow_context=bow_result["context"],
         )
 
+        self._validate_complete_document_extraction(selected_specs)
         self.dataset = self.extraction_provider.ensure_features(
             self.dataset,
             selected_specs,
@@ -521,6 +580,14 @@ class MultiModelAgenticForestRunner:
         selected_specs = parsimony_result["selected_specs"]
         train_df = self.dataset.iloc[train_idx].copy()
         test_df = self.dataset.iloc[test_idx].copy()
+        signal_review_rows = self._build_candidate_signal_review_rows(
+            outer_fold=outer_fold,
+            train_df=train_df,
+            selected_specs=selected_specs,
+            bow_result=bow_result,
+            embedding_evidence=embedding_evidence,
+        )
+        self.candidate_signal_review_rows.extend(signal_review_rows)
         self.feature_set_rows.append(
             {
                 "outer_fold": int(outer_fold),
@@ -545,7 +612,12 @@ class MultiModelAgenticForestRunner:
             fold_id=outer_fold,
         )
         predictions = final_eval.predictions.copy()
+        honest = _split_is_honest(train_idx, test_idx)
         predictions["outer_fold"] = int(outer_fold)
+        predictions["honest_outer_holdout"] = bool(honest)
+        predictions["estimation_provenance"] = (
+            "honest_outer_fold" if honest else "full_data_refit_non_honest"
+        )
         predictions["selected_feature_names"] = ",".join(
             spec.name for spec in selected_specs
         )
@@ -562,6 +634,10 @@ class MultiModelAgenticForestRunner:
         self.outer_metric_rows.append(
             {
                 "outer_fold": int(outer_fold),
+                "honest_outer_holdout": bool(honest),
+                "estimation_provenance": (
+                    "honest_outer_fold" if honest else "full_data_refit_non_honest"
+                ),
                 "n_selected_features": int(len(selected_specs)),
                 **_prefix_metrics(
                     "extracted_feature_review_",
@@ -639,6 +715,10 @@ class MultiModelAgenticForestRunner:
             explicit_feature_dicts=explicit_feature_dicts,
             explicit_specs=prespecified_specs,
         )
+        if ensemble_result is not None:
+            self.ensemble_nuisance_prediction_frames.append(
+                ensemble_result["nuisance_predictions"]
+            )
 
         if ensemble_result is not None and htr_nuisance_result is not None:
             htr_effect_result = self._fit_htr_effect_discovery(
@@ -1384,6 +1464,10 @@ class MultiModelAgenticForestRunner:
                 "outcome_type": self.config.outcome_type,
             },
             "instructions": [
+                "You are generating candidate variables from empirical text "
+                "evidence. The workflow will validate extraction quality, signal, "
+                "parsimony, and honest causal-forest performance before retaining "
+                "any variable.",
                 "Review every sparse bag-of-words model view. Each view has its "
                 "own honest nuisance predictions, R pseudo-target, metrics, and "
                 "feature-importance summaries.",
@@ -1404,6 +1488,8 @@ class MultiModelAgenticForestRunner:
                 "signal built from BoW nuisance predictions plus HTR nuisance "
                 "predictions, not as a replacement for the BoW views.",
                 "Suggest explicit pre-treatment patient-level variables, not raw text tokens.",
+                "Do not invent broad clinical inventory variables unsupported by "
+                "BoW, embedding, or HTR evidence in this context.",
                 "Use variables predictive of both treatment and outcome as confounders.",
                 "Use variables predictive of the pseudo-target as effect modifiers.",
                 "Avoid near-duplicate aliases for the same extraction target; a "
@@ -2527,6 +2613,7 @@ class MultiModelAgenticForestRunner:
                 break
 
             current_specs = revised_specs
+            self._validate_complete_document_extraction(current_specs)
             self.dataset = self.extraction_provider.ensure_features(
                 self.dataset,
                 current_specs,
@@ -2808,10 +2895,118 @@ class MultiModelAgenticForestRunner:
             )
         return _compact_extracted_feature_review_context(context)
 
+    def _build_candidate_signal_review_rows(
+        self,
+        *,
+        outer_fold: int,
+        train_df: pd.DataFrame,
+        selected_specs: Sequence[ExplicitFeatureSpec],
+        bow_result: Dict[str, Any],
+        embedding_evidence: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for spec in selected_specs:
+            diagnostic = _evaluate_extracted_feature_set_diagnostic(
+                train_df=train_df,
+                specs=[spec],
+                config=self.config,
+                nn_config=self.nn_config,
+                bow_metrics=bow_result.get("metrics", {}),
+                embedding_evidence=embedding_evidence,
+                random_state=81_000 + 100 * int(outer_fold) + len(rows),
+            )
+            metrics = diagnostic.get("metrics", {})
+            extraction_summary = (
+                diagnostic.get("extraction_summary", [{}]) or [{}]
+            )[0]
+            rows.append(
+                {
+                    "outer_fold": int(outer_fold),
+                    "feature": spec.name,
+                    "roles": list(spec.roles),
+                    "type": spec.type,
+                    "categories": spec.categories,
+                    "description": spec.description,
+                    "coverage": extraction_summary.get("coverage"),
+                    "n_unique_observed": extraction_summary.get("n_unique_observed"),
+                    "top_values": extraction_summary.get("top_values", {}),
+                    "treatment_signal": {
+                        "auroc": metrics.get("treatment_auroc"),
+                        "brier": metrics.get("treatment_brier"),
+                        "log_loss": metrics.get("treatment_log_loss"),
+                    },
+                    "outcome_signal": {
+                        "auroc": metrics.get("outcome_auroc"),
+                        "rmse": metrics.get("outcome_rmse"),
+                        "brier": metrics.get("outcome_brier"),
+                        "log_loss": metrics.get("outcome_log_loss"),
+                    },
+                    "r_signal": {
+                        "r_loss_mean": metrics.get("r_loss_mean"),
+                        "r_loss_relative_improvement": metrics.get(
+                            "r_loss_relative_improvement"
+                        ),
+                        "tau_hat_pseudo_target_corr": metrics.get(
+                            "tau_hat_pseudo_target_corr"
+                        ),
+                    },
+                    "role_decision": _candidate_role_decision(spec),
+                    "upstream_evidence": {
+                        "bow_views": int(
+                            len(
+                                (bow_result.get("importance", {}) or {}).get(
+                                    "views",
+                                    [],
+                                )
+                            )
+                        ),
+                        "has_embedding_contrast": bool(embedding_evidence),
+                        "has_htr_attention": bool(bow_result.get("htr_evidence")),
+                    },
+                }
+            )
+        return rows
+
+    def _validate_complete_document_extraction(
+        self,
+        specs: Sequence[ExplicitFeatureSpec],
+    ) -> None:
+        if not specs or not bool(
+            getattr(self.nn_config, "fail_on_extraction_truncation", True)
+        ):
+            return
+        if not isinstance(self.extraction_provider, VLLMExplicitFeatureExtractionProvider):
+            return
+        max_chars = getattr(
+            self.config.explicit_features,
+            "extraction_max_text_length",
+            None,
+        )
+        if max_chars is None:
+            return
+        max_chars = int(max_chars)
+        if max_chars <= 0:
+            return
+        text_lengths = self.dataset[self.config.text_column].fillna("").astype(str).str.len()
+        too_long = text_lengths > max_chars
+        if not bool(too_long.any()):
+            return
+        raise ValueError(
+            "multi_model_agentic_forest final feature extraction requires "
+            "complete-document reading. The built-in VLLM extractor would "
+            f"truncate {int(too_long.sum())} note(s) because "
+            f"explicit_features.extraction_max_text_length={max_chars}. "
+            "Increase extraction_max_text_length, set it to null, use a "
+            "complete-document recursive extraction provider, or set "
+            "multi_model_agentic_forest.fail_on_extraction_truncation=False "
+            "only for non-skill-compatible debugging runs."
+        )
+
     def _ensure_prespecified_features(self) -> None:
         specs = self._initial_specs()
         if not specs:
             return
+        self._validate_complete_document_extraction(specs)
         self.dataset = self.extraction_provider.ensure_features(self.dataset, specs)
 
     def _initial_specs(self) -> List[ExplicitFeatureSpec]:
@@ -2950,27 +3145,155 @@ class MultiModelAgenticForestRunner:
             for fold, (fit_pos, heldout_pos) in split_items
         )
 
+    def _dataset_summary(self) -> Dict[str, Any]:
+        df = self.dataset
+        text_lengths = df[self.config.text_column].fillna("").astype(str).str.len()
+        summary: Dict[str, Any] = {
+            "n_rows": int(len(df)),
+            "row_id_column": "_oci_row_id",
+            "text_column": self.config.text_column,
+            "treatment_column": self.config.treatment_column,
+            "outcome_column": self.config.outcome_column,
+            "outcome_type": self.config.outcome_type,
+            "chronology_assumption": (
+                "clinical_text is treated as baseline/pre-treatment/pre-outcome "
+                "unless the user configuration states otherwise"
+            ),
+            "missingness": {
+                column: float(df[column].isna().mean())
+                for column in [
+                    self.config.text_column,
+                    self.config.treatment_column,
+                    self.config.outcome_column,
+                ]
+                if column in df.columns
+            },
+            "note_length_chars": {
+                "min": _finite_or_none(text_lengths.min()),
+                "median": _finite_or_none(text_lengths.median()),
+                "mean": _finite_or_none(text_lengths.mean()),
+                "max": _finite_or_none(text_lengths.max()),
+            },
+        }
+        if self.config.treatment_column in df.columns:
+            t = pd.to_numeric(df[self.config.treatment_column], errors="coerce")
+            summary["treatment_rate"] = _finite_or_none(t.mean())
+        if self.config.outcome_column in df.columns:
+            y = pd.to_numeric(df[self.config.outcome_column], errors="coerce")
+            summary["outcome_rate_or_mean"] = _finite_or_none(y.mean())
+        if {
+            self.config.treatment_column,
+            self.config.outcome_column,
+        }.issubset(df.columns):
+            table = pd.crosstab(
+                df[self.config.treatment_column],
+                df[self.config.outcome_column],
+                dropna=False,
+            )
+            summary["treatment_outcome_table"] = {
+                str(treatment): {
+                    str(outcome): int(count)
+                    for outcome, count in row.items()
+                }
+                for treatment, row in table.iterrows()
+            }
+        return summary
+
+    def _report_text(self) -> str:
+        summary = self._dataset_summary()
+        honest_rows = [
+            row for row in self.split_provenance_rows if row.get("honest_outer_holdout")
+        ]
+        lines = [
+            "Multi-Model Agentic Forest Skill-Aligned Report",
+            "",
+            "Dataset",
+            f"- Rows: {summary.get('n_rows')}",
+            f"- Text column: {summary.get('text_column')}",
+            f"- Treatment column: {summary.get('treatment_column')}",
+            f"- Outcome column: {summary.get('outcome_column')} ({summary.get('outcome_type')})",
+            f"- Treatment rate: {summary.get('treatment_rate')}",
+            f"- Outcome rate/mean: {summary.get('outcome_rate_or_mean')}",
+            f"- Note length chars: {summary.get('note_length_chars')}",
+            f"- Chronology: {summary.get('chronology_assumption')}",
+            "",
+            "Folds",
+            f"- Outer split rows: {len(self.split_provenance_rows)}",
+            f"- Honest outer holdout folds: {len(honest_rows)}",
+            "",
+            "Evidence And Review",
+            f"- BoW evidence records: {len(self.importance_rows)}",
+            f"- Embedding evidence records: {len(self.embedding_evidence_rows)}",
+            f"- HTR attention records: {len(self.htr_attention_rows)}",
+            f"- Candidate proposal/review records: {len(self.agent_rows)}",
+            f"- Extracted-feature diagnostic records: {len(self.extracted_feature_diagnostic_rows)}",
+            f"- Candidate signal review records: {len(self.candidate_signal_review_rows)}",
+            f"- Parsimony review records: {len(self.parsimony_review_rows)}",
+            "",
+            "Final Variables",
+        ]
+        for row in self.feature_set_rows:
+            lines.append(
+                "- outer_fold={fold}: features={features}; confounders={conf}; "
+                "effect_modifiers={mods}".format(
+                    fold=row.get("outer_fold"),
+                    features=[
+                        item.get("name")
+                        for item in row.get("selected_features", [])
+                        if isinstance(item, dict)
+                    ],
+                    conf=row.get("confounders", []),
+                    mods=row.get("effect_modifiers", []),
+                )
+            )
+        lines.extend(
+            [
+                "",
+                "Artifacts",
+                "- text_evidence.bow.jsonl, text_evidence.embedding.jsonl, text_evidence.htr.parquet",
+                "- ensemble_nuisance_predictions.parquet",
+                "- candidate_features.parquet and candidate_signal_review.jsonl",
+                "- parsimony_review.by_fold.jsonl",
+                "- ite_estimates.parquet",
+            ]
+        )
+        return "\n".join(lines) + "\n"
+
     def _save_predictions(self, results_df: pd.DataFrame) -> None:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.prediction_results = results_df.copy()
         results_df.to_parquet(self.output_path, index=False)
         logger.info("Multi-model agentic forest predictions saved to: %s", self.output_path)
 
     def _save_artifacts(self) -> None:
-        if self.bow_prediction_frames:
-            pd.concat(self.bow_prediction_frames).to_parquet(
+        bow_predictions = (
+            pd.concat(self.bow_prediction_frames, ignore_index=True)
+            if self.bow_prediction_frames
+            else pd.DataFrame()
+        )
+        if not bow_predictions.empty:
+            bow_predictions.to_parquet(
                 self.artifact_dir / "bow_view_oof_predictions.parquet",
                 index=False,
             )
-        text_prediction_frames = list(self.bow_prediction_frames)
+        text_prediction_frames = []
+        if not bow_predictions.empty:
+            text_prediction_frames.append(bow_predictions)
         if self.htr_nuisance_prediction_frames:
-            htr_nuisance = pd.concat(self.htr_nuisance_prediction_frames)
+            htr_nuisance = pd.concat(
+                self.htr_nuisance_prediction_frames,
+                ignore_index=True,
+            )
             htr_nuisance.to_parquet(
                 self.artifact_dir / "htr_nuisance_oof_predictions.parquet",
                 index=False,
             )
             text_prediction_frames.append(htr_nuisance)
         if self.htr_effect_prediction_frames:
-            htr_effect = pd.concat(self.htr_effect_prediction_frames)
+            htr_effect = pd.concat(
+                self.htr_effect_prediction_frames,
+                ignore_index=True,
+            )
             htr_effect.to_parquet(
                 self.artifact_dir / "htr_effect_oof_predictions.parquet",
                 index=False,
@@ -2982,8 +3305,22 @@ class MultiModelAgenticForestRunner:
                 index=False,
             )
         if self.htr_attention_rows:
-            pd.DataFrame(self.htr_attention_rows).to_parquet(
+            htr_attention = pd.DataFrame(self.htr_attention_rows)
+            htr_attention.to_parquet(
                 self.artifact_dir / "htr_attention_evidence.parquet",
+                index=False,
+            )
+            htr_attention.to_parquet(
+                self.artifact_dir / "text_evidence.htr.parquet",
+                index=False,
+            )
+        ensemble_nuisance = _ensemble_nuisance_artifact_frame(
+            source_frames=text_prediction_frames,
+            ensemble_frames=self.ensemble_nuisance_prediction_frames,
+        )
+        if not ensemble_nuisance.empty:
+            ensemble_nuisance.to_parquet(
+                self.artifact_dir / "ensemble_nuisance_predictions.parquet",
                 index=False,
             )
         pd.DataFrame(self.outer_metric_rows).to_csv(
@@ -2991,7 +3328,17 @@ class MultiModelAgenticForestRunner:
             index=False,
         )
         _write_jsonl(
+            self.artifact_dir / "split_provenance.jsonl",
+            self.split_provenance_rows,
+        )
+        with open(self.artifact_dir / "dataset_summary.json", "w") as f:
+            json.dump(self._dataset_summary(), f, indent=2, default=_json_default)
+        _write_jsonl(
             self.artifact_dir / "bow_view_feature_importance_by_fold.jsonl",
+            self.importance_rows,
+        )
+        _write_jsonl(
+            self.artifact_dir / "text_evidence.bow.jsonl",
             self.importance_rows,
         )
         if self.embedding_evidence_rows:
@@ -2999,19 +3346,46 @@ class MultiModelAgenticForestRunner:
                 self.artifact_dir / "embedding_contrast_evidence_by_fold.jsonl",
                 self.embedding_evidence_rows,
             )
+            _write_jsonl(
+                self.artifact_dir / "text_evidence.embedding.jsonl",
+                self.embedding_evidence_rows,
+            )
         if self.extracted_feature_diagnostic_rows:
             _write_jsonl(
                 self.artifact_dir / "extracted_feature_diagnostics_by_fold.jsonl",
                 self.extracted_feature_diagnostic_rows,
+            )
+        if self.candidate_signal_review_rows:
+            _write_jsonl(
+                self.artifact_dir / "candidate_signal_review.jsonl",
+                self.candidate_signal_review_rows,
             )
         if self.parsimony_review_rows:
             _write_jsonl(
                 self.artifact_dir / "parsimony_review_by_fold.jsonl",
                 self.parsimony_review_rows,
             )
+            _write_jsonl(
+                self.artifact_dir / "parsimony_review.by_fold.jsonl",
+                self.parsimony_review_rows,
+            )
         _write_jsonl(self.artifact_dir / "agent_candidate_proposals.jsonl", self.agent_rows)
         with open(self.artifact_dir / "selected_feature_sets.json", "w") as f:
             json.dump(self.feature_set_rows, f, indent=2, default=_json_default)
+        candidate_features = _candidate_features_frame(self.dataset)
+        candidate_features.to_parquet(
+            self.artifact_dir / "candidate_features.parquet",
+            index=False,
+        )
+        with open(self.artifact_dir / "candidate_features.specs.json", "w") as f:
+            json.dump(self.feature_set_rows, f, indent=2, default=_json_default)
+        if self.prediction_results is not None:
+            self.prediction_results.to_parquet(
+                self.artifact_dir / "ite_estimates.parquet",
+                index=False,
+            )
+        with open(self.artifact_dir / "report.txt", "w") as f:
+            f.write(self._report_text())
         logger.info("Multi-model agentic forest artifacts saved to: %s", self.artifact_dir)
 
 
@@ -3052,6 +3426,9 @@ def _run_multi_model_outer_fold_worker(
         "bow_prediction_frames": fold_runner.bow_prediction_frames,
         "htr_nuisance_prediction_frames": fold_runner.htr_nuisance_prediction_frames,
         "htr_effect_prediction_frames": fold_runner.htr_effect_prediction_frames,
+        "ensemble_nuisance_prediction_frames": (
+            fold_runner.ensemble_nuisance_prediction_frames
+        ),
         "htr_attention_rows": fold_runner.htr_attention_rows,
         "importance_rows": fold_runner.importance_rows,
         "embedding_evidence_rows": fold_runner.embedding_evidence_rows,
@@ -3059,6 +3436,7 @@ def _run_multi_model_outer_fold_worker(
         "extracted_feature_diagnostic_rows": (
             fold_runner.extracted_feature_diagnostic_rows
         ),
+        "candidate_signal_review_rows": fold_runner.candidate_signal_review_rows,
         "parsimony_review_rows": fold_runner.parsimony_review_rows,
         "feature_set_rows": fold_runner.feature_set_rows,
         "outer_metric_rows": fold_runner.outer_metric_rows,
@@ -3099,6 +3477,30 @@ def _build_multi_model_inner_candidate_bundle_worker(
 
 def _normalize_texts(values: Sequence[Any]) -> List[str]:
     return [_normalize_text(value) for value in values]
+
+
+def _split_is_honest(train_idx: np.ndarray, test_idx: np.ndarray) -> bool:
+    train_ids = {int(idx) for idx in np.asarray(train_idx, dtype=int).tolist()}
+    test_ids = {int(idx) for idx in np.asarray(test_idx, dtype=int).tolist()}
+    return bool(test_ids) and train_ids.isdisjoint(test_ids)
+
+
+def _non_htr_prediction_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    if "model_family" not in frame.columns:
+        return frame.copy()
+    mask = frame["model_family"].fillna("").astype(str).str.lower() != "htr"
+    return frame.loc[mask].copy()
+
+
+def _candidate_role_decision(spec: ExplicitFeatureSpec) -> str:
+    roles = set(str(role) for role in spec.roles)
+    if {"confounder", "effect_modifier"}.issubset(roles):
+        return "dual_role_confounder_and_effect_modifier"
+    if "confounder" in roles:
+        return "confounder"
+    if "effect_modifier" in roles:
+        return "effect_modifier"
+    return "unspecified_role"
 
 
 def _normalize_text(value: Any) -> str:
@@ -3243,6 +3645,86 @@ def _columns_to_feature_dicts(
             item[f"{spec.name}_missing"] = bool(row.get(missing_col, pd.isna(value)))
         values.append(item)
     return values
+
+
+def _candidate_features_frame(dataset: pd.DataFrame) -> pd.DataFrame:
+    id_cols = [column for column in ["_oci_row_id"] if column in dataset.columns]
+    feature_cols = [
+        column
+        for column in dataset.columns
+        if column.startswith("explicit_feat_")
+    ]
+    cols = [*id_cols, *sorted(feature_cols)]
+    if cols:
+        return dataset[cols].copy()
+    return pd.DataFrame({"_oci_row_id": np.arange(len(dataset), dtype=int)})
+
+
+def _ensemble_nuisance_artifact_frame(
+    *,
+    source_frames: Sequence[pd.DataFrame],
+    ensemble_frames: Sequence[pd.DataFrame],
+) -> pd.DataFrame:
+    rows: List[pd.DataFrame] = []
+    for frame in source_frames:
+        if frame is None or frame.empty or not {"e_hat", "m_hat"}.issubset(frame.columns):
+            continue
+        local = frame.copy()
+        view_name = (
+            local["view_name"].fillna("").astype(str)
+            if "view_name" in local.columns
+            else pd.Series([""] * len(local), index=local.index)
+        )
+        mask = ~view_name.str.startswith("ensemble_r__")
+        mask &= view_name != "htr_effect"
+        local = local.loc[mask].copy()
+        if local.empty:
+            continue
+        local["nuisance_record_type"] = "source"
+        local["source_name"] = _nuisance_source_name(local)
+        if "r_pseudo_outcome" not in local.columns and "pseudo_target" in local.columns:
+            local["r_pseudo_outcome"] = local["pseudo_target"]
+        rows.append(local)
+    for frame in ensemble_frames:
+        if frame is None or frame.empty:
+            continue
+        local = frame.copy()
+        local["nuisance_record_type"] = "ensemble_mean"
+        local["source_name"] = local.get("target_source", "ensemble_mean_nuisance")
+        if "pseudo_target" not in local.columns and "r_pseudo_outcome" in local.columns:
+            local["pseudo_target"] = local["r_pseudo_outcome"]
+        rows.append(local)
+    if not rows:
+        return pd.DataFrame()
+    combined = pd.concat(rows, ignore_index=True, sort=False)
+    preferred = [
+        "_oci_row_id",
+        "outer_fold",
+        "nuisance_fold",
+        "nuisance_record_type",
+        "source_name",
+        "view_name",
+        "target_source",
+        "e_hat",
+        "m_hat",
+        "y_residual",
+        "t_residual",
+        "pseudo_target",
+        "r_pseudo_outcome",
+        "r_loss",
+        "r_loss_at_zero_tau",
+    ]
+    ordered = [column for column in preferred if column in combined.columns]
+    ordered.extend([column for column in combined.columns if column not in ordered])
+    return combined[ordered]
+
+
+def _nuisance_source_name(frame: pd.DataFrame) -> pd.Series:
+    if "view_name" in frame.columns:
+        return frame["view_name"].fillna("").astype(str)
+    if "target_source" in frame.columns:
+        return frame["target_source"].fillna("").astype(str)
+    return pd.Series(["source"] * len(frame), index=frame.index)
 
 
 def _evaluate_extracted_feature_set_diagnostic(

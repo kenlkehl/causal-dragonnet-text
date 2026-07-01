@@ -2323,10 +2323,17 @@ The upstream models are multi-model:
   R signal and highlights attended tokens/spans for treatment, outcome, and
   effect-modifier hypotheses.
 
-Your task is to propose at most {max_proposals} extractable pre-treatment patient-level variables for a downstream causal forest.
+Your task is to propose at most {max_proposals} extractable pre-treatment
+patient-level candidate variables for a downstream causal forest. Your proposals
+are not final causal claims; the workflow will validate complete-document
+extraction, fold-honest signal, parsimony, and held-out ITE provenance before
+retaining variables.
 
 Rules:
 - Propose variables, not raw tokens. Convert token patterns into precise extractable patient-level variables.
+- Start from the supplied empirical text-model evidence. Do not invent a broad
+  hand-built clinical inventory unsupported by BoW, embedding, or HTR evidence
+  in this context.
 - Review all feature_importance.views. Repeated support across views is stronger,
   but a clinically coherent single-view signal can still be worth proposing.
 - Pay special attention to feature_importance.phrase_consensus: it summarizes
@@ -2434,7 +2441,7 @@ def build_multi_model_agentic_extracted_feature_review_prompt(
 
 The outer test fold is not included here. All diagnostics come from cross-fitted models on the current outer-training fold only.
 
-The selected variables have already been extracted from clinical text. Simple nuisance and R/pseudo-target models were trained on those extracted values and compared with the original multi-view BoW, embedding-contrast, and HTR evidence. Your task is to revise the explicit feature set when the extracted variables do not preserve the confounder or effect-modifier signal seen upstream.
+The selected candidate variables have already been extracted from clinical text. Simple nuisance and R/pseudo-target models were trained on those extracted values and compared with the original multi-view BoW, embedding-contrast, and HTR evidence. Your task is to propose evidence-supported revisions when the extracted variables do not preserve the confounder or effect-modifier signal seen upstream.
 
 Return JSON only with this shape:
 {{
@@ -2458,6 +2465,7 @@ Rules:
 - Use remove when an agent-added feature is too sparse, constant, redundant, post-treatment, or unsupported by diagnostics.
 - Do not remove required_features; propose role updates for them only when diagnostics justify it.
 - Add a replacement only when the BoW/embedding/HTR evidence points to a clearer extractable pre-treatment patient-level variable.
+- Do not add variables from general clinical intuition alone; tie revisions to the supplied upstream evidence or extracted-feature diagnostics.
 - For categorical variables, provide 2-8 mutually exclusive categories.
 - Do not use treatment choice, post-treatment response, toxicity after treatment, survival, or outcome-derived variables.
 - Use "none" if the current extracted feature set is the best defensible set despite the diagnostic gap.

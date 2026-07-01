@@ -33,7 +33,7 @@ from oci.config import (  # noqa: E402
 from oci.inference.multi_model_agentic_forest import (  # noqa: E402
     run_multi_model_agentic_forest,
 )
-from run_oracle_experiments import _resolve_parquet_file  # noqa: E402
+from run_oracle_experiments import _resolve_parquet_file as _shared_resolve_parquet_file  # noqa: E402
 
 
 logging.basicConfig(
@@ -80,6 +80,8 @@ class MultiModelAgenticOracleConfig:
     extracted_feature_review_auc_margin: float = 0.02
     extracted_feature_review_loss_relative_margin: float = 0.05
     extracted_feature_review_min_benchmark_auc: float = 0.55
+    require_honest_outer_split: bool = True
+    fail_on_extraction_truncation: bool = True
     outer_parallelism: str = "1"
     bow_parallel_backend: str = "processes"
     fold_parallelism: str = "auto"
@@ -112,7 +114,7 @@ class MultiModelAgenticOracleConfig:
 
     min_feature_coverage: float = 0.70
     agent_server_url: str = "http://localhost:8000/v1"
-    agent_model_name: str = "Qwen/Qwen3.6-27B"
+    agent_model_name: str = "auto"
     agent_api_key: str = "EMPTY"
     agent_temperature: float = 0.0
     agent_max_tokens: int = 25000
@@ -124,7 +126,7 @@ class MultiModelAgenticOracleConfig:
     agent_save_raw_output: bool = False
 
     extraction_server_url: str = "http://localhost:8000/v1"
-    extraction_model_name: str = "Qwen/Qwen3.6-27B"
+    extraction_model_name: str = "auto"
     extraction_mode: str = "server"
     extraction_reasoning_parser: Optional[str] = "auto"
     extraction_batch_size: int = 100
@@ -212,6 +214,8 @@ def _make_applied_config(
                 extracted_feature_review_min_benchmark_auc=(
                     config.extracted_feature_review_min_benchmark_auc
                 ),
+                require_honest_outer_split=config.require_honest_outer_split,
+                fail_on_extraction_truncation=config.fail_on_extraction_truncation,
                 outer_parallelism=config.outer_parallelism,
                 bow_parallel_backend=config.bow_parallel_backend,
                 fold_parallelism=config.fold_parallelism,
@@ -346,6 +350,24 @@ def _bow_views_for_config(config: MultiModelAgenticOracleConfig) -> List[BoWView
     )
 
 
+def _resolve_oracle_parquet_file(dataset_path: str) -> Path:
+    """Resolve either a direct parquet file or an oracle dataset directory."""
+    path = Path(dataset_path).expanduser()
+    if path.is_file():
+        if path.suffix != ".parquet":
+            raise ValueError(
+                f"--dataset must be a parquet file or dataset directory: {path}"
+            )
+        return path
+    parquet_file = _shared_resolve_parquet_file(str(path))
+    if parquet_file is None:
+        raise FileNotFoundError(
+            f"Could not resolve --dataset {dataset_path!r}. Pass a parquet file, "
+            "or a directory containing dataset_with_extraction.parquet or dataset.parquet."
+        )
+    return parquet_file
+
+
 def _load_dataset(config: MultiModelAgenticOracleConfig, parquet_file: Path) -> pd.DataFrame:
     df = pd.read_parquet(parquet_file).reset_index(drop=True)
     if config.sample_size is not None and config.sample_size < len(df):
@@ -410,7 +432,7 @@ def _metrics(results_df: pd.DataFrame) -> Dict[str, Any]:
 
 
 def _run_one(config: MultiModelAgenticOracleConfig, output_dir: Path) -> Dict[str, Any]:
-    parquet_file = _resolve_parquet_file(config.dataset_path)
+    parquet_file = _resolve_oracle_parquet_file(config.dataset_path)
     df = _load_dataset(config, parquet_file)
     applied = _make_applied_config(config, parquet_file)
     run_hash = config.config_hash()
@@ -572,6 +594,23 @@ def main() -> None:
         default=0.55,
         help="Minimum benchmark AUC before an AUC comparison is enforced.",
     )
+    parser.add_argument(
+        "--allow-full-data-refit",
+        action="store_true",
+        help=(
+            "Allow n_folds <= 1 or no held-out split. Outputs will be labeled "
+            "full_data_refit_non_honest; default oracle runs require honest folds."
+        ),
+    )
+    parser.add_argument(
+        "--allow-extraction-truncation",
+        action="store_true",
+        help=(
+            "Allow the built-in extraction backend to truncate long notes. This is "
+            "for debugging only; skill-aligned oracle runs should keep the default "
+            "complete-document guard."
+        ),
+    )
 
     parser.add_argument(
         "--enable-embedding-contrast",
@@ -669,7 +708,11 @@ def main() -> None:
         default="http://localhost:8000/v1",
         help="OpenAI-compatible agent endpoint, or comma-separated endpoints.",
     )
-    parser.add_argument("--agent-model-name", default="Qwen/Qwen3.6-27B")
+    parser.add_argument(
+        "--agent-model-name",
+        default="auto",
+        help="Agent model id, or 'auto' to use the first id returned by /v1/models.",
+    )
     parser.add_argument("--agent-api-key", default="EMPTY")
     parser.add_argument("--agent-max-tokens", type=int, default=25000)
     parser.add_argument("--agent-request-max-retries", type=int, default=3)
@@ -686,7 +729,11 @@ def main() -> None:
         default="http://localhost:8000/v1",
         help="OpenAI-compatible extraction endpoint, or comma-separated endpoints.",
     )
-    parser.add_argument("--extraction-model-name", default="Qwen/Qwen3.6-27B")
+    parser.add_argument(
+        "--extraction-model-name",
+        default="auto",
+        help="Extraction model id, or 'auto' to use the first id returned by /v1/models.",
+    )
     parser.add_argument(
         "--extraction-mode",
         default="server",
@@ -752,6 +799,8 @@ def main() -> None:
         extracted_feature_review_min_benchmark_auc=(
             args.extracted_feature_review_min_benchmark_auc
         ),
+        require_honest_outer_split=not args.allow_full_data_refit,
+        fail_on_extraction_truncation=not args.allow_extraction_truncation,
         outer_parallelism=args.outer_parallelism,
         bow_parallel_backend=args.bow_parallel_backend,
         fold_parallelism=args.fold_parallelism,

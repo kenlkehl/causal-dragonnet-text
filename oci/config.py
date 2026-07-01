@@ -765,8 +765,9 @@ class MultiModelAgenticForestConfig:
     This pathway uses multiple cross-fitted sparse text-model views,
     embedding-contrast retrieval, and HTR attention/span evidence to produce
     agent-facing evidence.
-    The proposal agent still defines explicit patient-level variables for
-    downstream extraction and CausalForestDML fitting.
+    The proposal agent is used as a candidate-generation tool. Downstream
+    extraction review, parsimony review, and honest causal-forest fitting decide
+    which explicit patient-level variables are retained.
     """
 
     nuisance_folds: int = 5
@@ -801,6 +802,12 @@ class MultiModelAgenticForestConfig:
     parsimony_review_loss_relative_tolerance: float = 0.03
     parsimony_review_corr_threshold: float = 0.75
     parsimony_review_max_single_feature_ablations: int = 30
+    # Compatibility default: allow legacy full-data runs, but label them as
+    # non-honest. Set true to require CV or an explicit held-out test split.
+    require_honest_outer_split: bool = False
+    # Final accepted values must come from complete-document reading. This guard
+    # prevents the current LLM extractor from silently using only the note tail.
+    fail_on_extraction_truncation: bool = True
     outer_parallelism: str = "1"
     bow_parallel_backend: str = "processes"
     # "auto" uses the runner num_workers setting; set a positive integer to
