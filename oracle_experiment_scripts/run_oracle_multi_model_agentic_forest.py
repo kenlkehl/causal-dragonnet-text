@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from oci.config import (  # noqa: E402
     AgenticFeatureSearchConfig,
+    AgenticAttentionVariableForestConfig,
     AppliedInferenceConfig,
     BoWViewConfig,
     EmbeddingContrastDiscoveryConfig,
@@ -85,12 +86,15 @@ class MultiModelAgenticOracleConfig:
     outer_parallelism: str = "1"
     bow_parallel_backend: str = "processes"
     fold_parallelism: str = "auto"
+    htr_device: Optional[str] = "cuda:0"
+    htr_gpu_ids: Optional[List[int]] = None
 
     embedding_contrast_enabled: bool = True
     embedding_model_name: str = "Qwen/Qwen3-Embedding-8B"
     embedding_cache_dir: Optional[str] = None
     embedding_device: Optional[str] = None
     embedding_batch_size: int = 16
+    embedding_max_seq_length: Optional[int] = 1024
     embedding_chunk_size_words: int = 256
     embedding_chunk_overlap_words: int = 64
     embedding_max_chunks: int = 64
@@ -122,8 +126,8 @@ class MultiModelAgenticOracleConfig:
     agent_retry_initial_delay: float = 1.0
     agent_retry_max_delay: float = 30.0
     agent_retry_backoff_factor: float = 2.0
-    agent_save_context: bool = False
-    agent_save_raw_output: bool = False
+    agent_save_context: bool = True
+    agent_save_raw_output: bool = True
 
     extraction_server_url: str = "http://localhost:8000/v1"
     extraction_model_name: str = "auto"
@@ -191,6 +195,11 @@ def _make_applied_config(
                 save_agent_raw_output=config.agent_save_raw_output,
                 random_state=config.seed,
             ),
+            agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
+                nuisance_folds=config.nuisance_folds,
+                effect_folds=config.effect_folds,
+                fold_parallelism=config.fold_parallelism,
+            ),
             multi_model_agentic_forest=MultiModelAgenticForestConfig(
                 nuisance_folds=config.nuisance_folds,
                 effect_folds=config.effect_folds,
@@ -230,6 +239,7 @@ def _make_applied_config(
                     cache_dir=config.embedding_cache_dir,
                     device=config.embedding_device,
                     batch_size=config.embedding_batch_size,
+                    max_seq_length=config.embedding_max_seq_length,
                     chunk_size_words=config.embedding_chunk_size_words,
                     chunk_overlap_words=config.embedding_chunk_overlap_words,
                     max_chunks=config.embedding_max_chunks,
@@ -450,6 +460,8 @@ def _run_one(config: MultiModelAgenticOracleConfig, output_dir: Path) -> Dict[st
         df,
         applied,
         prediction_path,
+        device=config.htr_device,
+        gpu_ids=config.htr_gpu_ids,
         num_workers=config.num_workers,
     )
     results_df = pd.read_parquet(prediction_path)
@@ -636,6 +648,15 @@ def main() -> None:
     )
     parser.add_argument("--embedding-device", default=None)
     parser.add_argument("--embedding-batch-size", type=int, default=16)
+    parser.add_argument(
+        "--embedding-max-seq-length",
+        type=int,
+        default=1024,
+        help=(
+            "Maximum tokenizer length, in model tokens, for embedding-contrast "
+            "chunks. Chunks longer than this are split before encoding."
+        ),
+    )
     parser.add_argument("--embedding-chunk-size-words", type=int, default=256)
     parser.add_argument("--embedding-chunk-overlap-words", type=int, default=64)
     parser.add_argument("--embedding-max-chunks", type=int, default=64)
@@ -691,8 +712,24 @@ def main() -> None:
         "--fold-parallelism",
         default="auto",
         help=(
-            "Parallelism for BoW nuisance/effect cross-fit folds: 'auto' uses "
-            "num_workers from the runner, or pass a positive integer."
+            "Parallelism for BoW nuisance/effect cross-fit folds and nested HTR "
+            "evidence training folds: 'auto' uses num_workers from the runner, "
+            "or pass a positive integer."
+        ),
+    )
+    parser.add_argument(
+        "--htr-device",
+        default="cuda:0",
+        help="Torch device for nested HTR evidence training. Defaults to cuda:0.",
+    )
+    parser.add_argument(
+        "--htr-gpu-ids",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional CUDA device ids for distributing nested HTR training folds. "
+            "Requires --htr-device to be a CUDA device."
         ),
     )
 
@@ -719,8 +756,24 @@ def main() -> None:
     parser.add_argument("--agent-retry-initial-delay", type=float, default=1.0)
     parser.add_argument("--agent-retry-max-delay", type=float, default=30.0)
     parser.add_argument("--agent-retry-backoff-factor", type=float, default=2.0)
-    parser.add_argument("--agent-save-context", action="store_true")
-    parser.add_argument("--agent-save-raw-output", action="store_true")
+    parser.add_argument(
+        "--agent-save-context",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Save agent prompt/context payloads in artifacts. Use "
+            "--no-agent-save-context to omit them."
+        ),
+    )
+    parser.add_argument(
+        "--agent-save-raw-output",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Save raw agent LLM outputs in artifacts. Use "
+            "--no-agent-save-raw-output to omit them."
+        ),
+    )
 
     parser.add_argument(
         "--extraction-server-url",
@@ -804,11 +857,14 @@ def main() -> None:
         outer_parallelism=args.outer_parallelism,
         bow_parallel_backend=args.bow_parallel_backend,
         fold_parallelism=args.fold_parallelism,
+        htr_device=args.htr_device,
+        htr_gpu_ids=args.htr_gpu_ids,
         embedding_contrast_enabled=args.enable_embedding_contrast,
         embedding_model_name=args.embedding_model_name,
         embedding_cache_dir=args.embedding_cache_dir,
         embedding_device=args.embedding_device,
         embedding_batch_size=args.embedding_batch_size,
+        embedding_max_seq_length=args.embedding_max_seq_length,
         embedding_chunk_size_words=args.embedding_chunk_size_words,
         embedding_chunk_overlap_words=args.embedding_chunk_overlap_words,
         embedding_max_chunks=args.embedding_max_chunks,

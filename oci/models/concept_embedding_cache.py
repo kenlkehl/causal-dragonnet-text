@@ -16,13 +16,14 @@ from typing import List, Optional, Tuple
 import numpy as np
 import torch
 
-from .concept_embedding_utils import chunk_text_words
+from .concept_embedding_utils import chunk_text_words, split_text_to_token_chunks
 from .hidden_state_cache import VariableLengthArray, VariableLengthMaskArray
 
 
 logger = logging.getLogger(__name__)
 
 _SENTENCE_TRANSFORMER_CACHE = {}
+_CHUNK_TEXTS_FILENAME = "chunk_texts.jsonl"
 
 
 def _is_cuda_oom(exc: BaseException) -> bool:
@@ -32,7 +33,47 @@ def _is_cuda_oom(exc: BaseException) -> bool:
     return "cuda" in message and "out of memory" in message
 
 
-def load_sentence_transformer(model_name: str, device: Optional[torch.device] = None):
+def _clear_cuda_memory() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            logger.debug("torch.cuda.ipc_collect failed", exc_info=True)
+
+
+def _apply_max_seq_length(encoder, max_seq_length: Optional[int]) -> None:
+    if max_seq_length is None:
+        return
+    max_seq_length = int(max_seq_length)
+    current = getattr(encoder, "max_seq_length", None)
+    try:
+        current_int = int(current) if current is not None else None
+    except (TypeError, ValueError):
+        current_int = None
+    if current_int is not None and current_int <= max_seq_length:
+        return
+    try:
+        encoder.max_seq_length = max_seq_length
+        logger.info(
+            "Capped SentenceTransformer max_seq_length at %d (model default was %s)",
+            max_seq_length,
+            current if current is not None else "unknown",
+        )
+    except Exception:
+        logger.warning(
+            "Failed to set SentenceTransformer max_seq_length=%d",
+            max_seq_length,
+            exc_info=True,
+        )
+
+
+def load_sentence_transformer(
+    model_name: str,
+    device: Optional[torch.device] = None,
+    max_seq_length: Optional[int] = None,
+):
     """Load a sentence-transformer model lazily."""
     try:
         from sentence_transformers import SentenceTransformer
@@ -42,13 +83,15 @@ def load_sentence_transformer(model_name: str, device: Optional[torch.device] = 
             "Install the project dependency or run: pip install sentence-transformers"
         ) from exc
     model_device = str(device) if device is not None else None
-    key = (model_name, model_device)
+    max_seq_key = int(max_seq_length) if max_seq_length is not None else None
+    key = (model_name, model_device, max_seq_key)
     if key not in _SENTENCE_TRANSFORMER_CACHE:
         encoder = SentenceTransformer(
             model_name,
             device=model_device,
             model_kwargs={"torch_dtype": torch.float32},
         )
+        _apply_max_seq_length(encoder, max_seq_key)
         encoder.float()
         encoder.eval()
         _SENTENCE_TRANSFORMER_CACHE[key] = encoder
@@ -62,19 +105,13 @@ def clear_sentence_transformer_cache(
     """Drop cached sentence-transformer instances so GPU memory can be reused."""
     device_names = {str(device) for device in devices} if devices is not None else None
     for key in list(_SENTENCE_TRANSFORMER_CACHE):
-        cached_model_name, cached_device = key
+        cached_model_name, cached_device, _ = key
         if model_name is not None and cached_model_name != model_name:
             continue
         if device_names is not None and cached_device not in device_names:
             continue
         del _SENTENCE_TRANSFORMER_CACHE[key]
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        try:
-            torch.cuda.ipc_collect()
-        except Exception:
-            logger.debug("torch.cuda.ipc_collect failed", exc_info=True)
+    _clear_cuda_memory()
 
 
 def _coerce_embedding_matrix(
@@ -105,6 +142,40 @@ def _coerce_embedding_matrix(
     return batch_embeddings, embedding_dim
 
 
+def _get_sentence_transformer_tokenizer(encoder):
+    tokenizer = getattr(encoder, "tokenizer", None)
+    if tokenizer is not None:
+        return tokenizer
+    first_module = getattr(encoder, "_first_module", None)
+    if callable(first_module):
+        module = first_module()
+        tokenizer = getattr(module, "tokenizer", None)
+        if tokenizer is not None:
+            return tokenizer
+    try:
+        module = encoder[0]
+        tokenizer = getattr(module, "tokenizer", None)
+        if tokenizer is not None:
+            return tokenizer
+    except Exception:
+        pass
+    return None
+
+
+def _effective_max_seq_length(encoder, requested_max_seq_length: Optional[int]):
+    if requested_max_seq_length is None:
+        return None
+    requested = int(requested_max_seq_length)
+    current = getattr(encoder, "max_seq_length", None)
+    try:
+        current_int = int(current) if current is not None else None
+    except (TypeError, ValueError):
+        current_int = None
+    if current_int is not None and current_int > 0:
+        return min(requested, current_int)
+    return requested
+
+
 class ConceptEmbeddingCache:
     """Cache of sentence-transformer embeddings for overlapping text chunks.
 
@@ -123,6 +194,7 @@ class ConceptEmbeddingCache:
         max_chunks: int,
         normalize_embeddings: bool = True,
         chunk_selection: str = "first",
+        max_seq_length: Optional[int] = None,
     ):
         self._cache_dir = Path(cache_dir)
         self._sentence_model_name = sentence_model_name
@@ -132,6 +204,9 @@ class ConceptEmbeddingCache:
         self._max_chunks = max_chunks
         self._normalize_embeddings = normalize_embeddings
         self._chunk_selection = str(chunk_selection).strip().lower()
+        self._max_seq_length = (
+            int(max_seq_length) if max_seq_length is not None else None
+        )
         self._cache_hash = self.compute_cache_hash(
             sentence_model_name=sentence_model_name,
             dataset_path=dataset_path,
@@ -140,6 +215,7 @@ class ConceptEmbeddingCache:
             max_chunks=max_chunks,
             normalize_embeddings=normalize_embeddings,
             chunk_selection=self._chunk_selection,
+            max_seq_length=self._max_seq_length,
         )
         self._cache_path = self._cache_dir / f"cecnn_chunk_embeddings_{self._cache_hash}"
         self._flat_mmap = None
@@ -157,6 +233,7 @@ class ConceptEmbeddingCache:
         max_chunks: int,
         normalize_embeddings: bool = True,
         chunk_selection: str = "first",
+        max_seq_length: Optional[int] = None,
     ) -> str:
         key = "|".join(
             [
@@ -167,6 +244,9 @@ class ConceptEmbeddingCache:
                 f"max{max_chunks}",
                 f"norm{int(normalize_embeddings)}",
                 f"select{str(chunk_selection).strip().lower()}",
+                "tokmax"
+                f"{int(max_seq_length) if max_seq_length is not None else 'model'}",
+                "chunker_word_then_token_bound_v1",
             ]
         )
         return hashlib.md5(key.encode()).hexdigest()[:12]
@@ -232,7 +312,10 @@ class ConceptEmbeddingCache:
             meta_path = self._cache_path / "metadata.json"
             emb_path = self._cache_path / "chunk_embeddings.npy"
             offsets_path = self._cache_path / "offsets.npy"
-            if not all(p.exists() for p in [meta_path, emb_path, offsets_path]):
+            chunks_path = self._cache_path / _CHUNK_TEXTS_FILENAME
+            if not all(
+                p.exists() for p in [meta_path, emb_path, offsets_path, chunks_path]
+            ):
                 return False
 
             self._load_metadata()
@@ -251,10 +334,78 @@ class ConceptEmbeddingCache:
                 return False
             if embeddings.shape[1] != int(self._metadata["hidden_size"]):
                 return False
+            chunks_by_sample = self.load_chunks(expected_num_samples)
+            if len(chunks_by_sample) != expected_num_samples:
+                return False
+            if sum(len(chunks) for chunks in chunks_by_sample) != int(offsets[-1]):
+                return False
             return True
         except Exception as exc:
             logger.warning("Concept embedding cache validation failed: %s", exc)
             return False
+
+    def load_chunks(self, expected_num_samples: Optional[int] = None) -> List[List[str]]:
+        chunks_path = self._cache_path / _CHUNK_TEXTS_FILENAME
+        chunks_by_sample: List[List[str]] = []
+        with open(chunks_path, encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    payload = json.loads(line)
+                    chunks = payload.get("chunks", [])
+                    chunks_by_sample.append([str(chunk) for chunk in chunks])
+        if expected_num_samples is not None and len(chunks_by_sample) != int(
+            expected_num_samples
+        ):
+            raise RuntimeError(
+                "Chunk text cache has "
+                f"{len(chunks_by_sample)} samples; expected {expected_num_samples}"
+            )
+        return chunks_by_sample
+
+    def _write_chunks(self, sample_chunks: List[List[str]]) -> None:
+        chunks_path = self._cache_path / _CHUNK_TEXTS_FILENAME
+        with open(chunks_path, "w", encoding="utf-8") as f:
+            for chunks in sample_chunks:
+                f.write(json.dumps({"chunks": chunks}, ensure_ascii=False) + "\n")
+
+    def _chunk_texts(
+        self,
+        texts: List[str],
+        tokenizer=None,
+        max_seq_length: Optional[int] = None,
+    ) -> List[List[str]]:
+        sample_chunks = [
+            chunk_text_words(
+                text,
+                self._chunk_size_words,
+                self._chunk_overlap_words,
+                self._max_chunks,
+                self._chunk_selection,
+            )
+            for text in texts
+        ]
+        if tokenizer is None or max_seq_length is None:
+            return sample_chunks
+
+        token_bounded_chunks: List[List[str]] = []
+        for chunks in sample_chunks:
+            split_chunks: List[str] = []
+            for chunk in chunks:
+                split_chunks.extend(
+                    split_text_to_token_chunks(
+                        chunk,
+                        tokenizer,
+                        max_seq_length=int(max_seq_length),
+                        chunk_overlap_tokens=int(self._chunk_overlap_words),
+                    )
+                )
+            if len(split_chunks) > self._max_chunks:
+                if self._chunk_selection == "first":
+                    split_chunks = split_chunks[: self._max_chunks]
+                else:
+                    split_chunks = split_chunks[-self._max_chunks :]
+            token_bounded_chunks.append(split_chunks or [""])
+        return token_bounded_chunks
 
     def precompute(
         self,
@@ -270,16 +421,26 @@ class ConceptEmbeddingCache:
             self._sentence_model_name,
         )
 
-        sample_chunks = [
-            chunk_text_words(
-                text,
-                self._chunk_size_words,
-                self._chunk_overlap_words,
-                self._max_chunks,
-                self._chunk_selection,
+        encoder = load_sentence_transformer(
+            self._sentence_model_name,
+            device=device,
+            max_seq_length=self._max_seq_length,
+        )
+        tokenizer = _get_sentence_transformer_tokenizer(encoder)
+        effective_max_seq_length = _effective_max_seq_length(
+            encoder,
+            self._max_seq_length,
+        )
+        if effective_max_seq_length is not None and tokenizer is None:
+            logger.warning(
+                "No tokenizer found on sentence-transformer; embedding chunks "
+                "will remain whitespace-word chunks and rely on encoder truncation"
             )
-            for text in texts
-        ]
+        sample_chunks = self._chunk_texts(
+            texts,
+            tokenizer=tokenizer,
+            max_seq_length=effective_max_seq_length,
+        )
         chunk_counts = [len(chunks) for chunks in sample_chunks]
         total_chunks = int(sum(chunk_counts))
         offsets = np.zeros(num_samples + 1, dtype=np.int64)
@@ -287,12 +448,12 @@ class ConceptEmbeddingCache:
             offsets[i + 1] = offsets[i] + count
 
         flat_chunks = [chunk for chunks in sample_chunks for chunk in chunks]
-        encoder = load_sentence_transformer(self._sentence_model_name, device=device)
 
         self._cache_path.mkdir(parents=True, exist_ok=True)
         emb_path = self._cache_path / "chunk_embeddings.npy"
         offsets_path = self._cache_path / "offsets.npy"
         np.save(str(offsets_path), offsets)
+        self._write_chunks(sample_chunks)
 
         effective_batch_size = max(1, int(batch_size))
         logger.info(
@@ -319,6 +480,8 @@ class ConceptEmbeddingCache:
                     show_progress_bar=False,
                 )
             except Exception as exc:
+                if _is_cuda_oom(exc):
+                    _clear_cuda_memory()
                 if _is_cuda_oom(exc) and effective_batch_size > 1:
                     new_batch_size = max(1, effective_batch_size // 2)
                     logger.warning(
@@ -328,9 +491,17 @@ class ConceptEmbeddingCache:
                         new_batch_size,
                     )
                     effective_batch_size = new_batch_size
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
                     continue
+                if _is_cuda_oom(exc):
+                    logger.error(
+                        "CUDA OOM while encoding concept chunk at flat index %d "
+                        "with batch_size=%d, chunk_chars=%d, chunk_words=%d; "
+                        "try lowering embedding max_seq_length or chunk_size_words",
+                        cursor,
+                        effective_batch_size,
+                        len(batch_chunks[0]) if batch_chunks else 0,
+                        len(batch_chunks[0].split()) if batch_chunks else 0,
+                    )
                 raise
 
             batch_embeddings, batch_embedding_dim = _coerce_embedding_matrix(
@@ -349,6 +520,7 @@ class ConceptEmbeddingCache:
                 )
 
             emb_mmap[cursor:end] = batch_embeddings.astype(np.float16)
+            del batch_embeddings
             cursor = end
 
             if torch.cuda.is_available():
@@ -373,6 +545,9 @@ class ConceptEmbeddingCache:
             "chunk_overlap_words": self._chunk_overlap_words,
             "max_chunks": self._max_chunks,
             "normalize_embeddings": self._normalize_embeddings,
+            "max_seq_length": self._max_seq_length,
+            "effective_max_seq_length": effective_max_seq_length,
+            "chunking_mode": "word_chunks_token_bounded",
             "actual_max_len": max(chunk_counts) if chunk_counts else 0,
             "storage_format": "variable_length_chunks",
             "dataset_path": os.path.abspath(self._dataset_path),
@@ -424,16 +599,26 @@ class ConceptEmbeddingCache:
             [str(device) for device in unique_devices],
         )
 
-        sample_chunks = [
-            chunk_text_words(
-                text,
-                self._chunk_size_words,
-                self._chunk_overlap_words,
-                self._max_chunks,
-                self._chunk_selection,
+        probe_encoder = load_sentence_transformer(
+            self._sentence_model_name,
+            device=unique_devices[0],
+            max_seq_length=self._max_seq_length,
+        )
+        tokenizer = _get_sentence_transformer_tokenizer(probe_encoder)
+        effective_max_seq_length = _effective_max_seq_length(
+            probe_encoder,
+            self._max_seq_length,
+        )
+        if effective_max_seq_length is not None and tokenizer is None:
+            logger.warning(
+                "No tokenizer found on sentence-transformer; embedding chunks "
+                "will remain whitespace-word chunks and rely on encoder truncation"
             )
-            for text in texts
-        ]
+        sample_chunks = self._chunk_texts(
+            texts,
+            tokenizer=tokenizer,
+            max_seq_length=effective_max_seq_length,
+        )
         chunk_counts = [len(chunks) for chunks in sample_chunks]
         total_chunks = int(sum(chunk_counts))
         offsets = np.zeros(num_samples + 1, dtype=np.int64)
@@ -444,10 +629,6 @@ class ConceptEmbeddingCache:
         if total_chunks == 0:
             raise RuntimeError("No text chunks were generated")
 
-        probe_encoder = load_sentence_transformer(
-            self._sentence_model_name,
-            device=unique_devices[0],
-        )
         embedding_dim = int(
             getattr(probe_encoder, "get_sentence_embedding_dimension", lambda: 0)()
             or 0
@@ -469,6 +650,7 @@ class ConceptEmbeddingCache:
         emb_path = self._cache_path / "chunk_embeddings.npy"
         offsets_path = self._cache_path / "offsets.npy"
         np.save(str(offsets_path), offsets)
+        self._write_chunks(sample_chunks)
         emb_mmap = np.lib.format.open_memmap(
             str(emb_path),
             mode="w+",
@@ -504,7 +686,11 @@ class ConceptEmbeddingCache:
         log_stride = max(1000, total_chunks // 10)
 
         def _encode_shard(device: torch.device, shard_start: int, shard_end: int) -> int:
-            encoder = load_sentence_transformer(self._sentence_model_name, device=device)
+            encoder = load_sentence_transformer(
+                self._sentence_model_name,
+                device=device,
+                max_seq_length=self._max_seq_length,
+            )
             effective_batch_size = max(1, int(batch_size))
             cursor = shard_start
             while cursor < shard_end:
@@ -519,6 +705,8 @@ class ConceptEmbeddingCache:
                         show_progress_bar=False,
                     )
                 except Exception as exc:
+                    if _is_cuda_oom(exc):
+                        _clear_cuda_memory()
                     if _is_cuda_oom(exc) and effective_batch_size > 1:
                         new_batch_size = max(1, effective_batch_size // 2)
                         logger.warning(
@@ -529,9 +717,19 @@ class ConceptEmbeddingCache:
                             new_batch_size,
                         )
                         effective_batch_size = new_batch_size
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
                         continue
+                    if _is_cuda_oom(exc):
+                        logger.error(
+                            "CUDA OOM while encoding concept chunk on %s at flat "
+                            "index %d with batch_size=%d, chunk_chars=%d, "
+                            "chunk_words=%d; try lowering embedding max_seq_length "
+                            "or chunk_size_words",
+                            device,
+                            cursor,
+                            effective_batch_size,
+                            len(batch_chunks[0]) if batch_chunks else 0,
+                            len(batch_chunks[0].split()) if batch_chunks else 0,
+                        )
                     raise
 
                 batch_embeddings, _ = _coerce_embedding_matrix(
@@ -540,6 +738,7 @@ class ConceptEmbeddingCache:
                     expected_dim=embedding_dim,
                 )
                 emb_mmap[cursor:end] = batch_embeddings.astype(np.float16)
+                del batch_embeddings
                 cursor = end
 
                 with progress_lock:
@@ -588,6 +787,9 @@ class ConceptEmbeddingCache:
             "chunk_overlap_words": self._chunk_overlap_words,
             "max_chunks": self._max_chunks,
             "normalize_embeddings": self._normalize_embeddings,
+            "max_seq_length": self._max_seq_length,
+            "effective_max_seq_length": effective_max_seq_length,
+            "chunking_mode": "word_chunks_token_bounded",
             "actual_max_len": max(chunk_counts) if chunk_counts else 0,
             "storage_format": "variable_length_chunks",
             "dataset_path": os.path.abspath(self._dataset_path),

@@ -107,7 +107,7 @@ class TarNetStageOnlyOracleConfig:
     htr_freeze_sentence_encoder: bool = False
     htr_chunk_size_words: int = 96
     htr_chunk_overlap_words: int = 24
-    htr_max_chunks: int = 128
+    htr_max_chunks: int = 512
     htr_max_chunk_length: int = 128
     htr_num_layers: int = 2
     htr_num_heads: int = 4
@@ -119,9 +119,9 @@ class TarNetStageOnlyOracleConfig:
     htr_sentence_pooling: str = "token_attention"
     htr_normalize_sentence_embeddings: bool = True
     htr_trainable_sentence_encoder_layers: int = 0
-    htr_dropout: float = 0.1
+    htr_dropout: float = 0.05
 
-    non_nuisance_epochs: int = 20
+    non_nuisance_epochs: int = 30
     batch_size: int = 8
     effect_batch_size: int = 32
     tarnet_offset_batch_size: Optional[int] = 128
@@ -131,8 +131,8 @@ class TarNetStageOnlyOracleConfig:
     alpha_propensity: float = 1.0
 
     nuisance_folds: int = 5
-    nuisance_epochs: int = 20
-    nuisance_weight_decay: float = 0.05
+    nuisance_epochs: int = 30
+    nuisance_weight_decay: float = 0.01
     nuisance_label_smoothing: float = 0.02
     nuisance_calibration: str = "temperature_isotonic"
     effect_folds: int = 5
@@ -285,6 +285,7 @@ def _make_applied_config(
                 nuisance_label_smoothing=config.nuisance_label_smoothing,
                 nuisance_calibration=config.nuisance_calibration,
                 effect_folds=config.effect_folds,
+                effect_epochs=config.non_nuisance_epochs,
                 fold_parallelism=config.fold_parallelism,
                 attention_top_k_chunks=config.attention_top_k_chunks,
                 e_clip=config.e_clip,
@@ -829,7 +830,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--htr-freeze-sentence-encoder", type=_parse_bool, default=False)
     parser.add_argument("--htr-chunk-size-words", type=int, default=96)
     parser.add_argument("--htr-chunk-overlap-words", type=int, default=24)
-    parser.add_argument("--htr-max-chunks", type=int, default=128)
+    parser.add_argument("--htr-max-chunks", type=int, default=512)
     parser.add_argument("--htr-max-chunk-length", type=int, default=128)
     parser.add_argument("--htr-num-layers", type=int, default=2)
     parser.add_argument("--htr-num-heads", type=int, default=4)
@@ -853,13 +854,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=True,
     )
     parser.add_argument("--htr-trainable-sentence-encoder-layers", type=int, default=0)
-    parser.add_argument("--htr-dropout", type=float, default=0.1)
+    parser.add_argument("--htr-dropout", type=float, default=0.05)
 
     parser.add_argument(
         "--non-nuisance-epochs",
         dest="non_nuisance_epochs",
         type=int,
-        default=20,
+        default=30,
         help="Epochs for the TarNet-offset neural stage.",
     )
     parser.add_argument(
@@ -877,8 +878,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--alpha-propensity", type=float, default=1.0)
 
     parser.add_argument("--nuisance-folds", type=int, default=5)
-    parser.add_argument("--nuisance-epochs", type=int, default=20)
-    parser.add_argument("--nuisance-weight-decay", type=float, default=0.05)
+    parser.add_argument("--nuisance-epochs", type=int, default=30)
+    parser.add_argument("--nuisance-weight-decay", type=float, default=0.01)
     parser.add_argument("--nuisance-label-smoothing", type=float, default=0.02)
     parser.add_argument(
         "--nuisance-calibration",

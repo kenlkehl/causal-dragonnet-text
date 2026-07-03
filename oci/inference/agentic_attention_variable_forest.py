@@ -72,7 +72,7 @@ EFFECT_OBJECTIVES = {"squared_r_loss", "logistic_r_loss", "pseudo_outcome_mse"}
 
 
 def _effect_objective_name(config: AgenticAttentionVariableForestConfig) -> str:
-    value = str(getattr(config, "effect_objective", "squared_r_loss")).strip().lower()
+    value = str(getattr(config, "effect_objective", "pseudo_outcome_mse")).strip().lower()
     if value not in EFFECT_OBJECTIVES:
         raise ValueError(
             "agentic_attention_variable_forest.effect_objective must be one of "
@@ -1152,6 +1152,12 @@ class AgenticAttentionVariableForestRunner:
             value = self.config.training.batch_size
         return max(1, int(value))
 
+    def _effect_epochs(self) -> int:
+        value = getattr(self.avf_config, "effect_epochs", None)
+        if value is None:
+            value = getattr(self.config.training, "epochs", 1)
+        return max(1, int(value))
+
     def _merge_residual_contrastive_predictions(
         self,
         predictions: pd.DataFrame,
@@ -1197,12 +1203,12 @@ class AgenticAttentionVariableForestRunner:
             htr_freeze_sentence_encoder=getattr(arch, "htr_freeze_sentence_encoder", False),
             htr_chunk_size_words=getattr(arch, "htr_chunk_size_words", 96),
             htr_chunk_overlap_words=getattr(arch, "htr_chunk_overlap_words", 24),
-            htr_max_chunks=getattr(arch, "htr_max_chunks", 128),
+            htr_max_chunks=getattr(arch, "htr_max_chunks", 512),
             htr_max_chunk_length=getattr(arch, "htr_max_chunk_length", 128),
             htr_num_layers=getattr(arch, "htr_num_layers", 2),
             htr_num_heads=getattr(arch, "htr_num_heads", 4),
             htr_transformer_dim=getattr(arch, "htr_transformer_dim", 256),
-            htr_dropout=getattr(arch, "htr_dropout", 0.1),
+            htr_dropout=getattr(arch, "htr_dropout", 0.05),
             htr_projection_dim=getattr(arch, "htr_projection_dim", 128),
             htr_hash_embedding_dim=getattr(arch, "htr_hash_embedding_dim", 256),
             htr_sentence_encoder_batch_size=getattr(
@@ -3621,6 +3627,7 @@ class AgenticAttentionVariableForestRunner:
         total_folds: int,
     ):
         train_config = self.config.training
+        effect_epochs = self._effect_epochs()
         offset_l2 = float(self.avf_config.interaction_l2_weight)
         heterogeneity_weight = float(
             self.avf_config.tarnet_offset_heterogeneity_weight
@@ -3648,7 +3655,12 @@ class AgenticAttentionVariableForestRunner:
             weight_decay=getattr(train_config, "weight_decay", 0.01),
         )
         num_batches = max(1, len(train_loader))
-        scheduler = _make_linear_lr_scheduler(optimizer, train_config, num_batches)
+        scheduler = _make_linear_lr_scheduler(
+            optimizer,
+            train_config,
+            num_batches,
+            epochs_override=effect_epochs,
+        )
         progress_every = max(1, num_batches // 5)
         logger.info(
             "Outer fold %s TarNet-offset fold %s/%s: training for %s epoch(s), "
@@ -3658,7 +3670,7 @@ class AgenticAttentionVariableForestRunner:
             outer_fold,
             fold,
             total_folds,
-            train_config.epochs,
+            effect_epochs,
             train_loader.batch_size,
             num_batches,
             train_loader.num_workers,
@@ -3669,7 +3681,7 @@ class AgenticAttentionVariableForestRunner:
             "linear" if scheduler is not None else "none",
             self._cuda_memory_summary(),
         )
-        for epoch in range(1, train_config.epochs + 1):
+        for epoch in range(1, effect_epochs + 1):
             model.train()
             loss_sum = 0.0
             outcome_sum = 0.0
@@ -3736,7 +3748,7 @@ class AgenticAttentionVariableForestRunner:
                         fold,
                         total_folds,
                         epoch,
-                        train_config.epochs,
+                        effect_epochs,
                         batch_idx,
                         num_batches,
                         loss_value,
@@ -3756,7 +3768,7 @@ class AgenticAttentionVariableForestRunner:
                 fold,
                 total_folds,
                 epoch,
-                train_config.epochs,
+                effect_epochs,
                 loss_sum / denom,
                 outcome_sum / denom,
                 offset_sum / denom,
@@ -3782,6 +3794,7 @@ class AgenticAttentionVariableForestRunner:
         total_folds: int,
     ):
         train_config = self.config.training
+        effect_epochs = self._effect_epochs()
         model.extractor.fit_tokenizer(
             df.iloc[positions][self.config.text_column].astype(str).tolist()
         )
@@ -3807,7 +3820,12 @@ class AgenticAttentionVariableForestRunner:
             weight_decay=getattr(train_config, "weight_decay", 0.01),
         )
         num_batches = max(1, len(train_loader))
-        scheduler = _make_linear_lr_scheduler(optimizer, train_config, num_batches)
+        scheduler = _make_linear_lr_scheduler(
+            optimizer,
+            train_config,
+            num_batches,
+            epochs_override=effect_epochs,
+        )
         progress_every = max(1, num_batches // 5)
         effect_objective = _effect_objective_name(self.avf_config)
         logger.info(
@@ -3817,7 +3835,7 @@ class AgenticAttentionVariableForestRunner:
             outer_fold,
             fold,
             total_folds,
-            train_config.epochs,
+            effect_epochs,
             effect_objective,
             train_loader.batch_size,
             num_batches,
@@ -3826,7 +3844,7 @@ class AgenticAttentionVariableForestRunner:
             "linear" if scheduler is not None else "none",
             self._cuda_memory_summary(),
         )
-        for epoch in range(1, train_config.epochs + 1):
+        for epoch in range(1, effect_epochs + 1):
             model.train()
             loss_sum = 0.0
             batch_count = 0
@@ -3875,7 +3893,7 @@ class AgenticAttentionVariableForestRunner:
                         fold,
                         total_folds,
                         epoch,
-                        train_config.epochs,
+                        effect_epochs,
                         batch_idx,
                         num_batches,
                         _effect_loss_label(effect_objective),
@@ -3890,7 +3908,7 @@ class AgenticAttentionVariableForestRunner:
                 fold,
                 total_folds,
                 epoch,
-                train_config.epochs,
+                effect_epochs,
                 _effect_loss_label(effect_objective),
                 loss_sum / max(1, batch_count),
                 _current_lr(optimizer),
@@ -3909,6 +3927,7 @@ class AgenticAttentionVariableForestRunner:
         total_folds: int,
     ):
         train_config = self.config.training
+        effect_epochs = self._effect_epochs()
         model.extractor.fit_tokenizer(
             df.iloc[positions][self.config.text_column].astype(str).tolist()
         )
@@ -3936,7 +3955,12 @@ class AgenticAttentionVariableForestRunner:
             dtype=torch.float32,
         )
         num_batches = max(1, len(train_loader))
-        scheduler = _make_linear_lr_scheduler(optimizer, train_config, num_batches)
+        scheduler = _make_linear_lr_scheduler(
+            optimizer,
+            train_config,
+            num_batches,
+            epochs_override=effect_epochs,
+        )
         progress_every = max(1, num_batches // 5)
         logger.info(
             "Outer fold %s residual contrastive %s fold %s/%s: training for "
@@ -3946,7 +3970,7 @@ class AgenticAttentionVariableForestRunner:
             contrast_tail,
             fold,
             total_folds,
-            train_config.epochs,
+            effect_epochs,
             int(n_pos),
             int(n_neg),
             train_loader.batch_size,
@@ -3956,7 +3980,7 @@ class AgenticAttentionVariableForestRunner:
             "linear" if scheduler is not None else "none",
             self._cuda_memory_summary(),
         )
-        for epoch in range(1, train_config.epochs + 1):
+        for epoch in range(1, effect_epochs + 1):
             model.train()
             loss_sum = 0.0
             batch_count = 0
@@ -3987,7 +4011,7 @@ class AgenticAttentionVariableForestRunner:
                         fold,
                         total_folds,
                         epoch,
-                        train_config.epochs,
+                        effect_epochs,
                         batch_idx,
                         num_batches,
                         loss_value,
@@ -4002,7 +4026,7 @@ class AgenticAttentionVariableForestRunner:
                 fold,
                 total_folds,
                 epoch,
-                train_config.epochs,
+                effect_epochs,
                 loss_sum / max(1, batch_count),
                 _current_lr(optimizer),
                 self._cuda_memory_summary(),
@@ -5866,6 +5890,7 @@ class AgenticAttentionVariableForestRunner:
             "nuisance_weight_decay": self.avf_config.nuisance_weight_decay,
             "nuisance_label_smoothing": self.avf_config.nuisance_label_smoothing,
             "nuisance_calibration": self.avf_config.nuisance_calibration,
+            "effect_epochs": self.avf_config.effect_epochs,
             "neural_stage_mode": self.avf_config.neural_stage_mode,
             "joint_rlearner_gamma": self.avf_config.joint_rlearner_gamma,
             "interaction_l2_weight": self.avf_config.interaction_l2_weight,

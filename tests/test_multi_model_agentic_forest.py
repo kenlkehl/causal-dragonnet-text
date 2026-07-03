@@ -543,7 +543,8 @@ def test_embedding_contrast_reuses_warm_chunk_and_concept_phrase_caches_without_
     config = _embedding_contrast_cache_test_config(tmp_path)
     load_calls = []
 
-    def fake_load_sentence_transformer(model_name, device=None):
+    def fake_load_sentence_transformer(model_name, device=None, max_seq_length=None):
+        del max_seq_length
         load_calls.append((model_name, str(device)))
         return KeywordSentenceTransformer()
 
@@ -564,8 +565,8 @@ def test_embedding_contrast_reuses_warm_chunk_and_concept_phrase_caches_without_
     assert treatment["concept_probe_scores"]
     assert load_calls
 
-    def fail_load_sentence_transformer(model_name, device=None):
-        del model_name, device
+    def fail_load_sentence_transformer(model_name, device=None, max_seq_length=None):
+        del model_name, device, max_seq_length
         raise AssertionError("sentence-transformer should not load on warm caches")
 
     monkeypatch.setattr(
@@ -601,7 +602,8 @@ def test_embedding_contrast_skips_concept_probe_load_when_only_chunk_cache_is_wa
     config = _embedding_contrast_cache_test_config(tmp_path)
     load_calls = []
 
-    def fake_load_sentence_transformer(model_name, device=None):
+    def fake_load_sentence_transformer(model_name, device=None, max_seq_length=None):
+        del max_seq_length
         load_calls.append((model_name, str(device)))
         return KeywordSentenceTransformer()
 
@@ -613,8 +615,8 @@ def test_embedding_contrast_skips_concept_probe_load_when_only_chunk_cache_is_wa
     generator.prepare(dataset)
     assert load_calls
 
-    def fail_load_sentence_transformer(model_name, device=None):
-        del model_name, device
+    def fail_load_sentence_transformer(model_name, device=None, max_seq_length=None):
+        del model_name, device, max_seq_length
         raise AssertionError("sentence-transformer should not load for optional probes")
 
     monkeypatch.setattr(
@@ -923,6 +925,44 @@ def test_multi_model_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path:
     assert (artifact_dir / "candidate_features.parquet").exists()
     assert (artifact_dir / "candidate_signal_review.jsonl").exists()
     assert (artifact_dir / "ite_estimates.parquet").exists()
+    for fold in (1, 2):
+        fold_dir = artifact_dir / f"outer_fold_{fold:03d}"
+        assert (fold_dir / "predictions.parquet").exists()
+        assert (fold_dir / "selected_feature_set.json").exists()
+        assert (fold_dir / "selected_feature_sets.json").exists()
+        assert (fold_dir / "agent_candidate_proposals.jsonl").exists()
+        assert (fold_dir / "extracted_feature_diagnostics_by_fold.jsonl").exists()
+        assert (fold_dir / "candidate_signal_review.jsonl").exists()
+        assert (fold_dir / "parsimony_review_by_fold.jsonl").exists()
+        assert (fold_dir / "outer_cv_metrics.csv").exists()
+        assert (fold_dir / "checkpoint_summary.json").exists()
+
+        fold_predictions = pd.read_parquet(fold_dir / "predictions.parquet")
+        assert set(fold_predictions["outer_fold"]) == {fold}
+        selected = json.loads((fold_dir / "selected_feature_set.json").read_text())
+        assert selected["outer_fold"] == fold
+        assert {item["name"] for item in selected["selected_features"]} == {
+            "age",
+            "pd_l1_expression",
+        }
+        fold_agent_rows = [
+            json.loads(line)
+            for line in (fold_dir / "agent_candidate_proposals.jsonl")
+            .read_text()
+            .splitlines()
+        ]
+        assert fold_agent_rows
+        assert all(row.get("outer_fold") == fold for row in fold_agent_rows)
+        fold_parsimony_rows = [
+            json.loads(line)
+            for line in (fold_dir / "parsimony_review_by_fold.jsonl")
+            .read_text()
+            .splitlines()
+        ]
+        assert fold_parsimony_rows
+        assert all(row["outer_fold"] == fold for row in fold_parsimony_rows)
+        fold_metrics = pd.read_csv(fold_dir / "outer_cv_metrics.csv")
+        assert set(fold_metrics["outer_fold"]) == {fold}
     split_rows = [
         json.loads(line)
         for line in (artifact_dir / "split_provenance.jsonl").read_text().splitlines()
@@ -1804,6 +1844,7 @@ def test_multi_model_agentic_forest_parses_bow_views_and_embedding_option():
                         "embedding_contrast": {
                             "enabled": True,
                             "model_name": "Qwen/Qwen3-Embedding-8B",
+                            "max_seq_length": 768,
                             "chunk_size_words": 128,
                             "chunk_overlap_words": 32,
                             "max_chunks": 16,
@@ -1844,6 +1885,7 @@ def test_multi_model_agentic_forest_parses_bow_views_and_embedding_option():
     assert nn_cfg.fail_on_extraction_truncation is False
     assert nn_cfg.embedding_contrast.enabled is True
     assert nn_cfg.embedding_contrast.model_name == "Qwen/Qwen3-Embedding-8B"
+    assert nn_cfg.embedding_contrast.max_seq_length == 768
     assert nn_cfg.embedding_contrast.chunk_size_words == 128
     assert nn_cfg.embedding_contrast.chunk_overlap_words == 32
     assert nn_cfg.embedding_contrast.max_chunks == 16
@@ -1916,6 +1958,7 @@ def test_oracle_multi_model_script_builds_default_and_cli_bow_views():
     mm_cfg = applied.architecture.multi_model_agentic_forest
     assert len(mm_cfg.bow_views) == 6
     assert mm_cfg.embedding_contrast.enabled is True
+    assert mm_cfg.embedding_contrast.max_seq_length == 1024
     assert mm_cfg.require_honest_outer_split is True
     assert mm_cfg.fail_on_extraction_truncation is True
     assert applied.architecture.agentic_feature_search.agent_model_name == "auto"

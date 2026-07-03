@@ -332,12 +332,18 @@ class MultiModelAgenticForestRunner:
                     len(train_idx),
                     len(test_idx),
                 )
-                prediction_frames.append(
-                    self._run_one_analysis_split(
-                        outer_fold=outer_fold,
-                        train_idx=train_idx,
-                        test_idx=test_idx,
-                    )
+                predictions = self._run_one_analysis_split(
+                    outer_fold=outer_fold,
+                    train_idx=train_idx,
+                    test_idx=test_idx,
+                )
+                prediction_frames.append(predictions)
+                self._save_outer_fold_checkpoint(
+                    outer_fold=int(outer_fold),
+                    predictions=predictions,
+                    target_dir=(
+                        self.artifact_dir / f"outer_fold_{int(outer_fold):03d}"
+                    ),
                 )
 
         results_df = pd.concat(prediction_frames).sort_values("_oci_row_id")
@@ -371,6 +377,11 @@ class MultiModelAgenticForestRunner:
             outer_fold=outer_fold,
             train_idx=train_idx,
             test_idx=test_idx,
+        )
+        fold_runner._save_outer_fold_checkpoint(
+            outer_fold=int(outer_fold),
+            predictions=predictions,
+            target_dir=self.artifact_dir / f"outer_fold_{int(outer_fold):03d}",
         )
         return {
             "outer_fold": int(outer_fold),
@@ -557,8 +568,9 @@ class MultiModelAgenticForestRunner:
         train_df = self.dataset.iloc[train_idx].copy()
         test_df = self.dataset.iloc[test_idx].copy()
         selected_specs = self._filter_specs_by_extraction_coverage(
-            train_df,
-            selected_specs,
+            train_df=train_df,
+            specs=selected_specs,
+            outer_fold=outer_fold,
         )
         review_result = self._review_extracted_features_if_needed(
             outer_fold=outer_fold,
@@ -2421,8 +2433,10 @@ class MultiModelAgenticForestRunner:
 
     def _filter_specs_by_extraction_coverage(
         self,
+        *,
         train_df: pd.DataFrame,
         specs: List[ExplicitFeatureSpec],
+        outer_fold: Optional[int],
     ) -> List[ExplicitFeatureSpec]:
         initial_names = {spec.name for spec in self._initial_specs()}
         kept: List[ExplicitFeatureSpec] = []
@@ -2443,7 +2457,13 @@ class MultiModelAgenticForestRunner:
                 dropped.append({"name": spec.name, "coverage": coverage})
         if dropped:
             logger.info("Dropped low-coverage multi-model agentic features: %s", dropped)
-            self.agent_rows.append({"event": "coverage_filter", "dropped": dropped})
+            self.agent_rows.append(
+                {
+                    "outer_fold": None if outer_fold is None else int(outer_fold),
+                    "event": "coverage_filter",
+                    "dropped": dropped,
+                }
+            )
         return kept
 
     def _review_extracted_features_if_needed(
@@ -2488,8 +2508,9 @@ class MultiModelAgenticForestRunner:
         for round_index in range(max_rounds + 1):
             train_df = self.dataset.iloc[train_idx].copy()
             current_specs = self._filter_specs_by_extraction_coverage(
-                train_df,
-                current_specs,
+                train_df=train_df,
+                specs=current_specs,
+                outer_fold=outer_fold,
             )
             diagnostic = _evaluate_extracted_feature_set_diagnostic(
                 train_df=train_df,
@@ -3265,6 +3286,86 @@ class MultiModelAgenticForestRunner:
         results_df.to_parquet(self.output_path, index=False)
         logger.info("Multi-model agentic forest predictions saved to: %s", self.output_path)
 
+    @staticmethod
+    def _outer_fold_rows(
+        rows: Sequence[Dict[str, Any]],
+        outer_fold: int,
+    ) -> List[Dict[str, Any]]:
+        fold = int(outer_fold)
+        return [row for row in rows if row.get("outer_fold") == fold]
+
+    def _save_outer_fold_checkpoint(
+        self,
+        *,
+        outer_fold: int,
+        predictions: Optional[pd.DataFrame],
+        target_dir: Path,
+    ) -> None:
+        """Persist fold-local trace artifacts as soon as a fold completes."""
+        fold = int(outer_fold)
+        target_dir = Path(target_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        if predictions is not None:
+            predictions.to_parquet(target_dir / "predictions.parquet", index=False)
+
+        selected_rows = self._outer_fold_rows(self.feature_set_rows, fold)
+        _write_json(target_dir / "selected_feature_sets.json", selected_rows)
+        if selected_rows:
+            _write_json(target_dir / "selected_feature_set.json", selected_rows[-1])
+
+        agent_rows = self._outer_fold_rows(self.agent_rows, fold)
+        diagnostics = self._outer_fold_rows(
+            self.extracted_feature_diagnostic_rows,
+            fold,
+        )
+        signal_rows = self._outer_fold_rows(self.candidate_signal_review_rows, fold)
+        parsimony_rows = self._outer_fold_rows(self.parsimony_review_rows, fold)
+        metric_rows = self._outer_fold_rows(self.outer_metric_rows, fold)
+        split_rows = self._outer_fold_rows(self.split_provenance_rows, fold)
+        importance_rows = self._outer_fold_rows(self.importance_rows, fold)
+        embedding_rows = self._outer_fold_rows(self.embedding_evidence_rows, fold)
+
+        _write_jsonl(target_dir / "agent_candidate_proposals.jsonl", agent_rows)
+        _write_jsonl(
+            target_dir / "extracted_feature_diagnostics_by_fold.jsonl",
+            diagnostics,
+        )
+        _write_jsonl(target_dir / "candidate_signal_review.jsonl", signal_rows)
+        _write_jsonl(target_dir / "parsimony_review_by_fold.jsonl", parsimony_rows)
+        _write_jsonl(target_dir / "parsimony_review.by_fold.jsonl", parsimony_rows)
+        _write_jsonl(target_dir / "split_provenance.jsonl", split_rows)
+        _write_jsonl(
+            target_dir / "bow_view_feature_importance_by_fold.jsonl",
+            importance_rows,
+        )
+        _write_jsonl(target_dir / "text_evidence.bow.jsonl", importance_rows)
+        _write_jsonl(
+            target_dir / "embedding_contrast_evidence_by_fold.jsonl",
+            embedding_rows,
+        )
+        _write_jsonl(target_dir / "text_evidence.embedding.jsonl", embedding_rows)
+        pd.DataFrame(metric_rows).to_csv(target_dir / "outer_cv_metrics.csv", index=False)
+
+        _write_json(
+            target_dir / "checkpoint_summary.json",
+            {
+                "outer_fold": fold,
+                "n_predictions": 0 if predictions is None else int(len(predictions)),
+                "n_selected_feature_rows": int(len(selected_rows)),
+                "n_agent_rows": int(len(agent_rows)),
+                "n_extracted_feature_diagnostic_rows": int(len(diagnostics)),
+                "n_candidate_signal_review_rows": int(len(signal_rows)),
+                "n_parsimony_review_rows": int(len(parsimony_rows)),
+                "n_metric_rows": int(len(metric_rows)),
+            },
+        )
+        logger.info(
+            "Multi-model outer fold %s checkpoint artifacts saved to: %s",
+            fold,
+            target_dir,
+        )
+
     def _save_artifacts(self) -> None:
         bow_predictions = (
             pd.concat(self.bow_prediction_frames, ignore_index=True)
@@ -3419,6 +3520,11 @@ def _run_multi_model_outer_fold_worker(
         outer_fold=outer_fold,
         train_idx=train_idx,
         test_idx=test_idx,
+    )
+    fold_runner._save_outer_fold_checkpoint(
+        outer_fold=int(outer_fold),
+        predictions=predictions,
+        target_dir=Path(artifact_dir) / f"outer_fold_{int(outer_fold):03d}",
     )
     return {
         "outer_fold": int(outer_fold),
@@ -5770,3 +5876,9 @@ def _write_jsonl(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
     with open(path, "w") as f:
         for row in rows:
             f.write(json.dumps(row, default=_json_default) + "\n")
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2, default=_json_default)

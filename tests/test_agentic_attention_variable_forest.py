@@ -526,11 +526,12 @@ def test_config_parses_agentic_attention_variable_forest_block(tmp_path):
         == 2
     )
     avf = config.applied_inference.architecture.agentic_attention_variable_forest
-    assert avf.nuisance_epochs == 20
-    assert avf.nuisance_weight_decay == pytest.approx(0.05)
+    assert avf.nuisance_epochs == 30
+    assert avf.nuisance_weight_decay == pytest.approx(0.01)
     assert avf.nuisance_label_smoothing == pytest.approx(0.02)
     assert avf.nuisance_calibration == "temperature_isotonic"
-    assert avf.effect_objective == "squared_r_loss"
+    assert avf.effect_epochs == 30
+    assert avf.effect_objective == "pseudo_outcome_mse"
     assert avf.neural_stage_mode == "staged"
     assert avf.joint_rlearner_gamma == pytest.approx(1.0)
     assert avf.interaction_l2_weight == pytest.approx(1e-3)
@@ -2793,8 +2794,8 @@ def test_oracle_agentic_attention_script_builds_configs(tmp_path):
     assert config.residual_contrastive_low_quantile == 0.15
     assert config.residual_contrastive_neutral_abs_quantile == 0.35
     assert config.residual_contrastive_min_class_count == 3
-    assert config.nuisance_epochs == 20
-    assert config.nuisance_weight_decay == pytest.approx(0.05)
+    assert config.nuisance_epochs == 30
+    assert config.nuisance_weight_decay == pytest.approx(0.01)
     assert config.nuisance_label_smoothing == pytest.approx(0.02)
     assert config.nuisance_calibration == "temperature_isotonic"
 
@@ -2812,7 +2813,8 @@ def test_oracle_agentic_attention_script_builds_configs(tmp_path):
     assert applied.training.epochs == 4
     assert applied.training.alpha_propensity == pytest.approx(0.2)
     assert applied.architecture.agentic_attention_variable_forest.nuisance_folds == 2
-    assert applied.architecture.agentic_attention_variable_forest.nuisance_epochs == 20
+    assert applied.architecture.agentic_attention_variable_forest.nuisance_epochs == 30
+    assert applied.architecture.agentic_attention_variable_forest.effect_epochs == 4
     assert (
         applied.architecture.agentic_attention_variable_forest.effect_objective
         == "logistic_r_loss"
@@ -3133,7 +3135,7 @@ def test_joint_rlearner_neural_only_writes_oof_artifacts(tmp_path, monkeypatch):
 
     results = pd.read_parquet(output_path)
     assert len(results) == len(df)
-    assert set(results["effect_objective"]) == {"squared_r_loss"}
+    assert set(results["effect_objective"]) == {"pseudo_outcome_mse"}
     assert np.all(np.isfinite(results["tau_hat_r_stage"].to_numpy(dtype=float)))
     assert np.all(np.isfinite(results["e_hat"].to_numpy(dtype=float)))
     assert np.all(np.isfinite(results["m_hat"].to_numpy(dtype=float)))

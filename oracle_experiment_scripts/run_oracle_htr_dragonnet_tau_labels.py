@@ -520,7 +520,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--htr-freeze-sentence-encoder", type=_parse_bool, default=False)
     parser.add_argument("--htr-chunk-size-words", type=int, default=96)
     parser.add_argument("--htr-chunk-overlap-words", type=int, default=24)
-    parser.add_argument("--htr-max-chunks", type=int, default=128)
+    parser.add_argument("--htr-max-chunks", type=int, default=512)
     parser.add_argument("--htr-max-chunk-length", type=int, default=128)
     parser.add_argument("--htr-num-layers", type=int, default=2)
     parser.add_argument("--htr-num-heads", type=int, default=4)
@@ -540,7 +540,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--htr-normalize-sentence-embeddings", type=_parse_bool, default=True)
     parser.add_argument("--htr-trainable-sentence-encoder-layers", type=int, default=0)
-    parser.add_argument("--htr-dropout", type=float, default=0.1)
+    parser.add_argument("--htr-dropout", type=float, default=0.05)
 
     parser.add_argument("--causal-head-representation-dim", type=int, default=128)
     parser.add_argument("--causal-head-hidden-outcome-dim", type=int, default=64)

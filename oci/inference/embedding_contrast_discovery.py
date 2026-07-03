@@ -75,18 +75,17 @@ class EmbeddingContrastEvidenceGenerator:
         self._row_id_to_position = {
             _row_key(row_id): idx for idx, row_id in enumerate(self._row_ids)
         }
-        self._chunks_by_position = [
-            chunk_text_words(
-                text,
-                int(self.embedding_config.chunk_size_words),
-                int(self.embedding_config.chunk_overlap_words),
-                int(self.embedding_config.max_chunks),
-                str(self.embedding_config.chunk_selection),
-            )
-            for text in texts
-        ]
-
         if self.embedding_provider is not None:
+            self._chunks_by_position = [
+                chunk_text_words(
+                    text,
+                    int(self.embedding_config.chunk_size_words),
+                    int(self.embedding_config.chunk_overlap_words),
+                    int(self.embedding_config.max_chunks),
+                    str(self.embedding_config.chunk_selection),
+                )
+                for text in texts
+            ]
             self._prepare_from_provider()
         else:
             self._prepare_from_sentence_transformer_cache(texts)
@@ -153,6 +152,11 @@ class EmbeddingContrastEvidenceGenerator:
             "chunking": {
                 "chunk_size_words": int(self.embedding_config.chunk_size_words),
                 "chunk_overlap_words": int(self.embedding_config.chunk_overlap_words),
+                "max_seq_length_tokens": (
+                    None
+                    if self.embedding_config.max_seq_length is None
+                    else int(self.embedding_config.max_seq_length)
+                ),
                 "max_chunks": int(self.embedding_config.max_chunks),
                 "chunk_selection": str(self.embedding_config.chunk_selection),
             },
@@ -201,6 +205,7 @@ class EmbeddingContrastEvidenceGenerator:
             max_chunks=int(self.embedding_config.max_chunks),
             normalize_embeddings=bool(self.embedding_config.normalize_embeddings),
             chunk_selection=str(self.embedding_config.chunk_selection),
+            max_seq_length=self.embedding_config.max_seq_length,
         )
         logger.info("Embedding contrast chunk cache: %s", cache.cache_path)
         cache_valid = cache.is_valid(expected_num_samples=len(texts))
@@ -221,6 +226,7 @@ class EmbeddingContrastEvidenceGenerator:
         self._cache = cache
         self._flat_embeddings = cache.hidden_states_array.flat
         self._offsets = cache.hidden_states_array.offsets
+        self._chunks_by_position = cache.load_chunks(expected_num_samples=len(texts))
 
     def _positions_for_frame(self, frame: pd.DataFrame) -> List[int]:
         if "_oci_row_id" in frame.columns:
@@ -716,6 +722,7 @@ class EmbeddingContrastEvidenceGenerator:
                 encoder = load_sentence_transformer(
                     str(self.embedding_config.model_name),
                     device=_torch_device_or_none(self.embedding_config.device),
+                    max_seq_length=self.embedding_config.max_seq_length,
                 )
                 embeddings = encoder.encode(
                     phrase_list,
@@ -740,6 +747,7 @@ class EmbeddingContrastEvidenceGenerator:
         payload = {
             "model_name": str(self.embedding_config.model_name),
             "normalize_embeddings": bool(self.embedding_config.normalize_embeddings),
+            "max_seq_length": self.embedding_config.max_seq_length,
             "phrases": [str(phrase) for phrase in phrases],
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(

@@ -600,6 +600,7 @@ class EmbeddingContrastDiscoveryConfig:
     cache_dir: Optional[str] = None
     device: Optional[str] = None
     batch_size: int = 16
+    max_seq_length: Optional[int] = 1024
     chunk_size_words: int = 256
     chunk_overlap_words: int = 64
     max_chunks: int = 64
@@ -626,6 +627,10 @@ class EmbeddingContrastDiscoveryConfig:
             )
         if self.batch_size < 1:
             raise ValueError("embedding_contrast.batch_size must be >= 1")
+        if self.max_seq_length is not None:
+            self.max_seq_length = int(self.max_seq_length)
+            if self.max_seq_length < 1:
+                raise ValueError("embedding_contrast.max_seq_length must be >= 1")
         if self.chunk_size_words < 1:
             raise ValueError("embedding_contrast.chunk_size_words must be >= 1")
         if self.chunk_overlap_words < 0:
@@ -1070,11 +1075,12 @@ class AgenticAttentionVariableForestConfig:
     """
 
     nuisance_folds: int = 5
-    nuisance_epochs: Optional[int] = 20
-    nuisance_weight_decay: Optional[float] = 0.05
+    nuisance_epochs: Optional[int] = 30
+    nuisance_weight_decay: Optional[float] = 0.01
     nuisance_label_smoothing: float = 0.02
     nuisance_calibration: str = "temperature_isotonic"
     effect_folds: int = 5
+    effect_epochs: Optional[int] = 30
     # "auto" parallelizes folds on CPU via num_workers and across configured
     # CUDA devices when more than one device is supplied.
     fold_parallelism: str = "auto"
@@ -1102,7 +1108,7 @@ class AgenticAttentionVariableForestConfig:
     e_clip: float = 0.01
     r_stage_min_propensity: float = 0.0
     r_stage_max_propensity: float = 1.0
-    effect_objective: str = "squared_r_loss"
+    effect_objective: str = "pseudo_outcome_mse"
     neural_stage_mode: str = "staged"
     joint_rlearner_gamma: float = 1.0
     interaction_l2_weight: float = 1e-3
@@ -1143,6 +1149,10 @@ class AgenticAttentionVariableForestConfig:
         self.nuisance_calibration = nuisance_calibration
         if self.effect_folds < 2:
             raise ValueError("agentic_attention_variable_forest.effect_folds must be >= 2")
+        if self.effect_epochs is not None and self.effect_epochs < 1:
+            raise ValueError(
+                "agentic_attention_variable_forest.effect_epochs must be >= 1 when set"
+            )
         _validate_parallelism_setting(
             self.candidate_proposal_parallelism,
             "agentic_attention_variable_forest.candidate_proposal_parallelism",
@@ -1391,12 +1401,12 @@ class ModelArchitectureConfig:
     htr_freeze_sentence_encoder: bool = False
     htr_chunk_size_words: int = 96
     htr_chunk_overlap_words: int = 24
-    htr_max_chunks: int = 128
+    htr_max_chunks: int = 512
     htr_max_chunk_length: int = 128
     htr_num_layers: int = 2
     htr_num_heads: int = 4
     htr_transformer_dim: int = 256
-    htr_dropout: float = 0.1
+    htr_dropout: float = 0.05
     htr_projection_dim: int = 128
     htr_hash_embedding_dim: int = 256
     htr_sentence_encoder_batch_size: int = 128

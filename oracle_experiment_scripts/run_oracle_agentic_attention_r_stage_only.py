@@ -95,7 +95,7 @@ class RStageOnlyOracleConfig:
     htr_freeze_sentence_encoder: bool = False
     htr_chunk_size_words: int = 96
     htr_chunk_overlap_words: int = 24
-    htr_max_chunks: int = 128
+    htr_max_chunks: int = 512
     htr_max_chunk_length: int = 128
     htr_num_layers: int = 2
     htr_num_heads: int = 4
@@ -107,9 +107,9 @@ class RStageOnlyOracleConfig:
     htr_sentence_pooling: str = "token_attention"
     htr_normalize_sentence_embeddings: bool = True
     htr_trainable_sentence_encoder_layers: int = 0
-    htr_dropout: float = 0.1
+    htr_dropout: float = 0.05
 
-    epochs: int = 50
+    epochs: int = 30
     batch_size: int = 8
     effect_batch_size: int = 128
     learning_rate: float = 1e-5
@@ -122,7 +122,7 @@ class RStageOnlyOracleConfig:
     e_clip: float = 0.01
     r_stage_min_propensity: float = 0.0
     r_stage_max_propensity: float = 1.0
-    effect_objective: str = "squared_r_loss"
+    effect_objective: str = "pseudo_outcome_mse"
     residual_contrastive_enabled: bool = False
     residual_contrastive_score: str = "r_score"
     residual_contrastive_high_quantile: float = 0.80
@@ -236,6 +236,7 @@ def _make_applied_config(
             agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
                 nuisance_folds=2,
                 effect_folds=config.effect_folds,
+                effect_epochs=config.epochs,
                 fold_parallelism=config.fold_parallelism,
                 attention_top_k_chunks=config.attention_top_k_chunks,
                 e_clip=config.e_clip,
@@ -347,7 +348,7 @@ def _aggregate_neural_metrics(results_df: pd.DataFrame) -> Dict[str, Any]:
         "neural_effect_objective": (
             str(results_df["effect_objective"].iloc[0])
             if "effect_objective" in results_df.columns and len(results_df) > 0
-            else "squared_r_loss"
+            else "pseudo_outcome_mse"
         ),
         "neural_r_loss_mean": _finite_or_none(results_df["r_loss"].mean()),
         "neural_r_loss_at_zero_tau_mean": _finite_or_none(
@@ -635,7 +636,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--htr-freeze-sentence-encoder", type=_parse_bool, default=False)
     parser.add_argument("--htr-chunk-size-words", type=int, default=96)
     parser.add_argument("--htr-chunk-overlap-words", type=int, default=24)
-    parser.add_argument("--htr-max-chunks", type=int, default=128)
+    parser.add_argument("--htr-max-chunks", type=int, default=512)
     parser.add_argument("--htr-max-chunk-length", type=int, default=128)
     parser.add_argument("--htr-num-layers", type=int, default=2)
     parser.add_argument("--htr-num-heads", type=int, default=4)
@@ -659,9 +660,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=True,
     )
     parser.add_argument("--htr-trainable-sentence-encoder-layers", type=int, default=0)
-    parser.add_argument("--htr-dropout", type=float, default=0.1)
+    parser.add_argument("--htr-dropout", type=float, default=0.05)
 
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--effect-batch-size", type=int, default=128)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
@@ -674,7 +675,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--effect-objective",
         choices=["squared_r_loss", "logistic_r_loss", "pseudo_outcome_mse"],
-        default="squared_r_loss",
+        default="pseudo_outcome_mse",
         help=(
             "Neural effect-stage objective. logistic_r_loss trains a Bernoulli "
             "R-learner logit modifier and reports probability-scale CATE; "

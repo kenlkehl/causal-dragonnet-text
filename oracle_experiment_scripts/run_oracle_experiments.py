@@ -227,7 +227,7 @@ class ExperimentConfig:
     htr_freeze_sentence_encoder: bool = False
     htr_chunk_size_words: int = 128
     htr_chunk_overlap_words: int = 32
-    htr_max_chunks: int = 256
+    htr_max_chunks: int = 512
     htr_max_chunk_length: int = 192
     htr_num_layers: int = 2
     htr_num_heads: int = 4
@@ -239,7 +239,7 @@ class ExperimentConfig:
     htr_sentence_pooling: str = "token_attention"
     htr_normalize_sentence_embeddings: bool = True
     htr_trainable_sentence_encoder_layers: int = 0
-    htr_dropout: float = 0.1
+    htr_dropout: float = 0.05
     htr_role_attention: bool = False
     htr_w_attention_heads: int = 1
     htr_x_attention_heads: int = 1

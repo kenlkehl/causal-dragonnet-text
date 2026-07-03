@@ -102,7 +102,7 @@ class AgenticAttentionOracleConfig:
     htr_freeze_sentence_encoder: bool = False
     htr_chunk_size_words: int = 96
     htr_chunk_overlap_words: int = 24
-    htr_max_chunks: int = 128
+    htr_max_chunks: int = 512
     htr_max_chunk_length: int = 128
     htr_num_layers: int = 2
     htr_num_heads: int = 4
@@ -114,9 +114,9 @@ class AgenticAttentionOracleConfig:
     htr_sentence_pooling: str = "token_attention"
     htr_normalize_sentence_embeddings: bool = True
     htr_trainable_sentence_encoder_layers: int = 0
-    htr_dropout: float = 0.1
+    htr_dropout: float = 0.05
 
-    non_nuisance_epochs: int = 3
+    non_nuisance_epochs: int = 30
     batch_size: int = 8
     effect_batch_size: int = 32
     learning_rate: float = 1e-4
@@ -125,8 +125,8 @@ class AgenticAttentionOracleConfig:
     alpha_propensity: float = 1.0
 
     nuisance_folds: int = 5
-    nuisance_epochs: int = 20
-    nuisance_weight_decay: float = 0.05
+    nuisance_epochs: int = 30
+    nuisance_weight_decay: float = 0.01
     nuisance_label_smoothing: float = 0.02
     nuisance_calibration: str = "temperature_isotonic"
     effect_folds: int = 5
@@ -151,7 +151,7 @@ class AgenticAttentionOracleConfig:
     e_clip: float = 0.01
     r_stage_min_propensity: float = 0.0
     r_stage_max_propensity: float = 1.0
-    effect_objective: str = "squared_r_loss"
+    effect_objective: str = "pseudo_outcome_mse"
     neural_stage_mode: str = "staged"
     joint_rlearner_gamma: float = 1.0
     interaction_l2_weight: float = 1e-3
@@ -309,6 +309,7 @@ def _make_applied_config(
                 nuisance_label_smoothing=config.nuisance_label_smoothing,
                 nuisance_calibration=config.nuisance_calibration,
                 effect_folds=config.effect_folds,
+                effect_epochs=config.non_nuisance_epochs,
                 fold_parallelism=config.fold_parallelism,
                 outer_parallelism=config.outer_parallelism,
                 attention_top_k_chunks=config.attention_top_k_chunks,
@@ -481,7 +482,7 @@ def _safe_neural_metrics(results_df: pd.DataFrame) -> Dict[str, Any]:
         "neural_effect_objective": (
             str(results_df["effect_objective"].iloc[0])
             if "effect_objective" in results_df.columns and len(results_df) > 0
-            else "squared_r_loss"
+            else "pseudo_outcome_mse"
         ),
         "neural_r_loss_mean": _finite_or_none(results_df["r_loss"].mean()),
         "neural_r_loss_at_zero_tau_mean": _finite_or_none(
@@ -872,7 +873,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--htr-freeze-sentence-encoder", type=_parse_bool, default=False)
     parser.add_argument("--htr-chunk-size-words", type=int, default=96)
     parser.add_argument("--htr-chunk-overlap-words", type=int, default=24)
-    parser.add_argument("--htr-max-chunks", type=int, default=128)
+    parser.add_argument("--htr-max-chunks", type=int, default=512)
     parser.add_argument("--htr-max-chunk-length", type=int, default=128)
     parser.add_argument("--htr-num-layers", type=int, default=2)
     parser.add_argument("--htr-num-heads", type=int, default=4)
@@ -892,13 +893,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--htr-normalize-sentence-embeddings", type=_parse_bool, default=True)
     parser.add_argument("--htr-trainable-sentence-encoder-layers", type=int, default=0)
-    parser.add_argument("--htr-dropout", type=float, default=0.1)
+    parser.add_argument("--htr-dropout", type=float, default=0.05)
 
     parser.add_argument(
         "--non-nuisance-epochs",
         dest="non_nuisance_epochs",
         type=int,
-        default=3,
+        default=30,
         help="Epochs for non-nuisance neural stages, including the R/effect stage.",
     )
     parser.add_argument(
@@ -930,8 +931,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--nuisance-folds", type=int, default=5)
-    parser.add_argument("--nuisance-epochs", type=int, default=20)
-    parser.add_argument("--nuisance-weight-decay", type=float, default=0.05)
+    parser.add_argument("--nuisance-epochs", type=int, default=30)
+    parser.add_argument("--nuisance-weight-decay", type=float, default=0.01)
     parser.add_argument("--nuisance-label-smoothing", type=float, default=0.02)
     parser.add_argument(
         "--nuisance-calibration",
@@ -992,7 +993,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--effect-objective",
         choices=["squared_r_loss", "logistic_r_loss", "pseudo_outcome_mse"],
-        default="squared_r_loss",
+        default="pseudo_outcome_mse",
         help=(
             "Neural effect-stage objective. logistic_r_loss trains a Bernoulli "
             "R-learner logit modifier and reports probability-scale CATE; "
