@@ -304,7 +304,9 @@ class FakeHTREvidenceProvider:
         )
         return {
             "predictions": predictions,
-            "attention": self._attention_rows(discovery_df, outer_fold, "nuisance", e_hat=e_hat, m_hat=m_hat),
+            "attention": self._attention_rows(
+                discovery_df, outer_fold, "nuisance", e_hat=e_hat, m_hat=m_hat
+            ),
         }
 
     def fit_effect(self, discovery_df, nuisance_predictions, outer_fold):
@@ -323,7 +325,9 @@ class FakeHTREvidenceProvider:
         predictions["r_stage_train_eligible"] = True
         return {
             "predictions": predictions,
-            "attention": self._attention_rows(discovery_df, outer_fold, "effect_modifier", tau_hat_r_stage=tau_hat),
+            "attention": self._attention_rows(
+                discovery_df, outer_fold, "effect_modifier", tau_hat_r_stage=tau_hat
+            ),
         }
 
     def _attention_rows(self, discovery_df, outer_fold, stage, **extra):
@@ -525,14 +529,20 @@ def test_embedding_contrast_default_cache_dir_is_dataset_scoped(tmp_path: Path):
     dataset_dir = tmp_path / "dataset"
     dataset_dir.mkdir()
     parquet_path = dataset_dir / "cohort.parquet"
-    assert _default_embedding_cache_dir(
-        str(parquet_path),
-        tmp_path / "run",
-    ) == dataset_dir / ".oci_cache" / "embedding_contrast"
-    assert _default_embedding_cache_dir(
-        str(dataset_dir),
-        tmp_path / "run",
-    ) == dataset_dir / ".oci_cache" / "embedding_contrast"
+    assert (
+        _default_embedding_cache_dir(
+            str(parquet_path),
+            tmp_path / "run",
+        )
+        == dataset_dir / ".oci_cache" / "embedding_contrast"
+    )
+    assert (
+        _default_embedding_cache_dir(
+            str(dataset_dir),
+            tmp_path / "run",
+        )
+        == dataset_dir / ".oci_cache" / "embedding_contrast"
+    )
 
 
 def test_embedding_contrast_reuses_warm_chunk_and_concept_phrase_caches_without_model_load(
@@ -634,10 +644,7 @@ def test_embedding_contrast_skips_concept_probe_load_when_only_chunk_cache_is_wa
     )
     warm_generator.prepare(dataset)
     evidence = _build_embedding_contrast_cache_test_evidence(warm_generator, dataset)
-    assert (
-        evidence["concept_probe_skipped"]
-        == "concept_phrase_cache_miss_on_warm_chunk_cache"
-    )
+    assert evidence["concept_probe_skipped"] == "concept_phrase_cache_miss_on_warm_chunk_cache"
     treatment = next(item for item in evidence["contrasts"] if item["name"] == "treatment")
     assert treatment["concept_probe_scores"] == []
 
@@ -701,19 +708,13 @@ def test_embedding_contrast_evidence_retrieves_aligned_chunks(tmp_path: Path):
     assert treatment["probe_auc_role"] == "diagnostic_only"
     assert any("brain" in row["text"] for row in treatment["positive_aligned_chunks"])
     assert any("liver" in row["text"] for row in treatment["negative_aligned_chunks"])
-    assert any(
-        row["concept"] == "brain metastases"
-        for row in treatment["concept_probe_scores"]
-    )
+    assert any(row["concept"] == "brain metastases" for row in treatment["concept_probe_scores"])
 
     redacted = redact_embedding_contrast_evidence(evidence)
-    redacted_treatment = next(
-        item for item in redacted["contrasts"] if item["name"] == "treatment"
-    )
+    redacted_treatment = next(item for item in redacted["contrasts"] if item["name"] == "treatment")
     assert all(row["text"] is None for row in redacted_treatment["positive_aligned_chunks"])
     assert all(
-        row["text_redacted"] is True
-        for row in redacted_treatment["positive_aligned_chunks"]
+        row["text_redacted"] is True for row in redacted_treatment["positive_aligned_chunks"]
     )
 
 
@@ -778,32 +779,151 @@ def test_embedding_contrast_adds_cell_and_orthogonal_r_score_contrasts(
         "treated_outcome",
         "untreated_outcome",
         "treatment_outcome_interaction",
+        "residualized_treatment_outcome_interaction",
         "orthogonal_r_score",
     }.issubset(contrast_names)
 
     interaction = next(
-        item
-        for item in evidence["contrasts"]
-        if item["name"] == "treatment_outcome_interaction"
+        item for item in evidence["contrasts"] if item["name"] == "treatment_outcome_interaction"
     )
     assert interaction["contrast_family"] == "treatment_outcome_cell_interaction"
     assert interaction["direction_source"] == "cell_mean_difference_in_differences"
     assert {row["n"] for row in interaction["component_counts"]} == {2}
-    assert any(
-        "brain" in row["text"] for row in interaction["positive_aligned_chunks"]
-    )
-    assert any(
-        "liver" in row["text"] for row in interaction["negative_aligned_chunks"]
-    )
+    assert any("brain" in row["text"] for row in interaction["positive_aligned_chunks"])
+    assert any("liver" in row["text"] for row in interaction["negative_aligned_chunks"])
 
     orthogonal = next(
         item for item in evidence["contrasts"] if item["name"] == "orthogonal_r_score"
     )
     assert orthogonal["contrast_family"] == "orthogonal_r_score"
     assert "(Y - m_hat) * (T - e_hat)" in orthogonal["score_formula"]
-    assert any(
-        "brain" in row["text"] for row in orthogonal["positive_aligned_chunks"]
+    assert any("brain" in row["text"] for row in orthogonal["positive_aligned_chunks"])
+
+    residualized = next(
+        item
+        for item in evidence["contrasts"]
+        if item["name"] == "residualized_treatment_outcome_interaction"
     )
+    assert residualized["contrast_family"] == ("residualized_treatment_outcome_cell_interaction")
+    assert residualized["projection_basis"] == ["treatment", "outcome"]
+    assert any("brain" in row["text"] for row in residualized["positive_aligned_chunks"])
+    assert any("liver" in row["text"] for row in residualized["negative_aligned_chunks"])
+
+
+def test_embedding_contrast_residualized_interaction_does_not_require_r_targets(
+    tmp_path: Path,
+):
+    dataset = pd.DataFrame(
+        {
+            "_oci_row_id": np.arange(8),
+            "clinical_text": [
+                "brain metastases pd-l1 high",
+                "brain metastases pd-l1 high",
+                "liver lesion pd-l1 low",
+                "liver lesion pd-l1 low",
+                "liver lesion pd-l1 low",
+                "liver lesion pd-l1 low",
+                "brain metastases pd-l1 high",
+                "brain metastases pd-l1 high",
+            ],
+        }
+    )
+    config = AppliedInferenceConfig(
+        outcome_type="binary",
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        architecture=ModelArchitectureConfig(
+            model_type="multi_model_agentic_forest",
+            multi_model_agentic_forest=MultiModelAgenticForestConfig(
+                embedding_contrast=EmbeddingContrastDiscoveryConfig(
+                    enabled=True,
+                    model_name="fake-keyword",
+                    chunk_size_words=4,
+                    chunk_overlap_words=0,
+                    max_chunks=1,
+                    min_probe_auc=0.0,
+                    top_k_chunks_per_tail=3,
+                    max_chunks_per_patient=1,
+                ),
+                **_disable_htr_test_kwargs(),
+            ),
+        ),
+    )
+    generator = EmbeddingContrastEvidenceGenerator(
+        config=config,
+        output_dir=tmp_path,
+        embedding_provider=KeywordEmbeddingProvider(),
+    )
+    generator.prepare(dataset)
+    evidence = generator.build_evidence(
+        discovery_df=dataset,
+        y=np.asarray([1, 1, 0, 0, 1, 1, 0, 0], dtype=float),
+        t=np.asarray([1, 1, 1, 1, 0, 0, 0, 0], dtype=float),
+        pseudo_target=None,
+        t_resid=None,
+        importance={},
+    )
+    contrast_names = {item["name"] for item in evidence["contrasts"]}
+    assert "r_pseudo_target" not in contrast_names
+    residualized = next(
+        item
+        for item in evidence["contrasts"]
+        if item["name"] == "residualized_treatment_outcome_interaction"
+    )
+    assert "retrieval_skipped" not in residualized
+    assert any("brain" in row["text"] for row in residualized["positive_aligned_chunks"])
+
+
+def test_embedding_contrast_retrieves_external_chunks(tmp_path: Path):
+    external_cache = tmp_path / "external_cache"
+    external_cache.mkdir()
+    embeddings = KeywordEmbeddingProvider().encode_chunks(
+        ["external brain metastases review", "external liver lesion review"]
+    )
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    embeddings = embeddings / np.maximum(norms, 1e-12)
+    np.save(external_cache / "chunk_embeddings.npy", embeddings.astype(np.float32))
+    np.save(external_cache / "offsets.npy", np.asarray([0, 1, 2], dtype=np.int64))
+    (external_cache / "chunk_texts.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({"chunks": ["external brain metastases review"]}),
+                json.dumps({"chunks": ["external liver lesion review"]}),
+            ]
+        )
+        + "\n"
+    )
+    (external_cache / "metadata.json").write_text(
+        json.dumps({"corpus_name": "pubmed_smoke", "hidden_size": 8})
+    )
+    (external_cache / "row_metadata.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({"row_index": 0, "metadata": {"title": "Brain review"}}),
+                json.dumps({"row_index": 1, "metadata": {"title": "Liver review"}}),
+            ]
+        )
+        + "\n"
+    )
+    dataset = _embedding_contrast_cache_test_dataset()
+    config = _embedding_contrast_cache_test_config(tmp_path)
+    config.architecture.multi_model_agentic_forest.embedding_contrast.external_corpus_cache_dirs = [
+        str(external_cache)
+    ]
+    config.architecture.multi_model_agentic_forest.embedding_contrast.external_top_k_chunks_per_tail = (
+        2
+    )
+    generator = EmbeddingContrastEvidenceGenerator(
+        config=config,
+        output_dir=tmp_path,
+        embedding_provider=KeywordEmbeddingProvider(),
+    )
+    generator.prepare(dataset)
+    evidence = _build_embedding_contrast_cache_test_evidence(generator, dataset)
+    treatment = next(item for item in evidence["contrasts"] if item["name"] == "treatment")
+    assert any(row["corpus"] == "pubmed_smoke" for row in treatment["positive_external_chunks"])
+    assert any("external brain" in row["text"] for row in treatment["positive_external_chunks"])
 
 
 def test_multi_model_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path: Path):
@@ -893,24 +1013,13 @@ def test_multi_model_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path:
     assert all({"age", "pd_l1_expression"}.issubset(set(names)) for names in seen_names)
     assert all(names.count("pd_l1_expression") == 1 for names in seen_names)
     pdl1_specs = [
-        spec
-        for specs in evaluator.seen_specs
-        for spec in specs
-        if spec.name == "pd_l1_expression"
+        spec for specs in evaluator.seen_specs for spec in specs if spec.name == "pd_l1_expression"
     ]
     assert pdl1_specs
     assert all(spec.categories == ["<1%", "1-49%", ">=50%"] for spec in pdl1_specs)
     assert all("unknown" not in spec.categories for spec in pdl1_specs)
-    assert all(
-        spec.value_aliases[">=50%"] == ["high", "50% or greater"]
-        for spec in pdl1_specs
-    )
-    age_specs = [
-        spec
-        for specs in evaluator.seen_specs
-        for spec in specs
-        if spec.name == "age"
-    ]
+    assert all(spec.value_aliases[">=50%"] == ["high", "50% or greater"] for spec in pdl1_specs)
+    age_specs = [spec for specs in evaluator.seen_specs for spec in specs if spec.name == "age"]
     assert age_specs
     assert all(spec.type == "continuous" and spec.categories is None for spec in age_specs)
     assert all("numeric value only" in (spec.description or "") for spec in age_specs)
@@ -947,17 +1056,13 @@ def test_multi_model_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path:
         }
         fold_agent_rows = [
             json.loads(line)
-            for line in (fold_dir / "agent_candidate_proposals.jsonl")
-            .read_text()
-            .splitlines()
+            for line in (fold_dir / "agent_candidate_proposals.jsonl").read_text().splitlines()
         ]
         assert fold_agent_rows
         assert all(row.get("outer_fold") == fold for row in fold_agent_rows)
         fold_parsimony_rows = [
             json.loads(line)
-            for line in (fold_dir / "parsimony_review_by_fold.jsonl")
-            .read_text()
-            .splitlines()
+            for line in (fold_dir / "parsimony_review_by_fold.jsonl").read_text().splitlines()
         ]
         assert fold_parsimony_rows
         assert all(row["outer_fold"] == fold for row in fold_parsimony_rows)
@@ -1166,8 +1271,7 @@ def test_multi_model_agentic_forest_adds_embedding_contrast_context(
     )
     assert all(row["text"] is None for row in artifact_treatment["positive_aligned_chunks"])
     assert all(
-        row["text_redacted"] is True
-        for row in artifact_treatment["positive_aligned_chunks"]
+        row["text_redacted"] is True for row in artifact_treatment["positive_aligned_chunks"]
     )
 
 
@@ -1250,17 +1354,11 @@ def test_multi_model_agentic_forest_adds_htr_to_ensemble_and_agent_context(
     assert (artifact_dir / "htr_effect_oof_predictions.parquet").exists()
     assert (artifact_dir / "htr_attention_evidence.parquet").exists()
     text_predictions = pd.read_parquet(artifact_dir / "text_model_oof_predictions.parquet")
-    assert {"htr_nuisance", "htr_effect"}.issubset(
-        set(text_predictions["view_name"].dropna())
-    )
+    assert {"htr_nuisance", "htr_effect"}.issubset(set(text_predictions["view_name"].dropna()))
     assert int((text_predictions["view_name"] == "htr_nuisance").sum()) == len(dataset)
     assert int((text_predictions["view_name"] == "htr_effect").sum()) == len(dataset)
-    ensemble_nuisance = pd.read_parquet(
-        artifact_dir / "ensemble_nuisance_predictions.parquet"
-    )
-    assert {"source", "ensemble_mean"}.issubset(
-        set(ensemble_nuisance["nuisance_record_type"])
-    )
+    ensemble_nuisance = pd.read_parquet(artifact_dir / "ensemble_nuisance_predictions.parquet")
+    assert {"source", "ensemble_mean"}.issubset(set(ensemble_nuisance["nuisance_record_type"]))
     assert "htr_effect" not in set(ensemble_nuisance["source_name"].dropna())
     importance_rows = [
         json.loads(line)
@@ -1269,9 +1367,9 @@ def test_multi_model_agentic_forest_adds_htr_to_ensemble_and_agent_context(
         .splitlines()
     ]
     consensus_row = next(row for row in importance_rows if row["record_type"] == "consensus")
-    artifact_htr_row = consensus_row["context"]["htr_attention_evidence"]["nuisance"][
-        "attention"
-    ][0]
+    artifact_htr_row = consensus_row["context"]["htr_attention_evidence"]["nuisance"]["attention"][
+        0
+    ]
     assert artifact_htr_row["text_redacted"] is True
     assert "evidence_snippet" not in artifact_htr_row
     assert "top_token_spans" not in artifact_htr_row
@@ -1489,8 +1587,7 @@ def test_multi_model_agent_context_compacts_large_evidence_payload():
                         for idx in range(10)
                     ],
                     "concept_probe_scores": [
-                        {"concept": f"concept {idx}", "score": 0.111111}
-                        for idx in range(20)
+                        {"concept": f"concept {idx}", "score": 0.111111} for idx in range(20)
                     ],
                 }
             ],
@@ -1720,8 +1817,7 @@ def test_multi_model_extracted_feature_review_revises_underperforming_specs(
     )
 
     assert any(
-        context.get("prompt_version")
-        == "multi_model_agentic_extracted_feature_review_v1"
+        context.get("prompt_version") == "multi_model_agentic_extracted_feature_review_v1"
         for context in agent.contexts
     )
     assert ["noise_marker"] in extractor.calls
@@ -1742,9 +1838,7 @@ def test_multi_model_extracted_feature_review_revises_underperforming_specs(
     assert selected_sets[0]["parsimony_review"]["decision"] in {"retain_all", "prune"}
     parsimony_rows = [
         json.loads(line)
-        for line in (artifact_dir / "parsimony_review_by_fold.jsonl")
-        .read_text()
-        .splitlines()
+        for line in (artifact_dir / "parsimony_review_by_fold.jsonl").read_text().splitlines()
     ]
     assert parsimony_rows
     assert parsimony_rows[0]["event"] == "mandatory_parsimony_review"
@@ -1863,11 +1957,7 @@ def test_multi_model_prespecified_features_extract_before_bow_and_merge_roles(
     assert first_view["n_prespecified_features"] == 2
     assert "explicit:age_normalized" in first_view["prespecified_raw_feature_names"]
     assert "explicit:biomarker_positive" in first_view["prespecified_raw_feature_names"]
-    seen_roles = {
-        spec.name: spec.roles
-        for specs in evaluator.seen_specs
-        for spec in specs
-    }
+    seen_roles = {spec.name: spec.roles for specs in evaluator.seen_specs for spec in specs}
     assert seen_roles == {
         "age": ["confounder"],
         "biomarker": ["confounder", "effect_modifier"],
@@ -1925,7 +2015,11 @@ def test_multi_model_agentic_forest_parses_bow_views_and_embedding_option():
                             "chunk_selection": "last",
                             "min_probe_auc": 0.55,
                             "include_cell_contrasts": False,
+                            "include_confounder_vector_contrast": False,
+                            "include_residualized_interaction_contrast": False,
                             "include_orthogonal_r_score_contrasts": False,
+                            "external_corpus_cache_dirs": ["/tmp/pubmed_cache"],
+                            "external_top_k_chunks_per_tail": 5,
                             "concept_phrases": ["brain metastases"],
                         },
                     },
@@ -1966,7 +2060,11 @@ def test_multi_model_agentic_forest_parses_bow_views_and_embedding_option():
     assert nn_cfg.embedding_contrast.chunk_selection == "last"
     assert nn_cfg.embedding_contrast.min_probe_auc == 0.55
     assert nn_cfg.embedding_contrast.include_cell_contrasts is False
+    assert nn_cfg.embedding_contrast.include_confounder_vector_contrast is False
+    assert nn_cfg.embedding_contrast.include_residualized_interaction_contrast is False
     assert nn_cfg.embedding_contrast.include_orthogonal_r_score_contrasts is False
+    assert nn_cfg.embedding_contrast.external_corpus_cache_dirs == ["/tmp/pubmed_cache"]
+    assert nn_cfg.embedding_contrast.external_top_k_chunks_per_tail == 5
     assert nn_cfg.embedding_contrast.concept_phrases == ["brain metastases"]
     assert nn_cfg.feature_discovery_methods == ["bow", "htr", "embedding_contrast"]
     cfg.validate()
@@ -2059,10 +2157,7 @@ def test_oracle_multi_model_script_builds_default_and_cli_bow_views():
     )
     extracted_dataset_path = dataset_path.parent / "dataset_with_extraction.parquet"
     assert script._resolve_oracle_parquet_file(str(dataset_path)) == dataset_path
-    assert (
-        script._resolve_oracle_parquet_file(str(dataset_path.parent))
-        == extracted_dataset_path
-    )
+    assert script._resolve_oracle_parquet_file(str(dataset_path.parent)) == extracted_dataset_path
 
     cfg = script.MultiModelAgenticOracleConfig(
         dataset_path=str(dataset_path),
@@ -2082,6 +2177,8 @@ def test_oracle_multi_model_script_builds_default_and_cli_bow_views():
     cfg.bow_model = "extratrees"
     cfg.embedding_contrast_enabled = True
     cfg.embedding_concept_phrases = ["brain metastases"]
+    cfg.embedding_external_cache_dirs = ["/tmp/pubmed_cache"]
+    cfg.embedding_external_top_k_chunks_per_tail = 7
     cfg.extracted_feature_review_enabled = False
     cfg.extracted_feature_review_max_rounds = 1
     cfg.require_honest_outer_split = False
@@ -2092,6 +2189,8 @@ def test_oracle_multi_model_script_builds_default_and_cli_bow_views():
     assert mm_cfg.bow_views[0].bow_model == "extratrees"
     assert mm_cfg.embedding_contrast.enabled is True
     assert mm_cfg.embedding_contrast.concept_phrases == ["brain metastases"]
+    assert mm_cfg.embedding_contrast.external_corpus_cache_dirs == ["/tmp/pubmed_cache"]
+    assert mm_cfg.embedding_contrast.external_top_k_chunks_per_tail == 7
     assert mm_cfg.extracted_feature_review_enabled is False
     assert mm_cfg.extracted_feature_review_max_rounds == 1
     assert mm_cfg.require_honest_outer_split is False
@@ -2170,11 +2269,14 @@ def test_multi_model_agentic_forest_parses_prespecified_feature_sources(tmp_path
 
 
 def test_multi_model_candidate_consistency_fallback_prefers_stable_candidates():
-    assert _candidate_consistency_threshold(
-        3,
-        min_folds=2,
-        min_fold_fraction=0.5,
-    ) == 2
+    assert (
+        _candidate_consistency_threshold(
+            3,
+            min_folds=2,
+            min_fold_fraction=0.5,
+        )
+        == 2
+    )
     age = AgenticFeatureProposal(
         action="add",
         name="patient_age",

@@ -23,7 +23,6 @@ from ..models.concept_embedding_cache import (
 )
 from ..models.concept_embedding_utils import chunk_text_words
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -53,6 +52,7 @@ class EmbeddingContrastEvidenceGenerator:
         self._cache_dir: Optional[Path] = None
         self._chunk_cache_reused = False
         self._concept_probe_skip_reason: Optional[str] = None
+        self._external_corpora: List[Dict[str, Any]] = []
 
     @property
     def enabled(self) -> bool:
@@ -63,9 +63,7 @@ class EmbeddingContrastEvidenceGenerator:
         if not self.enabled or self._prepared:
             return
         if self.config.text_column not in dataset.columns:
-            raise ValueError(
-                f"Embedding contrast requires text column {self.config.text_column!r}"
-            )
+            raise ValueError(f"Embedding contrast requires text column {self.config.text_column!r}")
 
         texts = [str(text or "") for text in dataset[self.config.text_column].fillna("")]
         if "_oci_row_id" in dataset.columns:
@@ -89,6 +87,7 @@ class EmbeddingContrastEvidenceGenerator:
             self._prepare_from_provider()
         else:
             self._prepare_from_sentence_transformer_cache(texts)
+        self._external_corpora = self._load_external_corpora()
         self._prepared = True
 
     def build_evidence(
@@ -122,18 +121,19 @@ class EmbeddingContrastEvidenceGenerator:
 
         concept_phrases = self._concept_phrases(importance or {})
         self._concept_probe_skip_reason = None
-        concept_embeddings = (
-            self._encode_concepts(concept_phrases) if concept_phrases else None
+        concept_embeddings = self._encode_concepts(concept_phrases) if concept_phrases else None
+        y_array = np.asarray(y, dtype=float)
+        t_array = np.asarray(t, dtype=float)
+        pseudo_targets = _named_pseudo_targets(
+            pseudo_target,
+            t_resid,
+            pseudo_target_names,
         )
         contrasts = []
         for contrast in self._contrast_specs(
-            y=np.asarray(y, dtype=float),
-            t=np.asarray(t, dtype=float),
-            pseudo_targets=_named_pseudo_targets(
-                pseudo_target,
-                t_resid,
-                pseudo_target_names,
-            ),
+            y=y_array,
+            t=t_array,
+            pseudo_targets=pseudo_targets,
         ):
             contrasts.append(
                 self._build_one_contrast(
@@ -142,6 +142,28 @@ class EmbeddingContrastEvidenceGenerator:
                     concept_phrases=concept_phrases,
                     concept_embeddings=concept_embeddings,
                     **contrast,
+                )
+            )
+        if bool(self.embedding_config.include_confounder_vector_contrast):
+            contrasts.append(
+                self._build_confounder_vector_contrast(
+                    positions=positions,
+                    patient_embeddings=patient_embeddings,
+                    y=y_array,
+                    t=t_array,
+                    concept_phrases=concept_phrases,
+                    concept_embeddings=concept_embeddings,
+                )
+            )
+        if bool(self.embedding_config.include_residualized_interaction_contrast):
+            contrasts.append(
+                self._build_residualized_interaction_contrast(
+                    positions=positions,
+                    patient_embeddings=patient_embeddings,
+                    y=y_array,
+                    t=t_array,
+                    concept_phrases=concept_phrases,
+                    concept_embeddings=concept_embeddings,
                 )
             )
 
@@ -167,6 +189,14 @@ class EmbeddingContrastEvidenceGenerator:
             ],
             "n_patients": int(len(positions)),
             "n_concept_phrases": int(len(concept_phrases)),
+            "external_corpora": [
+                {
+                    "name": str(corpus["name"]),
+                    "cache_path": str(corpus["cache_path"]),
+                    "n_chunks": int(corpus["embeddings"].shape[0]),
+                }
+                for corpus in self._external_corpora
+            ],
             "contrasts": contrasts,
         }
         if self._concept_probe_skip_reason:
@@ -227,6 +257,27 @@ class EmbeddingContrastEvidenceGenerator:
         self._flat_embeddings = cache.hidden_states_array.flat
         self._offsets = cache.hidden_states_array.offsets
         self._chunks_by_position = cache.load_chunks(expected_num_samples=len(texts))
+
+    def _load_external_corpora(self) -> List[Dict[str, Any]]:
+        corpora: List[Dict[str, Any]] = []
+        for raw_path in self.embedding_config.external_corpus_cache_dirs:
+            for cache_path in _resolve_external_cache_paths(raw_path):
+                try:
+                    corpus = _load_external_corpus_cache(cache_path)
+                except Exception as exc:
+                    logger.warning(
+                        "Skipping external embedding corpus cache %s: %s",
+                        cache_path,
+                        exc,
+                    )
+                    continue
+                corpora.append(corpus)
+                logger.info(
+                    "Loaded external embedding corpus %s: %d chunks",
+                    corpus["name"],
+                    int(corpus["embeddings"].shape[0]),
+                )
+        return corpora
 
     def _positions_for_frame(self, frame: pd.DataFrame) -> List[int]:
         if "_oci_row_id" in frame.columns:
@@ -301,8 +352,7 @@ class EmbeddingContrastEvidenceGenerator:
                 "metadata": {
                     "contrast_family": "marginal",
                     "direction_formula": (
-                        f"mean_embedding({positive_label}) - "
-                        f"mean_embedding({negative_label})"
+                        f"mean_embedding({positive_label}) - " f"mean_embedding({negative_label})"
                     ),
                 },
             }
@@ -370,9 +420,7 @@ class EmbeddingContrastEvidenceGenerator:
                 )
                 score_name = "orthogonal_r_score"
                 if multiple_pseudo_targets:
-                    score_name = (
-                        f"orthogonal_r_score__{_safe_contrast_suffix(pseudo_name)}"
-                    )
+                    score_name = f"orthogonal_r_score__{_safe_contrast_suffix(pseudo_name)}"
                 specs.append(
                     {
                         "name": score_name,
@@ -438,18 +486,10 @@ class EmbeddingContrastEvidenceGenerator:
                 }
             )
 
-        treated_positive = (
-            base_mask & (treatment_labels == 1) & (outcome_labels == 1)
-        )
-        treated_negative = (
-            base_mask & (treatment_labels == 1) & (outcome_labels == 0)
-        )
-        untreated_positive = (
-            base_mask & (treatment_labels == 0) & (outcome_labels == 1)
-        )
-        untreated_negative = (
-            base_mask & (treatment_labels == 0) & (outcome_labels == 0)
-        )
+        treated_positive = base_mask & (treatment_labels == 1) & (outcome_labels == 1)
+        treated_negative = base_mask & (treatment_labels == 1) & (outcome_labels == 0)
+        untreated_positive = base_mask & (treatment_labels == 0) & (outcome_labels == 1)
+        untreated_negative = base_mask & (treatment_labels == 0) & (outcome_labels == 0)
         interaction_labels = np.zeros(len(treatment_labels), dtype=int)
         interaction_labels[treated_positive | untreated_negative] = 1
         specs.append(
@@ -502,6 +542,194 @@ class EmbeddingContrastEvidenceGenerator:
             }
         )
         return specs
+
+    def _build_confounder_vector_contrast(
+        self,
+        *,
+        positions: Sequence[int],
+        patient_embeddings: np.ndarray,
+        y: np.ndarray,
+        t: np.ndarray,
+        concept_phrases: Sequence[str],
+        concept_embeddings: Optional[np.ndarray],
+    ) -> Dict[str, Any]:
+        """Build averaged marginal T/Y contrast evidence for confounder discovery."""
+        treatment_labels, treatment_mask = _binary_labels(t)
+        outcome_labels, outcome_mask, outcome_positive_label, outcome_negative_label = (
+            self._outcome_label_spec(y)
+        )
+        record: Dict[str, Any] = {
+            "name": "confounder_vector",
+            "positive_label": "treated_or_outcome_positive_side",
+            "negative_label": "untreated_or_outcome_negative_side",
+            "role_hint": "confounder",
+            "contrast_family": "marginal_confounder_average",
+            "direction_source": "average_normalized_treatment_and_outcome_mean_differences",
+            "direction_formula": (
+                "normalize((normalize(mean_embedding(T=1)-mean_embedding(T=0)) + "
+                f"normalize(mean_embedding({outcome_positive_label}) - "
+                f"mean_embedding({outcome_negative_label}))) / 2)"
+            ),
+        }
+        usable = np.all(np.isfinite(patient_embeddings), axis=1)
+        t_direction, t_counts = _binary_mean_difference_direction(
+            patient_embeddings,
+            treatment_labels,
+            treatment_mask & usable,
+        )
+        y_direction, y_counts = _binary_mean_difference_direction(
+            patient_embeddings,
+            outcome_labels,
+            outcome_mask & usable,
+        )
+        record["component_counts"] = [
+            {"label": "treatment_positive", "n": t_counts[1], "coefficient": 0.5},
+            {"label": "treatment_negative", "n": t_counts[0], "coefficient": -0.5},
+            {"label": "outcome_positive", "n": y_counts[1], "coefficient": 0.5},
+            {"label": "outcome_negative", "n": y_counts[0], "coefficient": -0.5},
+        ]
+        record["n_positive"] = min(t_counts[1], y_counts[1])
+        record["n_negative"] = min(t_counts[0], y_counts[0])
+        if t_direction is None or y_direction is None:
+            record["retrieval_skipped"] = "too_few_examples_per_component"
+            return record
+        t_unit = _normalize_vector(t_direction)
+        y_unit = _normalize_vector(y_direction)
+        direction = 0.5 * t_unit + 0.5 * y_unit
+        record["treatment_direction_norm"] = _finite_or_none(float(np.linalg.norm(t_direction)))
+        record["outcome_direction_norm"] = _finite_or_none(float(np.linalg.norm(y_direction)))
+        record["component_cosine"] = _finite_or_none(float(np.dot(t_unit, y_unit)))
+        return self._finalize_direction_record(
+            record=record,
+            positions=positions,
+            direction=direction,
+            concept_phrases=concept_phrases,
+            concept_embeddings=concept_embeddings,
+        )
+
+    def _build_residualized_interaction_contrast(
+        self,
+        *,
+        positions: Sequence[int],
+        patient_embeddings: np.ndarray,
+        y: np.ndarray,
+        t: np.ndarray,
+        concept_phrases: Sequence[str],
+        concept_embeddings: Optional[np.ndarray],
+    ) -> Dict[str, Any]:
+        """Build no-nuisance residualized 2x2 interaction evidence."""
+        treatment_labels, treatment_mask = _binary_labels(t)
+        outcome_labels, outcome_mask, outcome_positive_label, outcome_negative_label = (
+            self._outcome_label_spec(y)
+        )
+        base_mask = (
+            np.asarray(treatment_mask, dtype=bool)
+            & np.asarray(outcome_mask, dtype=bool)
+            & np.all(np.isfinite(patient_embeddings), axis=1)
+        )
+        treated_positive = base_mask & (treatment_labels == 1) & (outcome_labels == 1)
+        treated_negative = base_mask & (treatment_labels == 1) & (outcome_labels == 0)
+        untreated_positive = base_mask & (treatment_labels == 0) & (outcome_labels == 1)
+        untreated_negative = base_mask & (treatment_labels == 0) & (outcome_labels == 0)
+        component_masks = [
+            ("treated_outcome_positive", 1.0, treated_positive),
+            ("treated_outcome_negative", -1.0, treated_negative),
+            ("untreated_outcome_positive", -1.0, untreated_positive),
+            ("untreated_outcome_negative", 1.0, untreated_negative),
+        ]
+        record: Dict[str, Any] = {
+            "name": "residualized_treatment_outcome_interaction",
+            "positive_label": "treated_outcome_association_exceeds_untreated",
+            "negative_label": "untreated_outcome_association_exceeds_treated",
+            "role_hint": "effect_modifier",
+            "contrast_family": "residualized_treatment_outcome_cell_interaction",
+            "direction_source": ("cell_mean_difference_in_differences_residualized_from_marginals"),
+            "direction_formula": (
+                "residualize(mean(T=1,Y=high/present) - "
+                "mean(T=1,Y=low/absent) - mean(T=0,Y=high/present) + "
+                "mean(T=0,Y=low/absent), basis=[treatment contrast, "
+                "outcome contrast])"
+            ),
+            "projection_basis": ["treatment", "outcome"],
+            "positive_cell_labels": [
+                f"treated_{outcome_positive_label}",
+                f"untreated_{outcome_negative_label}",
+            ],
+            "negative_cell_labels": [
+                f"treated_{outcome_negative_label}",
+                f"untreated_{outcome_positive_label}",
+            ],
+        }
+        raw_direction = np.zeros(patient_embeddings.shape[1], dtype=np.float32)
+        component_counts = []
+        for label, coefficient, component_mask in component_masks:
+            count = int(np.sum(component_mask))
+            component_counts.append(
+                {
+                    "label": label,
+                    "coefficient": _finite_or_none(coefficient),
+                    "n": count,
+                }
+            )
+            if count < 2:
+                record["component_counts"] = component_counts
+                record["retrieval_skipped"] = "too_few_examples_per_component"
+                return record
+            raw_direction += coefficient * np.mean(
+                patient_embeddings[component_mask],
+                axis=0,
+            )
+        record["component_counts"] = component_counts
+        record["n_positive"] = int(np.sum(treated_positive | untreated_negative))
+        record["n_negative"] = int(np.sum(treated_negative | untreated_positive))
+        treatment_direction, _ = _binary_mean_difference_direction(
+            patient_embeddings,
+            treatment_labels,
+            treatment_mask & np.all(np.isfinite(patient_embeddings), axis=1),
+        )
+        outcome_direction, _ = _binary_mean_difference_direction(
+            patient_embeddings,
+            outcome_labels,
+            outcome_mask & np.all(np.isfinite(patient_embeddings), axis=1),
+        )
+        if treatment_direction is None or outcome_direction is None:
+            record["retrieval_skipped"] = "too_few_examples_per_marginal_basis"
+            return record
+        raw_norm = float(np.linalg.norm(raw_direction))
+        residual_direction = _residualize_vector_from_basis(
+            raw_direction,
+            [treatment_direction, outcome_direction],
+        )
+        record["raw_interaction_norm"] = _finite_or_none(raw_norm)
+        record["residualized_direction_norm"] = _finite_or_none(
+            float(np.linalg.norm(residual_direction))
+        )
+        record["treatment_direction_cosine_before_residualization"] = _finite_or_none(
+            float(np.dot(_normalize_vector(raw_direction), _normalize_vector(treatment_direction)))
+        )
+        record["outcome_direction_cosine_before_residualization"] = _finite_or_none(
+            float(np.dot(_normalize_vector(raw_direction), _normalize_vector(outcome_direction)))
+        )
+        return self._finalize_direction_record(
+            record=record,
+            positions=positions,
+            direction=residual_direction,
+            concept_phrases=concept_phrases,
+            concept_embeddings=concept_embeddings,
+        )
+
+    def _outcome_label_spec(
+        self,
+        y: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, str, str]:
+        if str(self.config.outcome_type).lower() == "continuous":
+            labels, mask = _tail_labels(
+                y,
+                float(self.embedding_config.pseudo_target_quantile),
+            )
+            return labels, mask, "higher_outcome", "lower_outcome"
+        labels, mask = _binary_labels(y)
+        return labels, mask, "outcome_present", "outcome_absent"
 
     def _build_one_contrast(
         self,
@@ -591,9 +819,7 @@ class EmbeddingContrastEvidenceGenerator:
 
         min_auc = float(self.embedding_config.min_probe_auc)
         if min_auc > 0.0 and (
-            probe_auc is None
-            or not np.isfinite(probe_auc)
-            or probe_auc < min_auc
+            probe_auc is None or not np.isfinite(probe_auc) or probe_auc < min_auc
         ):
             record["retrieval_skipped"] = "probe_auc_below_threshold"
             return record
@@ -603,9 +829,33 @@ class EmbeddingContrastEvidenceGenerator:
 
         direction = _normalize_vector(mean_direction)
         record["direction_source"] = direction_source
-        record["probe_auc_role"] = (
-            "diagnostic_gate_only" if min_auc > 0.0 else "diagnostic_only"
+        record["probe_auc_role"] = "diagnostic_gate_only" if min_auc > 0.0 else "diagnostic_only"
+        return self._finalize_direction_record(
+            record=record,
+            positions=positions,
+            direction=direction,
+            concept_phrases=concept_phrases,
+            concept_embeddings=concept_embeddings,
         )
+
+    def _finalize_direction_record(
+        self,
+        *,
+        record: Dict[str, Any],
+        positions: Sequence[int],
+        direction: np.ndarray,
+        concept_phrases: Sequence[str],
+        concept_embeddings: Optional[np.ndarray],
+    ) -> Dict[str, Any]:
+        direction_norm = float(np.linalg.norm(direction))
+        record["mean_difference_norm"] = record.get(
+            "mean_difference_norm",
+            _finite_or_none(direction_norm),
+        )
+        if not np.isfinite(direction_norm) or direction_norm <= 0.0:
+            record["retrieval_skipped"] = "zero_direction"
+            return record
+        direction = _normalize_vector(direction)
         record["direction_norm"] = _finite_or_none(float(np.linalg.norm(direction)))
         record["positive_aligned_chunks"] = self._retrieve_chunks(
             positions,
@@ -617,6 +867,15 @@ class EmbeddingContrastEvidenceGenerator:
             direction,
             descending=False,
         )
+        if self._external_corpora:
+            record["positive_external_chunks"] = self._retrieve_external_chunks(
+                direction,
+                descending=True,
+            )
+            record["negative_external_chunks"] = self._retrieve_external_chunks(
+                direction,
+                descending=False,
+            )
         record["concept_probe_scores"] = self._score_concepts(
             concept_phrases,
             concept_embeddings,
@@ -668,6 +927,62 @@ class EmbeddingContrastEvidenceGenerator:
                 break
         return rows
 
+    def _retrieve_external_chunks(
+        self,
+        direction: np.ndarray,
+        *,
+        descending: bool,
+    ) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        limit = int(self.embedding_config.external_top_k_chunks_per_tail)
+        for corpus in self._external_corpora:
+            embeddings = corpus["embeddings"]
+            if embeddings.ndim != 2 or embeddings.shape[1] != len(direction):
+                logger.warning(
+                    "Skipping external corpus %s due to embedding dimension %s; "
+                    "contrast direction has dimension %s",
+                    corpus["name"],
+                    embeddings.shape[1] if embeddings.ndim == 2 else embeddings.shape,
+                    len(direction),
+                )
+                continue
+            candidates = _top_scored_flat_indices(
+                embeddings,
+                direction,
+                limit=limit,
+                descending=descending,
+            )
+            offsets = corpus["offsets"]
+            chunks_by_sample = corpus["chunks_by_sample"]
+            row_metadata = corpus["row_metadata"]
+            for score, flat_index in candidates:
+                sample_index = int(np.searchsorted(offsets, flat_index, side="right") - 1)
+                if sample_index < 0 or sample_index >= len(chunks_by_sample):
+                    continue
+                chunk_index = int(flat_index - int(offsets[sample_index]))
+                chunks = chunks_by_sample[sample_index]
+                text = chunks[chunk_index] if chunk_index < len(chunks) else ""
+                if not _informative_chunk_text(text):
+                    continue
+                metadata = (
+                    row_metadata[sample_index]
+                    if sample_index < len(row_metadata)
+                    else {"row_index": sample_index}
+                )
+                rows.append(
+                    {
+                        "corpus": str(corpus["name"]),
+                        "cache_path": str(corpus["cache_path"]),
+                        "row_index": int(sample_index),
+                        "chunk_index": int(chunk_index),
+                        "score": _finite_or_none(float(score)),
+                        "text": text,
+                        "metadata": _jsonable_value(metadata),
+                    }
+                )
+        rows.sort(key=lambda item: float(item.get("score") or 0.0), reverse=descending)
+        return rows[:limit]
+
     def _concept_phrases(self, importance: Dict[str, Any]) -> List[str]:
         phrases: List[str] = list(self.embedding_config.concept_phrases)
         if bool(self.embedding_config.include_bow_phrases_as_concepts):
@@ -709,9 +1024,7 @@ class EmbeddingContrastEvidenceGenerator:
             if cached is not None:
                 return cached
             if self._chunk_cache_reused:
-                self._concept_probe_skip_reason = (
-                    "concept_phrase_cache_miss_on_warm_chunk_cache"
-                )
+                self._concept_probe_skip_reason = "concept_phrase_cache_miss_on_warm_chunk_cache"
                 logger.info(
                     "Skipping embedding concept probes because chunk embeddings "
                     "were reused from cache and concept phrase embeddings are not "
@@ -750,9 +1063,7 @@ class EmbeddingContrastEvidenceGenerator:
             "max_seq_length": self.embedding_config.max_seq_length,
             "phrases": [str(phrase) for phrase in phrases],
         }
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
-            "utf-8"
-        )
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         digest = hashlib.sha256(encoded).hexdigest()[:16]
         return self._cache_dir / f"embedding_concept_phrases_{digest}.npz"
 
@@ -816,9 +1127,7 @@ class EmbeddingContrastEvidenceGenerator:
             return provider.encode_texts(list(texts))
         if hasattr(provider, "encode"):
             return provider.encode(list(texts))
-        raise TypeError(
-            "embedding_provider must implement encode_chunks, encode_texts, or encode"
-        )
+        raise TypeError("embedding_provider must implement encode_chunks, encode_texts, or encode")
 
 
 def redact_embedding_contrast_evidence(evidence: Any) -> Any:
@@ -854,8 +1163,12 @@ def _named_pseudo_targets(
     t_resid: Any,
     names: Optional[Sequence[str]],
 ) -> List[Tuple[str, np.ndarray, np.ndarray]]:
+    if pseudo_target is None or t_resid is None:
+        return []
     targets = _as_target_list(pseudo_target)
     residuals = _as_target_list(t_resid)
+    if not targets or not residuals:
+        return []
     if len(residuals) == 1 and len(targets) > 1:
         residuals = residuals * len(targets)
     if len(targets) != len(residuals):
@@ -880,6 +1193,8 @@ def _named_pseudo_targets(
 
 
 def _as_target_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
     if isinstance(value, np.ndarray):
         return [value]
     if isinstance(value, (list, tuple)):
@@ -1005,6 +1320,49 @@ def _weighted_mean(values: np.ndarray, weights: Optional[np.ndarray]) -> np.ndar
     return np.sum(values * weights[:, None], axis=0)
 
 
+def _binary_mean_difference_direction(
+    embeddings: np.ndarray,
+    labels: np.ndarray,
+    mask: np.ndarray,
+) -> Tuple[Optional[np.ndarray], Dict[int, int]]:
+    labels = np.asarray(labels, dtype=int)
+    mask = np.asarray(mask, dtype=bool)
+    pos_mask = mask & (labels == 1)
+    neg_mask = mask & (labels == 0)
+    counts = {1: int(np.sum(pos_mask)), 0: int(np.sum(neg_mask))}
+    if counts[1] < 2 or counts[0] < 2:
+        return None, counts
+    return (
+        np.mean(embeddings[pos_mask], axis=0) - np.mean(embeddings[neg_mask], axis=0),
+        counts,
+    )
+
+
+def _residualize_vector_from_basis(
+    vector: np.ndarray,
+    basis: Sequence[np.ndarray],
+) -> np.ndarray:
+    columns = []
+    for item in basis:
+        item = np.asarray(item, dtype=np.float32).reshape(-1)
+        if np.all(np.isfinite(item)) and np.linalg.norm(item) > 0.0:
+            columns.append(_normalize_vector(item))
+    if not columns:
+        return np.asarray(vector, dtype=np.float32)
+    design = np.vstack(columns).T.astype(np.float64, copy=False)
+    try:
+        coef, *_ = np.linalg.lstsq(
+            design,
+            np.asarray(vector, dtype=np.float64).reshape(-1),
+            rcond=None,
+        )
+    except np.linalg.LinAlgError:
+        logger.warning("Vector residualization failed; using raw direction")
+        return np.asarray(vector, dtype=np.float32)
+    residual = np.asarray(vector, dtype=np.float64).reshape(-1) - design @ coef
+    return residual.astype(np.float32, copy=False)
+
+
 def _subset(values: Optional[np.ndarray], mask: np.ndarray) -> Optional[np.ndarray]:
     if values is None:
         return None
@@ -1073,6 +1431,118 @@ def _default_embedding_cache_dir(dataset_path: str, output_dir: Path) -> Path:
     return dataset_dir / ".oci_cache" / "embedding_contrast"
 
 
+def _resolve_external_cache_paths(raw_path: str) -> List[Path]:
+    root = Path(str(raw_path)).expanduser()
+    if _is_embedding_cache_path(root):
+        return [root]
+    if not root.exists():
+        raise FileNotFoundError(f"External embedding corpus path not found: {root}")
+    paths = [
+        child
+        for child in sorted(root.iterdir())
+        if child.is_dir() and _is_embedding_cache_path(child)
+    ]
+    if not paths:
+        raise FileNotFoundError(
+            f"No embedding chunk cache found at {root}; expected chunk_embeddings.npy, "
+            "offsets.npy, and chunk_texts.jsonl in the path or an immediate child."
+        )
+    return paths
+
+
+def _is_embedding_cache_path(path: Path) -> bool:
+    return all(
+        (path / filename).exists()
+        for filename in ["chunk_embeddings.npy", "offsets.npy", "chunk_texts.jsonl"]
+    )
+
+
+def _load_external_corpus_cache(cache_path: Path) -> Dict[str, Any]:
+    metadata_path = cache_path / "metadata.json"
+    metadata: Dict[str, Any] = {}
+    if metadata_path.exists():
+        with open(metadata_path, encoding="utf-8") as f:
+            metadata = json.load(f)
+    embeddings = np.load(str(cache_path / "chunk_embeddings.npy"), mmap_mode="r")
+    offsets = np.load(str(cache_path / "offsets.npy"))
+    chunks_by_sample = []
+    with open(cache_path / "chunk_texts.jsonl", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                chunks_by_sample.append(
+                    [str(chunk) for chunk in json.loads(line).get("chunks", [])]
+                )
+    if len(offsets) != len(chunks_by_sample) + 1:
+        raise RuntimeError(f"External cache offsets/chunk text length mismatch in {cache_path}")
+    row_metadata = _load_external_row_metadata(cache_path, len(chunks_by_sample))
+    name = str(metadata.get("corpus_name") or metadata.get("dataset_path") or cache_path.name)
+    return {
+        "name": name,
+        "cache_path": cache_path,
+        "metadata": metadata,
+        "embeddings": embeddings,
+        "offsets": offsets,
+        "chunks_by_sample": chunks_by_sample,
+        "row_metadata": row_metadata,
+    }
+
+
+def _load_external_row_metadata(
+    cache_path: Path,
+    expected_rows: int,
+) -> List[Dict[str, Any]]:
+    path = cache_path / "row_metadata.jsonl"
+    if not path.exists():
+        return [{"row_index": idx} for idx in range(expected_rows)]
+    rows: List[Dict[str, Any]] = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                payload = json.loads(line)
+                rows.append(payload if isinstance(payload, dict) else {"value": payload})
+    if len(rows) != expected_rows:
+        logger.warning(
+            "External row metadata in %s has %d rows; expected %d",
+            path,
+            len(rows),
+            expected_rows,
+        )
+    return rows
+
+
+def _top_scored_flat_indices(
+    embeddings: np.ndarray,
+    direction: np.ndarray,
+    *,
+    limit: int,
+    descending: bool,
+) -> List[Tuple[float, int]]:
+    direction = np.asarray(direction, dtype=np.float32).reshape(-1)
+    block_size = 50_000
+    candidates: List[Tuple[float, int]] = []
+    n_rows = int(embeddings.shape[0])
+    for start in range(0, n_rows, block_size):
+        end = min(start + block_size, n_rows)
+        scores = np.asarray(embeddings[start:end], dtype=np.float32) @ direction
+        finite = np.isfinite(scores)
+        if not np.any(finite):
+            continue
+        finite_indices = np.flatnonzero(finite)
+        finite_scores = scores[finite_indices]
+        k = min(int(limit), len(finite_scores))
+        if k <= 0:
+            continue
+        if descending:
+            local = np.argpartition(finite_scores, -k)[-k:]
+        else:
+            local = np.argpartition(finite_scores, k - 1)[:k]
+        candidates.extend(
+            (float(finite_scores[idx]), int(start + finite_indices[idx])) for idx in local
+        )
+    candidates.sort(key=lambda item: item[0], reverse=descending)
+    return candidates[: int(limit)]
+
+
 def _finite_or_none(value: Optional[float]) -> Optional[float]:
     if value is None:
         return None
@@ -1092,5 +1562,17 @@ def _jsonable_scalar(value: Any) -> Any:
     if isinstance(value, np.generic):
         return value.item()
     if isinstance(value, (np.ndarray,)):
+        return value.tolist()
+    return value
+
+
+def _jsonable_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _jsonable_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_value(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
         return value.tolist()
     return value

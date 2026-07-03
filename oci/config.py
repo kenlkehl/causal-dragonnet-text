@@ -127,6 +127,7 @@ def normalize_multi_model_feature_discovery_methods(
 # EXPLICIT FEATURE EXTRACTION CONFIGURATION
 # =============================================================================
 
+
 @dataclass
 class ExplicitFeatureSpec:
     """Specification for a single explicit feature to extract from clinical text.
@@ -134,6 +135,7 @@ class ExplicitFeatureSpec:
     Roles are causal roles, not mutually exclusive classes. A variable can be a
     confounder, an effect modifier, or both.
     """
+
     name: str  # e.g., "performance_status"
     type: str  # "categorical" or "continuous"
     categories: Optional[List[str]] = None  # For categorical only (e.g., ["0", "1", "2", "3", "4"])
@@ -170,14 +172,10 @@ class ExplicitFeatureSpec:
                     continue
                 alias_values = aliases if isinstance(aliases, list) else [aliases]
                 normalized_aliases[category_text] = [
-                    str(alias).strip()
-                    for alias in alias_values
-                    if str(alias).strip()
+                    str(alias).strip() for alias in alias_values if str(alias).strip()
                 ]
             self.value_aliases = {
-                category: values
-                for category, values in normalized_aliases.items()
-                if values
+                category: values for category, values in normalized_aliases.items() if values
             } or None
 
 
@@ -187,6 +185,7 @@ class ExplicitFeatureExtractionConfig:
 
     Extracted features are role-tagged as confounders, effect modifiers, or both.
     """
+
     enabled: bool = False
     features: List[ExplicitFeatureSpec] = field(default_factory=list)
 
@@ -301,9 +300,7 @@ def parse_explicit_feature_specs_payload(
             )
         )
     if not specs:
-        raise ValueError(
-            f"{source} must contain 'features', 'confounders', or 'effect_modifiers'"
-        )
+        raise ValueError(f"{source} must contain 'features', 'confounders', or 'effect_modifiers'")
     return specs
 
 
@@ -372,6 +369,7 @@ ExplicitConfounderExtractionConfig = ExplicitFeatureExtractionConfig
 # MATCHING ANALYSIS CONFIGURATION (used as post-hoc analysis with DragonNet)
 # =============================================================================
 
+
 @dataclass
 class MatchingAnalysisConfig:
     """Configuration for propensity score matching analysis (post-hoc)."""
@@ -407,6 +405,7 @@ class MatchingAnalysisConfig:
 # CAUSAL FOREST CONFIGURATION
 # =============================================================================
 
+
 @dataclass
 class ContrastiveEffectConfig:
     """Configuration for matched contrastive effect-modifier representation learning.
@@ -415,6 +414,7 @@ class ContrastiveEffectConfig:
     propensity-neighborhood treatment/control contrasts, then trains the X
     representation to explain within-neighborhood outcome differences.
     """
+
     enabled: bool = False
 
     # X representation bottleneck
@@ -519,6 +519,7 @@ class CausalForestConfig:
 # TF-IDF + CAUSAL FOREST CONFIGURATION
 # =============================================================================
 
+
 @dataclass
 class TfidfForestConfig:
     """Configuration for TF-IDF + Causal Forest baseline (model_type="tfidf_forest").
@@ -528,25 +529,26 @@ class TfidfForestConfig:
     """
 
     # TF-IDF vectorizer parameters
-    max_features: int = 10000       # Maximum number of TF-IDF features
-    ngram_range_min: int = 1        # Minimum n-gram size
-    ngram_range_max: int = 2        # Maximum n-gram size
-    min_df: int = 5                 # Minimum document frequency (absolute count)
-    max_df: float = 0.95            # Maximum document frequency (proportion)
-    sublinear_tf: bool = True       # Use sublinear TF scaling (1 + log(tf))
+    max_features: int = 10000  # Maximum number of TF-IDF features
+    ngram_range_min: int = 1  # Minimum n-gram size
+    ngram_range_max: int = 2  # Maximum n-gram size
+    min_df: int = 5  # Minimum document frequency (absolute count)
+    max_df: float = 0.95  # Maximum document frequency (proportion)
+    sublinear_tf: bool = True  # Use sublinear TF scaling (1 + log(tf))
 
     # Causal forest parameters
-    n_estimators: int = 200         # Number of trees (must be divisible by 4 for econml)
-    max_depth: Optional[int] = None # Maximum tree depth (None = unlimited)
-    min_samples_leaf: int = 10      # Minimum samples per leaf
+    n_estimators: int = 200  # Number of trees (must be divisible by 4 for econml)
+    max_depth: Optional[int] = None  # Maximum tree depth (None = unlimited)
+    min_samples_leaf: int = 10  # Minimum samples per leaf
     max_features_forest: str = "sqrt"  # Feature subset strategy for splitting
-    honest: bool = True             # Honest estimation (sample splitting within trees)
-    inference: bool = True          # Enable confidence intervals
+    honest: bool = True  # Honest estimation (sample splitting within trees)
+    inference: bool = True  # Enable confidence intervals
 
 
 # =============================================================================
 # EXPLICIT-FEATURE-ONLY CAUSAL FOREST CONFIGURATION
 # =============================================================================
+
 
 @dataclass
 class ExplicitFeatureForestConfig:
@@ -556,6 +558,7 @@ class ExplicitFeatureForestConfig:
     CausalForestDML. Confounder-role features are passed as W, and
     effect-modifier-role features are passed as X.
     """
+
     n_estimators: int = 200
     max_depth: Optional[int] = None
     min_samples_leaf: int = 10
@@ -571,6 +574,7 @@ ConfounderForestConfig = ExplicitFeatureForestConfig
 # AGENTIC EXPLICIT FEATURE SEARCH CONFIGURATION
 # =============================================================================
 
+
 @dataclass
 class AgenticFeatureSearchConfig:
     """Configuration for adaptive explicit-feature causal forest search.
@@ -579,6 +583,7 @@ class AgenticFeatureSearchConfig:
     object being evaluated. The outer CV folds report performance, while the
     inner folds decide whether a proposed add/remove/re-role action is accepted.
     """
+
     outer_folds: int = 5
     inner_folds: int = 3
     max_iterations: int = 3
@@ -644,8 +649,7 @@ class AgenticFeatureSearchConfig:
             raise ValueError("agentic_feature_search.min_feature_coverage must be in [0, 1]")
         if self.search_mode not in {"iterative", "broad_screen"}:
             raise ValueError(
-                "agentic_feature_search.search_mode must be one of "
-                "['iterative', 'broad_screen']"
+                "agentic_feature_search.search_mode must be one of " "['iterative', 'broad_screen']"
             )
         if self.broad_candidate_count < 1:
             raise ValueError("agentic_feature_search.broad_candidate_count must be >= 1")
@@ -658,9 +662,7 @@ class AgenticFeatureSearchConfig:
         if self.role_diagnostic_min_n < 2:
             raise ValueError("agentic_feature_search.role_diagnostic_min_n must be >= 2")
         if self.role_diagnostic_min_non_missing < 1:
-            raise ValueError(
-                "agentic_feature_search.role_diagnostic_min_non_missing must be >= 1"
-            )
+            raise ValueError("agentic_feature_search.role_diagnostic_min_non_missing must be >= 1")
         if self.role_diagnostic_score_delta_threshold < 0.0:
             raise ValueError(
                 "agentic_feature_search.role_diagnostic_score_delta_threshold must be >= 0"
@@ -670,29 +672,17 @@ class AgenticFeatureSearchConfig:
                 "agentic_feature_search.clinical_text_examples_per_prompt must be >= 0"
             )
         if self.clinical_text_example_chars < 0:
-            raise ValueError(
-                "agentic_feature_search.clinical_text_example_chars must be >= 0"
-            )
+            raise ValueError("agentic_feature_search.clinical_text_example_chars must be >= 0")
         if self.agent_schema_repair_attempts < 0:
-            raise ValueError(
-                "agentic_feature_search.agent_schema_repair_attempts must be >= 0"
-            )
+            raise ValueError("agentic_feature_search.agent_schema_repair_attempts must be >= 0")
         if self.agent_request_max_retries < 0:
-            raise ValueError(
-                "agentic_feature_search.agent_request_max_retries must be >= 0"
-            )
+            raise ValueError("agentic_feature_search.agent_request_max_retries must be >= 0")
         if self.agent_retry_initial_delay < 0:
-            raise ValueError(
-                "agentic_feature_search.agent_retry_initial_delay must be >= 0"
-            )
+            raise ValueError("agentic_feature_search.agent_retry_initial_delay must be >= 0")
         if self.agent_retry_max_delay < 0:
-            raise ValueError(
-                "agentic_feature_search.agent_retry_max_delay must be >= 0"
-            )
+            raise ValueError("agentic_feature_search.agent_retry_max_delay must be >= 0")
         if self.agent_retry_backoff_factor < 1:
-            raise ValueError(
-                "agentic_feature_search.agent_retry_backoff_factor must be >= 1"
-            )
+            raise ValueError("agentic_feature_search.agent_retry_backoff_factor must be >= 1")
 
 
 @dataclass
@@ -717,7 +707,11 @@ class EmbeddingContrastDiscoveryConfig:
     pseudo_target_quantile: float = 0.20
     pseudo_target_weighted: bool = True
     include_cell_contrasts: bool = True
+    include_confounder_vector_contrast: bool = True
+    include_residualized_interaction_contrast: bool = True
     include_orthogonal_r_score_contrasts: bool = True
+    external_corpus_cache_dirs: List[str] = field(default_factory=list)
+    external_top_k_chunks_per_tail: int = 12
     residualize_columns: List[str] = field(default_factory=list)
     concept_phrases: List[str] = field(default_factory=list)
     include_bow_phrases_as_concepts: bool = True
@@ -742,8 +736,7 @@ class EmbeddingContrastDiscoveryConfig:
             raise ValueError("embedding_contrast.chunk_overlap_words must be >= 0")
         if self.chunk_overlap_words >= self.chunk_size_words:
             raise ValueError(
-                "embedding_contrast.chunk_overlap_words must be smaller than "
-                "chunk_size_words"
+                "embedding_contrast.chunk_overlap_words must be smaller than " "chunk_size_words"
             )
         if self.max_chunks < 1:
             raise ValueError("embedding_contrast.max_chunks must be >= 1")
@@ -755,6 +748,8 @@ class EmbeddingContrastDiscoveryConfig:
             raise ValueError("embedding_contrast.top_k_chunks_per_tail must be >= 1")
         if self.max_chunks_per_patient < 1:
             raise ValueError("embedding_contrast.max_chunks_per_patient must be >= 1")
+        if self.external_top_k_chunks_per_tail < 1:
+            raise ValueError("embedding_contrast.external_top_k_chunks_per_tail must be >= 1")
         if not 0.0 <= self.min_probe_auc <= 1.0:
             raise ValueError("embedding_contrast.min_probe_auc must be in [0, 1]")
         if not 0.0 < self.pseudo_target_quantile < 0.5:
@@ -763,11 +758,12 @@ class EmbeddingContrastDiscoveryConfig:
             raise ValueError("embedding_contrast.max_concept_phrases must be >= 0")
         if self.concept_probe_top_k < 1:
             raise ValueError("embedding_contrast.concept_probe_top_k must be >= 1")
+        self.external_corpus_cache_dirs = [
+            str(path).strip() for path in self.external_corpus_cache_dirs if str(path).strip()
+        ]
         self.residualize_columns = [str(col) for col in self.residualize_columns]
         self.concept_phrases = [
-            str(phrase).strip()
-            for phrase in self.concept_phrases
-            if str(phrase).strip()
+            str(phrase).strip() for phrase in self.concept_phrases if str(phrase).strip()
         ]
 
 
@@ -799,8 +795,7 @@ class BoWViewConfig:
             raise ValueError("bow view max_df must be in (0, 1]")
         if self.ngram_range_min < 1 or self.ngram_range_max < self.ngram_range_min:
             raise ValueError(
-                "bow view ngram range must satisfy "
-                "1 <= ngram_range_min <= ngram_range_max"
+                "bow view ngram range must satisfy " "1 <= ngram_range_min <= ngram_range_max"
             )
         bow_model = str(self.bow_model).strip().lower()
         if bow_model not in {"linear", "extratrees", "random_forest", "xgboost"}:
@@ -937,9 +932,7 @@ class MultiModelAgenticForestConfig:
 
     def __post_init__(self):
         if isinstance(self.embedding_contrast, dict):
-            self.embedding_contrast = EmbeddingContrastDiscoveryConfig(
-                **self.embedding_contrast
-            )
+            self.embedding_contrast = EmbeddingContrastDiscoveryConfig(**self.embedding_contrast)
         if self.feature_discovery_methods is not None:
             self.set_feature_discovery_methods(
                 self.feature_discovery_methods,
@@ -952,15 +945,17 @@ class MultiModelAgenticForestConfig:
                 "multi_model_agentic_forest must enable at least one feature "
                 "discovery method: bow, htr, or embedding_contrast"
             )
-        if not bool(self.bow_discovery_enabled) and not str(
-            self.bow_discovery_disable_reason or ""
-        ).strip():
+        if (
+            not bool(self.bow_discovery_enabled)
+            and not str(self.bow_discovery_disable_reason or "").strip()
+        ):
             self.bow_discovery_disable_reason = (
                 "disabled by multi_model_agentic_forest.feature_discovery_methods"
             )
-        if not bool(self.htr_evidence_enabled) and not str(
-            self.htr_evidence_disable_reason or ""
-        ).strip():
+        if (
+            not bool(self.htr_evidence_enabled)
+            and not str(self.htr_evidence_disable_reason or "").strip()
+        ):
             self.htr_evidence_disable_reason = (
                 "disabled by multi_model_agentic_forest.feature_discovery_methods"
             )
@@ -975,13 +970,10 @@ class MultiModelAgenticForestConfig:
         for idx, view in enumerate(self.bow_views, start=1):
             if not view.name:
                 view.name = (
-                    f"{view.bow_model}_{view.ngram_range_min}_"
-                    f"{view.ngram_range_max}_{idx}"
+                    f"{view.bow_model}_{view.ngram_range_min}_" f"{view.ngram_range_max}_{idx}"
                 )
             if view.name in seen_view_names:
-                raise ValueError(
-                    "multi_model_agentic_forest.bow_views names must be unique"
-                )
+                raise ValueError("multi_model_agentic_forest.bow_views names must be unique")
             seen_view_names.add(view.name)
         self.prespecified_features = parse_explicit_feature_spec_entries(
             self.prespecified_features,
@@ -1012,9 +1004,7 @@ class MultiModelAgenticForestConfig:
         if self.top_n_features < 1:
             raise ValueError("multi_model_agentic_forest.top_n_features must be >= 1")
         if self.candidate_proposals_per_fold < 1:
-            raise ValueError(
-                "multi_model_agentic_forest.candidate_proposals_per_fold must be >= 1"
-            )
+            raise ValueError("multi_model_agentic_forest.candidate_proposals_per_fold must be >= 1")
         if self.candidate_consistency_inner_folds < 2:
             raise ValueError(
                 "multi_model_agentic_forest.candidate_consistency_inner_folds must be >= 2"
@@ -1035,13 +1025,11 @@ class MultiModelAgenticForestConfig:
             )
         if self.extracted_feature_review_max_rounds < 0:
             raise ValueError(
-                "multi_model_agentic_forest.extracted_feature_review_max_rounds "
-                "must be >= 0"
+                "multi_model_agentic_forest.extracted_feature_review_max_rounds " "must be >= 0"
             )
         if self.extracted_feature_review_auc_margin < 0.0:
             raise ValueError(
-                "multi_model_agentic_forest.extracted_feature_review_auc_margin "
-                "must be >= 0"
+                "multi_model_agentic_forest.extracted_feature_review_auc_margin " "must be >= 0"
             )
         if self.extracted_feature_review_loss_relative_margin < 0.0:
             raise ValueError(
@@ -1055,8 +1043,7 @@ class MultiModelAgenticForestConfig:
             )
         if self.parsimony_review_auc_tolerance < 0.0:
             raise ValueError(
-                "multi_model_agentic_forest.parsimony_review_auc_tolerance "
-                "must be >= 0"
+                "multi_model_agentic_forest.parsimony_review_auc_tolerance " "must be >= 0"
             )
         if self.parsimony_review_loss_relative_tolerance < 0.0:
             raise ValueError(
@@ -1065,8 +1052,7 @@ class MultiModelAgenticForestConfig:
             )
         if not 0.0 <= self.parsimony_review_corr_threshold <= 1.0:
             raise ValueError(
-                "multi_model_agentic_forest.parsimony_review_corr_threshold "
-                "must be in [0, 1]"
+                "multi_model_agentic_forest.parsimony_review_corr_threshold " "must be in [0, 1]"
             )
         if self.parsimony_review_max_single_feature_ablations < 0:
             raise ValueError(
@@ -1116,23 +1102,26 @@ class MultiModelAgenticForestConfig:
 
         if self.bow_discovery_enabled:
             self.bow_discovery_disable_reason = None
-        elif not self.bow_discovery_enabled and not str(
-            self.bow_discovery_disable_reason or ""
-        ).strip():
+        elif (
+            not self.bow_discovery_enabled
+            and not str(self.bow_discovery_disable_reason or "").strip()
+        ):
             self.bow_discovery_disable_reason = f"disabled by {source}"
 
         if self.htr_evidence_enabled:
             self.htr_evidence_disable_reason = None
-        elif not self.htr_evidence_enabled and not str(
-            self.htr_evidence_disable_reason or ""
-        ).strip():
+        elif (
+            not self.htr_evidence_enabled
+            and not str(self.htr_evidence_disable_reason or "").strip()
+        ):
             self.htr_evidence_disable_reason = f"disabled by {source}"
 
         if self.embedding_contrast.enabled:
             self.embedding_contrast.disable_reason = None
-        elif not self.embedding_contrast.enabled and not str(
-            self.embedding_contrast.disable_reason or ""
-        ).strip():
+        elif (
+            not self.embedding_contrast.enabled
+            and not str(self.embedding_contrast.disable_reason or "").strip()
+        ):
             self.embedding_contrast.disable_reason = f"disabled by {source}"
 
     def _feature_discovery_methods_from_flags(self) -> List[str]:
@@ -1380,14 +1369,10 @@ class AgenticAttentionVariableForestConfig:
         self.neural_stage_mode = neural_stage_mode
         self.joint_rlearner_gamma = float(self.joint_rlearner_gamma)
         if self.joint_rlearner_gamma < 0:
-            raise ValueError(
-                "agentic_attention_variable_forest.joint_rlearner_gamma must be >= 0"
-            )
+            raise ValueError("agentic_attention_variable_forest.joint_rlearner_gamma must be >= 0")
         self.interaction_l2_weight = float(self.interaction_l2_weight)
         if self.interaction_l2_weight < 0:
-            raise ValueError(
-                "agentic_attention_variable_forest.interaction_l2_weight must be >= 0"
-            )
+            raise ValueError("agentic_attention_variable_forest.interaction_l2_weight must be >= 0")
         if self.tarnet_offset_batch_size is not None:
             self.tarnet_offset_batch_size = int(self.tarnet_offset_batch_size)
             if self.tarnet_offset_batch_size < 1:
@@ -1395,9 +1380,7 @@ class AgenticAttentionVariableForestConfig:
                     "agentic_attention_variable_forest.tarnet_offset_batch_size "
                     "must be >= 1 when set"
                 )
-        self.tarnet_offset_heterogeneity_weight = float(
-            self.tarnet_offset_heterogeneity_weight
-        )
+        self.tarnet_offset_heterogeneity_weight = float(self.tarnet_offset_heterogeneity_weight)
         if self.tarnet_offset_heterogeneity_weight < 0:
             raise ValueError(
                 "agentic_attention_variable_forest."
@@ -1406,38 +1389,30 @@ class AgenticAttentionVariableForestConfig:
         self.tarnet_offset_min_logit_std = float(self.tarnet_offset_min_logit_std)
         if self.tarnet_offset_min_logit_std < 0:
             raise ValueError(
-                "agentic_attention_variable_forest.tarnet_offset_min_logit_std "
-                "must be >= 0"
+                "agentic_attention_variable_forest.tarnet_offset_min_logit_std " "must be >= 0"
             )
         if self.candidate_proposals_per_fold < 1:
             raise ValueError(
-                "agentic_attention_variable_forest.candidate_proposals_per_fold "
-                "must be >= 1"
+                "agentic_attention_variable_forest.candidate_proposals_per_fold " "must be >= 1"
             )
         if self.coverage_retry_attempts < 0:
             raise ValueError(
                 "agentic_attention_variable_forest.coverage_retry_attempts must be >= 0"
             )
         if self.signal_retry_attempts < 0:
-            raise ValueError(
-                "agentic_attention_variable_forest.signal_retry_attempts must be >= 0"
-            )
+            raise ValueError("agentic_attention_variable_forest.signal_retry_attempts must be >= 0")
         if not 0.0 < self.association_alpha < 1.0:
             raise ValueError(
                 "agentic_attention_variable_forest.association_alpha must be in (0, 1)"
             )
         if self.association_min_n < 1:
-            raise ValueError(
-                "agentic_attention_variable_forest.association_min_n must be >= 1"
-            )
+            raise ValueError("agentic_attention_variable_forest.association_min_n must be >= 1")
         if self.association_min_non_missing < 1:
             raise ValueError(
                 "agentic_attention_variable_forest.association_min_non_missing must be >= 1"
             )
         if self.signal_cv_folds < 2:
-            raise ValueError(
-                "agentic_attention_variable_forest.signal_cv_folds must be >= 2"
-            )
+            raise ValueError("agentic_attention_variable_forest.signal_cv_folds must be >= 2")
         if not 0.5 <= self.min_signal_treatment_auroc <= 1.0:
             raise ValueError(
                 "agentic_attention_variable_forest.min_signal_treatment_auroc "
@@ -1445,18 +1420,15 @@ class AgenticAttentionVariableForestConfig:
             )
         if not 0.5 <= self.min_signal_outcome_auroc <= 1.0:
             raise ValueError(
-                "agentic_attention_variable_forest.min_signal_outcome_auroc "
-                "must be in [0.5, 1]"
+                "agentic_attention_variable_forest.min_signal_outcome_auroc " "must be in [0.5, 1]"
             )
         if self.consensus_min_folds is not None and self.consensus_min_folds < 1:
             raise ValueError(
-                "agentic_attention_variable_forest.consensus_min_folds "
-                "must be >= 1 when set"
+                "agentic_attention_variable_forest.consensus_min_folds " "must be >= 1 when set"
             )
         if not 0.0 < self.consensus_min_fold_fraction <= 1.0:
             raise ValueError(
-                "agentic_attention_variable_forest.consensus_min_fold_fraction "
-                "must be in (0, 1]"
+                "agentic_attention_variable_forest.consensus_min_fold_fraction " "must be in (0, 1]"
             )
         if self.consensus_recovery_max_candidates < 0:
             raise ValueError(
@@ -1533,7 +1505,10 @@ def normalize_feature_extractor_type(feature_type: str) -> str:
 @dataclass
 class ModelArchitectureConfig:
     """Configuration for model architecture."""
-    model_type: str = "dragonnet"  # "dragonnet", "dragonnet_drlearner", "rlearner", "causal_forest", "tfidf_forest", "explicit_feature_forest", "agentic_explicit_feature_forest", "agentic_attention_variable_forest", or "multi_model_agentic_forest"
+
+    model_type: str = (
+        "dragonnet"  # "dragonnet", "dragonnet_drlearner", "rlearner", "causal_forest", "tfidf_forest", "explicit_feature_forest", "agentic_explicit_feature_forest", "agentic_attention_variable_forest", or "multi_model_agentic_forest"
+    )
 
     # Feature extractor type: "frozen_llm_pooler"
     feature_extractor_type: str = "frozen_llm_pooler"
@@ -1548,17 +1523,27 @@ class ModelArchitectureConfig:
     flp_projection_dim: int = 128  # Final output dimension
     flp_dropout: float = 0.1  # Dropout rate for projection layers
     flp_gradient_checkpointing: bool = True  # Gradient checkpointing (when not frozen)
-    flp_downprojection_dim: Optional[int] = None  # Trainable linear downprojection dim applied to LLM hidden states before pooling (None = no downprojection, pool on full hidden_size)
-    flp_cache_hidden_states: bool = False  # Pre-compute and cache LLM hidden states to disk (when frozen). Default False = live LLM forward per batch.
-    flp_gpu_cache: bool = False  # Keep hidden states on GPU VRAM instead of disk (auto-fallback to disk if insufficient VRAM)
-    flp_random_projection_dim: Optional[int] = None  # Random linear projection dimension for cached hidden states (None = no projection, keeps original hidden_size)
-    flp_chat_template_prompt: Optional[str] = None  # Chat template prompt for instruct models. When set, wraps each text in the model's chat template with this prompt preceding the clinical text. None = disabled (raw text). Recommended for instruct models: "You are an expert clinical cancer researcher. Read this patient history, and then extract a set of features that will predict the patient's next treatment and their outcome on that treatment. The history is: "
+    flp_downprojection_dim: Optional[int] = (
+        None  # Trainable linear downprojection dim applied to LLM hidden states before pooling (None = no downprojection, pool on full hidden_size)
+    )
+    flp_cache_hidden_states: bool = (
+        False  # Pre-compute and cache LLM hidden states to disk (when frozen). Default False = live LLM forward per batch.
+    )
+    flp_gpu_cache: bool = (
+        False  # Keep hidden states on GPU VRAM instead of disk (auto-fallback to disk if insufficient VRAM)
+    )
+    flp_random_projection_dim: Optional[int] = (
+        None  # Random linear projection dimension for cached hidden states (None = no projection, keeps original hidden_size)
+    )
+    flp_chat_template_prompt: Optional[str] = (
+        None  # Chat template prompt for instruct models. When set, wraps each text in the model's chat template with this prompt preceding the clinical text. None = disabled (raw text). Recommended for instruct models: "You are an expert clinical cancer researcher. Read this patient history, and then extract a set of features that will predict the patient's next treatment and their outcome on that treatment. The history is: "
+    )
 
     # Hierarchical LLM extractor (frozen LLM on overlapping chunks + two-level pooling)
     hlm_model_name: str = "Qwen/Qwen3-0.6B-Base"
-    hlm_chunk_size: int = 2048          # tokens per chunk
-    hlm_chunk_overlap: int = 256        # overlapping tokens between chunks
-    hlm_max_chunks: int = 16            # maximum chunks per document
+    hlm_chunk_size: int = 2048  # tokens per chunk
+    hlm_chunk_overlap: int = 256  # overlapping tokens between chunks
+    hlm_max_chunks: int = 16  # maximum chunks per document
     hlm_freeze_llm: bool = True
     hlm_gated_attention_dim: int = 128
     hlm_projection_dim: int = 128
@@ -1680,10 +1665,14 @@ class ModelArchitectureConfig:
     tfidf_forest: TfidfForestConfig = field(default_factory=TfidfForestConfig)
 
     # Explicit-Feature-Only Causal Forest config (used when model_type="explicit_feature_forest")
-    explicit_feature_forest: ExplicitFeatureForestConfig = field(default_factory=ExplicitFeatureForestConfig)
+    explicit_feature_forest: ExplicitFeatureForestConfig = field(
+        default_factory=ExplicitFeatureForestConfig
+    )
 
     # Agentic explicit feature search config (used when model_type="agentic_explicit_feature_forest")
-    agentic_feature_search: AgenticFeatureSearchConfig = field(default_factory=AgenticFeatureSearchConfig)
+    agentic_feature_search: AgenticFeatureSearchConfig = field(
+        default_factory=AgenticFeatureSearchConfig
+    )
 
     # Agentic attention-evidence variable discovery + explicit-feature causal forest
     agentic_attention_variable_forest: AgenticAttentionVariableForestConfig = field(
@@ -1691,9 +1680,7 @@ class ModelArchitectureConfig:
     )
 
     # DragonNet nuisance model + independent DR pseudo-outcome effect learner
-    dragonnet_drlearner: DragonNetDRLearnerConfig = field(
-        default_factory=DragonNetDRLearnerConfig
-    )
+    dragonnet_drlearner: DragonNetDRLearnerConfig = field(default_factory=DragonNetDRLearnerConfig)
 
     # Multi-model BoW-guided variable discovery + explicit-feature causal forest
     multi_model_agentic_forest: MultiModelAgenticForestConfig = field(
@@ -1704,6 +1691,7 @@ class ModelArchitectureConfig:
 @dataclass
 class TrainingConfig:
     """Configuration for model training."""
+
     learning_rate: float = 1e-4
     optimizer: str = "adamw"
     lr_schedule: str = "linear"
@@ -1719,8 +1707,12 @@ class TrainingConfig:
     gradient_clip_norm: float = 1.0  # Max gradient norm (0 to disable)
     label_smoothing: float = 0.0  # Label smoothing for BCE (0 to disable)
     # Advanced training options for improving tau learning
-    stop_grad_propensity: bool = False  # Detach features before propensity loss (prevents propensity from dominating representation)
-    attention_entropy_weight: float = 0.0  # Weight for attention entropy regularization (encourages focused attention)
+    stop_grad_propensity: bool = (
+        False  # Detach features before propensity loss (prevents propensity from dominating representation)
+    )
+    attention_entropy_weight: float = (
+        0.0  # Weight for attention entropy regularization (encourages focused attention)
+    )
 
 
 @dataclass
@@ -1732,6 +1724,7 @@ class PropensityTrimmingConfig:
     removing patients with propensity scores outside the specified bounds.
     This helps enforce positivity assumption for causal inference.
     """
+
     enabled: bool = False  # Whether to trim by propensity before DragonNet training
     min_propensity: float = 0.1  # Remove patients with P(T=1|X) below this
     max_propensity: float = 0.9  # Remove patients with P(T=1|X) above this
@@ -1750,6 +1743,7 @@ class OutcomeModelConfig:
     prognostic signal in the data before DragonNet training.
     Unlike propensity trimming, this does NOT trim the dataset.
     """
+
     enabled: bool = False  # Whether to train outcome model before DragonNet
     cv_folds: int = 5  # Number of CV folds for outcome model training
     outcome_epochs: int = 20  # Training epochs for outcome model
@@ -1757,10 +1751,10 @@ class OutcomeModelConfig:
     outcome_batch_size: int = 8  # Batch size for outcome model
 
 
-
 @dataclass
 class AppliedInferenceConfig:
     """Configuration for applied inference on real data."""
+
     clinical_question: Optional[str] = None
     outcome_type: str = "binary"  # "binary" or "continuous"
     dataset_path: str = ""
@@ -1777,13 +1771,15 @@ class AppliedInferenceConfig:
     matching_analysis: MatchingAnalysisConfig = field(default_factory=MatchingAnalysisConfig)
 
     # Explicit feature extraction configuration (LLM-based)
-    explicit_features: ExplicitFeatureExtractionConfig = field(default_factory=ExplicitFeatureExtractionConfig)
-
+    explicit_features: ExplicitFeatureExtractionConfig = field(
+        default_factory=ExplicitFeatureExtractionConfig
+    )
 
 
 @dataclass
 class ExperimentConfig:
     """Main configuration for OCI experiments."""
+
     output_dir: str = "./oci_results"
     seed: int = 42
     device: Optional[str] = None
@@ -1791,8 +1787,12 @@ class ExperimentConfig:
     gpu_ids: Optional[List[int]] = None
 
     # Confounder interpretation settings
-    save_confounder_interpretations: bool = False  # Save confounder attention interpretations after training
-    confounder_interpretation_top_k: int = 5  # Number of top-attended sentences per confounder to save
+    save_confounder_interpretations: bool = (
+        False  # Save confounder attention interpretations after training
+    )
+    confounder_interpretation_top_k: int = (
+        5  # Number of top-attended sentences per confounder to save
+    )
 
     applied_inference: AppliedInferenceConfig = field(default_factory=AppliedInferenceConfig)
 
@@ -1802,21 +1802,21 @@ class ExperimentConfig:
 
     def to_json(self, path: str) -> None:
         """Save config to JSON file."""
-        with open(path, 'w') as f:
+        with open(path, "w") as f:
             json.dump(self.to_dict(), f, indent=2)
 
     @classmethod
-    def from_json(cls, path: str) -> 'ExperimentConfig':
+    def from_json(cls, path: str) -> "ExperimentConfig":
         """Load config from JSON file."""
-        with open(path, 'r') as f:
+        with open(path, "r") as f:
             data = json.load(f)
         return cls.from_dict(data)
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'ExperimentConfig':
+    def from_dict(cls, data: Dict[str, Any]) -> "ExperimentConfig":
         """Create config from dictionary."""
-        applied_data = data.get('applied_inference', {})
-        if 'explicit_confounders' in applied_data:
+        applied_data = data.get("applied_inference", {})
+        if "explicit_confounders" in applied_data:
             raise ValueError(
                 "Configuration key applied_inference.explicit_confounders has been removed. "
                 "Use applied_inference.explicit_features.features with role-tagged "
@@ -1826,112 +1826,136 @@ class ExperimentConfig:
         def parse_architecture_config(arch_data: Dict[str, Any]) -> ModelArchitectureConfig:
             """Parse architecture config, handling nested causal_forest and tfidf_forest."""
             arch_data = arch_data.copy()
-            if arch_data.get('model_type') == 'confounder_forest':
+            if arch_data.get("model_type") == "confounder_forest":
                 raise ValueError(
                     "model_type='confounder_forest' has been removed. "
                     "Use model_type='explicit_feature_forest' with role-tagged explicit_features."
                 )
-            if 'causal_forest' in arch_data and isinstance(arch_data['causal_forest'], dict):
-                cf_data = arch_data['causal_forest'].copy()
+            if "causal_forest" in arch_data and isinstance(arch_data["causal_forest"], dict):
+                cf_data = arch_data["causal_forest"].copy()
                 if (
-                    'inner_fold_parallelism' in cf_data
-                    and 'rlearner_inner_fold_parallelism' not in cf_data
+                    "inner_fold_parallelism" in cf_data
+                    and "rlearner_inner_fold_parallelism" not in cf_data
                 ):
-                    cf_data['rlearner_inner_fold_parallelism'] = cf_data.pop(
-                        'inner_fold_parallelism'
+                    cf_data["rlearner_inner_fold_parallelism"] = cf_data.pop(
+                        "inner_fold_parallelism"
                     )
                 else:
-                    cf_data.pop('inner_fold_parallelism', None)
-                if 'contrastive_effect' in cf_data and isinstance(cf_data['contrastive_effect'], dict):
-                    cf_data['contrastive_effect'] = ContrastiveEffectConfig(**cf_data['contrastive_effect'])
-                arch_data['causal_forest'] = CausalForestConfig(**cf_data)
-            if 'tfidf_forest' in arch_data and isinstance(arch_data['tfidf_forest'], dict):
-                arch_data['tfidf_forest'] = TfidfForestConfig(**arch_data['tfidf_forest'])
-            if 'confounder_forest' in arch_data:
+                    cf_data.pop("inner_fold_parallelism", None)
+                if "contrastive_effect" in cf_data and isinstance(
+                    cf_data["contrastive_effect"], dict
+                ):
+                    cf_data["contrastive_effect"] = ContrastiveEffectConfig(
+                        **cf_data["contrastive_effect"]
+                    )
+                arch_data["causal_forest"] = CausalForestConfig(**cf_data)
+            if "tfidf_forest" in arch_data and isinstance(arch_data["tfidf_forest"], dict):
+                arch_data["tfidf_forest"] = TfidfForestConfig(**arch_data["tfidf_forest"])
+            if "confounder_forest" in arch_data:
                 raise ValueError(
                     "architecture.confounder_forest has been removed. "
                     "Use architecture.explicit_feature_forest."
                 )
-            if 'non_neural_agentic_forest' in arch_data:
+            if "non_neural_agentic_forest" in arch_data:
                 raise ValueError(
                     "architecture.non_neural_agentic_forest has been removed. "
                     "Use architecture.multi_model_agentic_forest."
                 )
-            if 'explicit_feature_forest' in arch_data and isinstance(arch_data['explicit_feature_forest'], dict):
-                arch_data['explicit_feature_forest'] = ExplicitFeatureForestConfig(**arch_data['explicit_feature_forest'])
-            if (
-                'agentic_feature_search' in arch_data
-                and isinstance(arch_data['agentic_feature_search'], dict)
+            if "explicit_feature_forest" in arch_data and isinstance(
+                arch_data["explicit_feature_forest"], dict
             ):
-                arch_data['agentic_feature_search'] = AgenticFeatureSearchConfig(
-                    **arch_data['agentic_feature_search']
+                arch_data["explicit_feature_forest"] = ExplicitFeatureForestConfig(
+                    **arch_data["explicit_feature_forest"]
                 )
-            if (
-                'agentic_attention_variable_forest' in arch_data
-                and isinstance(arch_data['agentic_attention_variable_forest'], dict)
+            if "agentic_feature_search" in arch_data and isinstance(
+                arch_data["agentic_feature_search"], dict
             ):
-                avf_data = arch_data['agentic_attention_variable_forest'].copy()
-                if 'inner_fold_parallelism' in avf_data and 'fold_parallelism' not in avf_data:
-                    avf_data['fold_parallelism'] = avf_data.pop('inner_fold_parallelism')
+                arch_data["agentic_feature_search"] = AgenticFeatureSearchConfig(
+                    **arch_data["agentic_feature_search"]
+                )
+            if "agentic_attention_variable_forest" in arch_data and isinstance(
+                arch_data["agentic_attention_variable_forest"], dict
+            ):
+                avf_data = arch_data["agentic_attention_variable_forest"].copy()
+                if "inner_fold_parallelism" in avf_data and "fold_parallelism" not in avf_data:
+                    avf_data["fold_parallelism"] = avf_data.pop("inner_fold_parallelism")
                 else:
-                    avf_data.pop('inner_fold_parallelism', None)
-                arch_data['agentic_attention_variable_forest'] = (
+                    avf_data.pop("inner_fold_parallelism", None)
+                arch_data["agentic_attention_variable_forest"] = (
                     AgenticAttentionVariableForestConfig(**avf_data)
                 )
-            if (
-                'dragonnet_drlearner' in arch_data
-                and isinstance(arch_data['dragonnet_drlearner'], dict)
+            if "dragonnet_drlearner" in arch_data and isinstance(
+                arch_data["dragonnet_drlearner"], dict
             ):
-                arch_data['dragonnet_drlearner'] = DragonNetDRLearnerConfig(
-                    **arch_data['dragonnet_drlearner']
+                arch_data["dragonnet_drlearner"] = DragonNetDRLearnerConfig(
+                    **arch_data["dragonnet_drlearner"]
                 )
-            if (
-                'multi_model_agentic_forest' in arch_data
-                and isinstance(arch_data['multi_model_agentic_forest'], dict)
+            if "multi_model_agentic_forest" in arch_data and isinstance(
+                arch_data["multi_model_agentic_forest"], dict
             ):
-                arch_data['multi_model_agentic_forest'] = (
-                    MultiModelAgenticForestConfig(
-                        **arch_data['multi_model_agentic_forest']
-                    )
+                arch_data["multi_model_agentic_forest"] = MultiModelAgenticForestConfig(
+                    **arch_data["multi_model_agentic_forest"]
                 )
             return ModelArchitectureConfig(**arch_data)
 
-        def parse_explicit_features_config(feat_data: Dict[str, Any]) -> ExplicitFeatureExtractionConfig:
+        def parse_explicit_features_config(
+            feat_data: Dict[str, Any],
+        ) -> ExplicitFeatureExtractionConfig:
             """Parse explicit features config, handling nested feature specs."""
             if not feat_data:
                 return ExplicitFeatureExtractionConfig()
             feat_data = feat_data.copy()
-            if 'confounders' in feat_data:
+            if "confounders" in feat_data:
                 raise ValueError(
                     "explicit_features.confounders is not supported. "
                     "Use explicit_features.features and set roles on each feature."
                 )
-            if 'features' in feat_data and isinstance(feat_data['features'], list):
-                feat_data['features'] = [
+            if "features" in feat_data and isinstance(feat_data["features"], list):
+                feat_data["features"] = [
                     ExplicitFeatureSpec(**f) if isinstance(f, dict) else f
-                    for f in feat_data['features']
+                    for f in feat_data["features"]
                 ]
             return ExplicitFeatureExtractionConfig(**feat_data)
 
         applied = AppliedInferenceConfig(
-            **{k: parse_architecture_config(v) if k == 'architecture'
-               else TrainingConfig(**v) if k == 'training'
-               else PropensityTrimmingConfig(**v) if k == 'propensity_trimming'
-               else OutcomeModelConfig(**v) if k == 'outcome_model'
-               else MatchingAnalysisConfig(**v) if k == 'matching_analysis'
-               else parse_explicit_features_config(v) if k == 'explicit_features'
-               else v
-               for k, v in applied_data.items()}
+            **{
+                k: (
+                    parse_architecture_config(v)
+                    if k == "architecture"
+                    else (
+                        TrainingConfig(**v)
+                        if k == "training"
+                        else (
+                            PropensityTrimmingConfig(**v)
+                            if k == "propensity_trimming"
+                            else (
+                                OutcomeModelConfig(**v)
+                                if k == "outcome_model"
+                                else (
+                                    MatchingAnalysisConfig(**v)
+                                    if k == "matching_analysis"
+                                    else (
+                                        parse_explicit_features_config(v)
+                                        if k == "explicit_features"
+                                        else v
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+                for k, v in applied_data.items()
+            }
         )
 
         return cls(
-            output_dir=data.get('output_dir', './oci_results'),
-            seed=data.get('seed', 42),
-            device=data.get('device'),
-            num_workers=data.get('num_workers', 1),
-            gpu_ids=data.get('gpu_ids'),
-            save_confounder_interpretations=data.get('save_confounder_interpretations', False),
-            confounder_interpretation_top_k=data.get('confounder_interpretation_top_k', 5),
+            output_dir=data.get("output_dir", "./oci_results"),
+            seed=data.get("seed", 42),
+            device=data.get("device"),
+            num_workers=data.get("num_workers", 1),
+            gpu_ids=data.get("gpu_ids"),
+            save_confounder_interpretations=data.get("save_confounder_interpretations", False),
+            confounder_interpretation_top_k=data.get("confounder_interpretation_top_k", 5),
             applied_inference=applied,
         )
 
@@ -1951,8 +1975,10 @@ class ExperimentConfig:
         # Validate outcome_type
         valid_outcome_types = {"binary", "continuous"}
         if self.applied_inference.outcome_type not in valid_outcome_types:
-            raise ValueError(f"applied_inference.outcome_type must be one of {valid_outcome_types}, "
-                           f"got '{self.applied_inference.outcome_type}'")
+            raise ValueError(
+                f"applied_inference.outcome_type must be one of {valid_outcome_types}, "
+                f"got '{self.applied_inference.outcome_type}'"
+            )
 
         if self.applied_inference.architecture.model_type == "confounder_forest":
             raise ValueError(
@@ -1967,10 +1993,7 @@ class ExperimentConfig:
         if self.applied_inference.architecture.model_type == "agentic_attention_variable_forest":
             avf_config = self.applied_inference.architecture.agentic_attention_variable_forest
             if not (
-                0.0
-                <= avf_config.r_stage_min_propensity
-                < avf_config.r_stage_max_propensity
-                <= 1.0
+                0.0 <= avf_config.r_stage_min_propensity < avf_config.r_stage_max_propensity <= 1.0
             ):
                 raise ValueError(
                     "agentic_attention_variable_forest R-stage propensity bounds "
@@ -1999,16 +2022,18 @@ class ExperimentConfig:
                     "discovery method: bow, htr, or embedding_contrast"
                 )
             embedding_config = mm_config.embedding_contrast
-            if not bool(getattr(embedding_config, "enabled", False)) and not str(
-                getattr(embedding_config, "disable_reason", "") or ""
-            ).strip():
+            if (
+                not bool(getattr(embedding_config, "enabled", False))
+                and not str(getattr(embedding_config, "disable_reason", "") or "").strip()
+            ):
                 raise ValueError(
                     "multi_model_agentic_forest.embedding_contrast.enabled=False "
                     "requires embedding_contrast.disable_reason"
                 )
-            if not bool(getattr(mm_config, "htr_evidence_enabled", True)) and not str(
-                getattr(mm_config, "htr_evidence_disable_reason", "") or ""
-            ).strip():
+            if (
+                not bool(getattr(mm_config, "htr_evidence_enabled", True))
+                and not str(getattr(mm_config, "htr_evidence_disable_reason", "") or "").strip()
+            ):
                 raise ValueError(
                     "multi_model_agentic_forest.htr_evidence_enabled=False "
                     "requires htr_evidence_disable_reason"
@@ -2028,7 +2053,8 @@ class ExperimentConfig:
         if (
             self.applied_inference.explicit_features.enabled
             and not self.applied_inference.explicit_features.features
-            and self.applied_inference.architecture.model_type not in {
+            and self.applied_inference.architecture.model_type
+            not in {
                 "agentic_explicit_feature_forest",
                 "agentic_attention_variable_forest",
                 "multi_model_agentic_forest",
@@ -2041,7 +2067,7 @@ class ExperimentConfig:
 
         # Validate matching config
         if self.applied_inference.matching_analysis.enabled:
-            valid_methods = {'nearest', 'optimal', 'caliper'}
+            valid_methods = {"nearest", "optimal", "caliper"}
             if self.applied_inference.matching_analysis.method not in valid_methods:
                 raise ValueError(f"matching_analysis.method must be one of {valid_methods}")
 
@@ -2054,19 +2080,14 @@ def create_default_config(output_path: str) -> None:
         device="cuda:0",
         num_workers=1,
         gpu_ids=[0, 1],
-
         applied_inference=AppliedInferenceConfig(
             dataset_path="./dataset.parquet",
             cv_folds=5,
             architecture=ModelArchitectureConfig(
                 feature_extractor_type="frozen_llm_pooler",
             ),
-            training=TrainingConfig(
-                epochs=50,
-                batch_size=8
-            )
+            training=TrainingConfig(epochs=50, batch_size=8),
         ),
-
     )
 
     config.to_json(output_path)

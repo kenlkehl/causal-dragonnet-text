@@ -35,8 +35,9 @@ from oci.config import (  # noqa: E402
 from oci.inference.multi_model_agentic_forest import (  # noqa: E402
     run_multi_model_agentic_forest,
 )
-from run_oracle_experiments import _resolve_parquet_file as _shared_resolve_parquet_file  # noqa: E402
-
+from run_oracle_experiments import (
+    _resolve_parquet_file as _shared_resolve_parquet_file,
+)  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -107,7 +108,11 @@ class MultiModelAgenticOracleConfig:
     embedding_pseudo_target_quantile: float = 0.20
     embedding_pseudo_target_weighted: bool = True
     embedding_include_cell_contrasts: bool = True
+    embedding_include_confounder_vector_contrast: bool = True
+    embedding_include_residualized_interaction_contrast: bool = True
     embedding_include_orthogonal_r_score_contrasts: bool = True
+    embedding_external_cache_dirs: List[str] = field(default_factory=list)
+    embedding_external_top_k_chunks_per_tail: int = 12
     embedding_concept_phrases: List[str] = field(default_factory=list)
     embedding_residualize_columns: List[str] = field(default_factory=list)
 
@@ -266,8 +271,18 @@ def _make_applied_config(
                     pseudo_target_quantile=config.embedding_pseudo_target_quantile,
                     pseudo_target_weighted=config.embedding_pseudo_target_weighted,
                     include_cell_contrasts=config.embedding_include_cell_contrasts,
+                    include_confounder_vector_contrast=(
+                        config.embedding_include_confounder_vector_contrast
+                    ),
+                    include_residualized_interaction_contrast=(
+                        config.embedding_include_residualized_interaction_contrast
+                    ),
                     include_orthogonal_r_score_contrasts=(
                         config.embedding_include_orthogonal_r_score_contrasts
+                    ),
+                    external_corpus_cache_dirs=config.embedding_external_cache_dirs,
+                    external_top_k_chunks_per_tail=(
+                        config.embedding_external_top_k_chunks_per_tail
                     ),
                     concept_phrases=config.embedding_concept_phrases,
                     residualize_columns=config.embedding_residualize_columns,
@@ -371,9 +386,7 @@ def _bow_views_for_config(config: MultiModelAgenticOracleConfig) -> List[BoWView
                 ridge_alpha=config.ridge_alpha,
             )
         ]
-    raise ValueError(
-        "--bow-view-grid must be one of default_broad, linear_sweep, or cli_single"
-    )
+    raise ValueError("--bow-view-grid must be one of default_broad, linear_sweep, or cli_single")
 
 
 def _resolve_oracle_parquet_file(dataset_path: str) -> Path:
@@ -381,9 +394,7 @@ def _resolve_oracle_parquet_file(dataset_path: str) -> Path:
     path = Path(dataset_path).expanduser()
     if path.is_file():
         if path.suffix != ".parquet":
-            raise ValueError(
-                f"--dataset must be a parquet file or dataset directory: {path}"
-            )
+            raise ValueError(f"--dataset must be a parquet file or dataset directory: {path}")
         return path
     parquet_file = _shared_resolve_parquet_file(str(path))
     if parquet_file is None:
@@ -440,19 +451,13 @@ def _metrics(results_df: pd.DataFrame) -> Dict[str, Any]:
         selected_sets = sorted(set(results_df["selected_feature_names"].fillna("")))
         metrics["selected_feature_sets"] = selected_sets
     if "selected_feature_roles" in results_df.columns:
-        selected_role_sets = sorted(
-            set(results_df["selected_feature_roles"].fillna(""))
-        )
+        selected_role_sets = sorted(set(results_df["selected_feature_roles"].fillna("")))
         metrics["selected_feature_role_sets"] = selected_role_sets
     if "selected_confounder_names" in results_df.columns:
-        confounder_sets = sorted(
-            set(results_df["selected_confounder_names"].fillna(""))
-        )
+        confounder_sets = sorted(set(results_df["selected_confounder_names"].fillna("")))
         metrics["selected_confounder_sets"] = confounder_sets
     if "selected_effect_modifier_names" in results_df.columns:
-        effect_modifier_sets = sorted(
-            set(results_df["selected_effect_modifier_names"].fillna(""))
-        )
+        effect_modifier_sets = sorted(set(results_df["selected_effect_modifier_names"].fillna("")))
         metrics["selected_effect_modifier_sets"] = effect_modifier_sets
     return metrics
 
@@ -501,8 +506,7 @@ def _append_results(output_dir: Path, result_rows: Sequence[Dict[str, Any]]) -> 
         row = {
             key: value
             for key, value in result.items()
-            if key not in {"metrics"}
-            and not isinstance(value, (list, dict))
+            if key not in {"metrics"} and not isinstance(value, (list, dict))
         }
         row.update(result.get("metrics", {}))
         flat_rows.append(row)
@@ -707,9 +711,38 @@ def main() -> None:
         help="Disable within-arm outcome and treatment-outcome 2x2 interaction contrasts.",
     )
     parser.add_argument(
+        "--embedding-disable-confounder-vector-contrast",
+        action="store_true",
+        help=("Disable the no-nuisance averaged treatment/outcome confounder " "embedding vector."),
+    )
+    parser.add_argument(
+        "--embedding-disable-residualized-interaction-contrast",
+        action="store_true",
+        help=(
+            "Disable the no-nuisance 2x2 treatment-outcome interaction vector "
+            "residualized against marginal treatment and outcome directions."
+        ),
+    )
+    parser.add_argument(
         "--embedding-disable-orthogonal-r-score-contrasts",
         action="store_true",
         help="Disable high-vs-low orthogonal R-score embedding contrasts.",
+    )
+    parser.add_argument(
+        "--embedding-external-cache-dir",
+        action="append",
+        default=[],
+        help=(
+            "External embedding chunk cache directory to retrieve background "
+            "chunks from. May be a cache path or a parent containing cache dirs; "
+            "may be repeated."
+        ),
+    )
+    parser.add_argument(
+        "--embedding-external-top-k-chunks-per-tail",
+        type=int,
+        default=12,
+        help="External corpus chunks to retrieve per contrast tail.",
     )
     parser.add_argument(
         "--embedding-concept-phrase",
@@ -902,9 +935,17 @@ def main() -> None:
         embedding_pseudo_target_quantile=args.embedding_pseudo_target_quantile,
         embedding_pseudo_target_weighted=not args.embedding_unweighted_pseudo_target,
         embedding_include_cell_contrasts=not args.embedding_disable_cell_contrasts,
+        embedding_include_confounder_vector_contrast=(
+            not args.embedding_disable_confounder_vector_contrast
+        ),
+        embedding_include_residualized_interaction_contrast=(
+            not args.embedding_disable_residualized_interaction_contrast
+        ),
         embedding_include_orthogonal_r_score_contrasts=(
             not args.embedding_disable_orthogonal_r_score_contrasts
         ),
+        embedding_external_cache_dirs=args.embedding_external_cache_dir,
+        embedding_external_top_k_chunks_per_tail=(args.embedding_external_top_k_chunks_per_tail),
         embedding_concept_phrases=args.embedding_concept_phrase,
         embedding_residualize_columns=args.embedding_residualize_column,
         cf_n_estimators=args.cf_n_estimators,

@@ -388,11 +388,18 @@ increase `explicit_features.extraction_max_text_length`, set it to `null`, or
 use a complete-document recursive provider for notes longer than the prompt
 limit.
 
-This path includes embedding-contrast retrieval evidence by default. It pools
-document chunks into patient-level embeddings, builds train-fold treatment,
-outcome, per-view and ensemble R-pseudo-target, within-arm outcome, 2x2
-treatment-outcome interaction, and orthogonal R-score contrast directions, and
-retrieves real text chunks and concept phrases aligned with those directions.
+This path includes embedding-contrast retrieval evidence by default. It averages
+each patient's retained chunk embeddings into a patient-level embedding, row
+normalizes the patient vectors, optionally residualizes configured structured
+columns, and then builds train-fold contrast directions from patient-level group
+means. The default contrast set includes treatment, outcome, a treatment/outcome
+average `confounder_vector`, within-arm outcome, 2x2 treatment-outcome
+interaction, and a no-nuisance
+`residualized_treatment_outcome_interaction` direction for effect-modifier
+discovery. When nuisance predictions exist, the same evidence also includes
+per-view and ensemble R-pseudo-target and orthogonal R-score contrast
+directions. The retriever returns real text chunks and concept phrases aligned
+with those directions.
 The proposal agent sees the retrieved chunks as hypothesis-generation evidence;
 saved artifacts redact raw retrieved chunk text by default unless
 `architecture.agentic_feature_search.save_agent_context=true`.
@@ -403,8 +410,10 @@ to use it as an opt-in retrieval gate. It is not used as the retrieval direction
 When a patient has more chunks than `max_chunks`, embedding contrast keeps the
 last chunks by default because later notes are often more recent.
 Set `include_cell_contrasts=false` or
-`include_orthogonal_r_score_contrasts=false` to disable the richer contrast
-families.
+`include_orthogonal_r_score_contrasts=false` to disable nuisance or cell-based
+contrast families. Set `include_confounder_vector_contrast=false` or
+`include_residualized_interaction_contrast=false` only if you want to remove the
+no-nuisance confounder/effect-modifier embedding evidence.
 
 The default local embedding model is `Qwen/Qwen3-Embedding-8B`, loaded through
 `sentence-transformers` and cached on disk under
@@ -414,6 +423,26 @@ chunking settings, normalization, and chunk-selection mode, so different folds
 and repeated runs share the same chunk embeddings.
 Use a smaller model or pre-populated local Hugging Face cache for constrained
 hardware.
+
+You can also retrieve background chunks from an external embedded corpus, such
+as PubMed abstracts, using the same embedding model and chunking setup:
+
+```bash
+python -m oci.inference.build_embedding_chunk_cache \
+  --input pubmed_abstracts.parquet \
+  --text-column abstract \
+  --output-cache-dir /data1/ken/pubmed_embedding_cache \
+  --model-name Qwen/Qwen3-Embedding-8B \
+  --corpus-name pubmed_abstracts \
+  --source-id-column pmid
+```
+
+Then set
+`architecture.multi_model_agentic_forest.embedding_contrast.external_corpus_cache_dirs`
+to that cache path, or pass `--embedding-external-cache-dir` to the oracle
+script. External chunks are retrieved for the positive and negative tails of
+each derived direction and are included as background naming evidence; they do
+not alter the study-cohort contrast vectors.
 
 The proposal-agent prompt receives a compact evidence payload: BoW rows are
 capped per view, embedding retrieval chunks are clipped, and JSON is serialized
@@ -660,7 +689,9 @@ Use `--feature-discovery-methods bow htr embedding_contrast` to select the
 oracle run's discovery sources explicitly.
 Use `--embedding-disable-cell-contrasts` or
 `--embedding-disable-orthogonal-r-score-contrasts` to fall back to the smaller
-contrast set.
+contrast set. Use `--embedding-external-cache-dir /path/to/cache` to retrieve
+background chunks from an external cache built with
+`python -m oci.inference.build_embedding_chunk_cache`.
 
 Agentic attention-variable forest smoke test, assuming a Qwen vLLM server is
 already running with `--reasoning-parser qwen3`:
