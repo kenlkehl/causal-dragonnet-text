@@ -486,9 +486,9 @@ class MultiModelAgenticForestRunner:
         self._ensure_prespecified_features()
         discovery_df = self.dataset.iloc[train_idx].reset_index(drop=True)
         bow_result = self._fit_bow_discovery(discovery_df, outer_fold)
-        self.bow_prediction_frames.append(
-            _non_htr_prediction_frame(bow_result["predictions"])
-        )
+        non_htr_predictions = _non_htr_prediction_frame(bow_result["predictions"])
+        if not non_htr_predictions.empty:
+            self.bow_prediction_frames.append(non_htr_predictions)
         artifact_context = self._artifact_agent_context(bow_result["context"])
         for view in bow_result["importance"].get("views", []) or []:
             feature_importance = {
@@ -680,19 +680,25 @@ class MultiModelAgenticForestRunner:
         )
 
         view_results: List[Dict[str, Any]] = []
-        for view_index, view in enumerate(self.nn_config.bow_views):
-            view_results.append(
-                self._fit_one_bow_view(
-                    discovery_df=discovery_df,
-                    texts=texts,
-                    y=y,
-                    t=t,
-                    outer_fold=outer_fold,
-                    view=view,
-                    view_index=view_index,
-                    explicit_feature_dicts=explicit_feature_dicts,
-                    explicit_specs=prespecified_specs,
+        if self._bow_discovery_enabled():
+            for view_index, view in enumerate(self.nn_config.bow_views):
+                view_results.append(
+                    self._fit_one_bow_view(
+                        discovery_df=discovery_df,
+                        texts=texts,
+                        y=y,
+                        t=t,
+                        outer_fold=outer_fold,
+                        view=view,
+                        view_index=view_index,
+                        explicit_feature_dicts=explicit_feature_dicts,
+                        explicit_specs=prespecified_specs,
+                    )
                 )
+        else:
+            logger.info(
+                "Outer fold %s BoW discovery disabled; skipping sparse text views",
+                outer_fold,
             )
 
         htr_nuisance_result = self._fit_htr_nuisance_discovery(
@@ -712,6 +718,11 @@ class MultiModelAgenticForestRunner:
                 }
             }
 
+        nuisance_results = (
+            [*view_results, htr_nuisance_result]
+            if htr_nuisance_result is not None
+            else list(view_results)
+        )
         ensemble_result = self._fit_ensemble_r_discovery(
             discovery_df=discovery_df,
             texts=texts,
@@ -719,11 +730,7 @@ class MultiModelAgenticForestRunner:
             t=t,
             outer_fold=outer_fold,
             view_results=view_results,
-            nuisance_results=(
-                [*view_results, htr_nuisance_result]
-                if htr_nuisance_result is not None
-                else view_results
-            ),
+            nuisance_results=nuisance_results,
             explicit_feature_dicts=explicit_feature_dicts,
             explicit_specs=prespecified_specs,
         )
@@ -761,8 +768,13 @@ class MultiModelAgenticForestRunner:
             htr_effect_result = ensemble_result.get("htr_effect_result")
             if htr_effect_result is not None:
                 prediction_frames.append(htr_effect_result["predictions"])
-        predictions = pd.concat(prediction_frames, ignore_index=True)
+        predictions = (
+            pd.concat(prediction_frames, ignore_index=True)
+            if prediction_frames
+            else pd.DataFrame(columns=["_oci_row_id", "outer_fold"])
+        )
         metrics = _multi_view_metrics(view_results)
+        metrics["feature_discovery_methods"] = self._enabled_feature_discovery_methods()
         if htr_nuisance_result is not None:
             metrics["htr_nuisance"] = htr_nuisance_result.get("metrics", {})
         if ensemble_result is not None:
@@ -778,12 +790,16 @@ class MultiModelAgenticForestRunner:
             view_results,
             top_n=int(self.nn_config.top_n_features),
         )
+        importance["feature_discovery_methods"] = self._enabled_feature_discovery_methods()
         if ensemble_result is not None:
             importance["ensemble_r"] = ensemble_result["importance"]
 
         pseudo_targets = [result["pseudo_target"] for result in view_results]
         t_resids = [result["t_resid"] for result in view_results]
-        pseudo_target_names = [view.name for view in self.nn_config.bow_views]
+        pseudo_target_names = [
+            str(result.get("view_name") or getattr(result.get("view"), "name", "view"))
+            for result in view_results
+        ]
         if ensemble_result is not None:
             pseudo_targets.append(ensemble_result["pseudo_target"])
             t_resids.append(ensemble_result["t_resid"])
@@ -948,12 +964,12 @@ class MultiModelAgenticForestRunner:
         explicit_feature_dicts: Optional[List[Dict[str, Any]]] = None,
         explicit_specs: Optional[List[ExplicitFeatureSpec]] = None,
     ) -> Optional[Dict[str, Any]]:
-        if len(view_results) < 1:
-            return None
         nuisance_results = [
             result for result in (nuisance_results or view_results) if result is not None
         ]
-        if len(nuisance_results) < 2:
+        if len(view_results) < 1 and not nuisance_results:
+            return None
+        if len(view_results) >= 1 and len(nuisance_results) < 2:
             return None
 
         e_hat = np.nanmean(
@@ -978,11 +994,12 @@ class MultiModelAgenticForestRunner:
             str(result.get("view_name") or getattr(result.get("view"), "name", "model"))
             for result in nuisance_results
         ]
-        target_source = (
-            "ensemble_mean_nuisance_with_htr"
-            if any(str(name).startswith("htr") for name in nuisance_source_names)
-            else "ensemble_mean_nuisance"
-        )
+        if len(nuisance_source_names) == 1:
+            target_source = nuisance_source_names[0] or "single_nuisance_source"
+        elif any(str(name).startswith("htr") for name in nuisance_source_names):
+            target_source = "ensemble_mean_nuisance_with_htr"
+        else:
+            target_source = "ensemble_mean_nuisance"
         nuisance_predictions = pd.DataFrame(
             {
                 "_oci_row_id": discovery_df["_oci_row_id"].to_numpy(),
@@ -1073,13 +1090,21 @@ class MultiModelAgenticForestRunner:
         metrics["target_source"] = target_source
         metrics["n_nuisance_sources"] = int(len(nuisance_source_names))
         metrics["nuisance_sources"] = nuisance_source_names
-        metrics["pseudo_target_construction"] = (
-            "mean nuisance predictions across BoW and HTR models, then "
-            "(Y - mean_m_hat) / (T - mean_e_hat)"
-            if target_source == "ensemble_mean_nuisance_with_htr"
-            else "mean nuisance predictions across BoW views, then "
-            "(Y - mean_m_hat) / (T - mean_e_hat)"
-        )
+        if len(nuisance_source_names) == 1:
+            metrics["pseudo_target_construction"] = (
+                f"{target_source} nuisance predictions, then "
+                "(Y - m_hat) / (T - e_hat)"
+            )
+        elif target_source == "ensemble_mean_nuisance_with_htr":
+            metrics["pseudo_target_construction"] = (
+                "mean nuisance predictions across BoW and HTR models, then "
+                "(Y - mean_m_hat) / (T - mean_e_hat)"
+            )
+        else:
+            metrics["pseudo_target_construction"] = (
+                "mean nuisance predictions across BoW views, then "
+                "(Y - mean_m_hat) / (T - mean_e_hat)"
+            )
         importance = _multi_view_importance(
             ensemble_view_results,
             top_n=int(self.nn_config.top_n_features),
@@ -1465,9 +1490,68 @@ class MultiModelAgenticForestRunner:
         embedding_evidence: Optional[Dict[str, Any]] = None,
         htr_evidence: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        enabled_methods = self._enabled_feature_discovery_methods()
+        instructions = [
+            "You are generating candidate variables from empirical text "
+            "evidence. The workflow will validate extraction quality, signal, "
+            "parsimony, and honest causal-forest performance before retaining "
+            "any variable.",
+        ]
+        if self._bow_discovery_enabled():
+            instructions.extend(
+                [
+                    "Review every sparse bag-of-words model view. Each view has "
+                    "its own honest nuisance predictions, R pseudo-target, "
+                    "metrics, and feature-importance summaries.",
+                    "Use feature_importance.phrase_consensus as a cross-view "
+                    "summary, but also inspect feature_importance.views for "
+                    "useful signals that appear in only one model or n-gram setting.",
+                ]
+            )
+        else:
+            instructions.append(
+                "Bag-of-words modeling was disabled for this run; do not expect "
+                "sparse phrase importance evidence."
+            )
+        if self._embedding_contrast_enabled():
+            instructions.extend(
+                [
+                    "When embedding_contrast_evidence is present, use aligned "
+                    "real-text chunks and concept scores as retrieval evidence, "
+                    "not as direct vector interpretations.",
+                    "Treat within-arm outcome, treatment-outcome cell interaction, "
+                    "and orthogonal R-score embedding contrasts as effect-modifier "
+                    "hypothesis evidence when their retrieved chunks recur coherently.",
+                ]
+            )
+        if self._htr_evidence_enabled():
+            instructions.extend(
+                [
+                    "When htr_attention_evidence is present, use the highly "
+                    "attended tokens/spans from HTR nuisance and R-stage models "
+                    "as neural text evidence for variables that may explain "
+                    "treatment assignment, baseline outcome risk, or heterogeneous "
+                    "treatment effect.",
+                    "Treat ensemble_mean_nuisance_with_htr diagnostics as the "
+                    "R-loss signal built from BoW nuisance predictions plus HTR "
+                    "nuisance predictions when both source families are enabled.",
+                ]
+            )
+        instructions.extend(
+            [
+                "Suggest explicit pre-treatment patient-level variables, not raw text tokens.",
+                "Do not invent broad clinical inventory variables unsupported by "
+                "the enabled BoW, embedding, or HTR evidence in this context.",
+                "Use variables predictive of both treatment and outcome as confounders.",
+                "Use variables predictive of the pseudo-target as effect modifiers.",
+                "Avoid near-duplicate aliases for the same extraction target; a "
+                "separate alias-resolution pass may merge proposal names.",
+            ]
+        )
         context = {
             "prompt_version": "multi_model_agentic_forest_v1",
             "outer_fold": int(outer_fold),
+            "feature_discovery_methods": enabled_methods,
             "max_proposals": int(self.nn_config.candidate_proposals_per_fold),
             "clinical_question": self.config.clinical_question,
             "estimand": {
@@ -1475,38 +1559,7 @@ class MultiModelAgenticForestRunner:
                 "outcome_column": self.config.outcome_column,
                 "outcome_type": self.config.outcome_type,
             },
-            "instructions": [
-                "You are generating candidate variables from empirical text "
-                "evidence. The workflow will validate extraction quality, signal, "
-                "parsimony, and honest causal-forest performance before retaining "
-                "any variable.",
-                "Review every sparse bag-of-words model view. Each view has its "
-                "own honest nuisance predictions, R pseudo-target, metrics, and "
-                "feature-importance summaries.",
-                "Use feature_importance.phrase_consensus as a cross-view summary, "
-                "but also inspect feature_importance.views for useful signals that "
-                "appear in only one model or n-gram setting.",
-                "When embedding_contrast_evidence is present, use aligned real-text "
-                "chunks and concept scores as retrieval evidence, not as direct "
-                "vector interpretations.",
-                "Treat within-arm outcome, treatment-outcome cell interaction, "
-                "and orthogonal R-score embedding contrasts as effect-modifier "
-                "hypothesis evidence when their retrieved chunks recur coherently.",
-                "When htr_attention_evidence is present, use the highly attended "
-                "tokens/spans from HTR nuisance and R-stage models as neural text "
-                "evidence for variables that may explain treatment assignment, "
-                "baseline outcome risk, or heterogeneous treatment effect.",
-                "Treat ensemble_mean_nuisance_with_htr diagnostics as the R-loss "
-                "signal built from BoW nuisance predictions plus HTR nuisance "
-                "predictions, not as a replacement for the BoW views.",
-                "Suggest explicit pre-treatment patient-level variables, not raw text tokens.",
-                "Do not invent broad clinical inventory variables unsupported by "
-                "BoW, embedding, or HTR evidence in this context.",
-                "Use variables predictive of both treatment and outcome as confounders.",
-                "Use variables predictive of the pseudo-target as effect modifiers.",
-                "Avoid near-duplicate aliases for the same extraction target; a "
-                "separate alias-resolution pass may merge proposal names.",
-            ],
+            "instructions": instructions,
             "current_features": [_spec_to_dict(spec) for spec in self._initial_specs()],
             "model_diagnostics": _agent_visible_metrics(metrics),
             "feature_importance": importance,
@@ -1525,7 +1578,7 @@ class MultiModelAgenticForestRunner:
                         "categories": ["category_a", "category_b"],
                         "roles": ["confounder", "effect_modifier"],
                         "description": "exact pre-treatment extraction target",
-                        "rationale": "which BoW features support this variable",
+                        "rationale": "which enabled evidence supports this variable",
                         "expected_signal": "treatment, outcome, or pseudo-target signal expected",
                     }
                 ]
@@ -1550,17 +1603,44 @@ class MultiModelAgenticForestRunner:
         embedding_config = getattr(self.nn_config, "embedding_contrast", None)
         return bool(getattr(embedding_config, "enabled", False))
 
+    def _bow_discovery_enabled(self) -> bool:
+        return bool(getattr(self.nn_config, "bow_discovery_enabled", True))
+
     def _htr_evidence_enabled(self) -> bool:
         return bool(getattr(self.nn_config, "htr_evidence_enabled", True))
 
+    def _enabled_feature_discovery_methods(self) -> List[str]:
+        methods: List[str] = []
+        if self._bow_discovery_enabled():
+            methods.append("bow")
+        if self._htr_evidence_enabled():
+            methods.append("htr")
+        if self._embedding_contrast_enabled():
+            methods.append("embedding_contrast")
+        return methods
+
     def _validate_required_evidence_sources(self) -> None:
+        methods = self._enabled_feature_discovery_methods()
+        if not methods:
+            raise ValueError(
+                "multi_model_agentic_forest must enable at least one feature "
+                "discovery method: bow, htr, or embedding_contrast"
+            )
+        if not self._bow_discovery_enabled():
+            reason = str(
+                getattr(self.nn_config, "bow_discovery_disable_reason", "") or ""
+            ).strip()
+            logger.warning(
+                "BoW discovery disabled%s",
+                f": {reason}" if reason else "",
+            )
         embedding_config = getattr(self.nn_config, "embedding_contrast", None)
         if not bool(getattr(embedding_config, "enabled", False)):
             reason = str(getattr(embedding_config, "disable_reason", "") or "").strip()
             if not reason:
                 raise ValueError(
-                    "multi_model_agentic_forest requires embedding contrast evidence; "
-                    "set embedding_contrast.disable_reason when intentionally disabling it"
+                    "multi_model_agentic_forest.embedding_contrast.enabled=False "
+                    "requires embedding_contrast.disable_reason"
                 )
             logger.warning("Embedding contrast evidence disabled: %s", reason)
         if not self._htr_evidence_enabled():
@@ -1569,8 +1649,8 @@ class MultiModelAgenticForestRunner:
             ).strip()
             if not reason:
                 raise ValueError(
-                    "multi_model_agentic_forest requires HTR attention/span evidence; "
-                    "set htr_evidence_disable_reason when intentionally disabling it"
+                    "multi_model_agentic_forest.htr_evidence_enabled=False "
+                    "requires htr_evidence_disable_reason"
                 )
             logger.warning("HTR attention/span evidence disabled: %s", reason)
 
@@ -3243,6 +3323,7 @@ class MultiModelAgenticForestRunner:
             f"- Honest outer holdout folds: {len(honest_rows)}",
             "",
             "Evidence And Review",
+            f"- Feature discovery methods: {self._enabled_feature_discovery_methods()}",
             f"- BoW evidence records: {len(self.importance_rows)}",
             f"- Embedding evidence records: {len(self.embedding_evidence_rows)}",
             f"- HTR attention records: {len(self.htr_attention_rows)}",
@@ -5401,7 +5482,12 @@ def _compact_multi_model_importance(importance: Dict[str, Any]) -> Dict[str, Any
         compact_importance["ensemble_r"] = _compact_multi_model_importance(
             importance["ensemble_r"]
         )
-    for key in ["target_source", "pseudo_target_construction", "nuisance_sources"]:
+    for key in [
+        "feature_discovery_methods",
+        "target_source",
+        "pseudo_target_construction",
+        "nuisance_sources",
+    ]:
         if key in importance:
             compact_importance[key] = importance[key]
     return compact_importance

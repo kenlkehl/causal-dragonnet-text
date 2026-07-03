@@ -18,6 +18,111 @@ def _validate_parallelism_setting(value: Any, name: str) -> None:
         raise ValueError(f"{name} must be 'auto' or a positive integer") from exc
 
 
+MULTI_MODEL_FEATURE_DISCOVERY_METHODS = (
+    "bow",
+    "htr",
+    "embedding_contrast",
+)
+
+_MULTI_MODEL_FEATURE_DISCOVERY_METHOD_ALIASES = {
+    "bow": {
+        "bow",
+        "bag_of_words",
+        "bag-of-words",
+        "bagofwords",
+        "tfidf",
+        "tf-idf",
+        "bow_modeling",
+        "bow-modeling",
+        "bow-modelling",
+        "bow_modelling",
+    },
+    "htr": {
+        "htr",
+        "htr_modeling",
+        "htr-modeling",
+        "htr-modelling",
+        "htr_modelling",
+        "htr_evidence",
+        "hierarchical_transformer",
+        "hierarchical-transformer",
+        "attention",
+    },
+    "embedding_contrast": {
+        "embedding",
+        "embeddings",
+        "embedding_contrast",
+        "embedding_contrasts",
+        "embedding-contrast",
+        "embedding-contrasts",
+        "embedding_delta",
+        "embedding-delta",
+        "contrast",
+        "contrasts",
+    },
+}
+
+
+def normalize_multi_model_feature_discovery_methods(
+    methods: Any,
+    *,
+    source: str = "feature_discovery_methods",
+) -> Optional[List[str]]:
+    """Normalize a multi-model discovery-method selector.
+
+    Accepted canonical methods are "bow", "htr", and "embedding_contrast".
+    Strings may be comma-separated; "all" expands to all methods.
+    """
+    if methods is None:
+        return None
+
+    raw_values: List[Any]
+    if isinstance(methods, str):
+        raw_values = [methods]
+    elif isinstance(methods, (list, tuple, set)):
+        raw_values = list(methods)
+    else:
+        raw_values = [methods]
+
+    tokens: List[str] = []
+    for raw in raw_values:
+        for part in str(raw).replace(";", ",").split(","):
+            token = part.strip().lower()
+            if token:
+                tokens.append(token)
+
+    if not tokens:
+        raise ValueError(
+            f"{source} must include at least one of "
+            f"{list(MULTI_MODEL_FEATURE_DISCOVERY_METHODS)}"
+        )
+
+    if any(token == "all" for token in tokens):
+        return list(MULTI_MODEL_FEATURE_DISCOVERY_METHODS)
+
+    normalized: List[str] = []
+    for token in tokens:
+        canonical = None
+        for method, aliases in _MULTI_MODEL_FEATURE_DISCOVERY_METHOD_ALIASES.items():
+            if token in aliases:
+                canonical = method
+                break
+        if canonical is None:
+            raise ValueError(
+                f"Unknown {source} entry {token!r}; expected one or more of "
+                f"{list(MULTI_MODEL_FEATURE_DISCOVERY_METHODS)}"
+            )
+        if canonical not in normalized:
+            normalized.append(canonical)
+
+    if not normalized:
+        raise ValueError(
+            f"{source} must include at least one of "
+            f"{list(MULTI_MODEL_FEATURE_DISCOVERY_METHODS)}"
+        )
+    return normalized
+
+
 # =============================================================================
 # EXPLICIT FEATURE EXTRACTION CONFIGURATION
 # =============================================================================
@@ -777,6 +882,12 @@ class MultiModelAgenticForestConfig:
 
     nuisance_folds: int = 5
     effect_folds: int = 5
+    # Explicit selector for the evidence/discovery methods used in this run.
+    # Accepted entries: "bow", "htr", and "embedding_contrast".
+    # When omitted, the selector is derived from the per-method toggles below.
+    feature_discovery_methods: Optional[List[str]] = None
+    bow_discovery_enabled: bool = True
+    bow_discovery_disable_reason: Optional[str] = None
     bow_views: List[BoWViewConfig] = field(default_factory=list)
     # Optional researcher-provided variables to extract before BoW discovery.
     # Items must be ExplicitFeatureSpec-shaped dicts. confounder/effect-modifier
@@ -829,13 +940,29 @@ class MultiModelAgenticForestConfig:
             self.embedding_contrast = EmbeddingContrastDiscoveryConfig(
                 **self.embedding_contrast
             )
+        if self.feature_discovery_methods is not None:
+            self.set_feature_discovery_methods(
+                self.feature_discovery_methods,
+                source="multi_model_agentic_forest.feature_discovery_methods",
+            )
+        else:
+            self.feature_discovery_methods = self._feature_discovery_methods_from_flags()
+        if not self.feature_discovery_methods:
+            raise ValueError(
+                "multi_model_agentic_forest must enable at least one feature "
+                "discovery method: bow, htr, or embedding_contrast"
+            )
+        if not bool(self.bow_discovery_enabled) and not str(
+            self.bow_discovery_disable_reason or ""
+        ).strip():
+            self.bow_discovery_disable_reason = (
+                "disabled by multi_model_agentic_forest.feature_discovery_methods"
+            )
         if not bool(self.htr_evidence_enabled) and not str(
             self.htr_evidence_disable_reason or ""
         ).strip():
-            raise ValueError(
-                "multi_model_agentic_forest.htr_evidence_enabled=False requires "
-                "htr_evidence_disable_reason because HTR attention/span evidence is "
-                "a required multi-model evidence source"
+            self.htr_evidence_disable_reason = (
+                "disabled by multi_model_agentic_forest.feature_discovery_methods"
             )
         if self.bow_views:
             self.bow_views = [
@@ -970,6 +1097,53 @@ class MultiModelAgenticForestConfig:
                     "multi_model_agentic_forest.fold_parallelism must be 'auto' "
                     "or a positive integer"
                 ) from exc
+
+    def set_feature_discovery_methods(
+        self,
+        methods: Any,
+        *,
+        source: str = "feature_discovery_methods",
+    ) -> None:
+        normalized = normalize_multi_model_feature_discovery_methods(
+            methods,
+            source=source,
+        )
+        assert normalized is not None
+        self.feature_discovery_methods = normalized
+        self.bow_discovery_enabled = "bow" in normalized
+        self.htr_evidence_enabled = "htr" in normalized
+        self.embedding_contrast.enabled = "embedding_contrast" in normalized
+
+        if self.bow_discovery_enabled:
+            self.bow_discovery_disable_reason = None
+        elif not self.bow_discovery_enabled and not str(
+            self.bow_discovery_disable_reason or ""
+        ).strip():
+            self.bow_discovery_disable_reason = f"disabled by {source}"
+
+        if self.htr_evidence_enabled:
+            self.htr_evidence_disable_reason = None
+        elif not self.htr_evidence_enabled and not str(
+            self.htr_evidence_disable_reason or ""
+        ).strip():
+            self.htr_evidence_disable_reason = f"disabled by {source}"
+
+        if self.embedding_contrast.enabled:
+            self.embedding_contrast.disable_reason = None
+        elif not self.embedding_contrast.enabled and not str(
+            self.embedding_contrast.disable_reason or ""
+        ).strip():
+            self.embedding_contrast.disable_reason = f"disabled by {source}"
+
+    def _feature_discovery_methods_from_flags(self) -> List[str]:
+        methods: List[str] = []
+        if bool(self.bow_discovery_enabled):
+            methods.append("bow")
+        if bool(self.htr_evidence_enabled):
+            methods.append("htr")
+        if bool(getattr(self.embedding_contrast, "enabled", False)):
+            methods.append("embedding_contrast")
+        return methods
 
 
 @dataclass
@@ -1813,20 +1987,31 @@ class ExperimentConfig:
                     ) from exc
         if self.applied_inference.architecture.model_type == "multi_model_agentic_forest":
             mm_config = self.applied_inference.architecture.multi_model_agentic_forest
+            methods = normalize_multi_model_feature_discovery_methods(
+                getattr(mm_config, "feature_discovery_methods", None),
+                source="multi_model_agentic_forest.feature_discovery_methods",
+            )
+            if methods is None:
+                methods = mm_config._feature_discovery_methods_from_flags()
+            if not methods:
+                raise ValueError(
+                    "multi_model_agentic_forest must enable at least one feature "
+                    "discovery method: bow, htr, or embedding_contrast"
+                )
             embedding_config = mm_config.embedding_contrast
             if not bool(getattr(embedding_config, "enabled", False)) and not str(
                 getattr(embedding_config, "disable_reason", "") or ""
             ).strip():
                 raise ValueError(
-                    "multi_model_agentic_forest requires embedding contrast evidence; "
-                    "set embedding_contrast.disable_reason when intentionally disabling it"
+                    "multi_model_agentic_forest.embedding_contrast.enabled=False "
+                    "requires embedding_contrast.disable_reason"
                 )
             if not bool(getattr(mm_config, "htr_evidence_enabled", True)) and not str(
                 getattr(mm_config, "htr_evidence_disable_reason", "") or ""
             ).strip():
                 raise ValueError(
-                    "multi_model_agentic_forest requires HTR attention/span evidence; "
-                    "set htr_evidence_disable_reason when intentionally disabling it"
+                    "multi_model_agentic_forest.htr_evidence_enabled=False "
+                    "requires htr_evidence_disable_reason"
                 )
         if self.applied_inference.architecture.model_type == "causal_forest":
             cf_config = self.applied_inference.architecture.causal_forest

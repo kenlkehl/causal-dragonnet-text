@@ -343,6 +343,12 @@ embedding, or HTR evidence, the agent receives the diagnostics and can revise
 roles, replace weak variables, and trigger re-extraction before the final
 explicit-feature CausalForestDML is fit.
 
+Set `architecture.multi_model_agentic_forest.feature_discovery_methods` to choose
+which discovery sources run for a given applied-inference config. Accepted
+values are `bow`, `htr`, and `embedding_contrast`; the default is all three.
+The same selector is available from the normal runner as
+`oci run --config config.json --multi-model-feature-discovery-methods bow htr`.
+
 You can seed this path with known variables using
 `architecture.multi_model_agentic_forest.prespecified_confounders`,
 `prespecified_effect_modifiers`, `prespecified_features`, or
@@ -452,6 +458,7 @@ Minimal configuration:
           }
         ],
         "top_n_features": 100,
+        "feature_discovery_methods": ["bow", "htr", "embedding_contrast"],
         "candidate_consistency_enabled": true,
         "embedding_contrast": {
           "enabled": true,
@@ -649,6 +656,8 @@ python oracle_experiment_scripts/run_oracle_multi_model_agentic_forest.py \
 Embedding-delta retrieval evidence is enabled by default in the oracle run. Use
 `--embedding-model-name Qwen/Qwen3-Embedding-8B` to choose the embedding model,
 or `--disable-embedding-contrast` only for a documented lightweight run.
+Use `--feature-discovery-methods bow htr embedding_contrast` to select the
+oracle run's discovery sources explicitly.
 Use `--embedding-disable-cell-contrasts` or
 `--embedding-disable-orthogonal-r-score-contrasts` to fall back to the smaller
 contrast set.

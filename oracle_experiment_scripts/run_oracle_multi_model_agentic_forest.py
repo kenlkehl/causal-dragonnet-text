@@ -30,6 +30,7 @@ from oci.config import (  # noqa: E402
     ExplicitFeatureForestConfig,
     ModelArchitectureConfig,
     MultiModelAgenticForestConfig,
+    normalize_multi_model_feature_discovery_methods,
 )
 from oci.inference.multi_model_agentic_forest import (  # noqa: E402
     run_multi_model_agentic_forest,
@@ -56,6 +57,7 @@ class MultiModelAgenticOracleConfig:
 
     nuisance_folds: int = 5
     effect_folds: int = 5
+    feature_discovery_methods: Optional[List[str]] = None
     bow_view_grid: str = "default_broad"
     bow_views_json: Optional[str] = None
     max_features: int = 30000
@@ -154,6 +156,15 @@ def _make_applied_config(
     parquet_file: Path,
 ) -> AppliedInferenceConfig:
     bow_views = _bow_views_for_config(config)
+    selected_methods = normalize_multi_model_feature_discovery_methods(
+        config.feature_discovery_methods,
+        source="feature_discovery_methods",
+    )
+    embedding_contrast_enabled = (
+        "embedding_contrast" in selected_methods
+        if selected_methods is not None
+        else config.embedding_contrast_enabled
+    )
     return AppliedInferenceConfig(
         clinical_question=(
             "Estimate heterogeneous treatment effects from clinical text and "
@@ -203,6 +214,7 @@ def _make_applied_config(
             multi_model_agentic_forest=MultiModelAgenticForestConfig(
                 nuisance_folds=config.nuisance_folds,
                 effect_folds=config.effect_folds,
+                feature_discovery_methods=selected_methods,
                 bow_views=bow_views,
                 prespecified_features_json=config.prespecified_features_json,
                 e_clip=config.e_clip,
@@ -229,11 +241,15 @@ def _make_applied_config(
                 bow_parallel_backend=config.bow_parallel_backend,
                 fold_parallelism=config.fold_parallelism,
                 embedding_contrast=EmbeddingContrastDiscoveryConfig(
-                    enabled=config.embedding_contrast_enabled,
+                    enabled=embedding_contrast_enabled,
                     disable_reason=(
                         None
-                        if config.embedding_contrast_enabled
-                        else "disabled by oracle multi-model script CLI"
+                        if embedding_contrast_enabled
+                        else (
+                            "disabled by --feature-discovery-methods"
+                            if selected_methods is not None
+                            else "disabled by oracle multi-model script CLI"
+                        )
                     ),
                     model_name=config.embedding_model_name,
                     cache_dir=config.embedding_cache_dir,
@@ -515,6 +531,16 @@ def main() -> None:
 
     parser.add_argument("--nuisance-folds", type=int, default=5)
     parser.add_argument("--effect-folds", type=int, default=5)
+    parser.add_argument(
+        "--feature-discovery-methods",
+        nargs="+",
+        default=None,
+        help=(
+            "Feature discovery methods to use for this oracle run. Accepted "
+            "values: bow, htr, embedding_contrast, or all. Comma-separated "
+            "values are also accepted."
+        ),
+    )
     parser.add_argument(
         "--bow-view-grid",
         default="default_broad",
@@ -822,6 +848,7 @@ def main() -> None:
         num_workers=args.num_workers,
         nuisance_folds=args.nuisance_folds,
         effect_folds=args.effect_folds,
+        feature_discovery_methods=args.feature_discovery_methods,
         bow_view_grid=args.bow_view_grid,
         bow_views_json=args.bow_views_json,
         max_features=args.max_features,

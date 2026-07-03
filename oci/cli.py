@@ -10,6 +10,7 @@ from .config import (
     ExperimentConfig,
     create_default_config,
     load_explicit_feature_specs_json,
+    normalize_multi_model_feature_discovery_methods,
     parse_explicit_feature_spec_entries,
 )
 from .experiments.runner import ExperimentRunner
@@ -94,6 +95,16 @@ Examples:
         help=(
             "Add a pre-specified multi-model effect modifier as a JSON feature spec. "
             "May be repeated."
+        )
+    )
+    run_parser.add_argument(
+        '--multi-model-feature-discovery-methods',
+        nargs='+',
+        help=(
+            "Override feature discovery methods for "
+            "model_type='multi_model_agentic_forest'. Accepted values: "
+            "bow, htr, embedding_contrast, or all. Comma-separated values are "
+            "also accepted."
         )
     )
     run_parser.add_argument(
@@ -235,6 +246,29 @@ Examples:
             config.gpu_ids = args.gpu_ids
         if args.output_dir:
             config.output_dir = args.output_dir
+        if args.multi_model_feature_discovery_methods is not None:
+            model_type = getattr(config.applied_inference.architecture, 'model_type', None)
+            if model_type != "multi_model_agentic_forest":
+                print(
+                    "--multi-model-feature-discovery-methods only applies to "
+                    "model_type='multi_model_agentic_forest'"
+                )
+                return 1
+            mm_config = (
+                config.applied_inference.architecture
+                .multi_model_agentic_forest
+            )
+            try:
+                mm_config.set_feature_discovery_methods(
+                    normalize_multi_model_feature_discovery_methods(
+                        args.multi_model_feature_discovery_methods,
+                        source="--multi-model-feature-discovery-methods",
+                    ),
+                    source="--multi-model-feature-discovery-methods",
+                )
+            except ValueError as e:
+                print(f"Invalid multi-model feature discovery methods: {e}")
+                return 1
         if (
             args.multi_model_features_json
             or args.multi_model_confounder

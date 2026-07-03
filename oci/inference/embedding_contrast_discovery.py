@@ -884,7 +884,7 @@ def _as_target_list(value: Any) -> List[Any]:
         return [value]
     if isinstance(value, (list, tuple)):
         if not value:
-            return [np.asarray([], dtype=float)]
+            return []
         first = np.asarray(value[0])
         if first.ndim > 0:
             return list(value)

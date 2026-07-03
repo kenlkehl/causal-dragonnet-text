@@ -1277,6 +1277,80 @@ def test_multi_model_agentic_forest_adds_htr_to_ensemble_and_agent_context(
     assert "top_token_spans" not in artifact_htr_row
 
 
+def test_multi_model_agentic_forest_runs_htr_only_when_bow_disabled(
+    tmp_path: Path,
+):
+    dataset = pd.DataFrame(
+        {
+            "clinical_text": [
+                "age 55 baseline note brain metastases pd-l1 high",
+                "age 78 baseline note liver lesion pd-l1 low",
+                "age 57 baseline note brain metastases pd-l1 high",
+                "age 76 baseline note liver lesion pd-l1 low",
+                "age 61 baseline note brain metastases cachexia",
+                "age 81 baseline note liver lesion stable",
+                "age 54 baseline note brain metastases cachexia",
+                "age 70 baseline note liver lesion stable",
+            ],
+            "treatment_indicator": [1, 0, 1, 0, 1, 0, 1, 0],
+            "outcome_indicator": [1, 0, 1, 0, 1, 0, 1, 0],
+        }
+    )
+    config = AppliedInferenceConfig(
+        outcome_type="binary",
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        cv_folds=0,
+        architecture=ModelArchitectureConfig(
+            model_type="multi_model_agentic_forest",
+            explicit_feature_forest=ExplicitFeatureForestConfig(inference=False),
+            agentic_feature_search=AgenticFeatureSearchConfig(
+                max_iterations=1,
+                max_additions_per_iter=4,
+                min_feature_coverage=0.1,
+                clinical_text_examples_per_prompt=0,
+            ),
+            multi_model_agentic_forest=MultiModelAgenticForestConfig(
+                nuisance_folds=2,
+                effect_folds=2,
+                feature_discovery_methods=["htr"],
+                candidate_consistency_enabled=False,
+                extracted_feature_review_enabled=False,
+                fold_parallelism="1",
+            ),
+        ),
+        explicit_features=ExplicitFeatureExtractionConfig(enabled=True, features=[]),
+    )
+    agent = FakeProposalAgent()
+    htr_provider = FakeHTREvidenceProvider()
+    output_path = tmp_path / "predictions.parquet"
+
+    run_multi_model_agentic_forest(
+        dataset,
+        config,
+        output_path,
+        proposal_agent=agent,
+        extraction_provider=FakeExtractionProvider(),
+        evaluator=FakeEvaluator(),
+        htr_evidence_provider=htr_provider,
+    )
+
+    first_context = agent.contexts[0]
+    assert first_context["feature_discovery_methods"] == ["htr"]
+    assert first_context["feature_importance"]["n_views"] == 0
+    assert "htr_attention_evidence" in first_context
+    assert "embedding_contrast_evidence" not in first_context
+    assert htr_provider.seen_effect_nuisance_predictions
+    effect_nuisance = htr_provider.seen_effect_nuisance_predictions[0]
+    assert set(effect_nuisance["target_source"]) == {"htr_nuisance"}
+
+    artifact_dir = output_path.parent / "multi_model_agentic_forest"
+    assert not (artifact_dir / "bow_view_oof_predictions.parquet").exists()
+    assert (artifact_dir / "htr_nuisance_oof_predictions.parquet").exists()
+    assert (artifact_dir / "htr_effect_oof_predictions.parquet").exists()
+
+
 def test_multi_model_agentic_forest_adds_ensemble_r_target_context(tmp_path: Path):
     dataset = pd.DataFrame(
         {
@@ -1894,7 +1968,47 @@ def test_multi_model_agentic_forest_parses_bow_views_and_embedding_option():
     assert nn_cfg.embedding_contrast.include_cell_contrasts is False
     assert nn_cfg.embedding_contrast.include_orthogonal_r_score_contrasts is False
     assert nn_cfg.embedding_contrast.concept_phrases == ["brain metastases"]
+    assert nn_cfg.feature_discovery_methods == ["bow", "htr", "embedding_contrast"]
     cfg.validate()
+
+
+def test_multi_model_feature_discovery_methods_control_config_flags():
+    cfg = ExperimentConfig.from_dict(
+        {
+            "applied_inference": {
+                "dataset_path": (
+                    "synthetic_data/example_synthetic_datasets/"
+                    "one_confounder_one_effect_modifier_nsclc_with_structured/"
+                    "dataset.parquet"
+                ),
+                "architecture": {
+                    "model_type": "multi_model_agentic_forest",
+                    "multi_model_agentic_forest": {
+                        "feature_discovery_methods": ["bow", "embedding"],
+                    },
+                },
+                "explicit_features": {"enabled": True, "features": []},
+            }
+        }
+    )
+    nn_cfg = cfg.applied_inference.architecture.multi_model_agentic_forest
+    assert nn_cfg.feature_discovery_methods == ["bow", "embedding_contrast"]
+    assert nn_cfg.bow_discovery_enabled is True
+    assert nn_cfg.htr_evidence_enabled is False
+    assert "feature_discovery_methods" in nn_cfg.htr_evidence_disable_reason
+    assert nn_cfg.embedding_contrast.enabled is True
+    cfg.validate()
+
+    htr_only = MultiModelAgenticForestConfig(
+        nuisance_folds=2,
+        effect_folds=2,
+        feature_discovery_methods=["htr"],
+    )
+    assert htr_only.feature_discovery_methods == ["htr"]
+    assert htr_only.bow_discovery_enabled is False
+    assert htr_only.htr_evidence_enabled is True
+    assert htr_only.embedding_contrast.enabled is False
+    assert "feature_discovery_methods" in htr_only.embedding_contrast.disable_reason
 
 
 def test_multi_model_agentic_forest_default_bow_view_grid():
@@ -1982,6 +2096,16 @@ def test_oracle_multi_model_script_builds_default_and_cli_bow_views():
     assert mm_cfg.extracted_feature_review_max_rounds == 1
     assert mm_cfg.require_honest_outer_split is False
     assert mm_cfg.fail_on_extraction_truncation is False
+
+    cfg.feature_discovery_methods = ["bow", "htr"]
+    cfg.embedding_contrast_enabled = True
+    applied = script._make_applied_config(cfg, dataset_path)
+    mm_cfg = applied.architecture.multi_model_agentic_forest
+    assert mm_cfg.feature_discovery_methods == ["bow", "htr"]
+    assert mm_cfg.bow_discovery_enabled is True
+    assert mm_cfg.htr_evidence_enabled is True
+    assert mm_cfg.embedding_contrast.enabled is False
+    assert "feature-discovery-methods" in mm_cfg.embedding_contrast.disable_reason
 
 
 def test_multi_model_agentic_forest_parses_prespecified_feature_sources(tmp_path):
