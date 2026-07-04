@@ -422,7 +422,7 @@ class KeywordEmbeddingProvider:
                 "age": 6,
             }.items():
                 if token in lower:
-                    row[index] += 1.0
+                    row[index] += max(1, lower.count(token))
             row[7] = 0.1
             rows.append(row)
         return np.vstack(rows)
@@ -873,6 +873,92 @@ def test_embedding_contrast_residualized_interaction_does_not_require_r_targets(
     )
     assert "retrieval_skipped" not in residualized
     assert any("brain" in row["text"] for row in residualized["positive_aligned_chunks"])
+
+
+def test_embedding_contrast_adds_cluster_local_contrast_components(tmp_path: Path):
+    dataset = pd.DataFrame(
+        {
+            "_oci_row_id": np.arange(16),
+            "clinical_text": [
+                "brain brain brain pd-l1 high",
+                "brain brain brain pd-l1 high",
+                "brain brain brain pd-l1 low",
+                "brain brain brain pd-l1 low",
+                "brain brain brain cachexia high",
+                "brain brain brain cachexia high",
+                "brain brain brain stable low",
+                "brain brain brain stable low",
+                "liver liver liver pd-l1 high",
+                "liver liver liver pd-l1 high",
+                "liver liver liver pd-l1 low",
+                "liver liver liver pd-l1 low",
+                "liver liver liver cachexia high",
+                "liver liver liver cachexia high",
+                "liver liver liver stable low",
+                "liver liver liver stable low",
+            ],
+        }
+    )
+    config = AppliedInferenceConfig(
+        outcome_type="binary",
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        architecture=ModelArchitectureConfig(
+            model_type="multi_model_agentic_forest",
+            multi_model_agentic_forest=MultiModelAgenticForestConfig(
+                embedding_contrast=EmbeddingContrastDiscoveryConfig(
+                    enabled=True,
+                    model_name="fake-keyword",
+                    chunk_size_words=6,
+                    chunk_overlap_words=0,
+                    max_chunks=1,
+                    min_probe_auc=0.0,
+                    top_k_chunks_per_tail=4,
+                    max_chunks_per_patient=1,
+                    include_cluster_contrast_vectors=True,
+                    cluster_contrast_n_clusters=2,
+                    cluster_contrast_max_components=2,
+                    cluster_contrast_min_cluster_size=4,
+                    cluster_contrast_min_group_size=2,
+                    cluster_contrast_min_cell_size=1,
+                    cluster_contrast_top_loadings=2,
+                    cluster_contrast_random_state=7,
+                ),
+                **_disable_htr_test_kwargs(),
+            ),
+        ),
+    )
+    generator = EmbeddingContrastEvidenceGenerator(
+        config=config,
+        output_dir=tmp_path,
+        embedding_provider=KeywordEmbeddingProvider(),
+    )
+    generator.prepare(dataset)
+    evidence = generator.build_evidence(
+        discovery_df=dataset,
+        y=np.asarray([1, 1, 0, 0, 1, 1, 0, 0] * 2, dtype=float),
+        t=np.asarray([1, 1, 0, 0, 1, 1, 0, 0] * 2, dtype=float),
+        pseudo_target=None,
+        t_resid=None,
+        importance={},
+    )
+
+    summary = evidence["cluster_contrast_vectors"]
+    assert summary["n_clusters"] == 2
+    assert summary["usable_treatment_local_contrasts"] >= 2
+    cluster_treatment = [
+        item
+        for item in evidence["contrasts"]
+        if item["contrast_family"] == "cluster_local_treatment_contrast_basis"
+    ]
+    assert cluster_treatment
+    first = cluster_treatment[0]
+    assert first["direction_source"] == "svd_of_cluster_local_treatment_mean_differences"
+    assert first["local_contrast_count"] >= 2
+    assert first["cluster_component_loadings"]
+    assert "retrieval_skipped" not in first
+    assert first["positive_aligned_chunks"] or first["negative_aligned_chunks"]
 
 
 def test_embedding_contrast_retrieves_external_chunks(tmp_path: Path):
@@ -2018,6 +2104,14 @@ def test_multi_model_agentic_forest_parses_bow_views_and_embedding_option():
                             "include_confounder_vector_contrast": False,
                             "include_residualized_interaction_contrast": False,
                             "include_orthogonal_r_score_contrasts": False,
+                            "include_cluster_contrast_vectors": True,
+                            "cluster_contrast_n_clusters": 12,
+                            "cluster_contrast_max_components": 4,
+                            "cluster_contrast_min_cluster_size": 20,
+                            "cluster_contrast_min_group_size": 6,
+                            "cluster_contrast_min_cell_size": 3,
+                            "cluster_contrast_top_loadings": 4,
+                            "cluster_contrast_random_state": 17,
                             "external_corpus_cache_dirs": ["/tmp/pubmed_cache"],
                             "external_top_k_chunks_per_tail": 5,
                             "concept_phrases": ["brain metastases"],
@@ -2063,6 +2157,14 @@ def test_multi_model_agentic_forest_parses_bow_views_and_embedding_option():
     assert nn_cfg.embedding_contrast.include_confounder_vector_contrast is False
     assert nn_cfg.embedding_contrast.include_residualized_interaction_contrast is False
     assert nn_cfg.embedding_contrast.include_orthogonal_r_score_contrasts is False
+    assert nn_cfg.embedding_contrast.include_cluster_contrast_vectors is True
+    assert nn_cfg.embedding_contrast.cluster_contrast_n_clusters == 12
+    assert nn_cfg.embedding_contrast.cluster_contrast_max_components == 4
+    assert nn_cfg.embedding_contrast.cluster_contrast_min_cluster_size == 20
+    assert nn_cfg.embedding_contrast.cluster_contrast_min_group_size == 6
+    assert nn_cfg.embedding_contrast.cluster_contrast_min_cell_size == 3
+    assert nn_cfg.embedding_contrast.cluster_contrast_top_loadings == 4
+    assert nn_cfg.embedding_contrast.cluster_contrast_random_state == 17
     assert nn_cfg.embedding_contrast.external_corpus_cache_dirs == ["/tmp/pubmed_cache"]
     assert nn_cfg.embedding_contrast.external_top_k_chunks_per_tail == 5
     assert nn_cfg.embedding_contrast.concept_phrases == ["brain metastases"]

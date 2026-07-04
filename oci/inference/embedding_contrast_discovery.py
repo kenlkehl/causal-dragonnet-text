@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from sklearn.cluster import MiniBatchKMeans
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
@@ -130,6 +131,7 @@ class EmbeddingContrastEvidenceGenerator:
             pseudo_target_names,
         )
         contrasts = []
+        cluster_contrast_summary: Dict[str, Any] = {}
         for contrast in self._contrast_specs(
             y=y_array,
             t=t_array,
@@ -166,6 +168,16 @@ class EmbeddingContrastEvidenceGenerator:
                     concept_embeddings=concept_embeddings,
                 )
             )
+        if bool(self.embedding_config.include_cluster_contrast_vectors):
+            cluster_contrasts, cluster_contrast_summary = self._build_cluster_contrast_vectors(
+                positions=positions,
+                patient_embeddings=patient_embeddings,
+                y=y_array,
+                t=t_array,
+                concept_phrases=concept_phrases,
+                concept_embeddings=concept_embeddings,
+            )
+            contrasts.extend(cluster_contrasts)
 
         evidence = {
             "enabled": True,
@@ -199,6 +211,8 @@ class EmbeddingContrastEvidenceGenerator:
             ],
             "contrasts": contrasts,
         }
+        if cluster_contrast_summary:
+            evidence["cluster_contrast_vectors"] = cluster_contrast_summary
         if self._concept_probe_skip_reason:
             evidence["concept_probe_skipped"] = self._concept_probe_skip_reason
         return evidence
@@ -717,6 +731,322 @@ class EmbeddingContrastEvidenceGenerator:
             concept_phrases=concept_phrases,
             concept_embeddings=concept_embeddings,
         )
+
+    def _build_cluster_contrast_vectors(
+        self,
+        *,
+        positions: Sequence[int],
+        patient_embeddings: np.ndarray,
+        y: np.ndarray,
+        t: np.ndarray,
+        concept_phrases: Sequence[str],
+        concept_embeddings: Optional[np.ndarray],
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Build SVD components over cluster-local contrast vectors."""
+        usable = np.all(np.isfinite(patient_embeddings), axis=1)
+        n_usable = int(np.sum(usable))
+        requested_clusters = int(self.embedding_config.cluster_contrast_n_clusters)
+        min_cluster_size = int(self.embedding_config.cluster_contrast_min_cluster_size)
+        feasible_by_size = n_usable // min_cluster_size
+        n_clusters = min(requested_clusters, feasible_by_size)
+        summary: Dict[str, Any] = {
+            "enabled": True,
+            "n_clusters_requested": requested_clusters,
+            "min_cluster_size": min_cluster_size,
+            "min_group_size": int(self.embedding_config.cluster_contrast_min_group_size),
+            "min_cell_size": int(self.embedding_config.cluster_contrast_min_cell_size),
+            "max_components": int(self.embedding_config.cluster_contrast_max_components),
+            "n_usable_patients": n_usable,
+        }
+        if n_clusters < 2:
+            summary["skipped"] = "too_few_patients_for_cluster_contrasts"
+            return [], summary
+
+        try:
+            kmeans = MiniBatchKMeans(
+                n_clusters=n_clusters,
+                random_state=int(self.embedding_config.cluster_contrast_random_state),
+                batch_size=max(128, min(1024, n_usable)),
+                n_init=int(self.embedding_config.cluster_contrast_kmeans_n_init),
+                max_iter=300,
+            )
+            cluster_labels = np.full(len(patient_embeddings), -1, dtype=int)
+            cluster_labels[usable] = kmeans.fit_predict(patient_embeddings[usable])
+        except Exception as exc:
+            logger.warning("Cluster contrast vector construction failed during clustering: %s", exc)
+            summary["skipped"] = "clustering_failed"
+            summary["error"] = str(exc)
+            return [], summary
+
+        cluster_counts = np.bincount(cluster_labels[usable], minlength=n_clusters).astype(int)
+        summary["n_clusters"] = int(n_clusters)
+        summary["cluster_counts"] = [int(item) for item in cluster_counts]
+
+        records: List[Dict[str, Any]] = []
+        treatment_items = self._cluster_treatment_local_contrasts(
+            patient_embeddings=patient_embeddings,
+            t=t,
+            cluster_labels=cluster_labels,
+            n_clusters=n_clusters,
+            cluster_counts=cluster_counts,
+        )
+        interaction_items = self._cluster_residualized_interaction_local_contrasts(
+            patient_embeddings=patient_embeddings,
+            y=y,
+            t=t,
+            cluster_labels=cluster_labels,
+            n_clusters=n_clusters,
+            cluster_counts=cluster_counts,
+        )
+        summary["usable_treatment_local_contrasts"] = len(treatment_items)
+        summary["usable_residualized_interaction_local_contrasts"] = len(interaction_items)
+        records.extend(
+            self._cluster_component_records(
+                family_key="treatment",
+                items=treatment_items,
+                positions=positions,
+                role_hint="confounder",
+                positive_label="cluster_local_treated_side",
+                negative_label="cluster_local_untreated_side",
+                contrast_family="cluster_local_treatment_contrast_basis",
+                direction_source="svd_of_cluster_local_treatment_mean_differences",
+                direction_formula=(
+                    "top right singular vectors of rows "
+                    "sqrt(n_cluster) * normalize(mean_embedding(T=1,S=s) - "
+                    "mean_embedding(T=0,S=s))"
+                ),
+                concept_phrases=concept_phrases,
+                concept_embeddings=concept_embeddings,
+            )
+        )
+        records.extend(
+            self._cluster_component_records(
+                family_key="residualized_interaction",
+                items=interaction_items,
+                positions=positions,
+                role_hint="effect_modifier",
+                positive_label="cluster_local_treated_outcome_association_exceeds_untreated",
+                negative_label="cluster_local_untreated_outcome_association_exceeds_treated",
+                contrast_family="cluster_local_residualized_interaction_contrast_basis",
+                direction_source=(
+                    "svd_of_cluster_local_treatment_outcome_interactions_residualized_from_marginals"
+                ),
+                direction_formula=(
+                    "top right singular vectors of rows sqrt(n_cluster) * "
+                    "normalize(residualize(local 2x2 treatment-outcome interaction, "
+                    "basis=[local treatment contrast, local outcome contrast]))"
+                ),
+                concept_phrases=concept_phrases,
+                concept_embeddings=concept_embeddings,
+            )
+        )
+        summary["n_cluster_contrast_components"] = len(records)
+        if not records:
+            summary["skipped"] = "too_few_usable_local_contrasts"
+        return records, summary
+
+    def _cluster_treatment_local_contrasts(
+        self,
+        *,
+        patient_embeddings: np.ndarray,
+        t: np.ndarray,
+        cluster_labels: np.ndarray,
+        n_clusters: int,
+        cluster_counts: np.ndarray,
+    ) -> List[Dict[str, Any]]:
+        labels, treatment_mask = _binary_labels(t)
+        min_cluster_size = int(self.embedding_config.cluster_contrast_min_cluster_size)
+        min_group_size = int(self.embedding_config.cluster_contrast_min_group_size)
+        items: List[Dict[str, Any]] = []
+        for cluster_id in range(n_clusters):
+            if int(cluster_counts[cluster_id]) < min_cluster_size:
+                continue
+            cluster_mask = cluster_labels == cluster_id
+            local_mask = cluster_mask & treatment_mask
+            positive_mask = local_mask & (labels == 1)
+            negative_mask = local_mask & (labels == 0)
+            n_positive = int(np.sum(positive_mask))
+            n_negative = int(np.sum(negative_mask))
+            if n_positive < min_group_size or n_negative < min_group_size:
+                continue
+            direction = (
+                np.mean(patient_embeddings[positive_mask], axis=0)
+                - np.mean(patient_embeddings[negative_mask], axis=0)
+            ).astype(np.float32)
+            direction_norm = float(np.linalg.norm(direction))
+            if not np.isfinite(direction_norm) or direction_norm <= 0.0:
+                continue
+            items.append(
+                {
+                    "cluster_id": int(cluster_id),
+                    "n_cluster": int(cluster_counts[cluster_id]),
+                    "n_positive": n_positive,
+                    "n_negative": n_negative,
+                    "local_direction_norm": direction_norm,
+                    "direction": direction,
+                }
+            )
+        return items
+
+    def _cluster_residualized_interaction_local_contrasts(
+        self,
+        *,
+        patient_embeddings: np.ndarray,
+        y: np.ndarray,
+        t: np.ndarray,
+        cluster_labels: np.ndarray,
+        n_clusters: int,
+        cluster_counts: np.ndarray,
+    ) -> List[Dict[str, Any]]:
+        treatment_labels, treatment_mask = _binary_labels(t)
+        outcome_labels, outcome_mask, _positive_label, _negative_label = self._outcome_label_spec(y)
+        min_cluster_size = int(self.embedding_config.cluster_contrast_min_cluster_size)
+        min_cell_size = int(self.embedding_config.cluster_contrast_min_cell_size)
+        items: List[Dict[str, Any]] = []
+        for cluster_id in range(n_clusters):
+            if int(cluster_counts[cluster_id]) < min_cluster_size:
+                continue
+            cluster_mask = cluster_labels == cluster_id
+            base_mask = cluster_mask & treatment_mask & outcome_mask
+            treated_positive = base_mask & (treatment_labels == 1) & (outcome_labels == 1)
+            treated_negative = base_mask & (treatment_labels == 1) & (outcome_labels == 0)
+            untreated_positive = base_mask & (treatment_labels == 0) & (outcome_labels == 1)
+            untreated_negative = base_mask & (treatment_labels == 0) & (outcome_labels == 0)
+            cell_counts = {
+                "treated_outcome_positive": int(np.sum(treated_positive)),
+                "treated_outcome_negative": int(np.sum(treated_negative)),
+                "untreated_outcome_positive": int(np.sum(untreated_positive)),
+                "untreated_outcome_negative": int(np.sum(untreated_negative)),
+            }
+            if min(cell_counts.values()) < min_cell_size:
+                continue
+            raw_direction = (
+                np.mean(patient_embeddings[treated_positive], axis=0)
+                - np.mean(patient_embeddings[treated_negative], axis=0)
+                - np.mean(patient_embeddings[untreated_positive], axis=0)
+                + np.mean(patient_embeddings[untreated_negative], axis=0)
+            ).astype(np.float32)
+            local_treatment_direction, _ = _binary_mean_difference_direction(
+                patient_embeddings,
+                treatment_labels,
+                cluster_mask & treatment_mask,
+            )
+            local_outcome_direction, _ = _binary_mean_difference_direction(
+                patient_embeddings,
+                outcome_labels,
+                cluster_mask & outcome_mask,
+            )
+            if local_treatment_direction is None or local_outcome_direction is None:
+                continue
+            direction = _residualize_vector_from_basis(
+                raw_direction,
+                [local_treatment_direction, local_outcome_direction],
+            )
+            direction_norm = float(np.linalg.norm(direction))
+            if not np.isfinite(direction_norm) or direction_norm <= 0.0:
+                continue
+            items.append(
+                {
+                    "cluster_id": int(cluster_id),
+                    "n_cluster": int(cluster_counts[cluster_id]),
+                    "n_positive": int(np.sum(treated_positive | untreated_negative)),
+                    "n_negative": int(np.sum(treated_negative | untreated_positive)),
+                    "cell_counts": cell_counts,
+                    "local_direction_norm": direction_norm,
+                    "raw_direction_norm": float(np.linalg.norm(raw_direction)),
+                    "direction": direction,
+                }
+            )
+        return items
+
+    def _cluster_component_records(
+        self,
+        *,
+        family_key: str,
+        items: Sequence[Dict[str, Any]],
+        positions: Sequence[int],
+        role_hint: str,
+        positive_label: str,
+        negative_label: str,
+        contrast_family: str,
+        direction_source: str,
+        direction_formula: str,
+        concept_phrases: Sequence[str],
+        concept_embeddings: Optional[np.ndarray],
+    ) -> List[Dict[str, Any]]:
+        if len(items) < 2:
+            return []
+        weighted_rows = []
+        for item in items:
+            direction = _normalize_vector(np.asarray(item["direction"], dtype=np.float32))
+            weighted_rows.append(direction * np.sqrt(float(item["n_cluster"])))
+        matrix = np.vstack(weighted_rows).astype(np.float32, copy=False)
+        try:
+            _left, singular_values, components = np.linalg.svd(matrix, full_matrices=False)
+        except np.linalg.LinAlgError:
+            logger.warning("Cluster contrast SVD failed for %s contrasts", family_key)
+            return []
+        total_energy = float(np.sum(np.square(singular_values)))
+        max_components = min(
+            int(self.embedding_config.cluster_contrast_max_components),
+            len(singular_values),
+        )
+        records: List[Dict[str, Any]] = []
+        for component_index in range(max_components):
+            singular_value = float(singular_values[component_index])
+            if not np.isfinite(singular_value) or singular_value <= 0.0:
+                continue
+            direction = _normalize_vector(components[component_index])
+            loadings = np.asarray(matrix @ direction, dtype=float)
+            top_indices = np.argsort(np.abs(loadings))[::-1][
+                : int(self.embedding_config.cluster_contrast_top_loadings)
+            ]
+            loading_rows = []
+            for item_index in top_indices:
+                item = items[int(item_index)]
+                row = {
+                    "cluster_id": int(item["cluster_id"]),
+                    "loading": _finite_or_none(float(loadings[item_index])),
+                    "abs_loading": _finite_or_none(abs(float(loadings[item_index]))),
+                    "n_cluster": int(item["n_cluster"]),
+                    "n_positive": int(item["n_positive"]),
+                    "n_negative": int(item["n_negative"]),
+                    "local_direction_norm": _finite_or_none(float(item["local_direction_norm"])),
+                }
+                if "cell_counts" in item:
+                    row["cell_counts"] = copy.deepcopy(item["cell_counts"])
+                if "raw_direction_norm" in item:
+                    row["raw_direction_norm"] = _finite_or_none(float(item["raw_direction_norm"]))
+                loading_rows.append(row)
+            record: Dict[str, Any] = {
+                "name": f"cluster_{family_key}_pc{component_index + 1}",
+                "positive_label": f"{positive_label}_pc{component_index + 1}",
+                "negative_label": f"{negative_label}_pc{component_index + 1}",
+                "role_hint": role_hint,
+                "contrast_family": contrast_family,
+                "direction_source": direction_source,
+                "direction_formula": direction_formula,
+                "n_positive": int(sum(int(item["n_positive"]) for item in items)),
+                "n_negative": int(sum(int(item["n_negative"]) for item in items)),
+                "local_contrast_count": int(len(items)),
+                "cluster_component_index": int(component_index + 1),
+                "cluster_component_singular_value": _finite_or_none(singular_value),
+                "cluster_component_explained_energy": _finite_or_none(
+                    float(singular_value**2 / total_energy) if total_energy > 0.0 else np.nan
+                ),
+                "cluster_component_loadings": loading_rows,
+                "mean_difference_norm": None,
+            }
+            records.append(
+                self._finalize_direction_record(
+                    record=record,
+                    positions=positions,
+                    direction=direction,
+                    concept_phrases=concept_phrases,
+                    concept_embeddings=concept_embeddings,
+                )
+            )
+        return records
 
     def _outcome_label_spec(
         self,

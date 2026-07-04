@@ -710,6 +710,15 @@ class EmbeddingContrastDiscoveryConfig:
     include_confounder_vector_contrast: bool = True
     include_residualized_interaction_contrast: bool = True
     include_orthogonal_r_score_contrasts: bool = True
+    include_cluster_contrast_vectors: bool = True
+    cluster_contrast_n_clusters: int = 10
+    cluster_contrast_max_components: int = 5
+    cluster_contrast_min_cluster_size: int = 24
+    cluster_contrast_min_group_size: int = 8
+    cluster_contrast_min_cell_size: int = 4
+    cluster_contrast_top_loadings: int = 5
+    cluster_contrast_random_state: int = 42
+    cluster_contrast_kmeans_n_init: int = 20
     external_corpus_cache_dirs: List[str] = field(default_factory=list)
     external_top_k_chunks_per_tail: int = 12
     residualize_columns: List[str] = field(default_factory=list)
@@ -758,6 +767,20 @@ class EmbeddingContrastDiscoveryConfig:
             raise ValueError("embedding_contrast.max_concept_phrases must be >= 0")
         if self.concept_probe_top_k < 1:
             raise ValueError("embedding_contrast.concept_probe_top_k must be >= 1")
+        if self.cluster_contrast_n_clusters < 2:
+            raise ValueError("embedding_contrast.cluster_contrast_n_clusters must be >= 2")
+        if self.cluster_contrast_max_components < 1:
+            raise ValueError("embedding_contrast.cluster_contrast_max_components must be >= 1")
+        if self.cluster_contrast_min_cluster_size < 2:
+            raise ValueError("embedding_contrast.cluster_contrast_min_cluster_size must be >= 2")
+        if self.cluster_contrast_min_group_size < 2:
+            raise ValueError("embedding_contrast.cluster_contrast_min_group_size must be >= 2")
+        if self.cluster_contrast_min_cell_size < 1:
+            raise ValueError("embedding_contrast.cluster_contrast_min_cell_size must be >= 1")
+        if self.cluster_contrast_top_loadings < 1:
+            raise ValueError("embedding_contrast.cluster_contrast_top_loadings must be >= 1")
+        if self.cluster_contrast_kmeans_n_init < 1:
+            raise ValueError("embedding_contrast.cluster_contrast_kmeans_n_init must be >= 1")
         self.external_corpus_cache_dirs = [
             str(path).strip() for path in self.external_corpus_cache_dirs if str(path).strip()
         ]
