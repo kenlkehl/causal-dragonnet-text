@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import unicodedata
@@ -243,6 +244,7 @@ class MultiModelAgenticForestRunner:
         self.split_provenance_rows: List[Dict[str, Any]] = []
         self.prediction_results: Optional[pd.DataFrame] = None
         self.alias_reference_specs: List[ExplicitFeatureSpec] = self._initial_specs()
+        self.low_coverage_review_candidates_by_outer: Dict[int, Dict[str, Dict[str, Any]]] = {}
 
     def run(self) -> None:
         logger.info("=" * 80)
@@ -2464,8 +2466,27 @@ class MultiModelAgenticForestRunner:
                 coverage = float(train_df[value_col].notna().mean())
             if spec.name in initial_names or coverage >= min_coverage:
                 kept.append(spec)
+                if outer_fold is not None:
+                    self._clear_low_coverage_review_candidate(outer_fold, spec.name)
             else:
-                dropped.append({"name": spec.name, "coverage": coverage})
+                dropped_item = {
+                    "name": spec.name,
+                    "coverage": coverage,
+                    "required_min_coverage": min_coverage,
+                    "feature": _spec_to_dict(spec),
+                    "review_recommendation": (
+                        "If the evidence still supports this clinical target, propose a "
+                        "broader or more directly documented extraction target rather than "
+                        "repeating the same low-coverage specification unchanged."
+                    ),
+                }
+                dropped.append(dropped_item)
+                self._remember_low_coverage_review_candidate(
+                    outer_fold=outer_fold,
+                    spec=spec,
+                    coverage=coverage,
+                    min_coverage=min_coverage,
+                )
         if dropped:
             logger.info("Dropped low-coverage multi-model agentic features: %s", dropped)
             self.agent_rows.append(
@@ -2476,6 +2497,48 @@ class MultiModelAgenticForestRunner:
                 }
             )
         return kept
+
+    def _remember_low_coverage_review_candidate(
+        self,
+        *,
+        outer_fold: Optional[int],
+        spec: ExplicitFeatureSpec,
+        coverage: float,
+        min_coverage: float,
+    ) -> None:
+        if outer_fold is None:
+            return
+        by_name = self.low_coverage_review_candidates_by_outer.setdefault(int(outer_fold), {})
+        by_name[spec.name] = {
+            "name": spec.name,
+            "coverage": float(coverage),
+            "required_min_coverage": float(min_coverage),
+            "feature": _spec_to_dict(spec),
+            "review_recommendation": (
+                "If the evidence still supports this clinical target, propose a broader "
+                "or more directly documented extraction target rather than repeating the "
+                "same low-coverage specification unchanged."
+            ),
+        }
+
+    def _clear_low_coverage_review_candidate(
+        self,
+        outer_fold: int,
+        name: str,
+    ) -> None:
+        by_name = self.low_coverage_review_candidates_by_outer.get(int(outer_fold))
+        if not by_name:
+            return
+        by_name.pop(str(name), None)
+        if not by_name:
+            self.low_coverage_review_candidates_by_outer.pop(int(outer_fold), None)
+
+    def _low_coverage_review_candidates(self, outer_fold: int) -> List[Dict[str, Any]]:
+        by_name = self.low_coverage_review_candidates_by_outer.get(int(outer_fold), {})
+        return sorted(
+            [copy.deepcopy(item) for item in by_name.values()],
+            key=lambda item: (float(item.get("coverage", 0.0)), str(item.get("name", ""))),
+        )
 
     def _review_extracted_features_if_needed(
         self,
@@ -2883,6 +2946,13 @@ class MultiModelAgenticForestRunner:
                         0.55,
                     )
                 ),
+                "low_coverage_feature_policy": (
+                    "Features listed in low_coverage_features_needing_broader_targets "
+                    "were proposed, extracted, and dropped for insufficient coverage. "
+                    "Do not add the same target unchanged. If the original text evidence "
+                    "still supports the concept, propose a broader or more directly "
+                    "documented pre-treatment extraction target."
+                ),
             },
             "original_bow_context": {
                 "model_diagnostics": bow_context.get("model_diagnostics"),
@@ -2903,6 +2973,9 @@ class MultiModelAgenticForestRunner:
                 ]
             },
         }
+        low_coverage_candidates = self._low_coverage_review_candidates(outer_fold)
+        if low_coverage_candidates:
+            context["low_coverage_features_needing_broader_targets"] = low_coverage_candidates
         if embedding_evidence:
             context["embedding_contrast_evidence"] = (
                 embedding_evidence

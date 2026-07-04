@@ -210,6 +210,50 @@ class ReviewRevisionAgent:
         ]
 
 
+class LowCoverageReviewAgent:
+    def __init__(self):
+        self.contexts = []
+
+    def propose(self, context):
+        self.contexts.append(context)
+        prompt_version = context.get("prompt_version")
+        if prompt_version == "multi_model_agentic_value_harmonization_v1":
+            return {"features": context.get("selected_features", [])}
+        if prompt_version == "multi_model_agentic_extracted_feature_review_v1":
+            low_coverage = context.get("low_coverage_features_needing_broader_targets", [])
+            assert low_coverage
+            assert low_coverage[0]["name"] == "rare_signal_phrase"
+            assert low_coverage[0]["coverage"] < low_coverage[0]["required_min_coverage"]
+            assert "broader" in context["review_policy"]["low_coverage_feature_policy"]
+            return [
+                {
+                    "action": "add",
+                    "name": "signal_marker",
+                    "type": "categorical",
+                    "categories": ["negative", "positive"],
+                    "roles": ["confounder", "effect_modifier"],
+                    "description": "Broader pretreatment signal marker status.",
+                    "rationale": (
+                        "The rare phrasing had low extraction coverage; broader "
+                        "signal text is present across notes."
+                    ),
+                    "expected_signal": "treatment, outcome, and pseudo-target",
+                }
+            ]
+        return [
+            {
+                "action": "add",
+                "name": "rare_signal_phrase",
+                "type": "categorical",
+                "categories": ["absent", "present"],
+                "roles": ["confounder", "effect_modifier"],
+                "description": "Very narrow rare wording for signal marker status.",
+                "rationale": "Initial narrow extraction target.",
+                "expected_signal": "treatment and outcome",
+            }
+        ]
+
+
 class FakeExtractionProvider:
     def ensure_features(self, dataset, specs):
         dataset = dataset.copy()
@@ -250,6 +294,32 @@ class ReviewExtractionProvider:
                     "positive",
                     "negative",
                 )
+            else:
+                dataset[value_col] = np.nan
+            dataset[missing_col] = dataset[value_col].isna()
+        return dataset
+
+
+class LowCoverageExtractionProvider:
+    def __init__(self):
+        self.calls = []
+
+    def ensure_features(self, dataset, specs):
+        self.calls.append([spec.name for spec in specs])
+        dataset = dataset.copy()
+        text = dataset["clinical_text"].astype(str)
+        for spec in specs:
+            value_col = f"explicit_feat_{spec.name}"
+            missing_col = f"{value_col}_missing"
+            if spec.name == "rare_signal_phrase":
+                values = pd.Series(np.nan, index=dataset.index, dtype=object)
+                values.loc[text.str.contains("rare signal phrase")] = "present"
+                dataset[value_col] = values
+            elif spec.name == "signal_marker":
+                values = pd.Series(np.nan, index=dataset.index, dtype=object)
+                values.loc[text.str.contains("signal positive")] = "positive"
+                values.loc[text.str.contains("signal negative")] = "negative"
+                dataset[value_col] = values
             else:
                 dataset[value_col] = np.nan
             dataset[missing_col] = dataset[value_col].isna()
@@ -1930,6 +2000,89 @@ def test_multi_model_extracted_feature_review_revises_underperforming_specs(
     assert parsimony_rows[0]["event"] == "mandatory_parsimony_review"
     assert "redundancy_review" in parsimony_rows[0]
     assert "ablations" in parsimony_rows[0]
+
+
+def test_low_coverage_features_are_reviewed_as_broader_targets(
+    tmp_path: Path,
+):
+    dataset = pd.DataFrame(
+        {
+            "clinical_text": [
+                "signal positive rare signal phrase baseline note",
+                "signal negative baseline note",
+                "signal positive baseline note",
+                "signal negative baseline note",
+                "signal positive baseline note",
+                "signal negative baseline note",
+                "signal positive baseline note",
+                "signal negative baseline note",
+                "signal positive baseline note",
+                "signal negative baseline note",
+                "signal positive baseline note",
+                "signal negative baseline note",
+            ],
+            "treatment_indicator": [1, 0] * 6,
+            "outcome_indicator": [1, 0] * 6,
+        }
+    )
+    config = AppliedInferenceConfig(
+        outcome_type="binary",
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        cv_folds=0,
+        architecture=ModelArchitectureConfig(
+            model_type="multi_model_agentic_forest",
+            explicit_feature_forest=ExplicitFeatureForestConfig(inference=False),
+            agentic_feature_search=AgenticFeatureSearchConfig(
+                max_removals_per_iter=2,
+                min_feature_coverage=0.50,
+                clinical_text_examples_per_prompt=0,
+            ),
+            multi_model_agentic_forest=MultiModelAgenticForestConfig(
+                nuisance_folds=2,
+                effect_folds=2,
+                bow_views=_linear_test_bow_views(),
+                top_n_features=5,
+                candidate_consistency_enabled=False,
+                extracted_feature_review_enabled=True,
+                extracted_feature_review_max_rounds=1,
+                extracted_feature_review_auc_margin=0.0,
+                extracted_feature_review_loss_relative_margin=0.0,
+                extracted_feature_review_min_benchmark_auc=0.55,
+                fold_parallelism="1",
+                **_disable_required_evidence_test_kwargs(),
+            ),
+        ),
+        explicit_features=ExplicitFeatureExtractionConfig(enabled=True, features=[]),
+    )
+    agent = LowCoverageReviewAgent()
+    extractor = LowCoverageExtractionProvider()
+    evaluator = FakeEvaluator()
+    output_path = tmp_path / "predictions.parquet"
+
+    run_multi_model_agentic_forest(
+        dataset,
+        config,
+        output_path,
+        proposal_agent=agent,
+        extraction_provider=extractor,
+        evaluator=evaluator,
+    )
+
+    review_contexts = [
+        context
+        for context in agent.contexts
+        if context.get("prompt_version") == "multi_model_agentic_extracted_feature_review_v1"
+    ]
+    assert review_contexts
+    low_coverage = review_contexts[0]["low_coverage_features_needing_broader_targets"]
+    assert low_coverage[0]["feature"]["name"] == "rare_signal_phrase"
+    assert "rare_signal_phrase" in extractor.calls[0]
+    assert any("signal_marker" in call for call in extractor.calls)
+    final_names = [spec.name for spec in evaluator.seen_specs[-1]]
+    assert "rare_signal_phrase" not in final_names
+    assert "signal_marker" in final_names
 
 
 def test_multi_model_prespecified_features_extract_before_bow_and_merge_roles(
