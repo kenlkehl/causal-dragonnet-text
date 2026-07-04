@@ -95,6 +95,7 @@ Handles documents up to 50K+ tokens with the pretrained tokenizer. No `fit_token
 | `explicit_feature_forest` | Role-tagged explicit features + CausalForestDML (no text model) | tau with 95% confidence intervals |
 | `agentic_explicit_feature_forest` | Nested-CV LLM variable search + explicit-feature CausalForestDML | outer-CV tau, nuisance AUROC, R-loss |
 | `multi_model_agentic_forest` | Multi-view BoW + embedding contrast + HTR attention/span evidence + LLM extraction + explicit-feature CausalForestDML | outer-CV tau, per-view text diagnostics, selected variables |
+| `multi_model_forest_agent_optional` | Multi-view BoW + HTR + embedding-contrast outputs used directly as CausalForestDML W/X features, with optional final explicit-feature agent branch | outer-CV tau, text-model W/X feature manifest, optional agent branch metrics |
 
 **Recommended: Causal Forest** -- trains neural features with propensity + outcome losses (optionally with R-learner loss), then fits CausalForestDML on the learned representations for doubly-robust estimation with confidence intervals.
 
@@ -388,6 +389,17 @@ increase `explicit_features.extraction_max_text_length`, set it to `null`, or
 use a complete-document recursive provider for notes longer than the prompt
 limit.
 
+Use `model_type="multi_model_forest_agent_optional"` for the non-agentic
+multi-model W/X forest variant. This path uses the same BoW view grid, HTR
+evidence models, embedding chunk cache, and outer/inner honesty strategy, but
+the primary causal forest receives numeric text-model outputs directly: BoW and
+HTR treatment/outcome predictions plus confounder contrast cosine features as
+`W`, and per-BoW-view plus HTR pseudo-outcome/R-objective predictions plus
+effect-contrast cosine features as `X`. Set
+`architecture.multi_model_forest_agent_optional.agentic_explicit_branch_enabled=true`
+only when you want a separate post-hoc explicit-feature agent branch; that branch
+does not replace or alter the primary text-model W/X predictions.
+
 This path includes embedding-contrast retrieval evidence by default. It averages
 each patient's retained chunk embeddings into a patient-level embedding, row
 normalizes the patient vectors, optionally residualizes configured structured
@@ -680,6 +692,25 @@ python oracle_experiment_scripts/run_oracle_multi_model_agentic_forest.py \
   --agent-model-name Qwen/Qwen3.5-35B-A3B \
   --extraction-model-name Qwen/Qwen3.5-35B-A3B \
   --extraction-reasoning-parser qwen3
+```
+
+Non-agentic multi-model W/X forest oracle run, with the optional explicit-feature
+agent branch disabled by default:
+
+```bash
+python oracle_experiment_scripts/run_oracle_multi_model_forest_agent_optional.py \
+  --dataset synthetic_data/example_synthetic_datasets/one_confounder_one_effect_modifier_nsclc_with_structured \
+  --output-dir ../pcori_experiments/oracle_multi_model_forest_agent_optional_smoke \
+  --n-folds 5 \
+  --nuisance-folds 5 \
+  --effect-folds 5 \
+  --bow-view-grid default_broad \
+  --num-workers 2 \
+  --outer-parallelism auto \
+  --fold-parallelism auto \
+  --htr-device cuda:0 \
+  --htr-gpu-ids 0 1 \
+  --embedding-device cuda:0
 ```
 
 Embedding-delta retrieval evidence is enabled by default in the oracle run. Use

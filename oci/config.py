@@ -1159,6 +1159,16 @@ class MultiModelAgenticForestConfig:
 
 
 @dataclass
+class MultiModelForestAgentOptionalConfig(MultiModelAgenticForestConfig):
+    """Configuration for non-agentic multi-model W/X forest with optional agents."""
+
+    # The primary text-model forest never uses agents. When this flag is true,
+    # a separate agentic explicit-feature forest branch is run after the primary
+    # text-model traces and predictions are written.
+    agentic_explicit_branch_enabled: bool = False
+
+
+@dataclass
 class DragonNetDRLearnerConfig:
     """Configuration for a DragonNet nuisance stage plus DR pseudo-outcome learner."""
 
@@ -1530,7 +1540,7 @@ class ModelArchitectureConfig:
     """Configuration for model architecture."""
 
     model_type: str = (
-        "dragonnet"  # "dragonnet", "dragonnet_drlearner", "rlearner", "causal_forest", "tfidf_forest", "explicit_feature_forest", "agentic_explicit_feature_forest", "agentic_attention_variable_forest", or "multi_model_agentic_forest"
+        "dragonnet"  # "dragonnet", "dragonnet_drlearner", "rlearner", "causal_forest", "tfidf_forest", "explicit_feature_forest", "agentic_explicit_feature_forest", "agentic_attention_variable_forest", "multi_model_agentic_forest", or "multi_model_forest_agent_optional"
     )
 
     # Feature extractor type: "frozen_llm_pooler"
@@ -1708,6 +1718,11 @@ class ModelArchitectureConfig:
     # Multi-model BoW-guided variable discovery + explicit-feature causal forest
     multi_model_agentic_forest: MultiModelAgenticForestConfig = field(
         default_factory=MultiModelAgenticForestConfig
+    )
+
+    # Multi-model W/X text-feature causal forest with optional final agent branch
+    multi_model_forest_agent_optional: MultiModelForestAgentOptionalConfig = field(
+        default_factory=MultiModelForestAgentOptionalConfig
     )
 
 
@@ -1919,6 +1934,14 @@ class ExperimentConfig:
                 arch_data["multi_model_agentic_forest"] = MultiModelAgenticForestConfig(
                     **arch_data["multi_model_agentic_forest"]
                 )
+            if "multi_model_forest_agent_optional" in arch_data and isinstance(
+                arch_data["multi_model_forest_agent_optional"], dict
+            ):
+                arch_data["multi_model_forest_agent_optional"] = (
+                    MultiModelForestAgentOptionalConfig(
+                        **arch_data["multi_model_forest_agent_optional"]
+                    )
+                )
             return ModelArchitectureConfig(**arch_data)
 
         def parse_explicit_features_config(
@@ -2059,6 +2082,36 @@ class ExperimentConfig:
             ):
                 raise ValueError(
                     "multi_model_agentic_forest.htr_evidence_enabled=False "
+                    "requires htr_evidence_disable_reason"
+                )
+        if self.applied_inference.architecture.model_type == "multi_model_forest_agent_optional":
+            mm_config = self.applied_inference.architecture.multi_model_forest_agent_optional
+            methods = normalize_multi_model_feature_discovery_methods(
+                getattr(mm_config, "feature_discovery_methods", None),
+                source="multi_model_forest_agent_optional.feature_discovery_methods",
+            )
+            if methods is None:
+                methods = mm_config._feature_discovery_methods_from_flags()
+            if not methods:
+                raise ValueError(
+                    "multi_model_forest_agent_optional must enable at least one "
+                    "feature discovery method: bow, htr, or embedding_contrast"
+                )
+            embedding_config = mm_config.embedding_contrast
+            if (
+                not bool(getattr(embedding_config, "enabled", False))
+                and not str(getattr(embedding_config, "disable_reason", "") or "").strip()
+            ):
+                raise ValueError(
+                    "multi_model_forest_agent_optional.embedding_contrast.enabled=False "
+                    "requires embedding_contrast.disable_reason"
+                )
+            if (
+                not bool(getattr(mm_config, "htr_evidence_enabled", True))
+                and not str(getattr(mm_config, "htr_evidence_disable_reason", "") or "").strip()
+            ):
+                raise ValueError(
+                    "multi_model_forest_agent_optional.htr_evidence_enabled=False "
                     "requires htr_evidence_disable_reason"
                 )
         if self.applied_inference.architecture.model_type == "causal_forest":

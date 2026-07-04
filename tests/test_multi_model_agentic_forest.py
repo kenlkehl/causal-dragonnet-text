@@ -16,6 +16,7 @@ from oci.config import (
     ExplicitFeatureSpec,
     ModelArchitectureConfig,
     MultiModelAgenticForestConfig,
+    MultiModelForestAgentOptionalConfig,
 )
 from oci.inference.agentic_explicit_feature_forest import (
     AgenticFeatureProposal,
@@ -2460,6 +2461,133 @@ def test_oracle_multi_model_script_builds_default_and_cli_bow_views():
     assert mm_cfg.htr_evidence_enabled is True
     assert mm_cfg.embedding_contrast.enabled is False
     assert "feature-discovery-methods" in mm_cfg.embedding_contrast.disable_reason
+
+
+def test_multi_model_forest_agent_optional_parses_config():
+    cfg = ExperimentConfig.from_dict(
+        {
+            "applied_inference": {
+                "dataset_path": (
+                    "synthetic_data/example_synthetic_datasets/"
+                    "one_confounder_one_effect_modifier_nsclc_with_structured/"
+                    "dataset.parquet"
+                ),
+                "architecture": {
+                    "model_type": "multi_model_forest_agent_optional",
+                    "multi_model_forest_agent_optional": {
+                        "feature_discovery_methods": ["bow", "embedding_contrast"],
+                        "bow_views": [
+                            {
+                                "name": "linear_test",
+                                "ngram_range_min": 1,
+                                "ngram_range_max": 2,
+                                "min_df": 1,
+                            },
+                            {
+                                "name": "trees",
+                                "bow_model": "extratrees",
+                                "ngram_range_min": 1,
+                                "ngram_range_max": 3,
+                                "min_df": 1,
+                            },
+                        ],
+                        "nuisance_folds": 2,
+                        "effect_folds": 2,
+                        "agentic_explicit_branch_enabled": True,
+                        "embedding_contrast": {
+                            "enabled": True,
+                            "include_cluster_contrast_vectors": True,
+                            "cluster_contrast_max_components": 3,
+                        },
+                    },
+                },
+            }
+        }
+    )
+    arch = cfg.applied_inference.architecture
+    assert arch.model_type == "multi_model_forest_agent_optional"
+    nn_cfg = arch.multi_model_forest_agent_optional
+    assert isinstance(nn_cfg, MultiModelForestAgentOptionalConfig)
+    assert nn_cfg.feature_discovery_methods == ["bow", "embedding_contrast"]
+    assert nn_cfg.bow_discovery_enabled is True
+    assert nn_cfg.htr_evidence_enabled is False
+    assert nn_cfg.embedding_contrast.enabled is True
+    assert nn_cfg.agentic_explicit_branch_enabled is True
+    assert [view.name for view in nn_cfg.bow_views] == ["linear_test", "trees"]
+    assert nn_cfg.bow_views[1].bow_model == "extratrees"
+
+
+def test_oracle_multi_model_optional_script_builds_config():
+    from oracle_experiment_scripts import (
+        run_oracle_multi_model_forest_agent_optional as script,
+    )
+
+    dataset_path = Path(
+        "synthetic_data/example_synthetic_datasets/"
+        "one_confounder_one_effect_modifier_nsclc_with_structured/dataset.parquet"
+    )
+    cfg = script.MultiModelForestAgentOptionalOracleConfig(
+        dataset_path=str(dataset_path),
+        dataset_name="smoke",
+        bow_view_grid="cli_single",
+        bow_model="random_forest",
+        feature_discovery_methods=["bow", "embedding_contrast"],
+        agentic_explicit_branch_enabled=True,
+    )
+    applied = script._make_applied_config(cfg, dataset_path)
+    assert applied.architecture.model_type == "multi_model_forest_agent_optional"
+    nn_cfg = applied.architecture.multi_model_forest_agent_optional
+    assert nn_cfg.agentic_explicit_branch_enabled is True
+    assert nn_cfg.feature_discovery_methods == ["bow", "embedding_contrast"]
+    assert nn_cfg.htr_evidence_enabled is False
+    assert [view.name for view in nn_cfg.bow_views] == ["cli_view"]
+    assert nn_cfg.bow_views[0].bow_model == "random_forest"
+    assert nn_cfg.embedding_contrast.enabled is True
+    assert applied.explicit_features.enabled is True
+
+
+def test_oracle_multi_model_optional_prefers_cached_parquet(tmp_path):
+    from oracle_experiment_scripts import (
+        run_oracle_multi_model_forest_agent_optional as script,
+    )
+
+    dataset_dir = tmp_path / "oracle_dataset"
+    dataset_dir.mkdir()
+    base_parquet = dataset_dir / "dataset.parquet"
+    extracted_parquet = dataset_dir / "dataset_with_extraction.parquet"
+    base_parquet.write_text("placeholder")
+    extracted_parquet.write_text("placeholder")
+
+    cfg = script.MultiModelForestAgentOptionalOracleConfig(
+        dataset_path=str(dataset_dir),
+        dataset_name="smoke",
+        feature_discovery_methods=["embedding_contrast"],
+    )
+    cache_hash = script._embedding_cache_hash_for_config(cfg, base_parquet)
+    cache_path = (
+        dataset_dir
+        / ".oci_cache"
+        / "embedding_contrast"
+        / f"cecnn_chunk_embeddings_{cache_hash}"
+    )
+    cache_path.mkdir(parents=True)
+    (cache_path / "metadata.json").write_text(
+        json.dumps(
+            {
+                "cache_hash": cache_hash,
+                "storage_format": "variable_length_chunks",
+            }
+        )
+    )
+    for filename in ("chunk_embeddings.npy", "offsets.npy", "chunk_texts.jsonl"):
+        (cache_path / filename).write_text("")
+
+    resolved = script._resolve_oracle_parquet_file_for_optional_cache(cfg)
+    assert resolved == base_parquet
+    assert (
+        script._normalize_embedding_cache_dir_arg(str(cache_path))
+        == str(cache_path.parent)
+    )
 
 
 def test_multi_model_agentic_forest_parses_prespecified_feature_sources(tmp_path):

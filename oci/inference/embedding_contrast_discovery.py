@@ -233,11 +233,15 @@ class EmbeddingContrastEvidenceGenerator:
 
     def _prepare_from_sentence_transformer_cache(self, texts: Sequence[str]) -> None:
         dataset_path = self.config.dataset_path or str(self.output_dir / "in_memory_dataset")
-        cache_dir = (
-            Path(str(self.embedding_config.cache_dir))
-            if self.embedding_config.cache_dir
-            else _default_embedding_cache_dir(dataset_path, self.output_dir)
-        )
+        if self.embedding_config.cache_dir:
+            raw_cache_dir = Path(str(self.embedding_config.cache_dir))
+            cache_dir = (
+                raw_cache_dir.parent
+                if raw_cache_dir.name.startswith("cecnn_chunk_embeddings_")
+                else raw_cache_dir
+            )
+        else:
+            cache_dir = _default_embedding_cache_dir(dataset_path, self.output_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
         self._cache_dir = cache_dir
         cache = ConceptEmbeddingCache(

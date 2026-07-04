@@ -29,10 +29,18 @@ def run_multi_model_agentic_forest(*args, **kwargs):
     return _run_multi_model(*args, **kwargs)
 
 
+def run_multi_model_forest_agent_optional(*args, **kwargs):
+    from .multi_model_forest_agent_optional import (
+        run_multi_model_forest_agent_optional as _run_multi_model_optional,
+    )
+    return _run_multi_model_optional(*args, **kwargs)
+
+
 __all__ = [
     'run_applied_inference',
     'run_applied_inference_forest',
     'run_agentic_explicit_feature_forest',
     'run_agentic_attention_variable_forest',
     'run_multi_model_agentic_forest',
+    'run_multi_model_forest_agent_optional',
 ]
