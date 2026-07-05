@@ -17,6 +17,7 @@ from oci.config import (
     ModelArchitectureConfig,
     MultiModelAgenticForestConfig,
     MultiModelForestAgentOptionalConfig,
+    MultiModelForestConfig,
 )
 from oci.inference.agentic_explicit_feature_forest import (
     AgenticFeatureProposal,
@@ -40,6 +41,7 @@ from oci.inference.multi_model_agentic_forest import (
     _fit_binary_bow_fold,
     run_multi_model_agentic_forest,
 )
+from oci.inference.multi_model_forest import resolve_multi_model_forest_parallel_plan
 from oci.models.concept_embedding_utils import chunk_text_words
 
 
@@ -2526,6 +2528,193 @@ def test_multi_model_forest_agent_optional_parses_config():
     assert nn_cfg.htr_fold_parallelism == "2"
     assert [view.name for view in nn_cfg.bow_views] == ["linear_test", "trees"]
     assert nn_cfg.bow_views[1].bow_model == "extratrees"
+
+
+def test_multi_model_forest_parses_config():
+    cfg = ExperimentConfig.from_dict(
+        {
+            "applied_inference": {
+                "dataset_path": (
+                    "synthetic_data/example_synthetic_datasets/"
+                    "one_confounder_one_effect_modifier_nsclc_with_structured/"
+                    "dataset.parquet"
+                ),
+                "architecture": {
+                    "model_type": "multi_model_forest",
+                    "multi_model_forest": {
+                        "feature_discovery_methods": ["bow", "embedding_contrast"],
+                        "bow_views": [
+                            {
+                                "name": "linear_test",
+                                "ngram_range_min": 1,
+                                "ngram_range_max": 2,
+                                "min_df": 1,
+                            },
+                        ],
+                        "nuisance_folds": 2,
+                        "effect_folds": 2,
+                        "cpus_total": 10,
+                        "htr_jobs_per_gpu": 2,
+                        "embedding_contrast": {"enabled": True},
+                    },
+                },
+            }
+        }
+    )
+    arch = cfg.applied_inference.architecture
+    assert arch.model_type == "multi_model_forest"
+    nn_cfg = arch.multi_model_forest
+    assert isinstance(nn_cfg, MultiModelForestConfig)
+    assert nn_cfg.feature_discovery_methods == ["bow", "embedding_contrast"]
+    assert nn_cfg.cpus_total == 10
+    assert nn_cfg.htr_jobs_per_gpu == 2
+    assert nn_cfg.htr_evidence_enabled is False
+    assert nn_cfg.embedding_contrast.enabled is True
+
+
+def test_multi_model_forest_parallel_plan_reserves_htr_slots():
+    plan = resolve_multi_model_forest_parallel_plan(
+        cpus_total=10,
+        num_workers=1,
+        gpu_ids=[0, 1],
+        htr_jobs_per_gpu=2,
+        htr_enabled=True,
+        embedding_enabled=True,
+    )
+    assert plan.htr_slots == 4
+    assert plan.cpu_loky_workers == 6
+    assert plan.context_workers == 4
+    assert plan.htr_device_slots == [0, 0, 1, 1]
+
+    bow_only = resolve_multi_model_forest_parallel_plan(
+        cpus_total=10,
+        num_workers=1,
+        gpu_ids=[0, 1],
+        htr_jobs_per_gpu=2,
+        htr_enabled=False,
+        embedding_enabled=True,
+    )
+    assert bow_only.htr_slots == 0
+    assert bow_only.cpu_loky_workers == 10
+    assert bow_only.context_workers == 10
+
+
+def test_oracle_multi_model_forest_script_builds_config():
+    from oracle_experiment_scripts import run_oracle_multi_model_forest as script
+
+    dataset_path = Path(
+        "synthetic_data/example_synthetic_datasets/"
+        "one_confounder_one_effect_modifier_nsclc_with_structured/dataset.parquet"
+    )
+    cfg = script.MultiModelForestOracleConfig(
+        dataset_path=str(dataset_path),
+        dataset_name="smoke",
+        bow_view_grid="cli_single",
+        bow_model="random_forest",
+        feature_discovery_methods=["bow", "embedding_contrast"],
+        cpus_total=10,
+        gpu_ids=[0, 1],
+        htr_gpu_ids=[0, 1],
+        htr_jobs_per_gpu=2,
+    )
+    applied = script._make_applied_config(cfg, dataset_path)
+    assert applied.architecture.model_type == "multi_model_forest"
+    nn_cfg = applied.architecture.multi_model_forest
+    assert isinstance(nn_cfg, MultiModelForestConfig)
+    assert nn_cfg.cpus_total == 10
+    assert nn_cfg.htr_jobs_per_gpu == 2
+    assert nn_cfg.feature_discovery_methods == ["bow", "embedding_contrast"]
+    assert [view.name for view in nn_cfg.bow_views] == ["cli_view"]
+    assert nn_cfg.bow_views[0].bow_model == "random_forest"
+    assert applied.architecture.multi_model_agentic_forest is nn_cfg
+    assert applied.architecture.multi_model_forest_agent_optional is nn_cfg
+
+
+def test_oracle_multi_model_forest_splits_primary_and_agentic_hashes():
+    from dataclasses import replace
+
+    from oracle_experiment_scripts import run_oracle_multi_model_forest as script
+
+    cfg = script.MultiModelForestOracleConfig(
+        dataset_path="dataset.parquet",
+        dataset_name="smoke",
+        feature_discovery_methods=["bow"],
+        cpus_total=10,
+        gpu_ids=[0, 1],
+        htr_jobs_per_gpu=2,
+    )
+    base_primary = cfg.primary_hash()
+    base_agentic = cfg.agentic_hash()
+
+    assert replace(cfg, agent_server_url="http://localhost:4321/v1").primary_hash() == base_primary
+    assert replace(cfg, extraction_server_url="http://localhost:9876/v1").primary_hash() == base_primary
+    assert replace(cfg, cpus_total=2).primary_hash() == base_primary
+    assert replace(cfg, htr_jobs_per_gpu=1).primary_hash() == base_primary
+    assert replace(cfg, agent_server_url="http://localhost:4321/v1").agentic_hash() != base_agentic
+    assert replace(cfg, n_folds=3).primary_hash() != base_primary
+
+
+def test_embedding_contrast_prepare_uses_multi_gpu_precompute(tmp_path, monkeypatch):
+    import oci.inference.embedding_contrast_discovery as module
+
+    class FakeHiddenStates:
+        flat = np.zeros((2, 3), dtype=np.float32)
+        offsets = np.asarray([0, 1, 2], dtype=np.int64)
+
+    class FakeCache:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.cache_path = tmp_path / "fake_cache"
+            self.hidden_states_array = FakeHiddenStates()
+            self.multi_gpu_devices = None
+            FakeCache.instances.append(self)
+
+        def is_valid(self, expected_num_samples):
+            assert expected_num_samples == 2
+            return False
+
+        def precompute_multi_gpu(self, texts, devices, batch_size):
+            self.multi_gpu_devices = [str(device) for device in devices]
+            self.batch_size = batch_size
+
+        def precompute(self, texts, device=None, batch_size=128):
+            raise AssertionError("single-device precompute should not be used")
+
+        def open(self):
+            return None
+
+        def load_chunks(self, expected_num_samples):
+            assert expected_num_samples == 2
+            return [["alpha"], ["beta"]]
+
+    monkeypatch.setattr(module, "ConceptEmbeddingCache", FakeCache)
+    monkeypatch.setattr(module, "_release_sentence_transformer_model", lambda model_name: None)
+
+    config = AppliedInferenceConfig(
+        text_column="clinical_text",
+        architecture=ModelArchitectureConfig(
+            model_type="multi_model_agentic_forest",
+            multi_model_agentic_forest=MultiModelAgenticForestConfig(
+                feature_discovery_methods=["embedding_contrast"],
+                embedding_contrast=EmbeddingContrastDiscoveryConfig(
+                    enabled=True,
+                    cache_dir=str(tmp_path),
+                    batch_size=7,
+                ),
+                **_disable_htr_test_kwargs(),
+            ),
+        ),
+    )
+    generator = EmbeddingContrastEvidenceGenerator(
+        config=config,
+        output_dir=tmp_path,
+        precompute_devices=["cuda:0", "cuda:1"],
+    )
+    generator.prepare(pd.DataFrame({"clinical_text": ["alpha", "beta"]}))
+
+    assert FakeCache.instances[0].multi_gpu_devices == ["cuda:0", "cuda:1"]
+    assert FakeCache.instances[0].batch_size == 7
 
 
 def test_oracle_multi_model_optional_script_builds_config():

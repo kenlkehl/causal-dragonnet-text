@@ -241,6 +241,22 @@ def run_applied_inference(
         )
         return
 
+    if hasattr(config, 'architecture') and config.architecture.model_type == "multi_model_forest":
+        logger.info("Routing to integrated Multi-Model Forest pipeline")
+        from .multi_model_forest import run_multi_model_forest
+        mm_config = config.architecture.multi_model_forest
+        run_multi_model_forest(
+            dataset=dataset,
+            config=config,
+            output_path=output_path,
+            device=device,
+            gpu_ids=gpu_ids,
+            num_workers=num_workers,
+            cpus_total=getattr(mm_config, "cpus_total", None),
+            htr_jobs_per_gpu=getattr(mm_config, "htr_jobs_per_gpu", 1),
+        )
+        return
+
     if hasattr(config, 'architecture') and config.architecture.model_type == "dragonnet_drlearner":
         logger.info("Routing to DragonNet DR-learner pipeline")
         from .dragonnet_drlearner import run_dragonnet_drlearner

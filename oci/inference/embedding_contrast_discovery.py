@@ -36,6 +36,7 @@ class EmbeddingContrastEvidenceGenerator:
         config: AppliedInferenceConfig,
         output_dir: Path,
         embedding_provider: Optional[Any] = None,
+        precompute_devices: Optional[Sequence[Any]] = None,
     ) -> None:
         self.config = config
         self.embedding_config: EmbeddingContrastDiscoveryConfig = (
@@ -43,6 +44,7 @@ class EmbeddingContrastEvidenceGenerator:
         )
         self.output_dir = Path(output_dir)
         self.embedding_provider = embedding_provider
+        self.precompute_devices = list(precompute_devices or [])
         self._prepared = False
         self._row_ids: List[Any] = []
         self._row_id_to_position: Dict[Any, int] = {}
@@ -263,11 +265,25 @@ class EmbeddingContrastEvidenceGenerator:
         else:
             logger.info("Building embedding contrast chunk cache")
             try:
-                cache.precompute(
-                    list(texts),
-                    device=_torch_device_or_none(self.embedding_config.device),
-                    batch_size=int(self.embedding_config.batch_size),
-                )
+                precompute_devices = _coerce_torch_devices(self.precompute_devices)
+                if len(precompute_devices) > 1:
+                    cache.precompute_multi_gpu(
+                        list(texts),
+                        devices=precompute_devices,
+                        batch_size=int(self.embedding_config.batch_size),
+                    )
+                elif len(precompute_devices) == 1:
+                    cache.precompute(
+                        list(texts),
+                        device=precompute_devices[0],
+                        batch_size=int(self.embedding_config.batch_size),
+                    )
+                else:
+                    cache.precompute(
+                        list(texts),
+                        device=_torch_device_or_none(self.embedding_config.device),
+                        batch_size=int(self.embedding_config.batch_size),
+                    )
             finally:
                 _release_sentence_transformer_model(str(self.embedding_config.model_name))
         cache.open()
@@ -1737,6 +1753,14 @@ def _torch_device_or_none(device: Optional[str]):
     import torch
 
     return torch.device(str(device))
+
+
+def _coerce_torch_devices(devices: Sequence[Any]):
+    if not devices:
+        return []
+    import torch
+
+    return [device if isinstance(device, torch.device) else torch.device(str(device)) for device in devices]
 
 
 def _release_sentence_transformer_model(model_name: str) -> None:
