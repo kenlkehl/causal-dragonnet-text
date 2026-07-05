@@ -22,6 +22,7 @@ from sklearn.model_selection import KFold
 
 from ..config import (
     AgenticAttentionVariableForestConfig,
+    AgenticFeatureSearchConfig,
     AppliedInferenceConfig,
     BoWViewConfig,
     ExplicitFeatureForestConfig,
@@ -54,9 +55,14 @@ from .embedding_contrast_discovery import (
 )
 from .multi_model_agentic_forest import (
     MultiModelHTREvidenceProvider,
+    _agent_visible_metrics,
+    _agentic_discovery_handoff_row,
     _align_htr_prediction_frame,
     _binary_split_items,
     _bounded_fold_count,
+    _clinical_text_examples,
+    _compact_multi_model_agent_context,
+    _finite_or_none,
     build_multi_model_agentic_discovery_handoff,
     _fit_binary_bow_fold,
     _fit_regression_bow_fold,
@@ -66,8 +72,12 @@ from .multi_model_agentic_forest import (
     _make_bow_classifier,
     _make_bow_regressor,
     _make_bow_vectorizer,
+    _model_feature_scores,
+    _multi_view_importance,
     _normalize_texts,
     _split_is_honest,
+    _top_feature_rows,
+    _top_phrase_feature_rows,
     run_multi_model_agentic_forest_from_handoff,
     _write_json,
     _write_jsonl,
@@ -88,6 +98,7 @@ class _FeatureBundle:
     prediction_frames: List[pd.DataFrame]
     embedding_rows: List[Dict[str, Any]]
     metrics: Dict[str, Any]
+    handoff_evidence: Optional[Dict[str, Any]]
 
 
 def _run_optional_outer_fold_job(
@@ -127,6 +138,7 @@ def _run_optional_outer_fold_job(
             "source_prediction_frames": fold_runner.source_prediction_frames,
             "embedding_feature_rows": fold_runner.embedding_feature_rows,
             "outer_metric_rows": fold_runner.outer_metric_rows,
+            "agentic_handoff_rows": fold_runner.agentic_handoff_rows,
         }
     finally:
         if htr_dataloader_workers is not None:
@@ -327,6 +339,11 @@ class MultiModelForestAgentOptionalRunner:
             "multi_model_forest_agent_optional",
             MultiModelForestAgentOptionalConfig(),
         )
+        self.search_config: AgenticFeatureSearchConfig = getattr(
+            config.architecture,
+            "agentic_feature_search",
+            AgenticFeatureSearchConfig(),
+        )
         # Existing embedding and optional agentic code reads the old config slot.
         # Mirror the new config there so shared components use the same settings.
         config.architecture.multi_model_agentic_forest = self.nn_config
@@ -345,6 +362,7 @@ class MultiModelForestAgentOptionalRunner:
         self.feature_manifest_rows: List[Dict[str, Any]] = []
         self.source_prediction_frames: List[pd.DataFrame] = []
         self.embedding_feature_rows: List[Dict[str, Any]] = []
+        self.agentic_handoff_rows: List[Dict[str, Any]] = []
 
     def run(self) -> None:
         logger.info("=" * 80)
@@ -438,6 +456,7 @@ class MultiModelForestAgentOptionalRunner:
                 self.source_prediction_frames.extend(item["source_prediction_frames"])
                 self.embedding_feature_rows.extend(item["embedding_feature_rows"])
                 self.outer_metric_rows.extend(item["outer_metric_rows"])
+                self.agentic_handoff_rows.extend(item.get("agentic_handoff_rows", []))
         else:
             prediction_frames = []
             for outer_fold, train_idx, test_idx in splits:
@@ -688,6 +707,29 @@ class MultiModelForestAgentOptionalRunner:
             metrics["oracle_true_ite_mae"] = float(np.mean(np.abs(true_ite - tau)))
         self.outer_metric_rows.append(metrics)
 
+        if bundle.handoff_evidence is not None:
+            handoff_result = copy.deepcopy(bundle.handoff_evidence)
+            handoff_metrics = dict(handoff_result.get("metrics") or {})
+            handoff_metrics.update(metrics)
+            handoff_result["metrics"] = handoff_metrics
+            handoff_result["context"] = self._build_primary_agent_context(
+                outer_fold=outer_fold,
+                discovery_df=train_df,
+                metrics=handoff_metrics,
+                importance=handoff_result.get("importance") or {},
+                embedding_evidence=handoff_result.get("embedding_contrast_evidence") or {},
+                htr_evidence=handoff_result.get("htr_evidence") or {},
+            )
+            self.agentic_handoff_rows.append(
+                _agentic_discovery_handoff_row(
+                    handoff_result,
+                    fold_key=int(outer_fold),
+                    outer_fold=int(outer_fold),
+                    scope="full_outer_train",
+                    n_rows=len(train_df),
+                )
+            )
+
         fold_dir = self.artifact_dir / f"outer_fold_{int(outer_fold):03d}"
         fold_dir.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
@@ -725,6 +767,10 @@ class MultiModelForestAgentOptionalRunner:
         metrics: Dict[str, Any] = {}
         nuisance_train: List[Tuple[str, np.ndarray, np.ndarray]] = []
         nuisance_test: List[Tuple[str, np.ndarray, np.ndarray]] = []
+        bow_nuisance_by_view: List[Dict[str, Any]] = []
+        bow_view_results: List[Dict[str, Any]] = []
+        ensemble_view_results: List[Dict[str, Any]] = []
+        htr_evidence: Dict[str, Any] = {}
 
         if self._bow_enabled():
             for view_index, view in enumerate(self.nn_config.bow_views):
@@ -760,6 +806,14 @@ class MultiModelForestAgentOptionalRunner:
                     )
                 nuisance_train.append((view.name, e_train, m_train))
                 nuisance_test.append((view.name, e_test, m_test))
+                bow_nuisance_by_view.append(
+                    {
+                        "view": view,
+                        "view_index": int(view_index),
+                        "e_hat": e_train,
+                        "m_hat": m_train,
+                    }
+                )
                 _append_feature(
                     w_train_cols,
                     w_test_cols,
@@ -863,6 +917,20 @@ class MultiModelForestAgentOptionalRunner:
                 metrics["htr_outcome_rmse"] = float(np.sqrt(mean_squared_error(y, htr_m_train)))
             else:
                 metrics["htr_outcome_auroc"] = _safe_roc_auc(y, htr_m_train)
+            htr_attention = [dict(row) for row in htr_train_result.get("attention", []) or []]
+            for row in htr_attention:
+                row.setdefault("model_family", "htr")
+                row.setdefault("target_source", "htr_nuisance")
+            htr_evidence["nuisance"] = {
+                "metrics": _htr_nuisance_metrics(
+                    discovery_df=train_df,
+                    predictions=htr_train_predictions,
+                    treatment_column=self.config.treatment_column,
+                    outcome_column=self.config.outcome_column,
+                    outcome_type=self.config.outcome_type,
+                ),
+                "attention": htr_attention,
+            }
             prediction_frames.append(
                 _source_prediction_frame(
                     train_df,
@@ -995,8 +1063,62 @@ class MultiModelForestAgentOptionalRunner:
                         },
                     )
                 )
+                nuisance_view = next(
+                    (
+                        item
+                        for item in bow_nuisance_by_view
+                        if int(item["view_index"]) == int(view_index)
+                    ),
+                    None,
+                )
+                if nuisance_view is not None:
+                    importance = self._fit_primary_feature_importance_models(
+                        texts=texts_train,
+                        y=y,
+                        t=t,
+                        pseudo_target=pseudo_target,
+                        pseudo_target_sample_weight=r_weight,
+                        view=view,
+                    )
+                    view_metrics = self._primary_bow_metrics(
+                        discovery_df=train_df,
+                        y=y,
+                        t=t,
+                        e_hat=np.asarray(nuisance_view["e_hat"], dtype=float),
+                        m_hat=np.asarray(nuisance_view["m_hat"], dtype=float),
+                        pseudo_target=pseudo_target,
+                        tau_hat=r_train,
+                        y_resid=y_resid,
+                        t_resid=t_resid,
+                    )
+                    bow_view_results.append(
+                        {
+                            "metrics": view_metrics,
+                            "importance": importance,
+                            "pseudo_target": pseudo_target,
+                            "t_resid": t_resid,
+                            "view": view,
+                            "view_name": view.name,
+                            "view_index": int(view_index),
+                        }
+                    )
+                    ensemble_view_results.append(
+                        {
+                            "metrics": {
+                                **view_metrics,
+                                "target_source": "ensemble_mean_nuisance",
+                            },
+                            "importance": copy.deepcopy(importance),
+                            "pseudo_target": pseudo_target,
+                            "t_resid": t_resid,
+                            "view": view,
+                            "view_name": f"ensemble_r__{view.name}",
+                            "view_index": int(view_index),
+                        }
+                    )
 
         if self._htr_enabled():
+            htr_effect_variants: Dict[str, Any] = {}
             for effect_objective, feature_suffix in [
                 ("pseudo_outcome_mse", "effect_pseudo_target_pred"),
                 ("squared_r_loss", "effect_weighted_r_tau_pred"),
@@ -1028,6 +1150,21 @@ class MultiModelForestAgentOptionalRunner:
                 )
                 train_tau = train_predictions["tau_hat_r_stage"].to_numpy(dtype=float)
                 test_tau = test_predictions["tau_hat_r_stage"].to_numpy(dtype=float)
+                effect_attention = [
+                    dict(row) for row in htr_effect_train.get("attention", []) or []
+                ]
+                for row in effect_attention:
+                    row.setdefault("model_family", "htr")
+                    row.setdefault("target_source", "ensemble_mean_nuisance_with_htr")
+                    row.setdefault("effect_objective", effect_objective)
+                effect_evidence = {
+                    "metrics": _htr_effect_metrics(train_predictions),
+                    "attention": effect_attention,
+                    "effect_objective": effect_objective,
+                }
+                htr_effect_variants[effect_objective] = effect_evidence
+                if effect_objective == "pseudo_outcome_mse":
+                    htr_evidence["effect"] = effect_evidence
                 _append_feature(
                     x_train_cols,
                     x_test_cols,
@@ -1055,7 +1192,35 @@ class MultiModelForestAgentOptionalRunner:
                         values={"tau_hat": (train_tau, test_tau)},
                     )
                 )
+            if "effect" not in htr_evidence and htr_effect_variants:
+                htr_evidence["effect"] = next(iter(htr_effect_variants.values()))
+            if htr_effect_variants:
+                htr_evidence["effect_variants"] = htr_effect_variants
 
+        importance: Dict[str, Any] = _multi_view_importance(
+            bow_view_results,
+            top_n=int(self.nn_config.top_n_features),
+        )
+        importance["feature_discovery_methods"] = self._enabled_feature_discovery_methods()
+        if ensemble_view_results:
+            ensemble_importance = _multi_view_importance(
+                ensemble_view_results,
+                top_n=int(self.nn_config.top_n_features),
+            )
+            nuisance_source_names = [item[0] for item in nuisance_train]
+            ensemble_importance["target_source"] = (
+                "ensemble_mean_nuisance_with_htr"
+                if any(str(name).startswith("htr") for name in nuisance_source_names)
+                else "ensemble_mean_nuisance"
+            )
+            ensemble_importance["nuisance_sources"] = nuisance_source_names
+            ensemble_importance["pseudo_target_construction"] = (
+                "mean nuisance predictions across Stage 1 text models, then "
+                "(Y - mean_m_hat) / (T - mean_e_hat)"
+            )
+            importance["ensemble_r"] = ensemble_importance
+
+        embedding_evidence: Dict[str, Any] = {}
         if self._embedding_contrast_enabled():
             emb = self._embedding_feature_bundle(
                 train_df=train_df,
@@ -1099,6 +1264,21 @@ class MultiModelForestAgentOptionalRunner:
                     contrast_family=item.get("contrast_family"),
                 )
             embedding_rows.extend(emb["metadata"])
+            embedding_evidence = self._build_primary_embedding_contrast_evidence(
+                discovery_df=train_df,
+                y=y,
+                t=t,
+                pseudo_target=pseudo_target,
+                t_resid=t_resid,
+                importance=importance,
+            )
+
+        handoff_evidence = {
+            "metrics": copy.deepcopy(metrics),
+            "importance": importance,
+            "embedding_contrast_evidence": embedding_evidence,
+            "htr_evidence": htr_evidence,
+        }
 
         return _FeatureBundle(
             x_train=_column_matrix(x_train_cols, len(train_df)),
@@ -1111,7 +1291,261 @@ class MultiModelForestAgentOptionalRunner:
             prediction_frames=prediction_frames,
             embedding_rows=embedding_rows,
             metrics=metrics,
+            handoff_evidence=handoff_evidence,
         )
+
+    def _primary_bow_metrics(
+        self,
+        *,
+        discovery_df: pd.DataFrame,
+        y: np.ndarray,
+        t: np.ndarray,
+        e_hat: np.ndarray,
+        m_hat: np.ndarray,
+        pseudo_target: np.ndarray,
+        tau_hat: np.ndarray,
+        y_resid: np.ndarray,
+        t_resid: np.ndarray,
+    ) -> Dict[str, Any]:
+        r_loss = (np.asarray(y_resid, dtype=float) - np.asarray(tau_hat, dtype=float) * t_resid) ** 2
+        r_loss_at_zero = np.asarray(y_resid, dtype=float) ** 2
+        metrics: Dict[str, Any] = {
+            "treatment_auroc": _safe_roc_auc(t, e_hat),
+            "pseudo_target_mean": _finite_or_none(np.mean(pseudo_target)),
+            "pseudo_target_std": _finite_or_none(np.std(pseudo_target)),
+            "tau_hat_mean": _finite_or_none(np.mean(tau_hat)),
+            "tau_hat_std": _finite_or_none(np.std(tau_hat)),
+            "r_loss_mean": _finite_or_none(np.mean(r_loss)),
+            "r_loss_at_zero_mean": _finite_or_none(np.mean(r_loss_at_zero)),
+            "r_loss_improvement": _finite_or_none(np.mean(r_loss_at_zero) - np.mean(r_loss)),
+            "pseudo_target_construction": (
+                "Stage 1 ensemble nuisance predictions, then "
+                "(Y - mean_m_hat) / (T - mean_e_hat)"
+            ),
+        }
+        try:
+            metrics["treatment_brier"] = _finite_or_none(brier_score_loss(t, e_hat))
+        except Exception:
+            pass
+        try:
+            metrics["treatment_log_loss"] = _finite_or_none(log_loss(t, e_hat))
+        except Exception:
+            pass
+        if str(self.config.outcome_type).lower() == "continuous":
+            metrics["outcome_rmse"] = _finite_or_none(np.sqrt(mean_squared_error(y, m_hat)))
+        else:
+            metrics["outcome_auroc"] = _safe_roc_auc(y, m_hat)
+            try:
+                metrics["outcome_brier"] = _finite_or_none(brier_score_loss(y, m_hat))
+            except Exception:
+                pass
+        if "true_ite_prob" in discovery_df.columns:
+            metrics["tau_hat_true_ite_corr"] = _safe_corr(
+                tau_hat,
+                discovery_df["true_ite_prob"].to_numpy(dtype=float),
+            )
+            metrics["pseudo_target_true_ite_corr"] = _safe_corr(
+                pseudo_target,
+                discovery_df["true_ite_prob"].to_numpy(dtype=float),
+            )
+        return metrics
+
+    def _fit_primary_feature_importance_models(
+        self,
+        *,
+        texts: Sequence[str],
+        y: np.ndarray,
+        t: np.ndarray,
+        pseudo_target: np.ndarray,
+        pseudo_target_sample_weight: Optional[np.ndarray],
+        view: BoWViewConfig,
+    ) -> Dict[str, Any]:
+        vectorizer = _make_bow_vectorizer(_vectorizer_params(view))
+        x_model = vectorizer.fit_transform(texts)
+        features = np.asarray(vectorizer.get_feature_names_out())
+
+        if len(np.unique(np.asarray(t, dtype=int))) < 2:
+            treatment_coef = np.zeros(len(features), dtype=float)
+        else:
+            treatment_model = _make_bow_classifier(_model_params(view), random_state=101)
+            treatment_model.fit(x_model, np.asarray(t, dtype=int))
+            treatment_coef = _model_feature_scores(treatment_model, len(features))
+
+        if str(self.config.outcome_type).lower() == "continuous":
+            outcome_model = _make_bow_regressor(_model_params(view), random_state=202)
+            outcome_model.fit(x_model, y)
+            outcome_coef = _model_feature_scores(outcome_model, len(features))
+        elif len(np.unique(np.asarray(y, dtype=int))) < 2:
+            outcome_coef = np.zeros(len(features), dtype=float)
+        else:
+            outcome_model = _make_bow_classifier(_model_params(view), random_state=202)
+            outcome_model.fit(x_model, np.asarray(y, dtype=int))
+            outcome_coef = _model_feature_scores(outcome_model, len(features))
+
+        effect_model = _make_bow_regressor(_model_params(view), random_state=303)
+        _fit_regressor(
+            effect_model,
+            x_model,
+            pseudo_target,
+            sample_weight=pseudo_target_sample_weight,
+        )
+        effect_coef = _model_feature_scores(effect_model, len(features))
+
+        top_n = int(self.nn_config.top_n_features)
+        confounder_score = np.abs(treatment_coef) * np.abs(outcome_coef)
+        return {
+            "view_name": str(view.name),
+            "view_config": _bow_view_to_dict(view),
+            "n_features": int(len(features)),
+            "n_bow_features": int(len(features)),
+            "n_prespecified_features": 0,
+            "n_prespecified_raw_features": 0,
+            "prespecified_raw_feature_names": [],
+            "phrase_features": _top_phrase_feature_rows(
+                features,
+                top_n=top_n,
+                treatment_coef=treatment_coef,
+                outcome_coef=outcome_coef,
+                pseudo_target_coef=effect_coef,
+                confounder_score=confounder_score,
+            ),
+            "confounder_overlap": _top_feature_rows(
+                features,
+                confounder_score,
+                top_n,
+                treatment_coef=treatment_coef,
+                outcome_coef=outcome_coef,
+            ),
+            "treatment_positive": _top_feature_rows(features, treatment_coef, top_n),
+            "treatment_negative": _top_feature_rows(
+                features,
+                treatment_coef,
+                top_n,
+                descending=False,
+            ),
+            "outcome_positive": _top_feature_rows(features, outcome_coef, top_n),
+            "outcome_negative": _top_feature_rows(
+                features,
+                outcome_coef,
+                top_n,
+                descending=False,
+            ),
+            "pseudo_target_positive": _top_feature_rows(features, effect_coef, top_n),
+            "pseudo_target_negative": _top_feature_rows(
+                features,
+                effect_coef,
+                top_n,
+                descending=False,
+            ),
+        }
+
+    def _build_primary_embedding_contrast_evidence(
+        self,
+        *,
+        discovery_df: pd.DataFrame,
+        y: np.ndarray,
+        t: np.ndarray,
+        pseudo_target: np.ndarray,
+        t_resid: np.ndarray,
+        importance: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not self._embedding_contrast_enabled():
+            return {}
+        generator = self._embedding_generator()
+        generator.prepare(self.dataset)
+        return generator.build_evidence(
+            discovery_df=discovery_df,
+            y=y,
+            t=t,
+            pseudo_target=[pseudo_target],
+            t_resid=[t_resid],
+            pseudo_target_names=["stage1_ensemble_mean_nuisance"],
+            importance=importance,
+        )
+
+    def _build_primary_agent_context(
+        self,
+        *,
+        outer_fold: int,
+        discovery_df: pd.DataFrame,
+        metrics: Dict[str, Any],
+        importance: Dict[str, Any],
+        embedding_evidence: Optional[Dict[str, Any]] = None,
+        htr_evidence: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        instructions = [
+            "You are generating candidate variables from empirical text evidence.",
+            "The evidence was produced during Stage 1 primary text-model forest training.",
+            "Suggest explicit pre-treatment patient-level variables, not raw text tokens.",
+            "Use variables predictive of both treatment and outcome as confounders.",
+            "Use variables predictive of the pseudo-target or R-stage signal as effect modifiers.",
+            "Do not invent broad clinical inventory variables unsupported by the enabled evidence.",
+            "Avoid near-duplicate aliases for the same extraction target.",
+        ]
+        if self._bow_enabled():
+            instructions.append(
+                "Review sparse bag-of-words feature importance across the Stage 1 views."
+            )
+        if self._embedding_contrast_enabled():
+            instructions.append(
+                "Use embedding_contrast_evidence as retrieved chunk evidence, not as a direct vector interpretation."
+            )
+        if self._htr_enabled():
+            instructions.append(
+                "Use htr_attention_evidence from the Stage 1 HTR nuisance and R-stage models as neural text evidence."
+            )
+        context: Dict[str, Any] = {
+            "prompt_version": "multi_model_agentic_forest_v1",
+            "outer_fold": int(outer_fold),
+            "feature_discovery_methods": self._enabled_feature_discovery_methods(),
+            "max_proposals": int(self.nn_config.candidate_proposals_per_fold),
+            "clinical_question": self.config.clinical_question,
+            "estimand": {
+                "treatment_column": self.config.treatment_column,
+                "outcome_column": self.config.outcome_column,
+                "outcome_type": self.config.outcome_type,
+            },
+            "instructions": instructions,
+            "current_features": [],
+            "model_diagnostics": _agent_visible_metrics(metrics),
+            "feature_importance": importance,
+            "clinical_text_examples": _clinical_text_examples(
+                discovery_df,
+                self.config.text_column,
+                n_examples=self.search_config.clinical_text_examples_per_prompt,
+                max_chars=self.search_config.clinical_text_example_chars,
+            ),
+            "response_contract": {
+                "proposals": [
+                    {
+                        "action": "add",
+                        "name": "snake_case_variable_name",
+                        "type": "categorical|continuous",
+                        "categories": ["category_a", "category_b"],
+                        "roles": ["confounder", "effect_modifier"],
+                        "description": "exact pre-treatment extraction target",
+                        "rationale": "which enabled evidence supports this variable",
+                        "expected_signal": "treatment, outcome, or pseudo-target signal expected",
+                    }
+                ]
+            },
+            "handoff_provenance": {
+                "source": "multi_model_forest_stage1_primary_text_models",
+                "raw_text_modeling_reused_for_agentic_stage": True,
+            },
+        }
+        if embedding_evidence:
+            context["embedding_contrast_evidence"] = embedding_evidence
+        if htr_evidence:
+            context["htr_attention_evidence"] = htr_evidence
+        compact_context = _compact_multi_model_agent_context(context)
+        prompt_chars = len(json.dumps(compact_context, separators=(",", ":"), default=str))
+        logger.info(
+            "Multi-model forest primary handoff context outer_fold=%s: %.1fK JSON chars",
+            outer_fold,
+            prompt_chars / 1000.0,
+        )
+        return compact_context
 
     def _fit_bow_binary_train_test(
         self,
@@ -1932,6 +2366,21 @@ class MultiModelForestAgentOptionalRunner:
             self.embedding_feature_rows,
         )
         _write_jsonl(self.artifact_dir / "split_provenance.jsonl", self.split_provenance_rows)
+        if self.agentic_handoff_rows:
+            handoff_path = self._agentic_handoff_path()
+            _write_jsonl(handoff_path, self.agentic_handoff_rows)
+            _write_json(
+                handoff_path.with_suffix(".manifest.json"),
+                {
+                    "schema_version": "multi_model_agentic_discovery_handoff_v1",
+                    "path": str(handoff_path),
+                    "n_rows": int(len(self.agentic_handoff_rows)),
+                    "scopes": sorted(
+                        {str(row.get("scope")) for row in self.agentic_handoff_rows}
+                    ),
+                    "source": "stage1_primary_text_model_forest",
+                },
+            )
         if self.source_prediction_frames:
             pd.concat(self.source_prediction_frames, ignore_index=True).to_parquet(
                 self.artifact_dir / "text_model_feature_predictions.parquet",

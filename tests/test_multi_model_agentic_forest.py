@@ -44,6 +44,7 @@ from oci.inference.multi_model_agentic_forest import (
     run_multi_model_agentic_forest,
 )
 from oci.inference.multi_model_forest import (
+    MultiModelForestRunner,
     resolve_htr_sentence_model_snapshot,
     resolve_multi_model_forest_parallel_plan,
 )
@@ -2621,6 +2622,78 @@ def test_htr_sentence_model_snapshot_resolved_once(monkeypatch, tmp_path):
     assert calls == [("prajjwal1/bert-tiny", False)]
     assert resolve_htr_sentence_model_snapshot(str(resolved_path)) == str(resolved_path)
     assert resolve_htr_sentence_model_snapshot("hash") is None
+
+
+def test_multi_model_forest_expands_primary_handoff_for_consistency(tmp_path):
+    dataset = pd.DataFrame(
+        {
+            "clinical_text": [f"note {idx}" for idx in range(12)],
+            "treatment_indicator": [idx % 2 for idx in range(12)],
+            "outcome_indicator": [(idx + 1) % 2 for idx in range(12)],
+        }
+    )
+    config = AppliedInferenceConfig(
+        cv_folds=2,
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        architecture=ModelArchitectureConfig(
+            model_type="multi_model_forest",
+            agentic_feature_search=AgenticFeatureSearchConfig(),
+            multi_model_forest=MultiModelForestConfig(
+                feature_discovery_methods=["bow"],
+                bow_views=_linear_test_bow_views(),
+                candidate_consistency_inner_folds=3,
+            ),
+        ),
+    )
+    runner = MultiModelForestRunner(
+        dataset=dataset,
+        config=config,
+        output_path=tmp_path / "primary_predictions.parquet",
+        num_workers=2,
+    )
+    primary_rows = [
+        {
+            "schema_version": "multi_model_agentic_discovery_handoff_v1",
+            "fold_key": outer_fold,
+            "outer_fold": outer_fold,
+            "scope": "full_outer_train",
+            "n_rows": 6,
+            "metrics": {},
+            "importance": {},
+            "embedding_contrast_evidence": {},
+            "htr_evidence": {},
+            "context": {
+                "prompt_version": "multi_model_agentic_forest_v1",
+                "outer_fold": outer_fold,
+            },
+        }
+        for outer_fold in [1, 2]
+    ]
+
+    expanded = runner._expand_primary_handoff_rows(primary_rows)
+
+    assert len(expanded) == 8
+    assert sorted(int(row["fold_key"]) for row in expanded) == [
+        1,
+        2,
+        1001,
+        1002,
+        1003,
+        2001,
+        2002,
+        2003,
+    ]
+    inner_rows = [
+        row for row in expanded if row["scope"] == "candidate_consistency_inner_train"
+    ]
+    assert len(inner_rows) == 6
+    assert all(row["evidence_reused_from_fold_key"] in {1, 2} for row in inner_rows)
+    assert all(
+        row["context"]["handoff_provenance"]["stage2_raw_text_modeling_required"] is False
+        for row in inner_rows
+    )
 
 
 def test_oracle_multi_model_forest_script_builds_config():

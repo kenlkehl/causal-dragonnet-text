@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import os
 import shutil
@@ -354,6 +355,31 @@ class MultiModelForestRunner:
             logger.info("Reusing multi-model forest handoff at %s", self.handoff_path)
             return
         self.handoff_dir.mkdir(parents=True, exist_ok=True)
+        primary_handoff_path = (
+            self.output_path.parent
+            / "multi_model_forest_agent_optional"
+            / "agentic_handoff.jsonl"
+        )
+        if primary_handoff_path.exists():
+            primary_rows = _read_jsonl(primary_handoff_path)
+            rows = self._expand_primary_handoff_rows(primary_rows)
+            self._write_handoff_rows(
+                rows,
+                source="stage1_primary_text_model_forest",
+                exact_inner_contexts=any(
+                    str(row.get("scope")) == "candidate_consistency_inner_train"
+                    and not row.get("evidence_reused_from_fold_key")
+                    for row in rows
+                ),
+            )
+            logger.info(
+                "Saved multi-model forest handoff from primary Stage 1 evidence "
+                "rows=%s path=%s",
+                len(rows),
+                self.handoff_path,
+            )
+            return
+
         contexts = self._handoff_context_specs()
         rows = _run_handoff_contexts(
             dataset=self.dataset.drop(columns=["_oci_row_id"], errors="ignore"),
@@ -363,6 +389,19 @@ class MultiModelForestRunner:
             plan=self.plan,
             base_device=self.device,
         )
+        self._write_handoff_rows(
+            rows,
+            source="legacy_agentic_discovery_context_precompute",
+            exact_inner_contexts=True,
+        )
+
+    def _write_handoff_rows(
+        self,
+        rows: Sequence[Dict[str, Any]],
+        *,
+        source: str,
+        exact_inner_contexts: bool,
+    ) -> None:
         rows = sorted(
             rows,
             key=lambda row: (
@@ -380,9 +419,73 @@ class MultiModelForestRunner:
                 "n_rows": int(len(rows)),
                 "scopes": sorted({str(row.get("scope")) for row in rows}),
                 "parallel_plan": self.plan.to_log_dict(),
+                "source": source,
+                "exact_inner_contexts": bool(exact_inner_contexts),
+                "stage2_raw_text_modeling_required": False,
             },
         )
         logger.info("Saved multi-model forest handoff rows=%s path=%s", len(rows), self.handoff_path)
+
+    def _expand_primary_handoff_rows(
+        self,
+        rows: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        expanded: List[Dict[str, Any]] = [copy.deepcopy(row) for row in rows]
+        existing_keys = {int(row.get("fold_key", row.get("outer_fold", 0))) for row in expanded}
+        by_outer: Dict[int, Dict[str, Any]] = {}
+        for row in expanded:
+            if str(row.get("scope")) != "full_outer_train":
+                continue
+            by_outer[int(row.get("outer_fold", row.get("fold_key")))] = row
+        if not bool(getattr(self.nn_config, "candidate_consistency_enabled", True)):
+            return expanded
+        for context in self._handoff_context_specs():
+            if str(context.get("scope")) != "candidate_consistency_inner_train":
+                continue
+            fold_key = int(context["fold_key"])
+            if fold_key in existing_keys:
+                continue
+            outer_fold = int(context["outer_fold"])
+            source_row = by_outer.get(outer_fold)
+            if source_row is None:
+                continue
+            cloned = copy.deepcopy(source_row)
+            cloned["fold_key"] = fold_key
+            cloned["outer_fold"] = outer_fold
+            cloned["scope"] = "candidate_consistency_inner_train"
+            cloned["inner_fold"] = int(context["inner_fold"])
+            cloned["heldout_rows"] = int(context.get("heldout_rows") or 0)
+            cloned["n_rows"] = int(len(np.asarray(context["train_idx"], dtype=int)))
+            cloned["evidence_reused_from_fold_key"] = int(
+                source_row.get("fold_key", outer_fold)
+            )
+            cloned["evidence_reuse_reason"] = (
+                "Stage 1 primary text-model forest persisted outer-fold evidence; "
+                "inner consistency rows reuse that evidence to keep Stage 2 agent-only."
+            )
+            context_payload = copy.deepcopy(cloned.get("context") or {})
+            context_payload.update(
+                {
+                    "outer_fold": outer_fold,
+                    "inner_fold": int(context["inner_fold"]),
+                    "consistency_scope": "inner_train",
+                    "inner_train_rows": int(len(np.asarray(context["train_idx"], dtype=int))),
+                    "inner_heldout_rows": int(context.get("heldout_rows") or 0),
+                }
+            )
+            provenance = dict(context_payload.get("handoff_provenance") or {})
+            provenance.update(
+                {
+                    "candidate_consistency_evidence": "reused_full_outer_train_context",
+                    "reused_from_fold_key": int(source_row.get("fold_key", outer_fold)),
+                    "stage2_raw_text_modeling_required": False,
+                }
+            )
+            context_payload["handoff_provenance"] = provenance
+            cloned["context"] = context_payload
+            expanded.append(cloned)
+            existing_keys.add(fold_key)
+        return expanded
 
     def _handoff_context_specs(self) -> List[Dict[str, Any]]:
         runner = MultiModelAgenticForestRunner(
@@ -669,6 +772,20 @@ def _huggingface_offline() -> bool:
         if value and value.lower() in {"1", "true", "yes", "on"}:
             return True
     return False
+
+
+def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    with open(path, encoding="utf-8") as f:
+        for line_number, line in enumerate(f, start=1):
+            text = line.strip()
+            if not text:
+                continue
+            row = json.loads(text)
+            if not isinstance(row, dict):
+                raise ValueError(f"JSONL row {line_number} in {path} is not an object")
+            rows.append(row)
+    return rows
 
 
 @contextmanager
