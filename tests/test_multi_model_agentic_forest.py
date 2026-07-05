@@ -1,4 +1,6 @@
 import json
+import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -41,7 +43,10 @@ from oci.inference.multi_model_agentic_forest import (
     _fit_binary_bow_fold,
     run_multi_model_agentic_forest,
 )
-from oci.inference.multi_model_forest import resolve_multi_model_forest_parallel_plan
+from oci.inference.multi_model_forest import (
+    resolve_htr_sentence_model_snapshot,
+    resolve_multi_model_forest_parallel_plan,
+)
 from oci.models.concept_embedding_utils import chunk_text_words
 
 
@@ -2597,6 +2602,25 @@ def test_multi_model_forest_parallel_plan_reserves_htr_slots():
     assert bow_only.htr_slots == 0
     assert bow_only.cpu_loky_workers == 10
     assert bow_only.context_workers == 10
+
+
+def test_htr_sentence_model_snapshot_resolved_once(monkeypatch, tmp_path):
+    resolved_path = tmp_path / "models--prajjwal1--bert-tiny" / "snapshots" / "abc"
+    resolved_path.mkdir(parents=True)
+    calls = []
+
+    def fake_snapshot_download(model_name, local_files_only=False):
+        calls.append((model_name, local_files_only))
+        return str(resolved_path)
+
+    fake_hub = types.ModuleType("huggingface_hub")
+    fake_hub.snapshot_download = fake_snapshot_download
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+
+    assert resolve_htr_sentence_model_snapshot("prajjwal1/bert-tiny") == str(resolved_path)
+    assert calls == [("prajjwal1/bert-tiny", False)]
+    assert resolve_htr_sentence_model_snapshot(str(resolved_path)) == str(resolved_path)
+    assert resolve_htr_sentence_model_snapshot("hash") is None
 
 
 def test_oracle_multi_model_forest_script_builds_config():

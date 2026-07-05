@@ -1,0 +1,15 @@
+[
+  {
+    "model": "tabfm_ensemble",
+    "feature_view": "tfidf_svd128",
+    "status": "skipped",
+    "skip_reason": "OutOfMemoryError: CUDA out of memory. Tried to allocate 3.66 GiB. GPU 0 has a total capacity of 47.40 GiB of which 1.15 GiB is free. Process 4009491 has 9.87 GiB memory in use. Process 4009494 has 9.79 GiB memory in use. Process 4009492 has 9.71 GiB memory in use. Including non-PyTorch memory, this process has 16.86 GiB memory in use. Of the allocated memory 14.65 GiB is allocated by PyTorch, and 1.89 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",
+    "n_rows": 1000,
+    "folds": 5,
+    "n_tfidf_features_max": 5000,
+    "n_dense_features": 128,
+    "vocab_size_mean": 5000.0,
+    "vocab_size_min": 5000,
+    "vocab_size_max": 5000
+  }
+]

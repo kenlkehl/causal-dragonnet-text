@@ -219,6 +219,7 @@ class MultiModelForestRunner:
         if self._stage1_complete() and not self.force_stage1:
             logger.info("Reusing complete multi-model forest Stage 1 at %s", self.artifact_dir)
             return
+        self._prepare_htr_sentence_encoder_barrier()
         self._write_stage_config(self.artifact_dir / "stage1_config.json")
         self._prepare_embedding_cache_barrier()
         self._run_primary_text_model_forest()
@@ -296,6 +297,24 @@ class MultiModelForestRunner:
             precompute_devices=precompute_devices,
         )
         generator.prepare(self.dataset.drop(columns=["_oci_row_id"], errors="ignore"))
+
+    def _prepare_htr_sentence_encoder_barrier(self) -> None:
+        if not self._htr_enabled():
+            return
+        resolved = resolve_htr_sentence_model_snapshot(
+            getattr(self.config.architecture, "htr_sentence_model", "prajjwal1/bert-tiny"),
+            sentence_encoder_backend=getattr(
+                self.config.architecture,
+                "htr_sentence_encoder_backend",
+                "auto",
+            ),
+        )
+        if resolved is None:
+            return
+        previous = getattr(self.config.architecture, "htr_sentence_model", None)
+        if previous != resolved:
+            logger.info("Resolved HTR sentence encoder once: %s -> %s", previous, resolved)
+            self.config.architecture.htr_sentence_model = resolved
 
     def _run_primary_text_model_forest(self) -> None:
         old_artifact_dir = self.output_path.parent / "multi_model_forest_agent_optional"
@@ -600,6 +619,34 @@ def _config_for_handoff_runner(config: AppliedInferenceConfig) -> AppliedInferen
     return cfg
 
 
+def resolve_htr_sentence_model_snapshot(
+    sentence_model: Any,
+    *,
+    sentence_encoder_backend: str = "auto",
+) -> Optional[str]:
+    """Resolve a Hugging Face HTR sentence encoder repo to a local snapshot path."""
+    model = str(sentence_model or "").strip()
+    if not model:
+        return None
+    if model.lower() in {"hash", "hashed", "hashing", "test_hash"}:
+        return None
+    if str(sentence_encoder_backend or "").strip().lower() == "hash":
+        return None
+    model_path = Path(model).expanduser()
+    if model_path.exists():
+        return str(model_path)
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        raise ImportError("huggingface_hub is required to resolve HTR sentence models") from exc
+    return str(
+        snapshot_download(
+            model,
+            local_files_only=_huggingface_offline(),
+        )
+    )
+
+
 def _normalize_stage(stage: str) -> str:
     normalized = str(stage or "all").strip().lower()
     aliases = {
@@ -614,6 +661,14 @@ def _normalize_stage(stage: str) -> str:
     if normalized not in {"all", "stage1", "stage2"}:
         raise ValueError("--stage must be one of: all, stage1, stage2")
     return normalized
+
+
+def _huggingface_offline() -> bool:
+    for name in ("TRANSFORMERS_OFFLINE", "HF_HUB_OFFLINE"):
+        value = os.environ.get(name)
+        if value and value.lower() in {"1", "true", "yes", "on"}:
+            return True
+    return False
 
 
 @contextmanager
