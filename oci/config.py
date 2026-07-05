@@ -209,6 +209,7 @@ class ExplicitFeatureExtractionConfig:
     extraction_retry_initial_delay: float = 1.0
     extraction_retry_max_delay: float = 30.0
     extraction_retry_backoff_factor: float = 2.0
+    extraction_request_timeout: Optional[float] = 900.0
     extraction_temperature: float = 0.0  # LLM temperature (0 for deterministic)
     extraction_max_tokens: int = 25000  # Max tokens for LLM response
     extraction_max_text_length: int = 400000  # Max clinical text chars in extraction prompt
@@ -621,6 +622,7 @@ class AgenticFeatureSearchConfig:
     agent_retry_initial_delay: float = 1.0
     agent_retry_max_delay: float = 30.0
     agent_retry_backoff_factor: float = 2.0
+    agent_request_timeout: Optional[float] = 900.0
 
     # Prompt/context controls. Clinical text examples are sent to the proposal
     # agent to ground variable suggestions, but are not written to artifacts by
@@ -645,6 +647,8 @@ class AgenticFeatureSearchConfig:
             raise ValueError("agentic_feature_search.max_additions_per_iter must be >= 0")
         if self.max_removals_per_iter < 0:
             raise ValueError("agentic_feature_search.max_removals_per_iter must be >= 0")
+        if self.agent_request_timeout is not None and self.agent_request_timeout <= 0:
+            raise ValueError("agentic_feature_search.agent_request_timeout must be > 0 or None")
         if not 0.0 <= self.min_feature_coverage <= 1.0:
             raise ValueError("agentic_feature_search.min_feature_coverage must be in [0, 1]")
         if self.search_mode not in {"iterative", "broad_screen"}:
@@ -1091,12 +1095,12 @@ class MultiModelAgenticForestConfig:
             "multi_model_agentic_forest.outer_parallelism",
         )
         bow_backend = str(self.bow_parallel_backend).strip().lower()
-        if bow_backend not in {"processes", "threads"}:
+        if bow_backend not in {"processes", "threads", "loky"}:
             raise ValueError(
                 "multi_model_agentic_forest.bow_parallel_backend must be "
-                "'processes' or 'threads'"
+                "'processes', 'loky', or 'threads'"
             )
-        self.bow_parallel_backend = bow_backend
+        self.bow_parallel_backend = "processes" if bow_backend == "loky" else bow_backend
         if self.fold_parallelism != "auto":
             try:
                 if int(self.fold_parallelism) < 1:
@@ -1166,6 +1170,39 @@ class MultiModelForestAgentOptionalConfig(MultiModelAgenticForestConfig):
     # a separate agentic explicit-feature forest branch is run after the primary
     # text-model traces and predictions are written.
     agentic_explicit_branch_enabled: bool = False
+    # Precompute the agent-visible discovery evidence needed to run that branch
+    # later without refitting BoW/HTR/embedding discovery models.
+    agentic_handoff_enabled: bool = False
+    # Outer-fold execution backend. "threads" preserves historical behavior;
+    # "processes"/"loky" makes outer folds visible as joblib worker processes.
+    outer_parallel_backend: str = "threads"
+    # Optional overrides for the two nested fold families. When unset, the legacy
+    # fold_parallelism setting is used for both.
+    bow_fold_parallelism: Optional[str] = None
+    htr_fold_parallelism: Optional[str] = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        backend = str(self.outer_parallel_backend).strip().lower()
+        if backend not in {"threads", "processes", "loky"}:
+            raise ValueError(
+                "multi_model_forest_agent_optional.outer_parallel_backend must be "
+                "'threads', 'processes', or 'loky'"
+            )
+        self.outer_parallel_backend = "processes" if backend == "loky" else backend
+        for field_name in ("bow_fold_parallelism", "htr_fold_parallelism"):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            value_text = str(value).strip().lower()
+            if not value_text:
+                setattr(self, field_name, None)
+                continue
+            _validate_parallelism_setting(
+                value_text,
+                f"multi_model_forest_agent_optional.{field_name}",
+            )
+            setattr(self, field_name, value_text)
 
 
 @dataclass

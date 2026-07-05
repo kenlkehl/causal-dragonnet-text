@@ -30,6 +30,7 @@ from oci.inference.embedding_contrast_discovery import (
 )
 from oci.inference.multi_model_agentic_forest import (
     MultiModelAgenticForestRunner,
+    PrecomputedDiscoveryMultiModelAgenticForestRunner,
     _candidate_consistency_threshold,
     _compact_multi_model_agent_context,
     _evaluate_extracted_feature_set_diagnostic,
@@ -2494,6 +2495,11 @@ def test_multi_model_forest_agent_optional_parses_config():
                         "nuisance_folds": 2,
                         "effect_folds": 2,
                         "agentic_explicit_branch_enabled": True,
+                        "agentic_handoff_enabled": True,
+                        "outer_parallelism": "2",
+                        "outer_parallel_backend": "processes",
+                        "bow_fold_parallelism": "3",
+                        "htr_fold_parallelism": "2",
                         "embedding_contrast": {
                             "enabled": True,
                             "include_cluster_contrast_vectors": True,
@@ -2513,6 +2519,11 @@ def test_multi_model_forest_agent_optional_parses_config():
     assert nn_cfg.htr_evidence_enabled is False
     assert nn_cfg.embedding_contrast.enabled is True
     assert nn_cfg.agentic_explicit_branch_enabled is True
+    assert nn_cfg.agentic_handoff_enabled is True
+    assert nn_cfg.outer_parallelism == "2"
+    assert nn_cfg.outer_parallel_backend == "processes"
+    assert nn_cfg.bow_fold_parallelism == "3"
+    assert nn_cfg.htr_fold_parallelism == "2"
     assert [view.name for view in nn_cfg.bow_views] == ["linear_test", "trees"]
     assert nn_cfg.bow_views[1].bow_model == "extratrees"
 
@@ -2533,17 +2544,67 @@ def test_oracle_multi_model_optional_script_builds_config():
         bow_model="random_forest",
         feature_discovery_methods=["bow", "embedding_contrast"],
         agentic_explicit_branch_enabled=True,
+        agentic_handoff_enabled=True,
+        outer_parallelism="2",
+        outer_parallel_backend="processes",
+        bow_fold_parallelism="3",
+        htr_fold_parallelism="2",
     )
     applied = script._make_applied_config(cfg, dataset_path)
     assert applied.architecture.model_type == "multi_model_forest_agent_optional"
     nn_cfg = applied.architecture.multi_model_forest_agent_optional
     assert nn_cfg.agentic_explicit_branch_enabled is True
+    assert nn_cfg.agentic_handoff_enabled is True
     assert nn_cfg.feature_discovery_methods == ["bow", "embedding_contrast"]
+    assert nn_cfg.outer_parallelism == "2"
+    assert nn_cfg.outer_parallel_backend == "processes"
+    assert nn_cfg.bow_fold_parallelism == "3"
+    assert nn_cfg.htr_fold_parallelism == "2"
+    assert applied.architecture.agentic_attention_variable_forest.fold_parallelism == "2"
     assert nn_cfg.htr_evidence_enabled is False
     assert [view.name for view in nn_cfg.bow_views] == ["cli_view"]
     assert nn_cfg.bow_views[0].bow_model == "random_forest"
     assert nn_cfg.embedding_contrast.enabled is True
     assert applied.explicit_features.enabled is True
+
+
+def test_oracle_multi_model_optional_branch_only_targets_primary_hash():
+    from dataclasses import replace
+
+    from oracle_experiment_scripts import (
+        run_oracle_multi_model_forest_agent_optional as script,
+    )
+
+    cfg = script.MultiModelForestAgentOptionalOracleConfig(
+        dataset_path="dataset.parquet",
+        dataset_name="smoke",
+        feature_discovery_methods=["bow"],
+        agentic_explicit_branch_enabled=False,
+    )
+    base_hash = cfg.config_hash()
+
+    assert replace(cfg, agentic_explicit_branch_only=True).config_hash() == base_hash
+    assert replace(cfg, agentic_handoff_enabled=True).config_hash() == base_hash
+    assert replace(cfg, existing_config_hash="manualhash").config_hash() == base_hash
+    assert replace(cfg, agent_request_timeout=123.0).config_hash() == base_hash
+    assert replace(cfg, extraction_request_timeout=123.0).config_hash() == base_hash
+    assert (
+        script._agentic_branch_target_hash(
+            replace(
+                cfg,
+                agentic_explicit_branch_enabled=True,
+                agentic_explicit_branch_only=True,
+            )
+        )
+        == base_hash
+    )
+    assert (
+        script._agentic_branch_target_hash(
+            replace(cfg, agentic_explicit_branch_only=True, existing_config_hash="manualhash")
+        )
+        == "manualhash"
+    )
+    assert replace(cfg, agentic_explicit_branch_enabled=True).config_hash() != base_hash
 
 
 def test_oracle_multi_model_optional_prefers_cached_parquet(tmp_path):
@@ -2565,10 +2626,7 @@ def test_oracle_multi_model_optional_prefers_cached_parquet(tmp_path):
     )
     cache_hash = script._embedding_cache_hash_for_config(cfg, base_parquet)
     cache_path = (
-        dataset_dir
-        / ".oci_cache"
-        / "embedding_contrast"
-        / f"cecnn_chunk_embeddings_{cache_hash}"
+        dataset_dir / ".oci_cache" / "embedding_contrast" / f"cecnn_chunk_embeddings_{cache_hash}"
     )
     cache_path.mkdir(parents=True)
     (cache_path / "metadata.json").write_text(
@@ -2584,10 +2642,7 @@ def test_oracle_multi_model_optional_prefers_cached_parquet(tmp_path):
 
     resolved = script._resolve_oracle_parquet_file_for_optional_cache(cfg)
     assert resolved == base_parquet
-    assert (
-        script._normalize_embedding_cache_dir_arg(str(cache_path))
-        == str(cache_path.parent)
-    )
+    assert script._normalize_embedding_cache_dir_arg(str(cache_path)) == str(cache_path.parent)
 
 
 def test_multi_model_agentic_forest_parses_prespecified_feature_sources(tmp_path):
@@ -2689,6 +2744,55 @@ def test_multi_model_candidate_consistency_fallback_prefers_stable_candidates():
         {"patient_age": age, "rare_noise": noise},
     )
     assert selected == [age]
+
+
+def test_precomputed_discovery_runner_uses_handoff(tmp_path):
+    handoff_path = tmp_path / "agentic_handoff.jsonl"
+    handoff_row = {
+        "schema_version": "multi_model_agentic_discovery_handoff_v1",
+        "fold_key": 1,
+        "outer_fold": 1,
+        "scope": "full_outer_train",
+        "n_rows": 2,
+        "metrics": {"n_bow_views": 1},
+        "importance": {"phrase_consensus": [{"feature": "ecog"}]},
+        "embedding_contrast_evidence": {},
+        "htr_evidence": {},
+        "context": {"prompt_version": "multi_model_agentic_forest_v1", "outer_fold": 1},
+    }
+    handoff_path.write_text(json.dumps(handoff_row) + "\n")
+    runner = PrecomputedDiscoveryMultiModelAgenticForestRunner(
+        dataset=pd.DataFrame(
+            {
+                "clinical_text": ["ecog 0", "ecog 2"],
+                "treatment_indicator": [1, 0],
+                "outcome_indicator": [1, 0],
+            }
+        ),
+        config=AppliedInferenceConfig(
+            text_column="clinical_text",
+            treatment_column="treatment_indicator",
+            outcome_column="outcome_indicator",
+            architecture=ModelArchitectureConfig(
+                model_type="multi_model_agentic_forest",
+                agentic_feature_search=AgenticFeatureSearchConfig(),
+                multi_model_agentic_forest=MultiModelAgenticForestConfig(
+                    **_disable_required_evidence_test_kwargs(),
+                ),
+            ),
+        ),
+        output_path=tmp_path / "predictions.parquet",
+        handoff_path=handoff_path,
+    )
+
+    result = runner._fit_bow_discovery(pd.DataFrame(), outer_fold=1)
+
+    assert result["metrics"] == {"n_bow_views": 1}
+    assert result["importance"]["phrase_consensus"][0]["feature"] == "ecog"
+    assert result["context"]["outer_fold"] == 1
+    assert result["predictions"].empty
+    with pytest.raises(RuntimeError, match="Missing precomputed agentic discovery handoff"):
+        runner._fit_bow_discovery(pd.DataFrame(), outer_fold=1001)
 
 
 def test_multi_model_consistency_selection_is_deterministic_gate(tmp_path):

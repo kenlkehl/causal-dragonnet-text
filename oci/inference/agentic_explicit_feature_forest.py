@@ -37,7 +37,6 @@ from ..extraction.llm_routing import parse_server_urls
 from ..models.causal_forest_head import CausalForestHead
 from .applied_explicit_feature_forest import _build_features, _hstack_present
 
-
 logger = logging.getLogger(__name__)
 
 AGENT_PROMPT_VERSION = "agentic_explicit_feature_search_v1"
@@ -219,9 +218,7 @@ class AgenticFeatureSearchRunner:
                 "explicit_features.enabled=False"
             )
         if not self.initial_specs:
-            logger.info(
-                "Agentic explicit-feature search is starting from an empty feature set"
-            )
+            logger.info("Agentic explicit-feature search is starting from an empty feature set")
 
         self.proposal_agent = proposal_agent or OpenAICompatibleFeatureSearchAgent(
             self.search_config
@@ -265,9 +262,7 @@ class AgenticFeatureSearchRunner:
 
         selected_by_outer_fold: Dict[int, List[ExplicitFeatureSpec]] = {}
         if self.search_config.search_mode == "broad_screen":
-            selected_by_outer_fold = self._search_all_outer_trains_broad_screen(
-                outer_splits
-            )
+            selected_by_outer_fold = self._search_all_outer_trains_broad_screen(outer_splits)
 
         outer_predictions = []
         for outer_fold, (train_idx, test_idx) in enumerate(outer_splits, start=1):
@@ -588,8 +583,8 @@ class AgenticFeatureSearchRunner:
 
         selected_by_outer_fold = {}
         for prepared in prepared_folds:
-            selected_by_outer_fold[prepared.outer_fold] = (
-                self._screen_and_refine_broad_candidates(prepared)
+            selected_by_outer_fold[prepared.outer_fold] = self._screen_and_refine_broad_candidates(
+                prepared
             )
         return selected_by_outer_fold
 
@@ -619,9 +614,7 @@ class AgenticFeatureSearchRunner:
                 "context": context,
             }
             if self.search_config.save_agent_raw_output:
-                error_payload["agent_raw_output"] = _get_agent_response_trace(
-                    self.proposal_agent
-                )
+                error_payload["agent_raw_output"] = _get_agent_response_trace(self.proposal_agent)
             self._record_decision(
                 outer_fold,
                 0,
@@ -639,9 +632,7 @@ class AgenticFeatureSearchRunner:
             "raw_proposals": raw_proposals,
         }
         if self.search_config.save_agent_raw_output:
-            proposal_payload["agent_raw_output"] = _get_agent_response_trace(
-                self.proposal_agent
-            )
+            proposal_payload["agent_raw_output"] = _get_agent_response_trace(self.proposal_agent)
         proposals, rejected = validate_agentic_proposals(
             raw_proposals,
             current_specs=list(self.initial_specs),
@@ -695,11 +686,7 @@ class AgenticFeatureSearchRunner:
                 proposals=proposals,
             )
             available_items = select_screened_candidates(
-                [
-                    item
-                    for item in screened
-                    if item["candidate_id"] not in current_names
-                ],
+                [item for item in screened if item["candidate_id"] not in current_names],
                 top_k=self.search_config.broad_screen_top_k,
             )
             available_ids = {item["candidate_id"] for item in available_items}
@@ -980,9 +967,7 @@ class AgenticFeatureSearchRunner:
             if _normalize_feature_name(spec.name)
         }
         known_specs = [
-            spec
-            for spec in selected_specs
-            if _normalize_feature_name(spec.name) in initial_names
+            spec for spec in selected_specs if _normalize_feature_name(spec.name) in initial_names
         ]
         add_specs = [
             spec
@@ -1046,9 +1031,7 @@ class AgenticFeatureSearchRunner:
         if not applied_aliases:
             return selected_specs
         resolved_specs = [
-            _proposal_to_spec(proposal)
-            for proposal in resolved
-            if proposal.action == "add"
+            _proposal_to_spec(proposal) for proposal in resolved if proposal.action == "add"
         ]
         return _dedupe_agentic_specs([*known_specs, *resolved_specs])
 
@@ -1340,7 +1323,7 @@ class OpenAICompatibleFeatureSearchAgent:
         self._client_pool = OpenAIClientPool(
             server_urls=self.search_config.agent_server_url,
             api_key=self.search_config.agent_api_key,
-            timeout=None,
+            timeout=getattr(self.search_config, "agent_request_timeout", 900.0),
             max_retries=0,
         )
 
@@ -1371,13 +1354,9 @@ class OpenAICompatibleFeatureSearchAgent:
         )
         retry_kwargs = {
             "max_attempts": max_attempts,
-            "initial_delay": float(
-                getattr(self.search_config, "agent_retry_initial_delay", 1.0)
-            ),
+            "initial_delay": float(getattr(self.search_config, "agent_retry_initial_delay", 1.0)),
             "max_delay": float(getattr(self.search_config, "agent_retry_max_delay", 30.0)),
-            "backoff_factor": float(
-                getattr(self.search_config, "agent_retry_backoff_factor", 2.0)
-            ),
+            "backoff_factor": float(getattr(self.search_config, "agent_retry_backoff_factor", 2.0)),
             "context": "agent proposal LLM request",
         }
         if self._client is not None:
@@ -1390,7 +1369,22 @@ class OpenAICompatibleFeatureSearchAgent:
 
         def operation(attempt: int) -> Any:
             server_url, client = self._client_pool.client_for_attempt(start_index, attempt)
-            logger.debug("Sending agent proposal request to %s", server_url)
+            prompt_chars = sum(
+                len(str(message.get("content", "")))
+                for message in kwargs.get("messages", [])
+                if isinstance(message, dict)
+            )
+            logger.info(
+                "Sending agent proposal request to %s model=%s prompt_chars=%.1fK "
+                "max_tokens=%s timeout=%s attempt=%s/%s",
+                server_url,
+                kwargs.get("model"),
+                prompt_chars / 1000.0,
+                kwargs.get("max_tokens"),
+                getattr(self.search_config, "agent_request_timeout", 900.0),
+                attempt + 1,
+                max_attempts,
+            )
             return client.chat.completions.create(**kwargs)
 
         return call_with_exponential_backoff(operation, **retry_kwargs)
@@ -1453,9 +1447,7 @@ class OpenAICompatibleFeatureSearchAgent:
                     if is_value_harmonization:
                         repair_prompt = build_value_harmonization_repair_prompt(issues)
                     elif is_consensus_disambiguation:
-                        repair_prompt = build_consensus_disambiguation_repair_prompt(
-                            issues
-                        )
+                        repair_prompt = build_consensus_disambiguation_repair_prompt(issues)
                     else:
                         repair_prompt = build_agent_repair_prompt(issues)
                     messages.extend(
@@ -1678,6 +1670,11 @@ class VLLMExplicitFeatureExtractionProvider:
                 "extraction_retry_backoff_factor",
                 2.0,
             ),
+            request_timeout=getattr(
+                self.feature_config,
+                "extraction_request_timeout",
+                900.0,
+            ),
             temperature=self.feature_config.extraction_temperature,
             max_tokens=self.feature_config.extraction_max_tokens,
             max_text_length=self.feature_config.extraction_max_text_length,
@@ -1706,11 +1703,7 @@ class VLLMExplicitFeatureExtractionProvider:
             for spec in specs
         }
         rows_to_extract = sorted(
-            {
-                row_idx
-                for missing_rows in missing_by_spec.values()
-                for row_idx in missing_rows
-            }
+            {row_idx for missing_rows in missing_by_spec.values() for row_idx in missing_rows}
         )
 
         if rows_to_extract:
@@ -1855,6 +1848,7 @@ class VLLMExplicitFeatureExtractionProvider:
         client = OpenAI(
             base_url=server_url,
             api_key="EMPTY",
+            timeout=getattr(self.feature_config, "extraction_request_timeout", 900.0),
             max_retries=0,
         )
         self._resolved_vllm_model_name = _discover_openai_compatible_model_name(
@@ -1989,17 +1983,13 @@ def build_agent_prompt(
         return build_multi_model_agentic_alias_resolution_prompt(context, search_config)
 
     if context.get("prompt_version") == "multi_model_agentic_value_harmonization_v1":
-        return build_multi_model_agentic_value_harmonization_prompt(
-            context, search_config
-        )
+        return build_multi_model_agentic_value_harmonization_prompt(context, search_config)
 
     if context.get("prompt_version") == "multi_model_agentic_consistency_v1":
         return build_multi_model_agentic_consistency_prompt(context, search_config)
 
     if context.get("prompt_version") == "multi_model_agentic_extracted_feature_review_v1":
-        return build_multi_model_agentic_extracted_feature_review_prompt(
-            context, search_config
-        )
+        return build_multi_model_agentic_extracted_feature_review_prompt(context, search_config)
 
     if context.get("prompt_version") == "agentic_attention_variable_forest_v1":
         return build_attention_variable_agent_prompt(context, search_config)
@@ -2481,9 +2471,7 @@ def build_broad_agent_prompt(
 ) -> str:
     """Construct a high-recall initial proposal prompt for broad-screen mode."""
     context_json = json.dumps(context, indent=2, default=_json_default)
-    candidate_count = int(
-        context.get("broad_candidate_count", search_config.broad_candidate_count)
-    )
+    candidate_count = int(context.get("broad_candidate_count", search_config.broad_candidate_count))
     return f"""You are helping design a high-recall baseline variable inventory for causal inference.
 
 Propose a broad list of variables that are plausibly extractable from the text and could act as pre-treatment confounders or treatment effect modifiers.
@@ -2854,9 +2842,7 @@ def parse_agent_json_object(response: str) -> Dict[str, Any]:
     """Parse a top-level JSON object from an LLM response."""
     parsed = parse_agent_json_object_or_list(response)
     if not isinstance(parsed, dict):
-        raise ValueError(
-            f"Agent response JSON must be an object, got {type(parsed).__name__}"
-        )
+        raise ValueError(f"Agent response JSON must be an object, got {type(parsed).__name__}")
     return parsed
 
 
@@ -2978,9 +2964,7 @@ def validate_agentic_proposals(
     additions = 0
     removals = 0
     max_additions = (
-        search_config.max_additions_per_iter
-        if max_additions is None
-        else int(max_additions)
+        search_config.max_additions_per_iter if max_additions is None else int(max_additions)
     )
 
     for raw in raw_proposals:
@@ -3077,9 +3061,7 @@ def apply_agentic_value_harmonization(
 
         description = str(item.get("description") or spec.description or "").strip()
         if feature_type == "categorical":
-            categories = _canonical_value_categories(
-                item.get("categories") or spec.categories
-            )
+            categories = _canonical_value_categories(item.get("categories") or spec.categories)
             if not categories:
                 applied.append({"name": name, "reason": "empty_categorical_categories"})
                 continue
@@ -3387,8 +3369,7 @@ def _format_value_aliases(value_aliases: Any, categories: Sequence[str]) -> str:
         aliases = [
             _canonical_category_text(alias)
             for alias in _as_list(raw_aliases)
-            if _canonical_category_text(alias)
-            and not _is_missing_value_label(alias)
+            if _canonical_category_text(alias) and not _is_missing_value_label(alias)
         ]
         if aliases:
             chunks.append(f"{category}: {', '.join(dict.fromkeys(aliases))}")
@@ -3740,13 +3721,9 @@ def screen_agentic_candidate_specs(
         )
         diagnostic = diagnostics[0] if diagnostics else {}
         recommended_roles = [
-            role
-            for role in diagnostic.get("recommended_roles", [])
-            if role in VALID_ROLES
+            role for role in diagnostic.get("recommended_roles", []) if role in VALID_ROLES
         ]
-        confounder_score, modifier_score, screening_score = _role_screen_scores(
-            diagnostic
-        )
+        confounder_score, modifier_score, screening_score = _role_screen_scores(diagnostic)
         rejection_reason = None
         if coverage_failures:
             rejection_reason = "low_feature_coverage"
@@ -3805,9 +3782,7 @@ def select_screened_candidates(
 ) -> List[Dict[str, Any]]:
     """Select a balanced high-signal shortlist for inner-CV refinement."""
     top_k = max(1, int(top_k))
-    eligible = [
-        item for item in screened if item.get("screened_spec") is not None
-    ]
+    eligible = [item for item in screened if item.get("screened_spec") is not None]
     eligible = sorted(
         eligible,
         key=lambda item: (
@@ -3828,11 +3803,10 @@ def select_screened_candidates(
                 continue
             selected.append(item)
             selected_ids.add(item["candidate_id"])
-            if sum(
-                1
-                for selected_item in selected
-                if role in selected_item["screened_spec"].roles
-            ) >= per_role_quota:
+            if (
+                sum(1 for selected_item in selected if role in selected_item["screened_spec"].roles)
+                >= per_role_quota
+            ):
                 return
 
     add_for_role("confounder")
@@ -4247,11 +4221,7 @@ def _candidate_feedback_metrics(comparison: Any) -> Dict[str, Any]:
         "rejection_reason",
         "coverage_failures",
     ]
-    return {
-        key: comparison[key]
-        for key in keys
-        if key in comparison
-    }
+    return {key: comparison[key] for key in keys if key in comparison}
 
 
 def _candidate_feedback_role_diagnostics(summary: Any) -> List[Dict[str, Any]]:
@@ -4331,8 +4301,7 @@ def _candidate_failed_checks(
     outcome_floor = -search_config.max_outcome_auroc_drop
     if _is_number(outcome_delta) and float(outcome_delta) < outcome_floor:
         failed.append(
-            f"outcome_auroc_delta {float(outcome_delta):.4g} "
-            f"< allowed {outcome_floor:.4g}"
+            f"outcome_auroc_delta {float(outcome_delta):.4g} " f"< allowed {outcome_floor:.4g}"
         )
 
     treatment_delta = comparison.get("treatment_auroc_delta")
@@ -4392,7 +4361,11 @@ def summarize_extractions(
         if value_col not in dataset.columns:
             summaries.append({"name": spec.name, "coverage": 0.0, "top_values": {}})
             continue
-        missing = dataset[missing_col].astype(bool) if missing_col in dataset.columns else dataset[value_col].isna()
+        missing = (
+            dataset[missing_col].astype(bool)
+            if missing_col in dataset.columns
+            else dataset[value_col].isna()
+        )
         observed = dataset.loc[~missing, value_col]
         summaries.append(
             {
@@ -4540,9 +4513,7 @@ def _candidate_role_diagnostic_specs(
 
 
 def _choose_accepted_candidate(candidate_results: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    passing = [
-        item for item in candidate_results if item["comparison"].get("passes_acceptance")
-    ]
+    passing = [item for item in candidate_results if item["comparison"].get("passes_acceptance")]
     if not passing:
         return None
     return max(
@@ -4610,8 +4581,7 @@ def _screening_decision_payload(item: Dict[str, Any]) -> Dict[str, Any]:
         "kept_for_cv": bool(item.get("kept_for_cv", False)),
         "cv_accepted": bool(item.get("cv_accepted", False)),
         "passes_acceptance": bool(
-            isinstance(comparison, dict)
-            and comparison.get("passes_acceptance", False)
+            isinstance(comparison, dict) and comparison.get("passes_acceptance", False)
         ),
         "screening_rejection_reason": item.get("screening_rejection_reason"),
         "coverage_failures": item.get("coverage_failures", []),
@@ -4624,11 +4594,7 @@ def _screening_metric_row(
     iteration: int,
     item: Dict[str, Any],
 ) -> Dict[str, Any]:
-    diagnostic = (
-        item.get("role_diagnostics", [{}])[0]
-        if item.get("role_diagnostics")
-        else {}
-    )
+    diagnostic = item.get("role_diagnostics", [{}])[0] if item.get("role_diagnostics") else {}
     comparison = item.get("cv_comparison", {})
     screened_spec = item.get("screened_spec")
     proposed_spec = item.get("proposed_spec")
@@ -4645,9 +4611,7 @@ def _screening_metric_row(
         "diagnostic_status": diagnostic.get("status"),
         "proposed_roles": ",".join(getattr(spec, "roles", []) or []),
         "recommended_roles": ",".join(
-            diagnostic.get("recommended_roles", [])
-            if isinstance(diagnostic, dict)
-            else []
+            diagnostic.get("recommended_roles", []) if isinstance(diagnostic, dict) else []
         ),
         "screening_score": item.get("screening_score"),
         "confounder_score": item.get("confounder_score"),
@@ -4665,14 +4629,10 @@ def _screening_metric_row(
             "treatment_interaction",
         ),
         "r_loss_improvement": (
-            comparison.get("r_loss_improvement")
-            if isinstance(comparison, dict)
-            else None
+            comparison.get("r_loss_improvement") if isinstance(comparison, dict) else None
         ),
         "passes_acceptance": (
-            comparison.get("passes_acceptance")
-            if isinstance(comparison, dict)
-            else None
+            comparison.get("passes_acceptance") if isinstance(comparison, dict) else None
         ),
     }
 
@@ -4685,11 +4645,7 @@ def _make_splits(
 ) -> List[Tuple[np.ndarray, np.ndarray]]:
     if n_splits > len(df):
         raise ValueError(f"n_splits={n_splits} exceeds n={len(df)}")
-    y = (
-        df[config.treatment_column].astype(str)
-        + "_"
-        + df[config.outcome_column].astype(str)
-    )
+    y = df[config.treatment_column].astype(str) + "_" + df[config.outcome_column].astype(str)
     counts = y.value_counts()
     if len(counts) >= 2 and counts.min() >= n_splits:
         splitter = StratifiedKFold(
@@ -4813,9 +4769,7 @@ def _improved_fold_fraction(
 
 def _without_list_values(metrics: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        key: value
-        for key, value in metrics.items()
-        if not isinstance(value, (list, dict, tuple))
+        key: value for key, value in metrics.items() if not isinstance(value, (list, dict, tuple))
     }
 
 
@@ -4831,10 +4785,7 @@ def _clinical_question_text(config: AppliedInferenceConfig) -> str:
     configured = str(getattr(config, "clinical_question", "") or "").strip()
     if configured:
         return configured
-    return (
-        "What is the causal effect of "
-        f"{config.treatment_column} on {config.outcome_column}?"
-    )
+    return "What is the causal effect of " f"{config.treatment_column} on {config.outcome_column}?"
 
 
 def _scrub_decision_payload(payload: Any, save_agent_context: bool) -> Any:
@@ -4850,10 +4801,7 @@ def _scrub_decision_payload(payload: Any, save_agent_context: bool) -> Any:
                 scrubbed[key] = _scrub_decision_payload(value, save_agent_context)
         return scrubbed
     if isinstance(payload, list):
-        return [
-            _scrub_decision_payload(item, save_agent_context)
-            for item in payload
-        ]
+        return [_scrub_decision_payload(item, save_agent_context) for item in payload]
     return payload
 
 

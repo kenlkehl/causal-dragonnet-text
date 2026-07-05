@@ -12,6 +12,7 @@ import os
 import queue
 import re
 import threading
+import multiprocessing as mp
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -29,7 +30,13 @@ from sklearn.ensemble import (
     RandomForestRegressor,
 )
 from sklearn.linear_model import LogisticRegression, LinearRegression
-from sklearn.metrics import log_loss, mean_absolute_error, mean_squared_error, r2_score, roc_auc_score
+from sklearn.metrics import (
+    log_loss,
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+    roc_auc_score,
+)
 from sklearn.model_selection import KFold, StratifiedKFold
 from torch.utils.data import DataLoader, Dataset
 
@@ -69,6 +76,22 @@ _AGENT_CONTEXT_SNIPPET_CHARS = 480
 _AGENT_CONTEXT_SPAN_TEXT_CHARS = 120
 _AGENT_CONTEXT_SUMMARY_CHARS = 360
 EFFECT_OBJECTIVES = {"squared_r_loss", "logistic_r_loss", "pseudo_outcome_mse"}
+
+
+def _running_inside_loky_worker() -> bool:
+    try:
+        current = mp.current_process()
+        process_type = f"{type(current).__module__}.{type(current).__name__}"
+        if "loky" in process_type.lower():
+            return True
+    except Exception:
+        return False
+    try:
+        from joblib.externals.loky import process_executor
+
+        return int(getattr(process_executor, "_CURRENT_DEPTH", 0) or 0) > 0
+    except Exception:
+        return False
 
 
 def _effect_objective_name(config: AgenticAttentionVariableForestConfig) -> str:
@@ -364,7 +387,9 @@ class _InteractionOutcomeNet(nn.Module):
         if treatment is None:
             observed_raw = y0_raw
         else:
-            observed_raw = y0_raw + treatment.to(y0_raw.device, dtype=y0_raw.dtype) * treatment_delta
+            observed_raw = (
+                y0_raw + treatment.to(y0_raw.device, dtype=y0_raw.dtype) * treatment_delta
+            )
         if self.outcome_type == "continuous":
             tau = y1_raw - y0_raw
         else:
@@ -480,10 +505,7 @@ class _FoldTextDataset(Dataset):
     ):
         self.texts = [str(text or "") for text in texts]
         self.positions = np.asarray(positions, dtype=int)
-        self.fields = {
-            name: np.asarray(values)
-            for name, values in (fields or {}).items()
-        }
+        self.fields = {name: np.asarray(values) for name, values in (fields or {}).items()}
 
     def __len__(self) -> int:
         return int(len(self.positions))
@@ -507,20 +529,16 @@ class _FoldTextBatchCollator:
         texts = [str(item["text"]) for item in items]
         batch: Dict[str, Any] = {
             "model_input": (
-                self.text_preprocessor(texts)
-                if self.text_preprocessor is not None
-                else texts
+                self.text_preprocessor(texts) if self.text_preprocessor is not None else texts
             ),
             "position": torch.as_tensor(
                 [int(item["position"]) for item in items],
                 dtype=torch.long,
             ),
         }
-        field_names = [
-            key
-            for key in items[0].keys()
-            if key not in {"position", "text"}
-        ] if items else []
+        field_names = (
+            [key for key in items[0].keys() if key not in {"position", "text"}] if items else []
+        )
         for name in field_names:
             batch[name] = torch.as_tensor(
                 [float(item[name]) for item in items],
@@ -556,8 +574,7 @@ class AgenticAttentionVariableForestRunner:
         self._has_custom_proposal_agent = proposal_agent is not None
         self._has_custom_extraction_provider = extraction_provider is not None
         self._has_external_components = (
-            self._has_custom_proposal_agent
-            or self._has_custom_extraction_provider
+            self._has_custom_proposal_agent or self._has_custom_extraction_provider
         )
         self.devices = self._resolve_device_pool(
             base_device=self._device,
@@ -696,21 +713,15 @@ class AgenticAttentionVariableForestRunner:
             for item in fold_results:
                 self.nuisance_rows.extend(item["nuisance_rows"])
                 self.r_stage_rows.extend(item["r_stage_rows"])
-                self.residual_contrastive_rows.extend(
-                    item["residual_contrastive_rows"]
-                )
+                self.residual_contrastive_rows.extend(item["residual_contrastive_rows"])
                 self.nuisance_attention_rows.extend(item["nuisance_attention_rows"])
                 self.effect_attention_rows.extend(item["effect_attention_rows"])
                 self.residual_contrastive_attention_rows.extend(
                     item["residual_contrastive_attention_rows"]
                 )
-                self.confounder_candidate_rows.extend(
-                    item["confounder_candidate_rows"]
-                )
+                self.confounder_candidate_rows.extend(item["confounder_candidate_rows"])
                 self.modifier_candidate_rows.extend(item["modifier_candidate_rows"])
-                self.consensus_disambiguation_rows.extend(
-                    item["consensus_disambiguation_rows"]
-                )
+                self.consensus_disambiguation_rows.extend(item["consensus_disambiguation_rows"])
                 self.consensus_recovery_rows.extend(item["consensus_recovery_rows"])
                 self.value_harmonization_rows.extend(item["value_harmonization_rows"])
                 self.consensus_rows.extend(item["consensus_rows"])
@@ -759,9 +770,7 @@ class AgenticAttentionVariableForestRunner:
             dataset=self.dataset,
             config=self.config,
             output_path=(
-                self.artifact_dir
-                / f"outer_fold_{int(outer_fold):03d}"
-                / "predictions.parquet"
+                self.artifact_dir / f"outer_fold_{int(outer_fold):03d}" / "predictions.parquet"
             ),
             device=device,
             num_workers=self._inner_workers_for_outer_job(outer_n_jobs),
@@ -785,9 +794,7 @@ class AgenticAttentionVariableForestRunner:
             ),
             "confounder_candidate_rows": fold_runner.confounder_candidate_rows,
             "modifier_candidate_rows": fold_runner.modifier_candidate_rows,
-            "consensus_disambiguation_rows": (
-                fold_runner.consensus_disambiguation_rows
-            ),
+            "consensus_disambiguation_rows": (fold_runner.consensus_disambiguation_rows),
             "consensus_recovery_rows": fold_runner.consensus_recovery_rows,
             "value_harmonization_rows": fold_runner.value_harmonization_rows,
             "consensus_rows": fold_runner.consensus_rows,
@@ -924,14 +931,11 @@ class AgenticAttentionVariableForestRunner:
             attention_rows=nuisance["attention"],
             existing_specs=self._initial_specs(),
         )
-        contrastive_for_discovery = (
-            residual_contrastive is not None
-            and bool(
-                getattr(
-                    self.avf_config,
-                    "residual_contrastive_use_for_effect_discovery",
-                    True,
-                )
+        contrastive_for_discovery = residual_contrastive is not None and bool(
+            getattr(
+                self.avf_config,
+                "residual_contrastive_use_for_effect_discovery",
+                True,
             )
         )
         if contrastive_for_discovery and residual_contrastive["attention"]:
@@ -1025,15 +1029,9 @@ class AgenticAttentionVariableForestRunner:
                 else _effect_objective_name(self.avf_config)
             ),
             "r_loss_mean": _finite_or_none(predictions["r_loss"].mean()),
-            "r_loss_at_zero_tau_mean": _finite_or_none(
-                predictions["r_loss_at_zero_tau"].mean()
-            ),
-            "tau_hat_r_stage_mean": _finite_or_none(
-                predictions["tau_hat_r_stage"].mean()
-            ),
-            "tau_hat_r_stage_std": _finite_or_none(
-                predictions["tau_hat_r_stage"].std()
-            ),
+            "r_loss_at_zero_tau_mean": _finite_or_none(predictions["r_loss_at_zero_tau"].mean()),
+            "tau_hat_r_stage_mean": _finite_or_none(predictions["tau_hat_r_stage"].mean()),
+            "tau_hat_r_stage_std": _finite_or_none(predictions["tau_hat_r_stage"].std()),
         }
         zero_loss = metrics.get("r_loss_at_zero_tau_mean")
         r_loss = metrics.get("r_loss_mean")
@@ -1043,18 +1041,14 @@ class AgenticAttentionVariableForestRunner:
             "effect_loss",
             "effect_loss_at_zero_tau",
         }.issubset(predictions.columns):
-            metrics["effect_loss_mean"] = _finite_or_none(
-                predictions["effect_loss"].mean()
-            )
+            metrics["effect_loss_mean"] = _finite_or_none(predictions["effect_loss"].mean())
             metrics["effect_loss_at_zero_tau_mean"] = _finite_or_none(
                 predictions["effect_loss_at_zero_tau"].mean()
             )
             effect_zero = metrics.get("effect_loss_at_zero_tau_mean")
             effect_loss = metrics.get("effect_loss_mean")
             if effect_zero is not None and effect_zero > 0 and effect_loss is not None:
-                metrics["effect_loss_relative_improvement"] = float(
-                    1.0 - effect_loss / effect_zero
-                )
+                metrics["effect_loss_relative_improvement"] = float(1.0 - effect_loss / effect_zero)
         if "tau_logit_modifier" in predictions.columns:
             modifier = predictions["tau_logit_modifier"].to_numpy(dtype=float)
             finite = modifier[np.isfinite(modifier)]
@@ -1067,9 +1061,7 @@ class AgenticAttentionVariableForestRunner:
         if "r_stage_train_eligible" in predictions.columns:
             eligible = predictions["r_stage_train_eligible"].astype(bool)
             metrics["r_stage_train_eligible_rows"] = int(eligible.sum())
-            metrics["r_stage_train_eligible_fraction"] = _finite_or_none(
-                eligible.mean()
-            )
+            metrics["r_stage_train_eligible_fraction"] = _finite_or_none(eligible.mean())
         if self.config.treatment_column in predictions.columns:
             t = predictions[self.config.treatment_column].to_numpy()
             e_hat = predictions["e_hat"].to_numpy()
@@ -1177,8 +1169,7 @@ class AgenticAttentionVariableForestRunner:
         merge_cols = [
             col
             for col in residual_predictions.columns
-            if col in key_cols
-            or (col not in predictions.columns and col not in skip_cols)
+            if col in key_cols or (col not in predictions.columns and col not in skip_cols)
         ]
         return predictions.merge(
             residual_predictions[merge_cols],
@@ -1250,9 +1241,7 @@ class AgenticAttentionVariableForestRunner:
         if extractor is not None and hasattr(extractor, "make_batch_preprocessor"):
             text_preprocessor = extractor.make_batch_preprocessor()
         workers = self._data_loader_workers(total_folds=total_folds)
-        effective_batch_size = (
-            self.config.training.batch_size if batch_size is None else batch_size
-        )
+        effective_batch_size = self.config.training.batch_size if batch_size is None else batch_size
         loader_kwargs: Dict[str, Any] = {
             "batch_size": max(1, int(effective_batch_size)),
             "shuffle": bool(shuffle),
@@ -1369,14 +1358,10 @@ class AgenticAttentionVariableForestRunner:
                 propensity_auroc = _safe_roc_auc(t, e_hat)
                 propensity_raw_auroc = _safe_roc_auc(t, e_raw)
                 outcome_auroc = (
-                    _safe_roc_auc(y, m_hat)
-                    if self.config.outcome_type != "continuous"
-                    else None
+                    _safe_roc_auc(y, m_hat) if self.config.outcome_type != "continuous" else None
                 )
                 outcome_raw_auroc = (
-                    _safe_roc_auc(y, m_raw)
-                    if self.config.outcome_type != "continuous"
-                    else None
+                    _safe_roc_auc(y, m_raw) if self.config.outcome_type != "continuous" else None
                 )
                 prop_cal = binary_calibration_metrics(t, e_hat, prefix="propensity")
                 prop_raw_cal = binary_calibration_metrics(t, e_raw, prefix="propensity_raw")
@@ -1536,16 +1521,10 @@ class AgenticAttentionVariableForestRunner:
         m = r_df["m_hat"].to_numpy(dtype=float)
         y = df[self.config.outcome_column].to_numpy(dtype=float)
         t = df[self.config.treatment_column].to_numpy(dtype=float)
-        r_stage_min_propensity = float(
-            getattr(self.avf_config, "r_stage_min_propensity", 0.0)
-        )
-        r_stage_max_propensity = float(
-            getattr(self.avf_config, "r_stage_max_propensity", 1.0)
-        )
+        r_stage_min_propensity = float(getattr(self.avf_config, "r_stage_min_propensity", 0.0))
+        r_stage_max_propensity = float(getattr(self.avf_config, "r_stage_max_propensity", 1.0))
         train_eligible = (
-            np.isfinite(e)
-            & (e >= r_stage_min_propensity)
-            & (e <= r_stage_max_propensity)
+            np.isfinite(e) & (e >= r_stage_min_propensity) & (e <= r_stage_max_propensity)
         )
         e_clipped = np.clip(e, self.avf_config.e_clip, 1.0 - self.avf_config.e_clip)
         m_clipped = clip_probability(m)
@@ -1840,16 +1819,10 @@ class AgenticAttentionVariableForestRunner:
         m = r_df["m_hat"].to_numpy(dtype=float)
         y = df[self.config.outcome_column].to_numpy(dtype=float)
         t = df[self.config.treatment_column].to_numpy(dtype=float)
-        r_stage_min_propensity = float(
-            getattr(self.avf_config, "r_stage_min_propensity", 0.0)
-        )
-        r_stage_max_propensity = float(
-            getattr(self.avf_config, "r_stage_max_propensity", 1.0)
-        )
+        r_stage_min_propensity = float(getattr(self.avf_config, "r_stage_min_propensity", 0.0))
+        r_stage_max_propensity = float(getattr(self.avf_config, "r_stage_max_propensity", 1.0))
         train_eligible = (
-            np.isfinite(e)
-            & (e >= r_stage_min_propensity)
-            & (e <= r_stage_max_propensity)
+            np.isfinite(e) & (e >= r_stage_min_propensity) & (e <= r_stage_max_propensity)
         )
         r_df["r_stage_train_eligible"] = train_eligible
         e_clipped = np.clip(e, self.avf_config.e_clip, 1.0 - self.avf_config.e_clip)
@@ -1887,9 +1860,7 @@ class AgenticAttentionVariableForestRunner:
                 "tarnet_offset_heterogeneity_weight": float(
                     self.avf_config.tarnet_offset_heterogeneity_weight
                 ),
-                "tarnet_offset_min_logit_std": float(
-                    self.avf_config.tarnet_offset_min_logit_std
-                ),
+                "tarnet_offset_min_logit_std": float(self.avf_config.tarnet_offset_min_logit_std),
                 "r_stage_min_propensity": r_stage_min_propensity,
                 "r_stage_max_propensity": r_stage_max_propensity,
             },
@@ -1970,19 +1941,13 @@ class AgenticAttentionVariableForestRunner:
                     y1_hat = pred["y1_raw"]
                     heldout_effect_loss = (pred["observed_outcome_raw"] - y[heldout_pos]) ** 2
                 else:
-                    y0_hat = 1.0 / (
-                        1.0 + np.exp(-np.clip(pred["y0_raw"], -50.0, 50.0))
-                    )
-                    y1_hat = 1.0 / (
-                        1.0 + np.exp(-np.clip(pred["y1_raw"], -50.0, 50.0))
-                    )
+                    y0_hat = 1.0 / (1.0 + np.exp(-np.clip(pred["y0_raw"], -50.0, 50.0)))
+                    y1_hat = 1.0 / (1.0 + np.exp(-np.clip(pred["y1_raw"], -50.0, 50.0)))
                     heldout_effect_loss = _binary_log_loss_from_logits(
                         pred["observed_outcome_raw"],
                         y[heldout_pos],
                     )
-                heldout_r_loss = (
-                    y_resid[heldout_pos] - tau_hat * t_resid[heldout_pos]
-                ) ** 2
+                heldout_r_loss = (y_resid[heldout_pos] - tau_hat * t_resid[heldout_pos]) ** 2
                 fold_attention = self._tarnet_offset_attention_evidence(
                     model,
                     heldout,
@@ -2872,9 +2837,7 @@ class AgenticAttentionVariableForestRunner:
             high_quantile=float(
                 getattr(self.avf_config, "residual_contrastive_high_quantile", 0.80)
             ),
-            low_quantile=float(
-                getattr(self.avf_config, "residual_contrastive_low_quantile", 0.20)
-            ),
+            low_quantile=float(getattr(self.avf_config, "residual_contrastive_low_quantile", 0.20)),
             neutral_abs_quantile=float(
                 getattr(
                     self.avf_config,
@@ -3031,9 +2994,9 @@ class AgenticAttentionVariableForestRunner:
                                 "residual_score": contrast_df.iloc[attention_pos][
                                     "residual_score"
                                 ].to_numpy(dtype=float),
-                                "r_score": contrast_df.iloc[attention_pos][
-                                    "r_score"
-                                ].to_numpy(dtype=float),
+                                "r_score": contrast_df.iloc[attention_pos]["r_score"].to_numpy(
+                                    dtype=float
+                                ),
                                 "r_score_normalized": contrast_df.iloc[attention_pos][
                                     "r_score_normalized"
                                 ].to_numpy(dtype=float),
@@ -3052,8 +3015,7 @@ class AgenticAttentionVariableForestRunner:
                 except RuntimeError as exc:
                     if _is_cuda_oom(exc):
                         logger.error(
-                            "CUDA OOM in outer fold %s residual contrastive %s "
-                            "fold %s/%s%s",
+                            "CUDA OOM in outer fold %s residual contrastive %s " "fold %s/%s%s",
                             outer_fold,
                             tail,
                             fold,
@@ -3199,7 +3161,9 @@ class AgenticAttentionVariableForestRunner:
                     outcome_loss = F.mse_loss(y_pred, y)
                 else:
                     if nuisance_label_smoothing > 0:
-                        y_target = y * (1.0 - nuisance_label_smoothing) + 0.5 * nuisance_label_smoothing
+                        y_target = (
+                            y * (1.0 - nuisance_label_smoothing) + 0.5 * nuisance_label_smoothing
+                        )
                     else:
                         y_target = y
                     outcome_loss = F.binary_cross_entropy_with_logits(y_pred, y_target)
@@ -3213,11 +3177,7 @@ class AgenticAttentionVariableForestRunner:
                 loss_sum += loss_value
                 prop_sum += prop_value
                 outcome_sum += outcome_value
-                if (
-                    batch_idx == 1
-                    or batch_idx == num_batches
-                    or batch_idx % progress_every == 0
-                ):
+                if batch_idx == 1 or batch_idx == num_batches or batch_idx % progress_every == 0:
                     logger.info(
                         "Outer fold %s nuisance fold %s/%s epoch %s/%s "
                         "batch %s/%s loss=%.4f outcome=%.4f propensity=%.4f lr=%.3g%s",
@@ -3343,7 +3303,9 @@ class AgenticAttentionVariableForestRunner:
                     m_for_r = y_pred.detach()
                 else:
                     if nuisance_label_smoothing > 0:
-                        outcome_target = y * (1.0 - nuisance_label_smoothing) + 0.5 * nuisance_label_smoothing
+                        outcome_target = (
+                            y * (1.0 - nuisance_label_smoothing) + 0.5 * nuisance_label_smoothing
+                        )
                     else:
                         outcome_target = y
                     outcome_loss = F.binary_cross_entropy_with_logits(
@@ -3351,18 +3313,19 @@ class AgenticAttentionVariableForestRunner:
                         outcome_target,
                     )
                     m_for_r = torch.sigmoid(y_pred).detach()
-                e_for_r = torch.sigmoid(t_logit).detach().clamp(
-                    float(self.avf_config.e_clip),
-                    1.0 - float(self.avf_config.e_clip),
+                e_for_r = (
+                    torch.sigmoid(t_logit)
+                    .detach()
+                    .clamp(
+                        float(self.avf_config.e_clip),
+                        1.0 - float(self.avf_config.e_clip),
+                    )
                 )
-                train_eligible = (
-                    (e_for_r >= float(self.avf_config.r_stage_min_propensity))
-                    & (e_for_r <= float(self.avf_config.r_stage_max_propensity))
+                train_eligible = (e_for_r >= float(self.avf_config.r_stage_min_propensity)) & (
+                    e_for_r <= float(self.avf_config.r_stage_max_propensity)
                 )
                 if effect_objective == "logistic_r_loss":
-                    baseline_logit = torch.logit(
-                        torch.clamp(m_for_r, 1e-4, 1.0 - 1e-4)
-                    )
+                    baseline_logit = torch.logit(torch.clamp(m_for_r, 1e-4, 1.0 - 1e-4))
                     logits = baseline_logit + (t - e_for_r) * effect
                     effect_loss_vector = F.binary_cross_entropy_with_logits(
                         logits,
@@ -3385,9 +3348,7 @@ class AgenticAttentionVariableForestRunner:
                 else:
                     y_residual = y - m_for_r
                     t_residual = t - e_for_r
-                    effect_loss_vector = torch.square(
-                        y_residual - effect * t_residual
-                    )
+                    effect_loss_vector = torch.square(y_residual - effect * t_residual)
                     effect_mask = train_eligible
                 if torch.any(effect_mask):
                     effect_loss = effect_loss_vector[effect_mask].mean()
@@ -3409,11 +3370,7 @@ class AgenticAttentionVariableForestRunner:
                 prop_sum += prop_value
                 outcome_sum += outcome_value
                 effect_sum += effect_value
-                if (
-                    batch_idx == 1
-                    or batch_idx == num_batches
-                    or batch_idx % progress_every == 0
-                ):
+                if batch_idx == 1 or batch_idx == num_batches or batch_idx % progress_every == 0:
                     logger.info(
                         "Outer fold %s joint R-learner fold %s/%s epoch %s/%s "
                         "batch %s/%s loss=%.4f outcome=%.4f propensity=%.4f "
@@ -3573,11 +3530,7 @@ class AgenticAttentionVariableForestRunner:
                 prop_sum += prop_value
                 outcome_sum += outcome_value
                 interaction_sum += interaction_value
-                if (
-                    batch_idx == 1
-                    or batch_idx == num_batches
-                    or batch_idx % progress_every == 0
-                ):
+                if batch_idx == 1 or batch_idx == num_batches or batch_idx % progress_every == 0:
                     logger.info(
                         "Outer fold %s interaction-outcome fold %s/%s epoch %s/%s "
                         "batch %s/%s loss=%.4f outcome=%.4f propensity=%.4f "
@@ -3629,9 +3582,7 @@ class AgenticAttentionVariableForestRunner:
         train_config = self.config.training
         effect_epochs = self._effect_epochs()
         offset_l2 = float(self.avf_config.interaction_l2_weight)
-        heterogeneity_weight = float(
-            self.avf_config.tarnet_offset_heterogeneity_weight
-        )
+        heterogeneity_weight = float(self.avf_config.tarnet_offset_heterogeneity_weight)
         min_logit_std = float(self.avf_config.tarnet_offset_min_logit_std)
         model.extractor.fit_tokenizer(
             df.iloc[positions][self.config.text_column].astype(str).tolist()
@@ -3710,11 +3661,9 @@ class AgenticAttentionVariableForestRunner:
                     torch.mean(torch.square(out["offset0"]))
                     + torch.mean(torch.square(out["offset1"]))
                 )
-                heterogeneity_penalty, contrast_variance = (
-                    _tarnet_offset_heterogeneity_penalty(
-                        out["offset_contrast"],
-                        min_logit_std,
-                    )
+                heterogeneity_penalty, contrast_variance = _tarnet_offset_heterogeneity_penalty(
+                    out["offset_contrast"],
+                    min_logit_std,
                 )
                 loss = (
                     outcome_loss
@@ -3734,11 +3683,7 @@ class AgenticAttentionVariableForestRunner:
                 offset_sum += offset_value
                 heterogeneity_sum += heterogeneity_value
                 contrast_std_sum += contrast_std_value
-                if (
-                    batch_idx == 1
-                    or batch_idx == num_batches
-                    or batch_idx % progress_every == 0
-                ):
+                if batch_idx == 1 or batch_idx == num_batches or batch_idx % progress_every == 0:
                     logger.info(
                         "Outer fold %s TarNet-offset fold %s/%s epoch %s/%s "
                         "batch %s/%s loss=%.4f outcome=%.4f "
@@ -3867,11 +3812,7 @@ class AgenticAttentionVariableForestRunner:
                         y_residual,
                         t_residual,
                     )
-                    loss = (
-                        loss_vector[valid].mean()
-                        if torch.any(valid)
-                        else loss_vector.mean()
-                    )
+                    loss = loss_vector[valid].mean() if torch.any(valid) else loss_vector.mean()
                 else:
                     residual = y_residual - effect * t_residual
                     # Direct R-loss avoids high-variance y_residual / t_residual pseudo-labels.
@@ -3881,11 +3822,7 @@ class AgenticAttentionVariableForestRunner:
                 batch_count += 1
                 loss_value = float(loss.detach().cpu())
                 loss_sum += loss_value
-                if (
-                    batch_idx == 1
-                    or batch_idx == num_batches
-                    or batch_idx % progress_every == 0
-                ):
+                if batch_idx == 1 or batch_idx == num_batches or batch_idx % progress_every == 0:
                     logger.info(
                         "Outer fold %s effect fold %s/%s epoch %s/%s "
                         "batch %s/%s %s=%.4f lr=%.3g%s",
@@ -3902,8 +3839,7 @@ class AgenticAttentionVariableForestRunner:
                         self._cuda_memory_summary(),
                     )
             logger.info(
-                "Outer fold %s effect fold %s/%s epoch %s/%s complete: "
-                "%s=%.4f lr=%.3g%s",
+                "Outer fold %s effect fold %s/%s epoch %s/%s complete: " "%s=%.4f lr=%.3g%s",
                 outer_fold,
                 fold,
                 total_folds,
@@ -3998,11 +3934,7 @@ class AgenticAttentionVariableForestRunner:
                 batch_count += 1
                 loss_value = float(loss.detach().cpu())
                 loss_sum += loss_value
-                if (
-                    batch_idx == 1
-                    or batch_idx == num_batches
-                    or batch_idx % progress_every == 0
-                ):
+                if batch_idx == 1 or batch_idx == num_batches or batch_idx % progress_every == 0:
                     logger.info(
                         "Outer fold %s residual contrastive %s fold %s/%s "
                         "epoch %s/%s batch %s/%s loss=%.4f lr=%.3g%s",
@@ -4040,7 +3972,9 @@ class AgenticAttentionVariableForestRunner:
         if scheduler is not None:
             scheduler.step()
 
-    def _predict_nuisance_model(self, model: _NuisanceNet, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    def _predict_nuisance_model(
+        self, model: _NuisanceNet, df: pd.DataFrame
+    ) -> Tuple[np.ndarray, np.ndarray]:
         model.eval()
         prop = []
         outcome = []
@@ -4292,9 +4226,7 @@ class AgenticAttentionVariableForestRunner:
         }
         group_counts = predictions["residual_contrastive_group"].value_counts(dropna=False)
         for group in ["high", "low", "neutral", "middle"]:
-            metrics[f"residual_contrastive_{group}_rows"] = int(
-                group_counts.get(group, 0)
-            )
+            metrics[f"residual_contrastive_{group}_rows"] = int(group_counts.get(group, 0))
         for tail in ("high", "low"):
             label_col = f"residual_contrastive_{tail}_vs_neutral_label"
             prob_col = f"residual_contrastive_{tail}_prob"
@@ -4306,11 +4238,9 @@ class AgenticAttentionVariableForestRunner:
             )
             metrics[f"residual_contrastive_{tail}_vs_neutral_rows"] = int(mask.sum())
             if int(mask.sum()) > 1:
-                metrics[f"residual_contrastive_{tail}_vs_neutral_auroc"] = (
-                    _safe_roc_auc(
-                        predictions.loc[mask, label_col].to_numpy(dtype=float),
-                        predictions.loc[mask, prob_col].to_numpy(dtype=float),
-                    )
+                metrics[f"residual_contrastive_{tail}_vs_neutral_auroc"] = _safe_roc_auc(
+                    predictions.loc[mask, label_col].to_numpy(dtype=float),
+                    predictions.loc[mask, prob_col].to_numpy(dtype=float),
                 )
             else:
                 metrics[f"residual_contrastive_{tail}_vs_neutral_auroc"] = None
@@ -4349,11 +4279,7 @@ class AgenticAttentionVariableForestRunner:
                     metadata=metadata[start:end],
                 )
             )
-            if (
-                batch_idx == 1
-                or batch_idx == total_batches
-                or batch_idx % progress_every == 0
-            ):
+            if batch_idx == 1 or batch_idx == total_batches or batch_idx % progress_every == 0:
                 logger.info(
                     "Outer fold %s %s fold %s: attention batch %s/%s rows=%s/%s%s",
                     outer_fold,
@@ -4376,7 +4302,9 @@ class AgenticAttentionVariableForestRunner:
         stage: str,
         extra: Dict[str, np.ndarray],
     ) -> List[Dict[str, Any]]:
-        if not hasattr(model.extractor, "forward") or not hasattr(model.extractor, "_top_token_spans"):
+        if not hasattr(model.extractor, "forward") or not hasattr(
+            model.extractor, "_top_token_spans"
+        ):
             if not hasattr(model.extractor, "get_attention_evidence"):
                 return []
             return self._attention_evidence(
@@ -4444,11 +4372,7 @@ class AgenticAttentionVariableForestRunner:
                     metadata=metadata[start:end],
                 )
             records.extend(batch_records)
-            if (
-                batch_idx == 1
-                or batch_idx == total_batches
-                or batch_idx % progress_every == 0
-            ):
+            if batch_idx == 1 or batch_idx == total_batches or batch_idx % progress_every == 0:
                 logger.info(
                     "Outer fold %s %s fold %s: TarNet-offset attribution batch "
                     "%s/%s rows=%s/%s%s",
@@ -4472,7 +4396,9 @@ class AgenticAttentionVariableForestRunner:
         stage: str,
         extra: Dict[str, np.ndarray],
     ) -> List[Dict[str, Any]]:
-        if not hasattr(model.extractor, "forward") or not hasattr(model.extractor, "_top_token_spans"):
+        if not hasattr(model.extractor, "forward") or not hasattr(
+            model.extractor, "_top_token_spans"
+        ):
             if not hasattr(model.extractor, "get_attention_evidence"):
                 return []
             return self._attention_evidence(
@@ -4546,14 +4472,9 @@ class AgenticAttentionVariableForestRunner:
                     metadata=metadata[start:end],
                 )
             records.extend(batch_records)
-            if (
-                batch_idx == 1
-                or batch_idx == total_batches
-                or batch_idx % progress_every == 0
-            ):
+            if batch_idx == 1 or batch_idx == total_batches or batch_idx % progress_every == 0:
                 logger.info(
-                    "Outer fold %s %s fold %s: interaction attribution batch "
-                    "%s/%s rows=%s/%s%s",
+                    "Outer fold %s %s fold %s: interaction attribution batch " "%s/%s rows=%s/%s%s",
                     outer_fold,
                     stage,
                     fold,
@@ -4745,9 +4666,7 @@ class AgenticAttentionVariableForestRunner:
                     "error": str(exc),
                 }
                 if getattr(self.agent_search_config, "save_agent_raw_output", False):
-                    error_row["agent_raw_output"] = _get_agent_response_trace(
-                        proposal_agent
-                    )
+                    error_row["agent_raw_output"] = _get_agent_response_trace(proposal_agent)
                 self._save_agent_candidate_checkpoint(
                     error_row,
                     stage=stage,
@@ -4930,9 +4849,7 @@ class AgenticAttentionVariableForestRunner:
                     }
                 )
             support_count = len(support_folds)
-            support_fraction = (
-                float(support_count / len(fold_ids)) if fold_ids else None
-            )
+            support_fraction = float(support_count / len(fold_ids)) if fold_ids else None
             summary = {
                 "name": normalized_name,
                 "type": spec.type,
@@ -4941,9 +4858,7 @@ class AgenticAttentionVariableForestRunner:
                 "description": spec.description,
                 "source_names": source_names,
                 "support_folds": support_folds,
-                "missing_folds": [
-                    int(fold) for fold in fold_ids if int(fold) not in support_folds
-                ],
+                "missing_folds": [int(fold) for fold in fold_ids if int(fold) not in support_folds],
                 "support_count": int(support_count),
                 "support_fraction": support_fraction,
                 "passes_consensus_gate": bool(support_count >= threshold),
@@ -4973,11 +4888,7 @@ class AgenticAttentionVariableForestRunner:
                 categories = group.get("categories") if group_type == "categorical" else None
                 if categories is not None:
                     categories = [str(category) for category in categories[:8]]
-                roles = [
-                    role
-                    for role in group.get("roles", [])
-                    if role in VALID_ROLES
-                ]
+                roles = [role for role in group.get("roles", []) if role in VALID_ROLES]
                 if stage not in roles:
                     roles.append(stage)
                 try:
@@ -5048,15 +4959,11 @@ class AgenticAttentionVariableForestRunner:
         fold_count: int,
     ) -> Dict[str, Any]:
         ranked = self._rank_consensus_candidate_summaries(candidate_summaries)
-        passed = [
-            item for item in ranked if item.get("passes_consensus_gate")
+        passed = [item for item in ranked if item.get("passes_consensus_gate")]
+        recovery_limit = int(getattr(self.avf_config, "consensus_recovery_max_candidates", 12))
+        below_threshold = [item for item in ranked if not item.get("passes_consensus_gate")][
+            :recovery_limit
         ]
-        recovery_limit = int(
-            getattr(self.avf_config, "consensus_recovery_max_candidates", 12)
-        )
-        below_threshold = [
-            item for item in ranked if not item.get("passes_consensus_gate")
-        ][:recovery_limit]
         return {
             "prompt_version": "agentic_attention_consensus_recovery_v1",
             "stage": stage,
@@ -5106,9 +5013,7 @@ class AgenticAttentionVariableForestRunner:
             "threshold": int(threshold),
             "fold_count": int(fold_count),
             "candidate_summaries": candidate_summaries,
-            "fallback_selected_features": [
-                _spec_to_dict(spec) for spec in fallback_selected
-            ],
+            "fallback_selected_features": [_spec_to_dict(spec) for spec in fallback_selected],
             "selected_features": [_spec_to_dict(spec) for spec in fallback_selected],
             "rejected_proposals": [],
             "used_fallback": True,
@@ -5342,9 +5247,7 @@ class AgenticAttentionVariableForestRunner:
             self._flush_association_filter_rows()
 
             dropped = [*coverage_dropped, *signal_dropped]
-            signal_inadequate = not bool(
-                multivariable_signal_feedback.get("adequate", True)
-            )
+            signal_inadequate = not bool(multivariable_signal_feedback.get("adequate", True))
 
             if (not dropped and not signal_inadequate) or attempt >= max_attempts:
                 break
@@ -5451,17 +5354,14 @@ class AgenticAttentionVariableForestRunner:
         multivariable_signal_feedback: Optional[Dict[str, Any]] = None,
         excluded_feature_names: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
-        usable_rows = [
-            row for row in attention_rows if _attention_row_has_usable_text(row)
-        ]
+        usable_rows = [row for row in attention_rows if _attention_row_has_usable_text(row)]
         if not usable_rows:
             usable_rows = list(attention_rows)
         evidence_limit = min(
             _AGENT_CONTEXT_MAX_ROWS,
             max(
                 _AGENT_CONTEXT_MIN_ROWS,
-                int(self.avf_config.attention_top_k_chunks)
-                * _AGENT_CONTEXT_ROWS_PER_TOP_CHUNK,
+                int(self.avf_config.attention_top_k_chunks) * _AGENT_CONTEXT_ROWS_PER_TOP_CHUNK,
             ),
         )
         evidence = sorted(
@@ -5469,22 +5369,16 @@ class AgenticAttentionVariableForestRunner:
             key=lambda row: abs(float(row.get("attention", 0.0))),
             reverse=True,
         )[: max(1, evidence_limit)]
+        context_rows = [self._attention_evidence_context_row(row) for row in evidence]
         context_rows = [
-            self._attention_evidence_context_row(row)
-            for row in evidence
-        ]
-        context_rows = [
-            row
-            for row in context_rows
-            if row.get("evidence_snippet") or row.get("top_token_spans")
+            row for row in context_rows if row.get("evidence_snippet") or row.get("top_token_spans")
         ]
         instruction = (
             "Infer explicit pre-treatment patient-level variables represented by "
             "repeated high-attention token spans inside high-attention chunks."
         )
         if any(
-            str(row.get("stage", "")).startswith("residual_contrastive")
-            for row in attention_rows
+            str(row.get("stage", "")).startswith("residual_contrastive") for row in attention_rows
         ):
             instruction = (
                 "Infer explicit pre-treatment patient-level variables that "
@@ -5834,6 +5728,8 @@ class AgenticAttentionVariableForestRunner:
         env_workers = os.environ.get("OCI_AVF_DATALOADER_WORKERS")
         if env_workers is not None:
             return max(0, int(env_workers))
+        if _running_inside_loky_worker():
+            return 0
         if total_folds is not None and self._fold_n_jobs(total_folds) > 1:
             return 0
         return max(0, int(self.num_workers or 0))
@@ -5932,9 +5828,7 @@ class AgenticAttentionVariableForestRunner:
     ) -> Optional[Tuple[pd.DataFrame, List[Dict[str, Any]]]]:
         paths = self._fold_checkpoint_paths(stage, outer_fold, fold)
         if not (
-            paths["done"].exists()
-            and paths["predictions"].exists()
-            and paths["attention"].exists()
+            paths["done"].exists() and paths["predictions"].exists() and paths["attention"].exists()
         ):
             return None
         try:
@@ -6031,8 +5925,7 @@ class AgenticAttentionVariableForestRunner:
             paths["done"],
         )
         logger.info(
-            "Outer fold %s %s fold %s: saved checkpoint predictions=%s "
-            "attention_rows=%s",
+            "Outer fold %s %s fold %s: saved checkpoint predictions=%s " "attention_rows=%s",
             outer_fold,
             stage,
             fold,
@@ -6084,10 +5977,7 @@ class AgenticAttentionVariableForestRunner:
         proposal_attempt: int = 1,
     ) -> Path:
         stage_dir = self.artifact_dir / "agent_candidate_checkpoints" / stage
-        stem = (
-            f"outer_{int(outer_fold):03d}_consensus_attempt_"
-            f"{int(proposal_attempt):03d}"
-        )
+        stem = f"outer_{int(outer_fold):03d}_consensus_attempt_" f"{int(proposal_attempt):03d}"
         return stage_dir / f"{stem}.json"
 
     def _save_agent_consensus_checkpoint(
@@ -6105,8 +5995,7 @@ class AgenticAttentionVariableForestRunner:
         path.parent.mkdir(parents=True, exist_ok=True)
         _write_json_atomic(row, path)
         logger.info(
-            "Outer fold %s %s consensus attempt %s: saved agent checkpoint "
-            "status=%s path=%s",
+            "Outer fold %s %s consensus attempt %s: saved agent checkpoint " "status=%s path=%s",
             outer_fold,
             stage,
             proposal_attempt,
@@ -6259,9 +6148,7 @@ class AgenticAttentionVariableForestRunner:
                 "error": str(exc),
             }
             if getattr(self.agent_search_config, "save_agent_raw_output", False):
-                error_row["agent_raw_output"] = _get_agent_response_trace(
-                    self.proposal_agent
-                )
+                error_row["agent_raw_output"] = _get_agent_response_trace(self.proposal_agent)
             self._save_agent_consensus_checkpoint(
                 error_row,
                 stage=stage,
@@ -6709,19 +6596,12 @@ class AgenticAttentionVariableForestRunner:
         if loaded is None:
             return None
         pred_df, attention_rows = loaded
-        stage_values = [
-            str(row.get("stage", ""))
-            for row in attention_rows
-        ]
+        stage_values = [str(row.get("stage", "")) for row in attention_rows]
         nuisance_attention = [
-            row
-            for row, stage in zip(attention_rows, stage_values)
-            if stage == "nuisance"
+            row for row, stage in zip(attention_rows, stage_values) if stage == "nuisance"
         ]
         effect_attention = [
-            row
-            for row, stage in zip(attention_rows, stage_values)
-            if stage == "effect_modifier"
+            row for row, stage in zip(attention_rows, stage_values) if stage == "effect_modifier"
         ]
         default_effect_loss = (
             pred_df["effect_loss"].to_numpy(dtype=float)
@@ -7110,9 +6990,8 @@ class AgenticAttentionVariableForestRunner:
         for spec in specs:
             name = _normalize_feature_name(spec.name)
             coverage = _feature_coverage(df, name)
-            if (
-                coverage < self.avf_config.min_extraction_coverage
-                and not (self.avf_config.manual_features_locked and name in manual_names)
+            if coverage < self.avf_config.min_extraction_coverage and not (
+                self.avf_config.manual_features_locked and name in manual_names
             ):
                 logger.info(
                     "Dropping discovered feature %s for low extraction coverage %.3f < %.3f",
@@ -7127,9 +7006,7 @@ class AgenticAttentionVariableForestRunner:
                         "roles": list(spec.roles),
                         "description": spec.description,
                         "coverage": float(coverage),
-                        "min_extraction_coverage": float(
-                            self.avf_config.min_extraction_coverage
-                        ),
+                        "min_extraction_coverage": float(self.avf_config.min_extraction_coverage),
                     }
                 )
                 continue
@@ -7154,9 +7031,7 @@ class AgenticAttentionVariableForestRunner:
                 existing_specs=existing_specs,
                 alpha=alpha,
                 min_n=int(getattr(self.avf_config, "association_min_n", 20)),
-                min_non_missing=int(
-                    getattr(self.avf_config, "association_min_non_missing", 10)
-                ),
+                min_non_missing=int(getattr(self.avf_config, "association_min_non_missing", 10)),
             )
             if diagnostic.get("status") == "skipped_insufficient_sample":
                 kept.append(spec)
@@ -7164,14 +7039,12 @@ class AgenticAttentionVariableForestRunner:
 
             if stage == "confounder":
                 keep = bool(
-                    diagnostic.get("treatment_associated")
-                    and diagnostic.get("outcome_associated")
+                    diagnostic.get("treatment_associated") and diagnostic.get("outcome_associated")
                 )
                 rejection_reason = "no_joint_treatment_outcome_association"
             else:
                 keep = bool(
-                    diagnostic.get("outcome_associated")
-                    or diagnostic.get("interaction_associated")
+                    diagnostic.get("outcome_associated") or diagnostic.get("interaction_associated")
                 )
                 rejection_reason = "no_outcome_or_interaction_association"
 
@@ -7240,19 +7113,13 @@ class AgenticAttentionVariableForestRunner:
         min_outcome = float(getattr(self.avf_config, "min_signal_outcome_auroc", 0.55))
         treatment_ok = _score_meets_signal_threshold(treatment_score, min_treatment)
         outcome_ok = _score_meets_signal_threshold(outcome_score, min_outcome)
-        adequate = bool(
-            (treatment_ok and outcome_ok)
-            if stage == "confounder"
-            else outcome_ok
-        )
+        adequate = bool((treatment_ok and outcome_ok) if stage == "confounder" else outcome_ok)
         return {
             "status": "ok",
             "adequate": adequate,
             "stage": stage,
             "required": (
-                "treatment_and_outcome_auroc"
-                if stage == "confounder"
-                else "outcome_auroc"
+                "treatment_and_outcome_auroc" if stage == "confounder" else "outcome_auroc"
             ),
             "min_treatment_auroc": min_treatment,
             "min_outcome_auroc": min_outcome,
@@ -7380,18 +7247,10 @@ def consensus_feature_specs(
             concept_groups,
             key=lambda row: str(row.get("canonical_name", "")),
         ):
-            folds = {
-                int(fold)
-                for fold in group.get("member_folds", [])
-                if str(fold).strip()
-            }
+            folds = {int(fold) for fold in group.get("member_folds", []) if str(fold).strip()}
             if len(folds) < threshold:
                 continue
-            roles = [
-                role
-                for role in group.get("roles", [])
-                if role in VALID_ROLES
-            ]
+            roles = [role for role in group.get("roles", []) if role in VALID_ROLES]
             if required_role not in roles:
                 roles.append(required_role)
             name = _normalize_feature_name(group.get("canonical_name"))
@@ -7498,9 +7357,7 @@ def _validate_consensus_disambiguation_response(
             errors.append(f"{label}: member_names must be a list")
             continue
         member_names = [
-            _normalize_feature_name(name)
-            for name in member_values
-            if _normalize_feature_name(name)
+            _normalize_feature_name(name) for name in member_values if _normalize_feature_name(name)
         ]
         member_names = list(dict.fromkeys(member_names))
         if not member_names:
@@ -7508,9 +7365,7 @@ def _validate_consensus_disambiguation_response(
             continue
         unknown_names = [name for name in member_names if name not in by_name]
         if unknown_names:
-            errors.append(
-                f"{label}: member_names were not proposed: {sorted(unknown_names)}"
-            )
+            errors.append(f"{label}: member_names were not proposed: {sorted(unknown_names)}")
             continue
 
         member_folds, fold_error = _normalize_member_folds(raw_group.get("member_folds"))
@@ -7527,14 +7382,10 @@ def _validate_consensus_disambiguation_response(
         if member_folds is not None:
             missing_folds = sorted(set(member_folds) - actual_folds)
             if missing_folds:
-                errors.append(
-                    f"{label}: no proposed member found in folds {missing_folds}"
-                )
+                errors.append(f"{label}: no proposed member found in folds {missing_folds}")
                 continue
         if len(actual_folds) < 2:
-            errors.append(
-                f"{label}: group must contain proposals from at least 2 distinct folds"
-            )
+            errors.append(f"{label}: group must contain proposals from at least 2 distinct folds")
             continue
 
         member_specs = [spec for _, _, spec in members]
@@ -7547,30 +7398,21 @@ def _validate_consensus_disambiguation_response(
             errors.append(f"{label}: invalid type {raw_group.get('type')!r}")
             continue
         if group_type not in member_types:
-            errors.append(
-                f"{label}: group type {group_type!r} conflicts with member proposals"
-            )
+            errors.append(f"{label}: group type {group_type!r} conflicts with member proposals")
             continue
 
         categories = None
         if group_type == "categorical":
-            category_signatures = {
-                _category_signature(spec.categories)
-                for spec in member_specs
-            }
+            category_signatures = {_category_signature(spec.categories) for spec in member_specs}
             if len(category_signatures) != 1:
-                errors.append(
-                    f"{label}: grouped members have incompatible categories"
-                )
+                errors.append(f"{label}: grouped members have incompatible categories")
                 continue
             category_signature = next(iter(category_signatures))
             group_categories = raw_group.get("categories")
             if group_categories:
                 group_signature = _category_signature(group_categories)
                 if group_signature != category_signature:
-                    errors.append(
-                        f"{label}: group categories conflict with member proposals"
-                    )
+                    errors.append(f"{label}: group categories conflict with member proposals")
                     continue
                 categories = [str(category) for category in group_categories[:8]]
             else:
@@ -7581,17 +7423,12 @@ def _validate_consensus_disambiguation_response(
 
         canonical_name = _normalize_feature_name(raw_group.get("canonical_name"))
         if canonical_name not in member_names:
-            errors.append(
-                f"{label}: canonical_name was not a proposed member; using first member"
-            )
+            errors.append(f"{label}: canonical_name was not a proposed member; using first member")
             canonical_name = member_names[0]
         prototype = member_specs[0]
         roles = list(
             dict.fromkeys(
-                role
-                for spec in member_specs
-                for role in spec.roles
-                if role in VALID_ROLES
+                role for spec in member_specs for role in spec.roles if role in VALID_ROLES
             )
         )
         if required_role not in roles:
@@ -7773,7 +7610,11 @@ def _feature_association_diagnostic(
             "outcome_associated": False,
             "interaction_associated": False,
         }
-    missing = df[miss_col].astype(bool).to_numpy() if miss_col in df.columns else df[col].isna().to_numpy()
+    missing = (
+        df[miss_col].astype(bool).to_numpy()
+        if miss_col in df.columns
+        else df[col].isna().to_numpy()
+    )
     non_missing_n = int((~missing).sum())
     if non_missing_n < min_non_missing:
         return {
@@ -7886,7 +7727,9 @@ def _univariate_feature_target_association(
         if int(finite.sum()) < 3 or x[finite].nunique() < 2 or y[finite].nunique() < 2:
             return {"status": "constant_feature_or_target", "n": int(finite.sum())}
         try:
-            stat, p_value = stats.pearsonr(x[finite].to_numpy(dtype=float), y[finite].to_numpy(dtype=float))
+            stat, p_value = stats.pearsonr(
+                x[finite].to_numpy(dtype=float), y[finite].to_numpy(dtype=float)
+            )
         except Exception as exc:
             return {"status": "test_failed", "error": str(exc)}
         return {
@@ -7930,13 +7773,14 @@ def _treatment_interaction_association(
         return {"status": "missing_target_column"}
     outcome = np.asarray(df[config.outcome_column].to_numpy(), dtype=float)
     treatment = np.asarray(df[config.treatment_column].to_numpy(), dtype=float)
-    if len(np.unique(outcome[~np.isnan(outcome)])) < 2 or len(np.unique(treatment[~np.isnan(treatment)])) < 2:
+    if (
+        len(np.unique(outcome[~np.isnan(outcome)])) < 2
+        or len(np.unique(treatment[~np.isnan(treatment)])) < 2
+    ):
         return {"status": "constant_target_or_treatment"}
 
     current_confounders = [
-        item
-        for item in existing_specs
-        if item.name != spec.name and "confounder" in item.roles
+        item for item in existing_specs if item.name != spec.name and "confounder" in item.roles
     ]
     _, w_matrix, _, _, _, _ = _build_features(df, current_confounders)
     candidate = ExplicitFeatureSpec(
@@ -7993,9 +7837,7 @@ def _continuous_interaction_association(
     outcome = np.asarray(df[config.outcome_column].to_numpy(), dtype=float)
     treatment = np.asarray(df[config.treatment_column].to_numpy(), dtype=float)
     current_confounders = [
-        item
-        for item in existing_specs
-        if item.name != spec.name and "confounder" in item.roles
+        item for item in existing_specs if item.name != spec.name and "confounder" in item.roles
     ]
     _, w_matrix, _, _, _, _ = _build_features(df, current_confounders)
     candidate = ExplicitFeatureSpec(
@@ -8230,8 +8072,12 @@ def _binary_likelihood_ratio_p(
     full_model = LogisticRegression(max_iter=1000, solver="lbfgs")
     base_model.fit(_ensure_model_columns(base_x), y_binary)
     full_model.fit(_ensure_model_columns(full_x), y_binary)
-    base_pred = np.clip(base_model.predict_proba(_ensure_model_columns(base_x))[:, 1], 1e-6, 1 - 1e-6)
-    full_pred = np.clip(full_model.predict_proba(_ensure_model_columns(full_x))[:, 1], 1e-6, 1 - 1e-6)
+    base_pred = np.clip(
+        base_model.predict_proba(_ensure_model_columns(base_x))[:, 1], 1e-6, 1 - 1e-6
+    )
+    full_pred = np.clip(
+        full_model.predict_proba(_ensure_model_columns(full_x))[:, 1], 1e-6, 1 - 1e-6
+    )
     base_ll = -log_loss(y_binary, base_pred, labels=[0, 1], normalize=False)
     full_ll = -log_loss(y_binary, full_pred, labels=[0, 1], normalize=False)
     lr_stat = max(0.0, 2.0 * (float(full_ll) - float(base_ll)))
@@ -8253,8 +8099,8 @@ def _linear_nested_f_test(
     full_model.fit(full_x, y)
     base_resid = y - base_model.predict(base_x)
     full_resid = y - full_model.predict(full_x)
-    rss_base = float(np.sum(base_resid ** 2))
-    rss_full = float(np.sum(full_resid ** 2))
+    rss_base = float(np.sum(base_resid**2))
+    rss_full = float(np.sum(full_resid**2))
     dof_num = max(1, int(added_df))
     dof_den = max(1, int(len(y) - full_x.shape[1] - 1))
     f_stat = max(0.0, ((rss_base - rss_full) / dof_num) / max(rss_full / dof_den, 1e-12))
@@ -8361,8 +8207,7 @@ def _run_crossfit_fold_tasks(
 
     if n_jobs <= 1:
         return [
-            call_fold(fold, fit_pos, heldout_pos)
-            for fold, (fit_pos, heldout_pos) in split_items
+            call_fold(fold, fit_pos, heldout_pos) for fold, (fit_pos, heldout_pos) in split_items
         ]
     with ThreadPoolExecutor(
         max_workers=int(n_jobs),
@@ -8421,9 +8266,7 @@ def _residual_contrastive_label_frame(
         raise ValueError("No finite residual scores available for contrastive labels")
     high_threshold = float(np.nanquantile(score[finite], high_quantile))
     low_threshold = float(np.nanquantile(score[finite], low_quantile))
-    neutral_abs_threshold = float(
-        np.nanquantile(np.abs(score[finite]), neutral_abs_quantile)
-    )
+    neutral_abs_threshold = float(np.nanquantile(np.abs(score[finite]), neutral_abs_quantile))
 
     neutral = finite & (np.abs(score) <= neutral_abs_threshold)
     high = finite & (score >= high_threshold) & (score > neutral_abs_threshold)
@@ -8487,7 +8330,9 @@ def _make_linear_lr_scheduler(
     lr_schedule = str(getattr(train_config, "lr_schedule", "linear") or "").lower()
     if lr_schedule != "linear":
         return None
-    epochs = int(epochs_override if epochs_override is not None else getattr(train_config, "epochs", 1))
+    epochs = int(
+        epochs_override if epochs_override is not None else getattr(train_config, "epochs", 1)
+    )
     total_steps = max(1, int(steps_per_epoch) * epochs)
     return torch.optim.lr_scheduler.LinearLR(
         optimizer,
@@ -8569,8 +8414,12 @@ def _safe_corr(a: np.ndarray, b: np.ndarray) -> Optional[float]:
 
 def _oracle_metrics(results_df: pd.DataFrame) -> Dict[str, Any]:
     metrics = {
-        "ite_mse": float(mean_squared_error(results_df["true_ite_prob"], results_df["pred_ite_prob"])),
-        "ite_mae": float(mean_absolute_error(results_df["true_ite_prob"], results_df["pred_ite_prob"])),
+        "ite_mse": float(
+            mean_squared_error(results_df["true_ite_prob"], results_df["pred_ite_prob"])
+        ),
+        "ite_mae": float(
+            mean_absolute_error(results_df["true_ite_prob"], results_df["pred_ite_prob"])
+        ),
         "ite_corr": _safe_corr(results_df["true_ite_prob"], results_df["pred_ite_prob"]),
         "ate_bias": float(
             abs(results_df["pred_ite_prob"].mean() - results_df["true_ite_prob"].mean())
@@ -8693,8 +8542,7 @@ def _attention_evidence_snippet(
         if intervals:
             start = max(
                 0,
-                min(start for start, _ in intervals)
-                - _AGENT_CONTEXT_SNIPPET_CHARS // 3,
+                min(start for start, _ in intervals) - _AGENT_CONTEXT_SNIPPET_CHARS // 3,
             )
             end = min(
                 len(chunk),

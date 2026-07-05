@@ -106,7 +106,7 @@ def strip_reasoning_trace(response: str) -> str:
     end_marker = "</think>"
     end_idx = lower_text.rfind(end_marker)
     if end_idx >= 0:
-        text = text[end_idx + len(end_marker):].strip()
+        text = text[end_idx + len(end_marker) :].strip()
     return text
 
 
@@ -149,6 +149,7 @@ def _format_value_aliases(spec: ExplicitFeatureSpec) -> str:
 @dataclass
 class ExplicitFeatureValue:
     """Extracted value for a single feature."""
+
     name: str
     type: str  # "categorical" or "continuous"
     value: Optional[Union[str, float]]  # Extracted value (None if missing)
@@ -162,9 +163,7 @@ class _ExtractionParseResult:
 
 
 def build_extraction_prompt(
-    clinical_text: str,
-    specs: List[ExplicitFeatureSpec],
-    max_text_length: int = 400000
+    clinical_text: str, specs: List[ExplicitFeatureSpec], max_text_length: int = 400000
 ) -> str:
     """Build prompt for feature extraction.
 
@@ -189,20 +188,17 @@ def build_extraction_prompt(
             cat_list = ", ".join(f'"{c}"' for c in categories)
             alias_text = _format_value_aliases(spec)
             alias_instruction = (
-                f"\n   Value aliases to canonicalize: {alias_text}"
-                if alias_text
-                else ""
+                f"\n   Value aliases to canonicalize: {alias_text}" if alias_text else ""
             )
             instructions.append(
-                f'{i}. {name} (categorical): {description}\n'
-                f'   Valid values: {cat_list}'
-                f'{alias_instruction}'
+                f"{i}. {name} (categorical): {description}\n"
+                f"   Valid values: {cat_list}"
+                f"{alias_instruction}"
             )
             json_fields.append(f'"{name}": "<category>"')
         else:  # continuous
             instructions.append(
-                f'{i}. {name} (continuous): {description}\n'
-                f'   Respond with a numeric value.'
+                f"{i}. {name} (continuous): {description}\n" f"   Respond with a numeric value."
             )
             json_fields.append(f'"{name}": <number>')
 
@@ -213,7 +209,7 @@ def build_extraction_prompt(
     # are often documented.
     text = str(clinical_text)
     if max_text_length is not None and len(text) > int(max_text_length):
-        text = text[-int(max_text_length):]
+        text = text[-int(max_text_length) :]
 
     prompt = f"""Read this clinical note and extract the following patient characteristics.
 Use only information available before or at treatment initiation. If the value is not explicitly stated or cannot be inferred from pre-treatment information, return null for that field.
@@ -241,9 +237,7 @@ def build_extraction_repair_prompt(
         if spec.type == "categorical":
             categories = ", ".join(f'"{category}"' for category in (spec.categories or []))
             fields.append(f'"{spec.name}": "<category-or-null>"')
-            instructions.append(
-                f'- "{spec.name}" must be one of [{categories}] or null.'
-            )
+            instructions.append(f'- "{spec.name}" must be one of [{categories}] or null.')
         else:
             fields.append(f'"{spec.name}": <number-or-null>')
             instructions.append(f'- "{spec.name}" must be a number or null.')
@@ -265,8 +259,7 @@ Use null when a value is unknown, not stated, or cannot be inferred from pre-tre
 
 
 def parse_extraction_response(
-    response: str,
-    specs: List[ExplicitFeatureSpec]
+    response: str, specs: List[ExplicitFeatureSpec]
 ) -> Dict[str, ExplicitFeatureValue]:
     """Parse LLM JSON response to extract feature values.
 
@@ -361,7 +354,9 @@ def _parse_extraction_response_with_issues(
                         name=name, type=conf_type, value=None, is_missing=True
                     )
 
-    extra_keys = sorted(str(key) for key in parsed.keys() if key not in {spec.name for spec in specs})
+    extra_keys = sorted(
+        str(key) for key in parsed.keys() if key not in {spec.name for spec in specs}
+    )
     if extra_keys:
         issues.append(f"unexpected extra key(s): {extra_keys}")
 
@@ -414,7 +409,7 @@ def _extract_json_object_text(response: str) -> str:
         elif char == "}":
             depth -= 1
             if depth == 0:
-                return text[start:idx + 1]
+                return text[start : idx + 1]
     return text[start:]
 
 
@@ -443,9 +438,10 @@ class VLLMFeatureExtractor:
         retry_initial_delay: float = 1.0,
         retry_max_delay: float = 30.0,
         retry_backoff_factor: float = 2.0,
+        request_timeout: Optional[float] = 900.0,
         temperature: float = 0.0,
         max_tokens: int = 1024,
-        max_text_length: int = 400000
+        max_text_length: int = 400000,
     ):
         """Initialize extractor.
 
@@ -464,12 +460,15 @@ class VLLMFeatureExtractor:
             retry_initial_delay: Initial exponential backoff delay after request failures
             retry_max_delay: Maximum exponential backoff delay after request failures
             retry_backoff_factor: Exponential backoff multiplier
+            request_timeout: OpenAI-compatible client request timeout in seconds
             temperature: LLM temperature (0 for deterministic)
             max_tokens: Maximum tokens in response
             max_text_length: Maximum clinical text characters included in prompt
         """
         if mode not in ("server", "start_server", "python_api"):
-            raise ValueError(f"mode must be 'server', 'start_server', or 'python_api', got '{mode}'")
+            raise ValueError(
+                f"mode must be 'server', 'start_server', or 'python_api', got '{mode}'"
+            )
 
         self.specs = specs
         self.mode = mode
@@ -489,6 +488,7 @@ class VLLMFeatureExtractor:
         self.retry_initial_delay = retry_initial_delay
         self.retry_max_delay = retry_max_delay
         self.retry_backoff_factor = retry_backoff_factor
+        self.request_timeout = request_timeout
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.max_text_length = max_text_length
@@ -512,8 +512,8 @@ class VLLMFeatureExtractor:
         self._client_pool = OpenAIClientPool(
             server_urls=self.server_urls,
             api_key=self.api_key,
-            timeout=None,
-            max_retries=0,   # No internal retries (we have our own outer retry loop)
+            timeout=self.request_timeout,
+            max_retries=0,  # No internal retries (we have our own outer retry loop)
         )
         self._client = self._client_pool.client_for_url(self.server_url)
         logger.info("Configured %s vLLM server endpoint(s)", len(self.server_urls))
@@ -521,11 +521,16 @@ class VLLMFeatureExtractor:
     def _start_server(self):
         """Start vLLM server subprocess."""
         cmd = [
-            "python", "-m", "vllm.entrypoints.openai.api_server",
-            "--model", self.model_name,
-            "--tensor-parallel-size", str(self.tensor_parallel_size),
-            "--gpu-memory-utilization", str(self.gpu_memory_utilization),
-            "--trust-remote-code"
+            "python",
+            "-m",
+            "vllm.entrypoints.openai.api_server",
+            "--model",
+            self.model_name,
+            "--tensor-parallel-size",
+            str(self.tensor_parallel_size),
+            "--gpu-memory-utilization",
+            str(self.gpu_memory_utilization),
+            "--trust-remote-code",
         ]
         if self.download_dir:
             cmd.extend(["--download-dir", self.download_dir])
@@ -535,17 +540,14 @@ class VLLMFeatureExtractor:
             cmd.extend(["--reasoning-parser", self.vllm_reasoning_parser])
 
         logger.info(f"Starting vLLM server: {' '.join(cmd)}")
-        self._server_process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
+        self._server_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         # Wait for server to be ready
         logger.info("Waiting for vLLM server to start...")
         time.sleep(30)  # Initial wait
 
         import requests
+
         for i in range(60):  # Wait up to 5 minutes
             try:
                 resp = requests.get(f"{self.server_url.rstrip('/v1')}/health")
@@ -602,9 +604,7 @@ class VLLMFeatureExtractor:
         best_result = None
         max_attempts = max(1, int(self.max_retries))
         start_index = (
-            self._client_pool.reserve_start_index()
-            if self._client_pool is not None
-            else 0
+            self._client_pool.reserve_start_index() if self._client_pool is not None else 0
         )
 
         for attempt in range(max_attempts):
@@ -688,10 +688,7 @@ class VLLMFeatureExtractor:
         """Return a missing-value result for every requested feature."""
         return _missing_values_for_specs(self.specs)
 
-    def _extract_batch_python_api(
-        self,
-        texts: List[str]
-    ) -> List[Dict[str, ExplicitFeatureValue]]:
+    def _extract_batch_python_api(self, texts: List[str]) -> List[Dict[str, ExplicitFeatureValue]]:
         """Extract features from batch using vLLM Python API."""
         from vllm import SamplingParams
 
@@ -705,12 +702,12 @@ class VLLMFeatureExtractor:
             )
             tokenizer = self._llm.get_tokenizer()
 
-            if hasattr(tokenizer, 'apply_chat_template'):
+            if hasattr(tokenizer, "apply_chat_template"):
                 try:
                     prompt = tokenizer.apply_chat_template(
                         [{"role": "user", "content": user_content}],
                         tokenize=False,
-                        add_generation_prompt=True
+                        add_generation_prompt=True,
                     )
                 except Exception:
                     prompt = f"User: {user_content}\n\nAssistant:"
@@ -719,10 +716,7 @@ class VLLMFeatureExtractor:
             prompts.append(prompt)
 
         # Sample params
-        sampling_params = SamplingParams(
-            temperature=self.temperature,
-            max_tokens=self.max_tokens
-        )
+        sampling_params = SamplingParams(temperature=self.temperature, max_tokens=self.max_tokens)
 
         # Generate
         logger.info(f"Running vLLM batch inference on {len(prompts)} texts...")
@@ -741,10 +735,7 @@ class VLLMFeatureExtractor:
         return results
 
     def extract(
-        self,
-        texts: List[str],
-        batch_size: int = 32,
-        show_progress: bool = True
+        self, texts: List[str], batch_size: int = 32, show_progress: bool = True
     ) -> List[Dict[str, ExplicitFeatureValue]]:
         """Extract features from a list of clinical texts.
 
@@ -793,10 +784,7 @@ class VLLMFeatureExtractor:
         return [result if result is not None else self._missing_result() for result in results]
 
     def extract_to_dataframe(
-        self,
-        texts: List[str],
-        batch_size: int = 32,
-        show_progress: bool = True
+        self, texts: List[str], batch_size: int = 32, show_progress: bool = True
     ) -> pd.DataFrame:
         """Extract features and return as DataFrame.
 
@@ -857,10 +845,11 @@ def extract_explicit_features(
     retry_initial_delay: float = 1.0,
     retry_max_delay: float = 30.0,
     retry_backoff_factor: float = 2.0,
+    request_timeout: Optional[float] = 900.0,
     temperature: float = 0.0,
     max_tokens: int = 1024,
     max_text_length: int = 400000,
-    batch_size: int = 32
+    batch_size: int = 32,
 ) -> pd.DataFrame:
     """Convenience function to extract features from texts.
 
@@ -879,6 +868,7 @@ def extract_explicit_features(
         retry_initial_delay: Initial exponential backoff delay after request failures
         retry_max_delay: Maximum exponential backoff delay after request failures
         retry_backoff_factor: Exponential backoff multiplier
+        request_timeout: OpenAI-compatible client request timeout in seconds
         temperature: LLM temperature
         max_tokens: Max response tokens
         max_text_length: Maximum clinical text characters included in prompt
@@ -901,9 +891,10 @@ def extract_explicit_features(
         retry_initial_delay=retry_initial_delay,
         retry_max_delay=retry_max_delay,
         retry_backoff_factor=retry_backoff_factor,
+        request_timeout=request_timeout,
         temperature=temperature,
         max_tokens=max_tokens,
-        max_text_length=max_text_length
+        max_text_length=max_text_length,
     )
 
     try:

@@ -18,6 +18,7 @@ oci/extraction/__init__.py
 oci/extraction/cache.py
 oci/extraction/explicit_confounders.py
 oci/extraction/explicit_features.py
+oci/extraction/llm_routing.py
 oci/extraction/numeric_inventory.py
 oci/inference/__init__.py
 oci/inference/agentic_attention_variable_forest.py
@@ -27,8 +28,12 @@ oci/inference/applied_confounder_forest.py
 oci/inference/applied_explicit_feature_forest.py
 oci/inference/applied_forest.py
 oci/inference/applied_tfidf_forest.py
+oci/inference/build_embedding_chunk_cache.py
 oci/inference/build_neural_causal_forest_agent_context.py
+oci/inference/dragonnet_drlearner.py
+oci/inference/embedding_contrast_discovery.py
 oci/inference/multi_model_agentic_forest.py
+oci/inference/multi_model_forest_agent_optional.py
 oci/inference/predict_neural_causal_forest.py
 oci/inference/train_neural_causal_forest.py
 oci/matching/__init__.py
@@ -83,6 +88,7 @@ tests/test_causal_forest_tuning.py
 tests/test_concept_embedding_cnn.py
 tests/test_concept_token_cnn.py
 tests/test_contrastive_effect.py
+tests/test_dragonnet_drlearner.py
 tests/test_e2e_workflows.py
 tests/test_explicit_confounders_e2e.py
 tests/test_explicit_features.py

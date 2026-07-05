@@ -133,6 +133,7 @@ class MultiModelAgenticOracleConfig:
     agent_retry_initial_delay: float = 1.0
     agent_retry_max_delay: float = 30.0
     agent_retry_backoff_factor: float = 2.0
+    agent_request_timeout: Optional[float] = 900.0
     agent_save_context: bool = True
     agent_save_raw_output: bool = True
 
@@ -145,6 +146,7 @@ class MultiModelAgenticOracleConfig:
     extraction_retry_initial_delay: float = 1.0
     extraction_retry_max_delay: float = 30.0
     extraction_retry_backoff_factor: float = 2.0
+    extraction_request_timeout: Optional[float] = 900.0
     extraction_temperature: float = 0.0
     extraction_max_tokens: int = 25000
     extraction_max_text_length: int = 400000
@@ -152,7 +154,10 @@ class MultiModelAgenticOracleConfig:
     extraction_cache_dir: Optional[str] = None
 
     def config_hash(self) -> str:
-        payload = json.dumps(asdict(self), sort_keys=True)
+        payload_dict = asdict(self)
+        payload_dict.pop("agent_request_timeout", None)
+        payload_dict.pop("extraction_request_timeout", None)
+        payload = json.dumps(payload_dict, sort_keys=True)
         return hashlib.md5(payload.encode()).hexdigest()[:12]
 
 
@@ -207,6 +212,7 @@ def _make_applied_config(
                 agent_retry_initial_delay=config.agent_retry_initial_delay,
                 agent_retry_max_delay=config.agent_retry_max_delay,
                 agent_retry_backoff_factor=config.agent_retry_backoff_factor,
+                agent_request_timeout=config.agent_request_timeout,
                 save_agent_context=config.agent_save_context,
                 save_agent_raw_output=config.agent_save_raw_output,
                 random_state=config.seed,
@@ -301,6 +307,7 @@ def _make_applied_config(
             extraction_retry_initial_delay=config.extraction_retry_initial_delay,
             extraction_retry_max_delay=config.extraction_retry_max_delay,
             extraction_retry_backoff_factor=config.extraction_retry_backoff_factor,
+            extraction_request_timeout=config.extraction_request_timeout,
             extraction_temperature=config.extraction_temperature,
             extraction_max_tokens=config.extraction_max_tokens,
             extraction_max_text_length=config.extraction_max_text_length,
@@ -815,6 +822,7 @@ def main() -> None:
     parser.add_argument("--agent-retry-initial-delay", type=float, default=1.0)
     parser.add_argument("--agent-retry-max-delay", type=float, default=30.0)
     parser.add_argument("--agent-retry-backoff-factor", type=float, default=2.0)
+    parser.add_argument("--agent-request-timeout", type=float, default=900.0)
     parser.add_argument(
         "--agent-save-context",
         action=argparse.BooleanOptionalAction,
@@ -857,6 +865,7 @@ def main() -> None:
     parser.add_argument("--extraction-retry-initial-delay", type=float, default=1.0)
     parser.add_argument("--extraction-retry-max-delay", type=float, default=30.0)
     parser.add_argument("--extraction-retry-backoff-factor", type=float, default=2.0)
+    parser.add_argument("--extraction-request-timeout", type=float, default=900.0)
     parser.add_argument("--extraction-max-tokens", type=int, default=25000)
     parser.add_argument("--extraction-max-text-length", type=int, default=400000)
     parser.add_argument("--extraction-cache-dir", default=None)
@@ -960,6 +969,7 @@ def main() -> None:
         agent_retry_initial_delay=args.agent_retry_initial_delay,
         agent_retry_max_delay=args.agent_retry_max_delay,
         agent_retry_backoff_factor=args.agent_retry_backoff_factor,
+        agent_request_timeout=args.agent_request_timeout,
         agent_save_context=args.agent_save_context,
         agent_save_raw_output=args.agent_save_raw_output,
         extraction_server_url=args.extraction_server_url,
@@ -971,6 +981,7 @@ def main() -> None:
         extraction_retry_initial_delay=args.extraction_retry_initial_delay,
         extraction_retry_max_delay=args.extraction_retry_max_delay,
         extraction_retry_backoff_factor=args.extraction_retry_backoff_factor,
+        extraction_request_timeout=args.extraction_request_timeout,
         extraction_max_tokens=args.extraction_max_tokens,
         extraction_max_text_length=args.extraction_max_text_length,
         extraction_cache_enabled=not args.no_extraction_cache,

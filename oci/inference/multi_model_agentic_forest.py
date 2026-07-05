@@ -114,6 +114,76 @@ def run_multi_model_agentic_forest(
     runner.run()
 
 
+def build_multi_model_agentic_discovery_handoff(
+    dataset: pd.DataFrame,
+    config: AppliedInferenceConfig,
+    output_path: Path,
+    device=None,
+    gpu_ids: Optional[Sequence[int]] = None,
+    num_workers: int = 1,
+    *,
+    include_candidate_consistency: bool = True,
+) -> None:
+    """Precompute agent-visible discovery evidence without running LLM agents."""
+    runner = MultiModelAgenticForestRunner(
+        dataset=dataset,
+        config=config,
+        output_path=Path(output_path).with_suffix(".predictions.placeholder.parquet"),
+        device=device,
+        gpu_ids=gpu_ids,
+        num_workers=num_workers,
+    )
+    rows = runner.build_discovery_handoff_rows(
+        include_candidate_consistency=include_candidate_consistency
+    )
+    output_path = Path(output_path)
+    _write_jsonl(output_path, rows)
+    scopes = sorted({str(row.get("scope")) for row in rows})
+    _write_json(
+        output_path.with_suffix(".manifest.json"),
+        {
+            "schema_version": "multi_model_agentic_discovery_handoff_v1",
+            "path": str(output_path),
+            "n_rows": int(len(rows)),
+            "scopes": scopes,
+            "include_candidate_consistency": bool(include_candidate_consistency),
+        },
+    )
+    logger.info(
+        "Saved multi-model agentic discovery handoff rows=%s path=%s",
+        len(rows),
+        output_path,
+    )
+
+
+def run_multi_model_agentic_forest_from_handoff(
+    dataset: pd.DataFrame,
+    config: AppliedInferenceConfig,
+    output_path: Path,
+    handoff_path: Path,
+    device=None,
+    gpu_ids: Optional[Sequence[int]] = None,
+    num_workers: int = 1,
+    proposal_agent: Optional[Any] = None,
+    extraction_provider: Optional[Any] = None,
+    evaluator: Optional[Any] = None,
+) -> None:
+    """Run the agentic explicit-feature branch from precomputed discovery evidence."""
+    runner = PrecomputedDiscoveryMultiModelAgenticForestRunner(
+        dataset=dataset,
+        config=config,
+        output_path=output_path,
+        handoff_path=handoff_path,
+        device=device,
+        gpu_ids=gpu_ids,
+        num_workers=num_workers,
+        proposal_agent=proposal_agent,
+        extraction_provider=extraction_provider,
+        evaluator=evaluator,
+    )
+    runner.run()
+
+
 class MultiModelHTREvidenceProvider:
     """Adapter that reuses the attention runner's HTR cross-fit stages."""
 
@@ -245,6 +315,101 @@ class MultiModelAgenticForestRunner:
         self.prediction_results: Optional[pd.DataFrame] = None
         self.alias_reference_specs: List[ExplicitFeatureSpec] = self._initial_specs()
         self.low_coverage_review_candidates_by_outer: Dict[int, Dict[str, Dict[str, Any]]] = {}
+
+    def build_discovery_handoff_rows(
+        self,
+        *,
+        include_candidate_consistency: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Build fold-level discovery evidence rows for a later agent-only run."""
+        logger.info("=" * 80)
+        logger.info("MULTI-MODEL AGENTIC DISCOVERY HANDOFF")
+        logger.info("=" * 80)
+        self._validate_required_evidence_sources()
+        self._ensure_prespecified_features()
+
+        splits = self._analysis_splits()
+        if self._embedding_contrast_enabled() and self.embedding_provider is None:
+            self._embedding_contrast_generator().prepare(self.dataset)
+
+        rows: List[Dict[str, Any]] = []
+        for outer_fold, train_idx, _test_idx in splits:
+            discovery_df = self.dataset.iloc[train_idx].reset_index(drop=True)
+            logger.info(
+                "Precomputing agentic discovery handoff outer_fold=%s rows=%s",
+                outer_fold,
+                len(discovery_df),
+            )
+            result = self._fit_bow_discovery(discovery_df, int(outer_fold))
+            rows.append(
+                _agentic_discovery_handoff_row(
+                    result,
+                    fold_key=int(outer_fold),
+                    outer_fold=int(outer_fold),
+                    scope="full_outer_train",
+                    n_rows=len(discovery_df),
+                )
+            )
+            if include_candidate_consistency and bool(
+                getattr(self.nn_config, "candidate_consistency_enabled", True)
+            ):
+                rows.extend(
+                    self._build_inner_discovery_handoff_rows(
+                        outer_fold=int(outer_fold),
+                        discovery_df=discovery_df,
+                    )
+                )
+        return rows
+
+    def _build_inner_discovery_handoff_rows(
+        self,
+        *,
+        outer_fold: int,
+        discovery_df: pd.DataFrame,
+    ) -> List[Dict[str, Any]]:
+        try:
+            fold_count = _bounded_fold_count(
+                int(self.nn_config.candidate_consistency_inner_folds),
+                len(discovery_df),
+            )
+        except ValueError:
+            return []
+
+        splitter = KFold(
+            n_splits=fold_count,
+            shuffle=True,
+            random_state=51_000 + int(outer_fold),
+        )
+        rows: List[Dict[str, Any]] = []
+        for inner_fold, (fit_pos, heldout_pos) in enumerate(
+            splitter.split(discovery_df),
+            start=1,
+        ):
+            fit_pos = np.asarray(fit_pos, dtype=int)
+            heldout_pos = np.asarray(heldout_pos, dtype=int)
+            fold_key = 1000 * int(outer_fold) + int(inner_fold)
+            inner_df = discovery_df.iloc[fit_pos].reset_index(drop=True)
+            logger.info(
+                "Precomputing agentic discovery handoff outer_fold=%s "
+                "inner_fold=%s rows=%s heldout_rows=%s",
+                outer_fold,
+                inner_fold,
+                len(inner_df),
+                len(heldout_pos),
+            )
+            result = self._fit_bow_discovery(inner_df, outer_fold=fold_key)
+            rows.append(
+                _agentic_discovery_handoff_row(
+                    result,
+                    fold_key=fold_key,
+                    outer_fold=int(outer_fold),
+                    scope="candidate_consistency_inner_train",
+                    n_rows=len(inner_df),
+                    inner_fold=int(inner_fold),
+                    heldout_rows=len(heldout_pos),
+                )
+            )
+        return rows
 
     def run(self) -> None:
         logger.info("=" * 80)
@@ -3538,6 +3703,115 @@ class MultiModelAgenticForestRunner:
         with open(self.artifact_dir / "report.txt", "w") as f:
             f.write(self._report_text())
         logger.info("Multi-model agentic forest artifacts saved to: %s", self.artifact_dir)
+
+
+def _agentic_discovery_handoff_row(
+    result: Dict[str, Any],
+    *,
+    fold_key: int,
+    outer_fold: int,
+    scope: str,
+    n_rows: int,
+    inner_fold: Optional[int] = None,
+    heldout_rows: Optional[int] = None,
+) -> Dict[str, Any]:
+    row: Dict[str, Any] = {
+        "schema_version": "multi_model_agentic_discovery_handoff_v1",
+        "fold_key": int(fold_key),
+        "outer_fold": int(outer_fold),
+        "scope": str(scope),
+        "n_rows": int(n_rows),
+        "metrics": result.get("metrics") or {},
+        "importance": result.get("importance") or {},
+        "embedding_contrast_evidence": result.get("embedding_contrast_evidence") or {},
+        "htr_evidence": result.get("htr_evidence") or {},
+        "context": result.get("context") or {},
+    }
+    if inner_fold is not None:
+        row["inner_fold"] = int(inner_fold)
+    if heldout_rows is not None:
+        row["heldout_rows"] = int(heldout_rows)
+    return row
+
+
+def _load_agentic_discovery_handoff(path: Path) -> Dict[int, Dict[str, Any]]:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Precomputed agentic discovery handoff not found: {path}")
+    rows: Dict[int, Dict[str, Any]] = {}
+    with open(path, encoding="utf-8") as f:
+        for line_number, line in enumerate(f, start=1):
+            text = line.strip()
+            if not text:
+                continue
+            row = json.loads(text)
+            fold_key = int(row.get("fold_key", row.get("outer_fold")))
+            if fold_key in rows:
+                raise ValueError(
+                    f"Duplicate fold_key={fold_key} in agentic discovery handoff {path}"
+                )
+            rows[fold_key] = row
+            if row.get("schema_version") != "multi_model_agentic_discovery_handoff_v1":
+                raise ValueError(
+                    f"Unsupported agentic discovery handoff schema on line {line_number}: "
+                    f"{row.get('schema_version')!r}"
+                )
+    if not rows:
+        raise ValueError(f"Agentic discovery handoff is empty: {path}")
+    return rows
+
+
+class PrecomputedDiscoveryMultiModelAgenticForestRunner(MultiModelAgenticForestRunner):
+    """Agentic runner that consumes saved discovery evidence instead of refitting it."""
+
+    def __init__(
+        self,
+        *,
+        handoff_path: Path,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            embedding_provider=object(),
+            htr_evidence_provider=object(),
+            **kwargs,
+        )
+        self.handoff_path = Path(handoff_path)
+        self._handoff_by_key = _load_agentic_discovery_handoff(self.handoff_path)
+
+    def _fit_bow_discovery(
+        self,
+        discovery_df: pd.DataFrame,
+        outer_fold: int,
+    ) -> Dict[str, Any]:
+        del discovery_df
+        fold_key = int(outer_fold)
+        row = self._handoff_by_key.get(fold_key)
+        if row is None:
+            raise RuntimeError(
+                "Missing precomputed agentic discovery handoff for fold_key="
+                f"{fold_key} in {self.handoff_path}. Rerun the optional primary "
+                "stage with --prepare-agentic-handoff."
+            )
+        logger.info(
+            "Using precomputed agentic discovery handoff fold_key=%s scope=%s path=%s",
+            fold_key,
+            row.get("scope"),
+            self.handoff_path,
+        )
+        return {
+            "predictions": pd.DataFrame(columns=["_oci_row_id", "outer_fold"]),
+            "metrics": copy.deepcopy(row.get("metrics") or {}),
+            "importance": copy.deepcopy(row.get("importance") or {}),
+            "embedding_contrast_evidence": copy.deepcopy(
+                row.get("embedding_contrast_evidence") or {}
+            ),
+            "htr_evidence": copy.deepcopy(row.get("htr_evidence") or {}),
+            "context": copy.deepcopy(row.get("context") or {}),
+        }
+
+    def _candidate_consistency_n_jobs(self, folds: int) -> int:
+        del folds
+        return 1
 
 
 def _run_multi_model_outer_fold_worker(

@@ -141,6 +141,8 @@ Handles documents up to 50K+ tokens with the pretrained tokenizer. No `fit_token
 | `tfidf_forest` | TF-IDF features + CausalForestDML (no neural network, no GPU) | tau with 95% confidence intervals |
 | `explicit_feature_forest` | Role-tagged explicit features + CausalForestDML (no text model) | tau with 95% confidence intervals |
 | `agentic_explicit_feature_forest` | Nested-CV LLM variable search + explicit-feature CausalForestDML | outer-CV tau, nuisance AUROC, R-loss |
+| `multi_model_agentic_forest` | Multi-view BoW + embedding contrast + HTR attention/span evidence + LLM extraction + explicit-feature CausalForestDML | outer-CV tau, per-view text diagnostics, selected variables |
+| `multi_model_forest_agent_optional` | Multi-view BoW + HTR + embedding-contrast outputs used directly as CausalForestDML W/X features, with optional final explicit-feature agent branch | outer-CV tau, text-model W/X feature manifest, optional agent branch metrics |
 
 **Recommended: Causal Forest** -- trains neural features with propensity + outcome losses (optionally with R-learner loss), then fits CausalForestDML on the learned representations for doubly-robust estimation with confidence intervals.
 
@@ -368,6 +370,245 @@ Set `explicit_features.features` to a role-tagged starting list if a researcher 
 
 The agent receives a few train-fold text snippets to ground its proposals, but raw snippets are omitted from `agentic_feature_search/agent_decisions.jsonl` by default. Set `architecture.agentic_feature_search.save_agent_context=true` only for non-sensitive debugging runs. Raw proposal-model output is also omitted by default; set `architecture.agentic_feature_search.save_agent_raw_output=true` to persist the exact chat completion content and any provider-exposed reasoning field on each `agent_proposals` event.
 
+Use `model_type="multi_model_agentic_forest"` for the multi-signal sparse
+discovery path. This path does not train a neural text encoder. For each outer
+training fold, it fits several configured TF-IDF/BoW views with different
+learner and n-gram settings. Each view cross-fits treatment and outcome nuisance
+models, computes its own R-learner pseudo-target, fits a sparse pseudo-target
+model, and sends the per-view outputs plus a cross-view phrase consensus summary
+to the proposal agent as candidate-generation evidence. The same path also adds
+embedding-contrast retrieval and
+HTR nuisance/effect models: HTR nuisance predictions join the ensemble nuisance
+signal used for R-loss/pseudo-target construction, and attended tokens/spans are
+shown to the proposal agent. The proposal agent is not treated as the causal
+authority: it proposes evidence-supported candidate confounders and effect
+modifiers, optional inner-fold consistency checks stabilize the candidate set,
+the extractor materializes selected variables from complete patient notes, and a
+post-extraction
+review step trains simple fold-honest nuisance and R-pseudo-target models on the
+extracted variables. If those extracted-variable models underperform the BoW,
+embedding, or HTR evidence, the agent receives the diagnostics and can revise
+roles, replace weak variables, and trigger re-extraction before the final
+explicit-feature CausalForestDML is fit.
+
+Set `architecture.multi_model_agentic_forest.feature_discovery_methods` to choose
+which discovery sources run for a given applied-inference config. Accepted
+values are `bow`, `htr`, and `embedding_contrast`; the default is all three.
+The same selector is available from the normal runner as
+`oci run --config config.json --multi-model-feature-discovery-methods bow htr`.
+
+You can seed this path with known variables using
+`architecture.multi_model_agentic_forest.prespecified_confounders`,
+`prespecified_effect_modifiers`, `prespecified_features`, or
+`prespecified_features_json`. These entries use the same `ExplicitFeatureSpec`
+shape as `explicit_features.features`; `confounders` and `effect_modifiers`
+sections in the JSON file apply those roles automatically. If the same variable
+is supplied in both roles, it is extracted once, included in the BoW nuisance and
+pseudo-target models alongside the text features, and passed to both `W` and `X`
+in the final causal forest.
+
+By default this path uses a broad BoW grid: linear TF-IDF views over 1-1, 1-2,
+1-3, and 2-4 word n-grams, plus ExtraTrees and RandomForest views. Set
+`architecture.multi_model_agentic_forest.bow_views` to override the grid. The
+agent context includes `feature_importance.views` for every view and
+`feature_importance.phrase_consensus` for repeated 2-4 token n-gram signals.
+Final artifacts are written under `multi_model_agentic_forest/`, including
+`bow_view_oof_predictions.parquet`,
+`htr_nuisance_oof_predictions.parquet`, `htr_effect_oof_predictions.parquet`,
+`htr_attention_evidence.parquet`, `text_model_oof_predictions.parquet`,
+`bow_view_feature_importance_by_fold.jsonl`,
+`embedding_contrast_evidence_by_fold.jsonl`, `agent_candidate_proposals.jsonl`,
+`extracted_feature_diagnostics_by_fold.jsonl`, `parsimony_review_by_fold.jsonl`,
+`selected_feature_sets.json`, and `outer_cv_metrics.csv`. The parsimony review is
+mandatory before final forest fitting; it may record `retain_all` when ablations
+do not justify pruning. The same run also writes skill-compatible aliases:
+`report.txt`, `text_evidence.bow.jsonl`, `text_evidence.embedding.jsonl`,
+`text_evidence.htr.parquet`, `ensemble_nuisance_predictions.parquet`,
+`candidate_features.parquet`, `candidate_signal_review.jsonl`,
+`parsimony_review.by_fold.jsonl`, and `ite_estimates.parquet`.
+
+Set `architecture.multi_model_agentic_forest.require_honest_outer_split=true`
+to reject runs without cross-validation or an explicit held-out `test` split.
+By default legacy full-data runs are still allowed, but prediction rows are
+labeled `estimation_provenance="full_data_refit_non_honest"`. The built-in
+vLLM extraction provider also refuses to silently truncate notes in this path;
+increase `explicit_features.extraction_max_text_length`, set it to `null`, or
+use a complete-document recursive provider for notes longer than the prompt
+limit.
+
+Use `model_type="multi_model_forest_agent_optional"` for the non-agentic
+multi-model W/X forest variant. This path uses the same BoW view grid, HTR
+evidence models, embedding chunk cache, and outer/inner honesty strategy, but
+the primary causal forest receives numeric text-model outputs directly: BoW and
+HTR treatment/outcome predictions plus confounder contrast cosine features as
+`W`, and per-BoW-view plus HTR pseudo-outcome/R-objective predictions plus
+effect-contrast cosine features as `X`. Set
+`architecture.multi_model_forest_agent_optional.agentic_explicit_branch_enabled=true`
+only when you want a separate post-hoc explicit-feature agent branch; that branch
+does not replace or alter the primary text-model W/X predictions.
+
+This path includes embedding-contrast retrieval evidence by default. It averages
+each patient's retained chunk embeddings into a patient-level embedding, row
+normalizes the patient vectors, optionally residualizes configured structured
+columns, and then builds train-fold contrast directions from patient-level group
+means. The default contrast set includes treatment, outcome, a treatment/outcome
+average `confounder_vector`, within-arm outcome, 2x2 treatment-outcome
+interaction, and a no-nuisance
+`residualized_treatment_outcome_interaction` direction for effect-modifier
+discovery. When nuisance predictions exist, the same evidence also includes
+per-view and ensemble R-pseudo-target and orthogonal R-score contrast
+directions. The retriever returns real text chunks and concept phrases aligned
+with those directions.
+The proposal agent sees the retrieved chunks as hypothesis-generation evidence;
+saved artifacts redact raw retrieved chunk text by default unless
+`architecture.agentic_feature_search.save_agent_context=true`.
+Contrast directions use weighted patient-level mean differences, for example
+mean treated embedding minus mean untreated embedding. Linear-probe AUC is
+recorded as a diagnostic by default; set `min_probe_auc > 0` only if you want
+to use it as an opt-in retrieval gate. It is not used as the retrieval direction.
+When a patient has more chunks than `max_chunks`, embedding contrast keeps the
+last chunks by default because later notes are often more recent.
+Set `include_cell_contrasts=false` or
+`include_orthogonal_r_score_contrasts=false` to disable nuisance or cell-based
+contrast families. Set `include_confounder_vector_contrast=false` or
+`include_residualized_interaction_contrast=false` only if you want to remove the
+no-nuisance confounder/effect-modifier embedding evidence.
+
+The default local embedding model is `Qwen/Qwen3-Embedding-8B`, loaded through
+`sentence-transformers` and cached on disk under
+`{dataset_dir}/.oci_cache/embedding_contrast` unless `cache_dir` or
+`--embedding-cache-dir` is supplied. The cache is keyed by dataset path, model,
+chunking settings, normalization, and chunk-selection mode, so different folds
+and repeated runs share the same chunk embeddings.
+Use a smaller model or pre-populated local Hugging Face cache for constrained
+hardware.
+
+You can also retrieve background chunks from an external embedded corpus, such
+as PubMed abstracts, using the same embedding model and chunking setup:
+
+```bash
+python -m oci.inference.build_embedding_chunk_cache \
+  --input pubmed_abstracts.parquet \
+  --text-column abstract \
+  --output-cache-dir /data1/ken/pubmed_embedding_cache \
+  --model-name Qwen/Qwen3-Embedding-8B \
+  --corpus-name pubmed_abstracts \
+  --source-id-column pmid
+```
+
+Then set
+`architecture.multi_model_agentic_forest.embedding_contrast.external_corpus_cache_dirs`
+to that cache path, or pass `--embedding-external-cache-dir` to the oracle
+script. External chunks are retrieved for the positive and negative tails of
+each derived direction and are included as background naming evidence; they do
+not alter the study-cohort contrast vectors.
+
+The proposal-agent prompt receives a compact evidence payload: BoW rows are
+capped per view, embedding retrieval chunks are clipped, and JSON is serialized
+compactly. This keeps prompt length controlled while leaving
+`agent_max_tokens` high enough for reasoning models to think before emitting
+the final JSON.
+
+Minimal configuration:
+
+```json
+{
+  "applied_inference": {
+    "dataset_path": "path/to/dataset.parquet",
+    "text_column": "clinical_text",
+    "treatment_column": "treatment_indicator",
+    "outcome_column": "outcome_indicator",
+    "outcome_type": "binary",
+    "cv_folds": 5,
+    "architecture": {
+      "model_type": "multi_model_agentic_forest",
+      "multi_model_agentic_forest": {
+        "bow_views": [
+          {
+            "name": "linear_1_3",
+            "bow_model": "linear",
+            "ngram_range_min": 1,
+            "ngram_range_max": 3,
+            "min_df": 5,
+            "max_df": 0.95,
+            "max_features": 30000,
+            "logistic_c": 1.0,
+            "ridge_alpha": 10.0
+          },
+          {
+            "name": "extratrees_1_3",
+            "bow_model": "extratrees",
+            "ngram_range_min": 1,
+            "ngram_range_max": 3,
+            "min_df": 5,
+            "max_df": 0.95,
+            "max_features": 30000
+          }
+        ],
+        "top_n_features": 100,
+        "feature_discovery_methods": ["bow", "htr", "embedding_contrast"],
+        "candidate_consistency_enabled": true,
+        "embedding_contrast": {
+          "enabled": true,
+          "model_name": "Qwen/Qwen3-Embedding-8B",
+          "chunk_size_words": 256,
+          "chunk_overlap_words": 64,
+          "max_chunks": 64,
+          "chunk_selection": "last",
+          "top_k_chunks_per_tail": 12,
+          "max_chunks_per_patient": 2,
+          "min_probe_auc": 0.0,
+          "pseudo_target_quantile": 0.2,
+          "pseudo_target_weighted": true,
+          "concept_phrases": [
+            "brain metastases",
+            "liver metastases",
+            "PD-L1 high",
+            "poor performance status"
+          ]
+        },
+        "prespecified_confounders": [
+          {
+            "name": "age",
+            "type": "continuous",
+            "description": "Patient age at treatment initiation in years."
+          }
+        ],
+        "prespecified_effect_modifiers": [
+          {
+            "name": "pd_l1_expression",
+            "type": "categorical",
+            "categories": ["<1%", "1-49%", ">=50%"],
+            "description": "Pretreatment tumor PD-L1 expression category."
+          }
+        ]
+      }
+    },
+    "explicit_features": {
+      "enabled": true,
+      "features": []
+    }
+  }
+}
+```
+
+An optional `prespecified_features_json` file can contain:
+
+```json
+{
+  "confounders": [
+    {"name": "age", "type": "continuous", "description": "Age in years."}
+  ],
+  "effect_modifiers": [
+    {
+      "name": "pd_l1_expression",
+      "type": "categorical",
+      "categories": ["<1%", "1-49%", ">=50%"]
+    }
+  ]
+}
+```
+
 ## Contrastive Learning
 
 Optional supervised contrastive loss (SupCon) within similarity clusters encourages the model to discriminate treatment/outcome status among clinically similar patients. Features are clustered via K-means, then SupCon is computed within each cluster using treatment x outcome as 4-class labels.
@@ -483,6 +724,52 @@ python oracle_experiment_scripts/run_oracle_experiments.py \
     --output-dir ../my_results \
     --n-repeats 5
 ```
+
+Multi-model agentic forest oracle run, assuming compatible agent/extraction
+servers are already running:
+
+```bash
+python oracle_experiment_scripts/run_oracle_multi_model_agentic_forest.py \
+  --dataset synthetic_data/example_synthetic_datasets/one_confounder_one_effect_modifier_nsclc_with_structured \
+  --output-dir ../pcori_experiments/oracle_multi_model_agentic_forest_smoke \
+  --n-folds 5 \
+  --nuisance-folds 5 \
+  --effect-folds 5 \
+  --bow-view-grid default_broad \
+  --agent-model-name Qwen/Qwen3.5-35B-A3B \
+  --extraction-model-name Qwen/Qwen3.5-35B-A3B \
+  --extraction-reasoning-parser qwen3
+```
+
+Non-agentic multi-model W/X forest oracle run, with the optional explicit-feature
+agent branch disabled by default:
+
+```bash
+python oracle_experiment_scripts/run_oracle_multi_model_forest_agent_optional.py \
+  --dataset synthetic_data/example_synthetic_datasets/one_confounder_one_effect_modifier_nsclc_with_structured \
+  --output-dir ../pcori_experiments/oracle_multi_model_forest_agent_optional_smoke \
+  --n-folds 5 \
+  --nuisance-folds 5 \
+  --effect-folds 5 \
+  --bow-view-grid default_broad \
+  --num-workers 2 \
+  --outer-parallelism auto \
+  --fold-parallelism auto \
+  --htr-device cuda:0 \
+  --htr-gpu-ids 0 1 \
+  --embedding-device cuda:0
+```
+
+Embedding-delta retrieval evidence is enabled by default in the oracle run. Use
+`--embedding-model-name Qwen/Qwen3-Embedding-8B` to choose the embedding model,
+or `--disable-embedding-contrast` only for a documented lightweight run.
+Use `--feature-discovery-methods bow htr embedding_contrast` to select the
+oracle run's discovery sources explicitly.
+Use `--embedding-disable-cell-contrasts` or
+`--embedding-disable-orthogonal-r-score-contrasts` to fall back to the smaller
+contrast set. Use `--embedding-external-cache-dir /path/to/cache` to retrieve
+background chunks from an external cache built with
+`python -m oci.inference.build_embedding_chunk_cache`.
 
 Agentic attention-variable forest smoke test, assuming a Qwen vLLM server is
 already running with `--reasoning-parser qwen3`:

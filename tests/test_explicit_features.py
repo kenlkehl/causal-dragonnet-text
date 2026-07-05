@@ -122,14 +122,20 @@ def test_vllm_reasoning_parser_inference_and_resolution():
     assert infer_vllm_reasoning_parser("openai/gpt-oss-120b") == "openai_gptoss"
     assert infer_vllm_reasoning_parser("meta-llama/Llama-3.1-8B-Instruct") is None
 
-    assert resolve_vllm_reasoning_parser(
-        "auto",
-        "nvidia/Qwen3.6-35B-A3B-NVFP4",
-    ) == "qwen3"
-    assert resolve_vllm_reasoning_parser(
-        "deepseek_r1",
-        "unknown/model",
-    ) == "deepseek_r1"
+    assert (
+        resolve_vllm_reasoning_parser(
+            "auto",
+            "nvidia/Qwen3.6-35B-A3B-NVFP4",
+        )
+        == "qwen3"
+    )
+    assert (
+        resolve_vllm_reasoning_parser(
+            "deepseek_r1",
+            "unknown/model",
+        )
+        == "deepseek_r1"
+    )
     assert resolve_vllm_reasoning_parser("none", "nvidia/Gemma-4-31B-IT-NVFP4") is None
 
 
@@ -208,7 +214,7 @@ def test_raw_explicit_features_maps_categorical_value_aliases():
     assert features == [[0.0, 1.0, 0.0]]
 
 
-def test_vllm_feature_extractor_server_client_has_no_timeout(monkeypatch):
+def test_vllm_feature_extractor_server_client_uses_request_timeout(monkeypatch):
     calls = {}
 
     class FakeOpenAI:
@@ -221,11 +227,12 @@ def test_vllm_feature_extractor_server_client_has_no_timeout(monkeypatch):
             ExplicitFeatureSpec(name="age", type="continuous", roles=["confounder"]),
         ],
         mode="server",
+        request_timeout=123.0,
     )
 
     extractor._init_server_client()
 
-    assert calls["timeout"] is None
+    assert calls["timeout"] == 123.0
     assert calls["max_retries"] == 0
 
 
@@ -433,17 +440,21 @@ def test_vllm_feature_extractor_server_uses_batch_size_for_concurrency(monkeypat
 
 def test_experiment_config_rejects_old_explicit_confounder_keys():
     with pytest.raises(ValueError, match="explicit_confounders"):
-        ExperimentConfig.from_dict({
-            "applied_inference": {
-                "dataset_path": "dataset.parquet",
-                "explicit_confounders": {"enabled": True, "confounders": []},
+        ExperimentConfig.from_dict(
+            {
+                "applied_inference": {
+                    "dataset_path": "dataset.parquet",
+                    "explicit_confounders": {"enabled": True, "confounders": []},
+                }
             }
-        })
+        )
 
     with pytest.raises(ValueError, match="confounder_forest"):
-        ExperimentConfig.from_dict({
-            "applied_inference": {
-                "dataset_path": "dataset.parquet",
-                "architecture": {"model_type": "confounder_forest"},
+        ExperimentConfig.from_dict(
+            {
+                "applied_inference": {
+                    "dataset_path": "dataset.parquet",
+                    "architecture": {"model_type": "confounder_forest"},
+                }
             }
-        })
+        )

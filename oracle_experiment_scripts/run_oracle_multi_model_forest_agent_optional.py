@@ -10,7 +10,7 @@ import logging
 import os
 import sys
 import traceback
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -31,6 +31,7 @@ from oci.config import (  # noqa: E402
     normalize_multi_model_feature_discovery_methods,
 )
 from oci.inference.multi_model_forest_agent_optional import (  # noqa: E402
+    MultiModelForestAgentOptionalRunner,
     run_multi_model_forest_agent_optional,
 )
 from run_oracle_multi_model_agentic_forest import (  # noqa: E402
@@ -63,6 +64,22 @@ class MultiModelForestAgentOptionalOracleConfig(MultiModelAgenticOracleConfig):
     """CLI config for the optional-agent multi-model forest oracle run."""
 
     agentic_explicit_branch_enabled: bool = False
+    agentic_explicit_branch_only: bool = False
+    agentic_handoff_enabled: bool = False
+    existing_config_hash: Optional[str] = None
+    outer_parallel_backend: str = "threads"
+    bow_fold_parallelism: Optional[str] = None
+    htr_fold_parallelism: Optional[str] = None
+
+    def config_hash(self) -> str:
+        payload_dict = asdict(self)
+        payload_dict.pop("agentic_explicit_branch_only", None)
+        payload_dict.pop("agentic_handoff_enabled", None)
+        payload_dict.pop("existing_config_hash", None)
+        payload_dict.pop("agent_request_timeout", None)
+        payload_dict.pop("extraction_request_timeout", None)
+        payload = json.dumps(payload_dict, sort_keys=True)
+        return hashlib.md5(payload.encode()).hexdigest()[:12]
 
 
 def _make_applied_config(
@@ -117,6 +134,7 @@ def _make_applied_config(
                 agent_retry_initial_delay=config.agent_retry_initial_delay,
                 agent_retry_max_delay=config.agent_retry_max_delay,
                 agent_retry_backoff_factor=config.agent_retry_backoff_factor,
+                agent_request_timeout=config.agent_request_timeout,
                 save_agent_context=config.agent_save_context,
                 save_agent_raw_output=config.agent_save_raw_output,
                 random_state=config.seed,
@@ -124,7 +142,7 @@ def _make_applied_config(
             agentic_attention_variable_forest=AgenticAttentionVariableForestConfig(
                 nuisance_folds=config.nuisance_folds,
                 effect_folds=config.effect_folds,
-                fold_parallelism=config.fold_parallelism,
+                fold_parallelism=config.htr_fold_parallelism or config.fold_parallelism,
             ),
             multi_model_forest_agent_optional=MultiModelForestAgentOptionalConfig(
                 nuisance_folds=config.nuisance_folds,
@@ -136,17 +154,23 @@ def _make_applied_config(
                 top_n_features=config.top_n_features,
                 require_honest_outer_split=config.require_honest_outer_split,
                 outer_parallelism=config.outer_parallelism,
+                outer_parallel_backend=config.outer_parallel_backend,
                 bow_parallel_backend=config.bow_parallel_backend,
                 fold_parallelism=config.fold_parallelism,
-                htr_evidence_enabled=(
-                    selected_methods is None or "htr" in selected_methods
-                ),
+                bow_fold_parallelism=config.bow_fold_parallelism,
+                htr_fold_parallelism=config.htr_fold_parallelism,
+                htr_evidence_enabled=(selected_methods is None or "htr" in selected_methods),
                 htr_evidence_disable_reason=(
                     None
                     if selected_methods is None or "htr" in selected_methods
                     else "disabled by --feature-discovery-methods"
                 ),
                 agentic_explicit_branch_enabled=config.agentic_explicit_branch_enabled,
+                agentic_handoff_enabled=(
+                    config.agentic_handoff_enabled
+                    or config.agentic_explicit_branch_enabled
+                    or config.agentic_explicit_branch_only
+                ),
                 embedding_contrast=EmbeddingContrastDiscoveryConfig(
                     enabled=embedding_enabled,
                     disable_reason=(
@@ -203,6 +227,7 @@ def _make_applied_config(
             extraction_retry_initial_delay=config.extraction_retry_initial_delay,
             extraction_retry_max_delay=config.extraction_retry_max_delay,
             extraction_retry_backoff_factor=config.extraction_retry_backoff_factor,
+            extraction_request_timeout=config.extraction_request_timeout,
             extraction_temperature=config.extraction_temperature,
             extraction_max_tokens=config.extraction_max_tokens,
             extraction_max_text_length=config.extraction_max_text_length,
@@ -216,22 +241,7 @@ def _run_one(
     config: MultiModelForestAgentOptionalOracleConfig,
     output_dir: Path,
 ) -> Dict[str, Any]:
-    parquet_file = _resolve_oracle_parquet_file_for_optional_cache(config)
-    if config.dataset_path != str(parquet_file):
-        logger.info(
-            "Resolved --dataset %s to %s",
-            config.dataset_path,
-            parquet_file,
-        )
-        config.dataset_path = str(parquet_file)
-    normalized_cache_dir = _normalize_embedding_cache_dir_arg(config.embedding_cache_dir)
-    if normalized_cache_dir != config.embedding_cache_dir:
-        logger.info(
-            "Using embedding cache root %s from --embedding-cache-dir %s",
-            normalized_cache_dir,
-            config.embedding_cache_dir,
-        )
-        config.embedding_cache_dir = normalized_cache_dir
+    parquet_file = _normalize_optional_run_inputs(config)
     df = _load_dataset(config, parquet_file)
     applied = _make_applied_config(config, parquet_file)
     run_hash = config.config_hash()
@@ -247,14 +257,11 @@ def _run_one(
     )
     if applied.architecture.multi_model_forest_agent_optional.embedding_contrast.enabled:
         cache_dir = (
-            applied.architecture.multi_model_forest_agent_optional
-            .embedding_contrast
-            .cache_dir
+            applied.architecture.multi_model_forest_agent_optional.embedding_contrast.cache_dir
         )
         logger.info(
             "Embedding contrast cache root: %s",
-            cache_dir
-            or _default_embedding_cache_root_for_parquet(parquet_file),
+            cache_dir or _default_embedding_cache_root_for_parquet(parquet_file),
         )
     run_multi_model_forest_agent_optional(
         df,
@@ -280,6 +287,122 @@ def _run_one(
     if branch_summary.exists():
         with open(branch_summary) as f:
             result["agentic_explicit_branch"] = json.load(f)
+    return result
+
+
+def _normalize_optional_run_inputs(
+    config: MultiModelForestAgentOptionalOracleConfig,
+) -> Path:
+    parquet_file = _resolve_oracle_parquet_file_for_optional_cache(config)
+    if config.dataset_path != str(parquet_file):
+        logger.info(
+            "Resolved --dataset %s to %s",
+            config.dataset_path,
+            parquet_file,
+        )
+        config.dataset_path = str(parquet_file)
+    normalized_cache_dir = _normalize_embedding_cache_dir_arg(config.embedding_cache_dir)
+    if normalized_cache_dir != config.embedding_cache_dir:
+        logger.info(
+            "Using embedding cache root %s from --embedding-cache-dir %s",
+            normalized_cache_dir,
+            config.embedding_cache_dir,
+        )
+        config.embedding_cache_dir = normalized_cache_dir
+    return parquet_file
+
+
+def _agentic_branch_target_hash(config: MultiModelForestAgentOptionalOracleConfig) -> str:
+    if config.existing_config_hash:
+        return str(config.existing_config_hash)
+    primary_config = replace(
+        config,
+        agentic_explicit_branch_enabled=False,
+        agentic_explicit_branch_only=False,
+        existing_config_hash=None,
+    )
+    return primary_config.config_hash()
+
+
+def _merge_existing_result_with_branch(
+    output_dir: Path,
+    result: Dict[str, Any],
+) -> Dict[str, Any]:
+    result_path = output_dir / "results" / f"{result['config_hash']}.json"
+    if not result_path.exists():
+        return result
+    try:
+        with open(result_path, encoding="utf-8") as f:
+            merged = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return result
+    if "agentic_explicit_branch" in result:
+        merged["agentic_explicit_branch"] = result["agentic_explicit_branch"]
+    if "agentic_explicit_branch_metrics" in result:
+        merged["agentic_explicit_branch_metrics"] = result["agentic_explicit_branch_metrics"]
+    merged["agentic_explicit_branch_only_completed"] = True
+    return merged
+
+
+def _run_agentic_explicit_branch_only(
+    config: MultiModelForestAgentOptionalOracleConfig,
+    output_dir: Path,
+) -> Dict[str, Any]:
+    parquet_file = _normalize_optional_run_inputs(config)
+    df = _load_dataset(config, parquet_file)
+    run_hash = _agentic_branch_target_hash(config)
+    prediction_dir = output_dir / "multi_model_forest_agent_optional_predictions" / run_hash
+    prediction_dir.mkdir(parents=True, exist_ok=True)
+    prediction_path = prediction_dir / "predictions.parquet"
+    artifact_dir = prediction_dir / "multi_model_forest_agent_optional"
+
+    if not prediction_path.exists():
+        logger.warning(
+            "Primary optional-forest predictions were not found at %s; running "
+            "the final agentic branch only does not require them.",
+            prediction_path,
+        )
+
+    branch_config = replace(
+        config,
+        agentic_explicit_branch_enabled=True,
+        agentic_explicit_branch_only=False,
+    )
+    applied = _make_applied_config(branch_config, parquet_file)
+    logger.info(
+        "Running final agentic explicit-feature branch only dataset=%s rows=%s hash=%s",
+        config.dataset_name,
+        len(df),
+        run_hash,
+    )
+    runner = MultiModelForestAgentOptionalRunner(
+        df,
+        applied,
+        prediction_path,
+        device=config.htr_device,
+        gpu_ids=config.htr_gpu_ids,
+        num_workers=config.num_workers,
+    )
+    runner._run_optional_agentic_branch()
+
+    result = {
+        **asdict(config),
+        "config_hash": run_hash,
+        "run_mode": "agentic_explicit_branch_only",
+        "prediction_path": str(prediction_path),
+        "artifact_dir": str(artifact_dir),
+    }
+    branch_summary = artifact_dir / "agentic_explicit_branch_summary.json"
+    if branch_summary.exists():
+        with open(branch_summary, encoding="utf-8") as f:
+            branch_summary_data = json.load(f)
+        result["agentic_explicit_branch"] = branch_summary_data
+        branch_prediction_path = Path(branch_summary_data["prediction_path"])
+        if branch_prediction_path.exists():
+            branch_predictions = pd.read_parquet(branch_prediction_path)
+            branch_metrics = _metrics(branch_predictions)
+            result["agentic_explicit_branch_metrics"] = branch_metrics
+            result["metrics"] = branch_metrics
     return result
 
 
@@ -460,16 +583,27 @@ def main() -> None:
     parser.add_argument("--allow-full-data-refit", action="store_true")
     parser.add_argument("--outer-parallelism", default="1")
     parser.add_argument(
+        "--outer-parallel-backend",
+        default="threads",
+        choices=["threads", "processes", "loky"],
+    )
+    parser.add_argument(
         "--bow-parallel-backend",
         default="processes",
-        choices=["processes", "threads"],
+        choices=["processes", "threads", "loky"],
     )
     parser.add_argument("--fold-parallelism", default="auto")
+    parser.add_argument("--bow-fold-parallelism", default=None)
+    parser.add_argument("--htr-fold-parallelism", default=None)
     parser.add_argument("--htr-device", default="cuda:0")
     parser.add_argument("--htr-gpu-ids", type=int, nargs="+", default=None)
 
-    parser.add_argument("--enable-embedding-contrast", dest="embedding_contrast_enabled", action="store_true")
-    parser.add_argument("--disable-embedding-contrast", dest="embedding_contrast_enabled", action="store_false")
+    parser.add_argument(
+        "--enable-embedding-contrast", dest="embedding_contrast_enabled", action="store_true"
+    )
+    parser.add_argument(
+        "--disable-embedding-contrast", dest="embedding_contrast_enabled", action="store_false"
+    )
     parser.set_defaults(embedding_contrast_enabled=True)
     parser.add_argument("--embedding-model-name", default="Qwen/Qwen3-Embedding-8B")
     parser.add_argument("--embedding-cache-dir", default=None)
@@ -487,7 +621,9 @@ def main() -> None:
     parser.add_argument("--embedding-unweighted-pseudo-target", action="store_true")
     parser.add_argument("--embedding-disable-cell-contrasts", action="store_true")
     parser.add_argument("--embedding-disable-confounder-vector-contrast", action="store_true")
-    parser.add_argument("--embedding-disable-residualized-interaction-contrast", action="store_true")
+    parser.add_argument(
+        "--embedding-disable-residualized-interaction-contrast", action="store_true"
+    )
     parser.add_argument("--embedding-disable-orthogonal-r-score-contrasts", action="store_true")
     _append_list_arg(parser, "--embedding-external-cache-dir")
     parser.add_argument("--embedding-external-top-k-chunks-per-tail", type=int, default=12)
@@ -501,9 +637,39 @@ def main() -> None:
     parser.add_argument("--cf-no-inference", action="store_true")
 
     parser.add_argument("--enable-agentic-explicit-branch", action="store_true")
+    parser.add_argument(
+        "--prepare-agentic-handoff",
+        action="store_true",
+        help=(
+            "After the primary optional forest, precompute the agent-visible "
+            "BoW/HTR/embedding evidence needed for a later "
+            "--agentic-explicit-branch-only run."
+        ),
+    )
+    parser.add_argument(
+        "--agentic-explicit-branch-only",
+        action="store_true",
+        help=(
+            "Run only the final agentic explicit-feature branch and write it under "
+            "the matching no-agent optional-forest run hash."
+        ),
+    )
+    parser.add_argument(
+        "--existing-config-hash",
+        default=None,
+        help=(
+            "Optional existing optional-forest run hash to target with "
+            "--agentic-explicit-branch-only."
+        ),
+    )
     parser.add_argument("--candidate-proposals-per-fold", type=int, default=30)
     parser.add_argument("--min-feature-coverage", type=float, default=0.70)
-    parser.add_argument("--agent-server-url", "--agent-server-urls", dest="agent_server_url", default="http://localhost:8000/v1")
+    parser.add_argument(
+        "--agent-server-url",
+        "--agent-server-urls",
+        dest="agent_server_url",
+        default="http://localhost:8000/v1",
+    )
     parser.add_argument("--agent-model-name", default="auto")
     parser.add_argument("--agent-api-key", default="EMPTY")
     parser.add_argument("--agent-max-tokens", type=int, default=25000)
@@ -511,23 +677,37 @@ def main() -> None:
     parser.add_argument("--agent-retry-initial-delay", type=float, default=1.0)
     parser.add_argument("--agent-retry-max-delay", type=float, default=30.0)
     parser.add_argument("--agent-retry-backoff-factor", type=float, default=2.0)
+    parser.add_argument("--agent-request-timeout", type=float, default=900.0)
     parser.add_argument("--agent-save-context", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--agent-save-raw-output", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--extraction-server-url", "--extraction-server-urls", dest="extraction_server_url", default="http://localhost:8000/v1")
+    parser.add_argument(
+        "--agent-save-raw-output", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument(
+        "--extraction-server-url",
+        "--extraction-server-urls",
+        dest="extraction_server_url",
+        default="http://localhost:8000/v1",
+    )
     parser.add_argument("--extraction-model-name", default="auto")
-    parser.add_argument("--extraction-mode", default="server", choices=["server", "start_server", "python_api"])
+    parser.add_argument(
+        "--extraction-mode", default="server", choices=["server", "start_server", "python_api"]
+    )
     parser.add_argument("--extraction-reasoning-parser", default="auto")
     parser.add_argument("--extraction-batch-size", type=int, default=100)
     parser.add_argument("--extraction-max-retries", type=int, default=3)
     parser.add_argument("--extraction-retry-initial-delay", type=float, default=1.0)
     parser.add_argument("--extraction-retry-max-delay", type=float, default=30.0)
     parser.add_argument("--extraction-retry-backoff-factor", type=float, default=2.0)
+    parser.add_argument("--extraction-request-timeout", type=float, default=900.0)
     parser.add_argument("--extraction-max-tokens", type=int, default=25000)
     parser.add_argument("--extraction-max-text-length", type=int, default=400000)
     parser.add_argument("--extraction-cache-dir", default=None)
     parser.add_argument("--no-extraction-cache", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+
+    if args.existing_config_hash and not args.agentic_explicit_branch_only:
+        parser.error("--existing-config-hash only applies with --agentic-explicit-branch-only")
 
     logging.getLogger().setLevel(logging.DEBUG if args.verbose else logging.INFO)
     if not args.verbose:
@@ -561,8 +741,11 @@ def main() -> None:
         prespecified_features_json=args.prespecified_features_json,
         require_honest_outer_split=not args.allow_full_data_refit,
         outer_parallelism=args.outer_parallelism,
+        outer_parallel_backend=args.outer_parallel_backend,
         bow_parallel_backend=args.bow_parallel_backend,
         fold_parallelism=args.fold_parallelism,
+        bow_fold_parallelism=args.bow_fold_parallelism,
+        htr_fold_parallelism=args.htr_fold_parallelism,
         htr_device=args.htr_device,
         htr_gpu_ids=args.htr_gpu_ids,
         embedding_contrast_enabled=args.embedding_contrast_enabled,
@@ -600,6 +783,9 @@ def main() -> None:
         cf_max_features=args.cf_max_features,
         cf_inference=not args.cf_no_inference,
         agentic_explicit_branch_enabled=args.enable_agentic_explicit_branch,
+        agentic_explicit_branch_only=args.agentic_explicit_branch_only,
+        agentic_handoff_enabled=args.prepare_agentic_handoff,
+        existing_config_hash=args.existing_config_hash,
         candidate_proposals_per_fold=args.candidate_proposals_per_fold,
         min_feature_coverage=args.min_feature_coverage,
         agent_server_url=args.agent_server_url,
@@ -610,6 +796,7 @@ def main() -> None:
         agent_retry_initial_delay=args.agent_retry_initial_delay,
         agent_retry_max_delay=args.agent_retry_max_delay,
         agent_retry_backoff_factor=args.agent_retry_backoff_factor,
+        agent_request_timeout=args.agent_request_timeout,
         agent_save_context=args.agent_save_context,
         agent_save_raw_output=args.agent_save_raw_output,
         extraction_server_url=args.extraction_server_url,
@@ -621,6 +808,7 @@ def main() -> None:
         extraction_retry_initial_delay=args.extraction_retry_initial_delay,
         extraction_retry_max_delay=args.extraction_retry_max_delay,
         extraction_retry_backoff_factor=args.extraction_retry_backoff_factor,
+        extraction_request_timeout=args.extraction_request_timeout,
         extraction_max_tokens=args.extraction_max_tokens,
         extraction_max_text_length=args.extraction_max_text_length,
         extraction_cache_enabled=not args.no_extraction_cache,
@@ -628,9 +816,17 @@ def main() -> None:
     )
 
     try:
-        result = _run_one(config, output_dir)
+        if config.agentic_explicit_branch_only:
+            result = _run_agentic_explicit_branch_only(config, output_dir)
+            result = _merge_existing_result_with_branch(output_dir, result)
+        else:
+            result = _run_one(config, output_dir)
         _append_results(output_dir, [result])
-        logger.info("Completed multi-model optional-agent forest: %s", result["metrics"])
+        logger.info(
+            "Completed multi-model optional-agent forest run mode=%s metrics=%s",
+            ("agentic_explicit_branch_only" if config.agentic_explicit_branch_only else "full"),
+            result.get("metrics") or result.get("agentic_explicit_branch_metrics"),
+        )
     except Exception:
         logger.error("Multi-model optional-agent forest run failed")
         traceback.print_exc()

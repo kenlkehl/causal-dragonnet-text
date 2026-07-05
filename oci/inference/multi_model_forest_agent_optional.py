@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -56,6 +57,7 @@ from .multi_model_agentic_forest import (
     _align_htr_prediction_frame,
     _binary_split_items,
     _bounded_fold_count,
+    build_multi_model_agentic_discovery_handoff,
     _fit_binary_bow_fold,
     _fit_regression_bow_fold,
     _fit_regressor,
@@ -66,6 +68,7 @@ from .multi_model_agentic_forest import (
     _make_bow_vectorizer,
     _normalize_texts,
     _split_is_honest,
+    run_multi_model_agentic_forest_from_handoff,
     _write_json,
     _write_jsonl,
 )
@@ -85,6 +88,52 @@ class _FeatureBundle:
     prediction_frames: List[pd.DataFrame]
     embedding_rows: List[Dict[str, Any]]
     metrics: Dict[str, Any]
+
+
+def _run_optional_outer_fold_job(
+    *,
+    dataset: pd.DataFrame,
+    config: AppliedInferenceConfig,
+    output_path: Path,
+    outer_fold: int,
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+    device: str,
+    gpu_ids: Optional[Sequence[int]],
+    num_workers: int,
+    htr_dataloader_workers: Optional[int] = None,
+) -> Dict[str, Any]:
+    previous_dataloader_workers = os.environ.get("OCI_AVF_DATALOADER_WORKERS")
+    if htr_dataloader_workers is not None:
+        os.environ["OCI_AVF_DATALOADER_WORKERS"] = str(max(0, int(htr_dataloader_workers)))
+    fold_runner = MultiModelForestAgentOptionalRunner(
+        dataset=dataset.drop(columns=["_oci_row_id"], errors="ignore"),
+        config=copy.deepcopy(config),
+        output_path=output_path,
+        device=torch.device(device),
+        gpu_ids=gpu_ids,
+        num_workers=num_workers,
+    )
+    try:
+        predictions = fold_runner._run_one_analysis_split(
+            outer_fold=outer_fold,
+            train_idx=train_idx,
+            test_idx=test_idx,
+        )
+        return {
+            "outer_fold": int(outer_fold),
+            "predictions": predictions,
+            "feature_manifest_rows": fold_runner.feature_manifest_rows,
+            "source_prediction_frames": fold_runner.source_prediction_frames,
+            "embedding_feature_rows": fold_runner.embedding_feature_rows,
+            "outer_metric_rows": fold_runner.outer_metric_rows,
+        }
+    finally:
+        if htr_dataloader_workers is not None:
+            if previous_dataloader_workers is None:
+                os.environ.pop("OCI_AVF_DATALOADER_WORKERS", None)
+            else:
+                os.environ["OCI_AVF_DATALOADER_WORKERS"] = previous_dataloader_workers
 
 
 def run_multi_model_forest_agent_optional(
@@ -281,6 +330,7 @@ class MultiModelForestAgentOptionalRunner:
         # Existing embedding and optional agentic code reads the old config slot.
         # Mirror the new config there so shared components use the same settings.
         config.architecture.multi_model_agentic_forest = self.nn_config
+        self._sync_htr_fold_parallelism()
         self.cf_config: ExplicitFeatureForestConfig = getattr(
             config.architecture,
             "explicit_feature_forest",
@@ -317,32 +367,70 @@ class MultiModelForestAgentOptionalRunner:
 
         if outer_n_jobs > 1:
             outer_devices = self._outer_devices(outer_n_jobs)
+            outer_backend = self._outer_backend_name()
+            inner_workers = self._inner_workers_for_outer_job(outer_n_jobs)
             logger.info(
                 "Running %s multi-model optional-agent outer folds with "
-                "outer_parallelism=%s devices=%s",
+                "outer_parallelism=%s outer_backend=%s inner_workers_per_outer=%s "
+                "devices=%s bow_fold_parallelism=%s htr_fold_parallelism=%s",
                 len(splits),
                 outer_n_jobs,
+                outer_backend,
+                inner_workers,
                 [str(device) for device in outer_devices],
+                self._bow_fold_parallelism_setting(),
+                self._htr_fold_parallelism_setting(),
             )
-            with ThreadPoolExecutor(
-                max_workers=outer_n_jobs,
-                thread_name_prefix="mm-optional-outer",
-            ) as executor:
-                futures = [
-                    executor.submit(
-                        self._run_one_analysis_split_isolated,
+            if outer_backend == "threads":
+                with ThreadPoolExecutor(
+                    max_workers=outer_n_jobs,
+                    thread_name_prefix="mm-optional-outer",
+                ) as executor:
+                    futures = [
+                        executor.submit(
+                            self._run_one_analysis_split_isolated,
+                            outer_fold=int(outer_fold),
+                            train_idx=np.asarray(train_idx, dtype=int),
+                            test_idx=np.asarray(test_idx, dtype=int),
+                            device=outer_devices[(task_index - 1) % len(outer_devices)],
+                            outer_n_jobs=outer_n_jobs,
+                        )
+                        for task_index, (outer_fold, train_idx, test_idx) in enumerate(
+                            splits,
+                            start=1,
+                        )
+                    ]
+                    fold_results = [future.result() for future in futures]
+            else:
+                fold_results = Parallel(
+                    n_jobs=outer_n_jobs,
+                    backend="loky",
+                    batch_size=1,
+                    pre_dispatch="all",
+                )(
+                    delayed(_run_optional_outer_fold_job)(
+                        dataset=self.dataset,
+                        config=self.config,
+                        output_path=self.output_path,
                         outer_fold=int(outer_fold),
                         train_idx=np.asarray(train_idx, dtype=int),
                         test_idx=np.asarray(test_idx, dtype=int),
-                        device=outer_devices[(task_index - 1) % len(outer_devices)],
-                        outer_n_jobs=outer_n_jobs,
+                        device=str(outer_devices[(task_index - 1) % len(outer_devices)]),
+                        gpu_ids=(
+                            [int(outer_devices[(task_index - 1) % len(outer_devices)].index)]
+                            if outer_devices[(task_index - 1) % len(outer_devices)].type == "cuda"
+                            and outer_devices[(task_index - 1) % len(outer_devices)].index
+                            is not None
+                            else None
+                        ),
+                        num_workers=inner_workers,
+                        htr_dataloader_workers=0,
                     )
                     for task_index, (outer_fold, train_idx, test_idx) in enumerate(
                         splits,
                         start=1,
                     )
-                ]
-                fold_results = [future.result() for future in futures]
+                )
             fold_results = sorted(fold_results, key=lambda item: item["outer_fold"])
             prediction_frames = [item["predictions"] for item in fold_results]
             for item in fold_results:
@@ -372,6 +460,12 @@ class MultiModelForestAgentOptionalRunner:
         self.prediction_results = results_df
         self._save_outputs(results_df)
 
+        if bool(
+            getattr(self.nn_config, "agentic_handoff_enabled", False)
+            or getattr(self.nn_config, "agentic_explicit_branch_enabled", False)
+        ):
+            self._prepare_agentic_handoff()
+
         if bool(getattr(self.nn_config, "agentic_explicit_branch_enabled", False)):
             self._run_optional_agentic_branch()
 
@@ -394,27 +488,18 @@ class MultiModelForestAgentOptionalRunner:
         gpu_ids = None
         if device.type == "cuda" and device.index is not None:
             gpu_ids = [int(device.index)]
-        fold_runner = MultiModelForestAgentOptionalRunner(
-            dataset=self.dataset.drop(columns=["_oci_row_id"], errors="ignore"),
-            config=copy.deepcopy(self.config),
+        return _run_optional_outer_fold_job(
+            dataset=self.dataset,
+            config=self.config,
             output_path=self.output_path,
-            device=device,
-            gpu_ids=gpu_ids,
-            num_workers=self._inner_workers_for_outer_job(outer_n_jobs),
-        )
-        predictions = fold_runner._run_one_analysis_split(
             outer_fold=outer_fold,
             train_idx=train_idx,
             test_idx=test_idx,
+            device=str(device),
+            gpu_ids=gpu_ids,
+            num_workers=self._inner_workers_for_outer_job(outer_n_jobs),
+            htr_dataloader_workers=None,
         )
-        return {
-            "outer_fold": int(outer_fold),
-            "predictions": predictions,
-            "feature_manifest_rows": fold_runner.feature_manifest_rows,
-            "source_prediction_frames": fold_runner.source_prediction_frames,
-            "embedding_feature_rows": fold_runner.embedding_feature_rows,
-            "outer_metric_rows": fold_runner.outer_metric_rows,
-        }
 
     def _analysis_splits(self) -> List[Tuple[int, np.ndarray, np.ndarray]]:
         if self.config.cv_folds > 1:
@@ -1056,6 +1141,17 @@ class MultiModelForestAgentOptionalRunner:
         )
         vectorizer_params = _vectorizer_params(view)
         model_params = _model_params(view)
+        n_jobs = self._fold_n_jobs(len(split_items))
+        logger.info(
+            "Outer fold %s BoW binary %s view=%s model=%s folds=%s n_jobs=%s " "backend=%s",
+            outer_fold,
+            label_name,
+            view.name,
+            view.bow_model,
+            len(split_items),
+            n_jobs,
+            self._parallel_backend_name(),
+        )
 
         def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
             return _fit_binary_bow_fold(
@@ -1100,17 +1196,35 @@ class MultiModelForestAgentOptionalRunner:
         values = np.asarray(values, dtype=float)
         oof = np.full(len(values), np.nan, dtype=float)
         folds = _bounded_fold_count(
-            int(self.nn_config.effect_folds if "effect" in target_name else self.nn_config.nuisance_folds),
+            int(
+                self.nn_config.effect_folds
+                if "effect" in target_name
+                else self.nn_config.nuisance_folds
+            ),
             len(values),
         )
         splitter = KFold(
             n_splits=folds,
             shuffle=True,
-            random_state=13_000 + int(seed_offset) + 100 * int(outer_fold) + 1_000 * int(view_index),
+            random_state=13_000
+            + int(seed_offset)
+            + 100 * int(outer_fold)
+            + 1_000 * int(view_index),
         )
         split_items = list(enumerate(splitter.split(texts_train), start=1))
         vectorizer_params = _vectorizer_params(view)
         model_params = _model_params(view)
+        n_jobs = self._fold_n_jobs(len(split_items))
+        logger.info(
+            "Outer fold %s BoW regression %s view=%s model=%s folds=%s n_jobs=%s " "backend=%s",
+            outer_fold,
+            target_name,
+            view.name,
+            view.bow_model,
+            len(split_items),
+            n_jobs,
+            self._parallel_backend_name(),
+        )
 
         def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
             return _fit_regression_bow_fold(
@@ -1129,7 +1243,9 @@ class MultiModelForestAgentOptionalRunner:
         vectorizer = _make_bow_vectorizer(vectorizer_params)
         x_train = vectorizer.fit_transform(texts_train)
         x_test = vectorizer.transform(texts_test)
-        model = _make_bow_regressor(model_params, random_state=217 + int(seed_offset) + int(view_index))
+        model = _make_bow_regressor(
+            model_params, random_state=217 + int(seed_offset) + int(view_index)
+        )
         _fit_regressor(model, x_train, values, sample_weight=sample_weight)
         return oof, model.predict(x_test)
 
@@ -1273,7 +1389,11 @@ class MultiModelForestAgentOptionalRunner:
             patient_embeddings,
             pseudo_labels,
             pseudo_mask & finite,
-            pseudo_weights if bool(self.nn_config.embedding_contrast.pseudo_target_weighted) else None,
+            (
+                pseudo_weights
+                if bool(self.nn_config.embedding_contrast.pseudo_target_weighted)
+                else None
+            ),
         )
         if pseudo_direction is not None:
             self._add_embedding_direction(
@@ -1441,10 +1561,9 @@ class MultiModelForestAgentOptionalRunner:
             local_mask = cluster_mask & treatment_mask & finite
             pos = local_mask & (treatment_labels == 1)
             neg = local_mask & (treatment_labels == 0)
-            if (
-                int(np.sum(pos)) >= int(cfg.cluster_contrast_min_group_size)
-                and int(np.sum(neg)) >= int(cfg.cluster_contrast_min_group_size)
-            ):
+            if int(np.sum(pos)) >= int(cfg.cluster_contrast_min_group_size) and int(
+                np.sum(neg)
+            ) >= int(cfg.cluster_contrast_min_group_size):
                 direction = np.mean(patient_embeddings[pos], axis=0) - np.mean(
                     patient_embeddings[neg],
                     axis=0,
@@ -1513,12 +1632,15 @@ class MultiModelForestAgentOptionalRunner:
         untreated_positive = base & (treatment_labels == 0) & (outcome_labels == 1)
         untreated_negative = base & (treatment_labels == 0) & (outcome_labels == 0)
         min_cell = int(self.nn_config.embedding_contrast.cluster_contrast_min_cell_size)
-        if min(
-            int(np.sum(treated_positive)),
-            int(np.sum(treated_negative)),
-            int(np.sum(untreated_positive)),
-            int(np.sum(untreated_negative)),
-        ) < min_cell:
+        if (
+            min(
+                int(np.sum(treated_positive)),
+                int(np.sum(treated_negative)),
+                int(np.sum(untreated_positive)),
+                int(np.sum(untreated_negative)),
+            )
+            < min_cell
+        ):
             return None
         raw = (
             np.mean(patient_embeddings[treated_positive], axis=0)
@@ -1626,12 +1748,15 @@ class MultiModelForestAgentOptionalRunner:
         treated_negative = base & (treatment_labels == 1) & (outcome_labels == 0)
         untreated_positive = base & (treatment_labels == 0) & (outcome_labels == 1)
         untreated_negative = base & (treatment_labels == 0) & (outcome_labels == 0)
-        if min(
-            int(np.sum(treated_positive)),
-            int(np.sum(treated_negative)),
-            int(np.sum(untreated_positive)),
-            int(np.sum(untreated_negative)),
-        ) < 2:
+        if (
+            min(
+                int(np.sum(treated_positive)),
+                int(np.sum(treated_negative)),
+                int(np.sum(untreated_positive)),
+                int(np.sum(untreated_negative)),
+            )
+            < 2
+        ):
             return None
         raw = (
             np.mean(patient_embeddings[treated_positive], axis=0)
@@ -1701,14 +1826,46 @@ class MultiModelForestAgentOptionalRunner:
         if self.htr_evidence_provider is not None:
             return self.htr_evidence_provider
         if self._default_htr_provider is None:
+            htr_num_workers = 0 if self._outer_backend_name() == "processes" else self.num_workers
             self._default_htr_provider = MultiModelOptionalHTRProvider(
                 config=self.config,
                 output_dir=self.artifact_dir,
                 device=self.device,
                 gpu_ids=self.gpu_ids,
-                num_workers=self.num_workers,
+                num_workers=htr_num_workers,
             )
         return self._default_htr_provider
+
+    def _sync_htr_fold_parallelism(self) -> None:
+        htr_setting = self._htr_fold_parallelism_setting()
+        avf_config = getattr(self.config.architecture, "agentic_attention_variable_forest", None)
+        if avf_config is None:
+            avf_config = AgenticAttentionVariableForestConfig()
+            self.config.architecture.agentic_attention_variable_forest = avf_config
+        avf_config.fold_parallelism = str(htr_setting)
+
+    def _outer_backend_name(self) -> str:
+        backend = str(getattr(self.nn_config, "outer_parallel_backend", "threads")).strip().lower()
+        if backend == "loky":
+            backend = "processes"
+        if backend not in {"threads", "processes"}:
+            raise ValueError(
+                "multi_model_forest_agent_optional.outer_parallel_backend must be "
+                "'threads', 'processes', or 'loky'"
+            )
+        return backend
+
+    def _bow_fold_parallelism_setting(self) -> str:
+        setting = getattr(self.nn_config, "bow_fold_parallelism", None)
+        if setting is None:
+            setting = self.nn_config.fold_parallelism
+        return str(setting).strip().lower()
+
+    def _htr_fold_parallelism_setting(self) -> str:
+        setting = getattr(self.nn_config, "htr_fold_parallelism", None)
+        if setting is None:
+            setting = self.nn_config.fold_parallelism
+        return str(setting).strip().lower()
 
     def _parallel_n_jobs(self, setting: Any, tasks: int, *, auto_workers: int) -> int:
         if tasks <= 0:
@@ -1738,7 +1895,7 @@ class MultiModelForestAgentOptionalRunner:
 
     def _fold_n_jobs(self, folds: int) -> int:
         return self._parallel_n_jobs(
-            self.nn_config.fold_parallelism,
+            self._bow_fold_parallelism_setting(),
             folds,
             auto_workers=self.num_workers,
         )
@@ -1770,7 +1927,10 @@ class MultiModelForestAgentOptionalRunner:
         metric_frame = pd.DataFrame(self.outer_metric_rows)
         metric_frame.to_csv(self.artifact_dir / "outer_cv_metrics.csv", index=False)
         _write_jsonl(self.artifact_dir / "feature_manifest.jsonl", self.feature_manifest_rows)
-        _write_jsonl(self.artifact_dir / "embedding_contrast_feature_vectors.jsonl", self.embedding_feature_rows)
+        _write_jsonl(
+            self.artifact_dir / "embedding_contrast_feature_vectors.jsonl",
+            self.embedding_feature_rows,
+        )
         _write_jsonl(self.artifact_dir / "split_provenance.jsonl", self.split_provenance_rows)
         if self.source_prediction_frames:
             pd.concat(self.source_prediction_frames, ignore_index=True).to_parquet(
@@ -1793,23 +1953,55 @@ class MultiModelForestAgentOptionalRunner:
         (self.artifact_dir / "report.txt").write_text("\n".join(report) + "\n")
         logger.info("Multi-model optional-agent forest predictions saved to: %s", self.output_path)
 
+    def _agentic_handoff_path(self) -> Path:
+        return self.artifact_dir / "agentic_handoff.jsonl"
+
+    def _prepare_agentic_handoff(self) -> Path:
+        handoff_path = self._agentic_handoff_path()
+        logger.info(
+            "Preparing multi-model agentic discovery handoff at: %s",
+            handoff_path,
+        )
+        build_multi_model_agentic_discovery_handoff(
+            self.dataset.drop(columns=["_oci_row_id"], errors="ignore"),
+            self.config,
+            handoff_path,
+            device=self.device,
+            gpu_ids=self.gpu_ids,
+            num_workers=self.num_workers,
+            include_candidate_consistency=True,
+        )
+        return handoff_path
+
     def _run_optional_agentic_branch(self) -> None:
         logger.info("Running optional final agentic explicit-feature branch")
-        from .multi_model_agentic_forest import run_multi_model_agentic_forest
 
+        handoff_path = self._agentic_handoff_path()
+        if not handoff_path.exists():
+            raise RuntimeError(
+                "Cannot run optional final agentic explicit-feature branch because "
+                f"the discovery handoff is missing: {handoff_path}. Rerun the "
+                "primary optional forest with --prepare-agentic-handoff."
+            )
         branch_dir = self.artifact_dir / "agentic_explicit_branch"
         branch_dir.mkdir(parents=True, exist_ok=True)
         branch_prediction_path = branch_dir / "agentic_explicit_feature_predictions.parquet"
-        run_multi_model_agentic_forest(
+        run_multi_model_agentic_forest_from_handoff(
             self.dataset.drop(columns=["_oci_row_id"], errors="ignore"),
             self.config,
             branch_prediction_path,
+            handoff_path,
             device=self.device,
             gpu_ids=self.gpu_ids,
             num_workers=self.num_workers,
         )
-        summary = {"prediction_path": str(branch_prediction_path)}
-        artifact_metrics = branch_prediction_path.parent / "multi_model_agentic_forest" / "outer_cv_metrics.csv"
+        summary = {
+            "prediction_path": str(branch_prediction_path),
+            "agentic_handoff_path": str(handoff_path),
+        }
+        artifact_metrics = (
+            branch_prediction_path.parent / "multi_model_agentic_forest" / "outer_cv_metrics.csv"
+        )
         if artifact_metrics.exists():
             summary["outer_cv_metrics_path"] = str(artifact_metrics)
         _write_json(self.artifact_dir / "agentic_explicit_branch_summary.json", summary)
@@ -1887,7 +2079,9 @@ def _column_matrix(cols: Sequence[np.ndarray], n_rows: int) -> np.ndarray:
     return np.column_stack([np.asarray(col, dtype=np.float32).reshape(n_rows) for col in cols])
 
 
-def _clean_train_test_matrices(train: np.ndarray, test: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def _clean_train_test_matrices(
+    train: np.ndarray, test: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
     train = np.asarray(train, dtype=np.float32)
     test = np.asarray(test, dtype=np.float32)
     if train.shape[1] == 0:

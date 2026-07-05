@@ -138,7 +138,9 @@ def test_apply_proposals_add_remove_and_update_role():
             description="Baseline ECOG performance status",
         ),
         AgenticFeatureProposal(action="remove", name="pdl1"),
-        AgenticFeatureProposal(action="update_role", name="age", roles=["confounder", "effect_modifier"]),
+        AgenticFeatureProposal(
+            action="update_role", name="age", roles=["confounder", "effect_modifier"]
+        ),
     ]
 
     updated = apply_proposals(specs, proposals)
@@ -386,20 +388,24 @@ def test_agentic_vllm_wrapper_adds_autodetected_reasoning_parser():
     assert gemma_cmd[gemma_cmd.index("--reasoning-parser") + 1] == "gemma4"
     assert "--reasoning-parser" not in unknown_cmd
 
-    cleaned, parsed_settings = _extract_wrapper_vllm_args([
-        "runner.py",
-        "--vllm-reasoning-parser",
-        "qwen3",
-    ])
+    cleaned, parsed_settings = _extract_wrapper_vllm_args(
+        [
+            "runner.py",
+            "--vllm-reasoning-parser",
+            "qwen3",
+        ]
+    )
 
     assert parsed_settings["reasoning_parser"] == "qwen3"
     assert cleaned[-2:] == ["--agentic-extraction-reasoning-parser", "qwen3"]
 
-    parsed_settings = _extract_wrapper_vllm_args([
-        "runner.py",
-        "--vllm-quantization",
-        "modelopt",
-    ])[1]
+    parsed_settings = _extract_wrapper_vllm_args(
+        [
+            "runner.py",
+            "--vllm-quantization",
+            "modelopt",
+        ]
+    )[1]
     quantized_cmd = _vllm_cmd(
         server_url="http://localhost:8000/v1",
         model_name="nvidia/Qwen3.6-35B-A3B-NVFP4",
@@ -409,33 +415,48 @@ def test_agentic_vllm_wrapper_adds_autodetected_reasoning_parser():
 
     assert quantized_cmd[quantized_cmd.index("--quantization") + 1] == "modelopt"
 
-    expanded = _with_expanded_agentic_defaults([
-        "runner.py",
-        "--agentic-vllm-model-name",
-        "legacy/extraction-model",
-    ])
+    expanded = _with_expanded_agentic_defaults(
+        [
+            "runner.py",
+            "--agentic-vllm-model-name",
+            "legacy/extraction-model",
+        ]
+    )
 
     assert "--agentic-extraction-model-name" not in expanded
-    assert _option_value(
-        expanded[1:],
-        "--agentic-agent-model-name",
-    ) == "legacy/extraction-model"
-    assert _extract_wrapper_vllm_args([
-        "runner.py",
-        "--agentic-extraction-reasoning-parser",
-        "gemma4",
-    ])[1]["reasoning_parser"] == "gemma4"
+    assert (
+        _option_value(
+            expanded[1:],
+            "--agentic-agent-model-name",
+        )
+        == "legacy/extraction-model"
+    )
+    assert (
+        _extract_wrapper_vllm_args(
+            [
+                "runner.py",
+                "--agentic-extraction-reasoning-parser",
+                "gemma4",
+            ]
+        )[1]["reasoning_parser"]
+        == "gemma4"
+    )
 
-    expanded_from_agent = _with_expanded_agentic_defaults([
-        "runner.py",
-        "--agentic-agent-model-name",
-        "shared/model",
-    ])
+    expanded_from_agent = _with_expanded_agentic_defaults(
+        [
+            "runner.py",
+            "--agentic-agent-model-name",
+            "shared/model",
+        ]
+    )
 
-    assert _option_value(
-        expanded_from_agent[1:],
-        "--agentic-extraction-model-name",
-    ) == "shared/model"
+    assert (
+        _option_value(
+            expanded_from_agent[1:],
+            "--agentic-extraction-model-name",
+        )
+        == "shared/model"
+    )
 
     with pytest.raises(ValueError, match="shared local vLLM server"):
         _start_local_vllm_servers(
@@ -642,9 +663,7 @@ def test_agentic_extraction_provider_resumes_from_row_cache(
             data = {}
             for spec in self.specs:
                 value_col = f"explicit_feat_{spec.name}"
-                data[value_col] = [
-                    float(str(text).replace("note ", "")) for text in texts
-                ]
+                data[value_col] = [float(str(text).replace("note ", "")) for text in texts]
                 data[f"{value_col}_missing"] = [False] * len(texts)
             return pd.DataFrame(data)
 
@@ -830,9 +849,7 @@ class FakeOpenAIModels:
 
     def list(self):
         self.calls += 1
-        return SimpleNamespace(
-            data=[SimpleNamespace(id=model_id) for model_id in self.model_ids]
-        )
+        return SimpleNamespace(data=[SimpleNamespace(id=model_id) for model_id in self.model_ids])
 
 
 class FakeOpenAIClient:
@@ -930,9 +947,7 @@ def test_openai_agent_retries_next_server(monkeypatch):
 
     class FakeOpenAI:
         def __init__(self, **kwargs):
-            self.chat = SimpleNamespace(
-                completions=FakeCompletions(kwargs["base_url"])
-            )
+            self.chat = SimpleNamespace(completions=FakeCompletions(kwargs["base_url"]))
             self.models = FakeOpenAIModels(["unused-model"])
 
     monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
@@ -952,6 +967,30 @@ def test_openai_agent_retries_next_server(monkeypatch):
 
     assert proposals == []
     assert calls == ["http://server-a/v1", "http://server-b/v1"]
+
+
+def test_openai_agent_client_uses_request_timeout(monkeypatch):
+    calls = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            calls.update(kwargs)
+            self.chat = SimpleNamespace(completions=SimpleNamespace())
+            self.models = FakeOpenAIModels(["unused-model"])
+
+    monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
+    agent = OpenAICompatibleFeatureSearchAgent(
+        AgenticFeatureSearchConfig(
+            agent_server_url="http://server-a/v1",
+            agent_request_timeout=123.0,
+        )
+    )
+
+    agent._ensure_client()
+    agent._client_pool.client_for_url("http://server-a/v1")
+
+    assert calls["timeout"] == 123.0
+    assert calls["max_retries"] == 0
 
 
 def test_openai_agent_repairs_missing_required_proposal_fields():
@@ -1323,9 +1362,7 @@ class BroadCandidateAgent:
 class BroadScreenEvaluator:
     def evaluate_split(self, train_df, test_df, specs, fold_id):
         names = {spec.name for spec in specs}
-        selected_signal_count = int("strong_confounder" in names) + int(
-            "strong_modifier" in names
-        )
+        selected_signal_count = int("strong_confounder" in names) + int("strong_modifier" in names)
         r_loss = 1.0 - 0.30 * selected_signal_count
         predictions = test_df.copy()
         predictions["pred_ite_prob"] = 0.0
@@ -1356,9 +1393,7 @@ class CountingSourceExtractionProvider:
     def ensure_features(self, dataset, specs):
         dataset = dataset.copy()
         missing_specs = [
-            spec
-            for spec in specs
-            if f"explicit_feat_{spec.name}" not in dataset.columns
+            spec for spec in specs if f"explicit_feat_{spec.name}" not in dataset.columns
         ]
         if missing_specs:
             self.calls.append([spec.name for spec in missing_specs])
@@ -1648,10 +1683,7 @@ def test_agentic_runner_accepts_inner_cv_improvement_without_true_ite_leakage(tm
 
     assert len(results) == len(df)
     assert "hidden_modifier" in selected_names
-    assert all(
-        context["clinical_question"] == clinical_question
-        for context in agent.contexts
-    )
+    assert all(context["clinical_question"] == clinical_question for context in agent.contexts)
     assert all(
         context["estimand"]
         == {
@@ -1663,8 +1695,8 @@ def test_agentic_runner_accepts_inner_cv_improvement_without_true_ite_leakage(tm
     )
     assert all("true_ite" not in json.dumps(context) for context in agent.contexts)
     decision_lines = (
-        tmp_path / "agentic_feature_search" / "agent_decisions.jsonl"
-    ).read_text().splitlines()
+        (tmp_path / "agentic_feature_search" / "agent_decisions.jsonl").read_text().splitlines()
+    )
     persisted_contexts = [
         json.loads(line)["payload"].get("context", {})
         for line in decision_lines
@@ -1740,8 +1772,8 @@ def test_agentic_runner_checks_coverage_only_for_proposed_features(tmp_path):
         for feature in row["features"]
     }
     decision_lines = (
-        tmp_path / "agentic_feature_search" / "agent_decisions.jsonl"
-    ).read_text().splitlines()
+        (tmp_path / "agentic_feature_search" / "agent_decisions.jsonl").read_text().splitlines()
+    )
     candidate_payloads = [
         json.loads(line)["payload"]
         for line in decision_lines
@@ -1810,8 +1842,8 @@ def test_agentic_runner_can_persist_raw_agent_output_when_enabled(tmp_path):
     )
 
     decision_lines = (
-        tmp_path / "agentic_feature_search" / "agent_decisions.jsonl"
-    ).read_text().splitlines()
+        (tmp_path / "agentic_feature_search" / "agent_decisions.jsonl").read_text().splitlines()
+    )
     proposal_payloads = [
         json.loads(line)["payload"]
         for line in decision_lines
@@ -1824,9 +1856,7 @@ def test_agentic_runner_can_persist_raw_agent_output_when_enabled(tmp_path):
         assert payload["raw_proposals"][0]["name"] == "hidden_modifier"
         trace = payload["agent_raw_output"]
         assert "I considered baseline variables first." in trace["raw_content"]
-        assert trace["reasoning_content"] == (
-            "Baseline hidden modifier should improve tau signal."
-        )
+        assert trace["reasoning_content"] == ("Baseline hidden modifier should improve tau signal.")
 
 
 def test_agentic_runner_feeds_rejection_reasons_to_next_iteration(tmp_path):
@@ -1877,9 +1907,7 @@ def test_agentic_runner_feeds_rejection_reasons_to_next_iteration(tmp_path):
         evaluator=RejectThenAcceptEvaluator(),
     )
 
-    second_iteration_contexts = [
-        context for context in agent.contexts if context["iteration"] == 2
-    ]
+    second_iteration_contexts = [context for context in agent.contexts if context["iteration"] == 2]
     assert second_iteration_contexts
     for context in second_iteration_contexts:
         weak_feedback = [
@@ -1890,8 +1918,7 @@ def test_agentic_runner_feeds_rejection_reasons_to_next_iteration(tmp_path):
         assert weak_feedback
         assert weak_feedback[-1]["status"] == "rejected"
         assert any(
-            check.startswith("r_loss_improvement")
-            for check in weak_feedback[-1]["failed_checks"]
+            check.startswith("r_loss_improvement") for check in weak_feedback[-1]["failed_checks"]
         )
 
 
@@ -1995,8 +2022,8 @@ def test_broad_screen_runner_screens_then_cv_accepts_candidates(tmp_path):
     assert "low_feature_coverage" in low_coverage_reasons
 
     decision_lines = (
-        tmp_path / "agentic_feature_search" / "agent_decisions.jsonl"
-    ).read_text().splitlines()
+        (tmp_path / "agentic_feature_search" / "agent_decisions.jsonl").read_text().splitlines()
+    )
     decisions = [json.loads(line) for line in decision_lines]
     events = [decision["event"] for decision in decisions]
     assert "broad_screening" in events
@@ -2006,11 +2033,10 @@ def test_broad_screen_runner_screens_then_cv_accepts_candidates(tmp_path):
         if decision["event"] == "broad_screening"
         for item in decision["payload"]
     ]
-    assert {
-        item["candidate_id"]
-        for item in broad_payload
-        if item["cv_accepted"]
-    } >= {"strong_confounder", "strong_modifier"}
+    assert {item["candidate_id"] for item in broad_payload if item["cv_accepted"]} >= {
+        "strong_confounder",
+        "strong_modifier",
+    }
     assert all(context["search_mode"] == "broad_screen" for context in agent.contexts)
     assert all(context["broad_candidate_count"] == 4 for context in agent.contexts)
 
@@ -2051,9 +2077,7 @@ def test_broad_screen_runner_union_extracts_candidates_once_across_folds(tmp_pat
         def ensure_features(self, dataset, specs):
             dataset = dataset.copy()
             missing_specs = [
-                spec
-                for spec in specs
-                if f"explicit_feat_{spec.name}" not in dataset.columns
+                spec for spec in specs if f"explicit_feat_{spec.name}" not in dataset.columns
             ]
             if missing_specs:
                 self.calls.append([spec.name for spec in missing_specs])
@@ -2150,9 +2174,7 @@ def test_broad_screen_extracts_initial_and_inventory_once_with_initial_first(tmp
     assert provider.calls == [["age", "hidden_modifier"]]
 
     inventory_contexts = [
-        context
-        for context in agent.contexts
-        if context["broad_screen_stage"] == "inventory"
+        context for context in agent.contexts if context["broad_screen_stage"] == "inventory"
     ]
     assert inventory_contexts
     assert all(count == 0 for count in agent.provider_call_counts[: len(inventory_contexts)])
@@ -2205,14 +2227,10 @@ def test_broad_screen_agent_selects_extracted_candidate_without_reextraction(tmp
 
     assert provider.calls == [["strong_confounder"]]
     selection_contexts = [
-        context
-        for context in agent.contexts
-        if context["broad_screen_stage"] == "selection"
+        context for context in agent.contexts if context["broad_screen_stage"] == "selection"
     ]
     assert selection_contexts
-    assert selection_contexts[0]["available_extracted_features"][0]["name"] == (
-        "strong_confounder"
-    )
+    assert selection_contexts[0]["available_extracted_features"][0]["name"] == ("strong_confounder")
 
 
 def test_broad_screen_agent_new_feature_triggers_one_on_demand_extraction(tmp_path):
