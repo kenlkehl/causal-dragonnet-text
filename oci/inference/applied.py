@@ -225,22 +225,6 @@ def run_applied_inference(
         )
         return
 
-    if (
-        hasattr(config, 'architecture')
-        and config.architecture.model_type == "multi_model_forest_agent_optional"
-    ):
-        logger.info("Routing to Multi-Model Forest with Optional Agent Branch pipeline")
-        from .multi_model_forest_agent_optional import run_multi_model_forest_agent_optional
-        run_multi_model_forest_agent_optional(
-            dataset=dataset,
-            config=config,
-            output_path=output_path,
-            device=device,
-            gpu_ids=gpu_ids,
-            num_workers=num_workers,
-        )
-        return
-
     if hasattr(config, 'architecture') and config.architecture.model_type == "multi_model_forest":
         logger.info("Routing to integrated Multi-Model Forest pipeline")
         from .multi_model_forest import run_multi_model_forest

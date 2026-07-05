@@ -18,7 +18,6 @@ from oci.config import (
     ExplicitFeatureSpec,
     ModelArchitectureConfig,
     MultiModelAgenticForestConfig,
-    MultiModelForestAgentOptionalConfig,
     MultiModelForestConfig,
 )
 from oci.inference.agentic_explicit_feature_forest import (
@@ -45,6 +44,7 @@ from oci.inference.multi_model_agentic_forest import (
 )
 from oci.inference.multi_model_forest import (
     MultiModelForestRunner,
+    _config_for_primary_runner,
     resolve_htr_sentence_model_snapshot,
     resolve_multi_model_forest_parallel_plan,
 )
@@ -2472,70 +2472,6 @@ def test_oracle_multi_model_script_builds_default_and_cli_bow_views():
     assert "feature-discovery-methods" in mm_cfg.embedding_contrast.disable_reason
 
 
-def test_multi_model_forest_agent_optional_parses_config():
-    cfg = ExperimentConfig.from_dict(
-        {
-            "applied_inference": {
-                "dataset_path": (
-                    "synthetic_data/example_synthetic_datasets/"
-                    "one_confounder_one_effect_modifier_nsclc_with_structured/"
-                    "dataset.parquet"
-                ),
-                "architecture": {
-                    "model_type": "multi_model_forest_agent_optional",
-                    "multi_model_forest_agent_optional": {
-                        "feature_discovery_methods": ["bow", "embedding_contrast"],
-                        "bow_views": [
-                            {
-                                "name": "linear_test",
-                                "ngram_range_min": 1,
-                                "ngram_range_max": 2,
-                                "min_df": 1,
-                            },
-                            {
-                                "name": "trees",
-                                "bow_model": "extratrees",
-                                "ngram_range_min": 1,
-                                "ngram_range_max": 3,
-                                "min_df": 1,
-                            },
-                        ],
-                        "nuisance_folds": 2,
-                        "effect_folds": 2,
-                        "agentic_explicit_branch_enabled": True,
-                        "agentic_handoff_enabled": True,
-                        "outer_parallelism": "2",
-                        "outer_parallel_backend": "processes",
-                        "bow_fold_parallelism": "3",
-                        "htr_fold_parallelism": "2",
-                        "embedding_contrast": {
-                            "enabled": True,
-                            "include_cluster_contrast_vectors": True,
-                            "cluster_contrast_max_components": 3,
-                        },
-                    },
-                },
-            }
-        }
-    )
-    arch = cfg.applied_inference.architecture
-    assert arch.model_type == "multi_model_forest_agent_optional"
-    nn_cfg = arch.multi_model_forest_agent_optional
-    assert isinstance(nn_cfg, MultiModelForestAgentOptionalConfig)
-    assert nn_cfg.feature_discovery_methods == ["bow", "embedding_contrast"]
-    assert nn_cfg.bow_discovery_enabled is True
-    assert nn_cfg.htr_evidence_enabled is False
-    assert nn_cfg.embedding_contrast.enabled is True
-    assert nn_cfg.agentic_explicit_branch_enabled is True
-    assert nn_cfg.agentic_handoff_enabled is True
-    assert nn_cfg.outer_parallelism == "2"
-    assert nn_cfg.outer_parallel_backend == "processes"
-    assert nn_cfg.bow_fold_parallelism == "3"
-    assert nn_cfg.htr_fold_parallelism == "2"
-    assert [view.name for view in nn_cfg.bow_views] == ["linear_test", "trees"]
-    assert nn_cfg.bow_views[1].bow_model == "extratrees"
-
-
 def test_multi_model_forest_parses_config():
     cfg = ExperimentConfig.from_dict(
         {
@@ -2589,8 +2525,9 @@ def test_multi_model_forest_parallel_plan_reserves_htr_slots():
     )
     assert plan.htr_slots == 4
     assert plan.cpu_loky_workers == 6
-    assert plan.context_workers == 4
-    assert plan.htr_device_slots == [0, 0, 1, 1]
+    assert plan.context_workers == 2
+    assert plan.htr_inner_jobs_per_outer == 2
+    assert plan.htr_device_slots == [0, 1, 0, 1]
 
     bow_only = resolve_multi_model_forest_parallel_plan(
         cpus_total=10,
@@ -2603,6 +2540,37 @@ def test_multi_model_forest_parallel_plan_reserves_htr_slots():
     assert bow_only.htr_slots == 0
     assert bow_only.cpu_loky_workers == 10
     assert bow_only.context_workers == 10
+    assert bow_only.htr_inner_jobs_per_outer == 1
+
+
+def test_multi_model_forest_primary_config_uses_nested_parallelism():
+    config = AppliedInferenceConfig(
+        architecture=ModelArchitectureConfig(
+            model_type="multi_model_forest",
+            multi_model_forest=MultiModelForestConfig(
+                feature_discovery_methods=["bow", "htr"],
+                bow_views=_linear_test_bow_views(),
+            ),
+        )
+    )
+    plan = resolve_multi_model_forest_parallel_plan(
+        cpus_total=20,
+        num_workers=1,
+        gpu_ids=[0, 1],
+        htr_jobs_per_gpu=3,
+        htr_enabled=True,
+        embedding_enabled=False,
+    )
+
+    primary = _config_for_primary_runner(config, plan)
+    mm_cfg = primary.architecture.multi_model_forest
+
+    assert mm_cfg.outer_parallel_backend == "processes"
+    assert mm_cfg.outer_parallelism == "2"
+    assert mm_cfg.fold_parallelism == "auto"
+    assert mm_cfg.bow_fold_parallelism == "auto"
+    assert mm_cfg.htr_fold_parallelism == "3"
+    assert primary.architecture.agentic_attention_variable_forest.fold_parallelism == "3"
 
 
 def test_htr_sentence_model_snapshot_resolved_once(monkeypatch, tmp_path):
@@ -2724,7 +2692,6 @@ def test_oracle_multi_model_forest_script_builds_config():
     assert [view.name for view in nn_cfg.bow_views] == ["cli_view"]
     assert nn_cfg.bow_views[0].bow_model == "random_forest"
     assert applied.architecture.multi_model_agentic_forest is nn_cfg
-    assert applied.architecture.multi_model_forest_agent_optional is nn_cfg
 
 
 def test_oracle_multi_model_forest_splits_primary_and_agentic_hashes():
@@ -2814,89 +2781,8 @@ def test_embedding_contrast_prepare_uses_multi_gpu_precompute(tmp_path, monkeypa
     assert FakeCache.instances[0].batch_size == 7
 
 
-def test_oracle_multi_model_optional_script_builds_config():
-    from oracle_experiment_scripts import (
-        run_oracle_multi_model_forest_agent_optional as script,
-    )
-
-    dataset_path = Path(
-        "synthetic_data/example_synthetic_datasets/"
-        "one_confounder_one_effect_modifier_nsclc_with_structured/dataset.parquet"
-    )
-    cfg = script.MultiModelForestAgentOptionalOracleConfig(
-        dataset_path=str(dataset_path),
-        dataset_name="smoke",
-        bow_view_grid="cli_single",
-        bow_model="random_forest",
-        feature_discovery_methods=["bow", "embedding_contrast"],
-        agentic_explicit_branch_enabled=True,
-        agentic_handoff_enabled=True,
-        outer_parallelism="2",
-        outer_parallel_backend="processes",
-        bow_fold_parallelism="3",
-        htr_fold_parallelism="2",
-    )
-    applied = script._make_applied_config(cfg, dataset_path)
-    assert applied.architecture.model_type == "multi_model_forest_agent_optional"
-    nn_cfg = applied.architecture.multi_model_forest_agent_optional
-    assert nn_cfg.agentic_explicit_branch_enabled is True
-    assert nn_cfg.agentic_handoff_enabled is True
-    assert nn_cfg.feature_discovery_methods == ["bow", "embedding_contrast"]
-    assert nn_cfg.outer_parallelism == "2"
-    assert nn_cfg.outer_parallel_backend == "processes"
-    assert nn_cfg.bow_fold_parallelism == "3"
-    assert nn_cfg.htr_fold_parallelism == "2"
-    assert applied.architecture.agentic_attention_variable_forest.fold_parallelism == "2"
-    assert nn_cfg.htr_evidence_enabled is False
-    assert [view.name for view in nn_cfg.bow_views] == ["cli_view"]
-    assert nn_cfg.bow_views[0].bow_model == "random_forest"
-    assert nn_cfg.embedding_contrast.enabled is True
-    assert applied.explicit_features.enabled is True
-
-
-def test_oracle_multi_model_optional_branch_only_targets_primary_hash():
-    from dataclasses import replace
-
-    from oracle_experiment_scripts import (
-        run_oracle_multi_model_forest_agent_optional as script,
-    )
-
-    cfg = script.MultiModelForestAgentOptionalOracleConfig(
-        dataset_path="dataset.parquet",
-        dataset_name="smoke",
-        feature_discovery_methods=["bow"],
-        agentic_explicit_branch_enabled=False,
-    )
-    base_hash = cfg.config_hash()
-
-    assert replace(cfg, agentic_explicit_branch_only=True).config_hash() == base_hash
-    assert replace(cfg, agentic_handoff_enabled=True).config_hash() == base_hash
-    assert replace(cfg, existing_config_hash="manualhash").config_hash() == base_hash
-    assert replace(cfg, agent_request_timeout=123.0).config_hash() == base_hash
-    assert replace(cfg, extraction_request_timeout=123.0).config_hash() == base_hash
-    assert (
-        script._agentic_branch_target_hash(
-            replace(
-                cfg,
-                agentic_explicit_branch_enabled=True,
-                agentic_explicit_branch_only=True,
-            )
-        )
-        == base_hash
-    )
-    assert (
-        script._agentic_branch_target_hash(
-            replace(cfg, agentic_explicit_branch_only=True, existing_config_hash="manualhash")
-        )
-        == "manualhash"
-    )
-    assert replace(cfg, agentic_explicit_branch_enabled=True).config_hash() != base_hash
-
-
-def test_oracle_multi_model_optional_prefers_cached_parquet(tmp_path):
-    from oracle_experiment_scripts import (
-        run_oracle_multi_model_forest_agent_optional as script,
-    )
+def test_oracle_multi_model_forest_prefers_cached_parquet(tmp_path):
+    from oracle_experiment_scripts import run_oracle_multi_model_forest as script
 
     dataset_dir = tmp_path / "oracle_dataset"
     dataset_dir.mkdir()
@@ -2905,7 +2791,7 @@ def test_oracle_multi_model_optional_prefers_cached_parquet(tmp_path):
     base_parquet.write_text("placeholder")
     extracted_parquet.write_text("placeholder")
 
-    cfg = script.MultiModelForestAgentOptionalOracleConfig(
+    cfg = script.MultiModelForestOracleConfig(
         dataset_path=str(dataset_dir),
         dataset_name="smoke",
         feature_discovery_methods=["embedding_contrast"],
@@ -2926,7 +2812,7 @@ def test_oracle_multi_model_optional_prefers_cached_parquet(tmp_path):
     for filename in ("chunk_embeddings.npy", "offsets.npy", "chunk_texts.jsonl"):
         (cache_path / filename).write_text("")
 
-    resolved = script._resolve_oracle_parquet_file_for_optional_cache(cfg)
+    resolved = script._resolve_oracle_parquet_file_for_cache(cfg)
     assert resolved == base_parquet
     assert script._normalize_embedding_cache_dir_arg(str(cache_path)) == str(cache_path.parent)
 

@@ -32,7 +32,7 @@ from .multi_model_agentic_forest import (
     _write_jsonl,
     run_multi_model_agentic_forest_from_handoff,
 )
-from .multi_model_forest_agent_optional import MultiModelForestAgentOptionalRunner
+from .multi_model_forest_stage1 import MultiModelForestStage1Runner
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +48,7 @@ class MultiModelForestParallelPlan:
     reserved_htr_cpus: int
     cpu_loky_workers: int
     context_workers: int
+    htr_inner_jobs_per_outer: int
     htr_device_slots: List[Optional[int]]
 
     def to_log_dict(self) -> Dict[str, Any]:
@@ -57,6 +58,7 @@ class MultiModelForestParallelPlan:
             "gpu_ids": self.gpu_ids,
             "htr_jobs_per_gpu": self.htr_jobs_per_gpu,
             "htr_slots": self.htr_slots,
+            "htr_inner_jobs_per_outer": self.htr_inner_jobs_per_outer,
             "context_workers": self.context_workers,
             "embedding_enabled": self.embedding_enabled,
             "htr_enabled": self.htr_enabled,
@@ -80,14 +82,24 @@ def resolve_multi_model_forest_parallel_plan(
     htr_slots = len(gpus) * jobs_per_gpu if htr_enabled and gpus else (1 if htr_enabled else 0)
     reserved = min(total - 1, htr_slots) if htr_slots > 0 else 0
     cpu_workers = max(1, total - reserved)
-    if htr_enabled:
-        context_workers = max(1, min(total, htr_slots or 1))
+    if htr_enabled and gpus:
+        # Run one outer fold per GPU, then use htr_jobs_per_gpu for inner HTR
+        # folds within each active outer fold. This keeps per-GPU HTR
+        # concurrency at the requested slot count while still allowing nested
+        # inner-fold training.
+        context_workers = max(1, min(total, len(gpus)))
+        htr_inner_jobs = jobs_per_gpu
+    elif htr_enabled:
+        context_workers = 1
+        htr_inner_jobs = 1
     else:
         context_workers = cpu_workers
+        htr_inner_jobs = 1
     device_slots: List[Optional[int]] = []
     if htr_enabled and gpus:
-        for gpu_id in gpus:
-            device_slots.extend([int(gpu_id)] * jobs_per_gpu)
+        for _job_index in range(jobs_per_gpu):
+            for gpu_id in gpus:
+                device_slots.append(int(gpu_id))
     if not device_slots:
         device_slots = [None] * context_workers
     return MultiModelForestParallelPlan(
@@ -100,6 +112,7 @@ def resolve_multi_model_forest_parallel_plan(
         reserved_htr_cpus=int(reserved),
         cpu_loky_workers=int(cpu_workers),
         context_workers=int(max(1, context_workers)),
+        htr_inner_jobs_per_outer=int(max(1, htr_inner_jobs)),
         htr_device_slots=device_slots,
     )
 
@@ -318,25 +331,25 @@ class MultiModelForestRunner:
             self.config.architecture.htr_sentence_model = resolved
 
     def _run_primary_text_model_forest(self) -> None:
-        old_artifact_dir = self.output_path.parent / "multi_model_forest_agent_optional"
+        stage1_artifact_dir = self.output_path.parent / "stage1_text_models"
         if self.output_path.exists() and not self.force_stage1:
             logger.info("Reusing primary text-model forest predictions at %s", self.output_path)
-            self._promote_primary_artifacts(old_artifact_dir)
+            self._promote_primary_artifacts(stage1_artifact_dir)
             return
         primary_config = _config_for_primary_runner(self.config, self.plan)
         with _serial_torch_worker_environment():
-            runner = MultiModelForestAgentOptionalRunner(
+            runner = MultiModelForestStage1Runner(
                 dataset=self.dataset.drop(columns=["_oci_row_id"], errors="ignore"),
                 config=primary_config,
                 output_path=self.output_path,
                 device=self.device,
                 gpu_ids=self.gpu_ids,
-                num_workers=self.plan.context_workers,
+                num_workers=self.plan.cpu_loky_workers,
             )
             runner.run()
-        self._promote_primary_artifacts(old_artifact_dir)
+        self._promote_primary_artifacts(stage1_artifact_dir)
 
-    def _promote_primary_artifacts(self, old_artifact_dir: Path) -> None:
+    def _promote_primary_artifacts(self, stage1_artifact_dir: Path) -> None:
         copies = {
             "ite_estimates.parquet": "primary_ite_estimates.parquet",
             "outer_cv_metrics.csv": "outer_cv_metrics.csv",
@@ -344,9 +357,10 @@ class MultiModelForestRunner:
             "text_model_feature_predictions.parquet": "text_model_feature_predictions.parquet",
             "split_provenance.jsonl": "split_provenance.jsonl",
             "embedding_contrast_feature_vectors.jsonl": "embedding_contrast_feature_vectors.jsonl",
+            "stage1_inner_model_evidence.jsonl": "stage1_inner_model_evidence.jsonl",
         }
         for source_name, target_name in copies.items():
-            source = old_artifact_dir / source_name
+            source = stage1_artifact_dir / source_name
             if source.exists():
                 shutil.copyfile(source, self.artifact_dir / target_name)
 
@@ -357,7 +371,7 @@ class MultiModelForestRunner:
         self.handoff_dir.mkdir(parents=True, exist_ok=True)
         primary_handoff_path = (
             self.output_path.parent
-            / "multi_model_forest_agent_optional"
+            / "stage1_text_models"
             / "agentic_handoff.jsonl"
         )
         if primary_handoff_path.exists():
@@ -676,7 +690,6 @@ def _config_for_multi_model_forest(config: AppliedInferenceConfig) -> AppliedInf
         cfg.architecture.multi_model_forest = mm_config
     cfg.architecture.model_type = "multi_model_forest"
     cfg.architecture.multi_model_agentic_forest = copy.deepcopy(mm_config)
-    cfg.architecture.multi_model_forest_agent_optional = copy.deepcopy(mm_config)
     return cfg
 
 
@@ -685,23 +698,20 @@ def _config_for_primary_runner(
     plan: MultiModelForestParallelPlan,
 ) -> AppliedInferenceConfig:
     cfg = _config_for_multi_model_forest(config)
-    cfg.architecture.model_type = "multi_model_forest_agent_optional"
     opt_config = copy.deepcopy(cfg.architecture.multi_model_forest)
-    opt_config.agentic_explicit_branch_enabled = False
-    opt_config.agentic_handoff_enabled = False
     opt_config.outer_parallel_backend = "processes"
     opt_config.outer_parallelism = str(max(1, plan.context_workers))
     opt_config.bow_parallel_backend = "processes"
-    opt_config.fold_parallelism = "1"
-    opt_config.bow_fold_parallelism = "1"
-    opt_config.htr_fold_parallelism = "1"
-    cfg.architecture.multi_model_forest_agent_optional = opt_config
+    opt_config.fold_parallelism = "auto"
+    opt_config.bow_fold_parallelism = "auto"
+    opt_config.htr_fold_parallelism = str(max(1, plan.htr_inner_jobs_per_outer))
+    cfg.architecture.multi_model_forest = opt_config
     cfg.architecture.multi_model_agentic_forest = copy.deepcopy(opt_config)
     avf_config = getattr(cfg.architecture, "agentic_attention_variable_forest", None)
     if avf_config is None:
         avf_config = AgenticAttentionVariableForestConfig()
         cfg.architecture.agentic_attention_variable_forest = avf_config
-    avf_config.fold_parallelism = "1"
+    avf_config.fold_parallelism = str(max(1, plan.htr_inner_jobs_per_outer))
     return cfg
 
 
@@ -713,7 +723,6 @@ def _config_for_handoff_runner(config: AppliedInferenceConfig) -> AppliedInferen
     mm_config.fold_parallelism = "1"
     mm_config.bow_parallel_backend = "processes"
     cfg.architecture.multi_model_agentic_forest = mm_config
-    cfg.architecture.multi_model_forest_agent_optional = copy.deepcopy(mm_config)
     avf_config = getattr(cfg.architecture, "agentic_attention_variable_forest", None)
     if avf_config is None:
         avf_config = AgenticAttentionVariableForestConfig()

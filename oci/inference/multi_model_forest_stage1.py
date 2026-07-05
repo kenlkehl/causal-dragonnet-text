@@ -1,4 +1,4 @@
-"""Multi-model text-feature causal forest with optional final agent branch."""
+"""Stage 1 text-model training for the integrated multi-model forest."""
 
 from __future__ import annotations
 
@@ -26,13 +26,20 @@ from ..config import (
     AppliedInferenceConfig,
     BoWViewConfig,
     ExplicitFeatureForestConfig,
-    MultiModelForestAgentOptionalConfig,
+    MultiModelForestConfig,
 )
 from ..models.causal_forest_head import CausalForestHead
+from ..utils.calibration import BinaryProbabilityCalibrator
 from .agentic_attention_variable_forest import (
     AgenticAttentionVariableForestRunner,
     _EffectNet,
     _NuisanceNet,
+    _binary_log_loss_from_logits,
+    _effect_objective_name,
+    _logistic_r_logits,
+    _logistic_r_tau_from_delta,
+    _r_pseudo_outcome,
+    _run_crossfit_fold_tasks,
     clip_probability,
 )
 from .agentic_explicit_feature_forest import (
@@ -63,7 +70,6 @@ from .multi_model_agentic_forest import (
     _clinical_text_examples,
     _compact_multi_model_agent_context,
     _finite_or_none,
-    build_multi_model_agentic_discovery_handoff,
     _fit_binary_bow_fold,
     _fit_regression_bow_fold,
     _fit_regressor,
@@ -78,7 +84,6 @@ from .multi_model_agentic_forest import (
     _split_is_honest,
     _top_feature_rows,
     _top_phrase_feature_rows,
-    run_multi_model_agentic_forest_from_handoff,
     _write_json,
     _write_jsonl,
 )
@@ -99,9 +104,10 @@ class _FeatureBundle:
     embedding_rows: List[Dict[str, Any]]
     metrics: Dict[str, Any]
     handoff_evidence: Optional[Dict[str, Any]]
+    inner_model_rows: List[Dict[str, Any]]
 
 
-def _run_optional_outer_fold_job(
+def _run_stage1_outer_fold_job(
     *,
     dataset: pd.DataFrame,
     config: AppliedInferenceConfig,
@@ -117,7 +123,7 @@ def _run_optional_outer_fold_job(
     previous_dataloader_workers = os.environ.get("OCI_AVF_DATALOADER_WORKERS")
     if htr_dataloader_workers is not None:
         os.environ["OCI_AVF_DATALOADER_WORKERS"] = str(max(0, int(htr_dataloader_workers)))
-    fold_runner = MultiModelForestAgentOptionalRunner(
+    fold_runner = MultiModelForestStage1Runner(
         dataset=dataset.drop(columns=["_oci_row_id"], errors="ignore"),
         config=copy.deepcopy(config),
         output_path=output_path,
@@ -139,6 +145,7 @@ def _run_optional_outer_fold_job(
             "embedding_feature_rows": fold_runner.embedding_feature_rows,
             "outer_metric_rows": fold_runner.outer_metric_rows,
             "agentic_handoff_rows": fold_runner.agentic_handoff_rows,
+            "inner_model_evidence_rows": fold_runner.inner_model_evidence_rows,
         }
     finally:
         if htr_dataloader_workers is not None:
@@ -148,7 +155,7 @@ def _run_optional_outer_fold_job(
                 os.environ["OCI_AVF_DATALOADER_WORKERS"] = previous_dataloader_workers
 
 
-def run_multi_model_forest_agent_optional(
+def run_multi_model_forest_stage1(
     dataset: pd.DataFrame,
     config: AppliedInferenceConfig,
     output_path: Path,
@@ -159,7 +166,7 @@ def run_multi_model_forest_agent_optional(
     htr_evidence_provider: Optional[Any] = None,
 ) -> None:
     """Run the non-agentic multi-model W/X causal forest path."""
-    runner = MultiModelForestAgentOptionalRunner(
+    runner = MultiModelForestStage1Runner(
         dataset=dataset,
         config=config,
         output_path=output_path,
@@ -172,7 +179,7 @@ def run_multi_model_forest_agent_optional(
     runner.run()
 
 
-class MultiModelOptionalHTRProvider(MultiModelHTREvidenceProvider):
+class MultiModelForestStage1HTRProvider(MultiModelHTREvidenceProvider):
     """HTR adapter with full outer-train -> outer-test prediction helpers."""
 
     @contextmanager
@@ -198,6 +205,401 @@ class MultiModelOptionalHTRProvider(MultiModelHTREvidenceProvider):
         runner = self._ensure_runner(discovery_df)
         with self._temporary_effect_objective(effect_objective):
             return runner._crossfit_effect(discovery_df, nuisance_predictions, outer_fold)
+
+    def fit_nuisance_inner_ensemble_predict(
+        self,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        outer_fold: int,
+    ) -> Dict[str, Any]:
+        runner = self._ensure_runner(train_df)
+        folds = _bounded_fold_count(runner.avf_config.nuisance_folds, len(train_df))
+        predictions = pd.DataFrame(
+            {
+                "_oci_row_id": train_df["_oci_row_id"].to_numpy(),
+                "outer_fold": int(outer_fold),
+                "e_hat": np.nan,
+                "e_hat_raw": np.nan,
+                "m_hat": np.nan,
+                "m_hat_raw": np.nan,
+                "y_residual": np.nan,
+                "t_residual": np.nan,
+                "r_pseudo_outcome": np.nan,
+                "r_loss_at_zero_tau": np.nan,
+                "nuisance_fold": np.nan,
+            }
+        )
+        split_items = list(
+            enumerate(
+                KFold(n_splits=folds, shuffle=True, random_state=10_000 + outer_fold).split(
+                    train_df
+                ),
+                start=1,
+            )
+        )
+
+        def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
+            model = None
+            fit_pos = np.asarray(fit_pos, dtype=int)
+            heldout_pos = np.asarray(heldout_pos, dtype=int)
+            try:
+                model = _NuisanceNet(
+                    extractor=runner._create_extractor(),
+                    hidden_dim=getattr(
+                        runner.config.architecture,
+                        "causal_head_hidden_outcome_dim",
+                        64,
+                    ),
+                    outcome_type=runner.config.outcome_type,
+                ).to(runner.device)
+                runner._train_nuisance_model(
+                    model,
+                    train_df,
+                    fit_pos,
+                    outer_fold=outer_fold,
+                    fold=fold,
+                    total_folds=folds,
+                )
+                fit_df = train_df.iloc[fit_pos]
+                heldout = train_df.iloc[heldout_pos]
+                e_fit_raw, m_fit_raw = runner._predict_nuisance_model(model, fit_df)
+                e_raw, m_raw = runner._predict_nuisance_model(model, heldout)
+                e_test_raw, m_test_raw = runner._predict_nuisance_model(model, test_df)
+                prop_calibrator = BinaryProbabilityCalibrator.fit(
+                    e_fit_raw,
+                    fit_df[runner.config.treatment_column].to_numpy(dtype=float),
+                    method=runner.avf_config.nuisance_calibration,
+                )
+                e_hat = prop_calibrator.transform(e_raw)
+                e_test = prop_calibrator.transform(e_test_raw)
+                if runner.config.outcome_type == "continuous":
+                    m_hat = m_raw
+                    m_test = m_test_raw
+                else:
+                    outcome_calibrator = BinaryProbabilityCalibrator.fit(
+                        m_fit_raw,
+                        fit_df[runner.config.outcome_column].to_numpy(dtype=float),
+                        method=runner.avf_config.nuisance_calibration,
+                    )
+                    m_hat = outcome_calibrator.transform(m_raw)
+                    m_test = outcome_calibrator.transform(m_test_raw)
+                y = heldout[runner.config.outcome_column].to_numpy(dtype=float)
+                t = heldout[runner.config.treatment_column].to_numpy(dtype=float)
+                y_resid = y - m_hat
+                t_resid = t - e_hat
+                fold_attention = runner._attention_evidence(
+                    model.extractor,
+                    heldout,
+                    fold=fold,
+                    outer_fold=outer_fold,
+                    stage="nuisance",
+                    extra={
+                        "e_hat": e_hat,
+                        "e_hat_raw": e_raw,
+                        "m_hat": m_hat,
+                        "m_hat_raw": m_raw,
+                        "y_residual": y_resid,
+                        "t_residual": t_resid,
+                    },
+                )
+                return {
+                    "fold": int(fold),
+                    "heldout_pos": heldout_pos,
+                    "e_hat": e_hat,
+                    "e_hat_raw": e_raw,
+                    "m_hat": m_hat,
+                    "m_hat_raw": m_raw,
+                    "y_resid": y_resid,
+                    "t_resid": t_resid,
+                    "test_e_hat": e_test,
+                    "test_m_hat": m_test,
+                    "attention": fold_attention,
+                    "evidence": {
+                        "outer_fold": int(outer_fold),
+                        "inner_fold": int(fold),
+                        "source_family": "htr",
+                        "objective": "nuisance",
+                        "target_name": "treatment_outcome_nuisance",
+                        "train_rows": int(len(fit_pos)),
+                        "heldout_rows": int(len(heldout_pos)),
+                        "outer_test_rows": int(len(test_df)),
+                        "heldout_treatment_auroc": _safe_roc_auc(t, e_hat),
+                        "heldout_outcome_auroc": (
+                            _safe_roc_auc(y, m_hat)
+                            if runner.config.outcome_type != "continuous"
+                            else None
+                        ),
+                        "prediction_provenance": "inner_fold_model_heldout_and_outer_test",
+                    },
+                }
+            finally:
+                if model is not None:
+                    runner._cleanup_model(model)
+
+        n_jobs = runner._fold_n_jobs(folds)
+        fold_results = _run_crossfit_fold_tasks(
+            run_fold,
+            split_items,
+            n_jobs,
+            device_context=runner._device_context_for_inner_fold,
+        )
+        attention_rows: List[Dict[str, Any]] = []
+        test_e = []
+        test_m = []
+        inner_model_rows = []
+        for result in fold_results:
+            heldout_pos = result["heldout_pos"]
+            predictions.loc[heldout_pos, "e_hat"] = result["e_hat"]
+            predictions.loc[heldout_pos, "e_hat_raw"] = result["e_hat_raw"]
+            predictions.loc[heldout_pos, "m_hat"] = result["m_hat"]
+            predictions.loc[heldout_pos, "m_hat_raw"] = result["m_hat_raw"]
+            predictions.loc[heldout_pos, "y_residual"] = result["y_resid"]
+            predictions.loc[heldout_pos, "t_residual"] = result["t_resid"]
+            predictions.loc[heldout_pos, "r_pseudo_outcome"] = _r_pseudo_outcome(
+                result["y_resid"],
+                result["t_resid"],
+            )
+            predictions.loc[heldout_pos, "r_loss_at_zero_tau"] = result["y_resid"] ** 2
+            predictions.loc[heldout_pos, "nuisance_fold"] = result["fold"]
+            attention_rows.extend(result["attention"])
+            test_e.append(np.asarray(result["test_e_hat"], dtype=float))
+            test_m.append(np.asarray(result["test_m_hat"], dtype=float))
+            inner_model_rows.append(result["evidence"])
+        test_predictions = pd.DataFrame(
+            {
+                "_oci_row_id": test_df["_oci_row_id"].to_numpy(),
+                "outer_fold": int(outer_fold),
+                "e_hat": np.nanmean(np.vstack(test_e), axis=0),
+                "m_hat": np.nanmean(np.vstack(test_m), axis=0),
+                "model_family": "htr",
+                "view_name": "htr_nuisance",
+                "target_source": "htr_nuisance_inner_ensemble",
+            }
+        )
+        return {
+            "train": {"predictions": predictions, "attention": attention_rows},
+            "test_predictions": test_predictions,
+            "inner_model_rows": inner_model_rows,
+        }
+
+    def fit_effect_variant_inner_ensemble_predict(
+        self,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        nuisance_predictions: pd.DataFrame,
+        outer_fold: int,
+        *,
+        effect_objective: str,
+        test_nuisance_predictions: Optional[pd.DataFrame] = None,
+    ) -> Dict[str, Any]:
+        runner = self._ensure_runner(train_df)
+        folds = _bounded_fold_count(runner.avf_config.effect_folds, len(train_df))
+        with self._temporary_effect_objective(effect_objective):
+            effect_objective = _effect_objective_name(runner.avf_config)
+            r_df = train_df[["_oci_row_id"]].merge(
+                nuisance_predictions.copy(),
+                on="_oci_row_id",
+                how="left",
+                sort=False,
+            )
+            e = r_df["e_hat"].to_numpy(dtype=float)
+            m = r_df["m_hat"].to_numpy(dtype=float)
+            y = train_df[runner.config.outcome_column].to_numpy(dtype=float)
+            t = train_df[runner.config.treatment_column].to_numpy(dtype=float)
+            e_clipped = np.clip(e, runner.avf_config.e_clip, 1.0 - runner.avf_config.e_clip)
+            m_clipped = clip_probability(m)
+            t_resid = t - e_clipped
+            y_resid = y - m
+            r_pseudo_outcome = _r_pseudo_outcome(y_resid, t_resid)
+            r_stage_min = float(getattr(runner.avf_config, "r_stage_min_propensity", 0.0))
+            r_stage_max = float(getattr(runner.avf_config, "r_stage_max_propensity", 1.0))
+            train_eligible = np.isfinite(e) & (e >= r_stage_min) & (e <= r_stage_max)
+            if effect_objective == "pseudo_outcome_mse":
+                train_eligible = train_eligible & np.isfinite(r_pseudo_outcome)
+            r_df["tau_hat_r_stage"] = np.nan
+            r_df["tau_logit_modifier"] = np.nan
+            r_df["r_loss"] = np.nan
+            r_df["effect_loss"] = np.nan
+            r_df["effect_loss_at_zero_tau"] = (
+                y_resid**2
+                if effect_objective != "logistic_r_loss"
+                else _binary_log_loss_from_logits(_logistic_r_logits(0, t, e_clipped, m_clipped), y)
+            )
+            r_df["effect_fold"] = np.nan
+            r_df["r_stage_train_eligible"] = train_eligible
+            r_df["effect_objective"] = effect_objective
+            r_df["r_pseudo_outcome"] = r_pseudo_outcome
+
+            test_e = None
+            test_m = None
+            if test_nuisance_predictions is not None:
+                test_e = np.asarray(test_nuisance_predictions["e_hat"], dtype=float)
+                test_m = np.asarray(test_nuisance_predictions["m_hat"], dtype=float)
+            split_items = list(
+                enumerate(
+                    KFold(n_splits=folds, shuffle=True, random_state=20_000 + outer_fold).split(
+                        train_df
+                    ),
+                    start=1,
+                )
+            )
+
+            def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
+                model = None
+                fit_pos = np.asarray(fit_pos, dtype=int)
+                heldout_pos = np.asarray(heldout_pos, dtype=int)
+                eligible_fit_pos = fit_pos[train_eligible[fit_pos]]
+                if len(eligible_fit_pos) < 1:
+                    raise ValueError(
+                        "No rows remain for HTR R-stage inner fold "
+                        f"{fold} after applying propensity bounds"
+                    )
+                try:
+                    model = _EffectNet(
+                        extractor=runner._create_extractor(),
+                        hidden_dim=getattr(
+                            runner.config.architecture,
+                            "causal_head_hidden_outcome_dim",
+                            64,
+                        ),
+                    ).to(runner.device)
+                    runner._train_effect_model(
+                        model,
+                        train_df,
+                        eligible_fit_pos,
+                        y,
+                        t,
+                        e_clipped,
+                        m_clipped,
+                        y_resid,
+                        t_resid,
+                        outer_fold=outer_fold,
+                        fold=fold,
+                        total_folds=folds,
+                    )
+                    heldout = train_df.iloc[heldout_pos]
+                    raw_effect = runner._predict_effect_model(model, heldout)
+                    raw_test = runner._predict_effect_model(model, test_df)
+                    if effect_objective == "logistic_r_loss":
+                        tau_logit_modifier = raw_effect
+                        tau_hat = _logistic_r_tau_from_delta(
+                            tau_logit_modifier,
+                            e_clipped[heldout_pos],
+                            m_clipped[heldout_pos],
+                            e_clip=runner.avf_config.e_clip,
+                        )
+                        if test_e is None or test_m is None:
+                            test_tau = raw_test
+                        else:
+                            test_tau = _logistic_r_tau_from_delta(
+                                raw_test,
+                                np.clip(test_e, runner.avf_config.e_clip, 1.0 - runner.avf_config.e_clip),
+                                clip_probability(test_m),
+                                e_clip=runner.avf_config.e_clip,
+                            )
+                        heldout_effect_loss = _binary_log_loss_from_logits(
+                            _logistic_r_logits(
+                                tau_logit_modifier,
+                                t[heldout_pos],
+                                e_clipped[heldout_pos],
+                                m_clipped[heldout_pos],
+                                e_clip=runner.avf_config.e_clip,
+                            ),
+                            y[heldout_pos],
+                        )
+                    else:
+                        tau_hat = raw_effect
+                        test_tau = raw_test
+                        tau_logit_modifier = np.full(len(heldout_pos), np.nan)
+                        heldout_effect_loss = (
+                            (tau_hat - r_pseudo_outcome[heldout_pos]) ** 2
+                            if effect_objective == "pseudo_outcome_mse"
+                            else (y_resid[heldout_pos] - tau_hat * t_resid[heldout_pos]) ** 2
+                        )
+                    heldout_r_loss = (
+                        y_resid[heldout_pos] - tau_hat * t_resid[heldout_pos]
+                    ) ** 2
+                    fold_attention = runner._attention_evidence(
+                        model.extractor,
+                        heldout,
+                        fold=fold,
+                        outer_fold=outer_fold,
+                        stage="effect_modifier",
+                        extra={
+                            "tau_hat_r_stage": tau_hat,
+                            "tau_logit_modifier": tau_logit_modifier,
+                            "r_pseudo_outcome": r_pseudo_outcome[heldout_pos],
+                            "r_loss": heldout_r_loss,
+                            "effect_loss": heldout_effect_loss,
+                            "effect_objective": np.asarray(
+                                [effect_objective] * len(heldout_pos),
+                                dtype=object,
+                            ),
+                        },
+                    )
+                    return {
+                        "fold": int(fold),
+                        "heldout_pos": heldout_pos,
+                        "tau_hat": tau_hat,
+                        "tau_logit_modifier": tau_logit_modifier,
+                        "r_loss": heldout_r_loss,
+                        "effect_loss": heldout_effect_loss,
+                        "test_tau": test_tau,
+                        "attention": fold_attention,
+                        "evidence": {
+                            "outer_fold": int(outer_fold),
+                            "inner_fold": int(fold),
+                            "source_family": "htr",
+                            "objective": f"effect_{effect_objective}",
+                            "target_name": effect_objective,
+                            "effect_objective": effect_objective,
+                            "train_rows": int(len(eligible_fit_pos)),
+                            "heldout_rows": int(len(heldout_pos)),
+                            "outer_test_rows": int(len(test_df)),
+                            "heldout_r_loss": _finite_or_none(np.mean(heldout_r_loss)),
+                            "prediction_provenance": "inner_fold_model_heldout_and_outer_test",
+                        },
+                    }
+                finally:
+                    if model is not None:
+                        runner._cleanup_model(model)
+
+            n_jobs = runner._fold_n_jobs(folds)
+            fold_results = _run_crossfit_fold_tasks(
+                run_fold,
+                split_items,
+                n_jobs,
+                device_context=runner._device_context_for_inner_fold,
+            )
+            attention_rows: List[Dict[str, Any]] = []
+            test_tau_predictions = []
+            inner_model_rows = []
+            for result in fold_results:
+                heldout_pos = result["heldout_pos"]
+                r_df.loc[heldout_pos, "tau_hat_r_stage"] = result["tau_hat"]
+                r_df.loc[heldout_pos, "tau_logit_modifier"] = result["tau_logit_modifier"]
+                r_df.loc[heldout_pos, "r_loss"] = result["r_loss"]
+                r_df.loc[heldout_pos, "effect_loss"] = result["effect_loss"]
+                r_df.loc[heldout_pos, "effect_fold"] = result["fold"]
+                attention_rows.extend(result["attention"])
+                test_tau_predictions.append(np.asarray(result["test_tau"], dtype=float))
+                inner_model_rows.append(result["evidence"])
+            test_predictions = pd.DataFrame(
+                {
+                    "_oci_row_id": test_df["_oci_row_id"].to_numpy(),
+                    "outer_fold": int(outer_fold),
+                    "tau_hat_r_stage": np.nanmean(np.vstack(test_tau_predictions), axis=0),
+                    "model_family": "htr",
+                    "view_name": f"htr_effect_{effect_objective}",
+                    "target_source": "ensemble_mean_nuisance_inner_ensemble",
+                    "effect_objective": effect_objective,
+                }
+            )
+            return {
+                "train": {"predictions": r_df, "attention": attention_rows},
+                "test_predictions": test_predictions,
+                "inner_model_rows": inner_model_rows,
+            }
 
     def fit_nuisance_full_predict(
         self,
@@ -309,7 +711,7 @@ class MultiModelOptionalHTRProvider(MultiModelHTREvidenceProvider):
         )
 
 
-class MultiModelForestAgentOptionalRunner:
+class MultiModelForestStage1Runner:
     """Primary non-agentic text-model W/X causal-forest runner."""
 
     def __init__(
@@ -327,24 +729,24 @@ class MultiModelForestAgentOptionalRunner:
         self.dataset["_oci_row_id"] = np.arange(len(self.dataset), dtype=int)
         self.config = config
         self.output_path = Path(output_path)
-        self.artifact_dir = self.output_path.parent / "multi_model_forest_agent_optional"
+        self.artifact_dir = self.output_path.parent / "stage1_text_models"
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self.device = torch.device(device or "cpu")
         self.gpu_ids = list(gpu_ids) if gpu_ids is not None else None
         self.num_workers = 1 if num_workers is None else int(num_workers)
         self.embedding_provider = embedding_provider
         self.htr_evidence_provider = htr_evidence_provider
-        self.nn_config: MultiModelForestAgentOptionalConfig = getattr(
+        self.nn_config: MultiModelForestConfig = getattr(
             config.architecture,
-            "multi_model_forest_agent_optional",
-            MultiModelForestAgentOptionalConfig(),
+            "multi_model_forest",
+            MultiModelForestConfig(),
         )
         self.search_config: AgenticFeatureSearchConfig = getattr(
             config.architecture,
             "agentic_feature_search",
             AgenticFeatureSearchConfig(),
         )
-        # Existing embedding and optional agentic code reads the old config slot.
+        # Existing embedding and agentic code reads this config slot.
         # Mirror the new config there so shared components use the same settings.
         config.architecture.multi_model_agentic_forest = self.nn_config
         self._sync_htr_fold_parallelism()
@@ -354,7 +756,7 @@ class MultiModelForestAgentOptionalRunner:
             ExplicitFeatureForestConfig(),
         )
         self.embedding_evidence_generator: Optional[EmbeddingContrastEvidenceGenerator] = None
-        self._default_htr_provider: Optional[MultiModelOptionalHTRProvider] = None
+        self._default_htr_provider: Optional[MultiModelForestStage1HTRProvider] = None
 
         self.prediction_results: Optional[pd.DataFrame] = None
         self.outer_metric_rows: List[Dict[str, Any]] = []
@@ -363,10 +765,11 @@ class MultiModelForestAgentOptionalRunner:
         self.source_prediction_frames: List[pd.DataFrame] = []
         self.embedding_feature_rows: List[Dict[str, Any]] = []
         self.agentic_handoff_rows: List[Dict[str, Any]] = []
+        self.inner_model_evidence_rows: List[Dict[str, Any]] = []
 
     def run(self) -> None:
         logger.info("=" * 80)
-        logger.info("MULTI-MODEL FOREST WITH OPTIONAL AGENT BRANCH")
+        logger.info("MULTI-MODEL FOREST STAGE 1 TEXT MODELS")
         logger.info("=" * 80)
         splits = self._analysis_splits()
         self.split_provenance_rows = self._split_provenance_rows(splits)
@@ -388,7 +791,7 @@ class MultiModelForestAgentOptionalRunner:
             outer_backend = self._outer_backend_name()
             inner_workers = self._inner_workers_for_outer_job(outer_n_jobs)
             logger.info(
-                "Running %s multi-model optional-agent outer folds with "
+                "Running %s multi-model stage1 outer folds with "
                 "outer_parallelism=%s outer_backend=%s inner_workers_per_outer=%s "
                 "devices=%s bow_fold_parallelism=%s htr_fold_parallelism=%s",
                 len(splits),
@@ -402,7 +805,7 @@ class MultiModelForestAgentOptionalRunner:
             if outer_backend == "threads":
                 with ThreadPoolExecutor(
                     max_workers=outer_n_jobs,
-                    thread_name_prefix="mm-optional-outer",
+                    thread_name_prefix="mm-stage1-outer",
                 ) as executor:
                     futures = [
                         executor.submit(
@@ -426,7 +829,7 @@ class MultiModelForestAgentOptionalRunner:
                     batch_size=1,
                     pre_dispatch="all",
                 )(
-                    delayed(_run_optional_outer_fold_job)(
+                    delayed(_run_stage1_outer_fold_job)(
                         dataset=self.dataset,
                         config=self.config,
                         output_path=self.output_path,
@@ -457,11 +860,14 @@ class MultiModelForestAgentOptionalRunner:
                 self.embedding_feature_rows.extend(item["embedding_feature_rows"])
                 self.outer_metric_rows.extend(item["outer_metric_rows"])
                 self.agentic_handoff_rows.extend(item.get("agentic_handoff_rows", []))
+                self.inner_model_evidence_rows.extend(
+                    item.get("inner_model_evidence_rows", [])
+                )
         else:
             prediction_frames = []
             for outer_fold, train_idx, test_idx in splits:
                 logger.info(
-                    "Multi-model optional-agent fold %s: train=%s test=%s device=%s",
+                    "Multi-model stage1 fold %s: train=%s test=%s device=%s",
                     outer_fold,
                     len(train_idx),
                     len(test_idx),
@@ -479,15 +885,6 @@ class MultiModelForestAgentOptionalRunner:
         self.prediction_results = results_df
         self._save_outputs(results_df)
 
-        if bool(
-            getattr(self.nn_config, "agentic_handoff_enabled", False)
-            or getattr(self.nn_config, "agentic_explicit_branch_enabled", False)
-        ):
-            self._prepare_agentic_handoff()
-
-        if bool(getattr(self.nn_config, "agentic_explicit_branch_enabled", False)):
-            self._run_optional_agentic_branch()
-
     def _run_one_analysis_split_isolated(
         self,
         *,
@@ -498,7 +895,7 @@ class MultiModelForestAgentOptionalRunner:
         outer_n_jobs: int,
     ) -> Dict[str, Any]:
         logger.info(
-            "Multi-model optional-agent isolated fold %s: train=%s test=%s device=%s",
+            "Multi-model stage1 isolated fold %s: train=%s test=%s device=%s",
             outer_fold,
             len(train_idx),
             len(test_idx),
@@ -507,7 +904,7 @@ class MultiModelForestAgentOptionalRunner:
         gpu_ids = None
         if device.type == "cuda" and device.index is not None:
             gpu_ids = [int(device.index)]
-        return _run_optional_outer_fold_job(
+        return _run_stage1_outer_fold_job(
             dataset=self.dataset,
             config=self.config,
             output_path=self.output_path,
@@ -546,12 +943,12 @@ class MultiModelForestAgentOptionalRunner:
 
         if bool(getattr(self.nn_config, "require_honest_outer_split", False)):
             raise ValueError(
-                "multi_model_forest_agent_optional.require_honest_outer_split=True "
+                "multi_model_forest.require_honest_outer_split=True "
                 "requires cv_folds > 1 or split_column with a 'test' split"
             )
         all_idx = np.arange(len(self.dataset), dtype=int)
         logger.warning(
-            "No held-out split configured for multi_model_forest_agent_optional; "
+            "No held-out split configured for multi_model_forest Stage 1; "
             "predictions will be labeled full_data_refit_non_honest."
         )
         return [(1, all_idx, all_idx)]
@@ -593,6 +990,7 @@ class MultiModelForestAgentOptionalRunner:
         self.feature_manifest_rows.extend(bundle.feature_rows)
         self.embedding_feature_rows.extend(bundle.embedding_rows)
         self.source_prediction_frames.extend(bundle.prediction_frames)
+        self.inner_model_evidence_rows.extend(bundle.inner_model_rows)
 
         x_train, x_test = _clean_train_test_matrices(bundle.x_train, bundle.x_test)
         w_train, w_test = _clean_train_test_matrices(bundle.w_train, bundle.w_test)
@@ -729,6 +1127,14 @@ class MultiModelForestAgentOptionalRunner:
                     n_rows=len(train_df),
                 )
             )
+            self.agentic_handoff_rows.extend(
+                self._inner_model_handoff_rows(
+                    base_result=handoff_result,
+                    inner_model_rows=bundle.inner_model_rows,
+                    outer_fold=outer_fold,
+                    n_outer_train_rows=len(train_df),
+                )
+            )
 
         fold_dir = self.artifact_dir / f"outer_fold_{int(outer_fold):03d}"
         fold_dir.mkdir(parents=True, exist_ok=True)
@@ -771,10 +1177,11 @@ class MultiModelForestAgentOptionalRunner:
         bow_view_results: List[Dict[str, Any]] = []
         ensemble_view_results: List[Dict[str, Any]] = []
         htr_evidence: Dict[str, Any] = {}
+        inner_model_rows: List[Dict[str, Any]] = []
 
         if self._bow_enabled():
             for view_index, view in enumerate(self.nn_config.bow_views):
-                e_train, e_test = self._fit_bow_binary_train_test(
+                e_train, e_test, fold_rows = self._fit_bow_binary_train_test(
                     texts_train,
                     texts_test,
                     t,
@@ -783,8 +1190,9 @@ class MultiModelForestAgentOptionalRunner:
                     view_index=view_index,
                     label_name="treatment",
                 )
+                inner_model_rows.extend(fold_rows)
                 if str(self.config.outcome_type).lower() == "continuous":
-                    m_train, m_test = self._fit_bow_regression_train_test(
+                    m_train, m_test, fold_rows = self._fit_bow_regression_train_test(
                         texts_train,
                         texts_test,
                         y,
@@ -794,8 +1202,9 @@ class MultiModelForestAgentOptionalRunner:
                         view_index=view_index,
                         target_name="outcome",
                     )
+                    inner_model_rows.extend(fold_rows)
                 else:
-                    m_train, m_test = self._fit_bow_binary_train_test(
+                    m_train, m_test, fold_rows = self._fit_bow_binary_train_test(
                         texts_train,
                         texts_test,
                         y,
@@ -804,6 +1213,7 @@ class MultiModelForestAgentOptionalRunner:
                         view_index=view_index,
                         label_name="outcome",
                     )
+                    inner_model_rows.extend(fold_rows)
                 nuisance_train.append((view.name, e_train, m_train))
                 nuisance_test.append((view.name, e_test, m_test))
                 bow_nuisance_by_view.append(
@@ -860,17 +1270,28 @@ class MultiModelForestAgentOptionalRunner:
         htr_train_result = None
         htr_test_predictions = None
         if self._htr_enabled():
-            htr_train_result = self._htr_provider().fit_nuisance(train_df, outer_fold)
+            htr_provider = self._htr_provider()
+            if hasattr(htr_provider, "fit_nuisance_inner_ensemble_predict"):
+                htr_bundle = htr_provider.fit_nuisance_inner_ensemble_predict(
+                    train_df,
+                    test_df,
+                    outer_fold,
+                )
+                htr_train_result = htr_bundle["train"]
+                htr_test_predictions = htr_bundle["test_predictions"]
+                inner_model_rows.extend(htr_bundle.get("inner_model_rows", []))
+            else:
+                htr_train_result = htr_provider.fit_nuisance(train_df, outer_fold)
+                htr_test_predictions = htr_provider.fit_nuisance_full_predict(
+                    train_df,
+                    test_df,
+                    outer_fold,
+                )
             htr_train_predictions = _align_htr_prediction_frame(
                 htr_train_result.get("predictions"),
                 train_df,
                 required_columns=["e_hat", "m_hat"],
                 source="htr_nuisance",
-            )
-            htr_test_predictions = self._htr_provider().fit_nuisance_full_predict(
-                train_df,
-                test_df,
-                outer_fold,
             )
             htr_test_predictions = _align_htr_prediction_frame(
                 htr_test_predictions,
@@ -946,7 +1367,7 @@ class MultiModelForestAgentOptionalRunner:
 
         if not nuisance_train:
             raise ValueError(
-                "multi_model_forest_agent_optional requires at least one nuisance source"
+                "multi_model_forest Stage 1 requires at least one nuisance source"
             )
         e_train = np.nanmean(np.vstack([item[1] for item in nuisance_train]), axis=0)
         m_train = np.nanmean(np.vstack([item[2] for item in nuisance_train]), axis=0)
@@ -984,6 +1405,15 @@ class MultiModelForestAgentOptionalRunner:
                 "target_source": "ensemble_mean_nuisance",
             }
         )
+        ensemble_nuisance_test = pd.DataFrame(
+            {
+                "_oci_row_id": test_df["_oci_row_id"].to_numpy(),
+                "outer_fold": int(outer_fold),
+                "e_hat": e_test,
+                "m_hat": m_test,
+                "target_source": "ensemble_mean_nuisance_inner_ensemble",
+            }
+        )
         prediction_frames.append(
             _source_prediction_frame(
                 train_df,
@@ -999,7 +1429,7 @@ class MultiModelForestAgentOptionalRunner:
 
         if self._bow_enabled():
             for view_index, view in enumerate(self.nn_config.bow_views):
-                pseudo_train, pseudo_test = self._fit_bow_regression_train_test(
+                pseudo_train, pseudo_test, fold_rows = self._fit_bow_regression_train_test(
                     texts_train,
                     texts_test,
                     pseudo_target,
@@ -1010,7 +1440,8 @@ class MultiModelForestAgentOptionalRunner:
                     target_name="effect_pseudo_target",
                     seed_offset=50_000,
                 )
-                r_train, r_test = self._fit_bow_regression_train_test(
+                inner_model_rows.extend(fold_rows)
+                r_train, r_test, fold_rows = self._fit_bow_regression_train_test(
                     texts_train,
                     texts_test,
                     pseudo_target,
@@ -1021,6 +1452,7 @@ class MultiModelForestAgentOptionalRunner:
                     target_name="effect_weighted_r",
                     seed_offset=70_000,
                 )
+                inner_model_rows.extend(fold_rows)
                 _append_feature(
                     x_train_cols,
                     x_test_cols,
@@ -1119,28 +1551,42 @@ class MultiModelForestAgentOptionalRunner:
 
         if self._htr_enabled():
             htr_effect_variants: Dict[str, Any] = {}
+            htr_provider = self._htr_provider()
             for effect_objective, feature_suffix in [
                 ("pseudo_outcome_mse", "effect_pseudo_target_pred"),
                 ("squared_r_loss", "effect_weighted_r_tau_pred"),
             ]:
-                htr_effect_train = self._htr_provider().fit_effect_variant(
-                    train_df,
-                    ensemble_nuisance_train,
-                    outer_fold,
-                    effect_objective=effect_objective,
-                )
+                if hasattr(htr_provider, "fit_effect_variant_inner_ensemble_predict"):
+                    htr_effect_bundle = htr_provider.fit_effect_variant_inner_ensemble_predict(
+                        train_df,
+                        test_df,
+                        ensemble_nuisance_train,
+                        outer_fold,
+                        effect_objective=effect_objective,
+                        test_nuisance_predictions=ensemble_nuisance_test,
+                    )
+                    htr_effect_train = htr_effect_bundle["train"]
+                    test_predictions = htr_effect_bundle["test_predictions"]
+                    inner_model_rows.extend(htr_effect_bundle.get("inner_model_rows", []))
+                else:
+                    htr_effect_train = htr_provider.fit_effect_variant(
+                        train_df,
+                        ensemble_nuisance_train,
+                        outer_fold,
+                        effect_objective=effect_objective,
+                    )
+                    test_predictions = htr_provider.fit_effect_full_predict(
+                        train_df,
+                        test_df,
+                        ensemble_nuisance_train,
+                        outer_fold,
+                        effect_objective=effect_objective,
+                    )
                 train_predictions = _align_htr_prediction_frame(
                     htr_effect_train.get("predictions"),
                     train_df,
                     required_columns=["tau_hat_r_stage"],
                     source=f"htr_effect_{effect_objective}",
-                )
-                test_predictions = self._htr_provider().fit_effect_full_predict(
-                    train_df,
-                    test_df,
-                    ensemble_nuisance_train,
-                    outer_fold,
-                    effect_objective=effect_objective,
                 )
                 test_predictions = _align_htr_prediction_frame(
                     test_predictions,
@@ -1264,6 +1710,7 @@ class MultiModelForestAgentOptionalRunner:
                     contrast_family=item.get("contrast_family"),
                 )
             embedding_rows.extend(emb["metadata"])
+            inner_model_rows.extend(emb.get("inner_model_rows", []))
             embedding_evidence = self._build_primary_embedding_contrast_evidence(
                 discovery_df=train_df,
                 y=y,
@@ -1292,6 +1739,7 @@ class MultiModelForestAgentOptionalRunner:
             embedding_rows=embedding_rows,
             metrics=metrics,
             handoff_evidence=handoff_evidence,
+            inner_model_rows=inner_model_rows,
         )
 
     def _primary_bow_metrics(
@@ -1547,6 +1995,76 @@ class MultiModelForestAgentOptionalRunner:
         )
         return compact_context
 
+    def _inner_model_handoff_rows(
+        self,
+        *,
+        base_result: Dict[str, Any],
+        inner_model_rows: Sequence[Dict[str, Any]],
+        outer_fold: int,
+        n_outer_train_rows: int,
+    ) -> List[Dict[str, Any]]:
+        if not bool(getattr(self.nn_config, "candidate_consistency_enabled", True)):
+            return []
+        grouped: Dict[int, List[Dict[str, Any]]] = {}
+        for row in inner_model_rows:
+            if int(row.get("outer_fold", outer_fold)) != int(outer_fold):
+                continue
+            inner_fold = row.get("inner_fold")
+            if inner_fold is None:
+                continue
+            grouped.setdefault(int(inner_fold), []).append(copy.deepcopy(row))
+        if not grouped:
+            return []
+        rows: List[Dict[str, Any]] = []
+        for inner_fold in sorted(grouped):
+            fold_evidence = grouped[inner_fold]
+            sample = fold_evidence[0]
+            handoff_result = copy.deepcopy(base_result)
+            context = copy.deepcopy(handoff_result.get("context") or {})
+            context.update(
+                {
+                    "outer_fold": int(outer_fold),
+                    "inner_fold": int(inner_fold),
+                    "consistency_scope": "inner_train",
+                    "inner_train_rows": int(sample.get("train_rows") or 0),
+                    "inner_heldout_rows": int(sample.get("heldout_rows") or 0),
+                    "stage1_inner_model_evidence": fold_evidence,
+                }
+            )
+            provenance = dict(context.get("handoff_provenance") or {})
+            provenance.update(
+                {
+                    "candidate_consistency_evidence": "stage1_inner_fold_models",
+                    "stage2_raw_text_modeling_required": False,
+                    "outer_test_prediction": "mean_of_stage1_inner_fold_models",
+                }
+            )
+            context["handoff_provenance"] = provenance
+            handoff_result["context"] = context
+            metrics = dict(handoff_result.get("metrics") or {})
+            metrics.update(
+                {
+                    "stage1_inner_model_evidence_count": int(len(fold_evidence)),
+                    "inner_train_rows": int(sample.get("train_rows") or 0),
+                    "inner_heldout_rows": int(sample.get("heldout_rows") or 0),
+                    "outer_train_rows": int(n_outer_train_rows),
+                }
+            )
+            handoff_result["metrics"] = metrics
+            handoff_result["inner_model_evidence"] = fold_evidence
+            rows.append(
+                _agentic_discovery_handoff_row(
+                    handoff_result,
+                    fold_key=1000 * int(outer_fold) + int(inner_fold),
+                    outer_fold=int(outer_fold),
+                    scope="candidate_consistency_inner_train",
+                    n_rows=int(sample.get("train_rows") or 0),
+                    inner_fold=int(inner_fold),
+                    heldout_rows=int(sample.get("heldout_rows") or 0),
+                )
+            )
+        return rows
+
     def _fit_bow_binary_train_test(
         self,
         texts_train: Sequence[str],
@@ -1557,7 +2075,7 @@ class MultiModelForestAgentOptionalRunner:
         view: BoWViewConfig,
         view_index: int,
         label_name: str,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, List[Dict[str, Any]]]:
         labels = np.asarray(labels, dtype=int)
         oof = np.full(len(labels), np.nan, dtype=float)
         split_items = list(
@@ -1588,30 +2106,71 @@ class MultiModelForestAgentOptionalRunner:
         )
 
         def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
-            return _fit_binary_bow_fold(
-                texts_train,
-                labels,
-                fit_pos,
-                heldout_pos,
-                vectorizer_params,
-                model_params,
-                random_state=17 + int(fold),
+            fit_pos = np.asarray(fit_pos, dtype=int)
+            heldout_pos = np.asarray(heldout_pos, dtype=int)
+            if len(np.unique(labels[fit_pos])) < 2:
+                heldout_pred = np.full(
+                    len(heldout_pos),
+                    float(np.mean(labels[fit_pos])),
+                    dtype=float,
+                )
+                test_pred = np.full(len(texts_test), float(np.mean(labels[fit_pos])), dtype=float)
+            else:
+                vectorizer = _make_bow_vectorizer(vectorizer_params)
+                fit_texts = [texts_train[int(pos)] for pos in fit_pos]
+                heldout_texts = [texts_train[int(pos)] for pos in heldout_pos]
+                x_fit = vectorizer.fit_transform(fit_texts)
+                x_heldout = vectorizer.transform(heldout_texts)
+                x_test = vectorizer.transform(texts_test)
+                model = _make_bow_classifier(model_params, random_state=17 + int(fold))
+                model.fit(x_fit, labels[fit_pos])
+                heldout_pred = model.predict_proba(x_heldout)[:, 1]
+                test_pred = model.predict_proba(x_test)[:, 1]
+            heldout_pred = np.clip(
+                heldout_pred,
+                self.nn_config.e_clip,
+                1.0 - self.nn_config.e_clip,
             )
+            test_pred = np.clip(
+                test_pred,
+                self.nn_config.e_clip,
+                1.0 - self.nn_config.e_clip,
+            )
+            return {
+                "fold": int(fold),
+                "heldout_pos": heldout_pos,
+                "heldout_pred": heldout_pred,
+                "test_pred": test_pred,
+                "evidence": {
+                    "outer_fold": int(outer_fold),
+                    "inner_fold": int(fold),
+                    "source_family": "bow",
+                    "view_name": view.name,
+                    "view_config": _bow_view_to_dict(view),
+                    "objective": f"{label_name}_nuisance",
+                    "target_name": label_name,
+                    "model": str(view.bow_model),
+                    "train_rows": int(len(fit_pos)),
+                    "heldout_rows": int(len(heldout_pos)),
+                    "outer_test_rows": int(len(texts_test)),
+                    "heldout_auroc": _safe_roc_auc(labels[heldout_pos], heldout_pred),
+                    "prediction_provenance": "inner_fold_model_heldout_and_outer_test",
+                },
+            }
 
-        for heldout_pos, values in self._run_fold_tasks(run_fold, split_items):
-            oof[heldout_pos] = values
-        if len(np.unique(labels)) < 2:
-            test_pred = np.full(len(texts_test), float(np.mean(labels)), dtype=float)
-        else:
-            vectorizer = _make_bow_vectorizer(vectorizer_params)
-            x_train = vectorizer.fit_transform(texts_train)
-            x_test = vectorizer.transform(texts_test)
-            model = _make_bow_classifier(model_params, random_state=117 + int(view_index))
-            model.fit(x_train, labels)
-            test_pred = model.predict_proba(x_test)[:, 1]
+        fold_results = self._run_fold_tasks(run_fold, split_items)
+        test_predictions = []
+        evidence_rows = []
+        for result in fold_results:
+            heldout_pos = result["heldout_pos"]
+            oof[heldout_pos] = result["heldout_pred"]
+            test_predictions.append(np.asarray(result["test_pred"], dtype=float))
+            evidence_rows.append(result["evidence"])
+        test_pred = np.nanmean(np.vstack(test_predictions), axis=0)
         return (
             np.clip(oof, self.nn_config.e_clip, 1.0 - self.nn_config.e_clip),
             np.clip(test_pred, self.nn_config.e_clip, 1.0 - self.nn_config.e_clip),
+            evidence_rows,
         )
 
     def _fit_bow_regression_train_test(
@@ -1626,7 +2185,7 @@ class MultiModelForestAgentOptionalRunner:
         view_index: int,
         target_name: str,
         seed_offset: int = 0,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, List[Dict[str, Any]]]:
         values = np.asarray(values, dtype=float)
         oof = np.full(len(values), np.nan, dtype=float)
         folds = _bounded_fold_count(
@@ -1661,27 +2220,59 @@ class MultiModelForestAgentOptionalRunner:
         )
 
         def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
-            return _fit_regression_bow_fold(
-                texts_train,
-                values,
-                fit_pos,
-                heldout_pos,
-                vectorizer_params,
+            fit_pos = np.asarray(fit_pos, dtype=int)
+            heldout_pos = np.asarray(heldout_pos, dtype=int)
+            vectorizer = _make_bow_vectorizer(vectorizer_params)
+            fit_texts = [texts_train[int(pos)] for pos in fit_pos]
+            heldout_texts = [texts_train[int(pos)] for pos in heldout_pos]
+            x_fit = vectorizer.fit_transform(fit_texts)
+            x_heldout = vectorizer.transform(heldout_texts)
+            x_test = vectorizer.transform(texts_test)
+            model = _make_bow_regressor(
                 model_params,
-                sample_weight=sample_weight,
                 random_state=17 + int(seed_offset) + int(fold),
             )
+            fold_weight = None
+            if sample_weight is not None:
+                fold_weight = np.asarray(sample_weight, dtype=float)[fit_pos]
+            _fit_regressor(model, x_fit, values[fit_pos], sample_weight=fold_weight)
+            heldout_pred = model.predict(x_heldout)
+            test_pred = model.predict(x_test)
+            heldout_values = values[heldout_pos]
+            return {
+                "fold": int(fold),
+                "heldout_pos": heldout_pos,
+                "heldout_pred": heldout_pred,
+                "test_pred": test_pred,
+                "evidence": {
+                    "outer_fold": int(outer_fold),
+                    "inner_fold": int(fold),
+                    "source_family": "bow",
+                    "view_name": view.name,
+                    "view_config": _bow_view_to_dict(view),
+                    "objective": target_name,
+                    "target_name": target_name,
+                    "model": str(view.bow_model),
+                    "train_rows": int(len(fit_pos)),
+                    "heldout_rows": int(len(heldout_pos)),
+                    "outer_test_rows": int(len(texts_test)),
+                    "heldout_rmse": _finite_or_none(
+                        np.sqrt(mean_squared_error(heldout_values, heldout_pred))
+                    ),
+                    "prediction_provenance": "inner_fold_model_heldout_and_outer_test",
+                },
+            }
 
-        for heldout_pos, pred in self._run_fold_tasks(run_fold, split_items):
-            oof[heldout_pos] = pred
-        vectorizer = _make_bow_vectorizer(vectorizer_params)
-        x_train = vectorizer.fit_transform(texts_train)
-        x_test = vectorizer.transform(texts_test)
-        model = _make_bow_regressor(
-            model_params, random_state=217 + int(seed_offset) + int(view_index)
-        )
-        _fit_regressor(model, x_train, values, sample_weight=sample_weight)
-        return oof, model.predict(x_test)
+        fold_results = self._run_fold_tasks(run_fold, split_items)
+        test_predictions = []
+        evidence_rows = []
+        for result in fold_results:
+            heldout_pos = result["heldout_pos"]
+            oof[heldout_pos] = result["heldout_pred"]
+            test_predictions.append(np.asarray(result["test_pred"], dtype=float))
+            evidence_rows.append(result["evidence"])
+        test_pred = np.nanmean(np.vstack(test_predictions), axis=0)
+        return oof, test_pred, evidence_rows
 
     def _embedding_feature_bundle(
         self,
@@ -1705,46 +2296,100 @@ class MultiModelForestAgentOptionalRunner:
             self.nn_config.embedding_contrast.residualize_columns,
         )
         train_patient = _normalize_rows(train_patient)
-        directions, metadata = self._embedding_directions(
-            patient_embeddings=train_patient,
-            y=y,
-            t=t,
-            pseudo_target=pseudo_target,
-            t_resid=t_resid,
-            outer_fold=outer_fold,
-        )
+        folds = _bounded_fold_count(int(self.nn_config.nuisance_folds), len(train_df))
+        splitter = KFold(n_splits=folds, shuffle=True, random_state=40_000 + int(outer_fold))
+        feature_map: Dict[str, Dict[str, Any]] = {}
+        metadata: List[Dict[str, Any]] = []
+        inner_model_rows: List[Dict[str, Any]] = []
+
+        for inner_fold, (fit_pos, heldout_pos) in enumerate(splitter.split(train_df), start=1):
+            fit_pos = np.asarray(fit_pos, dtype=int)
+            heldout_pos = np.asarray(heldout_pos, dtype=int)
+            directions, fold_metadata = self._embedding_directions(
+                patient_embeddings=train_patient[fit_pos],
+                y=np.asarray(y, dtype=float)[fit_pos],
+                t=np.asarray(t, dtype=float)[fit_pos],
+                pseudo_target=np.asarray(pseudo_target, dtype=float)[fit_pos],
+                t_resid=np.asarray(t_resid, dtype=float)[fit_pos],
+                outer_fold=1000 * int(outer_fold) + int(inner_fold),
+            )
+            for row in fold_metadata:
+                row = dict(row)
+                row["outer_fold"] = int(outer_fold)
+                row["inner_fold"] = int(inner_fold)
+                row["prediction_provenance"] = "inner_fold_contrast_direction"
+                metadata.append(row)
+            inner_model_rows.append(
+                {
+                    "outer_fold": int(outer_fold),
+                    "inner_fold": int(inner_fold),
+                    "source_family": "embedding_contrast",
+                    "objective": "contrast_direction",
+                    "target_name": "embedding_contrast",
+                    "train_rows": int(len(fit_pos)),
+                    "heldout_rows": int(len(heldout_pos)),
+                    "outer_test_rows": int(len(test_df)),
+                    "n_contrast_directions": int(len(directions)),
+                    "prediction_provenance": "inner_fold_model_heldout_and_outer_test",
+                }
+            )
+            heldout_positions = [int(train_positions[int(pos)]) for pos in heldout_pos]
+            for direction in directions:
+                heldout_mean, heldout_max = self._chunk_similarity_features(
+                    generator,
+                    heldout_positions,
+                    direction["direction"],
+                )
+                test_mean, test_max = self._chunk_similarity_features(
+                    generator,
+                    test_positions,
+                    direction["direction"],
+                )
+                base_name = f"embedding__{direction['name']}"
+                for stat, heldout_values, test_values in [
+                    ("mean_cosine", heldout_mean, test_mean),
+                    ("max_cosine", heldout_max, test_max),
+                ]:
+                    feature_name = f"{base_name}__{stat}"
+                    entry = feature_map.setdefault(
+                        feature_name,
+                        {
+                            "name": feature_name,
+                            "role": direction["role"],
+                            "objective": direction["objective"],
+                            "contrast_family": direction["contrast_family"],
+                            "train": np.full(len(train_df), np.nan, dtype=np.float32),
+                            "test_predictions": [],
+                        },
+                    )
+                    entry["train"][heldout_pos] = heldout_values
+                    entry["test_predictions"].append(np.asarray(test_values, dtype=np.float32))
+
         w_features = []
         x_features = []
-        for direction in directions:
-            train_mean, train_max = self._chunk_similarity_features(
-                generator,
-                train_positions,
-                direction["direction"],
+        for entry in feature_map.values():
+            train_values = np.asarray(entry["train"], dtype=np.float32)
+            train_values = np.where(np.isfinite(train_values), train_values, 0.0)
+            test_values = (
+                np.nanmean(np.vstack(entry["test_predictions"]), axis=0)
+                if entry["test_predictions"]
+                else np.zeros(len(test_df), dtype=np.float32)
             )
-            test_mean, test_max = self._chunk_similarity_features(
-                generator,
-                test_positions,
-                direction["direction"],
+            target = w_features if entry["role"] == "W" else x_features
+            target.append(
+                {
+                    "name": entry["name"],
+                    "train": train_values,
+                    "test": np.asarray(test_values, dtype=np.float32),
+                    "objective": entry["objective"],
+                    "contrast_family": entry["contrast_family"],
+                }
             )
-            target = w_features if direction["role"] == "W" else x_features
-            base_name = f"embedding__{direction['name']}"
-            for stat, train_values, test_values in [
-                ("mean_cosine", train_mean, test_mean),
-                ("max_cosine", train_max, test_max),
-            ]:
-                target.append(
-                    {
-                        "name": f"{base_name}__{stat}",
-                        "train": train_values,
-                        "test": test_values,
-                        "objective": direction["objective"],
-                        "contrast_family": direction["contrast_family"],
-                    }
-                )
         return {
             "w_features": w_features,
             "x_features": x_features,
             "metadata": metadata,
+            "inner_model_rows": inner_model_rows,
         }
 
     def _embedding_directions(
@@ -2261,7 +2906,7 @@ class MultiModelForestAgentOptionalRunner:
             return self.htr_evidence_provider
         if self._default_htr_provider is None:
             htr_num_workers = 0 if self._outer_backend_name() == "processes" else self.num_workers
-            self._default_htr_provider = MultiModelOptionalHTRProvider(
+            self._default_htr_provider = MultiModelForestStage1HTRProvider(
                 config=self.config,
                 output_dir=self.artifact_dir,
                 device=self.device,
@@ -2284,7 +2929,7 @@ class MultiModelForestAgentOptionalRunner:
             backend = "processes"
         if backend not in {"threads", "processes"}:
             raise ValueError(
-                "multi_model_forest_agent_optional.outer_parallel_backend must be "
+                "multi_model_forest.outer_parallel_backend must be "
                 "'threads', 'processes', or 'loky'"
             )
         return backend
@@ -2366,6 +3011,10 @@ class MultiModelForestAgentOptionalRunner:
             self.embedding_feature_rows,
         )
         _write_jsonl(self.artifact_dir / "split_provenance.jsonl", self.split_provenance_rows)
+        _write_jsonl(
+            self.artifact_dir / "stage1_inner_model_evidence.jsonl",
+            self.inner_model_evidence_rows,
+        )
         if self.agentic_handoff_rows:
             handoff_path = self._agentic_handoff_path()
             _write_jsonl(handoff_path, self.agentic_handoff_rows)
@@ -2387,73 +3036,20 @@ class MultiModelForestAgentOptionalRunner:
                 index=False,
             )
         report = [
-            "# Multi-Model Forest With Optional Agent Branch",
+            "# Multi-Model Forest Stage 1 Text Models",
             "",
             f"- Rows: {len(self.dataset)}",
             f"- Outer folds: {len(self.outer_metric_rows)}",
             f"- Feature discovery methods: {', '.join(self._enabled_feature_discovery_methods())}",
             f"- Primary predictions: {self.output_path}",
             "- Agents used in primary forest: no",
+            "- Agentic Stage 2 owner: multi_model_forest",
         ]
-        if bool(getattr(self.nn_config, "agentic_explicit_branch_enabled", False)):
-            report.append("- Optional agentic explicit branch: enabled")
-        else:
-            report.append("- Optional agentic explicit branch: disabled")
         (self.artifact_dir / "report.txt").write_text("\n".join(report) + "\n")
-        logger.info("Multi-model optional-agent forest predictions saved to: %s", self.output_path)
+        logger.info("Multi-model stage1 forest predictions saved to: %s", self.output_path)
 
     def _agentic_handoff_path(self) -> Path:
         return self.artifact_dir / "agentic_handoff.jsonl"
-
-    def _prepare_agentic_handoff(self) -> Path:
-        handoff_path = self._agentic_handoff_path()
-        logger.info(
-            "Preparing multi-model agentic discovery handoff at: %s",
-            handoff_path,
-        )
-        build_multi_model_agentic_discovery_handoff(
-            self.dataset.drop(columns=["_oci_row_id"], errors="ignore"),
-            self.config,
-            handoff_path,
-            device=self.device,
-            gpu_ids=self.gpu_ids,
-            num_workers=self.num_workers,
-            include_candidate_consistency=True,
-        )
-        return handoff_path
-
-    def _run_optional_agentic_branch(self) -> None:
-        logger.info("Running optional final agentic explicit-feature branch")
-
-        handoff_path = self._agentic_handoff_path()
-        if not handoff_path.exists():
-            raise RuntimeError(
-                "Cannot run optional final agentic explicit-feature branch because "
-                f"the discovery handoff is missing: {handoff_path}. Rerun the "
-                "primary optional forest with --prepare-agentic-handoff."
-            )
-        branch_dir = self.artifact_dir / "agentic_explicit_branch"
-        branch_dir.mkdir(parents=True, exist_ok=True)
-        branch_prediction_path = branch_dir / "agentic_explicit_feature_predictions.parquet"
-        run_multi_model_agentic_forest_from_handoff(
-            self.dataset.drop(columns=["_oci_row_id"], errors="ignore"),
-            self.config,
-            branch_prediction_path,
-            handoff_path,
-            device=self.device,
-            gpu_ids=self.gpu_ids,
-            num_workers=self.num_workers,
-        )
-        summary = {
-            "prediction_path": str(branch_prediction_path),
-            "agentic_handoff_path": str(handoff_path),
-        }
-        artifact_metrics = (
-            branch_prediction_path.parent / "multi_model_agentic_forest" / "outer_cv_metrics.csv"
-        )
-        if artifact_metrics.exists():
-            summary["outer_cv_metrics_path"] = str(artifact_metrics)
-        _write_json(self.artifact_dir / "agentic_explicit_branch_summary.json", summary)
 
 
 def _vectorizer_params(view: BoWViewConfig) -> Dict[str, Any]:

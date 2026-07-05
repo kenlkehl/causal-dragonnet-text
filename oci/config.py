@@ -1163,16 +1163,9 @@ class MultiModelAgenticForestConfig:
 
 
 @dataclass
-class MultiModelForestAgentOptionalConfig(MultiModelAgenticForestConfig):
-    """Configuration for non-agentic multi-model W/X forest with optional agents."""
+class MultiModelForestConfig(MultiModelAgenticForestConfig):
+    """Configuration for the integrated two-stage multi-model forest path."""
 
-    # The primary text-model forest never uses agents. When this flag is true,
-    # a separate agentic explicit-feature forest branch is run after the primary
-    # text-model traces and predictions are written.
-    agentic_explicit_branch_enabled: bool = False
-    # Precompute the agent-visible discovery evidence needed to run that branch
-    # later without refitting BoW/HTR/embedding discovery models.
-    agentic_handoff_enabled: bool = False
     # Outer-fold execution backend. "threads" preserves historical behavior;
     # "processes"/"loky" makes outer folds visible as joblib worker processes.
     outer_parallel_backend: str = "threads"
@@ -1180,13 +1173,18 @@ class MultiModelForestAgentOptionalConfig(MultiModelAgenticForestConfig):
     # fold_parallelism setting is used for both.
     bow_fold_parallelism: Optional[str] = None
     htr_fold_parallelism: Optional[str] = None
+    # Public scheduler controls for the integrated path. The runner derives
+    # outer/inner fold execution from these rather than exposing separate fold
+    # parallelism flags.
+    cpus_total: Optional[int] = None
+    htr_jobs_per_gpu: int = 1
 
     def __post_init__(self):
         super().__post_init__()
         backend = str(self.outer_parallel_backend).strip().lower()
         if backend not in {"threads", "processes", "loky"}:
             raise ValueError(
-                "multi_model_forest_agent_optional.outer_parallel_backend must be "
+                "multi_model_forest.outer_parallel_backend must be "
                 "'threads', 'processes', or 'loky'"
             )
         self.outer_parallel_backend = "processes" if backend == "loky" else backend
@@ -1200,23 +1198,9 @@ class MultiModelForestAgentOptionalConfig(MultiModelAgenticForestConfig):
                 continue
             _validate_parallelism_setting(
                 value_text,
-                f"multi_model_forest_agent_optional.{field_name}",
+                f"multi_model_forest.{field_name}",
             )
             setattr(self, field_name, value_text)
-
-
-@dataclass
-class MultiModelForestConfig(MultiModelForestAgentOptionalConfig):
-    """Configuration for the integrated two-stage multi-model forest path."""
-
-    # Public scheduler controls for the integrated path. The runner derives
-    # outer/inner fold execution from these rather than exposing separate fold
-    # parallelism flags.
-    cpus_total: Optional[int] = None
-    htr_jobs_per_gpu: int = 1
-
-    def __post_init__(self):
-        super().__post_init__()
         if self.cpus_total is not None and int(self.cpus_total) < 1:
             raise ValueError("multi_model_forest.cpus_total must be >= 1")
         if int(self.htr_jobs_per_gpu) < 1:
@@ -1597,7 +1581,7 @@ class ModelArchitectureConfig:
     """Configuration for model architecture."""
 
     model_type: str = (
-        "dragonnet"  # "dragonnet", "dragonnet_drlearner", "rlearner", "causal_forest", "tfidf_forest", "explicit_feature_forest", "agentic_explicit_feature_forest", "agentic_attention_variable_forest", "multi_model_agentic_forest", "multi_model_forest_agent_optional", or "multi_model_forest"
+        "dragonnet"  # "dragonnet", "dragonnet_drlearner", "rlearner", "causal_forest", "tfidf_forest", "explicit_feature_forest", "agentic_explicit_feature_forest", "agentic_attention_variable_forest", "multi_model_agentic_forest", or "multi_model_forest"
     )
 
     # Feature extractor type: "frozen_llm_pooler"
@@ -1775,11 +1759,6 @@ class ModelArchitectureConfig:
     # Multi-model BoW-guided variable discovery + explicit-feature causal forest
     multi_model_agentic_forest: MultiModelAgenticForestConfig = field(
         default_factory=MultiModelAgenticForestConfig
-    )
-
-    # Multi-model W/X text-feature causal forest with optional final agent branch
-    multi_model_forest_agent_optional: MultiModelForestAgentOptionalConfig = field(
-        default_factory=MultiModelForestAgentOptionalConfig
     )
 
     # Integrated two-stage multi-model forest
@@ -1994,14 +1973,6 @@ class ExperimentConfig:
                 arch_data["multi_model_agentic_forest"] = MultiModelAgenticForestConfig(
                     **arch_data["multi_model_agentic_forest"]
                 )
-            if "multi_model_forest_agent_optional" in arch_data and isinstance(
-                arch_data["multi_model_forest_agent_optional"], dict
-            ):
-                arch_data["multi_model_forest_agent_optional"] = (
-                    MultiModelForestAgentOptionalConfig(
-                        **arch_data["multi_model_forest_agent_optional"]
-                    )
-                )
             if "multi_model_forest" in arch_data and isinstance(
                 arch_data["multi_model_forest"], dict
             ):
@@ -2148,36 +2119,6 @@ class ExperimentConfig:
             ):
                 raise ValueError(
                     "multi_model_agentic_forest.htr_evidence_enabled=False "
-                    "requires htr_evidence_disable_reason"
-                )
-        if self.applied_inference.architecture.model_type == "multi_model_forest_agent_optional":
-            mm_config = self.applied_inference.architecture.multi_model_forest_agent_optional
-            methods = normalize_multi_model_feature_discovery_methods(
-                getattr(mm_config, "feature_discovery_methods", None),
-                source="multi_model_forest_agent_optional.feature_discovery_methods",
-            )
-            if methods is None:
-                methods = mm_config._feature_discovery_methods_from_flags()
-            if not methods:
-                raise ValueError(
-                    "multi_model_forest_agent_optional must enable at least one "
-                    "feature discovery method: bow, htr, or embedding_contrast"
-                )
-            embedding_config = mm_config.embedding_contrast
-            if (
-                not bool(getattr(embedding_config, "enabled", False))
-                and not str(getattr(embedding_config, "disable_reason", "") or "").strip()
-            ):
-                raise ValueError(
-                    "multi_model_forest_agent_optional.embedding_contrast.enabled=False "
-                    "requires embedding_contrast.disable_reason"
-                )
-            if (
-                not bool(getattr(mm_config, "htr_evidence_enabled", True))
-                and not str(getattr(mm_config, "htr_evidence_disable_reason", "") or "").strip()
-            ):
-                raise ValueError(
-                    "multi_model_forest_agent_optional.htr_evidence_enabled=False "
                     "requires htr_evidence_disable_reason"
                 )
         if self.applied_inference.architecture.model_type == "multi_model_forest":

@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 import sys
 import traceback
 from dataclasses import asdict, dataclass
@@ -30,10 +31,7 @@ from run_oracle_multi_model_agentic_forest import (  # noqa: E402
     _load_dataset,
     _make_applied_config as _make_agentic_applied_config,
     _metrics,
-)
-from run_oracle_multi_model_forest_agent_optional import (  # noqa: E402
-    _normalize_embedding_cache_dir_arg,
-    _resolve_oracle_parquet_file_for_optional_cache,
+    _resolve_oracle_parquet_file,
 )
 
 logging.basicConfig(
@@ -41,6 +39,15 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+_EMBEDDING_CACHE_PREFIX = "cecnn_chunk_embeddings_"
+_REQUIRED_EMBEDDING_CACHE_FILES = (
+    "metadata.json",
+    "chunk_embeddings.npy",
+    "offsets.npy",
+    "chunk_texts.jsonl",
+)
 
 
 @dataclass
@@ -159,7 +166,6 @@ def _make_applied_config(
     mm_config = MultiModelForestConfig(**mm_data)
     applied.architecture.multi_model_forest = mm_config
     applied.architecture.multi_model_agentic_forest = mm_config
-    applied.architecture.multi_model_forest_agent_optional = mm_config
     return applied
 
 
@@ -224,7 +230,7 @@ def _run_one(config: MultiModelForestOracleConfig, output_dir: Path) -> Dict[str
 
 
 def _normalize_run_inputs(config: MultiModelForestOracleConfig) -> Path:
-    parquet_file = _resolve_oracle_parquet_file_for_optional_cache(config)
+    parquet_file = _resolve_oracle_parquet_file_for_cache(config)
     if config.dataset_path != str(parquet_file):
         logger.info("Resolved --dataset %s to %s", config.dataset_path, parquet_file)
         config.dataset_path = str(parquet_file)
@@ -237,6 +243,130 @@ def _normalize_run_inputs(config: MultiModelForestOracleConfig) -> Path:
         )
         config.embedding_cache_dir = normalized_cache_dir
     return parquet_file
+
+
+def _resolve_oracle_parquet_file_for_cache(config: MultiModelForestOracleConfig) -> Path:
+    """Resolve dataset input while preserving any complete embedding chunk cache."""
+    path = Path(config.dataset_path).expanduser()
+    if path.is_file():
+        if path.suffix != ".parquet":
+            raise ValueError(f"--dataset must be a parquet file or dataset directory: {path}")
+        return path
+
+    if (
+        _embedding_contrast_requested(config)
+        and config.sample_size is None
+        and config.text_max_chars is None
+    ):
+        for candidate in _candidate_oracle_parquet_files(path):
+            cache_path = _matching_complete_embedding_cache_path(config, candidate)
+            if cache_path is not None:
+                logger.info(
+                    "Resolved dataset directory to %s because matching embedding "
+                    "chunk cache exists at %s",
+                    candidate,
+                    cache_path,
+                )
+                return candidate
+    elif _embedding_contrast_requested(config):
+        logger.info(
+            "Skipping embedding-cache-aware dataset resolution because sample_size "
+            "or text_max_chars changes the in-memory text rows"
+        )
+
+    return _resolve_oracle_parquet_file(config.dataset_path)
+
+
+def _embedding_contrast_requested(config: MultiModelForestOracleConfig) -> bool:
+    selected_methods = normalize_multi_model_feature_discovery_methods(
+        config.feature_discovery_methods,
+        source="feature_discovery_methods",
+    )
+    if selected_methods is not None:
+        return "embedding_contrast" in selected_methods
+    return bool(config.embedding_contrast_enabled)
+
+
+def _candidate_oracle_parquet_files(path: Path) -> List[Path]:
+    if path.is_file():
+        return [path]
+    return [
+        candidate
+        for candidate in (
+            path / "dataset_with_extraction.parquet",
+            path / "dataset.parquet",
+        )
+        if candidate.exists()
+    ]
+
+
+def _matching_complete_embedding_cache_path(
+    config: MultiModelForestOracleConfig,
+    parquet_file: Path,
+) -> Optional[Path]:
+    cache_root = _embedding_cache_root_for_parquet(config, parquet_file)
+    cache_hash = _embedding_cache_hash_for_config(config, parquet_file)
+    cache_path = cache_root / f"{_EMBEDDING_CACHE_PREFIX}{cache_hash}"
+    if not all((cache_path / filename).exists() for filename in _REQUIRED_EMBEDDING_CACHE_FILES):
+        return None
+    try:
+        with open(cache_path / "metadata.json", encoding="utf-8") as f:
+            metadata = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if metadata.get("cache_hash") != cache_hash:
+        return None
+    if metadata.get("storage_format") != "variable_length_chunks":
+        return None
+    return cache_path
+
+
+def _embedding_cache_root_for_parquet(
+    config: MultiModelForestOracleConfig,
+    parquet_file: Path,
+) -> Path:
+    explicit = _normalize_embedding_cache_dir_arg(config.embedding_cache_dir)
+    if explicit:
+        return Path(explicit).expanduser()
+    return _default_embedding_cache_root_for_parquet(parquet_file)
+
+
+def _default_embedding_cache_root_for_parquet(parquet_file: Path) -> Path:
+    return parquet_file.expanduser().resolve().parent / ".oci_cache" / "embedding_contrast"
+
+
+def _normalize_embedding_cache_dir_arg(cache_dir: Optional[str]) -> Optional[str]:
+    if cache_dir is None:
+        return None
+    path = Path(str(cache_dir)).expanduser()
+    if path.name.startswith(_EMBEDDING_CACHE_PREFIX):
+        return str(path.parent)
+    return str(path)
+
+
+def _embedding_cache_hash_for_config(
+    config: MultiModelForestOracleConfig,
+    parquet_file: Path,
+) -> str:
+    token_limit = (
+        int(config.embedding_max_seq_length)
+        if config.embedding_max_seq_length is not None
+        else "model"
+    )
+    key = "|".join(
+        [
+            str(config.embedding_model_name),
+            os.path.abspath(str(parquet_file)),
+            f"words{int(config.embedding_chunk_size_words)}",
+            f"overlap{int(config.embedding_chunk_overlap_words)}",
+            f"max{int(config.embedding_max_chunks)}",
+            "norm1",
+            f"select{str(config.embedding_chunk_selection).strip().lower()}",
+            f"tokmax{token_limit}",
+            "chunker_word_then_token_bound_v1",
+        ]
+    )
+    return hashlib.md5(key.encode()).hexdigest()[:12]
 
 
 def _append_list_arg(parser: argparse.ArgumentParser, name: str, **kwargs: Any) -> None:
