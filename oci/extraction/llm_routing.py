@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 _RETRYABLE_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504, 529}
+_GOOGLE_ADC_API_KEY_VALUES = {"google_adc", "google-adc", "adc", "application_default"}
 
 
 def parse_server_urls(
@@ -39,6 +40,90 @@ def parse_server_urls(
             if url:
                 urls.append(url)
     return urls or [default]
+
+
+def uses_google_adc_api_key(api_key: Any) -> bool:
+    return str(api_key or "").strip().lower() in _GOOGLE_ADC_API_KEY_VALUES
+
+
+def uses_google_agent_platform(
+    *,
+    api_key: Any = None,
+    server_url: Any = None,
+    model_name: Any = None,
+) -> bool:
+    if uses_google_adc_api_key(api_key):
+        return True
+    url = str(server_url or "").lower()
+    if "aiplatform.googleapis.com" in url:
+        return True
+    return str(model_name or "").lower().startswith("google/")
+
+
+def google_json_response_format_kwargs(
+    *,
+    api_key: Any = None,
+    server_url: Any = None,
+    model_name: Any = None,
+) -> dict[str, Any]:
+    if not uses_google_agent_platform(
+        api_key=api_key,
+        server_url=server_url,
+        model_name=model_name,
+    ):
+        return {}
+    return {"response_format": {"type": "json_object"}}
+
+
+class GoogleADCOpenAIClient:
+    """OpenAI-compatible client wrapper that refreshes Google ADC OAuth tokens."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        timeout: Any = None,
+        max_retries: int = 0,
+        client_factory: Optional[Callable[..., Any]] = None,
+    ) -> None:
+        if client_factory is None:
+            try:
+                from openai import OpenAI
+            except ImportError as exc:
+                raise ImportError(
+                    "openai package is required for OpenAI-compatible LLM clients"
+                ) from exc
+            client_factory = OpenAI
+        try:
+            import google.auth
+            import google.auth.transport.requests
+        except ImportError as exc:
+            raise ImportError(
+                "google-auth package is required when api_key='GOOGLE_ADC'"
+            ) from exc
+
+        self._google_request = google.auth.transport.requests.Request()
+        self._creds, _project = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        self._client = client_factory(
+            base_url=base_url,
+            api_key="PLACEHOLDER",
+            timeout=timeout,
+            max_retries=max_retries,
+        )
+        self._refresh()
+
+    def _refresh(self) -> None:
+        if not getattr(self._creds, "valid", False):
+            self._creds.refresh(self._google_request)
+        if not getattr(self._creds, "valid", False):
+            raise RuntimeError("Unable to refresh Google ADC credentials")
+        self._client.api_key = self._creds.token
+
+    def __getattr__(self, name: str) -> Any:
+        self._refresh()
+        return getattr(self._client, name)
 
 
 def retry_delay(
@@ -166,6 +251,16 @@ class OpenAIClientPool:
             client = self._clients.get(url)
             if client is not None:
                 return client
+            if uses_google_adc_api_key(self.api_key):
+                client = GoogleADCOpenAIClient(
+                    base_url=url,
+                    timeout=self.timeout,
+                    max_retries=self.max_retries,
+                    client_factory=self._client_factory,
+                )
+                self._clients[url] = client
+                logger.info("Connected to Google ADC OpenAI-compatible endpoint at: %s", url)
+                return client
             if self._client_factory is None:
                 try:
                     from openai import OpenAI
@@ -186,4 +281,3 @@ class OpenAIClientPool:
 
     def first_url(self) -> str:
         return self.server_urls[0]
-

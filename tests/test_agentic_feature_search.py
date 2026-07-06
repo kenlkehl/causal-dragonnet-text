@@ -1,4 +1,6 @@
 import json
+import sys
+import types
 from types import SimpleNamespace
 
 import numpy as np
@@ -15,6 +17,7 @@ from oci.config import (
     ModelArchitectureConfig,
 )
 from oci.extraction.cache import _compute_config_hash
+from oci.extraction.llm_routing import OpenAIClientPool
 from oci.inference.agentic_explicit_feature_forest import (
     AgenticFeatureSearchRunner,
     AgenticFeatureProposal,
@@ -511,10 +514,9 @@ def test_agentic_extraction_provider_groups_missing_specs(monkeypatch, tmp_path)
         "oci.inference.agentic_explicit_feature_forest.VLLMFeatureExtractor",
         FakeVLLMFeatureExtractor,
     )
-    provider = VLLMExplicitFeatureExtractionProvider(
-        config=_provider_config(tmp_path, cache_enabled=False),
-        output_dir=tmp_path,
-    )
+    config = _provider_config(tmp_path, cache_enabled=False)
+    config.explicit_features.vllm_api_key = "test-extraction-key"
+    provider = VLLMExplicitFeatureExtractionProvider(config=config, output_dir=tmp_path)
     df = pd.DataFrame({"clinical_text": ["note a", "note b"]})
     specs = [
         ExplicitFeatureSpec(
@@ -537,6 +539,7 @@ def test_agentic_extraction_provider_groups_missing_specs(monkeypatch, tmp_path)
 
     assert len(calls) == 1
     assert calls[0]["spec_names"] == ["age", "ecog"]
+    assert calls[0]["kwargs"]["api_key"] == "test-extraction-key"
     assert calls[0]["texts"] == ["note a", "note b"]
     assert calls[0]["cleanup"]
     assert extracted["explicit_feat_age"].tolist() == [0, 1]
@@ -859,6 +862,79 @@ class FakeOpenAIClient:
         self.models = FakeOpenAIModels(model_ids or ["fake-agent"])
 
 
+def test_openai_client_pool_uses_google_adc_token_refresh(monkeypatch):
+    refresh_requests = []
+
+    class FakeCredentials:
+        valid = False
+        token = None
+
+        def refresh(self, request):
+            refresh_requests.append(request)
+            self.valid = True
+            self.token = f"token-{len(refresh_requests)}"
+
+    fake_credentials = FakeCredentials()
+    fake_google = types.ModuleType("google")
+    fake_google.__path__ = []
+    fake_auth = types.ModuleType("google.auth")
+    fake_transport = types.ModuleType("google.auth.transport")
+    fake_requests = types.ModuleType("google.auth.transport.requests")
+
+    class FakeRequest:
+        pass
+
+    def fake_default(scopes):
+        assert scopes == ["https://www.googleapis.com/auth/cloud-platform"]
+        return fake_credentials, "project-id"
+
+    fake_auth.default = fake_default
+    fake_requests.Request = FakeRequest
+    fake_google.auth = fake_auth
+    fake_auth.transport = fake_transport
+    fake_transport.requests = fake_requests
+    monkeypatch.setitem(sys.modules, "google", fake_google)
+    monkeypatch.setitem(sys.modules, "google.auth", fake_auth)
+    monkeypatch.setitem(sys.modules, "google.auth.transport", fake_transport)
+    monkeypatch.setitem(sys.modules, "google.auth.transport.requests", fake_requests)
+
+    init_kwargs = []
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            init_kwargs.append(kwargs)
+            self.api_key = kwargs["api_key"]
+            self.chat = SimpleNamespace(completions=object())
+            self.models = object()
+
+    base_url = "https://aiplatform.googleapis.com/v1/projects/p/locations/global/endpoints/openapi"
+    pool = OpenAIClientPool(
+        server_urls=base_url,
+        api_key="GOOGLE_ADC",
+        timeout=123,
+        max_retries=4,
+        client_factory=FakeOpenAI,
+    )
+    client = pool.client_for_url(base_url)
+
+    assert init_kwargs == [
+        {
+            "base_url": base_url,
+            "api_key": "PLACEHOLDER",
+            "timeout": 123,
+            "max_retries": 4,
+        }
+    ]
+    assert len(refresh_requests) == 1
+    assert client._client.api_key == "token-1"
+    assert client.chat.completions is not None
+
+    fake_credentials.valid = False
+    assert client.models is not None
+    assert len(refresh_requests) == 2
+    assert client._client.api_key == "token-2"
+
+
 def test_openai_agent_autodiscovers_model_name():
     client = FakeOpenAIClient(
         [json.dumps({"proposals": []})],
@@ -877,6 +953,27 @@ def test_openai_agent_autodiscovers_model_name():
     assert proposals == []
     assert client.models.calls == 1
     assert client.completions.calls[0]["model"] == "served-agent-model"
+
+
+def test_openai_agent_requests_json_response_format_for_google_agent_platform():
+    client = FakeOpenAIClient([json.dumps({"proposals": []})])
+    agent = OpenAICompatibleFeatureSearchAgent(
+        AgenticFeatureSearchConfig(
+            agent_server_url=(
+                "https://aiplatform.googleapis.com/v1/projects/p/"
+                "locations/global/endpoints/openapi"
+            ),
+            agent_model_name="google/gemma-4-26b-a4b-it-maas",
+            agent_api_key="GOOGLE_ADC",
+            agent_schema_repair_attempts=0,
+        )
+    )
+    agent._client = client
+
+    proposals = agent.propose({"current_features": [], "iteration_feedback": []})
+
+    assert proposals == []
+    assert client.completions.calls[0]["response_format"] == {"type": "json_object"}
 
 
 def test_openai_agent_autodiscovers_legacy_oracle_default_model_name():

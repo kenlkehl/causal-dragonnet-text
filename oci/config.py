@@ -197,6 +197,7 @@ class ExplicitFeatureExtractionConfig:
     vllm_server_url: Optional[str] = "http://localhost:8000/v1"
     # Set to "auto" in server mode to use the first id returned by /v1/models.
     vllm_model_name: str = "Qwen/Qwen2.5-7B-Instruct"
+    vllm_api_key: str = "EMPTY"
     vllm_tensor_parallel_size: int = 1
     vllm_gpu_memory_utilization: float = 0.9
     vllm_download_dir: Optional[str] = None  # Model download directory

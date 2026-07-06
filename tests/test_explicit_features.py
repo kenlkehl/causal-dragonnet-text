@@ -272,6 +272,53 @@ def test_vllm_feature_extractor_request_does_not_set_timeout():
     result = extractor._extract_single_server("Age: 41")
 
     assert "timeout" not in calls
+    assert "response_format" not in calls
+    assert result["age"].value == 41.0
+    assert result["age"].is_missing is False
+
+
+def test_vllm_feature_extractor_requests_json_response_format_for_google_agent_platform():
+    calls = {}
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.update(kwargs)
+
+            class Message:
+                content = '{"age": 41}'
+
+            class Choice:
+                message = Message()
+
+            class Response:
+                choices = [Choice()]
+
+            return Response()
+
+    class FakeClient:
+        class Chat:
+            completions = FakeCompletions()
+
+        chat = Chat()
+
+    extractor = VLLMFeatureExtractor(
+        specs=[
+            ExplicitFeatureSpec(name="age", type="continuous", roles=["confounder"]),
+        ],
+        mode="server",
+        server_url=(
+            "https://aiplatform.googleapis.com/v1/projects/p/"
+            "locations/global/endpoints/openapi"
+        ),
+        model_name="google/gemma-4-26b-a4b-it-maas",
+        api_key="GOOGLE_ADC",
+        max_retries=1,
+    )
+    extractor._client = FakeClient()
+
+    result = extractor._extract_single_server("Age: 41")
+
+    assert calls["response_format"] == {"type": "json_object"}
     assert result["age"].value == 41.0
     assert result["age"].is_missing is False
 

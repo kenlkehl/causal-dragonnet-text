@@ -57,6 +57,7 @@ from tqdm import tqdm
 from ..config import ExplicitFeatureSpec
 from .llm_routing import (
     OpenAIClientPool,
+    google_json_response_format_kwargs,
     is_retryable_llm_exception,
     parse_server_urls,
     retry_delay,
@@ -617,13 +618,22 @@ class VLLMFeatureExtractor:
                     logger.debug("Sending explicit feature extraction request to %s", server_url)
                 else:
                     client = self._client
-                response = client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
+                response_kwargs = {
+                    "model": self.model_name,
+                    "messages": messages,
+                    "temperature": self.temperature,
+                    "max_tokens": self.max_tokens,
+                }
+                response_kwargs.update(
+                    google_json_response_format_kwargs(
+                        api_key=self.api_key,
+                        server_url=self.server_url,
+                        model_name=self.model_name,
+                    )
                 )
-                content = response.choices[0].message.content
+                response = client.chat.completions.create(**response_kwargs)
+                choice = response.choices[0]
+                content = choice.message.content
                 if content:
                     parsed = _parse_extraction_response_with_issues(
                         content,
@@ -638,9 +648,13 @@ class VLLMFeatureExtractor:
                     if parsed.issues and attempt < max_attempts - 1:
                         logger.warning(
                             "Explicit feature extraction response had schema issues "
-                            "on attempt %s/%s: %s. Asking model to repair JSON.",
+                            "on attempt %s/%s: finish_reason=%s content_chars=%s "
+                            "max_tokens=%s issues=%s. Asking model to repair JSON.",
                             attempt + 1,
                             max_attempts,
+                            getattr(choice, "finish_reason", None),
+                            len(content),
+                            self.max_tokens,
                             "; ".join(parsed.issues[:3]),
                         )
                         messages.extend(

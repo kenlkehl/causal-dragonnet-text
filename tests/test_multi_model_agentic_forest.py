@@ -2843,6 +2843,50 @@ def test_oracle_multi_model_forest_script_builds_config():
     assert applied.architecture.multi_model_agentic_forest is nn_cfg
 
 
+def test_oracle_multi_model_forest_agent_platform_config():
+    from oracle_experiment_scripts import run_oracle_multi_model_forest as script
+
+    dataset_path = Path(
+        "synthetic_data/example_synthetic_datasets/"
+        "one_confounder_one_effect_modifier_nsclc_with_structured/dataset.parquet"
+    )
+    cfg = script.MultiModelForestOracleConfig(
+        dataset_path=str(dataset_path),
+        dataset_name="smoke",
+        agent_provider="google",
+        agent_platform_project="proposal-project",
+        agent_platform_location="global",
+        extraction_provider="vertex_ai",
+        extraction_agent_platform_project="extraction-project",
+        extraction_agent_platform_location="global",
+    )
+
+    applied = script._make_applied_config(cfg, dataset_path)
+
+    agent_cfg = applied.architecture.agentic_feature_search
+    assert agent_cfg.agent_server_url == (
+        "https://aiplatform.googleapis.com/v1/projects/"
+        "proposal-project/locations/global/endpoints/openapi"
+    )
+    assert agent_cfg.agent_model_name == "google/gemma-4-26b-a4b-it-maas"
+    assert agent_cfg.agent_api_key == "GOOGLE_ADC"
+    assert applied.explicit_features.vllm_server_url == (
+        "https://aiplatform.googleapis.com/v1/projects/"
+        "extraction-project/locations/global/endpoints/openapi"
+    )
+    assert applied.explicit_features.vllm_model_name == "google/gemma-4-26b-a4b-it-maas"
+    assert applied.explicit_features.vllm_api_key == "GOOGLE_ADC"
+
+    cfg.agent_model_name = "gemma-4-26b-a4b-it-maas"
+    cfg.extraction_model_name = "gemma-4-26b-a4b-it-maas"
+    applied = script._make_applied_config(cfg, dataset_path)
+    assert (
+        applied.architecture.agentic_feature_search.agent_model_name
+        == "google/gemma-4-26b-a4b-it-maas"
+    )
+    assert applied.explicit_features.vllm_model_name == "google/gemma-4-26b-a4b-it-maas"
+
+
 def test_oracle_multi_model_forest_splits_primary_and_agentic_hashes():
     from dataclasses import replace
 
@@ -2861,9 +2905,28 @@ def test_oracle_multi_model_forest_splits_primary_and_agentic_hashes():
 
     assert replace(cfg, agent_server_url="http://localhost:4321/v1").primary_hash() == base_primary
     assert replace(cfg, extraction_server_url="http://localhost:9876/v1").primary_hash() == base_primary
+    assert (
+        replace(cfg, agent_provider="agent_platform", agent_platform_project="p").primary_hash()
+        == base_primary
+    )
     assert replace(cfg, cpus_total=2).primary_hash() == base_primary
     assert replace(cfg, htr_jobs_per_gpu=1).primary_hash() == base_primary
     assert replace(cfg, agent_server_url="http://localhost:4321/v1").agentic_hash() != base_agentic
+    assert (
+        replace(cfg, agent_provider="agent_platform", agent_platform_project="p").agentic_hash()
+        != base_agentic
+    )
+    google_auto = replace(cfg, agent_provider="agent_platform", agent_platform_project="p")
+    google_bare = replace(
+        google_auto,
+        agent_model_name="gemma-4-26b-a4b-it-maas",
+    )
+    google_publisher = replace(
+        google_auto,
+        agent_model_name="google/gemma-4-26b-a4b-it-maas",
+    )
+    assert google_auto.agentic_hash() == google_bare.agentic_hash()
+    assert google_auto.agentic_hash() == google_publisher.agentic_hash()
     assert replace(cfg, n_folds=3).primary_hash() != base_primary
 
 

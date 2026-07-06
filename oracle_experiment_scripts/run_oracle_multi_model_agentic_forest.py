@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 import sys
 import traceback
 from dataclasses import asdict, dataclass, field
@@ -44,6 +45,123 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+_AGENT_PLATFORM_ADC_API_KEY = "GOOGLE_ADC"
+_AGENT_PLATFORM_GEMMA_4_26B_A4B_IT_MODEL_ID = "gemma-4-26b-a4b-it-maas"
+_AGENT_PLATFORM_GEMMA_4_26B_A4B_IT_MODEL = (
+    f"google/{_AGENT_PLATFORM_GEMMA_4_26B_A4B_IT_MODEL_ID}"
+)
+_LLM_PROVIDER_CLI_CHOICES = [
+    "openai",
+    "openai_compatible",
+    "vllm",
+    "agent_platform",
+    "google",
+    "google_agent_platform",
+    "vertex",
+    "vertex_ai",
+]
+
+
+def _normalize_llm_provider(provider: str, *, source: str) -> str:
+    normalized = str(provider or "openai").strip().lower().replace("-", "_")
+    aliases = {
+        "openai_compatible": "openai",
+        "vllm": "openai",
+        "google": "agent_platform",
+        "google_agent_platform": "agent_platform",
+        "vertex": "agent_platform",
+        "vertex_ai": "agent_platform",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"openai", "agent_platform"}:
+        raise ValueError(f"{source} must be 'openai' or 'agent_platform', got {provider!r}")
+    return normalized
+
+
+def _agent_platform_project(
+    explicit_project: Optional[str],
+    *,
+    source: str,
+) -> str:
+    project = (
+        explicit_project
+        or os.environ.get("GOOGLE_CLOUD_PROJECT")
+        or os.environ.get("GCLOUD_PROJECT")
+        or os.environ.get("PROJECT_ID")
+    )
+    if not project:
+        raise ValueError(
+            f"{source} requires a Google Cloud project. Pass the project flag or set "
+            "GOOGLE_CLOUD_PROJECT."
+        )
+    return str(project)
+
+
+def _agent_platform_openai_base_url(*, project: str, location: str) -> str:
+    loc = str(location or "global").strip()
+    host = "aiplatform.googleapis.com" if loc == "global" else f"{loc}-aiplatform.googleapis.com"
+    return (
+        f"https://{host}/v1/projects/{project}"
+        f"/locations/{loc}/endpoints/openapi"
+    )
+
+
+def _agent_platform_publisher_model_name(model_name: Optional[str]) -> str:
+    text = str(model_name or "").strip()
+    if not text or text.lower() == "auto":
+        return _AGENT_PLATFORM_GEMMA_4_26B_A4B_IT_MODEL
+    if "/" in text:
+        return text
+    if text == _AGENT_PLATFORM_GEMMA_4_26B_A4B_IT_MODEL_ID:
+        return _AGENT_PLATFORM_GEMMA_4_26B_A4B_IT_MODEL
+    return text
+
+
+def _resolve_agent_endpoint_config(
+    config: "MultiModelAgenticOracleConfig",
+) -> tuple[str, str, str]:
+    provider = _normalize_llm_provider(config.agent_provider, source="agent_provider")
+    if provider != "agent_platform":
+        return config.agent_server_url, config.agent_model_name, config.agent_api_key
+    project = _agent_platform_project(
+        config.agent_platform_project,
+        source="agent_provider=agent_platform",
+    )
+    model_name = _agent_platform_publisher_model_name(config.agent_model_name)
+    return (
+        _agent_platform_openai_base_url(
+            project=project,
+            location=config.agent_platform_location,
+        ),
+        model_name,
+        _AGENT_PLATFORM_ADC_API_KEY,
+    )
+
+
+def _resolve_extraction_endpoint_config(
+    config: "MultiModelAgenticOracleConfig",
+) -> tuple[str, str, str]:
+    provider = _normalize_llm_provider(
+        config.extraction_provider,
+        source="extraction_provider",
+    )
+    if provider != "agent_platform":
+        return config.extraction_server_url, config.extraction_model_name, config.extraction_api_key
+    project = _agent_platform_project(
+        config.extraction_agent_platform_project or config.agent_platform_project,
+        source="extraction_provider=agent_platform",
+    )
+    model_name = _agent_platform_publisher_model_name(config.extraction_model_name)
+    return (
+        _agent_platform_openai_base_url(
+            project=project,
+            location=config.extraction_agent_platform_location,
+        ),
+        model_name,
+        _AGENT_PLATFORM_ADC_API_KEY,
+    )
 
 
 @dataclass
@@ -124,6 +242,9 @@ class MultiModelAgenticOracleConfig:
     cf_inference: bool = True
 
     min_feature_coverage: float = 0.70
+    agent_provider: str = "openai"
+    agent_platform_project: Optional[str] = None
+    agent_platform_location: str = "global"
     agent_server_url: str = "http://localhost:8000/v1"
     agent_model_name: str = "auto"
     agent_api_key: str = "EMPTY"
@@ -137,8 +258,12 @@ class MultiModelAgenticOracleConfig:
     agent_save_context: bool = True
     agent_save_raw_output: bool = True
 
+    extraction_provider: str = "openai"
+    extraction_agent_platform_project: Optional[str] = None
+    extraction_agent_platform_location: str = "global"
     extraction_server_url: str = "http://localhost:8000/v1"
     extraction_model_name: str = "auto"
+    extraction_api_key: str = "EMPTY"
     extraction_mode: str = "server"
     extraction_reasoning_parser: Optional[str] = "auto"
     extraction_batch_size: int = 100
@@ -166,6 +291,10 @@ def _make_applied_config(
     parquet_file: Path,
 ) -> AppliedInferenceConfig:
     bow_views = _bow_views_for_config(config)
+    agent_server_url, agent_model_name, agent_api_key = _resolve_agent_endpoint_config(config)
+    extraction_server_url, extraction_model_name, extraction_api_key = (
+        _resolve_extraction_endpoint_config(config)
+    )
     selected_methods = normalize_multi_model_feature_discovery_methods(
         config.feature_discovery_methods,
         source="feature_discovery_methods",
@@ -203,9 +332,9 @@ def _make_applied_config(
                 max_additions_per_iter=config.candidate_proposals_per_fold,
                 max_removals_per_iter=0,
                 min_feature_coverage=config.min_feature_coverage,
-                agent_server_url=config.agent_server_url,
-                agent_model_name=config.agent_model_name,
-                agent_api_key=config.agent_api_key,
+                agent_server_url=agent_server_url,
+                agent_model_name=agent_model_name,
+                agent_api_key=agent_api_key,
                 agent_temperature=config.agent_temperature,
                 agent_max_tokens=config.agent_max_tokens,
                 agent_request_max_retries=config.agent_request_max_retries,
@@ -299,8 +428,9 @@ def _make_applied_config(
             enabled=True,
             features=[],
             vllm_mode=config.extraction_mode,
-            vllm_server_url=config.extraction_server_url,
-            vllm_model_name=config.extraction_model_name,
+            vllm_server_url=extraction_server_url,
+            vllm_model_name=extraction_model_name,
+            vllm_api_key=extraction_api_key,
             vllm_reasoning_parser=config.extraction_reasoning_parser,
             extraction_batch_size=config.extraction_batch_size,
             extraction_max_retries=config.extraction_max_retries,
@@ -817,6 +947,14 @@ def main() -> None:
         help="Agent model id, or 'auto' to use the first id returned by /v1/models.",
     )
     parser.add_argument("--agent-api-key", default="EMPTY")
+    parser.add_argument(
+        "--agent-provider",
+        default="openai",
+        choices=_LLM_PROVIDER_CLI_CHOICES,
+        help="Use local/OpenAI-compatible endpoints or Google Agent Platform.",
+    )
+    parser.add_argument("--agent-platform-project", default=None)
+    parser.add_argument("--agent-platform-location", default="global")
     parser.add_argument("--agent-max-tokens", type=int, default=25000)
     parser.add_argument("--agent-request-max-retries", type=int, default=3)
     parser.add_argument("--agent-retry-initial-delay", type=float, default=1.0)
@@ -854,6 +992,14 @@ def main() -> None:
         default="auto",
         help="Extraction model id, or 'auto' to use the first id returned by /v1/models.",
     )
+    parser.add_argument("--extraction-api-key", default="EMPTY")
+    parser.add_argument(
+        "--extraction-provider",
+        default="openai",
+        choices=_LLM_PROVIDER_CLI_CHOICES,
+    )
+    parser.add_argument("--extraction-agent-platform-project", default=None)
+    parser.add_argument("--extraction-agent-platform-location", default="global")
     parser.add_argument(
         "--extraction-mode",
         default="server",
@@ -961,6 +1107,9 @@ def main() -> None:
         cf_min_samples_leaf=args.cf_min_samples_leaf,
         cf_max_depth=args.cf_max_depth,
         cf_inference=not args.cf_no_inference,
+        agent_provider=args.agent_provider,
+        agent_platform_project=args.agent_platform_project,
+        agent_platform_location=args.agent_platform_location,
         agent_server_url=args.agent_server_url,
         agent_model_name=args.agent_model_name,
         agent_api_key=args.agent_api_key,
@@ -972,8 +1121,12 @@ def main() -> None:
         agent_request_timeout=args.agent_request_timeout,
         agent_save_context=args.agent_save_context,
         agent_save_raw_output=args.agent_save_raw_output,
+        extraction_provider=args.extraction_provider,
+        extraction_agent_platform_project=args.extraction_agent_platform_project,
+        extraction_agent_platform_location=args.extraction_agent_platform_location,
         extraction_server_url=args.extraction_server_url,
         extraction_model_name=args.extraction_model_name,
+        extraction_api_key=args.extraction_api_key,
         extraction_mode=args.extraction_mode,
         extraction_reasoning_parser=args.extraction_reasoning_parser,
         extraction_batch_size=args.extraction_batch_size,

@@ -26,11 +26,14 @@ from oci.config import (  # noqa: E402
 )
 from oci.inference.multi_model_forest import run_multi_model_forest  # noqa: E402
 from run_oracle_multi_model_agentic_forest import (  # noqa: E402
+    _LLM_PROVIDER_CLI_CHOICES,
     MultiModelAgenticOracleConfig,
     _append_results,
+    _agent_platform_publisher_model_name,
     _load_dataset,
     _make_applied_config as _make_agentic_applied_config,
     _metrics,
+    _normalize_llm_provider,
     _resolve_oracle_parquet_file,
 )
 
@@ -65,6 +68,9 @@ class MultiModelForestOracleConfig(MultiModelAgenticOracleConfig):
             "stage",
             "force_stage1",
             "force_stage2",
+            "agent_provider",
+            "agent_platform_project",
+            "agent_platform_location",
             "agent_server_url",
             "agent_model_name",
             "agent_api_key",
@@ -77,8 +83,12 @@ class MultiModelForestOracleConfig(MultiModelAgenticOracleConfig):
             "agent_request_timeout",
             "agent_save_context",
             "agent_save_raw_output",
+            "extraction_provider",
+            "extraction_agent_platform_project",
+            "extraction_agent_platform_location",
             "extraction_server_url",
             "extraction_model_name",
+            "extraction_api_key",
             "extraction_mode",
             "extraction_reasoning_parser",
             "extraction_batch_size",
@@ -103,18 +113,52 @@ class MultiModelForestOracleConfig(MultiModelAgenticOracleConfig):
         return _hash_payload(payload)
 
     def agentic_hash(self) -> str:
+        agent_provider = _normalize_llm_provider(self.agent_provider, source="agent_provider")
+        extraction_provider = _normalize_llm_provider(
+            self.extraction_provider,
+            source="extraction_provider",
+        )
+        agent_model_name = (
+            _agent_platform_publisher_model_name(self.agent_model_name)
+            if agent_provider == "agent_platform"
+            else self.agent_model_name
+        )
+        extraction_model_name = (
+            _agent_platform_publisher_model_name(self.extraction_model_name)
+            if extraction_provider == "agent_platform"
+            else self.extraction_model_name
+        )
+        agent_platform_project = (
+            self.agent_platform_project
+            or os.environ.get("GOOGLE_CLOUD_PROJECT")
+            or os.environ.get("GCLOUD_PROJECT")
+            or os.environ.get("PROJECT_ID")
+        )
+        extraction_agent_platform_project = (
+            self.extraction_agent_platform_project
+            or self.agent_platform_project
+            or os.environ.get("GOOGLE_CLOUD_PROJECT")
+            or os.environ.get("GCLOUD_PROJECT")
+            or os.environ.get("PROJECT_ID")
+        )
         payload = {
             "primary_hash": self.primary_hash(),
+            "agent_provider": agent_provider,
+            "agent_platform_project": agent_platform_project,
+            "agent_platform_location": self.agent_platform_location,
             "agent_server_url": self.agent_server_url,
-            "agent_model_name": self.agent_model_name,
+            "agent_model_name": agent_model_name,
             "agent_temperature": self.agent_temperature,
             "agent_max_tokens": self.agent_max_tokens,
             "agent_request_max_retries": self.agent_request_max_retries,
             "agent_retry_initial_delay": self.agent_retry_initial_delay,
             "agent_retry_max_delay": self.agent_retry_max_delay,
             "agent_retry_backoff_factor": self.agent_retry_backoff_factor,
+            "extraction_provider": extraction_provider,
+            "extraction_agent_platform_project": extraction_agent_platform_project,
+            "extraction_agent_platform_location": self.extraction_agent_platform_location,
             "extraction_server_url": self.extraction_server_url,
-            "extraction_model_name": self.extraction_model_name,
+            "extraction_model_name": extraction_model_name,
             "extraction_mode": self.extraction_mode,
             "extraction_reasoning_parser": self.extraction_reasoning_parser,
             "extraction_batch_size": self.extraction_batch_size,
@@ -492,6 +536,14 @@ def main() -> None:
     )
     parser.add_argument("--agent-model-name", default="auto")
     parser.add_argument("--agent-api-key", default="EMPTY")
+    parser.add_argument(
+        "--agent-provider",
+        default="openai",
+        choices=_LLM_PROVIDER_CLI_CHOICES,
+        help="Use local/OpenAI-compatible endpoints or Google Agent Platform.",
+    )
+    parser.add_argument("--agent-platform-project", default=None)
+    parser.add_argument("--agent-platform-location", default="global")
     parser.add_argument("--agent-max-tokens", type=int, default=25000)
     parser.add_argument("--agent-request-max-retries", type=int, default=3)
     parser.add_argument("--agent-retry-initial-delay", type=float, default=1.0)
@@ -511,6 +563,14 @@ def main() -> None:
         default="http://localhost:8000/v1",
     )
     parser.add_argument("--extraction-model-name", default="auto")
+    parser.add_argument("--extraction-api-key", default="EMPTY")
+    parser.add_argument(
+        "--extraction-provider",
+        default="openai",
+        choices=_LLM_PROVIDER_CLI_CHOICES,
+    )
+    parser.add_argument("--extraction-agent-platform-project", default=None)
+    parser.add_argument("--extraction-agent-platform-location", default="global")
     parser.add_argument(
         "--extraction-mode",
         default="server",
@@ -631,6 +691,9 @@ def main() -> None:
         cf_max_features=args.cf_max_features,
         cf_inference=not args.cf_no_inference,
         min_feature_coverage=args.min_feature_coverage,
+        agent_provider=args.agent_provider,
+        agent_platform_project=args.agent_platform_project,
+        agent_platform_location=args.agent_platform_location,
         agent_server_url=args.agent_server_url,
         agent_model_name=args.agent_model_name,
         agent_api_key=args.agent_api_key,
@@ -642,8 +705,12 @@ def main() -> None:
         agent_request_timeout=args.agent_request_timeout,
         agent_save_context=args.agent_save_context,
         agent_save_raw_output=args.agent_save_raw_output,
+        extraction_provider=args.extraction_provider,
+        extraction_agent_platform_project=args.extraction_agent_platform_project,
+        extraction_agent_platform_location=args.extraction_agent_platform_location,
         extraction_server_url=args.extraction_server_url,
         extraction_model_name=args.extraction_model_name,
+        extraction_api_key=args.extraction_api_key,
         extraction_mode=args.extraction_mode,
         extraction_reasoning_parser=args.extraction_reasoning_parser,
         extraction_batch_size=args.extraction_batch_size,

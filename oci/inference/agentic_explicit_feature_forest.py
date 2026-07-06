@@ -32,7 +32,11 @@ from ..extraction import (
     resolve_vllm_reasoning_parser,
     strip_reasoning_trace,
 )
-from ..extraction.llm_routing import OpenAIClientPool, call_with_exponential_backoff
+from ..extraction.llm_routing import (
+    OpenAIClientPool,
+    call_with_exponential_backoff,
+    google_json_response_format_kwargs,
+)
 from ..extraction.llm_routing import parse_server_urls
 from ..models.causal_forest_head import CausalForestHead
 from .applied_explicit_feature_forest import _build_features, _hstack_present
@@ -1410,11 +1414,21 @@ class OpenAICompatibleFeatureSearchAgent:
         )
 
         for attempt_idx in range(max_repair_attempts + 1):
+            response_kwargs = {
+                "model": model_name,
+                "messages": messages,
+                "temperature": self.search_config.agent_temperature,
+                "max_tokens": self.search_config.agent_max_tokens,
+            }
+            response_kwargs.update(
+                google_json_response_format_kwargs(
+                    api_key=self.search_config.agent_api_key,
+                    server_url=self.search_config.agent_server_url,
+                    model_name=model_name,
+                )
+            )
             response = self._create_completion(
-                model=model_name,
-                messages=messages,
-                temperature=self.search_config.agent_temperature,
-                max_tokens=self.search_config.agent_max_tokens,
+                **response_kwargs,
             )
             choice = response.choices[0]
             message = choice.message
@@ -1444,6 +1458,16 @@ class OpenAICompatibleFeatureSearchAgent:
             except Exception as exc:
                 issues = [f"malformed JSON: {exc}"]
                 if attempt_idx < max_repair_attempts:
+                    logger.warning(
+                        "Agent response had malformed JSON on attempt %s/%s: "
+                        "finish_reason=%s content_chars=%s max_tokens=%s. "
+                        "Asking model to repair JSON.",
+                        attempt_idx + 1,
+                        max_repair_attempts + 1,
+                        getattr(choice, "finish_reason", None),
+                        len(content),
+                        self.search_config.agent_max_tokens,
+                    )
                     if is_value_harmonization:
                         repair_prompt = build_value_harmonization_repair_prompt(issues)
                     elif is_consensus_disambiguation:
@@ -1467,6 +1491,17 @@ class OpenAICompatibleFeatureSearchAgent:
                 return proposals
 
             if attempt_idx < max_repair_attempts:
+                logger.warning(
+                    "Agent response had schema issues on attempt %s/%s: "
+                    "finish_reason=%s content_chars=%s max_tokens=%s issues=%s. "
+                    "Asking model to repair JSON.",
+                    attempt_idx + 1,
+                    max_repair_attempts + 1,
+                    getattr(choice, "finish_reason", None),
+                    len(content),
+                    self.search_config.agent_max_tokens,
+                    "; ".join(issues[:3]),
+                )
                 messages.extend(
                     [
                         {"role": "assistant", "content": content},
@@ -1654,6 +1689,7 @@ class VLLMExplicitFeatureExtractionProvider:
             download_dir=self.feature_config.vllm_download_dir,
             max_model_len=self.feature_config.vllm_max_model_len,
             vllm_reasoning_parser=self.feature_config.vllm_reasoning_parser,
+            api_key=getattr(self.feature_config, "vllm_api_key", "EMPTY"),
             max_retries=self.feature_config.extraction_max_retries,
             retry_initial_delay=getattr(
                 self.feature_config,
@@ -1838,19 +1874,14 @@ class VLLMExplicitFeatureExtractionProvider:
                 "vllm_model_name='auto' is only supported for vllm_mode='server'; "
                 f"got vllm_mode={mode!r}. Provide an explicit model name for this mode."
             )
-        try:
-            from openai import OpenAI
-        except ImportError as exc:
-            raise ImportError(
-                "openai package is required to autodiscover the vLLM server model"
-            ) from exc
         server_url = parse_server_urls(self.feature_config.vllm_server_url)[0]
-        client = OpenAI(
-            base_url=server_url,
-            api_key="EMPTY",
+        client_pool = OpenAIClientPool(
+            server_urls=[server_url],
+            api_key=getattr(self.feature_config, "vllm_api_key", "EMPTY"),
             timeout=getattr(self.feature_config, "extraction_request_timeout", 900.0),
             max_retries=0,
         )
+        client = client_pool.client_for_url(server_url)
         self._resolved_vllm_model_name = _discover_openai_compatible_model_name(
             client,
             server_url=server_url,
