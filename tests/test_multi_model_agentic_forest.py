@@ -2664,6 +2664,155 @@ def test_multi_model_forest_expands_primary_handoff_for_consistency(tmp_path):
     )
 
 
+def test_multi_model_agentic_proposal_bundle_cache_reuses_llm_result(tmp_path):
+    class CountingAgent:
+        def __init__(self):
+            self.calls = 0
+
+        def propose(self, _context):
+            self.calls += 1
+            return [
+                {
+                    "action": "add",
+                    "name": "cache_feature",
+                    "type": "continuous",
+                    "roles": ["confounder"],
+                    "description": "Cached feature.",
+                }
+            ]
+
+    class RaisingAgent:
+        def propose(self, _context):
+            raise AssertionError("proposal agent should not be called when cache exists")
+
+    dataset = pd.DataFrame(
+        {
+            "clinical_text": ["alpha", "beta", "gamma", "delta"],
+            "treatment_indicator": [0, 1, 0, 1],
+            "outcome_indicator": [0, 0, 1, 1],
+        }
+    )
+    config = AppliedInferenceConfig(
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        architecture=ModelArchitectureConfig(
+            model_type="multi_model_agentic_forest",
+            multi_model_agentic_forest=MultiModelAgenticForestConfig(
+                feature_discovery_methods=["bow"],
+                candidate_proposals_per_fold=3,
+                **_disable_htr_test_kwargs(),
+            ),
+        ),
+    )
+    output_path = tmp_path / "predictions.parquet"
+    agent = CountingAgent()
+    runner = MultiModelAgenticForestRunner(
+        dataset=dataset,
+        config=config,
+        output_path=output_path,
+        proposal_agent=agent,
+        extraction_provider=object(),
+        evaluator=object(),
+    )
+    first = runner._propose_candidate_bundle(
+        outer_fold=1,
+        scope="full_outer_train",
+        bow_context={"outer_fold": 1},
+        n_rows=4,
+    )
+    assert agent.calls == 1
+    assert first["valid_proposals"][0].name == "cache_feature"
+
+    resumed = MultiModelAgenticForestRunner(
+        dataset=dataset,
+        config=config,
+        output_path=output_path,
+        proposal_agent=RaisingAgent(),
+        extraction_provider=object(),
+        evaluator=object(),
+    )
+    second = resumed._propose_candidate_bundle(
+        outer_fold=1,
+        scope="full_outer_train",
+        bow_context={"outer_fold": 1},
+        n_rows=4,
+    )
+
+    assert second["valid_proposals"][0].name == "cache_feature"
+    assert "resumed_from_cache" in second
+
+
+def test_multi_model_agentic_outer_fold_checkpoint_loads_completed_fold(tmp_path):
+    dataset = pd.DataFrame(
+        {
+            "clinical_text": ["alpha", "beta", "gamma", "delta"],
+            "treatment_indicator": [0, 1, 0, 1],
+            "outcome_indicator": [0, 0, 1, 1],
+        }
+    )
+    config = AppliedInferenceConfig(
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        architecture=ModelArchitectureConfig(
+            model_type="multi_model_agentic_forest",
+            multi_model_agentic_forest=MultiModelAgenticForestConfig(
+                feature_discovery_methods=["bow"],
+                **_disable_htr_test_kwargs(),
+            ),
+        ),
+    )
+    runner = MultiModelAgenticForestRunner(
+        dataset=dataset,
+        config=config,
+        output_path=tmp_path / "predictions.parquet",
+        proposal_agent=object(),
+        extraction_provider=object(),
+        evaluator=object(),
+    )
+    fold_dir = runner.artifact_dir / "outer_fold_001"
+    fold_dir.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "_oci_row_id": [0, 1],
+            "outer_fold": [1, 1],
+            "tau_hat": [0.1, 0.2],
+        }
+    ).to_parquet(fold_dir / "predictions.parquet", index=False)
+    (fold_dir / "checkpoint_summary.json").write_text(
+        json.dumps({"outer_fold": 1, "n_predictions": 2})
+    )
+    (fold_dir / "selected_feature_sets.json").write_text(
+        json.dumps(
+            [
+                {
+                    "outer_fold": 1,
+                    "selected_features": [{"name": "cache_feature"}],
+                }
+            ]
+        )
+    )
+    (fold_dir / "agent_candidate_proposals.jsonl").write_text(
+        json.dumps({"outer_fold": 1, "selected_features": []}) + "\n"
+    )
+    pd.DataFrame([{"outer_fold": 1, "ite_mean": 0.15}]).to_csv(
+        fold_dir / "outer_cv_metrics.csv",
+        index=False,
+    )
+
+    cached = runner._load_outer_fold_checkpoint(
+        outer_fold=1,
+        expected_prediction_rows=2,
+    )
+
+    assert cached is not None
+    assert len(cached["predictions"]) == 2
+    assert cached["agent_rows"][0]["outer_fold"] == 1
+    assert cached["feature_set_rows"][0]["outer_fold"] == 1
+    assert cached["outer_metric_rows"][0]["ite_mean"] == 0.15
+
+
 def test_oracle_multi_model_forest_script_builds_config():
     from oracle_experiment_scripts import run_oracle_multi_model_forest as script
 

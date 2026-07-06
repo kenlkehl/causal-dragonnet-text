@@ -167,6 +167,7 @@ def run_multi_model_agentic_forest_from_handoff(
     proposal_agent: Optional[Any] = None,
     extraction_provider: Optional[Any] = None,
     evaluator: Optional[Any] = None,
+    resume: bool = True,
 ) -> None:
     """Run the agentic explicit-feature branch from precomputed discovery evidence."""
     runner = PrecomputedDiscoveryMultiModelAgenticForestRunner(
@@ -180,6 +181,7 @@ def run_multi_model_agentic_forest_from_handoff(
         proposal_agent=proposal_agent,
         extraction_provider=extraction_provider,
         evaluator=evaluator,
+        resume=resume,
     )
     runner.run()
 
@@ -249,6 +251,7 @@ class MultiModelAgenticForestRunner:
         evaluator: Optional[Any] = None,
         embedding_provider: Optional[Any] = None,
         htr_evidence_provider: Optional[Any] = None,
+        resume: bool = True,
     ) -> None:
         self.dataset = dataset.reset_index(drop=True).copy()
         self.dataset["_oci_row_id"] = np.arange(len(self.dataset), dtype=int)
@@ -295,6 +298,7 @@ class MultiModelAgenticForestRunner:
         )
         self.embedding_provider = embedding_provider
         self.htr_evidence_provider = htr_evidence_provider
+        self.resume = bool(resume)
         self.embedding_evidence_generator: Optional[EmbeddingContrastEvidenceGenerator] = None
         self._default_htr_evidence_provider: Optional[MultiModelHTREvidenceProvider] = None
 
@@ -422,7 +426,27 @@ class MultiModelAgenticForestRunner:
         self.split_provenance_rows = self._split_provenance_rows(splits)
         if self._embedding_contrast_enabled() and self.embedding_provider is None:
             self._embedding_contrast_generator().prepare(self.dataset)
-        outer_n_jobs = self._outer_n_jobs(len(splits))
+        prediction_frames: List[pd.DataFrame] = []
+        pending_splits: List[Tuple[int, np.ndarray, np.ndarray]] = []
+        if self.resume:
+            for outer_fold, train_idx, test_idx in splits:
+                cached = self._load_outer_fold_checkpoint(
+                    outer_fold=int(outer_fold),
+                    expected_prediction_rows=len(test_idx),
+                )
+                if cached is None:
+                    pending_splits.append((outer_fold, train_idx, test_idx))
+                    continue
+                logger.info(
+                    "Resuming multi-model agentic fold %s from checkpoint",
+                    outer_fold,
+                )
+                prediction_frames.append(cached["predictions"])
+                self._extend_from_fold_result(cached)
+        else:
+            pending_splits = splits
+
+        outer_n_jobs = self._outer_n_jobs(len(pending_splits))
         if outer_n_jobs > 1 and self._htr_evidence_enabled():
             logger.warning(
                 "Outer fold parallelism disabled because integrated HTR evidence "
@@ -442,7 +466,7 @@ class MultiModelAgenticForestRunner:
             logger.info(
                 "Running %s multi-model outer fold(s) with outer_parallelism=%s "
                 "backend=%s joblib_backend=%s",
-                len(splits),
+                len(pending_splits),
                 outer_n_jobs,
                 self.nn_config.bow_parallel_backend,
                 backend,
@@ -462,37 +486,14 @@ class MultiModelAgenticForestRunner:
                     np.asarray(test_idx),
                     self._inner_workers_for_outer_job(outer_n_jobs),
                 )
-                for outer_fold, train_idx, test_idx in splits
+                for outer_fold, train_idx, test_idx in pending_splits
             )
             fold_results = sorted(fold_results, key=lambda item: item["outer_fold"])
-            prediction_frames = [item["predictions"] for item in fold_results]
             for item in fold_results:
-                self.bow_prediction_frames.extend(item["bow_prediction_frames"])
-                self.htr_nuisance_prediction_frames.extend(
-                    item.get("htr_nuisance_prediction_frames", [])
-                )
-                self.htr_effect_prediction_frames.extend(
-                    item.get("htr_effect_prediction_frames", [])
-                )
-                self.ensemble_nuisance_prediction_frames.extend(
-                    item.get("ensemble_nuisance_prediction_frames", [])
-                )
-                self.htr_attention_rows.extend(item.get("htr_attention_rows", []))
-                self.importance_rows.extend(item["importance_rows"])
-                self.embedding_evidence_rows.extend(item["embedding_evidence_rows"])
-                self.agent_rows.extend(item["agent_rows"])
-                self.extracted_feature_diagnostic_rows.extend(
-                    item["extracted_feature_diagnostic_rows"]
-                )
-                self.candidate_signal_review_rows.extend(
-                    item.get("candidate_signal_review_rows", [])
-                )
-                self.parsimony_review_rows.extend(item.get("parsimony_review_rows", []))
-                self.feature_set_rows.extend(item["feature_set_rows"])
-                self.outer_metric_rows.extend(item["outer_metric_rows"])
+                prediction_frames.append(item["predictions"])
+                self._extend_from_fold_result(item)
         else:
-            prediction_frames: List[pd.DataFrame] = []
-            for outer_fold, train_idx, test_idx in splits:
+            for outer_fold, train_idx, test_idx in pending_splits:
                 logger.info(
                     "Multi-model agentic fold %s: train=%s test=%s",
                     outer_fold,
@@ -514,6 +515,92 @@ class MultiModelAgenticForestRunner:
         results_df = pd.concat(prediction_frames).sort_values("_oci_row_id")
         self._save_predictions(results_df)
         self._save_artifacts()
+
+    def _extend_from_fold_result(self, item: Dict[str, Any]) -> None:
+        self.bow_prediction_frames.extend(item.get("bow_prediction_frames", []))
+        self.htr_nuisance_prediction_frames.extend(
+            item.get("htr_nuisance_prediction_frames", [])
+        )
+        self.htr_effect_prediction_frames.extend(
+            item.get("htr_effect_prediction_frames", [])
+        )
+        self.ensemble_nuisance_prediction_frames.extend(
+            item.get("ensemble_nuisance_prediction_frames", [])
+        )
+        self.htr_attention_rows.extend(item.get("htr_attention_rows", []))
+        self.importance_rows.extend(item.get("importance_rows", []))
+        self.embedding_evidence_rows.extend(item.get("embedding_evidence_rows", []))
+        self.agent_rows.extend(item.get("agent_rows", []))
+        self.extracted_feature_diagnostic_rows.extend(
+            item.get("extracted_feature_diagnostic_rows", [])
+        )
+        self.candidate_signal_review_rows.extend(
+            item.get("candidate_signal_review_rows", [])
+        )
+        self.parsimony_review_rows.extend(item.get("parsimony_review_rows", []))
+        self.feature_set_rows.extend(item.get("feature_set_rows", []))
+        self.outer_metric_rows.extend(item.get("outer_metric_rows", []))
+
+    def _load_outer_fold_checkpoint(
+        self,
+        *,
+        outer_fold: int,
+        expected_prediction_rows: int,
+    ) -> Optional[Dict[str, Any]]:
+        fold = int(outer_fold)
+        target_dir = self.artifact_dir / f"outer_fold_{fold:03d}"
+        prediction_path = target_dir / "predictions.parquet"
+        summary_path = target_dir / "checkpoint_summary.json"
+        if not prediction_path.exists() or not summary_path.exists():
+            return None
+        try:
+            summary = _read_json(summary_path)
+            predictions = pd.read_parquet(prediction_path)
+        except Exception as exc:
+            logger.warning(
+                "Ignoring unreadable multi-model agentic fold checkpoint %s: %s",
+                target_dir,
+                exc,
+            )
+            return None
+        if int(summary.get("outer_fold", fold)) != fold:
+            return None
+        if len(predictions) != int(expected_prediction_rows):
+            logger.warning(
+                "Ignoring incomplete multi-model agentic fold checkpoint %s: "
+                "predictions=%s expected=%s",
+                target_dir,
+                len(predictions),
+                expected_prediction_rows,
+            )
+            return None
+        metric_rows = _read_csv_records(target_dir / "outer_cv_metrics.csv")
+        selected_rows = _read_json(target_dir / "selected_feature_sets.json", default=[])
+        return {
+            "outer_fold": fold,
+            "predictions": predictions,
+            "bow_prediction_frames": [],
+            "htr_nuisance_prediction_frames": [],
+            "htr_effect_prediction_frames": [],
+            "ensemble_nuisance_prediction_frames": [],
+            "htr_attention_rows": [],
+            "importance_rows": _read_jsonl(target_dir / "text_evidence.bow.jsonl"),
+            "embedding_evidence_rows": _read_jsonl(
+                target_dir / "text_evidence.embedding.jsonl"
+            ),
+            "agent_rows": _read_jsonl(target_dir / "agent_candidate_proposals.jsonl"),
+            "extracted_feature_diagnostic_rows": _read_jsonl(
+                target_dir / "extracted_feature_diagnostics_by_fold.jsonl"
+            ),
+            "candidate_signal_review_rows": _read_jsonl(
+                target_dir / "candidate_signal_review.jsonl"
+            ),
+            "parsimony_review_rows": _read_jsonl(
+                target_dir / "parsimony_review_by_fold.jsonl"
+            ),
+            "feature_set_rows": selected_rows if isinstance(selected_rows, list) else [],
+            "outer_metric_rows": metric_rows,
+        }
 
     def _run_one_analysis_split_isolated(
         self,
@@ -1956,6 +2043,16 @@ class MultiModelAgenticForestRunner:
         bow_context: Dict[str, Any],
     ) -> List[ExplicitFeatureSpec]:
         del discovery_df
+        cached = self._load_selected_specs_cache(
+            outer_fold=outer_fold,
+            consistency_enabled=False,
+        )
+        if cached is not None:
+            selected_specs, row = cached
+            self._remember_alias_reference_specs(selected_specs)
+            self.agent_rows.append(row)
+            return selected_specs
+
         raw_proposals = self.proposal_agent.propose(bow_context)
         proposal_agent_trace = _get_agent_response_trace(self.proposal_agent)
         proposals, rejected = validate_agentic_proposals(
@@ -2016,6 +2113,12 @@ class MultiModelAgenticForestRunner:
         if self.search_config.save_agent_raw_output:
             row["agent_raw_output"] = proposal_agent_trace
         self.agent_rows.append(row)
+        self._write_selected_specs_cache(
+            outer_fold=outer_fold,
+            consistency_enabled=False,
+            selected_specs=selected_specs,
+            row=row,
+        )
         return selected_specs
 
     def _propose_selected_specs_with_consistency(
@@ -2025,6 +2128,16 @@ class MultiModelAgenticForestRunner:
         discovery_df: pd.DataFrame,
         bow_context: Dict[str, Any],
     ) -> List[ExplicitFeatureSpec]:
+        cached = self._load_selected_specs_cache(
+            outer_fold=outer_fold,
+            consistency_enabled=True,
+        )
+        if cached is not None:
+            selected_specs, row = cached
+            self._remember_alias_reference_specs(selected_specs)
+            self.agent_rows.append(row)
+            return selected_specs
+
         full_bundle = self._propose_candidate_bundle(
             outer_fold=outer_fold,
             scope="full_outer_train",
@@ -2053,15 +2166,20 @@ class MultiModelAgenticForestRunner:
                 outer_fold=outer_fold,
                 selected_specs=selected_specs,
             )
-            self.agent_rows.append(
-                {
-                    "outer_fold": int(outer_fold),
-                    "consistency_enabled": True,
-                    "proposal_bundles": [_proposal_bundle_artifact(bundle) for bundle in bundles],
-                    "selected_features": [_spec_to_dict(spec) for spec in selected_specs],
-                    "value_harmonization": value_harmonization,
-                    "skipped": "no_valid_consistency_candidates",
-                }
+            row = {
+                "outer_fold": int(outer_fold),
+                "consistency_enabled": True,
+                "proposal_bundles": [_proposal_bundle_artifact(bundle) for bundle in bundles],
+                "selected_features": [_spec_to_dict(spec) for spec in selected_specs],
+                "value_harmonization": value_harmonization,
+                "skipped": "no_valid_consistency_candidates",
+            }
+            self.agent_rows.append(row)
+            self._write_selected_specs_cache(
+                outer_fold=outer_fold,
+                consistency_enabled=True,
+                selected_specs=selected_specs,
+                row=row,
             )
             return selected_specs
 
@@ -2120,6 +2238,12 @@ class MultiModelAgenticForestRunner:
         if self.search_config.save_agent_context:
             row["consistency_context"] = consistency_context
         self.agent_rows.append(row)
+        self._write_selected_specs_cache(
+            outer_fold=outer_fold,
+            consistency_enabled=True,
+            selected_specs=selected_specs,
+            row=row,
+        )
         return selected_specs
 
     def _propose_candidate_bundle(
@@ -2132,6 +2256,14 @@ class MultiModelAgenticForestRunner:
         inner_fold: Optional[int] = None,
         heldout_rows: Optional[int] = None,
     ) -> Dict[str, Any]:
+        cached = self._load_proposal_bundle_cache(
+            outer_fold=outer_fold,
+            scope=scope,
+            inner_fold=inner_fold,
+        )
+        if cached is not None:
+            return cached
+
         raw_proposals = self.proposal_agent.propose(bow_context)
         proposal_agent_trace = _get_agent_response_trace(self.proposal_agent)
         proposals, rejected = validate_agentic_proposals(
@@ -2155,7 +2287,138 @@ class MultiModelAgenticForestRunner:
             bundle["context"] = bow_context
         if self.search_config.save_agent_raw_output:
             bundle["agent_raw_output"] = proposal_agent_trace
+        self._write_proposal_bundle_cache(bundle)
         return bundle
+
+    def _outer_fold_artifact_dir(self, outer_fold: int) -> Path:
+        return self.artifact_dir / f"outer_fold_{int(outer_fold):03d}"
+
+    def _selected_specs_cache_path(self, outer_fold: int) -> Path:
+        return self._outer_fold_artifact_dir(outer_fold) / "selected_specs_cache.json"
+
+    def _proposal_bundle_cache_path(
+        self,
+        *,
+        outer_fold: int,
+        scope: str,
+        inner_fold: Optional[int],
+    ) -> Path:
+        if inner_fold is None:
+            stem = str(scope)
+        else:
+            stem = f"{scope}_inner_{int(inner_fold):03d}"
+        return (
+            self._outer_fold_artifact_dir(outer_fold)
+            / "proposal_bundles"
+            / f"{stem}.json"
+        )
+
+    def _load_selected_specs_cache(
+        self,
+        *,
+        outer_fold: int,
+        consistency_enabled: bool,
+    ) -> Optional[Tuple[List[ExplicitFeatureSpec], Dict[str, Any]]]:
+        if not self.resume:
+            return None
+        path = self._selected_specs_cache_path(outer_fold)
+        if not path.exists():
+            return None
+        try:
+            payload = _read_json(path)
+            if not isinstance(payload, dict):
+                return None
+            if bool(payload.get("consistency_enabled")) != bool(consistency_enabled):
+                return None
+            selected_specs = [
+                _feature_spec_from_dict(item)
+                for item in payload.get("selected_features", [])
+                if isinstance(item, dict)
+            ]
+            row = dict(payload.get("agent_row") or {})
+            row.setdefault("outer_fold", int(outer_fold))
+            row["resumed_from_cache"] = str(path)
+            logger.info(
+                "Reusing cached Stage 2 selected specs outer_fold=%s path=%s",
+                outer_fold,
+                path,
+            )
+            return selected_specs, row
+        except Exception as exc:
+            logger.warning("Ignoring unreadable selected-spec cache %s: %s", path, exc)
+            return None
+
+    def _write_selected_specs_cache(
+        self,
+        *,
+        outer_fold: int,
+        consistency_enabled: bool,
+        selected_specs: Sequence[ExplicitFeatureSpec],
+        row: Dict[str, Any],
+    ) -> None:
+        payload = {
+            "outer_fold": int(outer_fold),
+            "consistency_enabled": bool(consistency_enabled),
+            "selected_features": [_spec_to_dict(spec) for spec in selected_specs],
+            "agent_row": row,
+        }
+        _write_json(self._selected_specs_cache_path(outer_fold), payload)
+
+    def _load_proposal_bundle_cache(
+        self,
+        *,
+        outer_fold: int,
+        scope: str,
+        inner_fold: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        if not self.resume:
+            return None
+        path = self._proposal_bundle_cache_path(
+            outer_fold=outer_fold,
+            scope=scope,
+            inner_fold=inner_fold,
+        )
+        if not path.exists():
+            return None
+        try:
+            payload = _read_json(path)
+            if not isinstance(payload, dict):
+                return None
+            if int(payload.get("outer_fold", -1)) != int(outer_fold):
+                return None
+            if str(payload.get("scope")) != str(scope):
+                return None
+            payload_inner = payload.get("inner_fold")
+            if (None if payload_inner is None else int(payload_inner)) != (
+                None if inner_fold is None else int(inner_fold)
+            ):
+                return None
+            payload["valid_proposals"] = [
+                _proposal_from_dict(item)
+                for item in payload.get("valid_proposals", [])
+                if isinstance(item, dict)
+            ]
+            payload["resumed_from_cache"] = str(path)
+            logger.info(
+                "Reusing cached Stage 2 proposal bundle outer_fold=%s scope=%s "
+                "inner_fold=%s path=%s",
+                outer_fold,
+                scope,
+                inner_fold,
+                path,
+            )
+            return payload
+        except Exception as exc:
+            logger.warning("Ignoring unreadable proposal bundle cache %s: %s", path, exc)
+            return None
+
+    def _write_proposal_bundle_cache(self, bundle: Dict[str, Any]) -> None:
+        path = self._proposal_bundle_cache_path(
+            outer_fold=int(bundle["outer_fold"]),
+            scope=str(bundle["scope"]),
+            inner_fold=bundle.get("inner_fold"),
+        )
+        _write_json(path, _proposal_bundle_artifact(bundle))
 
     def _inner_consistency_candidate_bundles(
         self,
@@ -3789,8 +4052,8 @@ class PrecomputedDiscoveryMultiModelAgenticForestRunner(MultiModelAgenticForestR
         if row is None:
             raise RuntimeError(
                 "Missing precomputed agentic discovery handoff for fold_key="
-                f"{fold_key} in {self.handoff_path}. Rerun the optional primary "
-                "stage with --prepare-agentic-handoff."
+                f"{fold_key} in {self.handoff_path}. Rerun multi_model_forest "
+                "Stage 1 to regenerate the handoff."
             )
         logger.info(
             "Using precomputed agentic discovery handoff fold_key=%s scope=%s path=%s",
@@ -4037,6 +4300,30 @@ def _proposal_to_dict(proposal: AgenticFeatureProposal) -> Dict[str, Any]:
         "rationale": proposal.rationale,
         "expected_signal": proposal.expected_signal,
     }
+
+
+def _proposal_from_dict(payload: Dict[str, Any]) -> AgenticFeatureProposal:
+    return AgenticFeatureProposal(
+        action=str(payload.get("action") or "add"),
+        name=str(payload.get("name") or ""),
+        type=payload.get("type"),
+        categories=payload.get("categories"),
+        roles=list(payload.get("roles") or []),
+        description=payload.get("description"),
+        rationale=payload.get("rationale"),
+        expected_signal=payload.get("expected_signal"),
+    )
+
+
+def _feature_spec_from_dict(payload: Dict[str, Any]) -> ExplicitFeatureSpec:
+    return ExplicitFeatureSpec(
+        name=str(payload["name"]),
+        type=str(payload.get("type") or "continuous"),
+        categories=payload.get("categories"),
+        description=payload.get("description"),
+        roles=list(payload.get("roles") or []),
+        value_aliases=payload.get("value_aliases"),
+    )
 
 
 def _columns_to_feature_dicts(
@@ -6164,7 +6451,35 @@ def _write_jsonl(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
             f.write(json.dumps(row, default=_json_default) + "\n")
 
 
+def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    path = Path(path)
+    if not path.exists():
+        return []
+    rows: List[Dict[str, Any]] = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            text = line.strip()
+            if text:
+                rows.append(json.loads(text))
+    return rows
+
+
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         json.dump(payload, f, indent=2, default=_json_default)
+
+
+def _read_json(path: Path, default: Any = None) -> Any:
+    path = Path(path)
+    if not path.exists():
+        return default
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _read_csv_records(path: Path) -> List[Dict[str, Any]]:
+    path = Path(path)
+    if not path.exists() or path.stat().st_size == 0:
+        return []
+    return pd.read_csv(path).to_dict(orient="records")

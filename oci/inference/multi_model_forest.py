@@ -259,6 +259,7 @@ class MultiModelForestRunner:
                 device=self.device,
                 gpu_ids=self.gpu_ids,
                 num_workers=self.plan.cpu_loky_workers,
+                resume=not self.force_stage2,
             )
         if self.stage2_prediction_path.exists():
             shutil.copyfile(
