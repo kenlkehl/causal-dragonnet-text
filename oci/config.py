@@ -937,7 +937,7 @@ class MultiModelAgenticForestConfig:
     # Parsimony review before final forest fitting. The stage normally runs and
     # writes artifacts, but pruning is optional: retaining all features is a
     # valid outcome when ablations or redundancy checks do not justify removal.
-    parsimony_review_enabled: bool = True
+    parsimony_review_enabled: bool = False
     parsimony_review_auc_tolerance: float = 0.01
     parsimony_review_loss_relative_tolerance: float = 0.03
     parsimony_review_corr_threshold: float = 0.75

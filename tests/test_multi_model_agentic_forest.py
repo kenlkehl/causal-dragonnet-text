@@ -1962,6 +1962,7 @@ def test_multi_model_extracted_feature_review_revises_underperforming_specs(
                 extracted_feature_review_auc_margin=0.0,
                 extracted_feature_review_loss_relative_margin=0.0,
                 extracted_feature_review_min_benchmark_auc=0.55,
+                parsimony_review_enabled=True,
                 fold_parallelism="1",
                 **_disable_required_evidence_test_kwargs(),
             ),
@@ -2302,6 +2303,7 @@ def test_multi_model_agentic_forest_parses_bow_views_and_embedding_option():
     assert nn_cfg.extracted_feature_review_auc_margin == 0.03
     assert nn_cfg.extracted_feature_review_loss_relative_margin == 0.07
     assert nn_cfg.extracted_feature_review_min_benchmark_auc == 0.6
+    assert nn_cfg.parsimony_review_enabled is False
     assert nn_cfg.parsimony_review_auc_tolerance == 0.02
     assert nn_cfg.parsimony_review_loss_relative_tolerance == 0.04
     assert nn_cfg.parsimony_review_corr_threshold == 0.8

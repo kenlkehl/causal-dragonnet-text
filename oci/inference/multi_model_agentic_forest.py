@@ -3169,7 +3169,7 @@ class MultiModelAgenticForestRunner:
         """
         before_specs = list(selected_specs)
         required_names = {spec.name for spec in self._initial_specs()}
-        if not bool(getattr(self.nn_config, "parsimony_review_enabled", True)):
+        if not bool(getattr(self.nn_config, "parsimony_review_enabled", False)):
             stop_reason = "disabled_by_config"
             summary = {
                 "enabled": False,
