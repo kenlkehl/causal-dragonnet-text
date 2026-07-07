@@ -3168,9 +3168,51 @@ class MultiModelAgenticForestRunner:
         all features when redundancy/ablation evidence does not justify pruning.
         """
         before_specs = list(selected_specs)
+        required_names = {spec.name for spec in self._initial_specs()}
+        if not bool(getattr(self.nn_config, "parsimony_review_enabled", True)):
+            stop_reason = "disabled_by_config"
+            summary = {
+                "enabled": False,
+                "mandatory": False,
+                "decision": "skipped",
+                "stop_reason": stop_reason,
+                "n_features_before": int(len(before_specs)),
+                "n_features_after": int(len(before_specs)),
+                "n_removed": 0,
+                "removed_features": [],
+                "n_single_feature_ablations": 0,
+            }
+            review_row = {
+                "outer_fold": int(outer_fold),
+                "event": "mandatory_parsimony_review",
+                "decision": "skipped",
+                "stop_reason": stop_reason,
+                "required_features": sorted(required_names),
+                "selected_features_before": [_spec_to_dict(spec) for spec in before_specs],
+                "selected_features_after": [_spec_to_dict(spec) for spec in before_specs],
+                "base_metrics": None,
+                "base_gate": None,
+                "redundancy_review": [],
+                "ablations": [],
+                "summary": summary,
+            }
+            self.parsimony_review_rows.append(review_row)
+            self.agent_rows.append(
+                {
+                    "outer_fold": int(outer_fold),
+                    "event": "mandatory_parsimony_review",
+                    "decision": "skipped",
+                    "stop_reason": stop_reason,
+                    "n_features_before": int(len(before_specs)),
+                    "n_features_after": int(len(before_specs)),
+                    "removed_features": [],
+                    "artifact": "parsimony_review_by_fold.jsonl",
+                }
+            )
+            return {"selected_specs": before_specs, "summary": summary}
+
         current_specs = list(selected_specs)
         train_df = self.dataset.iloc[train_idx].copy()
-        required_names = {spec.name for spec in self._initial_specs()}
         max_ablations = int(
             getattr(self.nn_config, "parsimony_review_max_single_feature_ablations", 30)
         )

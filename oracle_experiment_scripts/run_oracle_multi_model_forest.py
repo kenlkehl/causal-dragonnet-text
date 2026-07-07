@@ -56,6 +56,7 @@ _REQUIRED_EMBEDDING_CACHE_FILES = (
 @dataclass
 class MultiModelForestOracleConfig(MultiModelAgenticOracleConfig):
     stage: str = "all"
+    primary_run_id: Optional[str] = None
     cpus_total: Optional[int] = None
     gpu_ids: Optional[List[int]] = None
     htr_jobs_per_gpu: int = 1
@@ -63,9 +64,12 @@ class MultiModelForestOracleConfig(MultiModelAgenticOracleConfig):
     force_stage2: bool = False
 
     def primary_hash(self) -> str:
+        if self.primary_run_id:
+            return str(self.primary_run_id).strip()
         payload = asdict(self)
         for key in [
             "stage",
+            "primary_run_id",
             "force_stage1",
             "force_stage2",
             "agent_provider",
@@ -190,6 +194,7 @@ class MultiModelForestOracleConfig(MultiModelAgenticOracleConfig):
             "extracted_feature_review_min_benchmark_auc": (
                 self.extracted_feature_review_min_benchmark_auc
             ),
+            "parsimony_review_enabled": self.parsimony_review_enabled,
         }
         return _hash_payload(payload)
 
@@ -214,6 +219,8 @@ def _make_applied_config(
 
 
 def _run_one(config: MultiModelForestOracleConfig, output_dir: Path) -> Dict[str, Any]:
+    if config.primary_run_id and config.stage != "stage2":
+        raise ValueError("--primary-run-id is only supported with --stage stage2")
     parquet_file = _normalize_run_inputs(config)
     df = _load_dataset(config, parquet_file)
     applied = _make_applied_config(config, parquet_file)
@@ -424,6 +431,14 @@ def main() -> None:
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--stage", default="all", choices=["all", "stage1", "stage2"])
+    parser.add_argument(
+        "--primary-run-id",
+        default=None,
+        help=(
+            "Existing multi_model_forest/<run_id> directory to reuse for Stage 2. "
+            "Use with --stage stage2."
+        ),
+    )
     parser.add_argument("--force-stage1", action="store_true")
     parser.add_argument("--force-stage2", action="store_true")
     parser.add_argument("--n-folds", type=int, default=5)
@@ -464,14 +479,14 @@ def main() -> None:
     parser.add_argument("--allow-full-data-refit", action="store_true")
     parser.add_argument("--allow-extraction-truncation", action="store_true")
 
-    parser.add_argument("--candidate-proposals-per-fold", type=int, default=30)
+    parser.add_argument("--candidate-proposals-per-fold", type=int, default=80)
     parser.add_argument("--no-candidate-consistency", action="store_true")
     parser.add_argument("--candidate-consistency-inner-folds", type=int, default=3)
     parser.add_argument("--candidate-consistency-min-folds", type=int, default=2)
     parser.add_argument("--candidate-consistency-min-fold-fraction", type=float, default=0.5)
-    parser.add_argument("--candidate-consistency-recovery-max-candidates", type=int, default=12)
+    parser.add_argument("--candidate-consistency-recovery-max-candidates", type=int, default=30)
     parser.add_argument("--no-extracted-feature-review", action="store_true")
-    parser.add_argument("--extracted-feature-review-max-rounds", type=int, default=3)
+    parser.add_argument("--extracted-feature-review-max-rounds", type=int, default=5)
     parser.add_argument("--extracted-feature-review-auc-margin", type=float, default=0.02)
     parser.add_argument(
         "--extracted-feature-review-loss-relative-margin",
@@ -479,7 +494,15 @@ def main() -> None:
         default=0.05,
     )
     parser.add_argument("--extracted-feature-review-min-benchmark-auc", type=float, default=0.55)
-    parser.add_argument("--min-feature-coverage", type=float, default=0.70)
+    parser.add_argument(
+        "--enable-parsimony-review",
+        action="store_true",
+        help=(
+            "Run the final parsimony pruning pass. Disabled by default for the "
+            "current oracle discovery stress tests."
+        ),
+    )
+    parser.add_argument("--min-feature-coverage", type=float, default=0.50)
 
     parser.add_argument("--htr-device", default="cuda:0")
     parser.add_argument("--gpu-ids", "--htr-gpu-ids", dest="gpu_ids", type=int, nargs="+")
@@ -610,6 +633,7 @@ def main() -> None:
         dataset_path=args.dataset,
         dataset_name=Path(args.dataset).name,
         stage=args.stage,
+        primary_run_id=args.primary_run_id,
         n_folds=args.n_folds,
         seed=args.seed,
         sample_size=args.sample_size,
@@ -653,6 +677,7 @@ def main() -> None:
         extracted_feature_review_min_benchmark_auc=(
             args.extracted_feature_review_min_benchmark_auc
         ),
+        parsimony_review_enabled=args.enable_parsimony_review,
         require_honest_outer_split=not args.allow_full_data_refit,
         fail_on_extraction_truncation=not args.allow_extraction_truncation,
         htr_device=args.htr_device,

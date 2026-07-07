@@ -372,9 +372,10 @@ Final artifacts are written under `multi_model_agentic_forest/`, including
 `bow_view_feature_importance_by_fold.jsonl`,
 `embedding_contrast_evidence_by_fold.jsonl`, `agent_candidate_proposals.jsonl`,
 `extracted_feature_diagnostics_by_fold.jsonl`, `parsimony_review_by_fold.jsonl`,
-`selected_feature_sets.json`, and `outer_cv_metrics.csv`. The parsimony review is
-mandatory before final forest fitting; it may record `retain_all` when ablations
-do not justify pruning. The same run also writes skill-compatible aliases:
+`selected_feature_sets.json`, and `outer_cv_metrics.csv`. When enabled, the
+parsimony review runs before final forest fitting and may record `retain_all`
+when ablations do not justify pruning; disabled runs record `skipped` and retain
+the reviewed feature set. The same run also writes skill-compatible aliases:
 `report.txt`, `text_evidence.bow.jsonl`, `text_evidence.embedding.jsonl`,
 `text_evidence.htr.parquet`, `ensemble_nuisance_predictions.parquet`,
 `candidate_features.parquet`, `candidate_signal_review.jsonl`,

@@ -190,18 +190,19 @@ class MultiModelAgenticOracleConfig:
     ridge_alpha: float = 10.0
     e_clip: float = 0.01
     top_n_features: int = 100
-    candidate_proposals_per_fold: int = 30
+    candidate_proposals_per_fold: int = 80
     candidate_consistency_enabled: bool = True
     candidate_consistency_inner_folds: int = 3
     candidate_consistency_min_folds: int = 2
     candidate_consistency_min_fold_fraction: float = 0.5
-    candidate_consistency_recovery_max_candidates: int = 12
+    candidate_consistency_recovery_max_candidates: int = 30
     candidate_consistency_parallelism: str = "1"
     extracted_feature_review_enabled: bool = True
-    extracted_feature_review_max_rounds: int = 3
+    extracted_feature_review_max_rounds: int = 5
     extracted_feature_review_auc_margin: float = 0.02
     extracted_feature_review_loss_relative_margin: float = 0.05
     extracted_feature_review_min_benchmark_auc: float = 0.55
+    parsimony_review_enabled: bool = False
     require_honest_outer_split: bool = True
     fail_on_extraction_truncation: bool = True
     outer_parallelism: str = "1"
@@ -241,7 +242,7 @@ class MultiModelAgenticOracleConfig:
     cf_honest: bool = True
     cf_inference: bool = True
 
-    min_feature_coverage: float = 0.70
+    min_feature_coverage: float = 0.50
     agent_provider: str = "openai"
     agent_platform_project: Optional[str] = None
     agent_platform_location: str = "global"
@@ -375,6 +376,7 @@ def _make_applied_config(
                 extracted_feature_review_min_benchmark_auc=(
                     config.extracted_feature_review_min_benchmark_auc
                 ),
+                parsimony_review_enabled=config.parsimony_review_enabled,
                 require_honest_outer_split=config.require_honest_outer_split,
                 fail_on_extraction_truncation=config.fail_on_extraction_truncation,
                 outer_parallelism=config.outer_parallelism,
@@ -722,7 +724,8 @@ def main() -> None:
     )
     parser.add_argument("--ridge-alpha", type=float, default=10.0)
     parser.add_argument("--top-n-features", type=int, default=100)
-    parser.add_argument("--candidate-proposals-per-fold", type=int, default=30)
+    parser.add_argument("--min-feature-coverage", type=float, default=0.50)
+    parser.add_argument("--candidate-proposals-per-fold", type=int, default=80)
     parser.add_argument(
         "--no-candidate-consistency",
         action="store_true",
@@ -738,7 +741,7 @@ def main() -> None:
     parser.add_argument(
         "--candidate-consistency-recovery-max-candidates",
         type=int,
-        default=12,
+        default=30,
         help="Maximum below-threshold candidates shown to the consistency agent for recovery.",
     )
     parser.add_argument(
@@ -754,7 +757,7 @@ def main() -> None:
         action="store_true",
         help="Disable post-extraction simple-model review and agent revision.",
     )
-    parser.add_argument("--extracted-feature-review-max-rounds", type=int, default=3)
+    parser.add_argument("--extracted-feature-review-max-rounds", type=int, default=5)
     parser.add_argument(
         "--extracted-feature-review-auc-margin",
         type=float,
@@ -772,6 +775,14 @@ def main() -> None:
         type=float,
         default=0.55,
         help="Minimum benchmark AUC before an AUC comparison is enforced.",
+    )
+    parser.add_argument(
+        "--enable-parsimony-review",
+        action="store_true",
+        help=(
+            "Run the final parsimony pruning pass. Disabled by default for the "
+            "current oracle discovery stress tests."
+        ),
     )
     parser.add_argument(
         "--allow-full-data-refit",
@@ -1049,6 +1060,7 @@ def main() -> None:
         prespecified_features_json=args.prespecified_features_json,
         ridge_alpha=args.ridge_alpha,
         top_n_features=args.top_n_features,
+        min_feature_coverage=args.min_feature_coverage,
         candidate_proposals_per_fold=args.candidate_proposals_per_fold,
         candidate_consistency_enabled=not args.no_candidate_consistency,
         candidate_consistency_inner_folds=args.candidate_consistency_inner_folds,
@@ -1067,6 +1079,7 @@ def main() -> None:
         extracted_feature_review_min_benchmark_auc=(
             args.extracted_feature_review_min_benchmark_auc
         ),
+        parsimony_review_enabled=args.enable_parsimony_review,
         require_honest_outer_split=not args.allow_full_data_refit,
         fail_on_extraction_truncation=not args.allow_extraction_truncation,
         outer_parallelism=args.outer_parallelism,
