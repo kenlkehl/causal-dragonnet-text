@@ -236,6 +236,33 @@ def test_vllm_feature_extractor_server_client_uses_request_timeout(monkeypatch):
     assert calls["max_retries"] == 0
 
 
+def test_vllm_feature_extractor_cleanup_closes_server_client_pool(monkeypatch):
+    closed = []
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def close(self):
+            closed.append(self.kwargs["base_url"])
+
+    monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
+    extractor = VLLMFeatureExtractor(
+        specs=[
+            ExplicitFeatureSpec(name="age", type="continuous", roles=["confounder"]),
+        ],
+        mode="server",
+        server_url="http://server/v1",
+    )
+    extractor._init_server_client()
+
+    extractor.cleanup()
+
+    assert closed == ["http://server/v1"]
+    assert extractor._client is None
+    assert extractor._client_pool is None
+
+
 def test_vllm_feature_extractor_request_does_not_set_timeout():
     calls = {}
 

@@ -125,6 +125,27 @@ class GoogleADCOpenAIClient:
         self._refresh()
         return getattr(self._client, name)
 
+    def close(self) -> None:
+        close_client = getattr(self._client, "close", None)
+        if callable(close_client):
+            try:
+                close_client()
+            except Exception:
+                logger.warning("Error closing OpenAI-compatible client", exc_info=True)
+
+        seen_sessions: set[int] = set()
+        for attr_name in ("session", "_session"):
+            session = getattr(self._google_request, attr_name, None)
+            if session is None or id(session) in seen_sessions:
+                continue
+            seen_sessions.add(id(session))
+            close_session = getattr(session, "close", None)
+            if callable(close_session):
+                try:
+                    close_session()
+                except Exception:
+                    logger.warning("Error closing Google auth request session", exc_info=True)
+
 
 def retry_delay(
     attempt_index: int,
@@ -281,3 +302,28 @@ class OpenAIClientPool:
 
     def first_url(self) -> str:
         return self.server_urls[0]
+
+    def close(self) -> None:
+        """Close all lazily-created clients and clear the pool."""
+        with self._lock:
+            clients = list(self._clients.values())
+            self._clients.clear()
+        seen: set[int] = set()
+        for client in clients:
+            client_id = id(client)
+            if client_id in seen:
+                continue
+            seen.add(client_id)
+            close_client = getattr(client, "close", None)
+            if not callable(close_client):
+                continue
+            try:
+                close_client()
+            except Exception:
+                logger.warning("Error closing OpenAI-compatible client", exc_info=True)
+
+    def __enter__(self) -> "OpenAIClientPool":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()

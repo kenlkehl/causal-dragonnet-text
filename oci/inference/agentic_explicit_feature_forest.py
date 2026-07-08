@@ -7,8 +7,13 @@ all feature-set decisions are made with inner CV on each outer-training split.
 
 import json
 import logging
+import os
 import re
+import shlex
+import subprocess
+import tempfile
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -32,10 +37,17 @@ from ..extraction import (
     resolve_vllm_reasoning_parser,
     strip_reasoning_trace,
 )
+from ..extraction.explicit_features import (
+    _missing_values_for_specs,
+    _parse_extraction_response_with_issues,
+    build_extraction_prompt,
+    build_extraction_repair_prompt,
+)
 from ..extraction.llm_routing import (
     OpenAIClientPool,
     call_with_exponential_backoff,
     google_json_response_format_kwargs,
+    retry_delay,
 )
 from ..extraction.llm_routing import parse_server_urls
 from ..models.causal_forest_head import CausalForestHead
@@ -224,12 +236,15 @@ class AgenticFeatureSearchRunner:
         if not self.initial_specs:
             logger.info("Agentic explicit-feature search is starting from an empty feature set")
 
-        self.proposal_agent = proposal_agent or OpenAICompatibleFeatureSearchAgent(
+        self.proposal_agent = proposal_agent or make_feature_search_agent(
             self.search_config
         )
-        self.extraction_provider = extraction_provider or VLLMExplicitFeatureExtractionProvider(
-            config=config,
-            output_dir=self.artifact_dir,
+        self.extraction_provider = (
+            extraction_provider
+            or make_explicit_feature_extraction_provider(
+                config=config,
+                output_dir=self.artifact_dir,
+            )
         )
         self.evaluator = evaluator or CausalForestExplicitEvaluator(
             config=config,
@@ -1412,6 +1427,9 @@ class OpenAICompatibleFeatureSearchAgent:
         is_value_harmonization = (
             context.get("prompt_version") == "multi_model_agentic_value_harmonization_v1"
         )
+        is_concept_inventory = (
+            context.get("prompt_version") == "multi_model_agentic_concept_inventory_v1"
+        )
 
         for attempt_idx in range(max_repair_attempts + 1):
             response_kwargs = {
@@ -1444,13 +1462,18 @@ class OpenAICompatibleFeatureSearchAgent:
             self.last_response_trace = _trace_with_repair_attempts(trace, attempts)
 
             try:
-                if is_consensus_disambiguation or is_value_harmonization:
+                if (
+                    is_consensus_disambiguation
+                    or is_value_harmonization
+                    or is_concept_inventory
+                ):
                     parsed = parse_agent_json_object(content)
-                    issues = (
-                        value_harmonization_response_issues(parsed, context)
-                        if is_value_harmonization
-                        else consensus_disambiguation_response_issues(parsed)
-                    )
+                    if is_value_harmonization:
+                        issues = value_harmonization_response_issues(parsed, context)
+                    elif is_concept_inventory:
+                        issues = concept_inventory_response_issues(parsed, context)
+                    else:
+                        issues = consensus_disambiguation_response_issues(parsed)
                     if issues:
                         raise ValueError("; ".join(issues))
                     return parsed
@@ -1470,6 +1493,8 @@ class OpenAICompatibleFeatureSearchAgent:
                     )
                     if is_value_harmonization:
                         repair_prompt = build_value_harmonization_repair_prompt(issues)
+                    elif is_concept_inventory:
+                        repair_prompt = build_concept_inventory_repair_prompt(issues)
                     elif is_consensus_disambiguation:
                         repair_prompt = build_consensus_disambiguation_repair_prompt(issues)
                     else:
@@ -1520,16 +1545,363 @@ class OpenAICompatibleFeatureSearchAgent:
         return []
 
 
-def _proposal_agent_supports_value_harmonization(agent: Any) -> bool:
-    return isinstance(agent, OpenAICompatibleFeatureSearchAgent) or bool(
-        getattr(agent, "supports_value_harmonization", False)
+@dataclass
+class CodexCLIResponse:
+    content: str
+    command: List[str]
+    stdout: str
+    stderr: str
+    returncode: int
+
+
+def _codex_cli_provider(value: Any) -> bool:
+    normalized = str(value or "openai").strip().lower().replace("-", "_")
+    return normalized in {"codex", "codex_cli"}
+
+
+def _codex_optional_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "null", "profile", "default"}:
+        return None
+    return text
+
+
+def _codex_extra_args(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return shlex.split(value)
+    args: List[str] = []
+    for item in value:
+        if item is None:
+            continue
+        if isinstance(item, str):
+            args.append(item)
+        else:
+            args.append(str(item))
+    return args
+
+
+def _codex_exec_command(
+    *,
+    executable: str,
+    model_name: Any,
+    reasoning_effort: Any,
+    extra_args: Any,
+    output_path: Path,
+) -> List[str]:
+    cmd = [
+        os.path.expanduser(str(executable or "codex")),
+        "exec",
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "--ignore-rules",
+        "--sandbox",
+        "read-only",
+        "--color",
+        "never",
+    ]
+    model = _codex_optional_value(model_name)
+    if model is not None:
+        cmd.extend(["--model", model])
+    effort = _codex_optional_value(reasoning_effort)
+    if effort is not None:
+        cmd.extend(["-c", f"model_reasoning_effort={json.dumps(effort)}"])
+    cmd.extend(_codex_extra_args(extra_args))
+    cmd.extend(["--output-last-message", str(output_path), "-"])
+    return cmd
+
+
+def _tail_text(text: str, limit: int = 4000) -> str:
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
+def _run_codex_exec(
+    prompt: str,
+    *,
+    executable: str,
+    model_name: Any,
+    reasoning_effort: Any,
+    extra_args: Any,
+    timeout: Optional[float],
+) -> CodexCLIResponse:
+    with tempfile.TemporaryDirectory(prefix="oci_codex_cli_") as tmpdir:
+        output_path = Path(tmpdir) / "last_message.txt"
+        cmd = _codex_exec_command(
+            executable=executable,
+            model_name=model_name,
+            reasoning_effort=reasoning_effort,
+            extra_args=extra_args,
+            output_path=output_path,
+        )
+        completed = subprocess.run(
+            cmd,
+            input=prompt,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+        content = ""
+        if output_path.exists():
+            content = output_path.read_text()
+        if not content.strip():
+            content = completed.stdout
+        response = CodexCLIResponse(
+            content=content.strip(),
+            command=cmd,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+            returncode=int(completed.returncode),
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "codex exec failed with return code "
+                f"{completed.returncode}: {_tail_text(completed.stderr or completed.stdout)}"
+            )
+        if not response.content:
+            raise RuntimeError("codex exec returned an empty final message")
+        return response
+
+
+def _codex_backend_prompt(task_prompt: str, *, task_kind: str) -> str:
+    return f"""You are being used as a noninteractive JSON LLM backend for {task_kind}.
+Do not inspect files, run shell commands, browse, invoke tools, edit files, or use skills.
+Use only the information in this prompt. Think internally, then return only the requested JSON.
+Do not include markdown fences, comments, prose, or reasoning in the final answer.
+
+{task_prompt}
+"""
+
+
+def _codex_extraction_prompt(
+    clinical_text: str,
+    specs: List[ExplicitFeatureSpec],
+) -> str:
+    task_prompt = build_extraction_prompt(
+        clinical_text,
+        specs,
+        max_text_length=None,
     )
+    return _codex_backend_prompt(
+        "Read the whole clinical note in the extraction prompt below from beginning "
+        "to end. Do not use regex-only, keyword-only, or hand-coded rule shortcuts; "
+        "perform the clinical extraction directly from the full note text. If the "
+        "note does not support a value, return null for that field.\n\n"
+        f"{task_prompt}",
+        task_kind="clinical explicit-feature extraction",
+    )
+
+
+def _codex_response_trace(response: CodexCLIResponse, *, model_name: Any) -> Dict[str, Any]:
+    return {
+        "provider": "codex_cli",
+        "model": _codex_optional_value(model_name),
+        "raw_content": response.content,
+        "returncode": response.returncode,
+        "command": response.command,
+        "stdout_tail": _tail_text(response.stdout),
+        "stderr_tail": _tail_text(response.stderr),
+    }
+
+
+class CodexCLIFeatureSearchAgent:
+    """Proposal agent that shells out to `codex exec` for each LLM call."""
+
+    supports_alias_resolution = True
+    supports_value_harmonization = True
+
+    def __init__(self, search_config: AgenticFeatureSearchConfig):
+        self.search_config = search_config
+        self.last_raw_response: Optional[str] = None
+        self.last_response_trace: Optional[Dict[str, Any]] = None
+
+    def _run(self, prompt: str) -> CodexCLIResponse:
+        max_attempts = 1 + max(
+            0,
+            int(getattr(self.search_config, "agent_request_max_retries", 3)),
+        )
+        for attempt in range(max_attempts):
+            try:
+                return _run_codex_exec(
+                    prompt,
+                    executable=getattr(self.search_config, "codex_cli_executable", "codex"),
+                    model_name=getattr(
+                        self.search_config,
+                        "codex_cli_model_name",
+                        "gpt-5.5",
+                    ),
+                    reasoning_effort=getattr(
+                        self.search_config,
+                        "codex_cli_reasoning_effort",
+                        "medium",
+                    ),
+                    extra_args=getattr(self.search_config, "codex_cli_extra_args", []),
+                    timeout=getattr(self.search_config, "agent_request_timeout", 900.0),
+                )
+            except Exception as exc:
+                if attempt >= max_attempts - 1:
+                    raise
+                delay = retry_delay(
+                    attempt,
+                    initial_delay=float(
+                        getattr(self.search_config, "agent_retry_initial_delay", 1.0)
+                    ),
+                    max_delay=float(getattr(self.search_config, "agent_retry_max_delay", 30.0)),
+                    backoff_factor=float(
+                        getattr(self.search_config, "agent_retry_backoff_factor", 2.0)
+                    ),
+                )
+                logger.warning(
+                    "Codex CLI agent request failed on attempt %s/%s with %s: %s. "
+                    "Retrying in %.2fs.",
+                    attempt + 1,
+                    max_attempts,
+                    exc.__class__.__name__,
+                    exc,
+                    delay,
+                )
+                import time
+
+                time.sleep(delay)
+        raise RuntimeError("Codex CLI agent request failed without an exception")
+
+    def propose(self, context: Dict[str, Any]) -> Any:
+        self.last_raw_response = None
+        self.last_response_trace = None
+        prompt_version = context.get("prompt_version")
+        task_kind = (
+            "clinical text concept inventory"
+            if prompt_version == "multi_model_agentic_concept_inventory_v1"
+            else "agentic causal-feature proposal"
+        )
+        base_prompt = _codex_backend_prompt(
+            build_agent_prompt(context, self.search_config),
+            task_kind=task_kind,
+        )
+        prompt = base_prompt
+        attempts: List[Dict[str, Any]] = []
+        max_repair_attempts = max(
+            0,
+            int(getattr(self.search_config, "agent_schema_repair_attempts", 1)),
+        )
+        is_consensus_disambiguation = prompt_version in {
+            "agentic_attention_consensus_disambiguation_v1",
+            "multi_model_agentic_alias_resolution_v1",
+        }
+        is_value_harmonization = (
+            prompt_version == "multi_model_agentic_value_harmonization_v1"
+        )
+        is_concept_inventory = (
+            prompt_version == "multi_model_agentic_concept_inventory_v1"
+        )
+
+        for attempt_idx in range(max_repair_attempts + 1):
+            response = self._run(prompt)
+            content = response.content
+            self.last_raw_response = content
+            trace = _codex_response_trace(
+                response,
+                model_name=getattr(self.search_config, "codex_cli_model_name", None),
+            )
+            attempts.append(trace)
+            self.last_response_trace = _trace_with_repair_attempts(trace, attempts)
+
+            try:
+                if (
+                    is_consensus_disambiguation
+                    or is_value_harmonization
+                    or is_concept_inventory
+                ):
+                    parsed = parse_agent_json_object(content)
+                    if is_value_harmonization:
+                        issues = value_harmonization_response_issues(parsed, context)
+                    elif is_concept_inventory:
+                        issues = concept_inventory_response_issues(parsed, context)
+                    else:
+                        issues = consensus_disambiguation_response_issues(parsed)
+                    if issues:
+                        raise ValueError("; ".join(issues))
+                    return parsed
+                proposals = parse_agent_response(content)
+            except Exception as exc:
+                issues = [f"malformed JSON: {exc}"]
+                if attempt_idx < max_repair_attempts:
+                    logger.warning(
+                        "Codex CLI agent response had malformed JSON on attempt %s/%s; "
+                        "requesting repaired JSON.",
+                        attempt_idx + 1,
+                        max_repair_attempts + 1,
+                    )
+                    if is_value_harmonization:
+                        repair_prompt = build_value_harmonization_repair_prompt(issues)
+                    elif is_concept_inventory:
+                        repair_prompt = build_concept_inventory_repair_prompt(issues)
+                    elif is_consensus_disambiguation:
+                        repair_prompt = build_consensus_disambiguation_repair_prompt(issues)
+                    else:
+                        repair_prompt = build_agent_repair_prompt(issues)
+                    prompt = (
+                        f"{base_prompt}\n\nPrevious Codex response:\n{content}\n\n"
+                        f"{repair_prompt}\nReturn repaired JSON only."
+                    )
+                    continue
+                raise ValueError(
+                    "Codex CLI agent response could not be parsed after "
+                    f"{attempt_idx + 1} attempt(s): {issues[0]}"
+                ) from exc
+
+            issues = agent_response_schema_issues(proposals, context=context)
+            if not issues:
+                return proposals
+
+            if attempt_idx < max_repair_attempts:
+                logger.warning(
+                    "Codex CLI agent response had schema issues on attempt %s/%s: %s. "
+                    "Requesting repaired JSON.",
+                    attempt_idx + 1,
+                    max_repair_attempts + 1,
+                    "; ".join(issues[:3]),
+                )
+                prompt = (
+                    f"{base_prompt}\n\nPrevious Codex response:\n{content}\n\n"
+                    f"{build_agent_repair_prompt(issues)}\nReturn repaired JSON only."
+                )
+                continue
+
+            logger.warning(
+                "Codex CLI proposal response still has schema issues after %s attempt(s): %s",
+                attempt_idx + 1,
+                "; ".join(issues),
+            )
+            return proposals
+
+        return []
+
+
+def make_feature_search_agent(search_config: AgenticFeatureSearchConfig) -> Any:
+    if _codex_cli_provider(getattr(search_config, "agent_provider", "openai")):
+        return CodexCLIFeatureSearchAgent(search_config)
+    return OpenAICompatibleFeatureSearchAgent(search_config)
+
+
+def _proposal_agent_supports_value_harmonization(agent: Any) -> bool:
+    return isinstance(
+        agent,
+        (OpenAICompatibleFeatureSearchAgent, CodexCLIFeatureSearchAgent),
+    ) or bool(getattr(agent, "supports_value_harmonization", False))
 
 
 def _proposal_agent_supports_alias_resolution(agent: Any) -> bool:
-    return isinstance(agent, OpenAICompatibleFeatureSearchAgent) or bool(
-        getattr(agent, "supports_alias_resolution", False)
-    )
+    return isinstance(
+        agent,
+        (OpenAICompatibleFeatureSearchAgent, CodexCLIFeatureSearchAgent),
+    ) or bool(getattr(agent, "supports_alias_resolution", False))
 
 
 class VLLMExplicitFeatureExtractionProvider:
@@ -1875,19 +2247,209 @@ class VLLMExplicitFeatureExtractionProvider:
                 f"got vllm_mode={mode!r}. Provide an explicit model name for this mode."
             )
         server_url = parse_server_urls(self.feature_config.vllm_server_url)[0]
-        client_pool = OpenAIClientPool(
+        with OpenAIClientPool(
             server_urls=[server_url],
             api_key=getattr(self.feature_config, "vllm_api_key", "EMPTY"),
             timeout=getattr(self.feature_config, "extraction_request_timeout", 900.0),
             max_retries=0,
-        )
-        client = client_pool.client_for_url(server_url)
-        self._resolved_vllm_model_name = _discover_openai_compatible_model_name(
-            client,
-            server_url=server_url,
-            purpose="explicit feature extraction",
-        )
+        ) as client_pool:
+            client = client_pool.client_for_url(server_url)
+            self._resolved_vllm_model_name = _discover_openai_compatible_model_name(
+                client,
+                server_url=server_url,
+                purpose="explicit feature extraction",
+            )
         return self._resolved_vllm_model_name
+
+
+class CodexCLIExplicitFeatureExtractionProvider(VLLMExplicitFeatureExtractionProvider):
+    """Resumable explicit-feature provider backed by one `codex exec` call per note."""
+
+    reads_complete_documents = True
+
+    def _cache_config(self, specs: List[ExplicitFeatureSpec]) -> Dict[str, Any]:
+        return {
+            "features": [_spec_extraction_contract_dict(spec) for spec in specs],
+            "prompt_template_version": EXTRACTION_PROMPT_VERSION,
+            "extraction_provider": "codex_cli",
+            "codex_cli_executable": getattr(
+                self.feature_config,
+                "codex_cli_executable",
+                "codex",
+            ),
+            "codex_cli_model_name": _codex_optional_value(
+                getattr(self.feature_config, "codex_cli_model_name", "gpt-5.5")
+            ),
+            "codex_cli_reasoning_effort": _codex_optional_value(
+                getattr(self.feature_config, "codex_cli_reasoning_effort", "medium")
+            ),
+            "codex_cli_extra_args": _codex_extra_args(
+                getattr(self.feature_config, "codex_cli_extra_args", [])
+            ),
+            "complete_document": True,
+        }
+
+    def _extract_spec_group(
+        self,
+        dataset: pd.DataFrame,
+        specs: List[ExplicitFeatureSpec],
+    ) -> pd.DataFrame:
+        logger.info(
+            "Extracting %s agentic feature(s) with Codex CLI: %s",
+            len(specs),
+            [spec.name for spec in specs],
+        )
+        texts = dataset[self.config.text_column].fillna("").astype(str).tolist()
+        max_workers = max(
+            1,
+            min(
+                len(texts),
+                int(getattr(self.feature_config, "codex_cli_parallelism", 4) or 4),
+            ),
+        )
+        if max_workers == 1:
+            results = [self._extract_one_text(text, specs) for text in texts]
+        else:
+            results = [None] * len(texts)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_idx = {
+                    executor.submit(self._extract_one_text, text, specs): idx
+                    for idx, text in enumerate(texts)
+                }
+                for future in as_completed(future_to_idx):
+                    results[future_to_idx[future]] = future.result()
+            results = [
+                result if result is not None else _missing_values_for_specs(specs)
+                for result in results
+            ]
+        return _extraction_results_to_dataframe(results, specs)
+
+    def _extract_one_text(
+        self,
+        text: str,
+        specs: List[ExplicitFeatureSpec],
+    ) -> Dict[str, Any]:
+        base_prompt = _codex_extraction_prompt(text, specs)
+        prompt = base_prompt
+        best_result = None
+        max_attempts = max(1, int(self.feature_config.extraction_max_retries))
+        for attempt in range(max_attempts):
+            try:
+                response = _run_codex_exec(
+                    prompt,
+                    executable=getattr(self.feature_config, "codex_cli_executable", "codex"),
+                    model_name=getattr(
+                        self.feature_config,
+                        "codex_cli_model_name",
+                        "gpt-5.5",
+                    ),
+                    reasoning_effort=getattr(
+                        self.feature_config,
+                        "codex_cli_reasoning_effort",
+                        "medium",
+                    ),
+                    extra_args=getattr(self.feature_config, "codex_cli_extra_args", []),
+                    timeout=getattr(
+                        self.feature_config,
+                        "extraction_request_timeout",
+                        900.0,
+                    ),
+                )
+                parsed = _parse_extraction_response_with_issues(
+                    response.content,
+                    specs,
+                )
+                result = parsed.values
+                if best_result is None or sum(
+                    1 for value in result.values() if not value.is_missing
+                ) > sum(1 for value in best_result.values() if not value.is_missing):
+                    best_result = result
+                if not parsed.issues:
+                    return result
+                if attempt < max_attempts - 1:
+                    logger.warning(
+                        "Codex CLI extraction response had schema issues on attempt "
+                        "%s/%s: %s. Requesting repaired JSON.",
+                        attempt + 1,
+                        max_attempts,
+                        "; ".join(parsed.issues[:3]),
+                    )
+                    prompt = (
+                        f"{base_prompt}\n\nPrevious Codex response:\n{response.content}\n\n"
+                        f"{build_extraction_repair_prompt(parsed.issues, specs)}"
+                    )
+                    continue
+            except Exception as exc:
+                if attempt >= max_attempts - 1:
+                    logger.warning(
+                        "Codex CLI extraction failed after %s attempt(s): %s",
+                        attempt + 1,
+                        exc,
+                    )
+                    break
+                delay = retry_delay(
+                    attempt,
+                    initial_delay=getattr(
+                        self.feature_config,
+                        "extraction_retry_initial_delay",
+                        1.0,
+                    ),
+                    max_delay=getattr(
+                        self.feature_config,
+                        "extraction_retry_max_delay",
+                        30.0,
+                    ),
+                    backoff_factor=getattr(
+                        self.feature_config,
+                        "extraction_retry_backoff_factor",
+                        2.0,
+                    ),
+                )
+                logger.warning(
+                    "Codex CLI extraction failed on attempt %s/%s with %s: %s. "
+                    "Retrying in %.2fs.",
+                    attempt + 1,
+                    max_attempts,
+                    exc.__class__.__name__,
+                    exc,
+                    delay,
+                )
+                import time
+
+                time.sleep(delay)
+
+        return best_result if best_result is not None else _missing_values_for_specs(specs)
+
+
+def _extraction_results_to_dataframe(
+    results: Sequence[Dict[str, Any]],
+    specs: List[ExplicitFeatureSpec],
+) -> pd.DataFrame:
+    data: Dict[str, List[Any]] = {}
+    for spec in specs:
+        values = []
+        missing_flags = []
+        for result in results:
+            val = result.get(spec.name)
+            if val:
+                values.append(val.value)
+                missing_flags.append(val.is_missing)
+            else:
+                values.append(None)
+                missing_flags.append(True)
+        data[f"explicit_feat_{spec.name}"] = values
+        data[f"explicit_feat_{spec.name}_missing"] = missing_flags
+    return pd.DataFrame(data)
+
+
+def make_explicit_feature_extraction_provider(
+    *,
+    config: AppliedInferenceConfig,
+    output_dir: Path,
+) -> Any:
+    if _codex_cli_provider(getattr(config.explicit_features, "extraction_provider", "openai")):
+        return CodexCLIExplicitFeatureExtractionProvider(config=config, output_dir=output_dir)
+    return VLLMExplicitFeatureExtractionProvider(config=config, output_dir=output_dir)
 
 
 class CausalForestExplicitEvaluator:
@@ -2015,6 +2577,9 @@ def build_agent_prompt(
 
     if context.get("prompt_version") == "multi_model_agentic_value_harmonization_v1":
         return build_multi_model_agentic_value_harmonization_prompt(context, search_config)
+
+    if context.get("prompt_version") == "multi_model_agentic_concept_inventory_v1":
+        return build_multi_model_agentic_concept_inventory_prompt(context, search_config)
 
     if context.get("prompt_version") == "multi_model_agentic_consistency_v1":
         return build_multi_model_agentic_consistency_prompt(context, search_config)
@@ -2313,6 +2878,61 @@ Current value-harmonization context:
 """
 
 
+def build_multi_model_agentic_concept_inventory_prompt(
+    context: Dict[str, Any],
+    search_config: AgenticFeatureSearchConfig,
+) -> str:
+    """Construct the source-grounded concept inventory prompt."""
+    del search_config
+    context_json = json.dumps(
+        context,
+        separators=(",", ":"),
+        default=_json_default,
+    )
+    max_concepts = int(context.get("max_concepts", 60))
+    return f"""You are analyzing evidence from clinical-note text models.
+
+Task: identify patient-level concepts that appear to be represented in common
+among the evidence families supplied in the context.
+
+Evidence families:
+- bow_feature_evidence: sparse text features and repeated phrase signals.
+- embedding_retrieved_text_evidence: retrieved real text chunks and concept scores.
+- htr_attended_text_evidence: tokens or spans highlighted by neural text models.
+
+Look for concepts that recur as the same patient-level field across at least two
+evidence families when possible. Concepts may be ordinary chart fields, clinical
+history, baseline lab values, demographics, staging, biomarkers, symptoms,
+performance status, comorbidities, treatment history, social history, or other
+extractable note-level fields.
+
+Do not rank concepts by downstream modeling usefulness. Do not ignore mundane
+or header-like variables when they are repeatedly represented. Collapse aliases
+that refer to the same field, and keep distinct fields separate.
+
+Return at most {max_concepts} concepts. Return JSON only with this shape:
+{{
+  "concepts": [
+    {{
+      "name": "snake_case_concept_name",
+      "label": "short human-readable label",
+      "value_kind": "binary|categorical|continuous|ordinal|text|unknown",
+      "source_families": ["bow", "embedding_contrast", "htr"],
+      "source_overlap": 2,
+      "supporting_phrases": ["short phrase or token evidence"],
+      "example_values_or_phrases": ["example values or note phrases"],
+      "extractability": "high|medium|low",
+      "notes": "brief source-grounded explanation"
+    }}
+  ],
+  "omitted_uncertain": ["optional short labels for weak one-source concepts"]
+}}
+
+Current concept-inventory context:
+{context_json}
+"""
+
+
 def build_multi_model_agentic_forest_prompt(
     context: Dict[str, Any],
     search_config: AgenticFeatureSearchConfig,
@@ -2329,6 +2949,14 @@ def build_multi_model_agentic_forest_prompt(
             max(1, int(getattr(search_config, "max_additions_per_iter", 6))),
         )
     )
+    concept_inventory_rule = ""
+    if context.get("concept_inventory"):
+        concept_inventory_rule = (
+            "- A separate source-grounded concept_inventory is included. Use it "
+            "as a recall checklist for concepts repeatedly represented in BoW, "
+            "embedding, or HTR evidence. It is broader than the final feature "
+            "set; propose only variables that satisfy the rules below.\n"
+        )
     return f"""You are helping convert multi-view sparse bag-of-words, embedding-retrieval, and HTR attention/span evidence into explicit variables for causal inference.
 
 The upstream models are multi-model:
@@ -2352,6 +2980,9 @@ retaining variables.
 
 Rules:
 - Propose variables, not raw tokens. Convert token patterns into precise extractable patient-level variables.
+- Review concept_inventory first when present so mundane but repeatedly
+  represented patient-level fields are not missed.
+{concept_inventory_rule}
 - Start from the supplied empirical text-model evidence. Do not invent a broad
   hand-built clinical inventory unsupported by BoW, embedding, or HTR evidence
   in this context.
@@ -2664,6 +3295,34 @@ Do not add prose, markdown, comments, or code fences.
 """
 
 
+def build_concept_inventory_repair_prompt(issues: Sequence[str]) -> str:
+    """Construct a follow-up prompt asking the agent to repair concept inventory JSON."""
+    issue_lines = "\n".join(f"- {issue}" for issue in issues)
+    return f"""The previous response could not be used because it failed these schema checks:
+{issue_lines}
+
+Return corrected JSON only. Use this exact top-level shape:
+{{
+  "concepts": [
+    {{
+      "name": "snake_case_concept_name",
+      "label": "short human-readable label",
+      "value_kind": "binary|categorical|continuous|ordinal|text|unknown",
+      "source_families": ["bow", "embedding_contrast", "htr"],
+      "source_overlap": 2,
+      "supporting_phrases": ["short phrase or token evidence"],
+      "example_values_or_phrases": ["example values or note phrases"],
+      "extractability": "high|medium|low",
+      "notes": "brief source-grounded explanation"
+    }}
+  ],
+  "omitted_uncertain": ["optional short labels for weak one-source concepts"]
+}}
+
+Do not add prose, markdown, comments, or code fences.
+"""
+
+
 def agent_response_schema_issues(
     proposals: Sequence[Any],
     context: Optional[Dict[str, Any]] = None,
@@ -2799,6 +3458,56 @@ def value_harmonization_response_issues(
     missing = sorted(expected_names - seen_names)
     if missing:
         issues.append(f"missing selected feature(s): {missing}")
+    return issues
+
+
+def concept_inventory_response_issues(
+    response: Any,
+    context: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Return schema issues for source-grounded concept inventory responses."""
+    if not isinstance(response, dict):
+        return [f"expected a JSON object, got {type(response).__name__}"]
+    concepts = response.get("concepts")
+    if not isinstance(concepts, list):
+        return ["missing concepts list"]
+
+    max_concepts = None
+    if isinstance(context, dict) and context.get("max_concepts") is not None:
+        try:
+            max_concepts = int(context.get("max_concepts"))
+        except (TypeError, ValueError):
+            max_concepts = None
+
+    issues: List[str] = []
+    seen_names = set()
+    for idx, item in enumerate(concepts, start=1):
+        if not isinstance(item, dict):
+            issues.append(f"concept {idx}: expected an object")
+            continue
+        name = _normalize_feature_name(item.get("name", ""))
+        if not name:
+            issues.append(f"concept {idx}: missing name")
+            continue
+        if name in seen_names:
+            issues.append(f"concept {idx} ({name}): duplicate concept name")
+        seen_names.add(name)
+        source_families = item.get("source_families", [])
+        if source_families is not None and not isinstance(source_families, list):
+            issues.append(f"concept {idx} ({name}): source_families must be a list")
+        if item.get("supporting_phrases") is not None and not isinstance(
+            item.get("supporting_phrases"),
+            list,
+        ):
+            issues.append(f"concept {idx} ({name}): supporting_phrases must be a list")
+
+    if max_concepts is not None and len(concepts) > max_concepts * 2:
+        issues.append(
+            f"concepts list has {len(concepts)} entries; expected at most about {max_concepts}"
+        )
+    omitted = response.get("omitted_uncertain", [])
+    if omitted is not None and not isinstance(omitted, list):
+        issues.append("omitted_uncertain must be a list when provided")
     return issues
 
 

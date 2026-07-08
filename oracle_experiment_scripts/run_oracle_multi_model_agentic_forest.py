@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import os
+import shlex
 import sys
 import traceback
 from dataclasses import asdict, dataclass, field
@@ -61,6 +62,8 @@ _LLM_PROVIDER_CLI_CHOICES = [
     "google_agent_platform",
     "vertex",
     "vertex_ai",
+    "codex",
+    "codex_cli",
 ]
 
 
@@ -73,11 +76,30 @@ def _normalize_llm_provider(provider: str, *, source: str) -> str:
         "google_agent_platform": "agent_platform",
         "vertex": "agent_platform",
         "vertex_ai": "agent_platform",
+        "codex": "codex_cli",
     }
     normalized = aliases.get(normalized, normalized)
-    if normalized not in {"openai", "agent_platform"}:
-        raise ValueError(f"{source} must be 'openai' or 'agent_platform', got {provider!r}")
+    if normalized not in {"openai", "agent_platform", "codex_cli"}:
+        raise ValueError(
+            f"{source} must be 'openai', 'agent_platform', or 'codex_cli', got {provider!r}"
+        )
     return normalized
+
+
+def _parse_codex_extra_args(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return shlex.split(value)
+    args: List[str] = []
+    for item in value:
+        if item is None:
+            continue
+        if isinstance(item, str):
+            args.extend(shlex.split(item))
+        else:
+            args.append(str(item))
+    return args
 
 
 def _agent_platform_project(
@@ -191,6 +213,8 @@ class MultiModelAgenticOracleConfig:
     e_clip: float = 0.01
     top_n_features: int = 100
     candidate_proposals_per_fold: int = 80
+    concept_inventory_enabled: bool = True
+    concept_inventory_max_concepts: int = 60
     candidate_consistency_enabled: bool = True
     candidate_consistency_inner_folds: int = 3
     candidate_consistency_min_folds: int = 2
@@ -279,6 +303,12 @@ class MultiModelAgenticOracleConfig:
     extraction_cache_enabled: bool = True
     extraction_cache_dir: Optional[str] = None
 
+    codex_executable: str = "codex"
+    codex_model_name: Optional[str] = "gpt-5.5"
+    codex_reasoning_effort: Optional[str] = "medium"
+    codex_extra_args: List[str] = field(default_factory=list)
+    codex_parallelism: int = 4
+
     def config_hash(self) -> str:
         payload_dict = asdict(self)
         payload_dict.pop("agent_request_timeout", None)
@@ -292,6 +322,11 @@ def _make_applied_config(
     parquet_file: Path,
 ) -> AppliedInferenceConfig:
     bow_views = _bow_views_for_config(config)
+    agent_provider = _normalize_llm_provider(config.agent_provider, source="agent_provider")
+    extraction_provider = _normalize_llm_provider(
+        config.extraction_provider,
+        source="extraction_provider",
+    )
     agent_server_url, agent_model_name, agent_api_key = _resolve_agent_endpoint_config(config)
     extraction_server_url, extraction_model_name, extraction_api_key = (
         _resolve_extraction_endpoint_config(config)
@@ -343,6 +378,11 @@ def _make_applied_config(
                 agent_retry_max_delay=config.agent_retry_max_delay,
                 agent_retry_backoff_factor=config.agent_retry_backoff_factor,
                 agent_request_timeout=config.agent_request_timeout,
+                agent_provider=agent_provider,
+                codex_cli_executable=config.codex_executable,
+                codex_cli_model_name=config.codex_model_name,
+                codex_cli_reasoning_effort=config.codex_reasoning_effort,
+                codex_cli_extra_args=list(config.codex_extra_args),
                 save_agent_context=config.agent_save_context,
                 save_agent_raw_output=config.agent_save_raw_output,
                 random_state=config.seed,
@@ -361,6 +401,8 @@ def _make_applied_config(
                 e_clip=config.e_clip,
                 top_n_features=config.top_n_features,
                 candidate_proposals_per_fold=config.candidate_proposals_per_fold,
+                concept_inventory_enabled=config.concept_inventory_enabled,
+                concept_inventory_max_concepts=config.concept_inventory_max_concepts,
                 candidate_consistency_enabled=config.candidate_consistency_enabled,
                 candidate_consistency_inner_folds=config.candidate_consistency_inner_folds,
                 candidate_consistency_min_folds=config.candidate_consistency_min_folds,
@@ -443,6 +485,12 @@ def _make_applied_config(
             extraction_temperature=config.extraction_temperature,
             extraction_max_tokens=config.extraction_max_tokens,
             extraction_max_text_length=config.extraction_max_text_length,
+            extraction_provider=extraction_provider,
+            codex_cli_executable=config.codex_executable,
+            codex_cli_model_name=config.codex_model_name,
+            codex_cli_reasoning_effort=config.codex_reasoning_effort,
+            codex_cli_extra_args=list(config.codex_extra_args),
+            codex_cli_parallelism=config.codex_parallelism,
             cache_enabled=config.extraction_cache_enabled,
             cache_dir=config.extraction_cache_dir,
         ),
@@ -726,6 +774,17 @@ def main() -> None:
     parser.add_argument("--top-n-features", type=int, default=100)
     parser.add_argument("--min-feature-coverage", type=float, default=0.50)
     parser.add_argument("--candidate-proposals-per-fold", type=int, default=80)
+    parser.add_argument(
+        "--no-concept-inventory",
+        action="store_true",
+        help="Disable the first-pass shared text-concept inventory before proposal generation.",
+    )
+    parser.add_argument(
+        "--concept-inventory-max-concepts",
+        type=int,
+        default=60,
+        help="Maximum concepts requested from the pre-proposal concept inventory agent.",
+    )
     parser.add_argument(
         "--no-candidate-consistency",
         action="store_true",
@@ -1027,6 +1086,41 @@ def main() -> None:
     parser.add_argument("--extraction-max-text-length", type=int, default=400000)
     parser.add_argument("--extraction-cache-dir", default=None)
     parser.add_argument("--no-extraction-cache", action="store_true")
+    parser.add_argument(
+        "--codex-executable",
+        default="codex",
+        help="Codex CLI executable used when agent/extraction provider is codex_cli.",
+    )
+    parser.add_argument(
+        "--codex-model-name",
+        default="gpt-5.5",
+        help=(
+            "Model passed to codex exec with -m for codex_cli providers. "
+            "Pass an empty string or 'profile' to omit -m and let --profile choose."
+        ),
+    )
+    parser.add_argument(
+        "--codex-reasoning-effort",
+        default="medium",
+        help=(
+            "model_reasoning_effort override passed to codex exec. "
+            "Pass an empty string or 'default' to omit the override."
+        ),
+    )
+    parser.add_argument(
+        "--codex-extra-args",
+        default="",
+        help=(
+            "Additional arguments appended to each codex exec call, e.g. "
+            "'--profile local-model'. Parsed with shell-like quoting."
+        ),
+    )
+    parser.add_argument(
+        "--codex-parallelism",
+        type=int,
+        default=4,
+        help="Maximum concurrent codex exec calls for extraction. Defaults to 4.",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -1062,6 +1156,8 @@ def main() -> None:
         top_n_features=args.top_n_features,
         min_feature_coverage=args.min_feature_coverage,
         candidate_proposals_per_fold=args.candidate_proposals_per_fold,
+        concept_inventory_enabled=not args.no_concept_inventory,
+        concept_inventory_max_concepts=args.concept_inventory_max_concepts,
         candidate_consistency_enabled=not args.no_candidate_consistency,
         candidate_consistency_inner_folds=args.candidate_consistency_inner_folds,
         candidate_consistency_min_folds=args.candidate_consistency_min_folds,
@@ -1152,6 +1248,11 @@ def main() -> None:
         extraction_max_text_length=args.extraction_max_text_length,
         extraction_cache_enabled=not args.no_extraction_cache,
         extraction_cache_dir=args.extraction_cache_dir,
+        codex_executable=args.codex_executable,
+        codex_model_name=args.codex_model_name,
+        codex_reasoning_effort=args.codex_reasoning_effort,
+        codex_extra_args=_parse_codex_extra_args(args.codex_extra_args),
+        codex_parallelism=args.codex_parallelism,
     )
 
     try:

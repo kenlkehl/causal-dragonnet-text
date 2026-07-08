@@ -52,6 +52,8 @@ from .agentic_explicit_feature_forest import (
     apply_agentic_alias_resolution,
     apply_agentic_value_harmonization,
     apply_proposals,
+    make_explicit_feature_extraction_provider,
+    make_feature_search_agent,
     validate_agentic_proposals,
 )
 from .embedding_contrast_discovery import (
@@ -285,12 +287,15 @@ class MultiModelAgenticForestRunner:
             "explicit_feature_forest",
             ExplicitFeatureForestConfig(),
         )
-        self.proposal_agent = proposal_agent or OpenAICompatibleFeatureSearchAgent(
+        self.proposal_agent = proposal_agent or make_feature_search_agent(
             self.search_config
         )
-        self.extraction_provider = extraction_provider or VLLMExplicitFeatureExtractionProvider(
-            config=config,
-            output_dir=self.artifact_dir,
+        self.extraction_provider = (
+            extraction_provider
+            or make_explicit_feature_extraction_provider(
+                config=config,
+                output_dir=self.artifact_dir,
+            )
         )
         self.evaluator = evaluator or CausalForestExplicitEvaluator(
             config=config,
@@ -576,6 +581,25 @@ class MultiModelAgenticForestRunner:
             return None
         metric_rows = _read_csv_records(target_dir / "outer_cv_metrics.csv")
         selected_rows = _read_json(target_dir / "selected_feature_sets.json", default=[])
+        agent_rows = _read_jsonl(target_dir / "agent_candidate_proposals.jsonl")
+        if self._concept_inventory_enabled():
+            consistency_enabled = bool(
+                getattr(self.nn_config, "candidate_consistency_enabled", True)
+            )
+            if not any(
+                _agent_row_has_concept_inventory(
+                    row,
+                    consistency_enabled=consistency_enabled,
+                )
+                for row in agent_rows
+            ):
+                logger.info(
+                    "Ignoring multi-model agentic fold checkpoint without concept "
+                    "inventory outer_fold=%s path=%s",
+                    fold,
+                    target_dir,
+                )
+                return None
         return {
             "outer_fold": fold,
             "predictions": predictions,
@@ -588,7 +612,7 @@ class MultiModelAgenticForestRunner:
             "embedding_evidence_rows": _read_jsonl(
                 target_dir / "text_evidence.embedding.jsonl"
             ),
-            "agent_rows": _read_jsonl(target_dir / "agent_candidate_proposals.jsonl"),
+            "agent_rows": agent_rows,
             "extracted_feature_diagnostic_rows": _read_jsonl(
                 target_dir / "extracted_feature_diagnostics_by_fold.jsonl"
             ),
@@ -2042,7 +2066,6 @@ class MultiModelAgenticForestRunner:
         discovery_df: pd.DataFrame,
         bow_context: Dict[str, Any],
     ) -> List[ExplicitFeatureSpec]:
-        del discovery_df
         cached = self._load_selected_specs_cache(
             outer_fold=outer_fold,
             consistency_enabled=False,
@@ -2053,7 +2076,17 @@ class MultiModelAgenticForestRunner:
             self.agent_rows.append(row)
             return selected_specs
 
-        raw_proposals = self.proposal_agent.propose(bow_context)
+        concept_inventory = self._run_concept_inventory(
+            outer_fold=outer_fold,
+            scope="full_outer_train",
+            bow_context=bow_context,
+            n_rows=len(discovery_df),
+        )
+        proposal_context = self._proposal_context_with_concept_inventory(
+            bow_context,
+            concept_inventory,
+        )
+        raw_proposals = self.proposal_agent.propose(proposal_context)
         proposal_agent_trace = _get_agent_response_trace(self.proposal_agent)
         proposals, rejected = validate_agentic_proposals(
             raw_proposals,
@@ -2108,8 +2141,10 @@ class MultiModelAgenticForestRunner:
             "rejected_proposals": rejected,
             "selected_features": [_spec_to_dict(spec) for spec in selected_specs],
         }
+        if concept_inventory is not None:
+            row["concept_inventory"] = _concept_inventory_artifact(concept_inventory)
         if self.search_config.save_agent_context:
-            row["context"] = bow_context
+            row["context"] = proposal_context
         if self.search_config.save_agent_raw_output:
             row["agent_raw_output"] = proposal_agent_trace
         self.agent_rows.append(row)
@@ -2264,7 +2299,19 @@ class MultiModelAgenticForestRunner:
         if cached is not None:
             return cached
 
-        raw_proposals = self.proposal_agent.propose(bow_context)
+        concept_inventory = self._run_concept_inventory(
+            outer_fold=outer_fold,
+            scope=scope,
+            inner_fold=inner_fold,
+            bow_context=bow_context,
+            n_rows=n_rows,
+            heldout_rows=heldout_rows,
+        )
+        proposal_context = self._proposal_context_with_concept_inventory(
+            bow_context,
+            concept_inventory,
+        )
+        raw_proposals = self.proposal_agent.propose(proposal_context)
         proposal_agent_trace = _get_agent_response_trace(self.proposal_agent)
         proposals, rejected = validate_agentic_proposals(
             raw_proposals,
@@ -2283,8 +2330,10 @@ class MultiModelAgenticForestRunner:
             "valid_proposals": proposals,
             "rejected_proposals": rejected,
         }
+        if concept_inventory is not None:
+            bundle["concept_inventory"] = _concept_inventory_artifact(concept_inventory)
         if self.search_config.save_agent_context:
-            bundle["context"] = bow_context
+            bundle["context"] = proposal_context
         if self.search_config.save_agent_raw_output:
             bundle["agent_raw_output"] = proposal_agent_trace
         self._write_proposal_bundle_cache(bundle)
@@ -2313,6 +2362,207 @@ class MultiModelAgenticForestRunner:
             / f"{stem}.json"
         )
 
+    def _concept_inventory_cache_path(
+        self,
+        *,
+        outer_fold: int,
+        scope: str,
+        inner_fold: Optional[int],
+    ) -> Path:
+        if inner_fold is None:
+            stem = str(scope)
+        else:
+            stem = f"{scope}_inner_{int(inner_fold):03d}"
+        return (
+            self._outer_fold_artifact_dir(outer_fold)
+            / "concept_inventories"
+            / f"{stem}.json"
+        )
+
+    def _concept_inventory_enabled(self) -> bool:
+        return bool(getattr(self.nn_config, "concept_inventory_enabled", True))
+
+    def _build_concept_inventory_context(
+        self,
+        *,
+        outer_fold: int,
+        scope: str,
+        bow_context: Dict[str, Any],
+        n_rows: int,
+        inner_fold: Optional[int],
+        heldout_rows: Optional[int],
+    ) -> Dict[str, Any]:
+        methods = (
+            bow_context.get("feature_discovery_methods")
+            or self._enabled_feature_discovery_methods()
+        )
+        if isinstance(methods, str):
+            method_list = [methods]
+        else:
+            method_list = list(methods)
+        context: Dict[str, Any] = {
+            "prompt_version": "multi_model_agentic_concept_inventory_v1",
+            "outer_fold": int(outer_fold),
+            "scope": str(scope),
+            "inner_fold": None if inner_fold is None else int(inner_fold),
+            "n_rows": int(n_rows),
+            "heldout_rows": None if heldout_rows is None else int(heldout_rows),
+            "feature_discovery_methods": method_list,
+            "max_concepts": int(getattr(self.nn_config, "concept_inventory_max_concepts", 60)),
+            "evidence_families": {
+                "bow_feature_evidence": bow_context.get("feature_importance") or {},
+                "embedding_retrieved_text_evidence": (
+                    bow_context.get("embedding_contrast_evidence") or {}
+                ),
+                "htr_attended_text_evidence": bow_context.get("htr_attention_evidence") or {},
+            },
+            "instructions": [
+                "Identify patient-level concepts represented in common across the enabled evidence families.",
+                "Prefer concepts with support in at least two of BoW phrases, embedding-retrieved chunks, and HTR attended spans.",
+                "Retain ordinary chart fields and baseline clinical fields when they recur in the evidence.",
+                "Use only the evidence in this context; do not create an unsupported general clinical inventory.",
+            ],
+            "response_contract": {
+                "concepts": [
+                    {
+                        "name": "snake_case_concept_name",
+                        "label": "short label",
+                        "value_kind": "binary|categorical|continuous|ordinal|text|unknown",
+                        "source_families": ["bow", "embedding_contrast", "htr"],
+                        "source_overlap": 2,
+                        "supporting_phrases": ["source phrase"],
+                        "example_values_or_phrases": ["example value or phrase"],
+                        "extractability": "high|medium|low",
+                        "notes": "brief source-grounded explanation",
+                    }
+                ]
+            },
+        }
+        if bow_context.get("prompt_compaction"):
+            context["prompt_compaction"] = bow_context.get("prompt_compaction")
+        return context
+
+    def _load_concept_inventory_cache(
+        self,
+        *,
+        outer_fold: int,
+        scope: str,
+        inner_fold: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        if not self.resume:
+            return None
+        path = self._concept_inventory_cache_path(
+            outer_fold=outer_fold,
+            scope=scope,
+            inner_fold=inner_fold,
+        )
+        if not path.exists():
+            return None
+        try:
+            payload = _read_json(path)
+            if not isinstance(payload, dict):
+                return None
+            if int(payload.get("outer_fold", -1)) != int(outer_fold):
+                return None
+            if str(payload.get("scope")) != str(scope):
+                return None
+            payload_inner = payload.get("inner_fold")
+            if (None if payload_inner is None else int(payload_inner)) != (
+                None if inner_fold is None else int(inner_fold)
+            ):
+                return None
+            if not isinstance(payload.get("concepts"), list):
+                return None
+            payload["resumed_from_cache"] = str(path)
+            logger.info(
+                "Reusing cached Stage 2 concept inventory outer_fold=%s scope=%s "
+                "inner_fold=%s path=%s concepts=%s",
+                outer_fold,
+                scope,
+                inner_fold,
+                path,
+                len(payload.get("concepts") or []),
+            )
+            return payload
+        except Exception as exc:
+            logger.warning("Ignoring unreadable concept inventory cache %s: %s", path, exc)
+            return None
+
+    def _write_concept_inventory_cache(self, inventory: Dict[str, Any]) -> None:
+        path = self._concept_inventory_cache_path(
+            outer_fold=int(inventory["outer_fold"]),
+            scope=str(inventory["scope"]),
+            inner_fold=inventory.get("inner_fold"),
+        )
+        _write_json(path, _concept_inventory_artifact(inventory))
+
+    def _run_concept_inventory(
+        self,
+        *,
+        outer_fold: int,
+        scope: str,
+        bow_context: Dict[str, Any],
+        n_rows: int,
+        inner_fold: Optional[int] = None,
+        heldout_rows: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not self._concept_inventory_enabled():
+            return None
+        cached = self._load_concept_inventory_cache(
+            outer_fold=outer_fold,
+            scope=scope,
+            inner_fold=inner_fold,
+        )
+        if cached is not None:
+            return cached
+        inventory_context = self._build_concept_inventory_context(
+            outer_fold=outer_fold,
+            scope=scope,
+            bow_context=bow_context,
+            n_rows=n_rows,
+            inner_fold=inner_fold,
+            heldout_rows=heldout_rows,
+        )
+        response = self.proposal_agent.propose(inventory_context)
+        inventory_agent_trace = _get_agent_response_trace(self.proposal_agent)
+        concepts = response.get("concepts", []) if isinstance(response, dict) else []
+        inventory: Dict[str, Any] = {
+            "outer_fold": int(outer_fold),
+            "scope": str(scope),
+            "inner_fold": None if inner_fold is None else int(inner_fold),
+            "n_rows": int(n_rows),
+            "heldout_rows": None if heldout_rows is None else int(heldout_rows),
+            "response": response,
+            "concepts": concepts if isinstance(concepts, list) else [],
+        }
+        if self.search_config.save_agent_context:
+            inventory["context"] = inventory_context
+        if self.search_config.save_agent_raw_output:
+            inventory["agent_raw_output"] = inventory_agent_trace
+        self._write_concept_inventory_cache(inventory)
+        logger.info(
+            "Generated Stage 2 concept inventory outer_fold=%s scope=%s "
+            "inner_fold=%s concepts=%s",
+            outer_fold,
+            scope,
+            inner_fold,
+            len(inventory["concepts"]),
+        )
+        return inventory
+
+    def _proposal_context_with_concept_inventory(
+        self,
+        bow_context: Dict[str, Any],
+        concept_inventory: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        visible = _agent_visible_concept_inventory(
+            concept_inventory,
+            max_concepts=int(getattr(self.nn_config, "concept_inventory_max_concepts", 60)),
+        )
+        if visible is None:
+            return bow_context
+        return {**bow_context, "concept_inventory": visible}
+
     def _load_selected_specs_cache(
         self,
         *,
@@ -2336,6 +2586,17 @@ class MultiModelAgenticForestRunner:
                 if isinstance(item, dict)
             ]
             row = dict(payload.get("agent_row") or {})
+            if self._concept_inventory_enabled() and not _agent_row_has_concept_inventory(
+                row,
+                consistency_enabled=consistency_enabled,
+            ):
+                logger.info(
+                    "Ignoring cached Stage 2 selected specs without concept "
+                    "inventory outer_fold=%s path=%s",
+                    outer_fold,
+                    path,
+                )
+                return None
             row.setdefault("outer_fold", int(outer_fold))
             row["resumed_from_cache"] = str(path)
             logger.info(
@@ -2392,6 +2653,19 @@ class MultiModelAgenticForestRunner:
             if (None if payload_inner is None else int(payload_inner)) != (
                 None if inner_fold is None else int(inner_fold)
             ):
+                return None
+            if self._concept_inventory_enabled() and not isinstance(
+                payload.get("concept_inventory"),
+                dict,
+            ):
+                logger.info(
+                    "Ignoring cached Stage 2 proposal bundle without concept "
+                    "inventory outer_fold=%s scope=%s inner_fold=%s path=%s",
+                    outer_fold,
+                    scope,
+                    inner_fold,
+                    path,
+                )
                 return None
             payload["valid_proposals"] = [
                 _proposal_from_dict(item)
@@ -3526,6 +3800,8 @@ class MultiModelAgenticForestRunner:
     ) -> None:
         if not specs or not bool(getattr(self.nn_config, "fail_on_extraction_truncation", True)):
             return
+        if bool(getattr(self.extraction_provider, "reads_complete_documents", False)):
+            return
         if not isinstance(self.extraction_provider, VLLMExplicitFeatureExtractionProvider):
             return
         max_chars = getattr(
@@ -4321,6 +4597,73 @@ def _rank_consistency_summaries(
             str(item.get("name") or ""),
         ),
     )
+
+
+def _agent_row_has_concept_inventory(
+    row: Dict[str, Any],
+    *,
+    consistency_enabled: bool,
+) -> bool:
+    if not isinstance(row, dict):
+        return False
+    if not consistency_enabled:
+        return isinstance(row.get("concept_inventory"), dict)
+    bundles = row.get("proposal_bundles")
+    if not isinstance(bundles, list) or not bundles:
+        return False
+    return all(
+        isinstance(bundle, dict) and isinstance(bundle.get("concept_inventory"), dict)
+        for bundle in bundles
+    )
+
+
+def _concept_inventory_artifact(inventory: Dict[str, Any]) -> Dict[str, Any]:
+    return dict(inventory)
+
+
+def _agent_visible_concept_inventory(
+    inventory: Optional[Dict[str, Any]],
+    *,
+    max_concepts: int,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(inventory, dict):
+        return None
+    concepts = inventory.get("concepts")
+    if not isinstance(concepts, list):
+        response = inventory.get("response")
+        if isinstance(response, dict):
+            concepts = response.get("concepts")
+    if not isinstance(concepts, list):
+        return None
+
+    visible: List[Dict[str, Any]] = []
+    allowed_keys = [
+        "name",
+        "label",
+        "value_kind",
+        "source_families",
+        "source_overlap",
+        "supporting_phrases",
+        "example_values_or_phrases",
+        "extractability",
+        "notes",
+    ]
+    for item in concepts[: max(1, int(max_concepts))]:
+        if not isinstance(item, dict):
+            continue
+        compact = {
+            key: item.get(key)
+            for key in allowed_keys
+            if item.get(key) not in (None, "", [])
+        }
+        if compact.get("name"):
+            visible.append(compact)
+    if not visible:
+        return None
+    return {
+        "source": "multi_model_agentic_concept_inventory_v1",
+        "concepts": visible,
+    }
 
 
 def _proposal_bundle_artifact(bundle: Dict[str, Any]) -> Dict[str, Any]:

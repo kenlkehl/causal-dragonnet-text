@@ -1,6 +1,7 @@
 import json
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -21,10 +22,14 @@ from oci.extraction.llm_routing import OpenAIClientPool
 from oci.inference.agentic_explicit_feature_forest import (
     AgenticFeatureSearchRunner,
     AgenticFeatureProposal,
+    CodexCLIFeatureSearchAgent,
+    CodexCLIExplicitFeatureExtractionProvider,
+    CodexCLIResponse,
     OpenAICompatibleFeatureSearchAgent,
     SplitEvaluation,
     VLLMExplicitFeatureExtractionProvider,
     _chat_completion_trace,
+    _codex_exec_command,
     apply_proposals,
     build_iteration_feedback,
     compare_candidate_to_baseline,
@@ -486,6 +491,53 @@ def _provider_config(tmp_path, cache_enabled=False, batch_size=32):
     )
 
 
+def test_codex_extraction_provider_reads_complete_note(monkeypatch, tmp_path):
+    prompts = []
+
+    def fake_run_codex_exec(prompt, **kwargs):
+        prompts.append({"prompt": prompt, "kwargs": kwargs})
+        return CodexCLIResponse(
+            content='{"age": 63}',
+            command=["codex", "exec"],
+            stdout="",
+            stderr="",
+            returncode=0,
+        )
+
+    monkeypatch.setattr(
+        "oci.inference.agentic_explicit_feature_forest._run_codex_exec",
+        fake_run_codex_exec,
+    )
+    config = _provider_config(tmp_path, cache_enabled=False)
+    config.explicit_features.extraction_provider = "codex_cli"
+    config.explicit_features.extraction_max_text_length = 20
+    config.explicit_features.codex_cli_model_name = "gpt-5.5"
+    config.explicit_features.codex_cli_reasoning_effort = "medium"
+    config.explicit_features.codex_cli_extra_args = ["--profile", "local"]
+    provider = CodexCLIExplicitFeatureExtractionProvider(config=config, output_dir=tmp_path)
+    note = "BEGINNING_MARKER " + ("middle " * 40) + " ENDING_MARKER"
+    df = pd.DataFrame({"clinical_text": [note]})
+    specs = [
+        ExplicitFeatureSpec(
+            name="age",
+            type="continuous",
+            roles=["confounder"],
+        )
+    ]
+
+    extracted = provider.ensure_features(df, specs)
+
+    assert extracted["explicit_feat_age"].tolist() == [63.0]
+    prompt = prompts[0]["prompt"]
+    assert "Read the whole clinical note" in prompt
+    assert "Do not use regex-only" in prompt
+    assert "BEGINNING_MARKER" in prompt
+    assert "ENDING_MARKER" in prompt
+    assert prompts[0]["kwargs"]["model_name"] == "gpt-5.5"
+    assert prompts[0]["kwargs"]["reasoning_effort"] == "medium"
+    assert prompts[0]["kwargs"]["extra_args"] == ["--profile", "local"]
+
+
 def test_agentic_extraction_provider_groups_missing_specs(monkeypatch, tmp_path):
     calls = []
 
@@ -862,6 +914,76 @@ class FakeOpenAIClient:
         self.models = FakeOpenAIModels(model_ids or ["fake-agent"])
 
 
+def test_codex_cli_agent_uses_model_reasoning_and_extra_args(monkeypatch):
+    calls = []
+
+    def fake_run_codex_exec(prompt, **kwargs):
+        calls.append({"prompt": prompt, "kwargs": kwargs})
+        return CodexCLIResponse(
+            content=json.dumps(
+                {
+                    "proposals": [
+                        {
+                            "action": "add",
+                            "name": "baseline_age",
+                            "type": "continuous",
+                            "roles": ["confounder"],
+                            "description": "Age at treatment initiation",
+                            "rationale": "Baseline age may affect treatment and outcome.",
+                            "expected_signal": "treatment and outcome",
+                        }
+                    ]
+                }
+            ),
+            command=["codex", "exec"],
+            stdout="",
+            stderr="",
+            returncode=0,
+        )
+
+    monkeypatch.setattr(
+        "oci.inference.agentic_explicit_feature_forest._run_codex_exec",
+        fake_run_codex_exec,
+    )
+    agent = CodexCLIFeatureSearchAgent(
+        AgenticFeatureSearchConfig(
+            agent_provider="codex_cli",
+            agent_schema_repair_attempts=0,
+            codex_cli_model_name="gpt-5.5",
+            codex_cli_reasoning_effort="medium",
+            codex_cli_extra_args=["--profile", "local-codex"],
+        )
+    )
+
+    proposals = agent.propose({"current_features": [], "iteration_feedback": []})
+
+    assert proposals[0]["name"] == "baseline_age"
+    assert calls[0]["kwargs"]["model_name"] == "gpt-5.5"
+    assert calls[0]["kwargs"]["reasoning_effort"] == "medium"
+    assert calls[0]["kwargs"]["extra_args"] == ["--profile", "local-codex"]
+    assert "Do not inspect files" in calls[0]["prompt"]
+    assert agent.last_response_trace["provider"] == "codex_cli"
+
+
+def test_codex_exec_command_can_defer_model_to_profile():
+    cmd = _codex_exec_command(
+        executable="codex",
+        model_name="profile",
+        reasoning_effort="medium",
+        extra_args=["--profile", "local-codex"],
+        output_path=Path("/tmp/codex-last-message.txt"),
+    )
+
+    assert "--model" not in cmd
+    assert "--ask-for-approval" not in cmd
+    assert "--ignore-rules" in cmd
+    assert "--profile" in cmd
+    assert cmd[cmd.index("--profile") + 1] == "local-codex"
+    assert "-c" in cmd
+    assert cmd[cmd.index("-c") + 1] == 'model_reasoning_effort="medium"'
+    assert cmd[-1] == "-"
+
+
 def test_openai_client_pool_uses_google_adc_token_refresh(monkeypatch):
     refresh_requests = []
 
@@ -933,6 +1055,96 @@ def test_openai_client_pool_uses_google_adc_token_refresh(monkeypatch):
     assert client.models is not None
     assert len(refresh_requests) == 2
     assert client._client.api_key == "token-2"
+
+
+def test_openai_client_pool_close_closes_clients_once():
+    closed = []
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def close(self):
+            closed.append(self.kwargs["base_url"])
+
+    pool = OpenAIClientPool(
+        server_urls=["http://server-a/v1", "http://server-b/v1"],
+        api_key="EMPTY",
+        client_factory=FakeOpenAI,
+    )
+    first = pool.client_for_url("http://server-a/v1")
+    assert pool.client_for_url("http://server-a/v1") is first
+    pool.client_for_url("http://server-b/v1")
+
+    pool.close()
+
+    assert closed == ["http://server-a/v1", "http://server-b/v1"]
+    assert pool.client_for_url("http://server-a/v1") is not first
+
+
+def test_openai_client_pool_close_closes_google_adc_client_and_request_session(monkeypatch):
+    closed = []
+    refresh_requests = []
+
+    class FakeCredentials:
+        valid = False
+        token = None
+
+        def refresh(self, request):
+            refresh_requests.append(request)
+            self.valid = True
+            self.token = "token-1"
+
+    class FakeSession:
+        def close(self):
+            closed.append("session")
+
+    fake_credentials = FakeCredentials()
+    fake_google = types.ModuleType("google")
+    fake_google.__path__ = []
+    fake_auth = types.ModuleType("google.auth")
+    fake_transport = types.ModuleType("google.auth.transport")
+    fake_requests = types.ModuleType("google.auth.transport.requests")
+
+    class FakeRequest:
+        def __init__(self):
+            self.session = FakeSession()
+
+    def fake_default(scopes):
+        assert scopes == ["https://www.googleapis.com/auth/cloud-platform"]
+        return fake_credentials, "project-id"
+
+    fake_auth.default = fake_default
+    fake_requests.Request = FakeRequest
+    fake_google.auth = fake_auth
+    fake_auth.transport = fake_transport
+    fake_transport.requests = fake_requests
+    monkeypatch.setitem(sys.modules, "google", fake_google)
+    monkeypatch.setitem(sys.modules, "google.auth", fake_auth)
+    monkeypatch.setitem(sys.modules, "google.auth.transport", fake_transport)
+    monkeypatch.setitem(sys.modules, "google.auth.transport.requests", fake_requests)
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.api_key = kwargs["api_key"]
+            self.chat = SimpleNamespace(completions=object())
+            self.models = object()
+
+        def close(self):
+            closed.append("openai")
+
+    base_url = "https://aiplatform.googleapis.com/v1/projects/p/locations/global/endpoints/openapi"
+    pool = OpenAIClientPool(
+        server_urls=base_url,
+        api_key="GOOGLE_ADC",
+        client_factory=FakeOpenAI,
+    )
+    pool.client_for_url(base_url)
+
+    pool.close()
+
+    assert len(refresh_requests) == 1
+    assert closed == ["openai", "session"]
 
 
 def test_openai_agent_autodiscovers_model_name():

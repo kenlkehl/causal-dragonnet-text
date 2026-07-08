@@ -545,6 +545,15 @@ class VLLMConfounderExtractor:
 
     def cleanup(self):
         """Clean up resources."""
+        if self._client is not None:
+            close_client = getattr(self._client, "close", None)
+            if callable(close_client):
+                try:
+                    close_client()
+                except Exception:
+                    logger.warning("Error closing OpenAI-compatible client", exc_info=True)
+            self._client = None
+
         if self._server_process is not None:
             logger.info("Stopping vLLM server...")
             self._server_process.terminate()

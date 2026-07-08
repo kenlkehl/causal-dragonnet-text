@@ -108,6 +108,29 @@ class FakeProposalAgent:
 
     def propose(self, context):
         self.contexts.append(context)
+        if context.get("prompt_version") == "multi_model_agentic_concept_inventory_v1":
+            return {
+                "concepts": [
+                    {
+                        "name": "age",
+                        "label": "Age",
+                        "value_kind": "continuous",
+                        "source_families": ["bow"],
+                        "source_overlap": 1,
+                        "supporting_phrases": ["age"],
+                        "extractability": "high",
+                    },
+                    {
+                        "name": "pd_l1_expression",
+                        "label": "PD-L1 expression",
+                        "value_kind": "categorical",
+                        "source_families": ["bow"],
+                        "source_overlap": 1,
+                        "supporting_phrases": ["pd-l1"],
+                        "extractability": "high",
+                    },
+                ]
+            }
         if context.get("prompt_version") == "multi_model_agentic_alias_resolution_v1":
             return {
                 "groups": [
@@ -182,6 +205,20 @@ class FakeProposalAgent:
                 "expected_signal": "pseudo-target",
             },
         ]
+
+
+def _agent_contexts(agent, prompt_version: str) -> list[dict]:
+    return [
+        context
+        for context in agent.contexts
+        if context.get("prompt_version") == prompt_version
+    ]
+
+
+def _first_agent_context(agent, prompt_version: str) -> dict:
+    contexts = _agent_contexts(agent, prompt_version)
+    assert contexts
+    return contexts[0]
 
 
 class ReviewRevisionAgent:
@@ -1166,15 +1203,17 @@ def test_multi_model_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path:
     assert set(predictions["selected_confounder_names"]) == {"age"}
     assert set(predictions["selected_effect_modifier_names"]) == {"pd_l1_expression"}
     assert agent.contexts
-    assert agent.contexts[0]["prompt_version"] == "multi_model_agentic_forest_v1"
-    assert agent.contexts[1]["prompt_version"] == "multi_model_agentic_alias_resolution_v1"
-    assert agent.contexts[2]["prompt_version"] == "multi_model_agentic_value_harmonization_v1"
-    assert "feature_importance" in agent.contexts[0]
-    phrase_features = agent.contexts[0]["feature_importance"]["phrase_features"]
+    first_context = _first_agent_context(agent, "multi_model_agentic_forest_v1")
+    assert _agent_contexts(agent, "multi_model_agentic_concept_inventory_v1")
+    assert _agent_contexts(agent, "multi_model_agentic_alias_resolution_v1")
+    assert _agent_contexts(agent, "multi_model_agentic_value_harmonization_v1")
+    assert "feature_importance" in first_context
+    assert "concept_inventory" in first_context
+    phrase_features = first_context["feature_importance"]["phrase_features"]
     assert phrase_features
     assert all(2 <= len(row["feature"].split()) <= 4 for row in phrase_features)
-    assert "canonical_feature_name_guidance" not in agent.contexts[0]
-    assert "true_" not in json.dumps(agent.contexts[0])
+    assert "canonical_feature_name_guidance" not in first_context
+    assert "true_" not in json.dumps(first_context)
     seen_names = [[spec.name for spec in specs] for specs in evaluator.seen_specs]
     assert all({"age", "pd_l1_expression"}.issubset(set(names)) for names in seen_names)
     assert all(names.count("pd_l1_expression") == 1 for names in seen_names)
@@ -1413,7 +1452,7 @@ def test_multi_model_agentic_forest_adds_embedding_contrast_context(
         embedding_provider=KeywordEmbeddingProvider(),
     )
 
-    first_context = agent.contexts[0]
+    first_context = _first_agent_context(agent, "multi_model_agentic_forest_v1")
     assert "embedding_contrast_evidence" in first_context
     treatment = next(
         item
@@ -1507,7 +1546,7 @@ def test_multi_model_agentic_forest_adds_htr_to_ensemble_and_agent_context(
     assert htr_provider.seen_effect_nuisance_predictions
     effect_nuisance = htr_provider.seen_effect_nuisance_predictions[0]
     assert set(effect_nuisance["target_source"]) == {"ensemble_mean_nuisance_with_htr"}
-    first_context = agent.contexts[0]
+    first_context = _first_agent_context(agent, "multi_model_agentic_forest_v1")
     assert first_context["feature_importance"]["ensemble_r"]["target_source"] == (
         "ensemble_mean_nuisance_with_htr"
     )
@@ -1600,7 +1639,7 @@ def test_multi_model_agentic_forest_runs_htr_only_when_bow_disabled(
         htr_evidence_provider=htr_provider,
     )
 
-    first_context = agent.contexts[0]
+    first_context = _first_agent_context(agent, "multi_model_agentic_forest_v1")
     assert first_context["feature_discovery_methods"] == ["htr"]
     assert first_context["feature_importance"]["n_views"] == 0
     assert "htr_attention_evidence" in first_context
@@ -1673,7 +1712,9 @@ def test_multi_model_agentic_forest_adds_ensemble_r_target_context(tmp_path: Pat
         evaluator=FakeEvaluator(),
     )
 
-    importance = agent.contexts[0]["feature_importance"]
+    importance = _first_agent_context(agent, "multi_model_agentic_forest_v1")[
+        "feature_importance"
+    ]
     assert "ensemble_r" in importance
     assert importance["ensemble_r"]["target_source"] == "ensemble_mean_nuisance"
     assert all(
@@ -2181,7 +2222,7 @@ def test_multi_model_prespecified_features_extract_before_bow_and_merge_roles(
         ("age", ("confounder",)),
         ("biomarker", ("confounder", "effect_modifier")),
     ]
-    first_context = agent.contexts[0]
+    first_context = _first_agent_context(agent, "multi_model_agentic_forest_v1")
     assert first_context["prompt_version"] == "multi_model_agentic_forest_v1"
     assert first_context["current_features"] == [
         {
@@ -2671,8 +2712,19 @@ def test_multi_model_agentic_proposal_bundle_cache_reuses_llm_result(tmp_path):
         def __init__(self):
             self.calls = 0
 
-        def propose(self, _context):
+        def propose(self, context):
             self.calls += 1
+            if context.get("prompt_version") == "multi_model_agentic_concept_inventory_v1":
+                return {
+                    "concepts": [
+                        {
+                            "name": "cache_feature",
+                            "label": "Cache feature",
+                            "source_families": ["bow"],
+                            "source_overlap": 1,
+                        }
+                    ]
+                }
             return [
                 {
                     "action": "add",
@@ -2723,8 +2775,9 @@ def test_multi_model_agentic_proposal_bundle_cache_reuses_llm_result(tmp_path):
         bow_context={"outer_fold": 1},
         n_rows=4,
     )
-    assert agent.calls == 1
+    assert agent.calls == 2
     assert first["valid_proposals"][0].name == "cache_feature"
+    assert first["concept_inventory"]["concepts"][0]["name"] == "cache_feature"
 
     resumed = MultiModelAgenticForestRunner(
         dataset=dataset,
@@ -2796,7 +2849,20 @@ def test_multi_model_agentic_outer_fold_checkpoint_loads_completed_fold(tmp_path
         )
     )
     (fold_dir / "agent_candidate_proposals.jsonl").write_text(
-        json.dumps({"outer_fold": 1, "selected_features": []}) + "\n"
+        json.dumps(
+            {
+                "outer_fold": 1,
+                "consistency_enabled": True,
+                "proposal_bundles": [
+                    {
+                        "scope": "full_outer_train",
+                        "concept_inventory": {"concepts": []},
+                    }
+                ],
+                "selected_features": [],
+            }
+        )
+        + "\n"
     )
     pd.DataFrame([{"outer_fold": 1, "ite_mean": 0.15}]).to_csv(
         fold_dir / "outer_cv_metrics.csv",
@@ -2887,6 +2953,39 @@ def test_oracle_multi_model_forest_agent_platform_config():
         == "google/gemma-4-26b-a4b-it-maas"
     )
     assert applied.explicit_features.vllm_model_name == "google/gemma-4-26b-a4b-it-maas"
+
+
+def test_oracle_multi_model_forest_codex_cli_config():
+    from oracle_experiment_scripts import run_oracle_multi_model_forest as script
+
+    dataset_path = Path(
+        "synthetic_data/example_synthetic_datasets/"
+        "one_confounder_one_effect_modifier_nsclc_with_structured/dataset.parquet"
+    )
+    cfg = script.MultiModelForestOracleConfig(
+        dataset_path=str(dataset_path),
+        dataset_name="smoke",
+        agent_provider="codex",
+        extraction_provider="codex_cli",
+        codex_executable="/tmp/codex",
+        codex_model_name="profile",
+        codex_reasoning_effort="medium",
+        codex_extra_args=["--profile", "local-codex"],
+        codex_parallelism=2,
+    )
+
+    applied = script._make_applied_config(cfg, dataset_path)
+
+    agent_cfg = applied.architecture.agentic_feature_search
+    assert agent_cfg.agent_provider == "codex_cli"
+    assert agent_cfg.codex_cli_executable == "/tmp/codex"
+    assert agent_cfg.codex_cli_model_name == "profile"
+    assert agent_cfg.codex_cli_reasoning_effort == "medium"
+    assert agent_cfg.codex_cli_extra_args == ["--profile", "local-codex"]
+    assert applied.explicit_features.extraction_provider == "codex_cli"
+    assert applied.explicit_features.codex_cli_executable == "/tmp/codex"
+    assert applied.explicit_features.codex_cli_extra_args == ["--profile", "local-codex"]
+    assert applied.explicit_features.codex_cli_parallelism == 2
 
 
 def test_oracle_multi_model_forest_splits_primary_and_agentic_hashes():

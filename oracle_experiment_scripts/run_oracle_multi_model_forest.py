@@ -34,6 +34,7 @@ from run_oracle_multi_model_agentic_forest import (  # noqa: E402
     _make_applied_config as _make_agentic_applied_config,
     _metrics,
     _normalize_llm_provider,
+    _parse_codex_extra_args,
     _resolve_oracle_parquet_file,
 )
 
@@ -106,6 +107,13 @@ class MultiModelForestOracleConfig(MultiModelAgenticOracleConfig):
             "extraction_max_text_length",
             "extraction_cache_enabled",
             "extraction_cache_dir",
+            "codex_executable",
+            "codex_model_name",
+            "codex_reasoning_effort",
+            "codex_extra_args",
+            "codex_parallelism",
+            "concept_inventory_enabled",
+            "concept_inventory_max_concepts",
             "cpus_total",
             "gpu_ids",
             "htr_device",
@@ -175,7 +183,14 @@ class MultiModelForestOracleConfig(MultiModelAgenticOracleConfig):
             "extraction_max_text_length": self.extraction_max_text_length,
             "extraction_cache_enabled": self.extraction_cache_enabled,
             "extraction_cache_dir": self.extraction_cache_dir,
+            "codex_executable": self.codex_executable,
+            "codex_model_name": self.codex_model_name,
+            "codex_reasoning_effort": self.codex_reasoning_effort,
+            "codex_extra_args": self.codex_extra_args,
+            "codex_parallelism": self.codex_parallelism,
             "candidate_proposals_per_fold": self.candidate_proposals_per_fold,
+            "concept_inventory_enabled": self.concept_inventory_enabled,
+            "concept_inventory_max_concepts": self.concept_inventory_max_concepts,
             "candidate_consistency_enabled": self.candidate_consistency_enabled,
             "candidate_consistency_inner_folds": self.candidate_consistency_inner_folds,
             "candidate_consistency_min_folds": self.candidate_consistency_min_folds,
@@ -480,6 +495,17 @@ def main() -> None:
     parser.add_argument("--allow-extraction-truncation", action="store_true")
 
     parser.add_argument("--candidate-proposals-per-fold", type=int, default=80)
+    parser.add_argument(
+        "--no-concept-inventory",
+        action="store_true",
+        help="Disable the first-pass shared text-concept inventory before proposal generation.",
+    )
+    parser.add_argument(
+        "--concept-inventory-max-concepts",
+        type=int,
+        default=60,
+        help="Maximum concepts requested from the pre-proposal concept inventory agent.",
+    )
     parser.add_argument("--no-candidate-consistency", action="store_true")
     parser.add_argument("--candidate-consistency-inner-folds", type=int, default=3)
     parser.add_argument("--candidate-consistency-min-folds", type=int, default=2)
@@ -610,6 +636,41 @@ def main() -> None:
     parser.add_argument("--extraction-max-text-length", type=int, default=400000)
     parser.add_argument("--extraction-cache-dir", default=None)
     parser.add_argument("--no-extraction-cache", action="store_true")
+    parser.add_argument(
+        "--codex-executable",
+        default="codex",
+        help="Codex CLI executable used when agent/extraction provider is codex_cli.",
+    )
+    parser.add_argument(
+        "--codex-model-name",
+        default="gpt-5.5",
+        help=(
+            "Model passed to codex exec with -m for codex_cli providers. "
+            "Pass an empty string or 'profile' to omit -m and let --profile choose."
+        ),
+    )
+    parser.add_argument(
+        "--codex-reasoning-effort",
+        default="medium",
+        help=(
+            "model_reasoning_effort override passed to codex exec. "
+            "Pass an empty string or 'default' to omit the override."
+        ),
+    )
+    parser.add_argument(
+        "--codex-extra-args",
+        default="",
+        help=(
+            "Additional arguments appended to each codex exec call, e.g. "
+            "'--profile local-model'. Parsed with shell-like quoting."
+        ),
+    )
+    parser.add_argument(
+        "--codex-parallelism",
+        type=int,
+        default=4,
+        help="Maximum concurrent codex exec calls for extraction. Defaults to 4.",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -661,6 +722,8 @@ def main() -> None:
         top_n_features=args.top_n_features,
         prespecified_features_json=args.prespecified_features_json,
         candidate_proposals_per_fold=args.candidate_proposals_per_fold,
+        concept_inventory_enabled=not args.no_concept_inventory,
+        concept_inventory_max_concepts=args.concept_inventory_max_concepts,
         candidate_consistency_enabled=not args.no_candidate_consistency,
         candidate_consistency_inner_folds=args.candidate_consistency_inner_folds,
         candidate_consistency_min_folds=args.candidate_consistency_min_folds,
@@ -748,6 +811,11 @@ def main() -> None:
         extraction_max_text_length=args.extraction_max_text_length,
         extraction_cache_enabled=not args.no_extraction_cache,
         extraction_cache_dir=args.extraction_cache_dir,
+        codex_executable=args.codex_executable,
+        codex_model_name=args.codex_model_name,
+        codex_reasoning_effort=args.codex_reasoning_effort,
+        codex_extra_args=_parse_codex_extra_args(args.codex_extra_args),
+        codex_parallelism=args.codex_parallelism,
     )
 
     try:

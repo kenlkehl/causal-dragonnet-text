@@ -167,9 +167,18 @@ class NumericInventoryLLMClient:
         )
 
     def cleanup(self) -> None:
+        if self._client_pool is not None:
+            self._client_pool.close()
+            self._client_pool = None
+        elif self._client is not None:
+            close_client = getattr(self._client, "close", None)
+            if callable(close_client):
+                try:
+                    close_client()
+                except Exception:
+                    logger.warning("Error closing OpenAI-compatible client", exc_info=True)
         self._llm = None
         self._client = None
-        self._client_pool = None
 
     def _ensure_server_client(self) -> None:
         if self._client is not None:

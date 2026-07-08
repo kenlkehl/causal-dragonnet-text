@@ -214,6 +214,12 @@ class ExplicitFeatureExtractionConfig:
     extraction_temperature: float = 0.0  # LLM temperature (0 for deterministic)
     extraction_max_tokens: int = 25000  # Max tokens for LLM response
     extraction_max_text_length: int = 400000  # Max clinical text chars in extraction prompt
+    extraction_provider: str = "openai"
+    codex_cli_executable: str = "codex"
+    codex_cli_model_name: Optional[str] = "gpt-5.5"
+    codex_cli_reasoning_effort: Optional[str] = "medium"
+    codex_cli_extra_args: List[str] = field(default_factory=list)
+    codex_cli_parallelism: int = 4
 
     # Caching
     cache_enabled: bool = True  # Cache extraction results to disk
@@ -624,6 +630,11 @@ class AgenticFeatureSearchConfig:
     agent_retry_max_delay: float = 30.0
     agent_retry_backoff_factor: float = 2.0
     agent_request_timeout: Optional[float] = 900.0
+    agent_provider: str = "openai"
+    codex_cli_executable: str = "codex"
+    codex_cli_model_name: Optional[str] = "gpt-5.5"
+    codex_cli_reasoning_effort: Optional[str] = "medium"
+    codex_cli_extra_args: List[str] = field(default_factory=list)
 
     # Prompt/context controls. Clinical text examples are sent to the proposal
     # agent to ground variable suggestions, but are not written to artifacts by
@@ -923,6 +934,8 @@ class MultiModelAgenticForestConfig:
     e_clip: float = 0.01
     top_n_features: int = 100
     candidate_proposals_per_fold: int = 30
+    concept_inventory_enabled: bool = True
+    concept_inventory_max_concepts: int = 60
     candidate_consistency_enabled: bool = True
     candidate_consistency_inner_folds: int = 3
     candidate_consistency_min_folds: int = 2
@@ -1034,6 +1047,8 @@ class MultiModelAgenticForestConfig:
             raise ValueError("multi_model_agentic_forest.top_n_features must be >= 1")
         if self.candidate_proposals_per_fold < 1:
             raise ValueError("multi_model_agentic_forest.candidate_proposals_per_fold must be >= 1")
+        if self.concept_inventory_max_concepts < 1:
+            raise ValueError("multi_model_agentic_forest.concept_inventory_max_concepts must be >= 1")
         if self.candidate_consistency_inner_folds < 2:
             raise ValueError(
                 "multi_model_agentic_forest.candidate_consistency_inner_folds must be >= 2"
