@@ -216,7 +216,7 @@ class ExplicitFeatureExtractionConfig:
     extraction_max_text_length: int = 400000  # Max clinical text chars in extraction prompt
     extraction_provider: str = "openai"
     codex_cli_executable: str = "codex"
-    codex_cli_model_name: Optional[str] = "gpt-5.5"
+    codex_cli_model_name: Optional[str] = "gpt-5.4-mini"
     codex_cli_reasoning_effort: Optional[str] = "medium"
     codex_cli_extra_args: List[str] = field(default_factory=list)
     codex_cli_parallelism: int = 4
@@ -632,7 +632,7 @@ class AgenticFeatureSearchConfig:
     agent_request_timeout: Optional[float] = 900.0
     agent_provider: str = "openai"
     codex_cli_executable: str = "codex"
-    codex_cli_model_name: Optional[str] = "gpt-5.5"
+    codex_cli_model_name: Optional[str] = "gpt-5.4-mini"
     codex_cli_reasoning_effort: Optional[str] = "medium"
     codex_cli_extra_args: List[str] = field(default_factory=list)
 

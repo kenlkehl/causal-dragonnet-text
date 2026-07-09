@@ -643,7 +643,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--codex-model-name",
-        default="gpt-5.5",
+        default="gpt-5.4-mini",
         help=(
             "Model passed to codex exec with -m for codex_cli providers. "
             "Pass an empty string or 'profile' to omit -m and let --profile choose."

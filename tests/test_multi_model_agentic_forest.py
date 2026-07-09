@@ -51,6 +51,10 @@ from oci.inference.multi_model_forest import (
 from oci.models.concept_embedding_utils import chunk_text_words
 
 
+_CONCEPT_CLUSTER_LABEL_PROMPT_VERSION = "multi_model_agentic_cluster_labeling_v2"
+_CONCEPT_INVENTORY_SCHEMA_VERSION = "multi_model_agentic_clustered_concept_inventory_v2"
+
+
 def _linear_test_bow_views() -> list[BoWViewConfig]:
     return [
         BoWViewConfig(
@@ -108,7 +112,7 @@ class FakeProposalAgent:
 
     def propose(self, context):
         self.contexts.append(context)
-        if context.get("prompt_version") == "multi_model_agentic_concept_inventory_v1":
+        if context.get("prompt_version") == _CONCEPT_CLUSTER_LABEL_PROMPT_VERSION:
             return {
                 "concepts": [
                     {
@@ -119,6 +123,7 @@ class FakeProposalAgent:
                         "source_overlap": 1,
                         "supporting_phrases": ["age"],
                         "extractability": "high",
+                        "cluster_ids": ["cluster_001"],
                     },
                     {
                         "name": "pd_l1_expression",
@@ -128,6 +133,7 @@ class FakeProposalAgent:
                         "source_overlap": 1,
                         "supporting_phrases": ["pd-l1"],
                         "extractability": "high",
+                        "cluster_ids": ["cluster_002"],
                     },
                 ]
             }
@@ -560,6 +566,91 @@ class KeywordSentenceTransformer:
             norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
             embeddings = embeddings / np.maximum(norms, 1e-12)
         return embeddings.astype(np.float32, copy=False)
+
+
+def test_concept_cluster_sentence_transformer_is_reused_and_released(
+    tmp_path: Path,
+    monkeypatch,
+):
+    instances = []
+
+    class FakeSentenceTransformer:
+        def __init__(self, model_name, device=None, cache_folder=None):
+            self.model_name = model_name
+            self.device = device
+            self.cache_folder = cache_folder
+            self.to_calls = []
+            instances.append(self)
+
+        def encode(
+            self,
+            texts,
+            batch_size=128,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        ):
+            del batch_size, convert_to_numpy, normalize_embeddings, show_progress_bar
+            return np.ones((len(texts), 4), dtype=np.float32)
+
+        def to(self, device):
+            self.to_calls.append(device)
+            return self
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sentence_transformers",
+        types.SimpleNamespace(SentenceTransformer=FakeSentenceTransformer),
+    )
+    config = AppliedInferenceConfig(
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        architecture=ModelArchitectureConfig(
+            model_type="multi_model_agentic_forest",
+            multi_model_agentic_forest=MultiModelAgenticForestConfig(
+                feature_discovery_methods=["embedding_contrast"],
+                embedding_contrast=EmbeddingContrastDiscoveryConfig(
+                    enabled=True,
+                    model_name="fake-concept-encoder",
+                    cache_dir=str(tmp_path / "embedding_cache"),
+                    device="cuda:7",
+                    batch_size=2,
+                ),
+                **_disable_htr_test_kwargs(),
+            ),
+        ),
+    )
+    runner = MultiModelAgenticForestRunner(
+        dataset=pd.DataFrame(
+            {
+                "clinical_text": ["age 70", "age 71"],
+                "treatment_indicator": [0, 1],
+                "outcome_indicator": [0, 1],
+            }
+        ),
+        config=config,
+        output_path=tmp_path / "predictions.parquet",
+        proposal_agent=object(),
+        extraction_provider=object(),
+        evaluator=object(),
+    )
+
+    first, first_error = runner._encode_concept_cluster_texts(["age 70", "ecog 1"])
+    second, second_error = runner._encode_concept_cluster_texts(["albumin 3.1"])
+
+    assert first_error is None
+    assert second_error is None
+    assert first.shape == (2, 4)
+    assert second.shape == (1, 4)
+    assert len(instances) == 1
+    assert instances[0].model_name == "fake-concept-encoder"
+    assert instances[0].device == "cuda:7"
+
+    runner._release_concept_cluster_embedding_encoder()
+
+    assert runner._concept_cluster_embedding_encoder is None
+    assert instances[0].to_calls == ["cpu"]
 
 
 def _embedding_contrast_cache_test_config(tmp_path: Path) -> AppliedInferenceConfig:
@@ -1204,7 +1295,7 @@ def test_multi_model_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path:
     assert set(predictions["selected_effect_modifier_names"]) == {"pd_l1_expression"}
     assert agent.contexts
     first_context = _first_agent_context(agent, "multi_model_agentic_forest_v1")
-    assert _agent_contexts(agent, "multi_model_agentic_concept_inventory_v1")
+    assert _agent_contexts(agent, _CONCEPT_CLUSTER_LABEL_PROMPT_VERSION)
     assert _agent_contexts(agent, "multi_model_agentic_alias_resolution_v1")
     assert _agent_contexts(agent, "multi_model_agentic_value_harmonization_v1")
     assert "feature_importance" in first_context
@@ -2714,7 +2805,7 @@ def test_multi_model_agentic_proposal_bundle_cache_reuses_llm_result(tmp_path):
 
         def propose(self, context):
             self.calls += 1
-            if context.get("prompt_version") == "multi_model_agentic_concept_inventory_v1":
+            if context.get("prompt_version") == _CONCEPT_CLUSTER_LABEL_PROMPT_VERSION:
                 return {
                     "concepts": [
                         {
@@ -2722,6 +2813,8 @@ def test_multi_model_agentic_proposal_bundle_cache_reuses_llm_result(tmp_path):
                             "label": "Cache feature",
                             "source_families": ["bow"],
                             "source_overlap": 1,
+                            "supporting_phrases": ["cache feature"],
+                            "cluster_ids": ["cluster_001"],
                         }
                     ]
                 }
@@ -2772,7 +2865,18 @@ def test_multi_model_agentic_proposal_bundle_cache_reuses_llm_result(tmp_path):
     first = runner._propose_candidate_bundle(
         outer_fold=1,
         scope="full_outer_train",
-        bow_context={"outer_fold": 1},
+        bow_context={
+            "outer_fold": 1,
+            "feature_importance": {
+                "phrase_consensus": [
+                    {
+                        "feature": "cache feature",
+                        "supporting_view_count": 4,
+                        "mean_abs_confounder_score": 0.2,
+                    }
+                ]
+            },
+        },
         n_rows=4,
     )
     assert agent.calls == 2
@@ -2856,7 +2960,10 @@ def test_multi_model_agentic_outer_fold_checkpoint_loads_completed_fold(tmp_path
                 "proposal_bundles": [
                     {
                         "scope": "full_outer_train",
-                        "concept_inventory": {"concepts": []},
+                        "concept_inventory": {
+                            "schema_version": _CONCEPT_INVENTORY_SCHEMA_VERSION,
+                            "concepts": [],
+                        },
                     }
                 ],
                 "selected_features": [],

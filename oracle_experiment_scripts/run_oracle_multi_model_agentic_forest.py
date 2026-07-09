@@ -304,7 +304,7 @@ class MultiModelAgenticOracleConfig:
     extraction_cache_dir: Optional[str] = None
 
     codex_executable: str = "codex"
-    codex_model_name: Optional[str] = "gpt-5.5"
+    codex_model_name: Optional[str] = "gpt-5.4-mini"
     codex_reasoning_effort: Optional[str] = "medium"
     codex_extra_args: List[str] = field(default_factory=list)
     codex_parallelism: int = 4
@@ -1093,7 +1093,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--codex-model-name",
-        default="gpt-5.5",
+        default="gpt-5.4-mini",
         help=(
             "Model passed to codex exec with -m for codex_cli providers. "
             "Pass an empty string or 'profile' to omit -m and let --profile choose."

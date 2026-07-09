@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import copy
+import gc
 import json
 import logging
+import re
 import unicodedata
+from collections import Counter
 from itertools import combinations
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -21,10 +24,13 @@ from sklearn.ensemble import (
     RandomForestClassifier,
     RandomForestRegressor,
 )
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import MiniBatchKMeans
+from sklearn.decomposition import TruncatedSVD
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, TfidfVectorizer
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import brier_score_loss, log_loss, mean_squared_error
 from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.preprocessing import normalize as sklearn_normalize
 
 from ..config import (
     AgenticFeatureSearchConfig,
@@ -84,6 +90,11 @@ _AGENT_PROMPT_CONCEPT_TOP_N = 8
 _AGENT_PROMPT_HTR_ROWS_PER_STAGE = 36
 _AGENT_PROMPT_HTR_SNIPPET_CHARS = 500
 _AGENT_PROMPT_HTR_SUMMARY_CHARS = 320
+_CONCEPT_INVENTORY_SCHEMA_VERSION = "multi_model_agentic_clustered_concept_inventory_v2"
+_CONCEPT_CLUSTER_LABEL_PROMPT_VERSION = "multi_model_agentic_cluster_labeling_v2"
+_CONCEPT_CLUSTER_MAX_AGENT_CLUSTERS = 120
+_CONCEPT_CLUSTER_SNIPPET_CHARS = 320
+_CONCEPT_CLUSTER_TOP_PHRASES = 12
 
 
 def run_multi_model_agentic_forest(
@@ -306,6 +317,8 @@ class MultiModelAgenticForestRunner:
         self.resume = bool(resume)
         self.embedding_evidence_generator: Optional[EmbeddingContrastEvidenceGenerator] = None
         self._default_htr_evidence_provider: Optional[MultiModelHTREvidenceProvider] = None
+        self._concept_cluster_embedding_encoder: Optional[Any] = None
+        self._concept_cluster_embedding_encoder_key: Optional[Tuple[str, str, str]] = None
 
         self.bow_prediction_frames: List[pd.DataFrame] = []
         self.htr_nuisance_prediction_frames: List[pd.DataFrame] = []
@@ -421,6 +434,12 @@ class MultiModelAgenticForestRunner:
         return rows
 
     def run(self) -> None:
+        try:
+            self._run_impl()
+        finally:
+            self._release_concept_cluster_embedding_encoder()
+
+    def _run_impl(self) -> None:
         logger.info("=" * 80)
         logger.info("MULTI-MODEL AGENTIC FEATURE CAUSAL FOREST")
         logger.info("=" * 80)
@@ -647,35 +666,40 @@ class MultiModelAgenticForestRunner:
             ),
             num_workers=self._inner_workers_for_outer_job(outer_n_jobs),
         )
-        predictions = fold_runner._run_one_analysis_split(
-            outer_fold=outer_fold,
-            train_idx=train_idx,
-            test_idx=test_idx,
-        )
-        fold_runner._save_outer_fold_checkpoint(
-            outer_fold=int(outer_fold),
-            predictions=predictions,
-            target_dir=self.artifact_dir / f"outer_fold_{int(outer_fold):03d}",
-        )
-        return {
-            "outer_fold": int(outer_fold),
-            "predictions": predictions,
-            "bow_prediction_frames": fold_runner.bow_prediction_frames,
-            "htr_nuisance_prediction_frames": fold_runner.htr_nuisance_prediction_frames,
-            "htr_effect_prediction_frames": fold_runner.htr_effect_prediction_frames,
-            "ensemble_nuisance_prediction_frames": (
-                fold_runner.ensemble_nuisance_prediction_frames
-            ),
-            "htr_attention_rows": fold_runner.htr_attention_rows,
-            "importance_rows": fold_runner.importance_rows,
-            "embedding_evidence_rows": fold_runner.embedding_evidence_rows,
-            "agent_rows": fold_runner.agent_rows,
-            "extracted_feature_diagnostic_rows": (fold_runner.extracted_feature_diagnostic_rows),
-            "candidate_signal_review_rows": fold_runner.candidate_signal_review_rows,
-            "parsimony_review_rows": fold_runner.parsimony_review_rows,
-            "feature_set_rows": fold_runner.feature_set_rows,
-            "outer_metric_rows": fold_runner.outer_metric_rows,
-        }
+        try:
+            predictions = fold_runner._run_one_analysis_split(
+                outer_fold=outer_fold,
+                train_idx=train_idx,
+                test_idx=test_idx,
+            )
+            fold_runner._save_outer_fold_checkpoint(
+                outer_fold=int(outer_fold),
+                predictions=predictions,
+                target_dir=self.artifact_dir / f"outer_fold_{int(outer_fold):03d}",
+            )
+            return {
+                "outer_fold": int(outer_fold),
+                "predictions": predictions,
+                "bow_prediction_frames": fold_runner.bow_prediction_frames,
+                "htr_nuisance_prediction_frames": fold_runner.htr_nuisance_prediction_frames,
+                "htr_effect_prediction_frames": fold_runner.htr_effect_prediction_frames,
+                "ensemble_nuisance_prediction_frames": (
+                    fold_runner.ensemble_nuisance_prediction_frames
+                ),
+                "htr_attention_rows": fold_runner.htr_attention_rows,
+                "importance_rows": fold_runner.importance_rows,
+                "embedding_evidence_rows": fold_runner.embedding_evidence_rows,
+                "agent_rows": fold_runner.agent_rows,
+                "extracted_feature_diagnostic_rows": (
+                    fold_runner.extracted_feature_diagnostic_rows
+                ),
+                "candidate_signal_review_rows": fold_runner.candidate_signal_review_rows,
+                "parsimony_review_rows": fold_runner.parsimony_review_rows,
+                "feature_set_rows": fold_runner.feature_set_rows,
+                "outer_metric_rows": fold_runner.outer_metric_rows,
+            }
+        finally:
+            fold_runner._release_concept_cluster_embedding_encoder()
 
     def _analysis_splits(self) -> List[Tuple[int, np.ndarray, np.ndarray]]:
         if self.config.cv_folds > 1:
@@ -2382,12 +2406,13 @@ class MultiModelAgenticForestRunner:
     def _concept_inventory_enabled(self) -> bool:
         return bool(getattr(self.nn_config, "concept_inventory_enabled", True))
 
-    def _build_concept_inventory_context(
+    def _build_concept_cluster_label_context(
         self,
         *,
         outer_fold: int,
         scope: str,
         bow_context: Dict[str, Any],
+        cluster_payload: Dict[str, Any],
         n_rows: int,
         inner_fold: Optional[int],
         heldout_rows: Optional[int],
@@ -2401,7 +2426,8 @@ class MultiModelAgenticForestRunner:
         else:
             method_list = list(methods)
         context: Dict[str, Any] = {
-            "prompt_version": "multi_model_agentic_concept_inventory_v1",
+            "prompt_version": _CONCEPT_CLUSTER_LABEL_PROMPT_VERSION,
+            "schema_version": _CONCEPT_INVENTORY_SCHEMA_VERSION,
             "outer_fold": int(outer_fold),
             "scope": str(scope),
             "inner_fold": None if inner_fold is None else int(inner_fold),
@@ -2409,18 +2435,17 @@ class MultiModelAgenticForestRunner:
             "heldout_rows": None if heldout_rows is None else int(heldout_rows),
             "feature_discovery_methods": method_list,
             "max_concepts": int(getattr(self.nn_config, "concept_inventory_max_concepts", 60)),
-            "evidence_families": {
-                "bow_feature_evidence": bow_context.get("feature_importance") or {},
-                "embedding_retrieved_text_evidence": (
-                    bow_context.get("embedding_contrast_evidence") or {}
-                ),
-                "htr_attended_text_evidence": bow_context.get("htr_attention_evidence") or {},
-            },
+            "cluster_generation": cluster_payload.get("generation", {}),
+            "labeling_mode": cluster_payload.get("labeling_mode", "single_cluster"),
+            "clusters": cluster_payload.get("agent_clusters", []),
             "instructions": [
-                "Identify patient-level concepts represented in common across the enabled evidence families.",
-                "Prefer concepts with support in at least two of BoW phrases, embedding-retrieved chunks, and HTR attended spans.",
-                "Retain ordinary chart fields and baseline clinical fields when they recur in the evidence.",
-                "Use only the evidence in this context; do not create an unsupported general clinical inventory.",
+                "Label and merge only the supplied evidence clusters.",
+                "Each cluster was generated without clinical dictionaries from BoW phrases, embedding-retrieved chunks, and HTR snippets.",
+                "A single cluster may contain several distinct patient-level fields; emit separate concepts for each supported field and reuse the same cluster_id across those concepts.",
+                "For mixed clinical panels such as CBCs, CMPs, molecular panels, vitals, demographics, or pathology/IHC groups, consider the individual represented components rather than only the panel-level label.",
+                "Name patient-level concepts represented by one or more clusters; reject boilerplate, document structure, and non-patient-level clusters.",
+                "Do not decide confounder/effect-modifier roles here.",
+                "Do not invent concepts that are not supported by the supplied clusters.",
             ],
             "response_contract": {
                 "concepts": [
@@ -2433,14 +2458,118 @@ class MultiModelAgenticForestRunner:
                         "supporting_phrases": ["source phrase"],
                         "example_values_or_phrases": ["example value or phrase"],
                         "extractability": "high|medium|low",
+                        "cluster_ids": ["tfidf_svd_001", "embedding_004"],
                         "notes": "brief source-grounded explanation",
                     }
-                ]
+                ],
+                "rejected_clusters": [
+                    {
+                        "cluster_id": "cluster_id",
+                        "reason": "why this cluster is boilerplate, too broad, or not patient-level",
+                    }
+                ],
             },
         }
-        if bow_context.get("prompt_compaction"):
-            context["prompt_compaction"] = bow_context.get("prompt_compaction")
         return context
+
+    def _get_concept_cluster_embedding_encoder(self) -> Tuple[Optional[Any], Optional[str]]:
+        embedding_config = getattr(self.nn_config, "embedding_contrast", None)
+        model_name = str(getattr(embedding_config, "model_name", "") or "").strip()
+        if not model_name:
+            return None, "embedding_model_name_missing"
+        device = getattr(embedding_config, "device", None)
+        cache_dir = getattr(embedding_config, "cache_dir", None)
+        encoder_key = (
+            model_name,
+            "" if device is None else str(device),
+            "" if cache_dir is None else str(cache_dir),
+        )
+        if (
+            self._concept_cluster_embedding_encoder is not None
+            and self._concept_cluster_embedding_encoder_key == encoder_key
+        ):
+            return self._concept_cluster_embedding_encoder, None
+
+        self._release_concept_cluster_embedding_encoder(empty_cache=False)
+        try:
+            from sentence_transformers import SentenceTransformer
+        except Exception as exc:
+            return None, f"sentence_transformers_unavailable:{exc.__class__.__name__}: {exc}"
+
+        try:
+            logger.info(
+                "Loading concept-cluster embedding encoder model=%s device=%s",
+                model_name,
+                device,
+            )
+            encoder = SentenceTransformer(
+                model_name,
+                device=device,
+                cache_folder=cache_dir,
+            )
+        except Exception as exc:
+            return None, f"sentence_transformer_load_failed:{exc.__class__.__name__}: {exc}"
+
+        self._concept_cluster_embedding_encoder = encoder
+        self._concept_cluster_embedding_encoder_key = encoder_key
+        return encoder, None
+
+    def _release_concept_cluster_embedding_encoder(self, *, empty_cache: bool = True) -> None:
+        encoder = self._concept_cluster_embedding_encoder
+        self._concept_cluster_embedding_encoder = None
+        self._concept_cluster_embedding_encoder_key = None
+        if encoder is None:
+            if empty_cache and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return
+        try:
+            if hasattr(encoder, "to"):
+                encoder.to("cpu")
+        except Exception:
+            logger.debug("Ignoring error while moving concept-cluster encoder to CPU", exc_info=True)
+        del encoder
+        gc.collect()
+        if empty_cache and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _encode_concept_cluster_texts(self, texts: Sequence[str]) -> Tuple[Optional[np.ndarray], Optional[str]]:
+        clean_texts = [str(text or "") for text in texts]
+        if not clean_texts:
+            return None, "no_texts"
+
+        provider = self.embedding_provider
+        try:
+            if provider is not None and hasattr(provider, "encode_chunks"):
+                matrix = provider.encode_chunks(clean_texts)
+                return _coerce_concept_embedding_matrix(matrix, len(clean_texts)), None
+            if provider is not None and hasattr(provider, "encode"):
+                matrix = provider.encode(clean_texts)
+                return _coerce_concept_embedding_matrix(matrix, len(clean_texts)), None
+            if provider is not None and hasattr(provider, "encode_texts"):
+                matrix = provider.encode_texts(clean_texts)
+                return _coerce_concept_embedding_matrix(matrix, len(clean_texts)), None
+        except Exception as exc:
+            return None, f"embedding_provider_failed:{exc.__class__.__name__}: {exc}"
+
+        if not self._embedding_contrast_enabled():
+            return None, "embedding_contrast_disabled"
+
+        embedding_config = getattr(self.nn_config, "embedding_contrast", None)
+        encoder, load_error = self._get_concept_cluster_embedding_encoder()
+        if load_error:
+            return None, load_error
+        try:
+            matrix = encoder.encode(
+                clean_texts,
+                batch_size=int(getattr(embedding_config, "batch_size", 16)),
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+            return _coerce_concept_embedding_matrix(matrix, len(clean_texts)), None
+        except Exception as exc:
+            self._release_concept_cluster_embedding_encoder()
+            return None, f"sentence_transformer_encode_failed:{exc.__class__.__name__}: {exc}"
 
     def _load_concept_inventory_cache(
         self,
@@ -2465,6 +2594,17 @@ class MultiModelAgenticForestRunner:
             if int(payload.get("outer_fold", -1)) != int(outer_fold):
                 return None
             if str(payload.get("scope")) != str(scope):
+                return None
+            if payload.get("schema_version") != _CONCEPT_INVENTORY_SCHEMA_VERSION:
+                logger.info(
+                    "Ignoring cached Stage 2 concept inventory with legacy schema "
+                    "outer_fold=%s scope=%s inner_fold=%s path=%s schema=%s",
+                    outer_fold,
+                    scope,
+                    inner_fold,
+                    path,
+                    payload.get("schema_version"),
+                )
                 return None
             payload_inner = payload.get("inner_fold")
             if (None if payload_inner is None else int(payload_inner)) != (
@@ -2515,38 +2655,140 @@ class MultiModelAgenticForestRunner:
         )
         if cached is not None:
             return cached
-        inventory_context = self._build_concept_inventory_context(
-            outer_fold=outer_fold,
-            scope=scope,
+        max_concepts = int(getattr(self.nn_config, "concept_inventory_max_concepts", 60))
+        cluster_payload = _build_clustered_concept_inventory_payload(
             bow_context=bow_context,
-            n_rows=n_rows,
-            inner_fold=inner_fold,
-            heldout_rows=heldout_rows,
+            outer_fold=outer_fold,
+            max_concepts=max_concepts,
+            embedding_encoder=self._encode_concept_cluster_texts,
         )
-        response = self.proposal_agent.propose(inventory_context)
-        inventory_agent_trace = _get_agent_response_trace(self.proposal_agent)
-        concepts = response.get("concepts", []) if isinstance(response, dict) else []
+        concepts: List[Dict[str, Any]] = []
+        rejected_clusters: List[Dict[str, Any]] = []
+        cluster_responses: List[Dict[str, Any]] = []
+        inventory_contexts: List[Dict[str, Any]] = []
+        inventory_agent_traces: List[Dict[str, Any]] = []
+        labeling_errors: List[Dict[str, str]] = []
+        fallback_used = False
+        agent_clusters = list(cluster_payload.get("agent_clusters", []) or [])
+        if agent_clusters:
+            for cluster in agent_clusters:
+                cluster_id = str(cluster.get("cluster_id") or "")
+                cluster_context = self._build_concept_cluster_label_context(
+                    outer_fold=outer_fold,
+                    scope=scope,
+                    bow_context=bow_context,
+                    cluster_payload={
+                        "generation": cluster_payload.get("generation", {}),
+                        "labeling_mode": "single_cluster",
+                        "agent_clusters": [cluster],
+                    },
+                    n_rows=n_rows,
+                    inner_fold=inner_fold,
+                    heldout_rows=heldout_rows,
+                )
+                if self.search_config.save_agent_context:
+                    inventory_contexts.append(cluster_context)
+                response: Dict[str, Any] = {}
+                try:
+                    raw_response = self.proposal_agent.propose(cluster_context)
+                    agent_trace = _get_agent_response_trace(self.proposal_agent)
+                    if self.search_config.save_agent_raw_output and agent_trace is not None:
+                        inventory_agent_traces.append(
+                            {"cluster_id": cluster_id, "agent_raw_output": agent_trace}
+                        )
+                    response = raw_response if isinstance(raw_response, dict) else {}
+                except Exception as exc:
+                    labeling_errors.append(
+                        {
+                            "cluster_id": cluster_id,
+                            "error": f"{exc.__class__.__name__}: {exc}",
+                        }
+                    )
+                    logger.warning(
+                        "Cluster concept labeling failed; using deterministic "
+                        "cluster label outer_fold=%s scope=%s inner_fold=%s cluster_id=%s",
+                        outer_fold,
+                        scope,
+                        inner_fold,
+                        cluster_id,
+                        exc_info=True,
+                    )
+
+                cluster_concepts = response.get("concepts", []) if response else []
+                cluster_concepts = cluster_concepts if isinstance(cluster_concepts, list) else []
+                cluster_rejected = response.get("rejected_clusters", []) if response else []
+                cluster_rejected = cluster_rejected if isinstance(cluster_rejected, list) else []
+                cluster_fallback_used = False
+                if not cluster_concepts and not cluster_rejected:
+                    fallback_used = True
+                    cluster_fallback_used = True
+                    cluster_concepts = _fallback_concepts_from_clusters(
+                        [cluster],
+                        max_concepts=max_concepts,
+                    )
+                concepts.extend(item for item in cluster_concepts if isinstance(item, dict))
+                rejected_clusters.extend(
+                    item for item in cluster_rejected if isinstance(item, dict)
+                )
+                cluster_responses.append(
+                    {
+                        "cluster_id": cluster_id,
+                        "response": response,
+                        "fallback_used": bool(cluster_fallback_used),
+                    }
+                )
+            concepts = _merge_concept_inventory_concepts(
+                concepts,
+                max_concepts=max_concepts,
+            )
+        else:
+            labeling_errors.append(
+                {"cluster_id": "", "error": "no_clusters_to_label"}
+            )
+        if not concepts:
+            fallback_used = True
+            concepts = _fallback_concepts_from_clusters(
+                agent_clusters,
+                max_concepts=max_concepts,
+            )
+        response = {
+            "mode": "per_cluster",
+            "cluster_responses": cluster_responses,
+            "concepts": concepts,
+            "rejected_clusters": rejected_clusters,
+        }
         inventory: Dict[str, Any] = {
+            "schema_version": _CONCEPT_INVENTORY_SCHEMA_VERSION,
             "outer_fold": int(outer_fold),
             "scope": str(scope),
             "inner_fold": None if inner_fold is None else int(inner_fold),
             "n_rows": int(n_rows),
             "heldout_rows": None if heldout_rows is None else int(heldout_rows),
+            "generation": cluster_payload.get("generation", {}),
+            "clusters": cluster_payload.get("agent_clusters", []),
             "response": response,
-            "concepts": concepts if isinstance(concepts, list) else [],
+            "concepts": concepts,
+            "fallback_used": bool(fallback_used),
         }
+        if labeling_errors:
+            inventory["labeling_errors"] = labeling_errors
         if self.search_config.save_agent_context:
-            inventory["context"] = inventory_context
-        if self.search_config.save_agent_raw_output:
-            inventory["agent_raw_output"] = inventory_agent_trace
+            inventory["context"] = {
+                "mode": "per_cluster",
+                "cluster_contexts": inventory_contexts,
+            }
+        if self.search_config.save_agent_raw_output and inventory_agent_traces:
+            inventory["agent_raw_output"] = inventory_agent_traces
         self._write_concept_inventory_cache(inventory)
         logger.info(
-            "Generated Stage 2 concept inventory outer_fold=%s scope=%s "
-            "inner_fold=%s concepts=%s",
+            "Generated clustered Stage 2 concept inventory outer_fold=%s scope=%s "
+            "inner_fold=%s concepts=%s clusters=%s fallback=%s",
             outer_fold,
             scope,
             inner_fold,
             len(inventory["concepts"]),
+            len(inventory.get("clusters") or []),
+            fallback_used,
         )
         return inventory
 
@@ -2660,6 +2902,18 @@ class MultiModelAgenticForestRunner:
             ):
                 logger.info(
                     "Ignoring cached Stage 2 proposal bundle without concept "
+                    "inventory outer_fold=%s scope=%s inner_fold=%s path=%s",
+                    outer_fold,
+                    scope,
+                    inner_fold,
+                    path,
+                )
+                return None
+            if self._concept_inventory_enabled() and not _concept_inventory_is_current(
+                payload.get("concept_inventory"),
+            ):
+                logger.info(
+                    "Ignoring cached Stage 2 proposal bundle with legacy concept "
                     "inventory outer_fold=%s scope=%s inner_fold=%s path=%s",
                     outer_fold,
                     scope,
@@ -4599,6 +4853,855 @@ def _rank_consistency_summaries(
     )
 
 
+def _build_clustered_concept_inventory_payload(
+    *,
+    bow_context: Dict[str, Any],
+    outer_fold: int,
+    max_concepts: int,
+    embedding_encoder: Any,
+) -> Dict[str, Any]:
+    units = _harvest_concept_evidence_units(
+        bow_context=bow_context,
+        outer_fold=outer_fold,
+    )
+    candidates = _aggregate_concept_units(units)
+    ranked_candidates = _rank_concept_candidates(candidates)
+    if not ranked_candidates:
+        return {
+            "generation": {
+                "schema_version": _CONCEPT_INVENTORY_SCHEMA_VERSION,
+                "n_evidence_units": int(len(units)),
+                "n_candidate_phrases": 0,
+                "n_raw_clusters": 0,
+                "n_agent_clusters": 0,
+                "skipped": "no_candidate_phrases",
+            },
+            "agent_clusters": [],
+        }
+
+    tfidf_clusters, tfidf_skip = _cluster_concept_candidates_tfidf_svd(
+        ranked_candidates,
+        max_concepts=max_concepts,
+    )
+    embedding_candidates = ranked_candidates[
+        : min(len(ranked_candidates), max(150, int(max_concepts) * 5))
+    ]
+    embedding_clusters, embedding_skip = _cluster_concept_candidates_embedding(
+        embedding_candidates,
+        embedding_encoder=embedding_encoder,
+        max_concepts=max_concepts,
+    )
+    fused = _fuse_concept_clusters([*tfidf_clusters, *embedding_clusters])
+    ranked_clusters = _rank_concept_clusters(fused)
+    limit = min(
+        len(ranked_clusters),
+        max(1, min(_CONCEPT_CLUSTER_MAX_AGENT_CLUSTERS, max(20, int(max_concepts) * 2))),
+    )
+    agent_clusters = [
+        _concept_cluster_agent_artifact(cluster, rank=rank)
+        for rank, cluster in enumerate(ranked_clusters[:limit], start=1)
+    ]
+    generation: Dict[str, Any] = {
+        "schema_version": _CONCEPT_INVENTORY_SCHEMA_VERSION,
+        "n_evidence_units": int(len(units)),
+        "n_candidate_phrases": int(len(ranked_candidates)),
+        "n_tfidf_svd_clusters": int(len(tfidf_clusters)),
+        "n_embedding_clusters": int(len(embedding_clusters)),
+        "n_raw_clusters": int(len(tfidf_clusters) + len(embedding_clusters)),
+        "n_fused_clusters": int(len(fused)),
+        "n_agent_clusters": int(len(agent_clusters)),
+        "methods": ["tfidf_svd", "embedding"],
+    }
+    if tfidf_skip:
+        generation["tfidf_svd_skipped"] = tfidf_skip
+    if embedding_skip:
+        generation["embedding_skipped"] = embedding_skip
+    return {
+        "generation": generation,
+        "agent_clusters": agent_clusters,
+    }
+
+
+def _harvest_concept_evidence_units(
+    *,
+    bow_context: Dict[str, Any],
+    outer_fold: int,
+) -> List[Dict[str, Any]]:
+    units: List[Dict[str, Any]] = []
+    importance = bow_context.get("feature_importance") or {}
+    for key in ("phrase_consensus", "phrase_features"):
+        for item in importance.get(key) or []:
+            if not isinstance(item, dict):
+                continue
+            phrase = item.get("feature") or item.get("phrase")
+            if not phrase:
+                continue
+            signal = []
+            if (item.get("mean_abs_confounder_score") or item.get("best_abs_confounder_score") or 0) > 0:
+                signal.append("bow_confounder")
+            if (item.get("mean_abs_effect_score") or item.get("best_abs_effect_score") or 0) > 0:
+                signal.append("bow_effect")
+            score = float(item.get("supporting_view_count") or 1)
+            score += 20.0 * float(item.get("mean_abs_confounder_score") or 0.0)
+            score += 20.0 * float(item.get("mean_abs_effect_score") or 0.0)
+            _add_concept_unit(
+                units,
+                phrase=phrase,
+                source_family="bow",
+                signal="+".join(signal) or "bow",
+                fold_key=outer_fold,
+                score=score,
+            )
+    for view in importance.get("views") or []:
+        if not isinstance(view, dict):
+            continue
+        view_name = str(view.get("view_name") or "")
+        for key in [
+            "phrase_features",
+            "confounder_overlap",
+            "treatment_positive",
+            "treatment_negative",
+            "outcome_positive",
+            "outcome_negative",
+            "effect_positive",
+            "effect_negative",
+            "r_pseudo_outcome_positive",
+            "r_pseudo_outcome_negative",
+            "top_features",
+        ]:
+            for item in view.get(key) or []:
+                if not isinstance(item, dict):
+                    continue
+                phrase = item.get("feature") or item.get("term") or item.get("phrase")
+                if not phrase:
+                    continue
+                raw_score = item.get("score", item.get("coef", item.get("importance", 0.0)))
+                try:
+                    score = 1.0 + abs(float(raw_score or 0.0))
+                except (TypeError, ValueError):
+                    score = 1.0
+                _add_concept_unit(
+                    units,
+                    phrase=phrase,
+                    source_family="bow",
+                    signal=f"{view_name}:{key}" if view_name else key,
+                    fold_key=outer_fold,
+                    score=score,
+                )
+
+    documents = _collect_concept_inventory_documents(bow_context, outer_fold=outer_fold)
+    units.extend(_mine_ngram_concept_units_from_documents(documents))
+    return units
+
+
+def _collect_concept_inventory_documents(
+    bow_context: Dict[str, Any],
+    *,
+    outer_fold: int,
+) -> List[Dict[str, Any]]:
+    documents: List[Dict[str, Any]] = []
+    embedding = bow_context.get("embedding_contrast_evidence") or {}
+    for contrast in embedding.get("contrasts") or []:
+        if not isinstance(contrast, dict):
+            continue
+        signal = str(contrast.get("name") or contrast.get("role_hint") or "embedding_contrast")
+        for chunk_key in [
+            "positive_aligned_chunks",
+            "negative_aligned_chunks",
+            "positive_external_chunks",
+            "negative_external_chunks",
+        ]:
+            for chunk in contrast.get(chunk_key) or []:
+                if not isinstance(chunk, dict):
+                    continue
+                text = chunk.get("text")
+                if text:
+                    documents.append(
+                        {
+                            "text": _concept_cluster_normalize_text(text),
+                            "source_family": "embedding_contrast",
+                            "signal": signal,
+                            "fold_key": int(outer_fold),
+                            "row_id": chunk.get("row_id"),
+                        }
+                    )
+    htr = bow_context.get("htr_attention_evidence") or {}
+    for section in ("nuisance", "effect"):
+        attention = (htr.get(section) or {}).get("attention") or []
+        for row in attention:
+            if not isinstance(row, dict):
+                continue
+            text = row.get("evidence_snippet") or row.get("snippet")
+            if text:
+                documents.append(
+                    {
+                        "text": _concept_cluster_normalize_text(text),
+                        "source_family": "htr",
+                        "signal": str(row.get("target_source") or row.get("stage") or section),
+                        "fold_key": int(outer_fold),
+                        "row_id": row.get("row_id"),
+                    }
+                )
+            spans = row.get("top_token_spans") or []
+            for span in spans[:8] if isinstance(spans, list) else []:
+                span_text = span.get("text") if isinstance(span, dict) else span
+                if span_text:
+                    documents.append(
+                        {
+                            "text": _concept_cluster_normalize_text(span_text),
+                            "source_family": "htr",
+                            "signal": str(row.get("target_source") or row.get("stage") or section),
+                            "fold_key": int(outer_fold),
+                            "row_id": row.get("row_id"),
+                        }
+                    )
+    return [
+        doc
+        for doc in documents
+        if len(str(doc.get("text") or "")) >= 8
+    ]
+
+
+def _mine_ngram_concept_units_from_documents(
+    documents: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not documents:
+        return []
+    texts = [str(doc.get("text") or "") for doc in documents]
+    min_df = 2 if len(texts) < 25 else 3
+    try:
+        vectorizer = TfidfVectorizer(
+            ngram_range=(1, 4),
+            min_df=min_df,
+            max_df=0.65,
+            stop_words=list(_concept_cluster_stop_words()),
+            token_pattern=r"(?u)\b[a-z][a-z0-9%<>/=+\-]*\b|\b\d+(?:\.\d+)?%?\b",
+            max_features=5000,
+            sublinear_tf=True,
+        )
+        matrix = vectorizer.fit_transform(texts)
+    except ValueError:
+        return []
+    terms = np.asarray(vectorizer.get_feature_names_out())
+    units: List[Dict[str, Any]] = []
+    for row_index, doc in enumerate(documents):
+        row = matrix.getrow(row_index)
+        if row.nnz == 0:
+            continue
+        top_positions = row.indices[np.argsort(row.data)[-8:]]
+        for term_index in top_positions:
+            phrase = str(terms[term_index])
+            score = float(row[0, term_index]) * 3.0
+            _add_concept_unit(
+                units,
+                phrase=phrase,
+                source_family=str(doc.get("source_family") or "text"),
+                signal=str(doc.get("signal") or ""),
+                fold_key=doc.get("fold_key"),
+                row_id=doc.get("row_id"),
+                snippet=str(doc.get("text") or ""),
+                score=score,
+            )
+    return units
+
+
+def _add_concept_unit(
+    units: List[Dict[str, Any]],
+    *,
+    phrase: Any,
+    source_family: str,
+    signal: str,
+    fold_key: Any,
+    row_id: Any = None,
+    snippet: str = "",
+    score: float = 1.0,
+) -> None:
+    normalized = _concept_cluster_normalize_phrase(phrase)
+    if not _concept_cluster_phrase_ok(normalized):
+        return
+    units.append(
+        {
+            "phrase": normalized,
+            "source_family": str(source_family or "unknown"),
+            "signal": str(signal or ""),
+            "fold_key": None if fold_key is None else int(fold_key),
+            "row_id": None if row_id is None else str(row_id),
+            "snippet": _concept_clip_text(snippet, _CONCEPT_CLUSTER_SNIPPET_CHARS),
+            "score": float(score),
+        }
+    )
+
+
+def _aggregate_concept_units(units: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    aggregated: Dict[str, Dict[str, Any]] = {}
+    for unit in units:
+        phrase = str(unit.get("phrase") or "")
+        if not phrase:
+            continue
+        item = aggregated.setdefault(
+            phrase,
+            {
+                "phrase": phrase,
+                "source_counts": Counter(),
+                "signal_counts": Counter(),
+                "folds": set(),
+                "rows": set(),
+                "snippets": [],
+                "score": 0.0,
+            },
+        )
+        item["source_counts"][str(unit.get("source_family") or "unknown")] += 1
+        signal = str(unit.get("signal") or "")
+        if signal:
+            item["signal_counts"][signal] += 1
+        if unit.get("fold_key") is not None:
+            item["folds"].add(int(unit["fold_key"]))
+        if unit.get("row_id") is not None:
+            item["rows"].add(str(unit["row_id"]))
+        snippet = str(unit.get("snippet") or "")
+        if snippet and len(item["snippets"]) < 6:
+            item["snippets"].append(snippet)
+        item["score"] += float(unit.get("score") or 0.0)
+    candidates = []
+    for item in aggregated.values():
+        source_overlap = len(item["source_counts"])
+        fold_count = len(item["folds"])
+        bow_count = int(item["source_counts"].get("bow", 0))
+        if source_overlap >= 2 or fold_count >= 2 or bow_count >= 2 or item["score"] >= 4.0:
+            candidates.append(item)
+    return candidates
+
+
+def _rank_concept_candidates(candidates: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(
+        candidates,
+        key=lambda item: (
+            -len(item.get("source_counts") or {}),
+            -len(item.get("folds") or []),
+            -float(item.get("score") or 0.0),
+            str(item.get("phrase") or ""),
+        ),
+    )
+
+
+def _cluster_concept_candidates_tfidf_svd(
+    candidates: Sequence[Dict[str, Any]],
+    *,
+    max_concepts: int,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    if not candidates:
+        return [], "no_candidate_phrases"
+    if len(candidates) <= 4:
+        return [
+            _make_concept_cluster("tfidf_svd", idx, [idx], candidates)
+            for idx in range(len(candidates))
+        ], None
+    documents = [_concept_candidate_document(candidate) for candidate in candidates]
+    try:
+        vectorizer = TfidfVectorizer(ngram_range=(1, 3), min_df=1, sublinear_tf=True)
+        matrix = vectorizer.fit_transform(documents)
+    except ValueError as exc:
+        return [], f"tfidf_failed:{exc}"
+    if matrix.shape[0] < 2 or matrix.shape[1] < 2:
+        return [
+            _make_concept_cluster("tfidf_svd", idx, [idx], candidates)
+            for idx in range(len(candidates))
+        ], None
+    n_components = min(80, matrix.shape[0] - 1, matrix.shape[1] - 1)
+    if n_components >= 2:
+        vectors = TruncatedSVD(n_components=n_components, random_state=17).fit_transform(matrix)
+    else:
+        vectors = matrix.toarray()
+    vectors = sklearn_normalize(vectors)
+    n_clusters = _concept_cluster_count(len(candidates), max_concepts=max_concepts)
+    if n_clusters >= len(candidates):
+        return [
+            _make_concept_cluster("tfidf_svd", idx, [idx], candidates)
+            for idx in range(len(candidates))
+        ], None
+    labels = MiniBatchKMeans(
+        n_clusters=n_clusters,
+        random_state=17,
+        n_init=10,
+        batch_size=max(64, min(512, len(candidates))),
+    ).fit_predict(vectors)
+    clusters = []
+    for cluster_idx in range(n_clusters):
+        indices = [idx for idx, label in enumerate(labels) if int(label) == cluster_idx]
+        if indices:
+            clusters.append(_make_concept_cluster("tfidf_svd", cluster_idx, indices, candidates))
+    return clusters, None
+
+
+def _cluster_concept_candidates_embedding(
+    candidates: Sequence[Dict[str, Any]],
+    *,
+    embedding_encoder: Any,
+    max_concepts: int,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    if len(candidates) < 4:
+        return [], "too_few_candidate_phrases"
+    documents = [_concept_candidate_document(candidate) for candidate in candidates]
+    matrix, skip_reason = embedding_encoder(documents)
+    if skip_reason:
+        return [], skip_reason
+    try:
+        vectors = _coerce_concept_embedding_matrix(matrix, len(candidates))
+    except Exception as exc:
+        return [], f"invalid_embedding_matrix:{exc}"
+    vectors = sklearn_normalize(vectors)
+    n_clusters = _concept_cluster_count(len(candidates), max_concepts=max_concepts)
+    if n_clusters >= len(candidates):
+        return [
+            _make_concept_cluster("embedding", idx, [idx], candidates)
+            for idx in range(len(candidates))
+        ], None
+    labels = MiniBatchKMeans(
+        n_clusters=n_clusters,
+        random_state=23,
+        n_init=10,
+        batch_size=max(64, min(512, len(candidates))),
+    ).fit_predict(vectors)
+    clusters = []
+    for cluster_idx in range(n_clusters):
+        indices = [idx for idx, label in enumerate(labels) if int(label) == cluster_idx]
+        if indices:
+            clusters.append(_make_concept_cluster("embedding", cluster_idx, indices, candidates))
+    return clusters, None
+
+
+def _concept_cluster_count(n_items: int, *, max_concepts: int) -> int:
+    if n_items <= 0:
+        return 0
+    return max(
+        2,
+        min(
+            int(n_items),
+            max(4, int(np.sqrt(max(1, n_items)) * 2)),
+            max(4, int(max_concepts) * 2),
+            80,
+        ),
+    )
+
+
+def _make_concept_cluster(
+    method: str,
+    cluster_idx: int,
+    candidate_indices: Sequence[int],
+    candidates: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    source_counts: Counter = Counter()
+    signal_counts: Counter = Counter()
+    folds = set()
+    rows = set()
+    score = 0.0
+    phrases: List[str] = []
+    snippets: List[str] = []
+    for idx in candidate_indices:
+        candidate = candidates[int(idx)]
+        phrases.append(str(candidate.get("phrase") or ""))
+        source_counts.update(candidate.get("source_counts") or {})
+        signal_counts.update(candidate.get("signal_counts") or {})
+        folds.update(candidate.get("folds") or set())
+        rows.update(candidate.get("rows") or set())
+        score += float(candidate.get("score") or 0.0)
+        for snippet in candidate.get("snippets") or []:
+            if snippet and len(snippets) < 6:
+                snippets.append(_concept_clip_text(snippet, _CONCEPT_CLUSTER_SNIPPET_CHARS))
+    top_phrases = _dedupe_phrase_list(
+        sorted(
+            set(phrases),
+            key=lambda phrase: (
+                -sum(1 for idx in candidate_indices if candidates[int(idx)].get("phrase") == phrase),
+                -len(phrase.split()),
+                phrase,
+            ),
+        ),
+        limit=_CONCEPT_CLUSTER_TOP_PHRASES,
+    )
+    return {
+        "cluster_id": f"{method}_{int(cluster_idx):03d}",
+        "methods": [method],
+        "candidate_indices": set(int(idx) for idx in candidate_indices),
+        "source_counts": source_counts,
+        "signal_counts": signal_counts,
+        "folds": folds,
+        "rows": rows,
+        "score": float(score),
+        "top_phrases": top_phrases,
+        "exemplar_snippets": snippets[:4],
+    }
+
+
+def _fuse_concept_clusters(clusters: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    fused: List[Dict[str, Any]] = []
+    for cluster in _rank_concept_clusters(clusters):
+        phrase_set = set(cluster.get("top_phrases") or [])
+        merged = False
+        for existing in fused:
+            existing_set = set(existing.get("top_phrases") or [])
+            if _phrase_sets_should_merge(phrase_set, existing_set):
+                _merge_concept_cluster(existing, cluster)
+                merged = True
+                break
+        if not merged:
+            fused.append(copy.deepcopy(cluster))
+    return fused
+
+
+def _phrase_sets_should_merge(left: set, right: set) -> bool:
+    if not left or not right:
+        return False
+    if left & right:
+        return True
+    overlap = len(left & right) / max(1, min(len(left), len(right)))
+    if overlap >= 0.35:
+        return True
+    for a in list(left)[:8]:
+        for b in list(right)[:8]:
+            if a and b and (a in b or b in a):
+                return True
+    return False
+
+
+def _merge_concept_cluster(target: Dict[str, Any], source: Dict[str, Any]) -> None:
+    target["methods"] = sorted(set(target.get("methods") or []) | set(source.get("methods") or []))
+    target["candidate_indices"] = set(target.get("candidate_indices") or set()) | set(
+        source.get("candidate_indices") or set()
+    )
+    target["source_counts"].update(source.get("source_counts") or {})
+    target["signal_counts"].update(source.get("signal_counts") or {})
+    target["folds"] = set(target.get("folds") or set()) | set(source.get("folds") or set())
+    target["rows"] = set(target.get("rows") or set()) | set(source.get("rows") or set())
+    target["score"] = float(target.get("score") or 0.0) + float(source.get("score") or 0.0)
+    target["top_phrases"] = _dedupe_phrase_list(
+        list(target.get("top_phrases") or []) + list(source.get("top_phrases") or []),
+        limit=_CONCEPT_CLUSTER_TOP_PHRASES,
+    )
+    target["exemplar_snippets"] = _dedupe_text_list(
+        list(target.get("exemplar_snippets") or [])
+        + list(source.get("exemplar_snippets") or []),
+        limit=4,
+    )
+
+
+def _rank_concept_clusters(clusters: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(
+        clusters,
+        key=lambda cluster: (
+            -len(cluster.get("source_counts") or {}),
+            -len(cluster.get("folds") or []),
+            -float(cluster.get("score") or 0.0),
+            -len(cluster.get("candidate_indices") or []),
+            str((cluster.get("top_phrases") or [""])[0]),
+        ),
+    )
+
+
+def _concept_cluster_agent_artifact(cluster: Dict[str, Any], *, rank: int) -> Dict[str, Any]:
+    cluster_id = f"cluster_{int(rank):03d}"
+    source_counts = cluster.get("source_counts") or Counter()
+    signal_counts = cluster.get("signal_counts") or Counter()
+    return {
+        "cluster_id": cluster_id,
+        "methods": list(cluster.get("methods") or []),
+        "source_families": [key for key, _ in Counter(source_counts).most_common()],
+        "source_counts": dict(Counter(source_counts).most_common()),
+        "source_overlap": int(len(source_counts)),
+        "fold_count": int(len(cluster.get("folds") or [])),
+        "row_count": int(len(cluster.get("rows") or [])),
+        "signal_counts": dict(Counter(signal_counts).most_common(12)),
+        "top_phrases": list(cluster.get("top_phrases") or [])[:_CONCEPT_CLUSTER_TOP_PHRASES],
+        "example_values_or_phrases": list(cluster.get("top_phrases") or [])[:6],
+        "exemplar_snippets": list(cluster.get("exemplar_snippets") or [])[:4],
+        "score": round(float(cluster.get("score") or 0.0), 4),
+    }
+
+
+def _fallback_concepts_from_clusters(
+    clusters: Sequence[Dict[str, Any]],
+    *,
+    max_concepts: int,
+) -> List[Dict[str, Any]]:
+    concepts: List[Dict[str, Any]] = []
+    seen = set()
+    for cluster in clusters:
+        phrases = [str(phrase) for phrase in cluster.get("top_phrases") or [] if str(phrase)]
+        if not phrases:
+            continue
+        label = phrases[0]
+        name = _normalize_feature_name(label)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        concepts.append(
+            {
+                "name": name,
+                "label": label,
+                "value_kind": _infer_concept_value_kind_from_phrases(phrases),
+                "source_families": cluster.get("source_families") or [],
+                "source_overlap": int(cluster.get("source_overlap") or 0),
+                "supporting_phrases": phrases[:6],
+                "example_values_or_phrases": cluster.get("example_values_or_phrases") or phrases[:6],
+                "extractability": _fallback_extractability(cluster),
+                "cluster_ids": [cluster.get("cluster_id")],
+                "notes": "Deterministic fallback label from clustered text evidence.",
+            }
+        )
+        if len(concepts) >= int(max_concepts):
+            break
+    return concepts
+
+
+def _merge_concept_inventory_concepts(
+    concepts: Sequence[Dict[str, Any]],
+    *,
+    max_concepts: int,
+) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    for raw in concepts:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        if not name:
+            label = str(raw.get("label") or "").strip()
+            name = _normalize_feature_name(label)
+        if not name:
+            continue
+        item = dict(raw)
+        item["name"] = name
+        existing = merged.get(name)
+        if existing is None:
+            merged[name] = item
+            continue
+        for key in (
+            "source_families",
+            "supporting_phrases",
+            "example_values_or_phrases",
+            "cluster_ids",
+        ):
+            existing[key] = _dedupe_any_list(
+                list(existing.get(key) or []) + list(item.get(key) or []),
+                limit=24 if key != "cluster_ids" else 120,
+            )
+        existing["source_overlap"] = max(
+            int(existing.get("source_overlap") or 0),
+            int(item.get("source_overlap") or 0),
+            len(existing.get("source_families") or []),
+        )
+        if not existing.get("label") and item.get("label"):
+            existing["label"] = item.get("label")
+        if not existing.get("value_kind") and item.get("value_kind"):
+            existing["value_kind"] = item.get("value_kind")
+        existing["extractability"] = _best_extractability(
+            existing.get("extractability"),
+            item.get("extractability"),
+        )
+        if item.get("notes") and item.get("notes") not in str(existing.get("notes") or ""):
+            existing["notes"] = _concept_clip_text(
+                " ".join(
+                    part
+                    for part in [str(existing.get("notes") or ""), str(item.get("notes") or "")]
+                    if part
+                ),
+                500,
+            )
+    return list(merged.values())[: max(1, int(max_concepts))]
+
+
+def _dedupe_any_list(values: Sequence[Any], *, limit: int) -> List[Any]:
+    result: List[Any] = []
+    seen = set()
+    for value in values:
+        key = json.dumps(value, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+        if len(result) >= int(limit):
+            break
+    return result
+
+
+def _best_extractability(left: Any, right: Any) -> str:
+    rank = {"high": 3, "medium": 2, "low": 1}
+    left_text = str(left or "").lower()
+    right_text = str(right or "").lower()
+    return left_text if rank.get(left_text, 0) >= rank.get(right_text, 0) else right_text
+
+
+def _infer_concept_value_kind_from_phrases(phrases: Sequence[str]) -> str:
+    joined = " ".join(phrases)
+    if re.search(r"\d", joined):
+        return "continuous"
+    if len(set(phrases)) <= 3:
+        return "categorical"
+    return "unknown"
+
+
+def _fallback_extractability(cluster: Dict[str, Any]) -> str:
+    if int(cluster.get("source_overlap") or 0) >= 2:
+        return "high"
+    if int(cluster.get("fold_count") or 0) >= 2:
+        return "medium"
+    return "low"
+
+
+def _concept_candidate_document(candidate: Dict[str, Any]) -> str:
+    phrase = str(candidate.get("phrase") or "")
+    sources = " ".join((candidate.get("source_counts") or Counter()).keys())
+    signals = " ".join(key for key, _ in (candidate.get("signal_counts") or Counter()).most_common(8))
+    snippets = " ".join(list(candidate.get("snippets") or [])[:3])
+    return " ".join([phrase] * 8 + [sources, signals, snippets])
+
+
+def _concept_cluster_normalize_text(value: Any) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "")).translate(_DASH_TRANSLATION)
+    text = text.replace("\u2265", ">=").replace("\u2264", "<=")
+    text = text.lower()
+    text = re.sub(r"([a-z])[-_/]([a-z0-9])", r"\1 \2", text)
+    text = re.sub(r"[^a-z0-9%\.<>/=+ -]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _concept_cluster_normalize_phrase(value: Any) -> str:
+    text = _concept_cluster_normalize_text(value)
+    text = re.sub(r"\s+", " ", text).strip(" -")
+    return text
+
+
+def _concept_cluster_phrase_ok(phrase: str) -> bool:
+    if not phrase:
+        return False
+    tokens = phrase.split()
+    if not tokens:
+        return False
+    if len(tokens) == 1 and (tokens[0] in _concept_cluster_stop_words() or len(tokens[0]) < 3):
+        return False
+    if all(token in _concept_cluster_stop_words() for token in tokens):
+        return False
+    if all(re.fullmatch(r"\d+(?:\.\d+)?%?", token) for token in tokens):
+        return False
+    numeric_count = sum(bool(re.fullmatch(r"\d+(?:\.\d+)?%?", token)) for token in tokens)
+    if len(tokens) > 1 and numeric_count > max(1, len(tokens) // 2):
+        return False
+    return True
+
+
+def _concept_cluster_stop_words() -> set:
+    return set(ENGLISH_STOP_WORDS) | {
+        "patient",
+        "patients",
+        "report",
+        "reports",
+        "date",
+        "omitted",
+        "specimen",
+        "clinical",
+        "history",
+        "description",
+        "gross",
+        "microscopic",
+        "sections",
+        "section",
+        "received",
+        "formalin",
+        "processed",
+        "embedded",
+        "paraffin",
+        "stained",
+        "additional",
+        "core",
+        "cores",
+        "fragment",
+        "fragments",
+        "tissue",
+        "tumor",
+        "tumour",
+        "cell",
+        "cells",
+        "lung",
+        "mass",
+        "right",
+        "left",
+        "upper",
+        "lower",
+        "lobe",
+        "biopsy",
+        "needle",
+        "bronchoscopic",
+        "diagnosis",
+        "assessment",
+        "plan",
+        "table",
+        "result",
+        "interpretation",
+        "study",
+        "studies",
+        "cm",
+        "mm",
+        "ml",
+        "mg",
+        "dl",
+        "mrn",
+        "id",
+        "accession",
+    }
+
+
+def _dedupe_phrase_list(values: Sequence[str], *, limit: int) -> List[str]:
+    result: List[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        if any(text == existing or text in existing or existing in text for existing in result):
+            continue
+        result.append(text)
+        if len(result) >= int(limit):
+            break
+    return result
+
+
+def _dedupe_text_list(values: Sequence[str], *, limit: int) -> List[str]:
+    result: List[str] = []
+    seen = set()
+    for value in values:
+        text = _concept_clip_text(value, _CONCEPT_CLUSTER_SNIPPET_CHARS)
+        key = text[:80]
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+        if len(result) >= int(limit):
+            break
+    return result
+
+
+def _concept_clip_text(value: Any, limit: int) -> str:
+    text = str(value or "")
+    if len(text) <= int(limit):
+        return text
+    return text[: int(limit)].rstrip()
+
+
+def _coerce_concept_embedding_matrix(embeddings: Any, expected_rows: int) -> np.ndarray:
+    matrix = np.asarray(embeddings, dtype=np.float32)
+    if matrix.ndim == 1:
+        matrix = matrix.reshape(1, -1)
+    if matrix.ndim != 2:
+        raise ValueError(f"expected 2D embedding matrix, got shape={matrix.shape}")
+    if int(matrix.shape[0]) != int(expected_rows):
+        raise ValueError(
+            f"expected {expected_rows} embedding rows, got {int(matrix.shape[0])}"
+        )
+    return matrix
+
+
+def _concept_inventory_is_current(value: Any) -> bool:
+    return isinstance(value, dict) and value.get("schema_version") == _CONCEPT_INVENTORY_SCHEMA_VERSION
+
+
 def _agent_row_has_concept_inventory(
     row: Dict[str, Any],
     *,
@@ -4607,12 +5710,12 @@ def _agent_row_has_concept_inventory(
     if not isinstance(row, dict):
         return False
     if not consistency_enabled:
-        return isinstance(row.get("concept_inventory"), dict)
+        return _concept_inventory_is_current(row.get("concept_inventory"))
     bundles = row.get("proposal_bundles")
     if not isinstance(bundles, list) or not bundles:
         return False
     return all(
-        isinstance(bundle, dict) and isinstance(bundle.get("concept_inventory"), dict)
+        isinstance(bundle, dict) and _concept_inventory_is_current(bundle.get("concept_inventory"))
         for bundle in bundles
     )
 
@@ -4626,7 +5729,7 @@ def _agent_visible_concept_inventory(
     *,
     max_concepts: int,
 ) -> Optional[Dict[str, Any]]:
-    if not isinstance(inventory, dict):
+    if not _concept_inventory_is_current(inventory):
         return None
     concepts = inventory.get("concepts")
     if not isinstance(concepts, list):
@@ -4646,6 +5749,7 @@ def _agent_visible_concept_inventory(
         "supporting_phrases",
         "example_values_or_phrases",
         "extractability",
+        "cluster_ids",
         "notes",
     ]
     for item in concepts[: max(1, int(max_concepts))]:
@@ -4661,7 +5765,7 @@ def _agent_visible_concept_inventory(
     if not visible:
         return None
     return {
-        "source": "multi_model_agentic_concept_inventory_v1",
+        "source": _CONCEPT_INVENTORY_SCHEMA_VERSION,
         "concepts": visible,
     }
 

@@ -61,6 +61,11 @@ EXTRACTION_PROMPT_VERSION = "explicit_features_v2"
 VALID_ACTIONS = {"add", "remove", "update_role", "none"}
 VALID_ROLES = {"confounder", "effect_modifier"}
 VALID_TYPES = {"categorical", "continuous"}
+_CONCEPT_INVENTORY_PROMPT_VERSIONS = {
+    "multi_model_agentic_concept_inventory_v1",
+    "multi_model_agentic_cluster_labeling_v1",
+    "multi_model_agentic_cluster_labeling_v2",
+}
 _AUTO_MODEL_NAME_VALUES = {"", "auto", "discover", "server"}
 _MODEL_NAME_AUTODISCOVERY_ALIASES = {"Qwen/Qwen3.6-27B"}
 _DASH_TRANSLATION = dict.fromkeys(
@@ -1427,9 +1432,7 @@ class OpenAICompatibleFeatureSearchAgent:
         is_value_harmonization = (
             context.get("prompt_version") == "multi_model_agentic_value_harmonization_v1"
         )
-        is_concept_inventory = (
-            context.get("prompt_version") == "multi_model_agentic_concept_inventory_v1"
-        )
+        is_concept_inventory = context.get("prompt_version") in _CONCEPT_INVENTORY_PROMPT_VERSIONS
 
         for attempt_idx in range(max_repair_attempts + 1):
             response_kwargs = {
@@ -1734,7 +1737,7 @@ class CodexCLIFeatureSearchAgent:
                     model_name=getattr(
                         self.search_config,
                         "codex_cli_model_name",
-                        "gpt-5.5",
+                        "gpt-5.4-mini",
                     ),
                     reasoning_effort=getattr(
                         self.search_config,
@@ -1777,7 +1780,7 @@ class CodexCLIFeatureSearchAgent:
         prompt_version = context.get("prompt_version")
         task_kind = (
             "clinical text concept inventory"
-            if prompt_version == "multi_model_agentic_concept_inventory_v1"
+            if prompt_version in _CONCEPT_INVENTORY_PROMPT_VERSIONS
             else "agentic causal-feature proposal"
         )
         base_prompt = _codex_backend_prompt(
@@ -1797,9 +1800,7 @@ class CodexCLIFeatureSearchAgent:
         is_value_harmonization = (
             prompt_version == "multi_model_agentic_value_harmonization_v1"
         )
-        is_concept_inventory = (
-            prompt_version == "multi_model_agentic_concept_inventory_v1"
-        )
+        is_concept_inventory = prompt_version in _CONCEPT_INVENTORY_PROMPT_VERSIONS
 
         for attempt_idx in range(max_repair_attempts + 1):
             response = self._run(prompt)
@@ -2278,7 +2279,7 @@ class CodexCLIExplicitFeatureExtractionProvider(VLLMExplicitFeatureExtractionPro
                 "codex",
             ),
             "codex_cli_model_name": _codex_optional_value(
-                getattr(self.feature_config, "codex_cli_model_name", "gpt-5.5")
+                getattr(self.feature_config, "codex_cli_model_name", "gpt-5.4-mini")
             ),
             "codex_cli_reasoning_effort": _codex_optional_value(
                 getattr(self.feature_config, "codex_cli_reasoning_effort", "medium")
@@ -2341,7 +2342,7 @@ class CodexCLIExplicitFeatureExtractionProvider(VLLMExplicitFeatureExtractionPro
                     model_name=getattr(
                         self.feature_config,
                         "codex_cli_model_name",
-                        "gpt-5.5",
+                        "gpt-5.4-mini",
                     ),
                     reasoning_effort=getattr(
                         self.feature_config,
@@ -2580,6 +2581,12 @@ def build_agent_prompt(
 
     if context.get("prompt_version") == "multi_model_agentic_concept_inventory_v1":
         return build_multi_model_agentic_concept_inventory_prompt(context, search_config)
+
+    if context.get("prompt_version") in {
+        "multi_model_agentic_cluster_labeling_v1",
+        "multi_model_agentic_cluster_labeling_v2",
+    }:
+        return build_multi_model_agentic_cluster_labeling_prompt(context, search_config)
 
     if context.get("prompt_version") == "multi_model_agentic_consistency_v1":
         return build_multi_model_agentic_consistency_prompt(context, search_config)
@@ -2929,6 +2936,72 @@ Return at most {max_concepts} concepts. Return JSON only with this shape:
 }}
 
 Current concept-inventory context:
+{context_json}
+"""
+
+
+def build_multi_model_agentic_cluster_labeling_prompt(
+    context: Dict[str, Any],
+    search_config: AgenticFeatureSearchConfig,
+) -> str:
+    """Construct the prompt for labeling deterministic evidence clusters."""
+    del search_config
+    context_json = json.dumps(
+        context,
+        separators=(",", ":"),
+        default=_json_default,
+    )
+    max_concepts = int(context.get("max_concepts", 60))
+    return f"""You are labeling clusters of clinical-note text evidence.
+
+The clusters were generated upstream from sparse text features, retrieved text
+chunks, and attended text snippets. They were not generated from a clinical
+dictionary. Your job is to turn these supplied clusters into a compact inventory
+of patient-level concepts. A cluster is evidence, not a one-concept container:
+one cluster may support multiple distinct concepts, and one concept may be
+supported by multiple clusters.
+
+Task:
+- Label clusters that represent extractable patient-level fields.
+- Merge multiple clusters when they clearly refer to the same field.
+- Split compound clusters when they contain multiple separately extractable
+  patient-level fields. It is valid for several concepts to cite the same
+  cluster_id.
+- For mixed panels or grouped chart content such as CBCs, CMPs, vitals,
+  demographics, molecular panels, pathology/IHC, or medication-history groups,
+  consider the individual represented components instead of only the broad
+  panel label.
+- Reject clusters that are boilerplate, document structure, too broad, too
+  noisy, or not patient-level.
+- Use only the supplied clusters and evidence phrases. Do not invent concepts
+  outside these clusters.
+- Do not decide downstream modeling roles.
+
+Return at most {max_concepts} concepts. Return JSON only with this shape:
+{{
+  "concepts": [
+    {{
+      "name": "snake_case_concept_name",
+      "label": "short human-readable label",
+      "value_kind": "binary|categorical|continuous|ordinal|text|unknown",
+      "source_families": ["bow", "embedding_contrast", "htr"],
+      "source_overlap": 2,
+      "supporting_phrases": ["short phrase or token evidence"],
+      "example_values_or_phrases": ["example values or note phrases"],
+      "extractability": "high|medium|low",
+      "cluster_ids": ["cluster_001", "cluster_014"],
+      "notes": "brief source-grounded explanation"
+    }}
+  ],
+  "rejected_clusters": [
+    {{
+      "cluster_id": "cluster_009",
+      "reason": "brief reason this cluster was not a patient-level concept"
+    }}
+  ]
+}}
+
+Current cluster-labeling context:
 {context_json}
 """
 
@@ -3313,10 +3386,17 @@ Return corrected JSON only. Use this exact top-level shape:
       "supporting_phrases": ["short phrase or token evidence"],
       "example_values_or_phrases": ["example values or note phrases"],
       "extractability": "high|medium|low",
+      "cluster_ids": ["cluster_001"],
       "notes": "brief source-grounded explanation"
     }}
   ],
-  "omitted_uncertain": ["optional short labels for weak one-source concepts"]
+  "omitted_uncertain": ["optional short labels for weak one-source concepts"],
+  "rejected_clusters": [
+    {{
+      "cluster_id": "cluster_009",
+      "reason": "brief reason this cluster was not a patient-level concept"
+    }}
+  ]
 }}
 
 Do not add prose, markdown, comments, or code fences.
@@ -3478,6 +3558,16 @@ def concept_inventory_response_issues(
             max_concepts = int(context.get("max_concepts"))
         except (TypeError, ValueError):
             max_concepts = None
+    prompt_version = context.get("prompt_version") if isinstance(context, dict) else None
+    is_cluster_labeling = prompt_version in {
+        "multi_model_agentic_cluster_labeling_v1",
+        "multi_model_agentic_cluster_labeling_v2",
+    }
+    known_cluster_ids = set()
+    if isinstance(context, dict):
+        for cluster in context.get("clusters") or []:
+            if isinstance(cluster, dict) and cluster.get("cluster_id"):
+                known_cluster_ids.add(str(cluster.get("cluster_id")))
 
     issues: List[str] = []
     seen_names = set()
@@ -3500,6 +3590,18 @@ def concept_inventory_response_issues(
             list,
         ):
             issues.append(f"concept {idx} ({name}): supporting_phrases must be a list")
+        cluster_ids = item.get("cluster_ids")
+        if cluster_ids is not None and not isinstance(cluster_ids, list):
+            issues.append(f"concept {idx} ({name}): cluster_ids must be a list")
+        elif cluster_ids is not None:
+            for cluster_id in cluster_ids:
+                cluster_id_text = str(cluster_id)
+                if known_cluster_ids and cluster_id_text not in known_cluster_ids:
+                    issues.append(
+                        f"concept {idx} ({name}): unknown cluster_id {cluster_id_text!r}"
+                    )
+        if is_cluster_labeling and not cluster_ids:
+            issues.append(f"concept {idx} ({name}): cluster_ids required for cluster labeling")
 
     if max_concepts is not None and len(concepts) > max_concepts * 2:
         issues.append(
@@ -3508,6 +3610,21 @@ def concept_inventory_response_issues(
     omitted = response.get("omitted_uncertain", [])
     if omitted is not None and not isinstance(omitted, list):
         issues.append("omitted_uncertain must be a list when provided")
+    rejected = response.get("rejected_clusters", [])
+    if rejected is not None and not isinstance(rejected, list):
+        issues.append("rejected_clusters must be a list when provided")
+    elif isinstance(rejected, list):
+        for idx, item in enumerate(rejected, start=1):
+            if not isinstance(item, dict):
+                issues.append(f"rejected_clusters {idx}: expected an object")
+                continue
+            cluster_id = str(item.get("cluster_id") or "")
+            if not cluster_id:
+                issues.append(f"rejected_clusters {idx}: missing cluster_id")
+            elif known_cluster_ids and cluster_id not in known_cluster_ids:
+                issues.append(f"rejected_clusters {idx}: unknown cluster_id {cluster_id!r}")
+            if _missing_or_empty(item.get("reason")):
+                issues.append(f"rejected_clusters {idx} ({cluster_id}): missing reason")
     return issues
 
 
