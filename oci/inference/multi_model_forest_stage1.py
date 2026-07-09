@@ -67,6 +67,7 @@ from .multi_model_agentic_forest import (
     _align_htr_prediction_frame,
     _binary_split_items,
     _bounded_fold_count,
+    _build_evidence_digest_agent_context,
     _clinical_text_examples,
     _compact_multi_model_agent_context,
     _finite_or_none,
@@ -86,6 +87,10 @@ from .multi_model_agentic_forest import (
     _top_phrase_feature_rows,
     _write_json,
     _write_jsonl,
+)
+from .multi_model_pair_uplift import (
+    fit_bow_pair_uplift_train_test,
+    fit_htr_pair_uplift_train_test,
 )
 
 logger = logging.getLogger(__name__)
@@ -205,6 +210,48 @@ class MultiModelForestStage1HTRProvider(MultiModelHTREvidenceProvider):
         runner = self._ensure_runner(discovery_df)
         with self._temporary_effect_objective(effect_objective):
             return runner._crossfit_effect(discovery_df, nuisance_predictions, outer_fold)
+
+    def fit_pair_uplift_inner_ensemble_predict(
+        self,
+        *,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        texts_train: Sequence[str],
+        texts_test: Sequence[str],
+        y_train: np.ndarray,
+        t_train: np.ndarray,
+        e_train: np.ndarray,
+        m_train: np.ndarray,
+        e_test: np.ndarray,
+        m_test: np.ndarray,
+        outer_fold: int,
+        propensity_caliper: float,
+        outcome_caliper: float,
+        max_controls_per_candidate: int,
+        nearest_fallback_controls: int,
+        max_attention_pairs: int,
+    ) -> Any:
+        runner = self._ensure_runner(train_df)
+        return fit_htr_pair_uplift_train_test(
+            runner=runner,
+            train_df=train_df,
+            test_df=test_df,
+            texts_train=texts_train,
+            texts_test=texts_test,
+            y_train=y_train,
+            t_train=t_train,
+            e_train=e_train,
+            m_train=m_train,
+            e_test=e_test,
+            m_test=m_test,
+            outer_fold=outer_fold,
+            effect_folds=runner.avf_config.effect_folds,
+            propensity_caliper=propensity_caliper,
+            outcome_caliper=outcome_caliper,
+            max_controls_per_candidate=max_controls_per_candidate,
+            nearest_fallback_controls=nearest_fallback_controls,
+            max_attention_pairs=max_attention_pairs,
+        )
 
     def fit_nuisance_inner_ensemble_predict(
         self,
@@ -1427,6 +1474,251 @@ class MultiModelForestStage1Runner:
             )
         )
 
+        bow_pair_uplift_results: List[Dict[str, Any]] = []
+        if self._matched_pair_bow_enabled():
+            for view_index, view in enumerate(self.nn_config.bow_views):
+                try:
+                    pair_result = fit_bow_pair_uplift_train_test(
+                        train_df=train_df,
+                        test_df=test_df,
+                        texts_train=texts_train,
+                        texts_test=texts_test,
+                        y_train=y,
+                        t_train=t,
+                        e_train=e_train,
+                        m_train=m_train,
+                        e_test=e_test,
+                        m_test=m_test,
+                        vectorizer_params=_vectorizer_params(view),
+                        model_params=_model_params(view),
+                        outer_fold=outer_fold,
+                        view_name=view.name,
+                        view_index=view_index,
+                        effect_folds=int(self.nn_config.effect_folds),
+                        propensity_caliper=float(
+                            self.nn_config.matched_pair_propensity_caliper
+                        ),
+                        outcome_caliper=float(self.nn_config.matched_pair_outcome_caliper),
+                        max_controls_per_candidate=int(
+                            self.nn_config.matched_pair_max_controls_per_candidate
+                        ),
+                        nearest_fallback_controls=int(
+                            self.nn_config.matched_pair_nearest_fallback_controls
+                        ),
+                        l2_alpha=float(self.nn_config.matched_pair_bow_l2_alpha),
+                        max_iter=int(self.nn_config.matched_pair_bow_max_iter),
+                        top_n=int(self.nn_config.top_n_features),
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "Outer fold %s BoW matched-pair uplift failed for view=%s: %s",
+                        outer_fold,
+                        view.name,
+                        exc,
+                    )
+                    inner_model_rows.append(
+                        {
+                            "outer_fold": int(outer_fold),
+                            "source_family": "bow_pair_uplift",
+                            "view_name": view.name,
+                            "objective": "matched_pair_uplift_delta_logit",
+                            "skipped": "exception",
+                            "error": str(exc),
+                        }
+                    )
+                    continue
+                inner_model_rows.extend(pair_result.evidence_rows)
+                if not pair_result.prediction_frame.empty:
+                    prediction_frames.append(pair_result.prediction_frame)
+                _append_feature(
+                    x_train_cols,
+                    x_test_cols,
+                    x_names,
+                    feature_rows,
+                    train=pair_result.train_delta_logit,
+                    test=pair_result.test_delta_logit,
+                    name=f"bow__{view.name}__matched_pair_uplift_delta_logit",
+                    role="X",
+                    source_family="bow_pair_uplift",
+                    outer_fold=outer_fold,
+                    objective="matched_pair_uplift_delta_logit",
+                    provenance="inner_oof_pair_model_outer_test_inner_ensemble",
+                    view_config=_bow_view_to_dict(view),
+                )
+                _append_feature(
+                    x_train_cols,
+                    x_test_cols,
+                    x_names,
+                    feature_rows,
+                    train=pair_result.train_pred_prob,
+                    test=pair_result.test_pred_prob,
+                    name=f"bow__{view.name}__matched_pair_treated_outcome_prob",
+                    role="X",
+                    source_family="bow_pair_uplift",
+                    outer_fold=outer_fold,
+                    objective="matched_pair_treated_outcome_probability",
+                    provenance="inner_oof_pair_model_outer_test_inner_ensemble",
+                    view_config=_bow_view_to_dict(view),
+                )
+                metrics[f"bow_pair_uplift_{view.name}_treated_oof_auroc"] = (
+                    pair_result.metrics.get("treated_oof", {}).get("auroc")
+                )
+                metrics[f"bow_pair_uplift_{view.name}_n_train_matched_pairs"] = (
+                    pair_result.metrics.get("n_train_matched_pairs")
+                )
+                prediction_frames.append(
+                    _source_prediction_frame(
+                        train_df,
+                        test_df,
+                        outer_fold=outer_fold,
+                        source_name=f"bow__{view.name}__matched_pair_uplift",
+                        values={
+                            "uplift_delta_logit": (
+                                pair_result.train_delta_logit,
+                                pair_result.test_delta_logit,
+                            ),
+                            "treated_outcome_prob": (
+                                pair_result.train_pred_prob,
+                                pair_result.test_pred_prob,
+                            ),
+                            "matched_control_count": (
+                                pair_result.train_n_controls,
+                                pair_result.test_n_controls,
+                            ),
+                        },
+                    )
+                )
+                bow_pair_uplift_results.append(
+                    {
+                        "metrics": pair_result.metrics,
+                        "importance": pair_result.feature_importance,
+                        "view": view,
+                        "view_name": f"pair_uplift__{view.name}",
+                        "view_index": int(view_index),
+                    }
+                )
+
+        htr_pair_uplift_result = None
+        if self._matched_pair_htr_enabled() and self._htr_enabled():
+            htr_provider = self._htr_provider()
+            if hasattr(htr_provider, "fit_pair_uplift_inner_ensemble_predict"):
+                try:
+                    htr_pair_uplift_result = htr_provider.fit_pair_uplift_inner_ensemble_predict(
+                        train_df=train_df,
+                        test_df=test_df,
+                        texts_train=texts_train,
+                        texts_test=texts_test,
+                        y_train=y,
+                        t_train=t,
+                        e_train=e_train,
+                        m_train=m_train,
+                        e_test=e_test,
+                        m_test=m_test,
+                        outer_fold=outer_fold,
+                        propensity_caliper=float(
+                            self.nn_config.matched_pair_propensity_caliper
+                        ),
+                        outcome_caliper=float(self.nn_config.matched_pair_outcome_caliper),
+                        max_controls_per_candidate=int(
+                            self.nn_config.matched_pair_max_controls_per_candidate
+                        ),
+                        nearest_fallback_controls=int(
+                            self.nn_config.matched_pair_nearest_fallback_controls
+                        ),
+                        max_attention_pairs=int(
+                            self.nn_config.matched_pair_htr_attention_pairs_per_fold
+                        ),
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "Outer fold %s HTR matched-pair uplift failed: %s",
+                        outer_fold,
+                        exc,
+                    )
+                    inner_model_rows.append(
+                        {
+                            "outer_fold": int(outer_fold),
+                            "source_family": "htr_pair_uplift",
+                            "objective": "matched_pair_uplift_delta_logit",
+                            "skipped": "exception",
+                            "error": str(exc),
+                        }
+                    )
+            else:
+                logger.info(
+                    "Skipping HTR matched-pair uplift: provider %s does not implement "
+                    "fit_pair_uplift_inner_ensemble_predict",
+                    type(htr_provider).__name__,
+                )
+            if htr_pair_uplift_result is not None:
+                inner_model_rows.extend(htr_pair_uplift_result.evidence_rows)
+                if not htr_pair_uplift_result.prediction_frame.empty:
+                    prediction_frames.append(htr_pair_uplift_result.prediction_frame)
+                _append_feature(
+                    x_train_cols,
+                    x_test_cols,
+                    x_names,
+                    feature_rows,
+                    train=htr_pair_uplift_result.train_delta_logit,
+                    test=htr_pair_uplift_result.test_delta_logit,
+                    name="htr__matched_pair_uplift_delta_logit",
+                    role="X",
+                    source_family="htr_pair_uplift",
+                    outer_fold=outer_fold,
+                    objective="matched_pair_uplift_delta_logit",
+                    provenance="inner_oof_pair_model_outer_test_inner_ensemble",
+                )
+                _append_feature(
+                    x_train_cols,
+                    x_test_cols,
+                    x_names,
+                    feature_rows,
+                    train=htr_pair_uplift_result.train_pred_prob,
+                    test=htr_pair_uplift_result.test_pred_prob,
+                    name="htr__matched_pair_treated_outcome_prob",
+                    role="X",
+                    source_family="htr_pair_uplift",
+                    outer_fold=outer_fold,
+                    objective="matched_pair_treated_outcome_probability",
+                    provenance="inner_oof_pair_model_outer_test_inner_ensemble",
+                )
+                metrics["htr_pair_uplift_treated_oof_auroc"] = (
+                    htr_pair_uplift_result.metrics.get("treated_oof", {}).get("auroc")
+                )
+                prediction_frames.append(
+                    _source_prediction_frame(
+                        train_df,
+                        test_df,
+                        outer_fold=outer_fold,
+                        source_name="htr__matched_pair_uplift",
+                        values={
+                            "uplift_delta_logit": (
+                                htr_pair_uplift_result.train_delta_logit,
+                                htr_pair_uplift_result.test_delta_logit,
+                            ),
+                            "treated_outcome_prob": (
+                                htr_pair_uplift_result.train_pred_prob,
+                                htr_pair_uplift_result.test_pred_prob,
+                            ),
+                            "matched_control_count": (
+                                htr_pair_uplift_result.train_n_controls,
+                                htr_pair_uplift_result.test_n_controls,
+                            ),
+                        },
+                    )
+                )
+                htr_pair_attention = [
+                    dict(row) for row in htr_pair_uplift_result.attention_rows or []
+                ]
+                for row in htr_pair_attention:
+                    row.setdefault("model_family", "htr_pair_uplift")
+                    row.setdefault("target_source", "matched_pair_uplift_delta_logit")
+                htr_evidence["pair_uplift"] = {
+                    "metrics": htr_pair_uplift_result.metrics,
+                    "attention": htr_pair_attention,
+                    "objective": "matched_pair_uplift_delta_logit",
+                }
+
         if self._bow_enabled():
             for view_index, view in enumerate(self.nn_config.bow_views):
                 pseudo_train, pseudo_test, fold_rows = self._fit_bow_regression_train_test(
@@ -1648,6 +1940,18 @@ class MultiModelForestStage1Runner:
             top_n=int(self.nn_config.top_n_features),
         )
         importance["feature_discovery_methods"] = self._enabled_feature_discovery_methods()
+        if bow_pair_uplift_results:
+            pair_importance = _multi_view_importance(
+                bow_pair_uplift_results,
+                top_n=int(self.nn_config.top_n_features),
+            )
+            pair_importance["target_source"] = "matched_pair_uplift_delta_logit"
+            pair_importance["pair_uplift_construction"] = (
+                "Observed treated/control outer-train patients are matched on "
+                "honest ensemble propensity and outcome probabilities; pair models "
+                "predict a delta logit added to the matched untreated outcome logit."
+            )
+            importance["matched_pair_uplift"] = pair_importance
         if ensemble_view_results:
             ensemble_importance = _multi_view_importance(
                 ensemble_view_results,
@@ -1921,6 +2225,41 @@ class MultiModelForestStage1Runner:
         embedding_evidence: Optional[Dict[str, Any]] = None,
         htr_evidence: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        agent_context_mode = str(
+            getattr(self.nn_config, "agent_context_mode", "evidence_digest") or ""
+        ).strip().lower()
+        if agent_context_mode == "evidence_digest":
+            context = _build_evidence_digest_agent_context(
+                outer_fold=outer_fold,
+                feature_discovery_methods=self._enabled_feature_discovery_methods(),
+                max_proposals=int(self.nn_config.candidate_proposals_per_fold),
+                clinical_question=self.config.clinical_question,
+                treatment_column=self.config.treatment_column,
+                outcome_column=self.config.outcome_column,
+                outcome_type=self.config.outcome_type,
+                current_features=[],
+                metrics=metrics,
+                importance=importance,
+                clinical_text_examples=_clinical_text_examples(
+                    discovery_df,
+                    self.config.text_column,
+                    n_examples=self.search_config.clinical_text_examples_per_prompt,
+                    max_chars=self.search_config.clinical_text_example_chars,
+                ),
+                embedding_evidence=embedding_evidence,
+                htr_evidence=htr_evidence,
+                handoff_provenance={
+                    "source": "multi_model_forest_stage1_primary_text_models",
+                    "raw_text_modeling_reused_for_agentic_stage": True,
+                },
+            )
+            prompt_chars = len(json.dumps(context, separators=(",", ":"), default=str))
+            logger.info(
+                "Multi-model forest primary evidence-digest context outer_fold=%s: %.1fK JSON chars",
+                outer_fold,
+                prompt_chars / 1000.0,
+            )
+            return context
         instructions = [
             "You are generating candidate variables from empirical text evidence.",
             "The evidence was produced during Stage 1 primary text-model forest training.",
@@ -1941,6 +2280,12 @@ class MultiModelForestStage1Runner:
         if self._htr_enabled():
             instructions.append(
                 "Use htr_attention_evidence from the Stage 1 HTR nuisance and R-stage models as neural text evidence."
+            )
+        if self._matched_pair_uplift_enabled():
+            instructions.append(
+                "Use matched_pair_uplift evidence as direct effect-modifier evidence: "
+                "BoW uplift coefficients and HTR pair-uplift attention are trained on "
+                "treated/control matched pairs and target treated-patient outcome under treatment."
             )
         context: Dict[str, Any] = {
             "prompt_version": "multi_model_agentic_forest_v1",
@@ -2093,6 +2438,7 @@ class MultiModelForestStage1Runner:
         )
         vectorizer_params = _vectorizer_params(view)
         model_params = _model_params(view)
+        e_clip = float(self.nn_config.e_clip)
         n_jobs = self._fold_n_jobs(len(split_items))
         logger.info(
             "Outer fold %s BoW binary %s view=%s model=%s folds=%s n_jobs=%s " "backend=%s",
@@ -2128,13 +2474,13 @@ class MultiModelForestStage1Runner:
                 test_pred = model.predict_proba(x_test)[:, 1]
             heldout_pred = np.clip(
                 heldout_pred,
-                self.nn_config.e_clip,
-                1.0 - self.nn_config.e_clip,
+                e_clip,
+                1.0 - e_clip,
             )
             test_pred = np.clip(
                 test_pred,
-                self.nn_config.e_clip,
-                1.0 - self.nn_config.e_clip,
+                e_clip,
+                1.0 - e_clip,
             )
             return {
                 "fold": int(fold),
@@ -2891,6 +3237,25 @@ class MultiModelForestStage1Runner:
 
     def _embedding_contrast_enabled(self) -> bool:
         return bool(getattr(self.nn_config.embedding_contrast, "enabled", False))
+
+    def _matched_pair_uplift_enabled(self) -> bool:
+        if str(self.config.outcome_type).lower() == "continuous":
+            return False
+        return bool(getattr(self.nn_config, "matched_pair_uplift_enabled", True))
+
+    def _matched_pair_bow_enabled(self) -> bool:
+        return (
+            self._matched_pair_uplift_enabled()
+            and self._bow_enabled()
+            and bool(getattr(self.nn_config, "matched_pair_bow_enabled", True))
+        )
+
+    def _matched_pair_htr_enabled(self) -> bool:
+        return (
+            self._matched_pair_uplift_enabled()
+            and self._htr_enabled()
+            and bool(getattr(self.nn_config, "matched_pair_htr_enabled", True))
+        )
 
     def _embedding_generator(self) -> EmbeddingContrastEvidenceGenerator:
         if self.embedding_evidence_generator is None:

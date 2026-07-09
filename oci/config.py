@@ -597,7 +597,7 @@ class AgenticFeatureSearchConfig:
     max_iterations: int = 3
     max_additions_per_iter: int = 6
     max_removals_per_iter: int = 3
-    min_feature_coverage: float = 0.70
+    min_feature_coverage: float = 0.0
     search_mode: str = "broad_screen"
     broad_candidate_count: int = 80
     broad_screen_top_k: int = 20
@@ -933,7 +933,10 @@ class MultiModelAgenticForestConfig:
     prespecified_features_json: Optional[str] = None
     e_clip: float = 0.01
     top_n_features: int = 100
-    candidate_proposals_per_fold: int = 30
+    candidate_proposals_per_fold: int = 60
+    # "evidence_digest" gives agents compact role-specific evidence blurbs by
+    # default. "rich_context" preserves the older full compacted evidence object.
+    agent_context_mode: str = "evidence_digest"
     concept_inventory_enabled: bool = True
     concept_inventory_max_concepts: int = 60
     candidate_consistency_enabled: bool = True
@@ -1047,6 +1050,13 @@ class MultiModelAgenticForestConfig:
             raise ValueError("multi_model_agentic_forest.top_n_features must be >= 1")
         if self.candidate_proposals_per_fold < 1:
             raise ValueError("multi_model_agentic_forest.candidate_proposals_per_fold must be >= 1")
+        agent_context_mode = str(self.agent_context_mode or "").strip().lower()
+        if agent_context_mode not in {"evidence_digest", "rich_context"}:
+            raise ValueError(
+                "multi_model_agentic_forest.agent_context_mode must be "
+                "'evidence_digest' or 'rich_context'"
+            )
+        self.agent_context_mode = agent_context_mode
         if self.concept_inventory_max_concepts < 1:
             raise ValueError("multi_model_agentic_forest.concept_inventory_max_concepts must be >= 1")
         if self.candidate_consistency_inner_folds < 2:
@@ -1195,6 +1205,21 @@ class MultiModelForestConfig(MultiModelAgenticForestConfig):
     # parallelism flags.
     cpus_total: Optional[int] = None
     htr_jobs_per_gpu: int = 1
+    # Matched-pair uplift evidence. Inner folds fit pair-level models on
+    # observed treated/control matches from the outer-train fold; outer-test
+    # patients are scored as candidate treated patients against similar
+    # untreated outer-train controls. The model output is a delta logit added
+    # to the matched untreated patient's outcome logit.
+    matched_pair_uplift_enabled: bool = True
+    matched_pair_bow_enabled: bool = True
+    matched_pair_htr_enabled: bool = True
+    matched_pair_propensity_caliper: float = 0.05
+    matched_pair_outcome_caliper: float = 0.05
+    matched_pair_max_controls_per_candidate: int = 3
+    matched_pair_nearest_fallback_controls: int = 1
+    matched_pair_bow_l2_alpha: float = 1.0
+    matched_pair_bow_max_iter: int = 100
+    matched_pair_htr_attention_pairs_per_fold: int = 16
 
     def __post_init__(self):
         super().__post_init__()
@@ -1224,6 +1249,43 @@ class MultiModelForestConfig(MultiModelAgenticForestConfig):
             raise ValueError("multi_model_forest.htr_jobs_per_gpu must be >= 1")
         self.cpus_total = None if self.cpus_total is None else int(self.cpus_total)
         self.htr_jobs_per_gpu = int(self.htr_jobs_per_gpu)
+        if not 0.0 < float(self.matched_pair_propensity_caliper) <= 1.0:
+            raise ValueError(
+                "multi_model_forest.matched_pair_propensity_caliper must be in (0, 1]"
+            )
+        if not 0.0 < float(self.matched_pair_outcome_caliper) <= 1.0:
+            raise ValueError(
+                "multi_model_forest.matched_pair_outcome_caliper must be in (0, 1]"
+            )
+        if int(self.matched_pair_max_controls_per_candidate) < 1:
+            raise ValueError(
+                "multi_model_forest.matched_pair_max_controls_per_candidate must be >= 1"
+            )
+        if int(self.matched_pair_nearest_fallback_controls) < 0:
+            raise ValueError(
+                "multi_model_forest.matched_pair_nearest_fallback_controls must be >= 0"
+            )
+        if float(self.matched_pair_bow_l2_alpha) < 0.0:
+            raise ValueError("multi_model_forest.matched_pair_bow_l2_alpha must be >= 0")
+        if int(self.matched_pair_bow_max_iter) < 1:
+            raise ValueError("multi_model_forest.matched_pair_bow_max_iter must be >= 1")
+        if int(self.matched_pair_htr_attention_pairs_per_fold) < 0:
+            raise ValueError(
+                "multi_model_forest.matched_pair_htr_attention_pairs_per_fold must be >= 0"
+            )
+        self.matched_pair_propensity_caliper = float(self.matched_pair_propensity_caliper)
+        self.matched_pair_outcome_caliper = float(self.matched_pair_outcome_caliper)
+        self.matched_pair_max_controls_per_candidate = int(
+            self.matched_pair_max_controls_per_candidate
+        )
+        self.matched_pair_nearest_fallback_controls = int(
+            self.matched_pair_nearest_fallback_controls
+        )
+        self.matched_pair_bow_l2_alpha = float(self.matched_pair_bow_l2_alpha)
+        self.matched_pair_bow_max_iter = int(self.matched_pair_bow_max_iter)
+        self.matched_pair_htr_attention_pairs_per_fold = int(
+            self.matched_pair_htr_attention_pairs_per_fold
+        )
 
 
 @dataclass

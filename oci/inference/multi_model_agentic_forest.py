@@ -90,6 +90,12 @@ _AGENT_PROMPT_CONCEPT_TOP_N = 8
 _AGENT_PROMPT_HTR_ROWS_PER_STAGE = 36
 _AGENT_PROMPT_HTR_SNIPPET_CHARS = 500
 _AGENT_PROMPT_HTR_SUMMARY_CHARS = 320
+_EVIDENCE_DIGEST_PROMPT_VERSION = "multi_model_agentic_evidence_digest_v1"
+_EVIDENCE_DIGEST_ROLE_PROMPT_VERSION = "multi_model_agentic_evidence_digest_role_v1"
+_EVIDENCE_DIGEST_BOW_ROWS_PER_LIST = 12
+_EVIDENCE_DIGEST_EMBEDDING_CONTRASTS_PER_ROLE = 12
+_EVIDENCE_DIGEST_TEXT_BLURBS_MAX = 80
+_EVIDENCE_DIGEST_TEXT_BLURB_CHARS = 1800
 _CONCEPT_INVENTORY_SCHEMA_VERSION = "multi_model_agentic_clustered_concept_inventory_v2"
 _CONCEPT_CLUSTER_LABEL_PROMPT_VERSION = "multi_model_agentic_cluster_labeling_v2"
 _CONCEPT_CLUSTER_MAX_AGENT_CLUSTERS = 120
@@ -1749,6 +1755,40 @@ class MultiModelAgenticForestRunner:
         htr_evidence: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         enabled_methods = self._enabled_feature_discovery_methods()
+        if self._evidence_digest_prompt_enabled():
+            context = _build_evidence_digest_agent_context(
+                outer_fold=outer_fold,
+                feature_discovery_methods=enabled_methods,
+                max_proposals=int(self.nn_config.candidate_proposals_per_fold),
+                clinical_question=self.config.clinical_question,
+                treatment_column=self.config.treatment_column,
+                outcome_column=self.config.outcome_column,
+                outcome_type=self.config.outcome_type,
+                current_features=[_spec_to_dict(spec) for spec in self._initial_specs()],
+                metrics=metrics,
+                importance=importance,
+                clinical_text_examples=_clinical_text_examples(
+                    discovery_df,
+                    self.config.text_column,
+                    n_examples=self.search_config.clinical_text_examples_per_prompt,
+                    max_chars=self.search_config.clinical_text_example_chars,
+                ),
+                embedding_evidence=embedding_evidence,
+                htr_evidence=htr_evidence,
+                handoff_provenance={
+                    "source": "multi_model_agentic_forest_text_models",
+                    "raw_text_modeling_reused_for_agentic_stage": True,
+                },
+            )
+            prompt_chars = len(
+                json.dumps(context, separators=(",", ":"), default=_json_default)
+            )
+            logger.info(
+                "Multi-model evidence-digest context outer_fold=%s: %.1fK JSON chars",
+                outer_fold,
+                prompt_chars / 1000.0,
+            )
+            return context
         instructions = [
             "You are generating candidate variables from empirical text "
             "evidence. The workflow will validate extraction quality, signal, "
@@ -1874,6 +1914,17 @@ class MultiModelAgenticForestRunner:
 
     def _htr_evidence_enabled(self) -> bool:
         return bool(getattr(self.nn_config, "htr_evidence_enabled", True))
+
+    def _agent_context_mode(self) -> str:
+        mode = str(getattr(self.nn_config, "agent_context_mode", "evidence_digest") or "")
+        mode = mode.strip().lower()
+        return mode if mode in {"evidence_digest", "rich_context"} else "evidence_digest"
+
+    def _evidence_digest_prompt_enabled(self) -> bool:
+        return self._agent_context_mode() == "evidence_digest"
+
+    def _role_proposal_cap(self) -> int:
+        return max(1, (int(self.nn_config.candidate_proposals_per_fold) + 1) // 2)
 
     def _enabled_feature_discovery_methods(self) -> List[str]:
         methods: List[str] = []
@@ -2051,7 +2102,11 @@ class MultiModelAgenticForestRunner:
     def _artifact_agent_context(self, context: Dict[str, Any]) -> Dict[str, Any]:
         if self.search_config.save_agent_context:
             return context
-        if "embedding_contrast_evidence" not in context and "htr_attention_evidence" not in context:
+        if (
+            "embedding_contrast_evidence" not in context
+            and "htr_attention_evidence" not in context
+            and "evidence_digest" not in context
+        ):
             return context
         artifact_context = dict(context)
         if "embedding_contrast_evidence" in context:
@@ -2061,6 +2116,10 @@ class MultiModelAgenticForestRunner:
         if "htr_attention_evidence" in context:
             artifact_context["htr_attention_evidence"] = _redact_htr_attention_evidence(
                 context["htr_attention_evidence"]
+            )
+        if "evidence_digest" in context:
+            artifact_context["evidence_digest"] = _redact_evidence_digest(
+                context["evidence_digest"]
             )
         return artifact_context
 
@@ -2100,25 +2159,13 @@ class MultiModelAgenticForestRunner:
             self.agent_rows.append(row)
             return selected_specs
 
-        concept_inventory = self._run_concept_inventory(
+        bundle = self._propose_candidate_bundle(
             outer_fold=outer_fold,
             scope="full_outer_train",
             bow_context=bow_context,
             n_rows=len(discovery_df),
         )
-        proposal_context = self._proposal_context_with_concept_inventory(
-            bow_context,
-            concept_inventory,
-        )
-        raw_proposals = self.proposal_agent.propose(proposal_context)
-        proposal_agent_trace = _get_agent_response_trace(self.proposal_agent)
-        proposals, rejected = validate_agentic_proposals(
-            raw_proposals,
-            current_specs=self._initial_specs(),
-            search_config=self.search_config,
-            allow_removals=False,
-            max_additions=self.nn_config.candidate_proposals_per_fold,
-        )
+        proposals = list(bundle.get("valid_proposals", []) or [])
         proposals, alias_resolution = self._resolve_proposal_aliases(
             outer_fold=outer_fold,
             proposals=proposals,
@@ -2146,7 +2193,8 @@ class MultiModelAgenticForestRunner:
         self._remember_alias_reference_specs(selected_specs)
         row: Dict[str, Any] = {
             "outer_fold": int(outer_fold),
-            "raw_proposals": raw_proposals,
+            "prompt_context_mode": self._agent_context_mode(),
+            "raw_proposals": bundle.get("raw_proposals"),
             "alias_resolution": alias_resolution,
             "value_harmonization": value_harmonization,
             "valid_proposals": [
@@ -2162,15 +2210,22 @@ class MultiModelAgenticForestRunner:
                 }
                 for proposal in proposals
             ],
-            "rejected_proposals": rejected,
+            "rejected_proposals": bundle.get("rejected_proposals", []),
             "selected_features": [_spec_to_dict(spec) for spec in selected_specs],
         }
-        if concept_inventory is not None:
-            row["concept_inventory"] = _concept_inventory_artifact(concept_inventory)
+        for key in ["raw_proposals_by_role", "role_candidate_caps", "prompt_versions"]:
+            if key in bundle:
+                row[key] = bundle[key]
+        if bundle.get("concept_inventory") is not None:
+            row["concept_inventory"] = bundle.get("concept_inventory")
         if self.search_config.save_agent_context:
-            row["context"] = proposal_context
+            for key in ["context", "contexts_by_role"]:
+                if key in bundle:
+                    row[key] = bundle[key]
         if self.search_config.save_agent_raw_output:
-            row["agent_raw_output"] = proposal_agent_trace
+            for key in ["agent_raw_output", "agent_raw_output_by_role"]:
+                if key in bundle:
+                    row[key] = bundle[key]
         self.agent_rows.append(row)
         self._write_selected_specs_cache(
             outer_fold=outer_fold,
@@ -2323,6 +2378,16 @@ class MultiModelAgenticForestRunner:
         if cached is not None:
             return cached
 
+        if self._evidence_digest_prompt_enabled():
+            return self._propose_digest_candidate_bundle(
+                outer_fold=outer_fold,
+                scope=scope,
+                bow_context=bow_context,
+                n_rows=n_rows,
+                inner_fold=inner_fold,
+                heldout_rows=heldout_rows,
+            )
+
         concept_inventory = self._run_concept_inventory(
             outer_fold=outer_fold,
             scope=scope,
@@ -2350,6 +2415,8 @@ class MultiModelAgenticForestRunner:
             "inner_fold": inner_fold,
             "n_rows": int(n_rows),
             "heldout_rows": None if heldout_rows is None else int(heldout_rows),
+            "prompt_context_mode": self._agent_context_mode(),
+            "prompt_versions": [str(proposal_context.get("prompt_version") or "")],
             "raw_proposals": raw_proposals,
             "valid_proposals": proposals,
             "rejected_proposals": rejected,
@@ -2360,6 +2427,79 @@ class MultiModelAgenticForestRunner:
             bundle["context"] = proposal_context
         if self.search_config.save_agent_raw_output:
             bundle["agent_raw_output"] = proposal_agent_trace
+        self._write_proposal_bundle_cache(bundle)
+        return bundle
+
+    def _propose_digest_candidate_bundle(
+        self,
+        *,
+        outer_fold: int,
+        scope: str,
+        bow_context: Dict[str, Any],
+        n_rows: int,
+        inner_fold: Optional[int] = None,
+        heldout_rows: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if not isinstance(bow_context.get("evidence_digest"), dict):
+            bow_context = _evidence_digest_context_from_rich_context(bow_context)
+        role_cap = self._role_proposal_cap()
+        raw_by_role: Dict[str, Any] = {}
+        context_by_role: Dict[str, Dict[str, Any]] = {}
+        trace_by_role: Dict[str, Any] = {}
+        rejected: List[Dict[str, Any]] = []
+        valid: List[AgenticFeatureProposal] = []
+
+        for role in ["confounder", "effect_modifier"]:
+            proposal_context = _evidence_digest_role_context(
+                bow_context,
+                role=role,
+                max_proposals=role_cap,
+            )
+            raw_proposals = self.proposal_agent.propose(proposal_context)
+            raw_by_role[role] = raw_proposals
+            if self.search_config.save_agent_context:
+                context_by_role[role] = proposal_context
+            if self.search_config.save_agent_raw_output:
+                trace_by_role[role] = _get_agent_response_trace(self.proposal_agent)
+            role_raw = _role_forced_raw_proposals(raw_proposals, role)
+            role_proposals, role_rejected = validate_agentic_proposals(
+                role_raw,
+                current_specs=self._initial_specs(),
+                search_config=self.search_config,
+                allow_removals=False,
+                max_additions=role_cap,
+            )
+            valid.extend(role_proposals)
+            for item in role_rejected:
+                row = dict(item)
+                row["target_role"] = role
+                rejected.append(row)
+
+        bundle: Dict[str, Any] = {
+            "outer_fold": int(outer_fold),
+            "scope": scope,
+            "inner_fold": inner_fold,
+            "n_rows": int(n_rows),
+            "heldout_rows": None if heldout_rows is None else int(heldout_rows),
+            "prompt_context_mode": self._agent_context_mode(),
+            "prompt_versions": [_EVIDENCE_DIGEST_ROLE_PROMPT_VERSION],
+            "role_candidate_caps": {
+                "confounder": int(role_cap),
+                "effect_modifier": int(role_cap),
+            },
+            "raw_proposals_by_role": raw_by_role,
+            "raw_proposals": [
+                proposal
+                for role in ["confounder", "effect_modifier"]
+                for proposal in _role_forced_raw_proposals(raw_by_role.get(role), role)
+            ],
+            "valid_proposals": _merge_duplicate_proposals(valid),
+            "rejected_proposals": rejected,
+        }
+        if self.search_config.save_agent_context:
+            bundle["contexts_by_role"] = context_by_role
+        if self.search_config.save_agent_raw_output:
+            bundle["agent_raw_output_by_role"] = trace_by_role
         self._write_proposal_bundle_cache(bundle)
         return bundle
 
@@ -2404,7 +2544,9 @@ class MultiModelAgenticForestRunner:
         )
 
     def _concept_inventory_enabled(self) -> bool:
-        return bool(getattr(self.nn_config, "concept_inventory_enabled", True))
+        return bool(getattr(self.nn_config, "concept_inventory_enabled", True)) and not (
+            self._evidence_digest_prompt_enabled()
+        )
 
     def _build_concept_cluster_label_context(
         self,
@@ -2822,6 +2964,16 @@ class MultiModelAgenticForestRunner:
                 return None
             if bool(payload.get("consistency_enabled")) != bool(consistency_enabled):
                 return None
+            if str(payload.get("prompt_context_mode") or "") != self._agent_context_mode():
+                logger.info(
+                    "Ignoring cached Stage 2 selected specs with stale prompt context "
+                    "mode outer_fold=%s path=%s cached=%s current=%s",
+                    outer_fold,
+                    path,
+                    payload.get("prompt_context_mode"),
+                    self._agent_context_mode(),
+                )
+                return None
             selected_specs = [
                 _feature_spec_from_dict(item)
                 for item in payload.get("selected_features", [])
@@ -2862,6 +3014,7 @@ class MultiModelAgenticForestRunner:
         payload = {
             "outer_fold": int(outer_fold),
             "consistency_enabled": bool(consistency_enabled),
+            "prompt_context_mode": self._agent_context_mode(),
             "selected_features": [_spec_to_dict(spec) for spec in selected_specs],
             "agent_row": row,
         }
@@ -2890,6 +3043,18 @@ class MultiModelAgenticForestRunner:
             if int(payload.get("outer_fold", -1)) != int(outer_fold):
                 return None
             if str(payload.get("scope")) != str(scope):
+                return None
+            if str(payload.get("prompt_context_mode") or "") != self._agent_context_mode():
+                logger.info(
+                    "Ignoring cached Stage 2 proposal bundle with stale prompt context "
+                    "mode outer_fold=%s scope=%s inner_fold=%s path=%s cached=%s current=%s",
+                    outer_fold,
+                    scope,
+                    inner_fold,
+                    path,
+                    payload.get("prompt_context_mode"),
+                    self._agent_context_mode(),
+                )
                 return None
             payload_inner = payload.get("inner_fold")
             if (None if payload_inner is None else int(payload_inner)) != (
@@ -3247,30 +3412,75 @@ class MultiModelAgenticForestRunner:
         candidate_summaries: Sequence[Dict[str, Any]],
         canonical_proposals: Dict[str, AgenticFeatureProposal],
     ) -> Tuple[List[AgenticFeatureProposal], Dict[str, Any]]:
-        del context
-        selected = _fallback_consistency_proposals(
+        fallback_selected = _fallback_consistency_proposals(
             candidate_summaries,
             canonical_proposals,
         )
         max_selected = int(self.nn_config.candidate_proposals_per_fold)
-        capped = selected[:max_selected]
-        selection_method = (
+        fallback_capped = fallback_selected[:max_selected]
+        fallback_method = (
             "deterministic_consistency_gate"
             if any(
                 item.get("passes_consistency_gate")
                 for item in candidate_summaries
-                if item.get("name") in {proposal.name for proposal in capped}
+                if item.get("name") in {proposal.name for proposal in fallback_capped}
             )
             else "deterministic_full_outer_train_fallback"
         )
-        return capped, {
-            "selection_method": selection_method,
+        try:
+            raw_selection = self.proposal_agent.propose(context)
+            agent_trace = _get_agent_response_trace(self.proposal_agent)
+            selected, rejected = _agentic_consistency_selected_proposals(
+                raw_selection,
+                candidate_summaries=candidate_summaries,
+                canonical_proposals=canonical_proposals,
+                max_selected=max_selected,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Multi-model consistency selection agent failed; using deterministic fallback",
+                exc_info=True,
+            )
+            return fallback_capped, {
+                "selection_method": f"{fallback_method}_after_agent_error",
+                "agent_selection_attempted": True,
+                "agent_selection_used": False,
+                "agent_error": str(exc),
+                "max_selected_candidates": max_selected,
+                "valid_proposals": [_proposal_to_dict(p) for p in fallback_capped],
+                "rejected_proposals": [],
+                "used_fallback": True,
+            }
+
+        if selected:
+            artifact: Dict[str, Any] = {
+                "selection_method": "agentic_consistency_selection",
+                "agent_selection_attempted": True,
+                "agent_selection_used": True,
+                "max_selected_candidates": max_selected,
+                "raw_proposals": raw_selection,
+                "valid_proposals": [_proposal_to_dict(p) for p in selected],
+                "rejected_proposals": rejected,
+                "used_fallback": False,
+            }
+            if self.search_config.save_agent_raw_output:
+                artifact["agent_raw_output"] = agent_trace
+            return selected, artifact
+
+        artifact = {
+            "selection_method": f"{fallback_method}_after_empty_agent_selection",
+            "agent_selection_attempted": True,
             "agent_selection_used": False,
             "max_selected_candidates": max_selected,
-            "valid_proposals": [_proposal_to_dict(p) for p in capped],
-            "rejected_proposals": [],
-            "used_fallback": False,
+            "raw_proposals": raw_selection,
+            "agent_valid_proposals": [],
+            "valid_proposals": [_proposal_to_dict(p) for p in fallback_capped],
+            "rejected_proposals": rejected,
+            "used_fallback": True,
         }
+        if self.search_config.save_agent_raw_output:
+            artifact["agent_raw_output"] = agent_trace
+        return fallback_capped, artifact
 
     def _selected_specs_from_proposals(
         self,
@@ -4837,6 +5047,61 @@ def _fallback_consistency_proposals(
         if item.get("proposed_on_full_outer_train") and item.get("name") in canonical_proposals
     ]
     return full_supported[:1]
+
+
+def _agentic_consistency_selected_proposals(
+    raw_selection: Any,
+    *,
+    candidate_summaries: Sequence[Dict[str, Any]],
+    canonical_proposals: Dict[str, AgenticFeatureProposal],
+    max_selected: int,
+) -> Tuple[List[AgenticFeatureProposal], List[Dict[str, Any]]]:
+    allowed_names = {
+        _normalize_feature_name(item.get("name", ""))
+        for item in candidate_summaries
+        if isinstance(item, dict) and item.get("name")
+    }
+    raw_items = _raw_proposal_items(raw_selection)
+    selected: List[AgenticFeatureProposal] = []
+    rejected: List[Dict[str, Any]] = []
+    selected_names = set()
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            rejected.append({"proposal": raw, "reason": "proposal_not_object"})
+            continue
+        action = str(raw.get("action", "")).strip().lower()
+        if action == "none":
+            continue
+        if action != "add":
+            rejected.append({"proposal": raw, "reason": "invalid_selection_action"})
+            continue
+        name = _normalize_feature_name(raw.get("name", ""))
+        if not name:
+            rejected.append({"proposal": raw, "reason": "missing_name"})
+            continue
+        if name not in allowed_names:
+            rejected.append({"proposal": raw, "reason": "name_not_in_candidate_summaries"})
+            continue
+        proposal = canonical_proposals.get(name)
+        if proposal is None:
+            rejected.append({"proposal": raw, "reason": "missing_canonical_proposal"})
+            continue
+        if name in selected_names:
+            rejected.append({"proposal": raw, "reason": "duplicate_selection"})
+            continue
+        selected.append(proposal)
+        selected_names.add(name)
+        if len(selected) >= max(0, int(max_selected)):
+            break
+    return selected, rejected
+
+
+def _raw_proposal_items(raw: Any) -> List[Any]:
+    if isinstance(raw, dict) and isinstance(raw.get("proposals"), list):
+        return list(raw.get("proposals") or [])
+    if isinstance(raw, list):
+        return list(raw)
+    return []
 
 
 def _rank_consistency_summaries(
@@ -7368,6 +7633,531 @@ def _bow_view_to_dict(view: BoWViewConfig) -> Dict[str, Any]:
     }
 
 
+def _build_evidence_digest_agent_context(
+    *,
+    outer_fold: int,
+    feature_discovery_methods: Sequence[str],
+    max_proposals: int,
+    clinical_question: str,
+    treatment_column: str,
+    outcome_column: str,
+    outcome_type: str,
+    current_features: Sequence[Dict[str, Any]],
+    metrics: Dict[str, Any],
+    importance: Dict[str, Any],
+    clinical_text_examples: Sequence[str],
+    embedding_evidence: Optional[Dict[str, Any]] = None,
+    htr_evidence: Optional[Dict[str, Any]] = None,
+    handoff_provenance: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build the compact role-grouped handoff used by default for agents."""
+    del clinical_text_examples
+    context: Dict[str, Any] = {
+        "prompt_version": _EVIDENCE_DIGEST_PROMPT_VERSION,
+        "prompt_mode": "evidence_digest",
+        "outer_fold": int(outer_fold),
+        "feature_discovery_methods": list(feature_discovery_methods),
+        "max_proposals": int(max_proposals),
+        "max_proposals_per_role": max(1, (int(max_proposals) + 1) // 2),
+        "clinical_question": clinical_question,
+        "estimand": {
+            "treatment_column": treatment_column,
+            "outcome_column": outcome_column,
+            "outcome_type": outcome_type,
+        },
+        "instructions": [
+            "You are given noisy evidence blurbs from Stage 1 text models, not a full model report.",
+            "Infer explicit pre-treatment patient-level variables reflected in the blurbs and chunks.",
+            "Prefer broad recall: downstream extraction, consistency checks, and causal-forest validation will prune weak variables.",
+            "Do not propose raw tokens, patient names, identifiers, document-structure fields, or post-treatment variables.",
+            "A role-specific prompt will be created from each evidence_digest role section.",
+        ],
+        "current_features": list(current_features),
+        "model_diagnostics": _agent_visible_metrics(metrics),
+        "evidence_digest": _build_role_grouped_evidence_digest(
+            importance=importance,
+            embedding_evidence=embedding_evidence or {},
+            htr_evidence=htr_evidence or {},
+        ),
+        "response_contract": _evidence_digest_response_contract(),
+    }
+    if handoff_provenance:
+        context["handoff_provenance"] = handoff_provenance
+    return context
+
+
+def _evidence_digest_context_from_rich_context(context: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(context, dict):
+        context = {}
+    return _build_evidence_digest_agent_context(
+        outer_fold=int(context.get("outer_fold") or -1),
+        feature_discovery_methods=context.get("feature_discovery_methods") or [],
+        max_proposals=int(context.get("max_proposals") or 1),
+        clinical_question=str(context.get("clinical_question") or ""),
+        treatment_column=str((context.get("estimand") or {}).get("treatment_column") or ""),
+        outcome_column=str((context.get("estimand") or {}).get("outcome_column") or ""),
+        outcome_type=str((context.get("estimand") or {}).get("outcome_type") or "binary"),
+        current_features=context.get("current_features") or [],
+        metrics=context.get("model_diagnostics") or {},
+        importance=context.get("feature_importance") or {},
+        clinical_text_examples=[],
+        embedding_evidence=context.get("embedding_contrast_evidence") or {},
+        htr_evidence=context.get("htr_attention_evidence") or {},
+        handoff_provenance={
+            **(context.get("handoff_provenance") or {}),
+            "converted_from_rich_context": True,
+        },
+    )
+
+
+def _build_role_grouped_evidence_digest(
+    *,
+    importance: Dict[str, Any],
+    embedding_evidence: Dict[str, Any],
+    htr_evidence: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "confounders": {
+            "role": "confounder",
+            "role_definition": (
+                "Variables that appear predictive of treatment assignment and baseline outcome risk."
+            ),
+            "bow_blurbs": _bow_evidence_digest_groups(importance, role="confounder"),
+            "embedding_chunks": _embedding_evidence_digest_groups(
+                embedding_evidence,
+                role="confounder",
+            ),
+            "htr_blurbs": _htr_evidence_digest_groups(htr_evidence, role="confounder"),
+        },
+        "effect_modifiers": {
+            "role": "effect_modifier",
+            "role_definition": (
+                "Variables that appear predictive of treatment-effect heterogeneity, "
+                "R-stage pseudo-targets, residual treatment/outcome interactions, or matched-pair uplift."
+            ),
+            "bow_blurbs": _bow_evidence_digest_groups(importance, role="effect_modifier"),
+            "embedding_chunks": _embedding_evidence_digest_groups(
+                embedding_evidence,
+                role="effect_modifier",
+            ),
+            "htr_blurbs": _htr_evidence_digest_groups(htr_evidence, role="effect_modifier"),
+        },
+        "prompt_compaction": {
+            "bow_rows_per_list": _EVIDENCE_DIGEST_BOW_ROWS_PER_LIST,
+            "embedding_chunks_per_tail": _AGENT_PROMPT_EMBEDDING_CHUNKS_PER_TAIL,
+            "embedding_chunk_text_chars": _AGENT_PROMPT_EMBEDDING_CHUNK_CHARS,
+            "htr_rows_per_stage": _AGENT_PROMPT_HTR_ROWS_PER_STAGE,
+            "htr_snippet_chars": _AGENT_PROMPT_HTR_SNIPPET_CHARS,
+        },
+    }
+
+
+def _bow_evidence_digest_groups(
+    importance: Dict[str, Any],
+    *,
+    role: str,
+    source_prefix: str = "",
+) -> List[Dict[str, Any]]:
+    if not isinstance(importance, dict):
+        return []
+    groups: List[Dict[str, Any]] = []
+
+    role_keys = _bow_digest_feature_keys(role)
+    for view in importance.get("views", []) or []:
+        if not isinstance(view, dict):
+            continue
+        view_name = str(view.get("view_name") or view.get("view_index") or "view")
+        for key in role_keys:
+            rows = _compact_feature_rows(
+                view.get(key, []) or [],
+                _EVIDENCE_DIGEST_BOW_ROWS_PER_LIST,
+            )
+            if not rows:
+                continue
+            groups.append(
+                {
+                    "source": f"{source_prefix}{view_name}.{key}",
+                    "view_name": view.get("view_name"),
+                    "evidence_type": key,
+                    "meaning": _bow_digest_key_description(key, role),
+                    "rows": rows,
+                }
+            )
+
+    if role == "effect_modifier":
+        for nested_key in ["ensemble_r", "matched_pair_uplift"]:
+            nested = importance.get(nested_key)
+            if isinstance(nested, dict):
+                groups.extend(
+                    _bow_evidence_digest_groups(
+                        nested,
+                        role=role,
+                        source_prefix=f"{source_prefix}{nested_key}.",
+                    )
+                )
+    return groups
+
+
+def _bow_digest_feature_keys(role: str) -> List[str]:
+    if role == "confounder":
+        return [
+            "confounder_overlap",
+            "treatment_positive",
+            "treatment_negative",
+            "outcome_positive",
+            "outcome_negative",
+        ]
+    return [
+        "pseudo_target_positive",
+        "pseudo_target_negative",
+        "uplift_pair_features",
+        "uplift_delta_logit_positive",
+        "uplift_delta_logit_negative",
+        "ridge_delta_probability_positive",
+        "ridge_delta_probability_negative",
+    ]
+
+
+def _bow_digest_key_description(key: str, role: str) -> str:
+    descriptions = {
+        "confounder_overlap": "Terms predictive of both treatment and outcome nuisance models.",
+        "treatment_positive": "Terms positively associated with treatment assignment.",
+        "treatment_negative": "Terms negatively associated with treatment assignment.",
+        "outcome_positive": "Terms positively associated with outcome risk.",
+        "outcome_negative": "Terms negatively associated with outcome risk.",
+        "pseudo_target_positive": "Terms positively associated with the R-stage pseudo-target.",
+        "pseudo_target_negative": "Terms negatively associated with the R-stage pseudo-target.",
+        "uplift_pair_features": "Matched-pair uplift terms from paired treated/control patients.",
+        "uplift_delta_logit_positive": "Terms increasing matched-pair treated outcome delta logit.",
+        "uplift_delta_logit_negative": "Terms decreasing matched-pair treated outcome delta logit.",
+        "ridge_delta_probability_positive": "Terms increasing matched-pair treated outcome delta probability.",
+        "ridge_delta_probability_negative": "Terms decreasing matched-pair treated outcome delta probability.",
+    }
+    return descriptions.get(key, f"Top BoW evidence for {role}.")
+
+
+def _embedding_evidence_digest_groups(
+    evidence: Dict[str, Any],
+    *,
+    role: str,
+) -> List[Dict[str, Any]]:
+    if not isinstance(evidence, dict):
+        return []
+    compact = _compact_embedding_contrast_evidence(evidence)
+    groups: List[Dict[str, Any]] = []
+    for contrast in compact.get("contrasts", []) or []:
+        if not isinstance(contrast, dict):
+            continue
+        if not _embedding_contrast_matches_role(contrast, role):
+            continue
+        item = {
+            key: contrast.get(key)
+            for key in [
+                "name",
+                "positive_label",
+                "negative_label",
+                "role_hint",
+                "contrast_family",
+                "probe_auc",
+                "direction_source",
+                "score_formula",
+            ]
+            if key in contrast
+        }
+        for chunk_key in [
+            "positive_aligned_chunks",
+            "negative_aligned_chunks",
+            "positive_external_chunks",
+            "negative_external_chunks",
+        ]:
+            chunks = contrast.get(chunk_key) or []
+            if chunks:
+                item[chunk_key] = chunks
+        concept_scores = contrast.get("concept_probe_scores") or []
+        if concept_scores:
+            item["concept_probe_scores"] = concept_scores
+        groups.append(item)
+        if len(groups) >= _EVIDENCE_DIGEST_EMBEDDING_CONTRASTS_PER_ROLE:
+            break
+    return groups
+
+
+def _embedding_contrast_matches_role(contrast: Dict[str, Any], role: str) -> bool:
+    text = " ".join(
+        str(contrast.get(key) or "").lower()
+        for key in ["name", "role_hint", "contrast_family", "direction_source", "score_formula"]
+    )
+    if role == "confounder":
+        if "effect" in text or "modifier" in text or "interaction" in text:
+            return False
+        return any(token in text for token in ["confounder", "treatment", "outcome"])
+    return any(
+        token in text
+        for token in [
+            "effect",
+            "modifier",
+            "interaction",
+            "pseudo",
+            "r-score",
+            "r_score",
+            "orthogonal",
+            "residual",
+            "uplift",
+        ]
+    )
+
+
+def _htr_evidence_digest_groups(
+    evidence: Dict[str, Any],
+    *,
+    role: str,
+) -> List[Dict[str, Any]]:
+    if not isinstance(evidence, dict):
+        return []
+    compact = _compact_htr_attention_evidence(evidence)
+    stage_keys = ["nuisance"] if role == "confounder" else ["effect", "pair_uplift"]
+    groups = []
+    for stage_key in stage_keys:
+        stage = compact.get(stage_key)
+        if not isinstance(stage, dict):
+            continue
+        rows = stage.get("attention") or []
+        if not rows:
+            continue
+        groups.append(
+            {
+                "stage": stage_key,
+                "meaning": _htr_digest_stage_description(stage_key),
+                "metrics": stage.get("metrics") or {},
+                "rows": rows,
+            }
+        )
+    return groups
+
+
+def _htr_digest_stage_description(stage_key: str) -> str:
+    if stage_key == "nuisance":
+        return "HTR nuisance-model attention for treatment assignment and baseline outcome risk."
+    if stage_key == "pair_uplift":
+        return "HTR matched-pair uplift attention for paired treated/control outcome delta prediction."
+    return "HTR R-stage/effect-model attention for treatment-effect heterogeneity."
+
+
+def _evidence_digest_response_contract() -> Dict[str, Any]:
+    return {
+        "proposals": [
+            {
+                "action": "add",
+                "name": "snake_case_variable_name",
+                "type": "categorical|continuous",
+                "categories": ["category_a", "category_b"],
+                "roles": ["confounder|effect_modifier"],
+                "description": "exact pre-treatment extraction target",
+                "rationale": "which noisy blurbs/chunks support this variable",
+                "expected_signal": "treatment/outcome or modifier signal expected",
+            }
+        ]
+    }
+
+
+def _evidence_digest_role_context(
+    context: Dict[str, Any],
+    *,
+    role: str,
+    max_proposals: int,
+) -> Dict[str, Any]:
+    role_key = "confounders" if role == "confounder" else "effect_modifiers"
+    digest = context.get("evidence_digest") or {}
+    role_evidence = digest.get(role_key) or {}
+    return {
+        "prompt_version": _EVIDENCE_DIGEST_ROLE_PROMPT_VERSION,
+        "prompt_mode": "evidence_digest",
+        "source_prompt_version": context.get("prompt_version"),
+        "outer_fold": context.get("outer_fold"),
+        "target_role": role,
+        "max_proposals": int(max_proposals),
+        "text_blurbs": _evidence_digest_text_blurbs(role_evidence),
+        "response_contract": {
+            "proposals": [
+                {
+                    "action": "add",
+                    "name": "snake_case_variable_name",
+                    "type": "categorical|continuous",
+                    "categories": ["category_a", "category_b"],
+                    "description": "exact pre-treatment extraction target",
+                    "rationale": "which blurbs support this concept",
+                    "expected_signal": "brief description of the repeated text pattern",
+                }
+            ]
+        },
+        "handoff_provenance": context.get("handoff_provenance", {}),
+    }
+
+
+def _evidence_digest_text_blurbs(role_evidence: Dict[str, Any]) -> List[str]:
+    bow_blurbs: List[str] = []
+    embedding_blurbs: List[str] = []
+    htr_blurbs: List[str] = []
+    if not isinstance(role_evidence, dict):
+        return []
+
+    for group in role_evidence.get("bow_blurbs", []) or []:
+        if not isinstance(group, dict):
+            continue
+        row_texts = [
+            _feature_row_blurb_text(row)
+            for row in group.get("rows", []) or []
+            if isinstance(row, dict)
+        ]
+        row_texts = [text for text in row_texts if text]
+        if row_texts:
+            bow_blurbs.append(
+                _clip_text(
+                    "; ".join(row_texts),
+                    _EVIDENCE_DIGEST_TEXT_BLURB_CHARS,
+                )
+            )
+
+    for contrast in role_evidence.get("embedding_chunks", []) or []:
+        if not isinstance(contrast, dict):
+            continue
+        for chunk_key in [
+            "positive_aligned_chunks",
+            "negative_aligned_chunks",
+            "positive_external_chunks",
+            "negative_external_chunks",
+        ]:
+            for row in contrast.get(chunk_key, []) or []:
+                if not isinstance(row, dict):
+                    continue
+                text = _clip_text(row.get("text"), _EVIDENCE_DIGEST_TEXT_BLURB_CHARS)
+                if text:
+                    embedding_blurbs.append(text)
+
+    for group in role_evidence.get("htr_blurbs", []) or []:
+        if not isinstance(group, dict):
+            continue
+        for row in group.get("rows", []) or []:
+            if not isinstance(row, dict):
+                continue
+            token_text = _htr_attended_token_text(row)
+            if token_text:
+                htr_blurbs.append(token_text)
+
+    return _interleave_deduped_blurbs(
+        [bow_blurbs, htr_blurbs, embedding_blurbs],
+        limit=_EVIDENCE_DIGEST_TEXT_BLURBS_MAX,
+    )
+
+
+def _interleave_deduped_blurbs(
+    groups: Sequence[Sequence[str]],
+    *,
+    limit: int,
+) -> List[str]:
+    deduped: List[str] = []
+    seen = set()
+    max_len = max((len(group) for group in groups), default=0)
+    for index in range(max_len):
+        for group in groups:
+            if index >= len(group):
+                continue
+            blurb = str(group[index]).strip()
+            if not blurb:
+                continue
+            normalized = blurb.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(blurb)
+            if len(deduped) >= max(0, int(limit)):
+                return deduped
+    return deduped
+
+
+def _feature_row_blurb_text(row: Dict[str, Any]) -> str:
+    feature = str(row.get("feature") or "").strip()
+    return feature
+
+
+def _htr_attended_token_text(row: Dict[str, Any]) -> str:
+    spans = row.get("top_token_spans")
+    tokens: List[str] = []
+    if isinstance(spans, list):
+        for span in spans:
+            if not isinstance(span, dict):
+                continue
+            text = str(span.get("text") or span.get("token") or span.get("span") or "").strip()
+            if text and text not in tokens:
+                tokens.append(text)
+    if tokens:
+        return _clip_text("; ".join(tokens), _EVIDENCE_DIGEST_TEXT_BLURB_CHARS)
+    summary = _compact_htr_token_summary(row.get("attended_token_summary"))
+    if summary:
+        return summary
+    return _compact_htr_token_summary(row.get("evidence_snippet"))
+
+
+def _compact_htr_token_summary(value: Any) -> str:
+    text = str(value or "")
+    if not text.strip():
+        return ""
+    normalized = _normalize_text(text)
+    numeric_phrases = re.findall(
+        r"\b\d+(?:\.\d+)?\s*(?:cm|mm|mg/dl|g/dl|k/ul|u/l|%|ml/min|years?|y/o)\b",
+        normalized,
+    )
+    lexical_tokens = re.findall(r"\b[a-z][a-z0-9+/-]{2,}\b", normalized)
+    stop_words = set(ENGLISH_STOP_WORDS) | {
+        "patient",
+        "report",
+        "date",
+        "timepoint",
+        "record",
+        "note",
+        "section",
+        "redacted",
+        "provider",
+        "signature",
+        "prepared",
+        "mrn",
+        "specimen",
+        "procedure",
+        "clinical",
+        "history",
+        "findings",
+        "impression",
+    }
+    tokens: List[str] = []
+    for token in [*numeric_phrases, *lexical_tokens]:
+        token = token.strip(" -_.,;:()[]{}")
+        if not token or token in stop_words or len(token) < 3:
+            continue
+        if token not in tokens:
+            tokens.append(token)
+        if len(tokens) >= 24:
+            break
+    return _clip_text("; ".join(tokens), _AGENT_PROMPT_HTR_SUMMARY_CHARS)
+
+
+def _role_forced_raw_proposals(raw_proposals: Any, role: str) -> List[Dict[str, Any]]:
+    if isinstance(raw_proposals, dict) and isinstance(raw_proposals.get("proposals"), list):
+        raw_items = raw_proposals.get("proposals") or []
+    elif isinstance(raw_proposals, list):
+        raw_items = raw_proposals
+    else:
+        raw_items = []
+    coerced: List[Dict[str, Any]] = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        item = copy.deepcopy(raw)
+        if str(item.get("action", "add")).strip().lower() == "add":
+            item["roles"] = [role]
+        coerced.append(item)
+    return coerced
+
+
 def _compact_multi_model_agent_context(context: Dict[str, Any]) -> Dict[str, Any]:
     compact = dict(context)
     if isinstance(context.get("feature_importance"), dict):
@@ -7431,6 +8221,11 @@ def _compact_multi_model_importance(importance: Dict[str, Any]) -> Dict[str, Any
             "outcome_negative",
             "pseudo_target_positive",
             "pseudo_target_negative",
+            "uplift_pair_features",
+            "uplift_delta_logit_positive",
+            "uplift_delta_logit_negative",
+            "ridge_delta_probability_positive",
+            "ridge_delta_probability_negative",
         ]:
             compact_view[key] = _compact_feature_rows(
                 view.get(key, []) or [],
@@ -7450,10 +8245,15 @@ def _compact_multi_model_importance(importance: Dict[str, Any]) -> Dict[str, Any
     }
     if isinstance(importance.get("ensemble_r"), dict):
         compact_importance["ensemble_r"] = _compact_multi_model_importance(importance["ensemble_r"])
+    if isinstance(importance.get("matched_pair_uplift"), dict):
+        compact_importance["matched_pair_uplift"] = _compact_multi_model_importance(
+            importance["matched_pair_uplift"]
+        )
     for key in [
         "feature_discovery_methods",
         "target_source",
         "pseudo_target_construction",
+        "pair_uplift_construction",
         "nuisance_sources",
     ]:
         if key in importance:
@@ -7549,7 +8349,7 @@ def _compact_embedding_contrast_evidence(evidence: Dict[str, Any]) -> Dict[str, 
 
 def _compact_htr_attention_evidence(evidence: Dict[str, Any]) -> Dict[str, Any]:
     compact: Dict[str, Any] = {}
-    for stage_key in ["nuisance", "effect"]:
+    for stage_key in ["nuisance", "effect", "pair_uplift"]:
         stage_evidence = evidence.get(stage_key)
         if not isinstance(stage_evidence, dict):
             continue
@@ -7600,6 +8400,9 @@ def _compact_htr_attention_rows(
             "effect_objective",
             "target_source",
             "view_name",
+            "pair_side",
+            "candidate_row_id",
+            "control_row_id",
         ]:
             if key in row:
                 item[key] = _round_floats(row[key])
@@ -7619,6 +8422,10 @@ def _compact_htr_attention_rows(
             "r_loss",
             "effect_loss",
             "effect_loss_at_zero_tau",
+            "pair_delta_logit",
+            "pair_pred_prob",
+            "pair_base_prob",
+            "pair_score_abs_diff_sum",
         ]:
             if key in row:
                 item[key] = _round_floats(row[key])
@@ -7648,7 +8455,7 @@ def _compact_htr_attention_rows(
 
 def _redact_htr_attention_evidence(evidence: Dict[str, Any]) -> Dict[str, Any]:
     compact = _compact_htr_attention_evidence(evidence)
-    for stage_key in ["nuisance", "effect"]:
+    for stage_key in ["nuisance", "effect", "pair_uplift"]:
         stage_evidence = compact.get(stage_key)
         if not isinstance(stage_evidence, dict):
             continue
@@ -7670,6 +8477,40 @@ def _redact_htr_attention_evidence(evidence: Dict[str, Any]) -> Dict[str, Any]:
             redacted_rows.append(redacted)
         stage_evidence["attention"] = redacted_rows
     return compact
+
+
+def _redact_evidence_digest(digest: Dict[str, Any]) -> Dict[str, Any]:
+    redacted = copy.deepcopy(digest) if isinstance(digest, dict) else {}
+    for role_key in ["confounders", "effect_modifiers"]:
+        section = redacted.get(role_key)
+        if not isinstance(section, dict):
+            continue
+        for contrast in section.get("embedding_chunks", []) or []:
+            if not isinstance(contrast, dict):
+                continue
+            for chunk_key in [
+                "positive_aligned_chunks",
+                "negative_aligned_chunks",
+                "positive_external_chunks",
+                "negative_external_chunks",
+            ]:
+                for row in contrast.get(chunk_key, []) or []:
+                    if not isinstance(row, dict):
+                        continue
+                    if "text" in row:
+                        row["text"] = None
+                    row["text_redacted"] = True
+        for group in section.get("htr_blurbs", []) or []:
+            if not isinstance(group, dict):
+                continue
+            for row in group.get("rows", []) or []:
+                if not isinstance(row, dict):
+                    continue
+                row.pop("evidence_snippet", None)
+                row.pop("top_token_spans", None)
+                row.pop("attended_token_summary", None)
+                row["text_redacted"] = True
+    return redacted
 
 
 def _compact_feature_rows(rows: Sequence[Dict[str, Any]], top_n: int) -> List[Dict[str, Any]]:
@@ -7694,6 +8535,8 @@ def _compact_feature_rows(rows: Sequence[Dict[str, Any]], top_n: int) -> List[Di
                     "abs_outcome_score",
                     "pseudo_target_score",
                     "abs_pseudo_target_score",
+                    "uplift_delta_logit_score",
+                    "abs_uplift_delta_logit_score",
                     "supporting_view_count",
                     "supporting_views",
                     "best_abs_confounder_score",

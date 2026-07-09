@@ -1706,16 +1706,15 @@ class HierarchicalTransformerExtractor(nn.Module):
             finally:
                 self._capture_token_attention = previous_capture
         role = self._attention_role_from_stage(role) or role
-        weights = (
-            self._last_role_chunk_weights.get(role)
-            if role in {"w", "x"}
-            else self._last_chunk_weights
-        )
-        token_weights_by_chunk = (
-            self._last_role_token_weights_by_chunk.get(role, [])
-            if role in {"w", "x"}
-            else self._last_token_weights_by_chunk
-        )
+        weights = self._last_chunk_weights
+        token_weights_by_chunk = self._last_token_weights_by_chunk
+        if role in {"w", "x"}:
+            role_weights = self._last_role_chunk_weights.get(role)
+            if role_weights is not None:
+                weights = role_weights
+            role_token_weights = self._last_role_token_weights_by_chunk.get(role, [])
+            if role_token_weights:
+                token_weights_by_chunk = role_token_weights
         results = []
         flat_offsets = []
         offset = 0

@@ -2600,6 +2600,9 @@ def build_agent_prompt(
     if context.get("prompt_version") == "multi_model_agentic_forest_v1":
         return build_multi_model_agentic_forest_prompt(context, search_config)
 
+    if context.get("prompt_version") == "multi_model_agentic_evidence_digest_role_v1":
+        return build_multi_model_evidence_digest_role_prompt(context, search_config)
+
     if context.get("search_mode") == "broad_screen":
         if context.get("broad_screen_stage") == "selection":
             return build_broad_selection_agent_prompt(context, search_config)
@@ -2703,6 +2706,58 @@ Limits:
 
 Current attention-evidence context:
 {context_json}
+"""
+
+
+def build_multi_model_evidence_digest_role_prompt(
+    context: Dict[str, Any],
+    search_config: AgenticFeatureSearchConfig,
+) -> str:
+    """Render flattened evidence blurbs as a simple concept proposal prompt."""
+    del search_config
+    max_proposals = int(context.get("max_proposals") or 30)
+    blurbs = [
+        str(item).strip()
+        for item in (context.get("text_blurbs") or [])
+        if str(item).strip()
+    ]
+    blurbs_text = (
+        "\n\n".join(f"{idx}. {blurb}" for idx, blurb in enumerate(blurbs, start=1))
+        if blurbs
+        else "No usable text blurbs were supplied."
+    )
+    return f"""You are reviewing text blurbs that emerged from clinical predictive modeling.
+
+The prediction target and downstream scientific task are intentionally hidden. Do not infer or discuss them.
+
+Identify patient-level concepts that could explain why these blurbs repeatedly emerged. Convert noisy phrases, fragments, and snippets into reusable variables a downstream extractor could read from a clinical note.
+
+Return a fairly broad list: up to {max_proposals} concepts. It is better to include plausible distinct concepts than to be overly sparse; a later pipeline will extract, merge aliases, and validate them.
+
+Rules:
+- Propose concepts/variables, not raw tokens or copied phrases.
+- Ignore patient names, identifiers, accession numbers, note boilerplate, and document-section labels.
+- Keep each concept precise enough for extraction from a full clinical note.
+- Use categorical type when a small set of values is natural; use continuous type for numeric measurements.
+- If the blurbs support no reusable patient-level concept, return one proposal with action "none".
+
+Return JSON only:
+{{
+  "proposals": [
+    {{
+      "action": "add|none",
+      "name": "snake_case_variable_name",
+      "type": "categorical|continuous",
+      "categories": ["category_a", "category_b"],
+      "description": "exact extraction target",
+      "rationale": "which blurb numbers support this concept",
+      "expected_signal": "brief description of the repeated text pattern"
+    }}
+  ]
+}}
+
+Text blurbs:
+{blurbs_text}
 """
 
 

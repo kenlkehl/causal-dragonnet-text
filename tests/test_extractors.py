@@ -232,6 +232,37 @@ class TestHierarchicalTransformer:
         assert all(isinstance(row["chunk_text"], str) for row in evidence)
         assert all(0.0 <= row["attention"] <= 1.0 for row in evidence)
 
+    def test_attention_evidence_falls_back_to_shared_attention_without_role_heads(self):
+        from oci.models.hierarchical_transformer_extractor import (
+            HierarchicalTransformerExtractor,
+        )
+
+        ext = HierarchicalTransformerExtractor(
+            sentence_encoder_model="hash",
+            chunk_size_words=3,
+            chunk_overlap_words=0,
+            max_chunks=4,
+            num_transformer_layers=1,
+            num_attention_heads=2,
+            transformer_dim=32,
+            projection_dim=16,
+            hash_embedding_dim=32,
+            transformer_dropout=0.0,
+            role_attention=False,
+        )
+
+        evidence = ext.get_attention_evidence(
+            ["alpha beta gamma delta epsilon zeta eta theta"],
+            row_ids=[99],
+            fold=1,
+            stage="effect_modifier",
+            top_k=2,
+        )
+
+        assert evidence
+        assert all(row["attention_role"] == "x" for row in evidence)
+        assert any(row["attention"] > 0.0 for row in evidence)
+
     def test_split_text_into_word_chunks(self):
         from oci.models.hierarchical_transformer_extractor import split_text_into_word_chunks
 

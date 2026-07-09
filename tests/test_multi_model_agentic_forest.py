@@ -1,5 +1,6 @@
 import json
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from oci.config import (
 from oci.inference.agentic_explicit_feature_forest import (
     AgenticFeatureProposal,
     SplitEvaluation,
+    build_agent_prompt,
 )
 from oci.inference.embedding_contrast_discovery import (
     EmbeddingContrastEvidenceGenerator,
@@ -48,11 +50,13 @@ from oci.inference.multi_model_forest import (
     resolve_htr_sentence_model_snapshot,
     resolve_multi_model_forest_parallel_plan,
 )
+from oci.inference.multi_model_forest_stage1 import MultiModelForestStage1Runner
 from oci.models.concept_embedding_utils import chunk_text_words
 
 
 _CONCEPT_CLUSTER_LABEL_PROMPT_VERSION = "multi_model_agentic_cluster_labeling_v2"
 _CONCEPT_INVENTORY_SCHEMA_VERSION = "multi_model_agentic_clustered_concept_inventory_v2"
+_EVIDENCE_DIGEST_ROLE_PROMPT_VERSION = "multi_model_agentic_evidence_digest_role_v1"
 
 
 def _linear_test_bow_views() -> list[BoWViewConfig]:
@@ -137,6 +141,41 @@ class FakeProposalAgent:
                     },
                 ]
             }
+        if context.get("prompt_version") == _EVIDENCE_DIGEST_ROLE_PROMPT_VERSION:
+            if context.get("target_role") == "confounder":
+                return [
+                    {
+                        "action": "add",
+                        "name": "age",
+                        "type": "continuous",
+                        "roles": ["confounder"],
+                        "description": "Patient age at treatment initiation in years.",
+                        "rationale": "Age-bearing terms appear in treatment and outcome models.",
+                        "expected_signal": "treatment and outcome",
+                    }
+                ]
+            return [
+                {
+                    "action": "add",
+                    "name": "pd_l1_expression",
+                    "type": "categorical",
+                    "categories": ["low", "high", "unknown"],
+                    "roles": ["effect_modifier"],
+                    "description": "Pretreatment tumor PD-L1 expression category.",
+                    "rationale": "PD-L1 threshold terms appear in the modifier evidence digest.",
+                    "expected_signal": "R-stage or matched-pair uplift",
+                },
+                {
+                    "action": "add",
+                    "name": "pd_l1_expression_level",
+                    "type": "categorical",
+                    "categories": ["<1%", "1-49%", ">=50%"],
+                    "roles": ["effect_modifier"],
+                    "description": "Pretreatment tumor PD-L1 expression category.",
+                    "rationale": "PD-L1 threshold terms appear in the modifier evidence digest.",
+                    "expected_signal": "R-stage or matched-pair uplift",
+                },
+            ]
         if context.get("prompt_version") == "multi_model_agentic_alias_resolution_v1":
             return {
                 "groups": [
@@ -225,6 +264,26 @@ def _first_agent_context(agent, prompt_version: str) -> dict:
     contexts = _agent_contexts(agent, prompt_version)
     assert contexts
     return contexts[0]
+
+
+def _role_agent_context(agent, role: str) -> dict:
+    contexts = [
+        context
+        for context in _agent_contexts(agent, _EVIDENCE_DIGEST_ROLE_PROMPT_VERSION)
+        if context.get("target_role") == role
+    ]
+    assert contexts
+    return contexts[0]
+
+
+def _digest_source_label_in_blurb(blurb: str) -> bool:
+    labels = [
+        "BoW top features:",
+        "HTR attended tokens:",
+        "Retrieved text blurb:",
+        "Model phrase cluster:",
+    ]
+    return any(label in str(blurb) for label in labels)
 
 
 class ReviewRevisionAgent:
@@ -499,8 +558,29 @@ class EmptyProposalAgent:
 class FailingConsistencyAgent:
     def propose(self, context):
         if context.get("prompt_version") == "multi_model_agentic_consistency_v1":
-            raise AssertionError("consistency agent should not select features")
+            raise RuntimeError("simulated consistency agent failure")
         return []
+
+
+class SelectingConsistencyAgent:
+    def __init__(self, names):
+        self.names = list(names)
+        self.contexts = []
+
+    def propose(self, context):
+        self.contexts.append(context)
+        if context.get("prompt_version") != "multi_model_agentic_consistency_v1":
+            return []
+        return {
+            "proposals": [
+                {
+                    "action": "add",
+                    "name": name,
+                    "rationale": "Selected from candidate_summaries.",
+                }
+                for name in self.names
+            ]
+        }
 
 
 class RecordingExtractionProvider:
@@ -1294,15 +1374,26 @@ def test_multi_model_agentic_forest_runs_with_fake_agent_and_extractor(tmp_path:
     assert set(predictions["selected_confounder_names"]) == {"age"}
     assert set(predictions["selected_effect_modifier_names"]) == {"pd_l1_expression"}
     assert agent.contexts
-    first_context = _first_agent_context(agent, "multi_model_agentic_forest_v1")
-    assert _agent_contexts(agent, _CONCEPT_CLUSTER_LABEL_PROMPT_VERSION)
+    first_context = _role_agent_context(agent, "confounder")
+    modifier_context = _role_agent_context(agent, "effect_modifier")
+    assert not _agent_contexts(agent, _CONCEPT_CLUSTER_LABEL_PROMPT_VERSION)
     assert _agent_contexts(agent, "multi_model_agentic_alias_resolution_v1")
     assert _agent_contexts(agent, "multi_model_agentic_value_harmonization_v1")
-    assert "feature_importance" in first_context
-    assert "concept_inventory" in first_context
-    phrase_features = first_context["feature_importance"]["phrase_features"]
-    assert phrase_features
-    assert all(2 <= len(row["feature"].split()) <= 4 for row in phrase_features)
+    assert first_context["prompt_version"] == _EVIDENCE_DIGEST_ROLE_PROMPT_VERSION
+    assert first_context["target_role"] == "confounder"
+    assert modifier_context["target_role"] == "effect_modifier"
+    assert "feature_importance" not in first_context
+    assert "concept_inventory" not in first_context
+    assert "evidence" not in first_context
+    assert first_context["text_blurbs"]
+    assert any("ecog" in blurb.lower() or "age" in blurb.lower() for blurb in first_context["text_blurbs"])
+    assert not any(_digest_source_label_in_blurb(blurb) for blurb in first_context["text_blurbs"])
+    assert modifier_context["text_blurbs"]
+    rendered_prompt = build_agent_prompt(first_context, config.architecture.agentic_feature_search)
+    assert "Text blurbs:" in rendered_prompt
+    assert "Current nested-CV context" not in rendered_prompt
+    assert '"target_role"' not in rendered_prompt
+    assert '"roles"' not in rendered_prompt
     assert "canonical_feature_name_guidance" not in first_context
     assert "true_" not in json.dumps(first_context)
     seen_names = [[spec.name for spec in specs] for specs in evaluator.seen_specs]
@@ -1543,14 +1634,11 @@ def test_multi_model_agentic_forest_adds_embedding_contrast_context(
         embedding_provider=KeywordEmbeddingProvider(),
     )
 
-    first_context = _first_agent_context(agent, "multi_model_agentic_forest_v1")
-    assert "embedding_contrast_evidence" in first_context
-    treatment = next(
-        item
-        for item in first_context["embedding_contrast_evidence"]["contrasts"]
-        if item["name"] == "treatment"
-    )
-    assert any("brain" in row["text"] for row in treatment["positive_aligned_chunks"])
+    first_context = _role_agent_context(agent, "confounder")
+    assert "embedding_contrast_evidence" not in first_context
+    assert first_context["text_blurbs"]
+    assert any("brain" in blurb for blurb in first_context["text_blurbs"])
+    assert not any(_digest_source_label_in_blurb(blurb) for blurb in first_context["text_blurbs"])
 
     artifact_dir = output_path.parent / "multi_model_agentic_forest"
     evidence_rows = [
@@ -1637,13 +1725,12 @@ def test_multi_model_agentic_forest_adds_htr_to_ensemble_and_agent_context(
     assert htr_provider.seen_effect_nuisance_predictions
     effect_nuisance = htr_provider.seen_effect_nuisance_predictions[0]
     assert set(effect_nuisance["target_source"]) == {"ensemble_mean_nuisance_with_htr"}
-    first_context = _first_agent_context(agent, "multi_model_agentic_forest_v1")
-    assert first_context["feature_importance"]["ensemble_r"]["target_source"] == (
-        "ensemble_mean_nuisance_with_htr"
-    )
-    htr_evidence = first_context["htr_attention_evidence"]
-    assert htr_evidence["nuisance"]["attention"][0]["evidence_snippet"]
-    assert htr_evidence["effect"]["attention"][0]["top_token_spans"]
+    confounder_context = _role_agent_context(agent, "confounder")
+    modifier_context = _role_agent_context(agent, "effect_modifier")
+    assert any("age" in blurb.lower() for blurb in confounder_context["text_blurbs"])
+    assert any("age" in blurb.lower() for blurb in modifier_context["text_blurbs"])
+    assert not any(_digest_source_label_in_blurb(blurb) for blurb in confounder_context["text_blurbs"])
+    assert not any(_digest_source_label_in_blurb(blurb) for blurb in modifier_context["text_blurbs"])
 
     artifact_dir = output_path.parent / "multi_model_agentic_forest"
     assert (artifact_dir / "htr_nuisance_oof_predictions.parquet").exists()
@@ -1663,9 +1750,8 @@ def test_multi_model_agentic_forest_adds_htr_to_ensemble_and_agent_context(
         .splitlines()
     ]
     consensus_row = next(row for row in importance_rows if row["record_type"] == "consensus")
-    artifact_htr_row = consensus_row["context"]["htr_attention_evidence"]["nuisance"]["attention"][
-        0
-    ]
+    artifact_htr_group = consensus_row["context"]["evidence_digest"]["confounders"]["htr_blurbs"][0]
+    artifact_htr_row = artifact_htr_group["rows"][0]
     assert artifact_htr_row["text_redacted"] is True
     assert "evidence_snippet" not in artifact_htr_row
     assert "top_token_spans" not in artifact_htr_row
@@ -1730,10 +1816,12 @@ def test_multi_model_agentic_forest_runs_htr_only_when_bow_disabled(
         htr_evidence_provider=htr_provider,
     )
 
-    first_context = _first_agent_context(agent, "multi_model_agentic_forest_v1")
-    assert first_context["feature_discovery_methods"] == ["htr"]
-    assert first_context["feature_importance"]["n_views"] == 0
-    assert "htr_attention_evidence" in first_context
+    first_context = _role_agent_context(agent, "confounder")
+    assert "feature_discovery_methods" not in first_context
+    assert first_context["text_blurbs"]
+    assert any("age" in blurb.lower() for blurb in first_context["text_blurbs"])
+    assert not any(_digest_source_label_in_blurb(blurb) for blurb in first_context["text_blurbs"])
+    assert "htr_attention_evidence" not in first_context
     assert "embedding_contrast_evidence" not in first_context
     assert htr_provider.seen_effect_nuisance_predictions
     effect_nuisance = htr_provider.seen_effect_nuisance_predictions[0]
@@ -1803,15 +1891,10 @@ def test_multi_model_agentic_forest_adds_ensemble_r_target_context(tmp_path: Pat
         evaluator=FakeEvaluator(),
     )
 
-    importance = _first_agent_context(agent, "multi_model_agentic_forest_v1")[
-        "feature_importance"
-    ]
-    assert "ensemble_r" in importance
-    assert importance["ensemble_r"]["target_source"] == "ensemble_mean_nuisance"
-    assert all(
-        str(view["view_name"]).startswith("ensemble_r__")
-        for view in importance["ensemble_r"]["views"]
-    )
+    modifier_context = _role_agent_context(agent, "effect_modifier")
+    assert modifier_context["text_blurbs"]
+    assert any("pd" in blurb.lower() or "brain" in blurb.lower() for blurb in modifier_context["text_blurbs"])
+    assert not any(_digest_source_label_in_blurb(blurb) for blurb in modifier_context["text_blurbs"])
 
     artifact_dir = output_path.parent / "multi_model_agentic_forest"
     bow_oof = pd.read_parquet(artifact_dir / "bow_view_oof_predictions.parquet")
@@ -2313,32 +2396,11 @@ def test_multi_model_prespecified_features_extract_before_bow_and_merge_roles(
         ("age", ("confounder",)),
         ("biomarker", ("confounder", "effect_modifier")),
     ]
-    first_context = _first_agent_context(agent, "multi_model_agentic_forest_v1")
-    assert first_context["prompt_version"] == "multi_model_agentic_forest_v1"
-    assert first_context["current_features"] == [
-        {
-            "name": "age",
-            "type": "continuous",
-            "categories": None,
-            "description": None,
-            "roles": ["confounder"],
-            "value_aliases": None,
-        },
-        {
-            "name": "biomarker",
-            "type": "categorical",
-            "categories": ["negative", "positive"],
-            "description": None,
-            "roles": ["confounder", "effect_modifier"],
-            "value_aliases": None,
-        },
-    ]
-    importance = first_context["feature_importance"]
-    assert importance["n_views"] == 1
-    first_view = importance["views"][0]
-    assert first_view["n_prespecified_features"] == 2
-    assert "explicit:age_normalized" in first_view["prespecified_raw_feature_names"]
-    assert "explicit:biomarker_positive" in first_view["prespecified_raw_feature_names"]
+    first_context = _role_agent_context(agent, "confounder")
+    assert first_context["prompt_version"] == _EVIDENCE_DIGEST_ROLE_PROMPT_VERSION
+    assert "current_features" not in first_context
+    assert first_context["text_blurbs"]
+    assert all("feature_importance" not in context for context in agent.contexts)
     seen_roles = {spec.name: spec.roles for specs in evaluator.seen_specs for spec in specs}
     assert seen_roles == {
         "age": ["confounder"],
@@ -2646,6 +2708,175 @@ def test_multi_model_forest_parses_config():
     assert nn_cfg.htr_jobs_per_gpu == 2
     assert nn_cfg.htr_evidence_enabled is False
     assert nn_cfg.embedding_contrast.enabled is True
+    assert nn_cfg.matched_pair_uplift_enabled is True
+    assert nn_cfg.matched_pair_propensity_caliper == pytest.approx(0.05)
+
+
+def test_multi_model_forest_stage1_adds_bow_pair_uplift_features(tmp_path: Path):
+    dataset = pd.DataFrame(
+        {
+            "clinical_text": [
+                "age 55 brain metastases high nlr",
+                "age 78 liver lesion low nlr",
+                "age 56 brain metastases high nlr",
+                "age 79 liver lesion low nlr",
+                "age 57 brain metastases high nlr",
+                "age 77 liver lesion low nlr",
+                "age 58 brain metastases high nlr",
+                "age 76 liver lesion low nlr",
+                "age 59 brain metastases high nlr",
+                "age 75 liver lesion low nlr",
+                "age 60 brain metastases high nlr",
+                "age 74 liver lesion low nlr",
+            ],
+            "treatment_indicator": [1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0],
+            "outcome_indicator": [1, 0, 1, 0, 1, 0, 0, 0, 1, 1, 1, 0],
+        }
+    )
+    config = AppliedInferenceConfig(
+        cv_folds=2,
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        outcome_type="binary",
+        architecture=ModelArchitectureConfig(
+            model_type="multi_model_forest",
+            multi_model_forest=MultiModelForestConfig(
+                feature_discovery_methods=["bow"],
+                bow_views=_linear_test_bow_views(),
+                nuisance_folds=2,
+                effect_folds=2,
+                fold_parallelism="1",
+                matched_pair_htr_enabled=False,
+                matched_pair_bow_max_iter=25,
+                matched_pair_max_controls_per_candidate=2,
+                embedding_contrast=EmbeddingContrastDiscoveryConfig(
+                    enabled=False,
+                    disable_reason="unit test disables embedding evidence",
+                ),
+            ),
+        ),
+    )
+    runner = MultiModelForestStage1Runner(
+        dataset=dataset,
+        config=config,
+        output_path=tmp_path / "stage1.parquet",
+        num_workers=1,
+    )
+    train_df = runner.dataset.iloc[:10].reset_index(drop=True)
+    test_df = runner.dataset.iloc[10:].reset_index(drop=True)
+
+    bundle = runner._build_feature_bundle(train_df=train_df, test_df=test_df, outer_fold=1)
+
+    assert "bow__linear_test__matched_pair_uplift_delta_logit" in bundle.x_names
+    assert "bow__linear_test__matched_pair_treated_outcome_prob" in bundle.x_names
+    pair_rows = [
+        row for row in bundle.feature_rows if row["source_family"] == "bow_pair_uplift"
+    ]
+    assert {row["objective"] for row in pair_rows} == {
+        "matched_pair_uplift_delta_logit",
+        "matched_pair_treated_outcome_probability",
+    }
+    assert any(
+        row.get("source_family") == "bow_pair_uplift"
+        and row.get("matched_pair_train_rows", 0) >= 0
+        for row in bundle.inner_model_rows
+    )
+    assert "matched_pair_uplift" in bundle.handoff_evidence["importance"]
+    pair_importance = bundle.handoff_evidence["importance"]["matched_pair_uplift"]
+    assert "uplift_delta_logit_positive" in pair_importance["views"][0]
+    compact = _compact_multi_model_agent_context(
+        {
+            "feature_importance": bundle.handoff_evidence["importance"],
+            "htr_attention_evidence": {
+                "pair_uplift": {
+                    "metrics": {},
+                    "attention": [
+                        {
+                            "row_id": 1,
+                            "stage": "effect_modifier",
+                            "pair_side": "treated_candidate",
+                            "chunk_text": "brain metastases high nlr",
+                            "attention": 0.9,
+                            "pair_delta_logit": 0.3,
+                        }
+                    ],
+                }
+            },
+        }
+    )
+    assert "matched_pair_uplift" in compact["feature_importance"]
+    assert "pair_uplift" in compact["htr_attention_evidence"]
+
+
+def test_stage1_bow_process_folds_do_not_pickle_existing_htr_provider(tmp_path: Path):
+    dataset = pd.DataFrame(
+        {
+            "clinical_text": [
+                "brain metastases pd-l1 high",
+                "liver lesion pd-l1 low",
+                "brain metastases pd-l1 high",
+                "liver lesion pd-l1 low",
+                "brain metastases prior radiation",
+                "liver lesion stable disease",
+                "brain metastases cachexia",
+                "liver lesion low nlr",
+                "brain metastases high nlr",
+                "liver lesion adrenal mass",
+                "brain metastases pd-l1 high response",
+                "liver lesion pd-l1 low progression",
+            ],
+            "treatment_indicator": [1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0],
+            "outcome_indicator": [1, 0, 1, 0, 1, 0, 0, 0, 1, 1, 1, 0],
+        }
+    )
+    config = AppliedInferenceConfig(
+        cv_folds=2,
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        outcome_type="binary",
+        architecture=ModelArchitectureConfig(
+            model_type="multi_model_forest",
+            multi_model_forest=MultiModelForestConfig(
+                feature_discovery_methods=["bow"],
+                bow_views=_linear_test_bow_views(),
+                nuisance_folds=2,
+                effect_folds=2,
+                bow_fold_parallelism="2",
+                bow_parallel_backend="processes",
+                matched_pair_uplift_enabled=False,
+                embedding_contrast=EmbeddingContrastDiscoveryConfig(
+                    enabled=False,
+                    disable_reason="unit test disables embedding evidence",
+                ),
+                **_disable_htr_test_kwargs(),
+            ),
+        ),
+    )
+    runner = MultiModelForestStage1Runner(
+        dataset=dataset,
+        config=config,
+        output_path=tmp_path / "stage1.parquet",
+        num_workers=2,
+    )
+    runner._default_htr_provider = types.SimpleNamespace(
+        _runner=types.SimpleNamespace(_thread_state=threading.local())
+    )
+
+    oof, test_pred, evidence_rows = runner._fit_bow_binary_train_test(
+        runner.dataset["clinical_text"].iloc[:10].tolist(),
+        runner.dataset["clinical_text"].iloc[10:].tolist(),
+        runner.dataset["treatment_indicator"].iloc[:10].to_numpy(dtype=int),
+        outer_fold=2,
+        view=_linear_test_bow_views()[0],
+        view_index=0,
+        label_name="treatment",
+    )
+
+    assert np.isfinite(oof).all()
+    assert np.isfinite(test_pred).all()
+    assert len(evidence_rows) == 2
 
 
 def test_multi_model_forest_parallel_plan_reserves_htr_slots():
@@ -2881,7 +3112,9 @@ def test_multi_model_agentic_proposal_bundle_cache_reuses_llm_result(tmp_path):
     )
     assert agent.calls == 2
     assert first["valid_proposals"][0].name == "cache_feature"
-    assert first["concept_inventory"]["concepts"][0]["name"] == "cache_feature"
+    assert set(first["valid_proposals"][0].roles) == {"confounder", "effect_modifier"}
+    assert "concept_inventory" not in first
+    assert set(first["raw_proposals_by_role"]) == {"confounder", "effect_modifier"}
 
     resumed = MultiModelAgenticForestRunner(
         dataset=dataset,
@@ -2899,6 +3132,7 @@ def test_multi_model_agentic_proposal_bundle_cache_reuses_llm_result(tmp_path):
     )
 
     assert second["valid_proposals"][0].name == "cache_feature"
+    assert set(second["valid_proposals"][0].roles) == {"confounder", "effect_modifier"}
     assert "resumed_from_cache" in second
 
 
@@ -3387,7 +3621,105 @@ def test_precomputed_discovery_runner_uses_handoff(tmp_path):
         runner._fit_bow_discovery(pd.DataFrame(), outer_fold=1001)
 
 
-def test_multi_model_consistency_selection_is_deterministic_gate(tmp_path):
+def test_multi_model_consistency_selection_uses_agent_choice(tmp_path):
+    agent = SelectingConsistencyAgent(["brain_metastases_present"])
+    runner = MultiModelAgenticForestRunner(
+        dataset=pd.DataFrame(
+            {
+                "clinical_text": ["ecog 0", "ecog 2"],
+                "treatment_indicator": [1, 0],
+                "outcome_indicator": [1, 0],
+            }
+        ),
+        config=AppliedInferenceConfig(
+            text_column="clinical_text",
+            treatment_column="treatment_indicator",
+            outcome_column="outcome_indicator",
+            architecture=ModelArchitectureConfig(
+                model_type="multi_model_agentic_forest",
+                agentic_feature_search=AgenticFeatureSearchConfig(),
+                multi_model_agentic_forest=MultiModelAgenticForestConfig(
+                    candidate_proposals_per_fold=5,
+                    **_disable_required_evidence_test_kwargs(),
+                ),
+            ),
+        ),
+        output_path=tmp_path / "predictions.parquet",
+        proposal_agent=agent,
+        extraction_provider=FakeExtractionProvider(),
+        evaluator=FakeEvaluator(),
+    )
+    ecog = AgenticFeatureProposal(
+        action="add",
+        name="ecog_performance_status",
+        type="categorical",
+        categories=[
+            "0",
+            "1",
+            "2",
+            "3",
+            "4",
+            "ECOG 0",
+            "ECOG 1",
+            "ECOG 2",
+            "ECOG 3",
+        ],
+        roles=["confounder"],
+        description="Baseline ECOG performance status.",
+    )
+    brain_mets = AgenticFeatureProposal(
+        action="add",
+        name="brain_metastases_present",
+        type="categorical",
+        categories=["yes", "no"],
+        roles=["effect_modifier"],
+        description="Presence of baseline brain metastases.",
+    )
+
+    selected, artifact = runner._select_consistent_proposals(
+        context={
+            "prompt_version": "multi_model_agentic_consistency_v1",
+            "candidate_summaries": [
+                {
+                    "name": "ecog_performance_status",
+                    "passes_consistency_gate": True,
+                },
+                {
+                    "name": "brain_metastases_present",
+                    "passes_consistency_gate": False,
+                    "proposed_on_full_outer_train": True,
+                },
+            ],
+        },
+        candidate_summaries=[
+            {
+                "name": "ecog_performance_status",
+                "passes_consistency_gate": True,
+                "inner_support_count": 3,
+                "proposed_on_full_outer_train": True,
+            },
+            {
+                "name": "brain_metastases_present",
+                "passes_consistency_gate": False,
+                "inner_support_count": 1,
+                "proposed_on_full_outer_train": True,
+            },
+        ],
+        canonical_proposals={
+            "ecog_performance_status": ecog,
+            "brain_metastases_present": brain_mets,
+        },
+    )
+
+    assert selected == [brain_mets]
+    assert artifact["selection_method"] == "agentic_consistency_selection"
+    assert artifact["agent_selection_attempted"] is True
+    assert artifact["agent_selection_used"] is True
+    assert artifact["used_fallback"] is False
+    assert agent.contexts
+
+
+def test_multi_model_consistency_selection_falls_back_on_agent_error(tmp_path):
     runner = MultiModelAgenticForestRunner(
         dataset=pd.DataFrame(
             {
@@ -3418,17 +3750,7 @@ def test_multi_model_consistency_selection_is_deterministic_gate(tmp_path):
         action="add",
         name="ecog_performance_status",
         type="categorical",
-        categories=[
-            "0",
-            "1",
-            "2",
-            "3",
-            "4",
-            "ECOG 0",
-            "ECOG 1",
-            "ECOG 2",
-            "ECOG 3",
-        ],
+        categories=["0", "1", "2", "3", "4"],
         roles=["confounder"],
         description="Baseline ECOG performance status.",
     )
@@ -3447,5 +3769,7 @@ def test_multi_model_consistency_selection_is_deterministic_gate(tmp_path):
     )
 
     assert selected == [ecog]
-    assert artifact["selection_method"] == "deterministic_consistency_gate"
+    assert artifact["selection_method"] == "deterministic_consistency_gate_after_agent_error"
+    assert artifact["agent_selection_attempted"] is True
     assert artifact["agent_selection_used"] is False
+    assert artifact["used_fallback"] is True
