@@ -2129,6 +2129,77 @@ def test_multi_model_parsimony_redundancy_review_records_required_summaries():
     assert len(review["missingness_overlap"]) == 6
 
 
+def test_extracted_feature_review_context_includes_htr_snippets_and_defers_temporal_filter(
+    tmp_path: Path,
+):
+    dataset = pd.DataFrame(
+        {
+            "clinical_text": ["PD-L1 TPS 70%", "PD-L1 TPS below 1%"],
+            "treatment_indicator": [1, 0],
+            "outcome_indicator": [1, 0],
+        }
+    )
+    config = AppliedInferenceConfig(
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        architecture=ModelArchitectureConfig(
+            model_type="multi_model_agentic_forest",
+            agentic_feature_search=AgenticFeatureSearchConfig(),
+            multi_model_agentic_forest=MultiModelAgenticForestConfig(
+                **_disable_required_evidence_test_kwargs(),
+            ),
+        ),
+    )
+    runner = MultiModelAgenticForestRunner(
+        dataset=dataset,
+        config=config,
+        output_path=tmp_path / "predictions.parquet",
+        proposal_agent=EmptyProposalAgent(),
+        extraction_provider=FakeExtractionProvider(),
+        evaluator=FakeEvaluator(),
+    )
+    context = runner._build_extracted_feature_review_context(
+        outer_fold=1,
+        round_index=0,
+        current_specs=[],
+        diagnostic={"extraction_summary": [], "metrics": {}},
+        gate={"failed_criteria": []},
+        benchmark={},
+        bow_context={"model_diagnostics": {}, "feature_importance": {}},
+        embedding_evidence={},
+        htr_evidence={
+            "effect": {
+                "metrics": {"r_loss_mean": 0.2},
+                "attention": [
+                    {
+                        "row_id": 7,
+                        "stage": "effect_modifier",
+                        "chunk_text": "PD-L1 TPS 70% documented before the decision",
+                        "attended_token_summary": "PD-L1 TPS 70%",
+                        "attention": 0.91,
+                    }
+                ],
+            }
+        },
+        required_names=set(),
+    )
+
+    htr_rows = context["htr_attention_evidence"]["effect"]["attention"]
+    assert len(htr_rows) == 1
+    assert "PD-L1 TPS 70%" in htr_rows[0]["evidence_snippet"]
+    assert htr_rows[0]["attended_token_summary"] == "PD-L1 TPS 70%"
+
+    prompt = build_agent_prompt(context, runner.search_config)
+    assert "Inspect htr_attention_evidence snippets" in prompt
+    assert "Temporal eligibility is enforced upstream" in prompt
+    assert (
+        "Do not use treatment choice, post-treatment response, toxicity after "
+        "treatment, survival, or outcome-derived variables."
+        not in prompt
+    )
+
+
 def test_multi_model_extracted_feature_review_revises_underperforming_specs(
     tmp_path: Path,
 ):
@@ -3717,6 +3788,42 @@ def test_multi_model_consistency_selection_uses_agent_choice(tmp_path):
     assert artifact["agent_selection_used"] is True
     assert artifact["used_fallback"] is False
     assert agent.contexts
+
+
+def test_multi_model_consistency_prompt_requires_exhaustive_gate_passing_keep_list():
+    prompt = build_agent_prompt(
+        {
+            "prompt_version": "multi_model_agentic_consistency_v1",
+            "max_selected_candidates": 17,
+            "candidate_summaries": [
+                {
+                    "name": "patient_age",
+                    "passes_consistency_gate": True,
+                    "inner_support_count": 3,
+                },
+                {
+                    "name": "disease_progression_status",
+                    "passes_consistency_gate": False,
+                    "inner_support_count": 1,
+                    "proposed_on_full_outer_train": True,
+                },
+            ],
+        },
+        AgenticFeatureSearchConfig(),
+    )
+
+    assert "complete, exhaustive keep-list" in prompt
+    assert "any candidate you omit will be discarded" in prompt
+    assert "Treat passes_consistency_gate=true as a keep decision" in prompt
+    assert "Do not spend selection capacity on below-threshold recovery candidates" in prompt
+    assert "Return at most 17 add proposals" in prompt
+    assert "Temporal eligibility has already been enforced upstream" in prompt
+    assert "Do not independently reject a supplied candidate" in prompt
+    assert (
+        "Do not select variables that are post-treatment, outcome-derived, "
+        "treatment choice itself, response, survival, or toxicity."
+        not in prompt
+    )
 
 
 def test_multi_model_consistency_selection_falls_back_on_agent_error(tmp_path):

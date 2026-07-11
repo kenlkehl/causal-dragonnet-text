@@ -3157,6 +3157,7 @@ def build_multi_model_agentic_consistency_prompt(
 ) -> str:
     """Construct the consistency-selection prompt for multi-model candidates."""
     del search_config
+    max_selected = int(context.get("max_selected_candidates", 6))
     context_json = json.dumps(
         context,
         separators=(",", ":"),
@@ -3167,9 +3168,11 @@ def build_multi_model_agentic_consistency_prompt(
 The outer test fold is not included here. All evidence comes from the current outer-train data only.
 
 Your goals:
-- Gate out one-off noisy candidates that appear in only weak or idiosyncratic inner-fold evidence.
-- Recover plausible real variables that missed one weak inner fold but have strong full outer-train evidence, coherent roles, or clear alias-stable support.
+- Return the complete, exhaustive keep-list for the next stage. This response replaces the candidate set; any candidate you omit will be discarded.
+- Keep every candidate with passes_consistency_gate=true when the gate-passing set fits within the selection limit. Do not omit an obvious or stable candidate on the assumption that another stage retains it automatically.
+- Only after including the gate-passing candidates, recover plausible variables that missed the gate but have strong full outer-train evidence, coherent roles, or clear alias-stable support.
 - Preserve honest causal inference: use only the supplied candidate summaries and do not invent new variables.
+- Temporal eligibility has already been enforced upstream by restricting source inputs to information available before the treatment decision. Do not independently reject a supplied candidate merely because its name or clinical meaning refers to treatment, response, outcome, survival, or toxicity.
 
 Return JSON only with this shape:
 {{
@@ -3180,7 +3183,7 @@ Return JSON only with this shape:
       "type": "categorical|continuous",
       "categories": ["category_a", "category_b"],
       "roles": ["confounder", "effect_modifier"],
-      "description": "exact pre-treatment extraction target",
+      "description": "exact extraction target represented in the supplied evidence",
       "rationale": "why this candidate is stable enough or should be recovered",
       "expected_signal": "treatment, outcome, or pseudo-target signal expected"
     }}
@@ -3189,11 +3192,13 @@ Return JSON only with this shape:
 
 Rules:
 - Choose only names listed in candidate_summaries.
-- Prefer candidates that pass the consistency gate.
-- You may recover a below-threshold candidate only if it has strong full_outer_train support or a clear explanation for fold instability.
-- Do not select variables that are post-treatment, outcome-derived, treatment choice itself, response, survival, or toxicity.
+- Treat passes_consistency_gate=true as a keep decision, not merely a preference. Include every such candidate as an add proposal unless the gate-passing set alone exceeds the limit or the candidate is an exact duplicate that cannot be represented separately.
+- If gate-passing candidates exceed the limit, keep the highest-support candidates first and return action=none for each omitted gate-passing candidate with a specific rationale.
+- Do not spend selection capacity on below-threshold recovery candidates until all gate-passing candidates have been included.
+- You may then recover a below-threshold candidate only if it has strong full_outer_train support or a clear explanation for fold instability.
+- Do not apply an additional temporal or outcome-semantic exclusion; the supplied candidate evidence is already restricted to the permitted decision-time information.
 - Keep roles tied to evidence: treatment+outcome support implies confounder; pseudo-target support implies effect_modifier; both signals may justify both roles.
-- Return at most max_selected_candidates add proposals.
+- Return at most {max_selected} add proposals. Your add proposals are the entire downstream keep-list, not a list of changes or exceptions.
 
 Current consistency-selection context:
 {context_json}
@@ -3223,6 +3228,8 @@ The outer test fold is not included here. All diagnostics come from cross-fitted
 
 The selected candidate variables have already been extracted from clinical text. Simple nuisance and R/pseudo-target models were trained on those extracted values and compared with the original multi-view BoW, embedding-contrast, and HTR evidence. Your task is to propose evidence-supported revisions when the extracted variables do not preserve the confounder or effect-modifier signal seen upstream.
 
+Temporal eligibility is enforced upstream by restricting source inputs to information available before the treatment decision. Do not independently exclude a supplied variable because its name or clinical meaning refers to treatment, response, outcome, survival, or toxicity.
+
 Return JSON only with this shape:
 {{
   "proposals": [
@@ -3232,7 +3239,7 @@ Return JSON only with this shape:
       "type": "categorical|continuous",
       "categories": ["category_a", "category_b"],
       "roles": ["confounder", "effect_modifier"],
-      "description": "exact pre-treatment extraction target",
+      "description": "exact extraction target represented in the supplied evidence",
       "rationale": "why this change addresses the diagnostic failure",
       "expected_signal": "treatment, outcome, or pseudo-target signal expected"
     }}
@@ -3242,12 +3249,13 @@ Return JSON only with this shape:
 Rules:
 - Return at most {max_proposals} add proposals and at most {max_removals} remove proposals.
 - Use update_role when a feature was extracted correctly but assigned to the wrong causal role.
-- Use remove when an agent-added feature is too sparse, constant, redundant, post-treatment, or unsupported by diagnostics.
+- Use remove when an agent-added feature is too sparse, constant, redundant, or unsupported by diagnostics.
 - Do not remove required_features; propose role updates for them only when diagnostics justify it.
-- Add a replacement only when the BoW/embedding/HTR evidence points to a clearer extractable pre-treatment patient-level variable.
+- Add a replacement only when the BoW, embedding, uplift, or HTR evidence points to a clearer extractable patient-level variable.
+- Inspect htr_attention_evidence snippets and attended token spans directly when deciding which missing or broader variable could preserve HTR nuisance, effect, or pair-uplift signal.
 - Do not add variables from general clinical intuition alone; tie revisions to the supplied upstream evidence or extracted-feature diagnostics.
 - For categorical variables, provide 2-8 mutually exclusive categories.
-- Do not use treatment choice, post-treatment response, toxicity after treatment, survival, or outcome-derived variables.
+- Do not apply an additional temporal or outcome-semantic exclusion; the supplied evidence has already been restricted to the permitted decision-time information.
 - Use "none" if the current extracted feature set is the best defensible set despite the diagnostic gap.
 
 Current extracted-feature review context:

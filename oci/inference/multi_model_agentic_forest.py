@@ -3398,8 +3398,10 @@ class MultiModelAgenticForestRunner:
             "min_support_folds": int(threshold),
             "min_support_fraction": float(self.nn_config.candidate_consistency_min_fold_fraction),
             "selection_policy": [
-                "Keep candidates that pass the inner-fold support gate unless they are redundant or likely leakage.",
-                "Recover below-threshold candidates only when full outer-train evidence is strong or fold absence appears unstable rather than absent.",
+                "Return an exhaustive keep-list because omitted candidates are discarded downstream.",
+                "Keep every candidate that passes the inner-fold support gate before considering any below-threshold recovery candidate.",
+                "Recover below-threshold candidates only after all gate-passing candidates are kept and only when full outer-train evidence is strong or fold absence appears unstable rather than absent.",
+                "Temporal eligibility is enforced upstream; do not reject supplied candidates based on treatment, response, outcome, survival, or toxicity semantics.",
                 "Do not invent variables outside candidate_summaries.",
             ],
             "candidate_summaries": passed + below_threshold,
@@ -3799,6 +3801,7 @@ class MultiModelAgenticForestRunner:
                 benchmark=benchmark,
                 bow_context=bow_result["context"],
                 embedding_evidence=embedding_evidence,
+                htr_evidence=bow_result.get("htr_evidence") or {},
                 required_names=required_names,
             )
             try:
@@ -4115,6 +4118,7 @@ class MultiModelAgenticForestRunner:
         benchmark: Dict[str, Any],
         bow_context: Dict[str, Any],
         embedding_evidence: Dict[str, Any],
+        htr_evidence: Dict[str, Any],
         required_names: set,
     ) -> Dict[str, Any]:
         context = {
@@ -4159,7 +4163,7 @@ class MultiModelAgenticForestRunner:
                     "were proposed, extracted, and dropped for insufficient coverage. "
                     "Do not add the same target unchanged. If the original text evidence "
                     "still supports the concept, propose a broader or more directly "
-                    "documented pre-treatment extraction target."
+                    "documented extraction target."
                 ),
             },
             "original_bow_context": {
@@ -4174,7 +4178,7 @@ class MultiModelAgenticForestRunner:
                         "type": "categorical|continuous",
                         "categories": ["category_a", "category_b"],
                         "roles": ["confounder", "effect_modifier"],
-                        "description": "exact pre-treatment extraction target",
+                        "description": "exact extraction target represented in the supplied evidence",
                         "rationale": "why this change addresses the diagnostic failure",
                         "expected_signal": "treatment, outcome, or pseudo-target signal expected",
                     }
@@ -4190,6 +4194,8 @@ class MultiModelAgenticForestRunner:
                 if self.search_config.save_agent_context
                 else redact_embedding_contrast_evidence(embedding_evidence)
             )
+        if htr_evidence:
+            context["htr_attention_evidence"] = htr_evidence
         return _compact_extracted_feature_review_context(context)
 
     def _build_candidate_signal_review_rows(
