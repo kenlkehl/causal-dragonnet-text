@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import hashlib
 import json
 import logging
 import re
@@ -17,6 +18,7 @@ import numpy as np
 import pandas as pd
 import torch
 from scipy import sparse
+from scipy.stats import chi2_contingency
 from joblib import Parallel, delayed
 from sklearn.ensemble import (
     ExtraTreesClassifier,
@@ -30,6 +32,7 @@ from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, TfidfVectorizer
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import brier_score_loss, log_loss, mean_squared_error
 from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import normalize as sklearn_normalize
 
 from ..config import (
@@ -45,7 +48,6 @@ from ..models.explicit_feature_featurizer import get_raw_explicit_features
 from .agentic_explicit_feature_forest import (
     AgenticFeatureProposal,
     CausalForestExplicitEvaluator,
-    OpenAICompatibleFeatureSearchAgent,
     SplitEvaluation,
     VLLMExplicitFeatureExtractionProvider,
     _clinical_text_examples,
@@ -101,6 +103,8 @@ _CONCEPT_CLUSTER_LABEL_PROMPT_VERSION = "multi_model_agentic_cluster_labeling_v2
 _CONCEPT_CLUSTER_MAX_AGENT_CLUSTERS = 120
 _CONCEPT_CLUSTER_SNIPPET_CHARS = 320
 _CONCEPT_CLUSTER_TOP_PHRASES = 12
+_PARSIMONY_SCHEMA_VERSION = "multi_model_agentic_cluster_factor_parsimony_v2"
+_PARSIMONY_FACTOR_PROMPT_VERSION = "multi_model_agentic_parsimony_factor_v1"
 
 
 def run_multi_model_agentic_forest(
@@ -288,6 +292,7 @@ class MultiModelAgenticForestRunner:
             or embedding_provider is not None
             or htr_evidence_provider is not None
         )
+        self._has_external_proposal_agent = proposal_agent is not None
 
         self.nn_config: MultiModelAgenticForestConfig = getattr(
             config.architecture,
@@ -337,6 +342,9 @@ class MultiModelAgenticForestRunner:
         self.extracted_feature_diagnostic_rows: List[Dict[str, Any]] = []
         self.candidate_signal_review_rows: List[Dict[str, Any]] = []
         self.parsimony_review_rows: List[Dict[str, Any]] = []
+        self.parsimony_cluster_rows: List[Dict[str, Any]] = []
+        self.parsimony_factor_rows: List[Dict[str, Any]] = []
+        self.parsimony_evaluation_rows: List[Dict[str, Any]] = []
         self.feature_set_rows: List[Dict[str, Any]] = []
         self.outer_metric_rows: List[Dict[str, Any]] = []
         self.split_provenance_rows: List[Dict[str, Any]] = []
@@ -568,6 +576,9 @@ class MultiModelAgenticForestRunner:
             item.get("candidate_signal_review_rows", [])
         )
         self.parsimony_review_rows.extend(item.get("parsimony_review_rows", []))
+        self.parsimony_cluster_rows.extend(item.get("parsimony_cluster_rows", []))
+        self.parsimony_factor_rows.extend(item.get("parsimony_factor_rows", []))
+        self.parsimony_evaluation_rows.extend(item.get("parsimony_evaluation_rows", []))
         self.feature_set_rows.extend(item.get("feature_set_rows", []))
         self.outer_metric_rows.extend(item.get("outer_metric_rows", []))
 
@@ -625,6 +636,19 @@ class MultiModelAgenticForestRunner:
                     target_dir,
                 )
                 return None
+        parsimony_rows = _read_jsonl(target_dir / "parsimony_review_by_fold.jsonl")
+        if bool(getattr(self.nn_config, "parsimony_review_enabled", False)) and not any(
+            isinstance(row, dict)
+            and row.get("schema_version") == _PARSIMONY_SCHEMA_VERSION
+            for row in parsimony_rows
+        ):
+            logger.info(
+                "Ignoring multi-model agentic fold checkpoint with legacy parsimony "
+                "schema outer_fold=%s path=%s",
+                fold,
+                target_dir,
+            )
+            return None
         return {
             "outer_fold": fold,
             "predictions": predictions,
@@ -644,8 +668,15 @@ class MultiModelAgenticForestRunner:
             "candidate_signal_review_rows": _read_jsonl(
                 target_dir / "candidate_signal_review.jsonl"
             ),
-            "parsimony_review_rows": _read_jsonl(
-                target_dir / "parsimony_review_by_fold.jsonl"
+            "parsimony_review_rows": parsimony_rows,
+            "parsimony_cluster_rows": _read_jsonl(
+                target_dir / "parsimony_clusters_by_fold.jsonl"
+            ),
+            "parsimony_factor_rows": _read_jsonl(
+                target_dir / "parsimony_factor_proposals_by_fold.jsonl"
+            ),
+            "parsimony_evaluation_rows": _read_jsonl(
+                target_dir / "parsimony_replacement_evaluations_by_fold.jsonl"
             ),
             "feature_set_rows": selected_rows if isinstance(selected_rows, list) else [],
             "outer_metric_rows": metric_rows,
@@ -701,6 +732,9 @@ class MultiModelAgenticForestRunner:
                 ),
                 "candidate_signal_review_rows": fold_runner.candidate_signal_review_rows,
                 "parsimony_review_rows": fold_runner.parsimony_review_rows,
+                "parsimony_cluster_rows": fold_runner.parsimony_cluster_rows,
+                "parsimony_factor_rows": fold_runner.parsimony_factor_rows,
+                "parsimony_evaluation_rows": fold_runner.parsimony_evaluation_rows,
                 "feature_set_rows": fold_runner.feature_set_rows,
                 "outer_metric_rows": fold_runner.outer_metric_rows,
             }
@@ -3903,16 +3937,14 @@ class MultiModelAgenticForestRunner:
         bow_result: Dict[str, Any],
         embedding_evidence: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Run the mandatory parsimony gate before final forest fitting.
-
-        The gate must always execute and write artifacts. It may validly retain
-        all features when redundancy/ablation evidence does not justify pruning.
-        """
+        """Run value-driven cluster-to-factor parsimony before final fitting."""
         before_specs = list(selected_specs)
         required_names = {spec.name for spec in self._initial_specs()}
         if not bool(getattr(self.nn_config, "parsimony_review_enabled", False)):
             stop_reason = "disabled_by_config"
             summary = {
+                "schema_version": _PARSIMONY_SCHEMA_VERSION,
+                "strategy": "value_driven_cluster_factor",
                 "enabled": False,
                 "mandatory": False,
                 "decision": "skipped",
@@ -3921,11 +3953,17 @@ class MultiModelAgenticForestRunner:
                 "n_features_after": int(len(before_specs)),
                 "n_removed": 0,
                 "removed_features": [],
+                "added_factors": [],
+                "n_clusters": 0,
+                "n_factor_proposals": 0,
+                "n_accepted_replacements": 0,
                 "n_single_feature_ablations": 0,
             }
             review_row = {
+                "schema_version": _PARSIMONY_SCHEMA_VERSION,
                 "outer_fold": int(outer_fold),
                 "event": "mandatory_parsimony_review",
+                "strategy": "value_driven_cluster_factor",
                 "decision": "skipped",
                 "stop_reason": stop_reason,
                 "required_features": sorted(required_names),
@@ -3935,6 +3973,9 @@ class MultiModelAgenticForestRunner:
                 "base_gate": None,
                 "redundancy_review": [],
                 "ablations": [],
+                "clusters": [],
+                "factor_proposals": [],
+                "replacement_evaluations": [],
                 "summary": summary,
             }
             self.parsimony_review_rows.append(review_row)
@@ -3952,24 +3993,33 @@ class MultiModelAgenticForestRunner:
             )
             return {"selected_specs": before_specs, "summary": summary}
 
-        current_specs = list(selected_specs)
+        legacy_overrides = {
+            "parsimony_review_auc_tolerance": 0.01,
+            "parsimony_review_loss_relative_tolerance": 0.03,
+            "parsimony_review_corr_threshold": 0.75,
+            "parsimony_review_max_single_feature_ablations": 30,
+        }
+        changed_legacy = [
+            name
+            for name, default in legacy_overrides.items()
+            if getattr(self.nn_config, name, default) != default
+        ]
+        if changed_legacy:
+            logger.warning(
+                "Ignoring deprecated single-feature parsimony settings: %s",
+                changed_legacy,
+            )
+
         train_df = self.dataset.iloc[train_idx].copy()
-        max_ablations = int(
-            getattr(self.nn_config, "parsimony_review_max_single_feature_ablations", 30)
-        )
-        redundancy = _feature_redundancy_review(
-            train_df=train_df,
-            specs=current_specs,
-            corr_threshold=float(getattr(self.nn_config, "parsimony_review_corr_threshold", 0.75)),
-        )
+        diagnostic_seed = 91_000 + 100 * int(outer_fold)
         base_diagnostic = _evaluate_extracted_feature_set_diagnostic(
             train_df=train_df,
-            specs=current_specs,
+            specs=before_specs,
             config=self.config,
             nn_config=self.nn_config,
             bow_metrics=bow_result.get("metrics", {}),
             embedding_evidence=embedding_evidence,
-            random_state=91_000 + 100 * int(outer_fold),
+            random_state=diagnostic_seed,
         )
         base_gate = _extracted_feature_review_gate(
             diagnostic=base_diagnostic,
@@ -3977,119 +4027,489 @@ class MultiModelAgenticForestRunner:
         )
         base_diagnostic["gate"] = base_gate
 
-        ablations: List[Dict[str, Any]] = []
-        removed: List[str] = []
-        stop_reason = "no_prunable_feature_improved_or_preserved_metrics"
-        n_ablations = 0
-        if not current_specs:
-            stop_reason = "no_selected_features"
-        elif max_ablations <= 0:
-            stop_reason = "max_single_feature_ablations_zero"
-        else:
-            while n_ablations < max_ablations and len(current_specs) > 1:
-                removable = [spec for spec in current_specs if spec.name not in required_names]
-                if not removable:
-                    stop_reason = "all_remaining_features_are_required"
-                    break
+        semantic_vectors, semantic_info = self._parsimony_semantic_vectors(before_specs)
+        cluster_result = _build_value_driven_feature_clusters(
+            train_df=train_df,
+            specs=before_specs,
+            semantic_vectors=semantic_vectors,
+            nn_config=self.nn_config,
+            random_state=diagnostic_seed + 7,
+        )
+        clusters = list(cluster_result.get("clusters", []))
+        for cluster in clusters:
+            self.parsimony_cluster_rows.append(
+                {
+                    "schema_version": _PARSIMONY_SCHEMA_VERSION,
+                    "outer_fold": int(outer_fold),
+                    "event": "value_driven_feature_cluster",
+                    **cluster,
+                }
+            )
 
-                best_removal: Optional[Dict[str, Any]] = None
-                for spec in removable:
-                    if n_ablations >= max_ablations:
-                        stop_reason = "max_single_feature_ablations_reached"
-                        break
-                    trial_specs = [s for s in current_specs if s.name != spec.name]
-                    role_guard = _parsimony_role_guard(current_specs, trial_specs)
-                    if role_guard is not None:
-                        ablations.append(
-                            {
-                                "feature": spec.name,
-                                "allowed": False,
-                                "reasons": [role_guard],
-                                "n_features_after": int(len(trial_specs)),
-                            }
-                        )
-                        n_ablations += 1
-                        continue
-                    trial_diagnostic = _evaluate_extracted_feature_set_diagnostic(
+        contexts = [
+            self._build_parsimony_factor_context(
+                outer_fold=outer_fold,
+                cluster=cluster,
+                specs=before_specs,
+                train_df=train_df,
+                required_names=required_names,
+                bow_result=bow_result,
+                embedding_evidence=embedding_evidence,
+            )
+            for cluster in clusters
+            if len(
+                [
+                    name
+                    for name in cluster.get("member_names", [])
+                    if name not in required_names
+                ]
+            )
+            >= 2
+        ]
+        factor_agent_results = self._request_parsimony_factor_responses(contexts)
+        candidates: List[Dict[str, Any]] = []
+        for context, agent_result in zip(contexts, factor_agent_results):
+            cluster = next(
+                item for item in clusters if item.get("cluster_id") == context.get("cluster_id")
+            )
+            candidate, validation = _validate_parsimony_factor_candidate(
+                response=agent_result.get("response"),
+                context=context,
+                cluster=cluster,
+                current_specs=before_specs,
+                required_names=required_names,
+            )
+            factor_row: Dict[str, Any] = {
+                "schema_version": _PARSIMONY_SCHEMA_VERSION,
+                "outer_fold": int(outer_fold),
+                "event": "parsimony_factor_proposal",
+                "cluster_id": context.get("cluster_id"),
+                "context_fingerprint": _parsimony_context_fingerprint(context),
+                "response": agent_result.get("response"),
+                "validation": validation,
+            }
+            if agent_result.get("resumed_from_cache"):
+                factor_row["resumed_from_cache"] = agent_result["resumed_from_cache"]
+            if agent_result.get("error"):
+                factor_row["agent_error"] = agent_result["error"]
+            if self.search_config.save_agent_context:
+                factor_row["context"] = context
+            if self.search_config.save_agent_raw_output and agent_result.get("agent_raw_output"):
+                factor_row["agent_raw_output"] = agent_result["agent_raw_output"]
+            self.parsimony_factor_rows.append(factor_row)
+            if candidate is not None:
+                candidate["factor_row"] = factor_row
+                candidates.append(candidate)
+
+        alias_resolution: Dict[str, Any] = {"skipped": "no_valid_factor_proposals"}
+        value_harmonization: Dict[str, Any] = {"skipped": "no_valid_factor_proposals"}
+        if candidates:
+            unique_factor_specs = _dedupe_specs(
+                [spec for candidate in candidates for spec in candidate["factor_specs"]]
+            )
+            factor_proposals = [
+                AgenticFeatureProposal(
+                    action="add",
+                    name=spec.name,
+                    type=spec.type,
+                    categories=spec.categories,
+                    roles=list(spec.roles),
+                    description=spec.description,
+                    rationale="Operational factor proposed for value-cluster replacement.",
+                    expected_signal="treatment, outcome, or pseudo-target signal expected",
+                )
+                for spec in unique_factor_specs
+            ]
+            resolved_proposals, alias_resolution = self._resolve_proposal_aliases(
+                outer_fold=outer_fold,
+                proposals=factor_proposals,
+            )
+            alias_map = {
+                str(item.get("from")): str(item.get("to"))
+                for item in alias_resolution.get("applied_aliases", [])
+                if isinstance(item, dict) and item.get("from") and item.get("to")
+            }
+            resolved_specs = _dedupe_specs(
+                [
+                    ExplicitFeatureSpec(
+                        name=proposal.name,
+                        type=proposal.type or "continuous",
+                        categories=proposal.categories,
+                        roles=list(proposal.roles),
+                        description=proposal.description,
+                    )
+                    for proposal in resolved_proposals
+                    if proposal.action == "add"
+                ]
+            )
+            resolved_specs, value_harmonization = self._harmonize_value_contracts(
+                outer_fold=outer_fold,
+                selected_specs=resolved_specs,
+            )
+            resolved_by_name = {spec.name: spec for spec in resolved_specs}
+            viable_candidates: List[Dict[str, Any]] = []
+            for candidate in candidates:
+                names = _dedupe_strings(
+                    [alias_map.get(spec.name, spec.name) for spec in candidate["factor_specs"]]
+                )
+                mapped_specs = [resolved_by_name[name] for name in names if name in resolved_by_name]
+                expected_roles = {
+                    role
+                    for spec in before_specs
+                    if spec.name in set(candidate["replaces"])
+                    for role in spec.roles
+                }
+                observed_roles = {role for spec in mapped_specs for role in spec.roles}
+                if not mapped_specs:
+                    candidate["factor_row"]["post_harmonization_rejection"] = (
+                        "no_factor_specs_after_alias_resolution"
+                    )
+                    continue
+                if len(mapped_specs) >= len(set(candidate["replaces"])):
+                    candidate["factor_row"]["post_harmonization_rejection"] = (
+                        "factor_count_no_longer_reduces_spec_count"
+                    )
+                    continue
+                if observed_roles != expected_roles:
+                    candidate["factor_row"]["post_harmonization_rejection"] = {
+                        "reason": "factor_role_union_changed_after_harmonization",
+                        "expected": sorted(expected_roles),
+                        "observed": sorted(observed_roles),
+                    }
+                    continue
+                candidate["factor_specs"] = mapped_specs
+                candidate["factor_row"]["resolved_factor_names"] = names
+                viable_candidates.append(candidate)
+            candidates = viable_candidates
+
+        all_factor_specs = _dedupe_specs(
+            [spec for candidate in candidates for spec in candidate["factor_specs"]]
+        )
+        # Persist expensive agent decisions before potentially long whole-note
+        # factor extraction so interrupted folds can reuse identical contexts.
+        self._flush_parsimony_fold_artifacts(outer_fold)
+        if all_factor_specs:
+            self._validate_complete_document_extraction(all_factor_specs)
+            self.dataset = self.extraction_provider.ensure_features(
+                self.dataset,
+                all_factor_specs,
+            )
+            train_df = self.dataset.iloc[train_idx].copy()
+
+        min_factor_coverage = max(
+            float(getattr(self.nn_config, "parsimony_factor_min_coverage", 0.10)),
+            float(getattr(self.search_config, "min_feature_coverage", 0.0)),
+        )
+        extraction_viable: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            quality = _parsimony_factor_extraction_quality(
+                train_df=train_df,
+                factor_specs=candidate["factor_specs"],
+                min_coverage=min_factor_coverage,
+            )
+            candidate["factor_row"]["extraction_quality"] = quality
+            if quality.get("passed"):
+                extraction_viable.append(candidate)
+            else:
+                candidate["factor_row"]["post_extraction_rejection"] = quality.get("reasons")
+        candidates = extraction_viable
+
+        self._flush_parsimony_fold_artifacts(outer_fold)
+
+        def evaluate_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
+            trial_specs = _apply_parsimony_factor_replacements(before_specs, [candidate])
+            trial_diagnostic = _evaluate_extracted_feature_set_diagnostic(
+                train_df=train_df,
+                specs=trial_specs,
+                config=self.config,
+                nn_config=self.nn_config,
+                bow_metrics=bow_result.get("metrics", {}),
+                embedding_evidence=embedding_evidence,
+                random_state=diagnostic_seed,
+            )
+            trial_gate = _extracted_feature_review_gate(
+                diagnostic=trial_diagnostic,
+                nn_config=self.nn_config,
+            )
+            trial_diagnostic["gate"] = trial_gate
+            allowed, reasons, deltas = _strict_parsimony_replacement_decision(
+                base_diagnostic=base_diagnostic,
+                trial_diagnostic=trial_diagnostic,
+                base_gate=base_gate,
+                trial_gate=trial_gate,
+                epsilon=float(getattr(self.nn_config, "parsimony_metric_epsilon", 1e-6)),
+            )
+            base_dim = _parsimony_model_dimension(base_diagnostic)
+            trial_dim = _parsimony_model_dimension(trial_diagnostic)
+            if trial_dim >= base_dim:
+                allowed = False
+                reasons = [*reasons, "expanded_model_dimension_not_reduced"]
+            return {
+                **candidate,
+                "trial_specs": trial_specs,
+                "diagnostic": trial_diagnostic,
+                "gate": trial_gate,
+                "allowed": bool(allowed),
+                "reasons": _dedupe_strings(reasons),
+                "metric_deltas": deltas,
+                "base_dimension": int(base_dim),
+                "trial_dimension": int(trial_dim),
+                "dimension_reduction": int(base_dim - trial_dim),
+            }
+
+        n_jobs = self._parsimony_n_jobs(len(candidates))
+        if n_jobs > 1:
+            evaluated = Parallel(n_jobs=n_jobs, backend="threading", batch_size=1)(
+                delayed(evaluate_candidate)(candidate) for candidate in candidates
+            )
+        else:
+            evaluated = [evaluate_candidate(candidate) for candidate in candidates]
+
+        passing: List[Dict[str, Any]] = []
+        for result in evaluated:
+            row = _parsimony_replacement_evaluation_row(
+                outer_fold=outer_fold,
+                phase="independent",
+                result=result,
+            )
+            self.parsimony_evaluation_rows.append(row)
+            if result.get("allowed"):
+                passing.append(result)
+
+        accepted: List[Dict[str, Any]] = []
+        final_specs = list(before_specs)
+        final_diagnostic = base_diagnostic
+        final_gate = base_gate
+        joint_result: Optional[Dict[str, Any]] = None
+        if passing:
+            joint_specs = _apply_parsimony_factor_replacements(before_specs, passing)
+            if len(passing) == 1:
+                joint_diagnostic = passing[0]["diagnostic"]
+                joint_gate = passing[0]["gate"]
+            else:
+                joint_diagnostic = _evaluate_extracted_feature_set_diagnostic(
+                    train_df=train_df,
+                    specs=joint_specs,
+                    config=self.config,
+                    nn_config=self.nn_config,
+                    bow_metrics=bow_result.get("metrics", {}),
+                    embedding_evidence=embedding_evidence,
+                    random_state=diagnostic_seed,
+                )
+                joint_gate = _extracted_feature_review_gate(
+                    diagnostic=joint_diagnostic,
+                    nn_config=self.nn_config,
+                )
+                joint_diagnostic["gate"] = joint_gate
+            joint_allowed, joint_reasons, joint_deltas = (
+                _strict_parsimony_replacement_decision(
+                    base_diagnostic=base_diagnostic,
+                    trial_diagnostic=joint_diagnostic,
+                    base_gate=base_gate,
+                    trial_gate=joint_gate,
+                    epsilon=float(
+                        getattr(self.nn_config, "parsimony_metric_epsilon", 1e-6)
+                    ),
+                )
+            )
+            if _parsimony_model_dimension(joint_diagnostic) >= _parsimony_model_dimension(
+                base_diagnostic
+            ):
+                joint_allowed = False
+                joint_reasons = [
+                    *joint_reasons,
+                    "expanded_model_dimension_not_reduced",
+                ]
+            joint_result = {
+                "cluster_ids": [item["cluster_id"] for item in passing],
+                "allowed": bool(joint_allowed),
+                "reasons": _dedupe_strings(joint_reasons),
+                "metric_deltas": joint_deltas,
+                "base_dimension": _parsimony_model_dimension(base_diagnostic),
+                "trial_dimension": _parsimony_model_dimension(joint_diagnostic),
+                "dimension_reduction": (
+                    _parsimony_model_dimension(base_diagnostic)
+                    - _parsimony_model_dimension(joint_diagnostic)
+                ),
+                "diagnostic": joint_diagnostic,
+                "gate": joint_gate,
+                "trial_specs": joint_specs,
+            }
+            self.parsimony_evaluation_rows.append(
+                _parsimony_replacement_evaluation_row(
+                    outer_fold=outer_fold,
+                    phase="joint",
+                    result=joint_result,
+                )
+            )
+            if joint_allowed:
+                accepted = list(passing)
+                final_specs = joint_specs
+                final_diagnostic = joint_diagnostic
+                final_gate = joint_gate
+            else:
+                ordered = sorted(
+                    passing,
+                    key=lambda item: (
+                        -int(item.get("dimension_reduction", 0)),
+                        -float(item.get("cluster", {}).get("empirical_cohesion", 0.0)),
+                        str(item.get("cluster_id", "")),
+                    ),
+                )
+                for candidate in ordered:
+                    trial_candidates = [*accepted, candidate]
+                    greedy_specs = _apply_parsimony_factor_replacements(
+                        before_specs,
+                        trial_candidates,
+                    )
+                    greedy_diagnostic = _evaluate_extracted_feature_set_diagnostic(
                         train_df=train_df,
-                        specs=trial_specs,
+                        specs=greedy_specs,
                         config=self.config,
                         nn_config=self.nn_config,
                         bow_metrics=bow_result.get("metrics", {}),
                         embedding_evidence=embedding_evidence,
-                        random_state=91_000 + 100 * int(outer_fold) + 17 * (n_ablations + 1),
+                        random_state=diagnostic_seed,
                     )
-                    trial_gate = _extracted_feature_review_gate(
-                        diagnostic=trial_diagnostic,
+                    greedy_gate = _extracted_feature_review_gate(
+                        diagnostic=greedy_diagnostic,
                         nn_config=self.nn_config,
                     )
-                    trial_diagnostic["gate"] = trial_gate
-                    allowed, reasons, deltas = _parsimony_removal_decision(
-                        base_diagnostic=base_diagnostic,
-                        trial_diagnostic=trial_diagnostic,
-                        base_gate=base_gate,
-                        trial_gate=trial_gate,
-                        nn_config=self.nn_config,
-                    )
-                    ablation_row = {
-                        "feature": spec.name,
-                        "allowed": bool(allowed),
-                        "reasons": reasons,
-                        "n_features_after": int(len(trial_specs)),
-                        "metric_deltas": deltas,
-                        "metrics_after": _parsimony_metric_snapshot(trial_diagnostic),
-                        "gate_after": trial_gate,
-                    }
-                    ablations.append(ablation_row)
-                    n_ablations += 1
-                    if allowed:
-                        score = _extracted_review_selection_score(
-                            trial_diagnostic,
-                            trial_gate,
+                    greedy_diagnostic["gate"] = greedy_gate
+                    greedy_allowed, greedy_reasons, greedy_deltas = (
+                        _strict_parsimony_replacement_decision(
+                            base_diagnostic=base_diagnostic,
+                            trial_diagnostic=greedy_diagnostic,
+                            base_gate=base_gate,
+                            trial_gate=greedy_gate,
+                            epsilon=float(
+                                getattr(
+                                    self.nn_config,
+                                    "parsimony_metric_epsilon",
+                                    1e-6,
+                                )
+                            ),
                         )
-                        candidate = {
-                            "feature": spec.name,
-                            "trial_specs": trial_specs,
-                            "diagnostic": trial_diagnostic,
-                            "gate": trial_gate,
-                            "score": score,
-                        }
-                        if best_removal is None or score < best_removal["score"]:
-                            best_removal = candidate
+                    )
+                    if _parsimony_model_dimension(greedy_diagnostic) >= (
+                        _parsimony_model_dimension(base_diagnostic)
+                    ):
+                        greedy_allowed = False
+                        greedy_reasons = [
+                            *greedy_reasons,
+                            "expanded_model_dimension_not_reduced",
+                        ]
+                    greedy_result = {
+                        "cluster_id": candidate["cluster_id"],
+                        "cluster_ids": [item["cluster_id"] for item in trial_candidates],
+                        "allowed": bool(greedy_allowed),
+                        "reasons": _dedupe_strings(greedy_reasons),
+                        "metric_deltas": greedy_deltas,
+                        "base_dimension": _parsimony_model_dimension(base_diagnostic),
+                        "trial_dimension": _parsimony_model_dimension(greedy_diagnostic),
+                        "dimension_reduction": (
+                            _parsimony_model_dimension(base_diagnostic)
+                            - _parsimony_model_dimension(greedy_diagnostic)
+                        ),
+                        "diagnostic": greedy_diagnostic,
+                        "gate": greedy_gate,
+                        "trial_specs": greedy_specs,
+                    }
+                    self.parsimony_evaluation_rows.append(
+                        _parsimony_replacement_evaluation_row(
+                            outer_fold=outer_fold,
+                            phase="greedy_backoff",
+                            result=greedy_result,
+                        )
+                    )
+                    if greedy_allowed:
+                        accepted.append(candidate)
+                        final_specs = greedy_specs
+                        final_diagnostic = greedy_diagnostic
+                        final_gate = greedy_gate
 
-                if best_removal is None:
-                    break
-                removed.append(str(best_removal["feature"]))
-                current_specs = list(best_removal["trial_specs"])
-                base_diagnostic = best_removal["diagnostic"]
-                base_gate = best_removal["gate"]
-                stop_reason = "greedy_removal_completed"
-
-        decision = "prune" if removed else "retain_all"
+        removed = _dedupe_strings(
+            [name for candidate in accepted for name in candidate.get("replaces", [])]
+        )
+        added_factors = _dedupe_strings(
+            [spec.name for candidate in accepted for spec in candidate.get("factor_specs", [])]
+        )
+        decision = "replace_clusters" if accepted else "retain_all"
+        if not before_specs:
+            stop_reason = "no_selected_features"
+        elif not clusters:
+            stop_reason = "no_coherent_value_clusters"
+        elif not candidates:
+            stop_reason = "no_valid_extractable_factor_proposals"
+        elif not passing:
+            stop_reason = "no_replacement_preserved_all_metrics"
+        elif not accepted:
+            stop_reason = "joint_and_greedy_replacements_failed"
+        else:
+            stop_reason = "strict_cluster_replacements_accepted"
         summary = {
+            "schema_version": _PARSIMONY_SCHEMA_VERSION,
+            "strategy": "value_driven_cluster_factor",
             "enabled": True,
             "mandatory": True,
             "decision": decision,
             "stop_reason": stop_reason,
             "n_features_before": int(len(before_specs)),
-            "n_features_after": int(len(current_specs)),
+            "n_features_after": int(len(final_specs)),
             "n_removed": int(len(removed)),
             "removed_features": removed,
-            "n_single_feature_ablations": int(n_ablations),
-            **_prefix_metrics("final_", _parsimony_metric_snapshot(base_diagnostic)),
+            "added_factors": added_factors,
+            "n_clusters": int(len(clusters)),
+            "n_factor_proposals": int(len(factor_agent_results)),
+            "n_valid_factor_proposals": int(len(candidates)),
+            "n_independent_replacements_passing": int(len(passing)),
+            "n_accepted_replacements": int(len(accepted)),
+            "accepted_cluster_ids": [item["cluster_id"] for item in accepted],
+            "n_single_feature_ablations": 0,
+            **_prefix_metrics("final_", _parsimony_metric_snapshot(final_diagnostic)),
         }
         review_row = {
+            "schema_version": _PARSIMONY_SCHEMA_VERSION,
             "outer_fold": int(outer_fold),
             "event": "mandatory_parsimony_review",
+            "strategy": "value_driven_cluster_factor",
             "decision": decision,
             "stop_reason": stop_reason,
             "required_features": sorted(required_names),
             "selected_features_before": [_spec_to_dict(spec) for spec in before_specs],
-            "selected_features_after": [_spec_to_dict(spec) for spec in current_specs],
+            "selected_features_after": [_spec_to_dict(spec) for spec in final_specs],
             "base_metrics": _parsimony_metric_snapshot(base_diagnostic),
             "base_gate": base_gate,
-            "redundancy_review": redundancy,
-            "ablations": ablations,
+            "cluster_generation": {
+                **cluster_result.get("generation", {}),
+                "semantic_encoding": semantic_info,
+            },
+            "clusters": [cluster.get("cluster_id") for cluster in clusters],
+            "factor_proposals": [
+                row.get("cluster_id")
+                for row in self._outer_fold_rows(self.parsimony_factor_rows, outer_fold)
+            ],
+            "replacement_evaluations": int(
+                len(self._outer_fold_rows(self.parsimony_evaluation_rows, outer_fold))
+            ),
+            "accepted_replacements": [
+                {
+                    "cluster_id": item["cluster_id"],
+                    "replaces": list(item["replaces"]),
+                    "factors": [_spec_to_dict(spec) for spec in item["factor_specs"]],
+                }
+                for item in accepted
+            ],
+            "alias_resolution": alias_resolution,
+            "value_harmonization": value_harmonization,
+            # Retain compatibility keys while making clear that no legacy
+            # pairwise redundancy/ablation pass ran.
+            "redundancy_review": {
+                "strategy": "value_driven_sparse_neighbor_graph",
+                "cluster_count": int(len(clusters)),
+            },
+            "ablations": [],
+            "final_gate": final_gate,
             "summary": summary,
         }
         self.parsimony_review_rows.append(review_row)
@@ -4098,14 +4518,178 @@ class MultiModelAgenticForestRunner:
                 "outer_fold": int(outer_fold),
                 "event": "mandatory_parsimony_review",
                 "decision": decision,
+                "strategy": "value_driven_cluster_factor",
                 "stop_reason": stop_reason,
                 "n_features_before": int(len(before_specs)),
-                "n_features_after": int(len(current_specs)),
+                "n_features_after": int(len(final_specs)),
                 "removed_features": removed,
+                "added_factors": added_factors,
                 "artifact": "parsimony_review_by_fold.jsonl",
             }
         )
-        return {"selected_specs": current_specs, "summary": summary}
+        self._flush_parsimony_fold_artifacts(outer_fold)
+        return {"selected_specs": final_specs, "summary": summary}
+
+    def _parsimony_semantic_vectors(
+        self,
+        specs: Sequence[ExplicitFeatureSpec],
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        documents = [_parsimony_feature_contract_document(spec) for spec in specs]
+        matrix, error = self._encode_concept_cluster_texts(documents)
+        if matrix is not None:
+            vectors = sklearn_normalize(np.asarray(matrix, dtype=float))
+            return vectors, {"method": "embedding", "fallback_reason": None}
+        vectors = _parsimony_tfidf_semantic_vectors(documents)
+        return vectors, {"method": "tfidf_svd", "fallback_reason": error}
+
+    def _build_parsimony_factor_context(
+        self,
+        *,
+        outer_fold: int,
+        cluster: Dict[str, Any],
+        specs: Sequence[ExplicitFeatureSpec],
+        train_df: pd.DataFrame,
+        required_names: set,
+        bow_result: Dict[str, Any],
+        embedding_evidence: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        member_names = list(cluster.get("member_names", []))
+        member_set = set(member_names)
+        member_specs = [spec for spec in specs if spec.name in member_set]
+        replaceable = [spec.name for spec in member_specs if spec.name not in required_names]
+        protected = [spec.name for spec in member_specs if spec.name in required_names]
+        role_union = sorted({role for spec in member_specs if spec.name in replaceable for role in spec.roles})
+        extraction_summary = {
+            item["name"]: item
+            for item in _summarize_multi_model_extractions(train_df, member_specs)
+        }
+        context: Dict[str, Any] = {
+            "prompt_version": _PARSIMONY_FACTOR_PROMPT_VERSION,
+            "schema_version": _PARSIMONY_SCHEMA_VERSION,
+            "outer_fold": int(outer_fold),
+            "cluster_id": cluster.get("cluster_id"),
+            "clinical_question": self.config.clinical_question,
+            "estimand": {
+                "treatment_column": self.config.treatment_column,
+                "outcome_column": self.config.outcome_column,
+                "outcome_type": self.config.outcome_type,
+            },
+            "cluster": cluster,
+            "cluster_members": [
+                {
+                    **_spec_to_dict(spec),
+                    "protected": spec.name in required_names,
+                    "extraction_summary": extraction_summary.get(spec.name, {}),
+                }
+                for spec in member_specs
+            ],
+            "replaceable_members": replaceable,
+            "protected_members": protected,
+            "required_role_union": role_union,
+            "max_factors": int(
+                getattr(self.nn_config, "parsimony_max_factors_per_cluster", 2)
+            ),
+            "temporal_policy": (
+                "Use only evidence available before the treatment decision. The permitted "
+                "source text is already temporally scoped; do not add an outcome-semantic ban."
+            ),
+            "response_contract": "cluster-to-factor operational rubric",
+        }
+        importance = (bow_result.get("context") or {}).get("feature_importance")
+        if isinstance(importance, dict):
+            context["bow_feature_evidence"] = _compact_multi_model_importance(importance)
+        if embedding_evidence:
+            context["embedding_contrast_evidence"] = _compact_embedding_contrast_evidence(
+                embedding_evidence
+            )
+        htr_evidence = bow_result.get("htr_evidence") or {}
+        if htr_evidence:
+            context["htr_attention_evidence"] = _cluster_relevant_htr_evidence(
+                htr_evidence,
+                member_specs,
+            )
+        return _round_floats(context)
+
+    def _request_parsimony_factor_responses(
+        self,
+        contexts: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not contexts:
+            return []
+        results: List[Optional[Dict[str, Any]]] = [None] * len(contexts)
+        pending: List[Tuple[int, Dict[str, Any]]] = []
+        cached_by_fingerprint: Dict[str, Dict[str, Any]] = {}
+        outer_fold = int(contexts[0].get("outer_fold", 0) or 0)
+        cache_path = (
+            self.artifact_dir
+            / f"outer_fold_{outer_fold:03d}"
+            / "parsimony_factor_proposals_by_fold.jsonl"
+        )
+        if self.resume and cache_path.exists():
+            for row in _read_jsonl(cache_path):
+                fingerprint = str(row.get("context_fingerprint") or "")
+                if fingerprint and row.get("response") is not None and not row.get("agent_error"):
+                    cached_by_fingerprint[fingerprint] = row
+        for index, context in enumerate(contexts):
+            fingerprint = _parsimony_context_fingerprint(context)
+            cached = cached_by_fingerprint.get(fingerprint)
+            if cached is not None:
+                results[index] = {
+                    "response": cached.get("response"),
+                    "agent_raw_output": cached.get("agent_raw_output"),
+                    "resumed_from_cache": str(cache_path),
+                }
+            else:
+                pending.append((index, context))
+        if not pending:
+            return [result or {"response": None} for result in results]
+
+        n_jobs = self._parsimony_n_jobs(len(pending))
+        if self._has_external_proposal_agent:
+            n_jobs = 1
+        if n_jobs <= 1:
+            for index, context in pending:
+                try:
+                    response = self.proposal_agent.propose(context)
+                    result: Dict[str, Any] = {"response": response}
+                    trace = _get_agent_response_trace(self.proposal_agent)
+                    if trace is not None:
+                        result["agent_raw_output"] = trace
+                except Exception as exc:
+                    logger.warning(
+                        "Parsimony factor agent failed for cluster %s; retaining cluster",
+                        context.get("cluster_id"),
+                        exc_info=True,
+                    )
+                    result = {
+                        "response": None,
+                        "error": f"{exc.__class__.__name__}: {exc}",
+                    }
+                results[index] = result
+            return [result or {"response": None} for result in results]
+        parallel_results = Parallel(n_jobs=n_jobs, backend="threading", batch_size=1)(
+            delayed(_parsimony_factor_agent_worker)(self.search_config, context)
+            for _, context in pending
+        )
+        for (index, _), result in zip(pending, parallel_results):
+            results[index] = result
+        return [result or {"response": None} for result in results]
+
+    def _flush_parsimony_fold_artifacts(self, outer_fold: int) -> None:
+        target_dir = self.artifact_dir / f"outer_fold_{int(outer_fold):03d}"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        _write_jsonl(
+            target_dir / "parsimony_clusters_by_fold.jsonl",
+            self._outer_fold_rows(self.parsimony_cluster_rows, outer_fold),
+        )
+        _write_jsonl(
+            target_dir / "parsimony_factor_proposals_by_fold.jsonl",
+            self._outer_fold_rows(self.parsimony_factor_rows, outer_fold),
+        )
+        _write_jsonl(
+            target_dir / "parsimony_replacement_evaluations_by_fold.jsonl",
+            self._outer_fold_rows(self.parsimony_evaluation_rows, outer_fold),
+        )
 
     def _build_extracted_feature_review_context(
         self,
@@ -4382,6 +4966,13 @@ class MultiModelAgenticForestRunner:
             auto_workers=self.num_workers,
         )
 
+    def _parsimony_n_jobs(self, tasks: int) -> int:
+        return self._parallel_n_jobs(
+            self.nn_config.parsimony_parallelism,
+            tasks,
+            auto_workers=self.num_workers,
+        )
+
     def _inner_workers_for_outer_job(self, outer_n_jobs: int) -> int:
         if str(self.nn_config.fold_parallelism).strip().lower() != "auto":
             return self.num_workers
@@ -4516,6 +5107,9 @@ class MultiModelAgenticForestRunner:
             f"- Extracted-feature diagnostic records: {len(self.extracted_feature_diagnostic_rows)}",
             f"- Candidate signal review records: {len(self.candidate_signal_review_rows)}",
             f"- Parsimony review records: {len(self.parsimony_review_rows)}",
+            f"- Value-cluster records: {len(self.parsimony_cluster_rows)}",
+            f"- Factor proposal records: {len(self.parsimony_factor_rows)}",
+            f"- Replacement evaluation records: {len(self.parsimony_evaluation_rows)}",
             "",
             "Final Variables",
         ]
@@ -4541,6 +5135,9 @@ class MultiModelAgenticForestRunner:
                 "- ensemble_nuisance_predictions.parquet",
                 "- candidate_features.parquet and candidate_signal_review.jsonl",
                 "- parsimony_review.by_fold.jsonl",
+                "- parsimony_clusters_by_fold.jsonl",
+                "- parsimony_factor_proposals_by_fold.jsonl",
+                "- parsimony_replacement_evaluations_by_fold.jsonl",
                 "- ite_estimates.parquet",
             ]
         )
@@ -4587,6 +5184,12 @@ class MultiModelAgenticForestRunner:
         )
         signal_rows = self._outer_fold_rows(self.candidate_signal_review_rows, fold)
         parsimony_rows = self._outer_fold_rows(self.parsimony_review_rows, fold)
+        parsimony_cluster_rows = self._outer_fold_rows(self.parsimony_cluster_rows, fold)
+        parsimony_factor_rows = self._outer_fold_rows(self.parsimony_factor_rows, fold)
+        parsimony_evaluation_rows = self._outer_fold_rows(
+            self.parsimony_evaluation_rows,
+            fold,
+        )
         metric_rows = self._outer_fold_rows(self.outer_metric_rows, fold)
         split_rows = self._outer_fold_rows(self.split_provenance_rows, fold)
         importance_rows = self._outer_fold_rows(self.importance_rows, fold)
@@ -4600,6 +5203,18 @@ class MultiModelAgenticForestRunner:
         _write_jsonl(target_dir / "candidate_signal_review.jsonl", signal_rows)
         _write_jsonl(target_dir / "parsimony_review_by_fold.jsonl", parsimony_rows)
         _write_jsonl(target_dir / "parsimony_review.by_fold.jsonl", parsimony_rows)
+        _write_jsonl(
+            target_dir / "parsimony_clusters_by_fold.jsonl",
+            parsimony_cluster_rows,
+        )
+        _write_jsonl(
+            target_dir / "parsimony_factor_proposals_by_fold.jsonl",
+            parsimony_factor_rows,
+        )
+        _write_jsonl(
+            target_dir / "parsimony_replacement_evaluations_by_fold.jsonl",
+            parsimony_evaluation_rows,
+        )
         _write_jsonl(target_dir / "split_provenance.jsonl", split_rows)
         _write_jsonl(
             target_dir / "bow_view_feature_importance_by_fold.jsonl",
@@ -4617,12 +5232,16 @@ class MultiModelAgenticForestRunner:
             target_dir / "checkpoint_summary.json",
             {
                 "outer_fold": fold,
+                "parsimony_schema_version": _PARSIMONY_SCHEMA_VERSION,
                 "n_predictions": 0 if predictions is None else int(len(predictions)),
                 "n_selected_feature_rows": int(len(selected_rows)),
                 "n_agent_rows": int(len(agent_rows)),
                 "n_extracted_feature_diagnostic_rows": int(len(diagnostics)),
                 "n_candidate_signal_review_rows": int(len(signal_rows)),
                 "n_parsimony_review_rows": int(len(parsimony_rows)),
+                "n_parsimony_cluster_rows": int(len(parsimony_cluster_rows)),
+                "n_parsimony_factor_rows": int(len(parsimony_factor_rows)),
+                "n_parsimony_evaluation_rows": int(len(parsimony_evaluation_rows)),
                 "n_metric_rows": int(len(metric_rows)),
             },
         )
@@ -4735,6 +5354,21 @@ class MultiModelAgenticForestRunner:
             _write_jsonl(
                 self.artifact_dir / "parsimony_review.by_fold.jsonl",
                 self.parsimony_review_rows,
+            )
+        if self.parsimony_cluster_rows:
+            _write_jsonl(
+                self.artifact_dir / "parsimony_clusters_by_fold.jsonl",
+                self.parsimony_cluster_rows,
+            )
+        if self.parsimony_factor_rows:
+            _write_jsonl(
+                self.artifact_dir / "parsimony_factor_proposals_by_fold.jsonl",
+                self.parsimony_factor_rows,
+            )
+        if self.parsimony_evaluation_rows:
+            _write_jsonl(
+                self.artifact_dir / "parsimony_replacement_evaluations_by_fold.jsonl",
+                self.parsimony_evaluation_rows,
             )
         _write_jsonl(self.artifact_dir / "agent_candidate_proposals.jsonl", self.agent_rows)
         with open(self.artifact_dir / "selected_feature_sets.json", "w") as f:
@@ -6719,6 +7353,533 @@ def _feature_redundancy_review(
     }
 
 
+def _parsimony_feature_contract_document(spec: ExplicitFeatureSpec) -> str:
+    categories = " ".join(str(value) for value in (spec.categories or []))
+    aliases = " ".join(
+        [
+            str(value)
+            for values in (getattr(spec, "value_aliases", None) or {}).values()
+            for value in values
+        ]
+    )
+    return " ".join(
+        part
+        for part in [
+            spec.name.replace("_", " "),
+            str(spec.description or ""),
+            spec.type,
+            categories,
+            aliases,
+            " ".join(spec.roles),
+        ]
+        if part
+    )
+
+
+def _parsimony_tfidf_semantic_vectors(documents: Sequence[str]) -> np.ndarray:
+    documents = [str(value or "") for value in documents]
+    n_items = len(documents)
+    if n_items == 0:
+        return np.zeros((0, 1), dtype=float)
+    if n_items == 1:
+        return np.ones((1, 1), dtype=float)
+    try:
+        matrix = TfidfVectorizer(
+            ngram_range=(1, 2),
+            min_df=1,
+            sublinear_tf=True,
+        ).fit_transform(documents)
+    except ValueError:
+        return np.eye(n_items, dtype=float)
+    if matrix.shape[0] > 1 and all(
+        (matrix[index] - matrix[0]).nnz == 0
+        for index in range(1, matrix.shape[0])
+    ):
+        return np.ones((n_items, 1), dtype=float)
+    n_components = min(64, matrix.shape[0] - 1, matrix.shape[1] - 1)
+    if n_components >= 2:
+        vectors = TruncatedSVD(
+            n_components=n_components,
+            random_state=97,
+        ).fit_transform(matrix)
+    else:
+        vectors = matrix.toarray()
+    return sklearn_normalize(np.asarray(vectors, dtype=float))
+
+
+def _parsimony_feature_value_block(
+    train_df: pd.DataFrame,
+    spec: ExplicitFeatureSpec,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    values = _explicit_feature_series(train_df, spec)
+    missing = _explicit_feature_missing_mask(train_df, spec, values)
+    n_rows = len(train_df)
+    if spec.type == "continuous":
+        numeric = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float).copy()
+        numeric[missing] = np.nan
+        observed = numeric[np.isfinite(numeric)]
+        if len(observed):
+            lower, upper = np.nanquantile(observed, [0.01, 0.99])
+            clipped = np.clip(numeric, lower, upper)
+            median = float(np.nanmedian(clipped))
+            filled = np.where(np.isfinite(clipped), clipped, median)
+            ranked = pd.Series(filled).rank(method="average", pct=True).to_numpy(dtype=float)
+            std = float(np.std(ranked))
+            standardized = (ranked - float(np.mean(ranked))) / (std if std > 0 else 1.0)
+        else:
+            standardized = np.zeros(n_rows, dtype=float)
+        block = np.column_stack([standardized, missing.astype(float)])
+        unique = int(pd.Series(observed).nunique(dropna=True)) if len(observed) else 0
+    else:
+        categorical = values.astype("object").where(~missing, "__MISSING__").astype(str)
+        counts = categorical.value_counts(dropna=False)
+        if len(counts) > 32:
+            keep = set(counts.head(31).index.astype(str))
+            categorical = categorical.where(categorical.isin(keep), "__OTHER__")
+        block = pd.get_dummies(categorical, dtype=float).to_numpy(dtype=float)
+        if block.shape[1] == 0:
+            block = np.zeros((n_rows, 1), dtype=float)
+        unique = int(values.loc[~missing].astype(str).nunique(dropna=True))
+
+    block = np.array(block, dtype=float, copy=True)
+    block -= np.mean(block, axis=0, keepdims=True)
+    norms = np.linalg.norm(block, axis=0)
+    norms = np.where(norms > 0.0, norms, 1.0)
+    block = block / norms
+    return block, {
+        "coverage": float(1.0 - np.mean(missing)) if n_rows else 0.0,
+        "n_unique_observed": unique,
+        "encoded_columns": int(block.shape[1]),
+    }
+
+
+def _parsimony_empirical_sketch_matrix(
+    *,
+    train_df: pd.DataFrame,
+    specs: Sequence[ExplicitFeatureSpec],
+    sketch_dim: int,
+    random_state: int,
+) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+    n_rows = len(train_df)
+    if not specs:
+        return np.zeros((0, max(1, sketch_dim + 3)), dtype=float), []
+    rng = np.random.default_rng(int(random_state))
+    projection = rng.normal(size=(max(1, n_rows), max(1, int(sketch_dim))))
+    projection = sklearn_normalize(projection, axis=0)
+    rows: List[np.ndarray] = []
+    summaries: List[Dict[str, Any]] = []
+    for spec in specs:
+        block, summary = _parsimony_feature_value_block(train_df, spec)
+        if n_rows:
+            projected = projection[:n_rows].T @ block
+            sketch = np.linalg.norm(projected, axis=1)
+        else:
+            sketch = np.zeros(max(1, int(sketch_dim)), dtype=float)
+        rows.append(
+            np.concatenate(
+                [
+                    sketch,
+                    np.asarray(
+                        [
+                            float(summary["coverage"]),
+                            min(1.0, np.log1p(summary["n_unique_observed"]) / np.log(33.0)),
+                            1.0 if spec.type == "continuous" else 0.0,
+                        ],
+                        dtype=float,
+                    ),
+                ]
+            )
+        )
+        summaries.append({"name": spec.name, **summary})
+    matrix = np.vstack(rows)
+    return sklearn_normalize(matrix), summaries
+
+
+def _parsimony_mutual_neighbor_pairs(
+    vectors: np.ndarray,
+    *,
+    neighbors: int,
+) -> set:
+    vectors = np.asarray(vectors, dtype=float)
+    n_items = int(vectors.shape[0]) if vectors.ndim == 2 else 0
+    if n_items < 2:
+        return set()
+    count = min(max(1, int(neighbors)), n_items - 1)
+    model = NearestNeighbors(
+        n_neighbors=count + 1,
+        metric="cosine",
+        algorithm="brute",
+    ).fit(vectors)
+    indices = model.kneighbors(vectors, return_distance=False)
+    directed = {
+        (row, int(col))
+        for row, cols in enumerate(indices)
+        for col in cols
+        if int(col) != row
+    }
+    return {
+        tuple(sorted((left, right)))
+        for left, right in directed
+        if (right, left) in directed and left != right
+    }
+
+
+def _parsimony_cramers_v(left: pd.Series, right: pd.Series) -> float:
+    table = pd.crosstab(left, right, dropna=False)
+    n = float(table.to_numpy().sum())
+    if n <= 1.0 or min(table.shape) < 2:
+        return 0.0
+    try:
+        chi2 = float(chi2_contingency(table, correction=False)[0])
+    except ValueError:
+        return 0.0
+    rows, cols = table.shape
+    phi2 = chi2 / n
+    correction = ((cols - 1) * (rows - 1)) / max(1.0, n - 1.0)
+    phi2_corrected = max(0.0, phi2 - correction)
+    rows_corrected = rows - ((rows - 1) ** 2) / max(1.0, n - 1.0)
+    cols_corrected = cols - ((cols - 1) ** 2) / max(1.0, n - 1.0)
+    denominator = min(rows_corrected - 1.0, cols_corrected - 1.0)
+    if denominator <= 0.0:
+        return 0.0
+    return float(np.clip(np.sqrt(phi2_corrected / denominator), 0.0, 1.0))
+
+
+def _parsimony_correlation_ratio(
+    continuous: np.ndarray,
+    categorical: pd.Series,
+) -> float:
+    continuous = np.asarray(continuous, dtype=float)
+    if len(continuous) < 3 or float(np.std(continuous)) <= 0.0:
+        return 0.0
+    grand_mean = float(np.mean(continuous))
+    denominator = float(np.sum(np.square(continuous - grand_mean)))
+    if denominator <= 0.0:
+        return 0.0
+    numerator = 0.0
+    categories = categorical.astype(str).to_numpy()
+    for value in np.unique(categories):
+        group = continuous[categories == value]
+        if len(group):
+            numerator += float(len(group)) * float(np.mean(group) - grand_mean) ** 2
+    return float(np.clip(np.sqrt(max(0.0, numerator / denominator)), 0.0, 1.0))
+
+
+def _parsimony_pair_association(
+    *,
+    train_df: pd.DataFrame,
+    left: ExplicitFeatureSpec,
+    right: ExplicitFeatureSpec,
+    missingness_weight: float,
+) -> Dict[str, Any]:
+    left_values = _explicit_feature_series(train_df, left)
+    right_values = _explicit_feature_series(train_df, right)
+    left_missing = _explicit_feature_missing_mask(train_df, left, left_values)
+    right_missing = _explicit_feature_missing_mask(train_df, right, right_values)
+    complete = ~(left_missing | right_missing)
+    n_complete = int(np.sum(complete))
+    association_type = f"{left.type}_{right.type}"
+    value_association = 0.0
+    if n_complete >= 3:
+        if left.type == "continuous" and right.type == "continuous":
+            x = pd.to_numeric(left_values[complete], errors="coerce")
+            y = pd.to_numeric(right_values[complete], errors="coerce")
+            valid = x.notna() & y.notna()
+            corr = x[valid].corr(y[valid], method="spearman") if int(valid.sum()) >= 3 else None
+            value_association = 0.0 if corr is None or not np.isfinite(corr) else abs(float(corr))
+            association_type = "absolute_spearman"
+        elif left.type == "categorical" and right.type == "categorical":
+            value_association = _parsimony_cramers_v(
+                left_values[complete].astype(str),
+                right_values[complete].astype(str),
+            )
+            association_type = "bias_corrected_cramers_v"
+        else:
+            if left.type == "continuous":
+                continuous = pd.to_numeric(left_values[complete], errors="coerce")
+                categorical = right_values[complete].astype(str)
+            else:
+                continuous = pd.to_numeric(right_values[complete], errors="coerce")
+                categorical = left_values[complete].astype(str)
+            valid = continuous.notna()
+            value_association = _parsimony_correlation_ratio(
+                continuous[valid].to_numpy(dtype=float),
+                categorical[valid],
+            )
+            association_type = "correlation_ratio"
+
+    missing_association = 0.0
+    if len(left_missing) >= 3 and np.std(left_missing) > 0 and np.std(right_missing) > 0:
+        missing_corr = np.corrcoef(left_missing.astype(float), right_missing.astype(float))[0, 1]
+        if np.isfinite(missing_corr):
+            missing_association = abs(float(missing_corr))
+    weight = float(np.clip(missingness_weight, 0.0, 1.0))
+    empirical = (1.0 - weight) * value_association + weight * missing_association
+    return {
+        "a": left.name,
+        "b": right.name,
+        "association_type": association_type,
+        "value_association": float(value_association),
+        "missingness_association": float(missing_association),
+        "empirical_similarity": float(np.clip(empirical, 0.0, 1.0)),
+        "n_pairwise_complete": n_complete,
+    }
+
+
+def _parsimony_split_large_component(
+    indices: Sequence[int],
+    *,
+    vectors: np.ndarray,
+    max_size: int,
+    random_state: int,
+) -> List[List[int]]:
+    indices = list(indices)
+    if len(indices) <= max_size:
+        return [indices]
+    n_clusters = int(np.ceil(len(indices) / max(1, max_size)))
+    labels = MiniBatchKMeans(
+        n_clusters=n_clusters,
+        random_state=int(random_state),
+        n_init=10,
+        batch_size=max(32, len(indices)),
+    ).fit_predict(vectors[np.asarray(indices)])
+    unique_labels = sorted(set(int(value) for value in labels))
+    if len(unique_labels) <= 1:
+        return [
+            indices[start : start + max_size]
+            for start in range(0, len(indices), max_size)
+        ]
+    result: List[List[int]] = []
+    for label in unique_labels:
+        members = [indices[pos] for pos, value in enumerate(labels) if int(value) == label]
+        result.extend(
+            _parsimony_split_large_component(
+                members,
+                vectors=vectors,
+                max_size=max_size,
+                random_state=random_state + label + 1,
+            )
+        )
+    return result
+
+
+def _build_value_driven_feature_clusters(
+    *,
+    train_df: pd.DataFrame,
+    specs: Sequence[ExplicitFeatureSpec],
+    semantic_vectors: np.ndarray,
+    nn_config: MultiModelAgenticForestConfig,
+    random_state: int,
+) -> Dict[str, Any]:
+    specs = list(specs)
+    n_specs = len(specs)
+    if n_specs < 2:
+        return {
+            "generation": {
+                "uses_actual_extracted_values": True,
+                "n_features": n_specs,
+                "skip_reason": "fewer_than_two_features",
+            },
+            "clusters": [],
+        }
+    empirical_vectors, value_summaries = _parsimony_empirical_sketch_matrix(
+        train_df=train_df,
+        specs=specs,
+        sketch_dim=int(getattr(nn_config, "parsimony_cluster_sketch_dim", 32)),
+        random_state=random_state,
+    )
+    semantic_vectors = sklearn_normalize(np.asarray(semantic_vectors, dtype=float))
+    if semantic_vectors.shape[0] != n_specs:
+        semantic_vectors = np.eye(n_specs, dtype=float)
+    weight = float(getattr(nn_config, "parsimony_cluster_semantic_weight", 0.5))
+    combined_vectors = sklearn_normalize(
+        np.hstack(
+            [
+                np.sqrt(max(0.0, 1.0 - weight)) * empirical_vectors,
+                np.sqrt(max(0.0, weight)) * semantic_vectors,
+            ]
+        )
+    )
+    neighbors = int(getattr(nn_config, "parsimony_cluster_neighbors", 20))
+    empirical_pairs = _parsimony_mutual_neighbor_pairs(
+        empirical_vectors,
+        neighbors=neighbors,
+    )
+    semantic_pairs = _parsimony_mutual_neighbor_pairs(
+        semantic_vectors,
+        neighbors=neighbors,
+    )
+    candidate_pairs = sorted(empirical_pairs | semantic_pairs)
+    missingness_weight = float(
+        getattr(nn_config, "parsimony_cluster_missingness_weight", 0.15)
+    )
+    empirical_min = float(
+        getattr(nn_config, "parsimony_cluster_empirical_min_similarity", 0.30)
+    )
+    strong_empirical = float(
+        getattr(nn_config, "parsimony_cluster_strong_empirical_threshold", 0.80)
+    )
+    combined_threshold = float(
+        getattr(nn_config, "parsimony_cluster_combined_threshold", 0.60)
+    )
+    pair_details: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    edges: List[Tuple[int, int]] = []
+    for left_idx, right_idx in candidate_pairs:
+        detail = _parsimony_pair_association(
+            train_df=train_df,
+            left=specs[left_idx],
+            right=specs[right_idx],
+            missingness_weight=missingness_weight,
+        )
+        semantic = float(
+            np.clip(np.dot(semantic_vectors[left_idx], semantic_vectors[right_idx]), 0.0, 1.0)
+        )
+        combined = (1.0 - weight) * detail["empirical_similarity"] + weight * semantic
+        detail.update(
+            {
+                "semantic_similarity": semantic,
+                "combined_similarity": float(combined),
+                "candidate_sources": sorted(
+                    [
+                        source
+                        for source, pairs in [
+                            ("empirical_value_knn", empirical_pairs),
+                            ("semantic_knn", semantic_pairs),
+                        ]
+                        if (left_idx, right_idx) in pairs
+                    ]
+                ),
+            }
+        )
+        qualifies = detail["empirical_similarity"] >= strong_empirical or (
+            detail["empirical_similarity"] >= empirical_min
+            and combined >= combined_threshold
+        )
+        detail["edge_retained"] = bool(qualifies)
+        pair_details[(left_idx, right_idx)] = detail
+        if qualifies:
+            edges.append((left_idx, right_idx))
+
+    parent = list(range(n_specs))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for left_idx, right_idx in edges:
+        union(left_idx, right_idx)
+    components: Dict[int, List[int]] = {}
+    connected_nodes = {index for edge in edges for index in edge}
+    for index in sorted(connected_nodes):
+        components.setdefault(find(index), []).append(index)
+
+    min_size = int(getattr(nn_config, "parsimony_cluster_min_size", 2))
+    max_size = int(getattr(nn_config, "parsimony_cluster_max_size", 12))
+    split_components: List[List[int]] = []
+    for component in components.values():
+        if len(component) < min_size:
+            continue
+        split_components.extend(
+            _parsimony_split_large_component(
+                component,
+                vectors=combined_vectors,
+                max_size=max_size,
+                random_state=random_state + len(split_components),
+            )
+        )
+
+    clusters: List[Dict[str, Any]] = []
+    for component in split_components:
+        if len(component) < min_size:
+            continue
+        component = sorted(component, key=lambda idx: specs[idx].name)
+        exact_pairs: List[Dict[str, Any]] = []
+        for left_idx, right_idx in combinations(component, 2):
+            key = tuple(sorted((left_idx, right_idx)))
+            detail = pair_details.get(key)
+            if detail is None:
+                detail = _parsimony_pair_association(
+                    train_df=train_df,
+                    left=specs[left_idx],
+                    right=specs[right_idx],
+                    missingness_weight=missingness_weight,
+                )
+                semantic = float(
+                    np.clip(
+                        np.dot(semantic_vectors[left_idx], semantic_vectors[right_idx]),
+                        0.0,
+                        1.0,
+                    )
+                )
+                detail.update(
+                    {
+                        "semantic_similarity": semantic,
+                        "combined_similarity": float(
+                            (1.0 - weight) * detail["empirical_similarity"]
+                            + weight * semantic
+                        ),
+                        "candidate_sources": [],
+                        "edge_retained": False,
+                    }
+                )
+            exact_pairs.append(detail)
+        empirical_cohesion = float(
+            np.mean([item["empirical_similarity"] for item in exact_pairs])
+        )
+        combined_cohesion = float(
+            np.mean([item["combined_similarity"] for item in exact_pairs])
+        )
+        if empirical_cohesion < empirical_min:
+            continue
+        member_names = [specs[index].name for index in component]
+        clusters.append(
+            {
+                "member_names": member_names,
+                "n_members": int(len(member_names)),
+                "empirical_cohesion": empirical_cohesion,
+                "combined_cohesion": combined_cohesion,
+                "pair_associations": exact_pairs,
+                "value_summaries": [value_summaries[index] for index in component],
+            }
+        )
+    clusters.sort(key=lambda item: tuple(item["member_names"]))
+    for index, cluster in enumerate(clusters, start=1):
+        cluster["cluster_id"] = f"value_cluster_{index:03d}"
+    return {
+        "generation": {
+            "uses_actual_extracted_values": True,
+            "uses_treatment_or_outcome_labels": False,
+            "n_rows": int(len(train_df)),
+            "n_features": int(n_specs),
+            "empirical_sketch_dim": int(
+                getattr(nn_config, "parsimony_cluster_sketch_dim", 32)
+            ),
+            "neighbors_per_view": neighbors,
+            "n_empirical_neighbor_pairs": int(len(empirical_pairs)),
+            "n_semantic_neighbor_pairs": int(len(semantic_pairs)),
+            "n_candidate_pairs": int(len(candidate_pairs)),
+            "n_retained_graph_edges": int(len(edges)),
+            "n_clusters": int(len(clusters)),
+            "semantic_weight": weight,
+            "empirical_min_similarity": empirical_min,
+            "strong_empirical_threshold": strong_empirical,
+            "combined_threshold": combined_threshold,
+            "missingness_weight": missingness_weight,
+            "continuous_association": "absolute_spearman",
+            "categorical_association": "bias_corrected_cramers_v",
+            "mixed_association": "correlation_ratio",
+        },
+        "clusters": clusters,
+    }
+
+
 def _explicit_feature_series(df: pd.DataFrame, spec: ExplicitFeatureSpec) -> pd.Series:
     value_col = f"explicit_feat_{spec.name}"
     legacy_col = f"explicit_conf_{spec.name}"
@@ -6777,6 +7938,382 @@ def _parsimony_metric_snapshot(diagnostic: Dict[str, Any]) -> Dict[str, Any]:
         "tau_hat_pseudo_target_corr",
     ]
     return {key: metrics.get(key) for key in keys if key in metrics}
+
+
+def _dedupe_strings(values: Sequence[Any]) -> List[str]:
+    return list(dict.fromkeys(str(value) for value in values if str(value)))
+
+
+def _parsimony_context_fingerprint(context: Dict[str, Any]) -> str:
+    payload = json.dumps(
+        context,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=_json_default,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:20]
+
+
+def _parsimony_operational_factor_description(factor: Dict[str, Any]) -> str:
+    supporting = "; ".join(str(value) for value in factor.get("supporting_indicators", []))
+    contrary = "; ".join(str(value) for value in factor.get("contrary_indicators", []))
+    return (
+        f"{str(factor.get('description') or '').strip()} "
+        f"Inference kind: {str(factor.get('inference_kind') or '').strip()}. "
+        f"Measurement unit: {str(factor.get('unit') or 'not applicable').strip()}. "
+        "Use only evidence temporally available before the treatment decision. "
+        f"Supporting indicators: {supporting or 'none supplied'}. "
+        f"Contrary indicators: {contrary or 'none supplied'}. "
+        f"Minimum evidence for a non-null value: "
+        f"{str(factor.get('minimum_evidence') or '').strip()}. "
+        f"Null policy: {str(factor.get('null_policy') or '').strip()}"
+    ).strip()
+
+
+def _validate_parsimony_factor_candidate(
+    *,
+    response: Any,
+    context: Dict[str, Any],
+    cluster: Dict[str, Any],
+    current_specs: Sequence[ExplicitFeatureSpec],
+    required_names: set,
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    reasons: List[str] = []
+    if not isinstance(response, dict):
+        return None, {"passed": False, "reasons": ["response_not_object"]}
+    decision = str(response.get("decision") or "").strip().lower()
+    if decision == "retain_cluster":
+        return None, {
+            "passed": True,
+            "decision": "retain_cluster",
+            "reasons": [str(response.get("rationale") or "agent_retained_cluster")],
+        }
+    if decision != "replace_cluster":
+        return None, {"passed": False, "reasons": ["invalid_decision"]}
+    if str(response.get("cluster_id") or "") != str(context.get("cluster_id") or ""):
+        reasons.append("cluster_id_mismatch")
+
+    member_names = set(cluster.get("member_names", []))
+    replaceable = member_names - set(required_names)
+    replaces = _dedupe_strings(
+        [_normalize_feature_name(value) for value in response.get("replaces", []) or []]
+    )
+    if len(replaces) < 2:
+        reasons.append("must_replace_at_least_two_members")
+    if any(name not in replaceable for name in replaces):
+        reasons.append("replacement_contains_unknown_or_protected_member")
+
+    factors = response.get("factors", [])
+    if not isinstance(factors, list):
+        factors = []
+        reasons.append("factors_not_list")
+    max_factors = int(context.get("max_factors", 2) or 2)
+    if not 1 <= len(factors) <= max_factors:
+        reasons.append("factor_count_out_of_range")
+    if factors and len(factors) >= len(replaces):
+        reasons.append("factor_count_does_not_reduce_spec_count")
+
+    current_by_name = {spec.name: spec for spec in current_specs}
+    seen_names: set = set()
+    factor_specs: List[ExplicitFeatureSpec] = []
+    for factor in factors:
+        if not isinstance(factor, dict):
+            reasons.append("factor_not_object")
+            continue
+        name = _normalize_feature_name(factor.get("name", ""))
+        if not name or name in seen_names:
+            reasons.append("missing_or_duplicate_factor_name")
+            continue
+        seen_names.add(name)
+        if name in current_by_name and name not in replaces:
+            reasons.append(f"factor_name_conflicts_with_existing_feature:{name}")
+            continue
+        inference_kind = str(factor.get("inference_kind") or "").strip().lower()
+        feature_type = str(factor.get("type") or "").strip().lower()
+        categories = factor.get("categories")
+        roles = _dedupe_strings(factor.get("roles", []) or [])
+        if inference_kind not in {"implicit", "direct"}:
+            reasons.append(f"invalid_inference_kind:{name}")
+            continue
+        if feature_type not in {"categorical", "continuous"}:
+            reasons.append(f"invalid_factor_type:{name}")
+            continue
+        if inference_kind == "implicit" and feature_type != "categorical":
+            reasons.append(f"implicit_factor_must_be_categorical:{name}")
+            continue
+        if feature_type == "categorical":
+            if not isinstance(categories, list) or not 2 <= len(categories) <= 8:
+                reasons.append(f"invalid_factor_categories:{name}")
+                continue
+            categories = _dedupe_strings(categories)
+            if not 2 <= len(categories) <= 8:
+                reasons.append(f"invalid_factor_categories:{name}")
+                continue
+        else:
+            categories = None
+            if not str(factor.get("unit") or "").strip():
+                reasons.append(f"continuous_factor_missing_unit:{name}")
+                continue
+        if not roles or set(roles) - {"confounder", "effect_modifier"}:
+            reasons.append(f"invalid_factor_roles:{name}")
+            continue
+        required_fields = [
+            "description",
+            "minimum_evidence",
+            "null_policy",
+            "rationale",
+        ]
+        if any(not str(factor.get(field) or "").strip() for field in required_fields):
+            reasons.append(f"incomplete_operational_rubric:{name}")
+            continue
+        if not isinstance(factor.get("supporting_indicators"), list) or not factor.get(
+            "supporting_indicators"
+        ):
+            reasons.append(f"missing_supporting_indicators:{name}")
+            continue
+        if not isinstance(factor.get("contrary_indicators"), list):
+            reasons.append(f"invalid_contrary_indicators:{name}")
+            continue
+        try:
+            factor_specs.append(
+                ExplicitFeatureSpec(
+                    name=name,
+                    type=feature_type,
+                    categories=categories,
+                    roles=roles,
+                    description=_parsimony_operational_factor_description(factor),
+                )
+            )
+        except ValueError as exc:
+            reasons.append(f"invalid_factor_spec:{name}:{exc}")
+
+    expected_roles = {
+        role
+        for name in replaces
+        if name in current_by_name
+        for role in current_by_name[name].roles
+    }
+    actual_roles = {role for spec in factor_specs for role in spec.roles}
+    if expected_roles != actual_roles:
+        reasons.append(
+            "factor_role_union_mismatch:"
+            f"expected={sorted(expected_roles)}:actual={sorted(actual_roles)}"
+        )
+    passed = not reasons and bool(factor_specs)
+    validation = {
+        "passed": bool(passed),
+        "decision": "replace_cluster",
+        "reasons": reasons or ["valid_operational_factor_replacement"],
+        "replaces": replaces,
+        "factor_names": [spec.name for spec in factor_specs],
+        "required_role_union": sorted(expected_roles),
+    }
+    if not passed:
+        return None, validation
+    return {
+        "cluster_id": str(cluster.get("cluster_id")),
+        "cluster": cluster,
+        "replaces": replaces,
+        "factor_specs": factor_specs,
+        "raw_response": response,
+    }, validation
+
+
+def _parsimony_factor_extraction_quality(
+    *,
+    train_df: pd.DataFrame,
+    factor_specs: Sequence[ExplicitFeatureSpec],
+    min_coverage: float,
+) -> Dict[str, Any]:
+    summaries: List[Dict[str, Any]] = []
+    reasons: List[str] = []
+    for spec in factor_specs:
+        values = _explicit_feature_series(train_df, spec)
+        missing = _explicit_feature_missing_mask(train_df, spec, values)
+        observed = values.loc[~missing]
+        coverage = float(1.0 - np.mean(missing)) if len(train_df) else 0.0
+        unique = int(observed.nunique(dropna=True))
+        item = {
+            "name": spec.name,
+            "coverage": coverage,
+            "n_unique_observed": unique,
+            "required_min_coverage": float(min_coverage),
+        }
+        summaries.append(item)
+        if coverage < float(min_coverage):
+            reasons.append(f"factor_coverage_below_minimum:{spec.name}")
+        if unique < 2:
+            reasons.append(f"factor_has_insufficient_variation:{spec.name}")
+        if spec.type == "continuous":
+            numeric = pd.to_numeric(observed, errors="coerce").dropna()
+            if len(numeric) < 2 or float(numeric.std(ddof=0)) <= 0.0:
+                reasons.append(f"continuous_factor_is_constant:{spec.name}")
+    return {
+        "passed": not reasons,
+        "reasons": _dedupe_strings(reasons),
+        "factors": summaries,
+    }
+
+
+def _apply_parsimony_factor_replacements(
+    specs: Sequence[ExplicitFeatureSpec],
+    candidates: Sequence[Dict[str, Any]],
+) -> List[ExplicitFeatureSpec]:
+    removed = {
+        name
+        for candidate in candidates
+        for name in candidate.get("replaces", [])
+    }
+    factors = [
+        spec
+        for candidate in candidates
+        for spec in candidate.get("factor_specs", [])
+    ]
+    return _dedupe_specs([*[spec for spec in specs if spec.name not in removed], *factors])
+
+
+def _parsimony_model_dimension(diagnostic: Dict[str, Any]) -> int:
+    metrics = diagnostic.get("metrics", {}) if isinstance(diagnostic, dict) else {}
+    return int(metrics.get("n_w_features", 0) or 0) + int(metrics.get("n_x_features", 0) or 0)
+
+
+def _strict_parsimony_replacement_decision(
+    *,
+    base_diagnostic: Dict[str, Any],
+    trial_diagnostic: Dict[str, Any],
+    base_gate: Dict[str, Any],
+    trial_gate: Dict[str, Any],
+    epsilon: float,
+) -> Tuple[bool, List[str], Dict[str, Any]]:
+    base_metrics = base_diagnostic.get("metrics", {})
+    trial_metrics = trial_diagnostic.get("metrics", {})
+    reasons: List[str] = []
+    deltas: Dict[str, Any] = {}
+    if trial_metrics.get("status") != "ok":
+        reasons.append("trial_diagnostic_status_not_ok")
+    if int(trial_gate.get("n_failed_criteria", 0) or 0) > int(
+        base_gate.get("n_failed_criteria", 0) or 0
+    ):
+        reasons.append("review_gate_would_worsen")
+
+    higher_is_better = ["treatment_auroc", "outcome_auroc"]
+    lower_is_better = [
+        "treatment_brier",
+        "treatment_log_loss",
+        "outcome_brier",
+        "outcome_log_loss",
+        "outcome_rmse",
+        "r_loss_mean",
+    ]
+    for metric in higher_is_better:
+        base_value = _finite_or_none(base_metrics.get(metric))
+        if base_value is None:
+            continue
+        trial_value = _finite_or_none(trial_metrics.get(metric))
+        if trial_value is None:
+            reasons.append(f"{metric}_missing_after_replacement")
+            continue
+        delta = float(trial_value - base_value)
+        deltas[metric] = delta
+        if delta < -float(epsilon):
+            reasons.append(f"{metric}_degraded")
+    for metric in lower_is_better:
+        base_value = _finite_or_none(base_metrics.get(metric))
+        if base_value is None:
+            continue
+        trial_value = _finite_or_none(trial_metrics.get(metric))
+        if trial_value is None:
+            reasons.append(f"{metric}_missing_after_replacement")
+            continue
+        delta = float(trial_value - base_value)
+        deltas[metric] = delta
+        if delta > float(epsilon):
+            reasons.append(f"{metric}_degraded")
+    if not reasons:
+        reasons.append("strict_pareto_non_degradation")
+    return reasons == ["strict_pareto_non_degradation"], reasons, deltas
+
+
+def _parsimony_replacement_evaluation_row(
+    *,
+    outer_fold: int,
+    phase: str,
+    result: Dict[str, Any],
+) -> Dict[str, Any]:
+    cluster_ids = result.get("cluster_ids")
+    if not cluster_ids and result.get("cluster_id"):
+        cluster_ids = [result.get("cluster_id")]
+    return {
+        "schema_version": _PARSIMONY_SCHEMA_VERSION,
+        "outer_fold": int(outer_fold),
+        "event": "parsimony_replacement_evaluation",
+        "phase": str(phase),
+        "cluster_ids": list(cluster_ids or []),
+        "allowed": bool(result.get("allowed", False)),
+        "reasons": list(result.get("reasons", [])),
+        "metric_deltas": result.get("metric_deltas", {}),
+        "base_dimension": result.get("base_dimension"),
+        "trial_dimension": result.get("trial_dimension"),
+        "dimension_reduction": result.get("dimension_reduction"),
+        "metrics_after": _parsimony_metric_snapshot(result.get("diagnostic", {})),
+        "gate_after": result.get("gate", {}),
+        "selected_features_after": [
+            _spec_to_dict(spec) for spec in result.get("trial_specs", [])
+        ],
+    }
+
+
+def _parsimony_factor_agent_worker(
+    search_config: AgenticFeatureSearchConfig,
+    context: Dict[str, Any],
+) -> Dict[str, Any]:
+    agent = make_feature_search_agent(search_config)
+    try:
+        response = agent.propose(context)
+        result: Dict[str, Any] = {"response": response}
+        trace = _get_agent_response_trace(agent)
+        if trace is not None:
+            result["agent_raw_output"] = trace
+        return result
+    except Exception as exc:
+        return {
+            "response": None,
+            "error": f"{exc.__class__.__name__}: {exc}",
+        }
+
+
+def _cluster_relevant_htr_evidence(
+    evidence: Dict[str, Any],
+    specs: Sequence[ExplicitFeatureSpec],
+) -> Dict[str, Any]:
+    compact = _compact_htr_attention_evidence(evidence)
+    token_source = " ".join(_parsimony_feature_contract_document(spec) for spec in specs)
+    tokens = {
+        token
+        for token in re.findall(r"[a-z0-9]+", token_source.lower())
+        if len(token) >= 4 and token not in ENGLISH_STOP_WORDS
+    }
+    result: Dict[str, Any] = {}
+    for stage in ["nuisance", "effect", "pair_uplift"]:
+        payload = compact.get(stage)
+        if not isinstance(payload, dict):
+            continue
+        rows = list(payload.get("attention", []) or [])
+        scored = []
+        for index, row in enumerate(rows):
+            text = json.dumps(row, default=_json_default).lower()
+            overlap = sum(1 for token in tokens if token in text)
+            scored.append((overlap, -index, row))
+        selected = [row for score, _, row in sorted(scored, reverse=True) if score > 0][:8]
+        if not selected:
+            selected = rows[:3]
+        result[stage] = {
+            "metrics": payload.get("metrics", {}),
+            "attention": selected,
+        }
+    if result:
+        result["selection_policy"] = "member-token overlap, up to 8 rows per stage"
+    return result
 
 
 def _parsimony_removal_decision(

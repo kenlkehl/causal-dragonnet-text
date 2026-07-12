@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+import oci.inference.multi_model_agentic_forest as multi_model_agentic_module
 
 from oci.config import (
     AgenticFeatureSearchConfig,
@@ -36,10 +37,13 @@ from oci.inference.multi_model_agentic_forest import (
     MultiModelAgenticForestRunner,
     PrecomputedDiscoveryMultiModelAgenticForestRunner,
     _candidate_consistency_threshold,
+    _build_value_driven_feature_clusters,
     _compact_multi_model_agent_context,
     _evaluate_extracted_feature_set_diagnostic,
     _extracted_feature_review_gate,
     _feature_redundancy_review,
+    _parsimony_mutual_neighbor_pairs,
+    _strict_parsimony_replacement_decision,
     _fallback_consistency_proposals,
     _fit_binary_bow_fold,
     run_multi_model_agentic_forest,
@@ -364,6 +368,62 @@ class LowCoverageReviewAgent:
                 "expected_signal": "treatment and outcome",
             }
         ]
+
+
+class ParsimonyFactorAgent:
+    def __init__(self):
+        self.contexts = []
+
+    def propose(self, context):
+        self.contexts.append(context)
+        prompt_version = context.get("prompt_version")
+        if prompt_version == "multi_model_agentic_parsimony_factor_v1":
+            return {
+                "cluster_id": context["cluster_id"],
+                "decision": "replace_cluster",
+                "replaces": list(context["replaceable_members"]),
+                "factors": [
+                    {
+                        "name": "latent_functional_burden",
+                        "inference_kind": "implicit",
+                        "type": "categorical",
+                        "categories": ["low", "high"],
+                        "roles": list(context["required_role_union"]),
+                        "description": "Overall pretreatment functional burden.",
+                        "supporting_indicators": [
+                            "multiple concordant functional limitations"
+                        ],
+                        "contrary_indicators": ["documented normal function"],
+                        "minimum_evidence": "at least two concordant indicators",
+                        "null_policy": "return null with fewer than two indicators",
+                        "rationale": "The member values are empirically redundant measures of function.",
+                    }
+                ],
+                "rationale": "One operational burden factor represents the coherent cluster.",
+            }
+        if prompt_version == "multi_model_agentic_value_harmonization_v1":
+            return {"features": context.get("selected_features", [])}
+        if prompt_version == "multi_model_agentic_alias_resolution_v1":
+            return {"groups": [], "unmerged": []}
+        return []
+
+
+class ParsimonyFactorExtractionProvider:
+    reads_complete_documents = True
+
+    def ensure_features(self, dataset, specs):
+        dataset = dataset.copy()
+        for spec in specs:
+            value_col = f"explicit_feat_{spec.name}"
+            missing_col = f"{value_col}_missing"
+            if spec.name == "latent_functional_burden":
+                dataset[value_col] = np.where(
+                    dataset["explicit_feat_function_a"].to_numpy(dtype=float) >= 0.5,
+                    "high",
+                    "low",
+                )
+                dataset[missing_col] = False
+        return dataset
 
 
 class FakeExtractionProvider:
@@ -2129,6 +2189,261 @@ def test_multi_model_parsimony_redundancy_review_records_required_summaries():
     assert len(review["missingness_overlap"]) == 6
 
 
+def test_value_driven_parsimony_clusters_use_values_and_ignore_task_labels():
+    df = pd.DataFrame(
+        {
+            "explicit_feat_function_a": np.arange(12, dtype=float),
+            "explicit_feat_function_b": np.arange(12, dtype=float) * 2.0 + 1.0,
+            "explicit_feat_unrelated": [0, 5, 2, 9, 1, 8, 4, 11, 3, 10, 6, 7],
+            "explicit_feat_function_a_missing": [False] * 12,
+            "explicit_feat_function_b_missing": [False] * 12,
+            "explicit_feat_unrelated_missing": [False] * 12,
+            "treatment_indicator": [0, 1] * 6,
+            "outcome_indicator": [1, 0, 0, 1] * 3,
+        }
+    )
+    specs = [
+        ExplicitFeatureSpec(
+            name="function_a",
+            type="continuous",
+            roles=["confounder"],
+        ),
+        ExplicitFeatureSpec(
+            name="function_b",
+            type="continuous",
+            roles=["confounder"],
+        ),
+        ExplicitFeatureSpec(
+            name="unrelated",
+            type="continuous",
+            roles=["effect_modifier"],
+        ),
+    ]
+    config = MultiModelAgenticForestConfig(
+        parsimony_cluster_semantic_weight=0.0,
+        parsimony_cluster_neighbors=2,
+        parsimony_cluster_empirical_min_similarity=0.5,
+        parsimony_cluster_strong_empirical_threshold=0.8,
+        parsimony_cluster_combined_threshold=0.5,
+        **_disable_required_evidence_test_kwargs(),
+    )
+    semantic = np.eye(len(specs), dtype=float)
+
+    first = _build_value_driven_feature_clusters(
+        train_df=df,
+        specs=specs,
+        semantic_vectors=semantic,
+        nn_config=config,
+        random_state=17,
+    )
+    assert first["generation"]["uses_actual_extracted_values"] is True
+    assert first["generation"]["uses_treatment_or_outcome_labels"] is False
+    assert any(
+        set(cluster["member_names"]) == {"function_a", "function_b"}
+        for cluster in first["clusters"]
+    )
+
+    relabeled = df.copy()
+    relabeled["treatment_indicator"] = relabeled["treatment_indicator"].sample(
+        frac=1.0,
+        random_state=3,
+    ).to_numpy()
+    relabeled["outcome_indicator"] = relabeled["outcome_indicator"].sample(
+        frac=1.0,
+        random_state=4,
+    ).to_numpy()
+    second = _build_value_driven_feature_clusters(
+        train_df=relabeled,
+        specs=specs,
+        semantic_vectors=semantic,
+        nn_config=config,
+        random_state=17,
+    )
+    assert second["clusters"] == first["clusters"]
+
+    changed_values = df.copy()
+    changed_values["explicit_feat_function_b"] = [
+        9,
+        2,
+        7,
+        4,
+        5,
+        11,
+        0,
+        3,
+        6,
+        10,
+        8,
+        1,
+    ]
+    third = _build_value_driven_feature_clusters(
+        train_df=changed_values,
+        specs=specs,
+        semantic_vectors=semantic,
+        nn_config=config,
+        random_state=17,
+    )
+    assert not any(
+        set(cluster["member_names"]) == {"function_a", "function_b"}
+        for cluster in third["clusters"]
+    )
+
+
+def test_value_cluster_neighbor_graph_stays_sparse_at_one_thousand_features():
+    vectors = np.random.default_rng(7).normal(size=(1000, 12))
+    pairs = _parsimony_mutual_neighbor_pairs(vectors, neighbors=20)
+
+    assert pairs
+    assert len(pairs) <= 1000 * 20 // 2
+
+
+def test_strict_parsimony_replacement_rejects_any_task_degradation():
+    base_metrics = {
+        "status": "ok",
+        "treatment_auroc": 0.8,
+        "treatment_brier": 0.2,
+        "treatment_log_loss": 0.5,
+        "outcome_auroc": 0.75,
+        "outcome_brier": 0.21,
+        "outcome_log_loss": 0.55,
+        "r_loss_mean": 0.18,
+    }
+    trial_metrics = dict(base_metrics)
+    trial_metrics["outcome_log_loss"] += 1e-3
+    allowed, reasons, _ = _strict_parsimony_replacement_decision(
+        base_diagnostic={"metrics": base_metrics},
+        trial_diagnostic={"metrics": trial_metrics},
+        base_gate={"n_failed_criteria": 0},
+        trial_gate={"n_failed_criteria": 0},
+        epsilon=1e-6,
+    )
+
+    assert allowed is False
+    assert "outcome_log_loss_degraded" in reasons
+
+
+def test_parsimony_factor_prompt_allows_operational_implicit_concepts():
+    context = {
+        "prompt_version": "multi_model_agentic_parsimony_factor_v1",
+        "cluster_id": "value_cluster_001",
+        "replaceable_members": ["fatigue", "weight_loss", "ecog"],
+        "protected_members": [],
+        "required_role_union": ["confounder", "effect_modifier"],
+        "max_factors": 2,
+    }
+    prompt = build_agent_prompt(context, AgenticFeatureSearchConfig())
+
+    assert "actual extracted patient-level values" in prompt
+    assert "implicit rather than literally named" in prompt
+    assert "minimum evidence" in prompt
+    assert "return null" in prompt
+    assert "before the treatment decision" in prompt
+    assert "response, prognosis, survival, or toxicity" in prompt
+
+
+def test_cluster_factor_parsimony_replaces_group_when_all_tasks_are_preserved(
+    tmp_path: Path,
+    monkeypatch,
+):
+    values = np.asarray([0.0, 0.0, 1.0, 1.0] * 4)
+    dataset = pd.DataFrame(
+        {
+            "clinical_text": ["pretreatment functional assessment"] * len(values),
+            "treatment_indicator": [0, 1] * (len(values) // 2),
+            "outcome_indicator": [1, 0, 0, 1] * (len(values) // 4),
+            "explicit_feat_function_a": values,
+            "explicit_feat_function_b": values,
+            "explicit_feat_function_c": values,
+            "explicit_feat_function_a_missing": [False] * len(values),
+            "explicit_feat_function_b_missing": [False] * len(values),
+            "explicit_feat_function_c_missing": [False] * len(values),
+        }
+    )
+    config = AppliedInferenceConfig(
+        outcome_type="binary",
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        architecture=ModelArchitectureConfig(
+            model_type="multi_model_agentic_forest",
+            agentic_feature_search=AgenticFeatureSearchConfig(min_feature_coverage=0.1),
+            multi_model_agentic_forest=MultiModelAgenticForestConfig(
+                parsimony_review_enabled=True,
+                parsimony_cluster_semantic_weight=0.0,
+                parsimony_parallelism="1",
+                **_disable_required_evidence_test_kwargs(),
+            ),
+        ),
+        explicit_features=ExplicitFeatureExtractionConfig(enabled=True, features=[]),
+    )
+    agent = ParsimonyFactorAgent()
+    runner = MultiModelAgenticForestRunner(
+        dataset=dataset,
+        config=config,
+        output_path=tmp_path / "predictions.parquet",
+        proposal_agent=agent,
+        extraction_provider=ParsimonyFactorExtractionProvider(),
+        evaluator=FakeEvaluator(),
+    )
+    specs = [
+        ExplicitFeatureSpec(
+            name=name,
+            type="continuous",
+            roles=["confounder", "effect_modifier"],
+        )
+        for name in ["function_a", "function_b", "function_c"]
+    ]
+
+    def preserved_diagnostic(*, specs, **kwargs):
+        del kwargs
+        role_dimensions = sum(len(spec.roles) for spec in specs)
+        return {
+            "metrics": {
+                "status": "ok",
+                "n_selected_features": len(specs),
+                "n_w_features": sum("confounder" in spec.roles for spec in specs),
+                "n_x_features": sum("effect_modifier" in spec.roles for spec in specs),
+                "treatment_auroc": 0.8,
+                "treatment_brier": 0.2,
+                "treatment_log_loss": 0.5,
+                "outcome_auroc": 0.75,
+                "outcome_brier": 0.21,
+                "outcome_log_loss": 0.55,
+                "r_loss_mean": 0.18,
+                "role_dimensions": role_dimensions,
+            },
+            "benchmark": {},
+            "extraction_summary": [],
+        }
+
+    monkeypatch.setattr(
+        multi_model_agentic_module,
+        "_evaluate_extracted_feature_set_diagnostic",
+        preserved_diagnostic,
+    )
+    result = runner._run_mandatory_parsimony_review(
+        outer_fold=1,
+        train_idx=np.arange(len(dataset)),
+        selected_specs=specs,
+        bow_result={"metrics": {}, "context": {}, "htr_evidence": {}},
+        embedding_evidence={},
+    )
+
+    assert [spec.name for spec in result["selected_specs"]] == [
+        "latent_functional_burden"
+    ]
+    assert result["summary"]["decision"] == "replace_clusters"
+    assert result["summary"]["n_removed"] == 3
+    assert result["summary"]["added_factors"] == ["latent_functional_burden"]
+    assert runner.parsimony_cluster_rows
+    assert runner.parsimony_factor_rows[0]["extraction_quality"]["passed"] is True
+    assert any(row["allowed"] for row in runner.parsimony_evaluation_rows)
+    fold_dir = tmp_path / "multi_model_agentic_forest" / "outer_fold_001"
+    assert (fold_dir / "parsimony_clusters_by_fold.jsonl").exists()
+    assert (fold_dir / "parsimony_factor_proposals_by_fold.jsonl").exists()
+    assert (fold_dir / "parsimony_replacement_evaluations_by_fold.jsonl").exists()
+
+
 def test_extracted_feature_review_context_includes_htr_snippets_and_defers_temporal_filter(
     tmp_path: Path,
 ):
@@ -2518,6 +2833,19 @@ def test_multi_model_agentic_forest_parses_bow_views_and_embedding_option():
                         "parsimony_review_loss_relative_tolerance": 0.04,
                         "parsimony_review_corr_threshold": 0.8,
                         "parsimony_review_max_single_feature_ablations": 7,
+                        "parsimony_cluster_semantic_weight": 0.4,
+                        "parsimony_cluster_neighbors": 14,
+                        "parsimony_cluster_combined_threshold": 0.62,
+                        "parsimony_cluster_empirical_min_similarity": 0.35,
+                        "parsimony_cluster_strong_empirical_threshold": 0.85,
+                        "parsimony_cluster_missingness_weight": 0.1,
+                        "parsimony_cluster_min_size": 3,
+                        "parsimony_cluster_max_size": 10,
+                        "parsimony_cluster_sketch_dim": 24,
+                        "parsimony_max_factors_per_cluster": 2,
+                        "parsimony_factor_min_coverage": 0.2,
+                        "parsimony_parallelism": "2",
+                        "parsimony_metric_epsilon": 1e-7,
                         "require_honest_outer_split": True,
                         "fail_on_extraction_truncation": False,
                         "embedding_contrast": {
@@ -2573,6 +2901,19 @@ def test_multi_model_agentic_forest_parses_bow_views_and_embedding_option():
     assert nn_cfg.parsimony_review_loss_relative_tolerance == 0.04
     assert nn_cfg.parsimony_review_corr_threshold == 0.8
     assert nn_cfg.parsimony_review_max_single_feature_ablations == 7
+    assert nn_cfg.parsimony_cluster_semantic_weight == 0.4
+    assert nn_cfg.parsimony_cluster_neighbors == 14
+    assert nn_cfg.parsimony_cluster_combined_threshold == 0.62
+    assert nn_cfg.parsimony_cluster_empirical_min_similarity == 0.35
+    assert nn_cfg.parsimony_cluster_strong_empirical_threshold == 0.85
+    assert nn_cfg.parsimony_cluster_missingness_weight == 0.1
+    assert nn_cfg.parsimony_cluster_min_size == 3
+    assert nn_cfg.parsimony_cluster_max_size == 10
+    assert nn_cfg.parsimony_cluster_sketch_dim == 24
+    assert nn_cfg.parsimony_max_factors_per_cluster == 2
+    assert nn_cfg.parsimony_factor_min_coverage == 0.2
+    assert nn_cfg.parsimony_parallelism == "2"
+    assert nn_cfg.parsimony_metric_epsilon == 1e-7
     assert nn_cfg.require_honest_outer_split is True
     assert nn_cfg.fail_on_extraction_truncation is False
     assert nn_cfg.embedding_contrast.enabled is True

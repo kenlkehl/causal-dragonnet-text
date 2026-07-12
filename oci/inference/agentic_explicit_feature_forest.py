@@ -66,6 +66,7 @@ _CONCEPT_INVENTORY_PROMPT_VERSIONS = {
     "multi_model_agentic_cluster_labeling_v1",
     "multi_model_agentic_cluster_labeling_v2",
 }
+_PARSIMONY_FACTOR_PROMPT_VERSION = "multi_model_agentic_parsimony_factor_v1"
 _AUTO_MODEL_NAME_VALUES = {"", "auto", "discover", "server"}
 _MODEL_NAME_AUTODISCOVERY_ALIASES = {"Qwen/Qwen3.6-27B"}
 _DASH_TRANSLATION = dict.fromkeys(
@@ -1433,6 +1434,9 @@ class OpenAICompatibleFeatureSearchAgent:
             context.get("prompt_version") == "multi_model_agentic_value_harmonization_v1"
         )
         is_concept_inventory = context.get("prompt_version") in _CONCEPT_INVENTORY_PROMPT_VERSIONS
+        is_parsimony_factor = (
+            context.get("prompt_version") == _PARSIMONY_FACTOR_PROMPT_VERSION
+        )
 
         for attempt_idx in range(max_repair_attempts + 1):
             response_kwargs = {
@@ -1469,12 +1473,15 @@ class OpenAICompatibleFeatureSearchAgent:
                     is_consensus_disambiguation
                     or is_value_harmonization
                     or is_concept_inventory
+                    or is_parsimony_factor
                 ):
                     parsed = parse_agent_json_object(content)
                     if is_value_harmonization:
                         issues = value_harmonization_response_issues(parsed, context)
                     elif is_concept_inventory:
                         issues = concept_inventory_response_issues(parsed, context)
+                    elif is_parsimony_factor:
+                        issues = parsimony_factor_response_issues(parsed, context)
                     else:
                         issues = consensus_disambiguation_response_issues(parsed)
                     if issues:
@@ -1498,6 +1505,8 @@ class OpenAICompatibleFeatureSearchAgent:
                         repair_prompt = build_value_harmonization_repair_prompt(issues)
                     elif is_concept_inventory:
                         repair_prompt = build_concept_inventory_repair_prompt(issues)
+                    elif is_parsimony_factor:
+                        repair_prompt = build_parsimony_factor_repair_prompt(issues)
                     elif is_consensus_disambiguation:
                         repair_prompt = build_consensus_disambiguation_repair_prompt(issues)
                     else:
@@ -1781,7 +1790,11 @@ class CodexCLIFeatureSearchAgent:
         task_kind = (
             "clinical text concept inventory"
             if prompt_version in _CONCEPT_INVENTORY_PROMPT_VERSIONS
-            else "agentic causal-feature proposal"
+            else (
+                "clinical latent-factor parsimony review"
+                if prompt_version == _PARSIMONY_FACTOR_PROMPT_VERSION
+                else "agentic causal-feature proposal"
+            )
         )
         base_prompt = _codex_backend_prompt(
             build_agent_prompt(context, self.search_config),
@@ -1801,6 +1814,7 @@ class CodexCLIFeatureSearchAgent:
             prompt_version == "multi_model_agentic_value_harmonization_v1"
         )
         is_concept_inventory = prompt_version in _CONCEPT_INVENTORY_PROMPT_VERSIONS
+        is_parsimony_factor = prompt_version == _PARSIMONY_FACTOR_PROMPT_VERSION
 
         for attempt_idx in range(max_repair_attempts + 1):
             response = self._run(prompt)
@@ -1818,12 +1832,15 @@ class CodexCLIFeatureSearchAgent:
                     is_consensus_disambiguation
                     or is_value_harmonization
                     or is_concept_inventory
+                    or is_parsimony_factor
                 ):
                     parsed = parse_agent_json_object(content)
                     if is_value_harmonization:
                         issues = value_harmonization_response_issues(parsed, context)
                     elif is_concept_inventory:
                         issues = concept_inventory_response_issues(parsed, context)
+                    elif is_parsimony_factor:
+                        issues = parsimony_factor_response_issues(parsed, context)
                     else:
                         issues = consensus_disambiguation_response_issues(parsed)
                     if issues:
@@ -1843,6 +1860,8 @@ class CodexCLIFeatureSearchAgent:
                         repair_prompt = build_value_harmonization_repair_prompt(issues)
                     elif is_concept_inventory:
                         repair_prompt = build_concept_inventory_repair_prompt(issues)
+                    elif is_parsimony_factor:
+                        repair_prompt = build_parsimony_factor_repair_prompt(issues)
                     elif is_consensus_disambiguation:
                         repair_prompt = build_consensus_disambiguation_repair_prompt(issues)
                     else:
@@ -2588,6 +2607,9 @@ def build_agent_prompt(
     }:
         return build_multi_model_agentic_cluster_labeling_prompt(context, search_config)
 
+    if context.get("prompt_version") == _PARSIMONY_FACTOR_PROMPT_VERSION:
+        return build_multi_model_agentic_parsimony_factor_prompt(context, search_config)
+
     if context.get("prompt_version") == "multi_model_agentic_consistency_v1":
         return build_multi_model_agentic_consistency_prompt(context, search_config)
 
@@ -2662,7 +2684,6 @@ def build_attention_variable_agent_prompt(
 ) -> str:
     """Construct the proposal prompt for attention-evidence variable discovery."""
     context_json = json.dumps(context, indent=2, default=_json_default)
-    stage = str(context.get("stage", "confounder"))
     max_proposals = int(
         context.get(
             "max_proposals",
@@ -3057,6 +3078,79 @@ Return at most {max_concepts} concepts. Return JSON only with this shape:
 }}
 
 Current cluster-labeling context:
+{context_json}
+"""
+
+
+def build_multi_model_agentic_parsimony_factor_prompt(
+    context: Dict[str, Any],
+    search_config: AgenticFeatureSearchConfig,
+) -> str:
+    """Construct the post-extraction cluster-to-factor parsimony prompt."""
+    del search_config
+    context_json = json.dumps(
+        context,
+        separators=(",", ":"),
+        default=_json_default,
+    )
+    max_factors = int(context.get("max_factors", 2))
+    return f"""You are reviewing one empirically clustered group of structured clinical variables for parsimonious causal modeling.
+
+The cluster was formed from the actual extracted patient-level values in the
+current outer-training fold, supplemented by semantic similarity between the
+variable contracts. The outer test fold is absent. Your task is conceptual:
+decide whether up to {max_factors} operational patient-level factors can replace
+at least two replaceable cluster members while preserving the information in
+the group.
+
+An underlying factor may be implicit rather than literally named in the note.
+For example, several functional, symptom, and nutritional measurements might
+support an operational frailty factor. An implicit factor is valid only when
+you define reproducible evidence rules. The downstream extractor will read the
+complete permitted note and must return null when the minimum evidence is not
+present. Do not manufacture a value from general clinical intuition.
+
+Rules:
+- Use only member names listed in replaceable_members in `replaces`.
+- Never replace a member listed in protected_members.
+- Return at most {max_factors} factors and fewer factors than replaced members.
+- The factors must collectively cover every role in required_role_union.
+- Implicit factors must be categorical with 2-8 mutually exclusive categories.
+- A continuous factor is allowed only for a directly interpretable measurement
+  with an explicit unit; set inference_kind to `direct`.
+- For every factor, give supporting indicators, contrary indicators, the
+  minimum evidence needed for a non-null value, and a null policy.
+- All evidence used to assign the factor must be temporally available before the treatment decision.
+  Do not impose an additional ban based on whether the
+  concept concerns treatment, response, prognosis, survival, or toxicity.
+- Choose `retain_cluster` when the group is multidimensional, incoherent, not
+  inferable reproducibly, or cannot be compressed without losing meaning.
+
+Return JSON only with this shape:
+{{
+  "cluster_id": "cluster_001",
+  "decision": "replace_cluster|retain_cluster",
+  "replaces": ["existing_member_a", "existing_member_b"],
+  "factors": [
+    {{
+      "name": "snake_case_factor_name",
+      "inference_kind": "implicit|direct",
+      "type": "categorical|continuous",
+      "categories": ["category_a", "category_b"],
+      "unit": "measurement unit for continuous factors or null",
+      "roles": ["confounder", "effect_modifier"],
+      "description": "precise patient-level factor",
+      "supporting_indicators": ["specific note evidence supporting a value"],
+      "contrary_indicators": ["specific evidence arguing against that value"],
+      "minimum_evidence": "minimum evidence required for non-null extraction",
+      "null_policy": "when the extractor must return null",
+      "rationale": "why this factor represents the replaced value cluster"
+    }}
+  ],
+  "rationale": "why replacement is or is not conceptually defensible"
+}}
+
+Current value-driven cluster context:
 {context_json}
 """
 
@@ -3466,6 +3560,40 @@ Do not add prose, markdown, comments, or code fences.
 """
 
 
+def build_parsimony_factor_repair_prompt(issues: Sequence[str]) -> str:
+    """Construct a repair request for cluster-to-factor response JSON."""
+    issue_lines = "\n".join(f"- {issue}" for issue in issues)
+    return f"""The previous response could not be used because it failed these schema checks:
+{issue_lines}
+
+Return corrected JSON only with this exact top-level shape:
+{{
+  "cluster_id": "the_supplied_cluster_id",
+  "decision": "replace_cluster|retain_cluster",
+  "replaces": ["replaceable_cluster_member"],
+  "factors": [
+    {{
+      "name": "snake_case_factor_name",
+      "inference_kind": "implicit|direct",
+      "type": "categorical|continuous",
+      "categories": ["category_a", "category_b"],
+      "unit": "measurement unit for continuous factors or null",
+      "roles": ["confounder", "effect_modifier"],
+      "description": "precise patient-level factor",
+      "supporting_indicators": ["specific supporting evidence"],
+      "contrary_indicators": ["specific contrary evidence"],
+      "minimum_evidence": "minimum evidence for a non-null value",
+      "null_policy": "when to return null",
+      "rationale": "why the factor represents the replaced members"
+    }}
+  ],
+  "rationale": "brief cluster-level decision rationale"
+}}
+
+Do not add prose, markdown, comments, or code fences.
+"""
+
+
 def agent_response_schema_issues(
     proposals: Sequence[Any],
     context: Optional[Dict[str, Any]] = None,
@@ -3688,6 +3816,146 @@ def concept_inventory_response_issues(
                 issues.append(f"rejected_clusters {idx}: unknown cluster_id {cluster_id!r}")
             if _missing_or_empty(item.get("reason")):
                 issues.append(f"rejected_clusters {idx} ({cluster_id}): missing reason")
+    return issues
+
+
+def parsimony_factor_response_issues(
+    response: Any,
+    context: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Return schema issues for value-cluster factorization responses."""
+    if not isinstance(response, dict):
+        return [f"expected a JSON object, got {type(response).__name__}"]
+
+    context = context if isinstance(context, dict) else {}
+    expected_cluster_id = str(context.get("cluster_id") or "")
+    cluster_id = str(response.get("cluster_id") or "")
+    issues: List[str] = []
+    if not cluster_id:
+        issues.append("missing cluster_id")
+    elif expected_cluster_id and cluster_id != expected_cluster_id:
+        issues.append(
+            f"cluster_id {cluster_id!r} does not match supplied {expected_cluster_id!r}"
+        )
+
+    decision = str(response.get("decision") or "").strip().lower()
+    if decision not in {"replace_cluster", "retain_cluster"}:
+        issues.append("decision must be replace_cluster or retain_cluster")
+        return issues
+
+    factors = response.get("factors", [])
+    replaces = response.get("replaces", [])
+    if not isinstance(factors, list):
+        issues.append("factors must be a list")
+        factors = []
+    if not isinstance(replaces, list):
+        issues.append("replaces must be a list")
+        replaces = []
+
+    if decision == "retain_cluster":
+        if factors:
+            issues.append("retain_cluster must not include factors")
+        if replaces:
+            issues.append("retain_cluster must not include replaces")
+        if _missing_or_empty(response.get("rationale")):
+            issues.append("retain_cluster needs a rationale")
+        return issues
+
+    max_factors = int(context.get("max_factors", 2) or 2)
+    if not 1 <= len(factors) <= max_factors:
+        issues.append(f"replace_cluster needs 1-{max_factors} factors")
+
+    replaceable = {
+        _normalize_feature_name(name)
+        for name in context.get("replaceable_members", []) or []
+        if _normalize_feature_name(name)
+    }
+    protected = {
+        _normalize_feature_name(name)
+        for name in context.get("protected_members", []) or []
+        if _normalize_feature_name(name)
+    }
+    normalized_replaces = [_normalize_feature_name(name) for name in replaces]
+    if len(set(normalized_replaces)) < 2:
+        issues.append("replace_cluster must replace at least two distinct members")
+    for name in normalized_replaces:
+        if name not in replaceable:
+            issues.append(f"replacement member {name!r} was not replaceable")
+        if name in protected:
+            issues.append(f"replacement member {name!r} is protected")
+    if len(factors) >= len(set(normalized_replaces)) and factors:
+        issues.append("factor count must be smaller than replaced-member count")
+
+    expected_roles = {
+        str(role)
+        for role in context.get("required_role_union", []) or []
+        if str(role) in VALID_ROLES
+    }
+    factor_roles: set = set()
+    seen_names: set = set()
+    for idx, factor in enumerate(factors, start=1):
+        if not isinstance(factor, dict):
+            issues.append(f"factor {idx}: expected an object")
+            continue
+        name = _normalize_feature_name(factor.get("name", ""))
+        if not name:
+            issues.append(f"factor {idx}: missing name")
+        elif name in seen_names:
+            issues.append(f"factor {idx} ({name}): duplicate name")
+        seen_names.add(name)
+
+        inference_kind = str(factor.get("inference_kind") or "").strip().lower()
+        if inference_kind not in {"implicit", "direct"}:
+            issues.append(f"factor {idx} ({name}): invalid inference_kind")
+        feature_type = str(factor.get("type") or "").strip().lower()
+        if feature_type not in VALID_TYPES:
+            issues.append(f"factor {idx} ({name}): invalid type")
+        categories = factor.get("categories")
+        if feature_type == "categorical":
+            if not isinstance(categories, list) or not 2 <= len(categories) <= 8:
+                issues.append(
+                    f"factor {idx} ({name}): categorical factor needs 2-8 categories"
+                )
+        elif categories not in (None, []):
+            issues.append(f"factor {idx} ({name}): continuous factor cannot have categories")
+        if feature_type == "continuous" and _missing_or_empty(factor.get("unit")):
+            issues.append(f"factor {idx} ({name}): continuous factor needs a unit")
+        if inference_kind == "implicit" and feature_type == "continuous":
+            issues.append(f"factor {idx} ({name}): implicit factors must be categorical")
+
+        roles = factor.get("roles")
+        if not isinstance(roles, list) or not roles:
+            issues.append(f"factor {idx} ({name}): missing roles")
+        else:
+            invalid_roles = {str(role) for role in roles} - VALID_ROLES
+            if invalid_roles:
+                issues.append(
+                    f"factor {idx} ({name}): invalid roles {sorted(invalid_roles)}"
+                )
+            factor_roles.update(str(role) for role in roles if str(role) in VALID_ROLES)
+
+        for field_name in [
+            "description",
+            "minimum_evidence",
+            "null_policy",
+            "rationale",
+        ]:
+            if _missing_or_empty(factor.get(field_name)):
+                issues.append(f"factor {idx} ({name}): missing {field_name}")
+        for field_name in ["supporting_indicators", "contrary_indicators"]:
+            value = factor.get(field_name)
+            if not isinstance(value, list):
+                issues.append(f"factor {idx} ({name}): {field_name} must be a list")
+        if not factor.get("supporting_indicators"):
+            issues.append(f"factor {idx} ({name}): supporting_indicators cannot be empty")
+
+    if expected_roles and factor_roles != expected_roles:
+        issues.append(
+            "factor roles must collectively equal required_role_union "
+            f"{sorted(expected_roles)}; got {sorted(factor_roles)}"
+        )
+    if _missing_or_empty(response.get("rationale")):
+        issues.append("replace_cluster needs a rationale")
     return issues
 
 

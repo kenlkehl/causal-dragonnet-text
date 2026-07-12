@@ -950,10 +950,28 @@ class MultiModelAgenticForestConfig:
     extracted_feature_review_auc_margin: float = 0.02
     extracted_feature_review_loss_relative_margin: float = 0.05
     extracted_feature_review_min_benchmark_auc: float = 0.55
-    # Parsimony review before final forest fitting. The stage normally runs and
-    # writes artifacts, but pruning is optional: retaining all features is a
-    # valid outcome when ablations or redundancy checks do not justify removal.
+    # Value-driven cluster-to-factor parsimony before final forest fitting.
+    # The clustering pass uses the actual outer-training-fold extracted values
+    # together with feature-contract semantics.  An agent may then propose up
+    # to a small number of operationalized latent factors for each coherent
+    # cluster; replacements are retained only when every applicable diagnostic
+    # metric is preserved or improved.
     parsimony_review_enabled: bool = False
+    parsimony_cluster_semantic_weight: float = 0.5
+    parsimony_cluster_neighbors: int = 20
+    parsimony_cluster_combined_threshold: float = 0.60
+    parsimony_cluster_empirical_min_similarity: float = 0.30
+    parsimony_cluster_strong_empirical_threshold: float = 0.80
+    parsimony_cluster_missingness_weight: float = 0.15
+    parsimony_cluster_min_size: int = 2
+    parsimony_cluster_max_size: int = 12
+    parsimony_cluster_sketch_dim: int = 32
+    parsimony_max_factors_per_cluster: int = 2
+    parsimony_factor_min_coverage: float = 0.10
+    parsimony_parallelism: str = "auto"
+    parsimony_metric_epsilon: float = 1e-6
+    # Deprecated compatibility fields from the legacy single-feature ablation
+    # implementation.  They remain parseable but no longer govern parsimony.
     parsimony_review_auc_tolerance: float = 0.01
     parsimony_review_loss_relative_tolerance: float = 0.03
     parsimony_review_corr_threshold: float = 0.75
@@ -1113,9 +1131,56 @@ class MultiModelAgenticForestConfig:
                 "multi_model_agentic_forest.parsimony_review_max_single_feature_ablations "
                 "must be >= 0"
             )
+        if not 0.0 <= self.parsimony_cluster_semantic_weight <= 1.0:
+            raise ValueError(
+                "multi_model_agentic_forest.parsimony_cluster_semantic_weight "
+                "must be in [0, 1]"
+            )
+        if self.parsimony_cluster_neighbors < 1:
+            raise ValueError(
+                "multi_model_agentic_forest.parsimony_cluster_neighbors must be >= 1"
+            )
+        for field_name in [
+            "parsimony_cluster_combined_threshold",
+            "parsimony_cluster_empirical_min_similarity",
+            "parsimony_cluster_strong_empirical_threshold",
+            "parsimony_cluster_missingness_weight",
+            "parsimony_factor_min_coverage",
+        ]:
+            value = float(getattr(self, field_name))
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(
+                    f"multi_model_agentic_forest.{field_name} must be in [0, 1]"
+                )
+        if self.parsimony_cluster_min_size < 2:
+            raise ValueError(
+                "multi_model_agentic_forest.parsimony_cluster_min_size must be >= 2"
+            )
+        if self.parsimony_cluster_max_size < self.parsimony_cluster_min_size:
+            raise ValueError(
+                "multi_model_agentic_forest.parsimony_cluster_max_size must be >= "
+                "parsimony_cluster_min_size"
+            )
+        if self.parsimony_cluster_sketch_dim < 1:
+            raise ValueError(
+                "multi_model_agentic_forest.parsimony_cluster_sketch_dim must be >= 1"
+            )
+        if not 1 <= self.parsimony_max_factors_per_cluster <= 2:
+            raise ValueError(
+                "multi_model_agentic_forest.parsimony_max_factors_per_cluster "
+                "must be 1 or 2"
+            )
+        if self.parsimony_metric_epsilon < 0.0:
+            raise ValueError(
+                "multi_model_agentic_forest.parsimony_metric_epsilon must be >= 0"
+            )
         _validate_parallelism_setting(
             self.candidate_consistency_parallelism,
             "multi_model_agentic_forest.candidate_consistency_parallelism",
+        )
+        _validate_parallelism_setting(
+            self.parsimony_parallelism,
+            "multi_model_agentic_forest.parsimony_parallelism",
         )
         _validate_parallelism_setting(
             self.outer_parallelism,
