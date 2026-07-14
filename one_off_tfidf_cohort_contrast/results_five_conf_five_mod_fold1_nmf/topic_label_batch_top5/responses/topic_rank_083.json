@@ -1,0 +1,91 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 4.232073068618774,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Contains a prepositional fragment likely resulting from natural language processing of clinical notes.",
+        "term": "for stage iiia"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "Stage IIIA disease status and postoperative state",
+      "summary": "The topic focuses on patients with Stage IIIA lung cancer, specifically in the postoperative context."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The terms explicitly identify a specific TNM staging category (IIIA).",
+        "feature_type": "categorical",
+        "name": "Cancer Stage",
+        "represented_values_or_categories": [
+          "Stage IIIA"
+        ],
+        "supporting_terms": [
+          "stage iiia",
+          "iiia",
+          "for stage iiia"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The terms describe the clinical state of the patient following a surgical procedure.",
+        "feature_type": "categorical",
+        "name": "Postoperative Status",
+        "represented_values_or_categories": [
+          "post-operative",
+          "stable postoperative"
+        ],
+        "supporting_terms": [
+          "post-operative",
+          "stable postoperative"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Cancer Stage",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Cancer Stage"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Postoperative Status",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Postoperative Status"
+        ]
+      }
+    ],
+    "topic_index": 74,
+    "topic_rank": 83
+  },
+  "raw_content": "{\n  \"topic_rank\": 83,\n  \"topic_index\": 74,\n  \"general_topic\": {\n    \"label\": \"Stage IIIA disease status and postoperative state\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic focuses on patients with Stage IIIA lung cancer, specifically in the postoperative context.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Cancer Stage\",\n      \"supporting_terms\": [\n        \"stage iiia\",\n        \"iiia\",\n        \"for stage iiia\"\n      ],\n      \"feature_type\": \"categorical\",\n      \"represented_values_or_categories\": [\n        \"Stage IIIA\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms explicitly identify a specific TNM staging category (IIIA).\"\n    },\n    {\n      \"name\": \"Postoperative Status\",\n      \"supporting_terms\": [\n        \"post-operative\",\n        \"stable postoperative\"\n      ],\n      \"feature_type\": \"categorical\",\n      \"represented_values_or_categories\": [\n        \"post-operative\",\n        \"stable postoperative\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms describe the clinical state of the patient following a surgical procedure.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"for stage iiia\",\n      \"reason\": \"Contains a prepositional fragment likely resulting from natural language processing of clinical notes.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Cancer Stage\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Cancer Stage\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Postoperative Status\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Postoperative Status\"\n      ],\n      \"confidence\": \"high\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-9fcc651cc96457e4",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "stage iiia",
+    "iiia",
+    "for stage iiia",
+    "post-operative",
+    "stable postoperative"
+  ],
+  "topic_index": 74,
+  "topic_rank": 83,
+  "usage": {
+    "completion_tokens": 512,
+    "prompt_tokens": 763,
+    "prompt_tokens_details": null,
+    "total_tokens": 1275
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 83, internal index 74\n\nTerms in this topic, ordered from highest to lowest loading:\n1. stage iiia\n2. iiia\n3. for stage iiia\n4. post-operative\n5. stable postoperative\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 83,\n  \"topic_index\": 74,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

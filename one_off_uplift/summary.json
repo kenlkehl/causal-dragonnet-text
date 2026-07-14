@@ -1,0 +1,34 @@
+{
+  "dataset": "synthetic_data/example_synthetic_datasets/one_confounder_one_effect_modifier_nsclc_with_structured/dataset.parquet",
+  "n_patients": 1000,
+  "n_treated": 487,
+  "n_control": 513,
+  "text_col": "clinical_text",
+  "treatment_col": "treatment_indicator",
+  "outcome_col": "outcome_indicator",
+  "folds": 5,
+  "seed": 42,
+  "ngram_range": [
+    1,
+    2
+  ],
+  "min_df": 2,
+  "max_df": 0.95,
+  "max_features": 100000,
+  "propensity_caliper": 0.05,
+  "outcome_caliper": 0.05,
+  "eligible_cross_treatment_pairs": 27292,
+  "max_one_to_one_matched_pairs": 272,
+  "propensity_prediction_mean": 0.48460412304615114,
+  "propensity_prediction_std": 0.1098792403329189,
+  "outcome_prediction_mean": 0.5452509098143428,
+  "outcome_prediction_std": 0.09765921155466592,
+  "outputs": {
+    "honest_dataset": "one_off_uplift/honest_tfidf_nuisance_predictions.parquet",
+    "eligible_pairs": "one_off_uplift/eligible_pairs_within_calipers.parquet",
+    "matched_pairs": "one_off_uplift/max_one_to_one_matched_pairs.parquet",
+    "summary": "one_off_uplift/summary.json"
+  },
+  "propensity_auroc_vs_treatment": 0.8378223679207144,
+  "outcome_auroc_vs_outcome": 0.817607552889577
+}

@@ -1,0 +1,132 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 6.304039716720581,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Fragmented phrase; likely part of a larger finding but lacks context on its own.",
+        "term": "a positive"
+      },
+      {
+        "reason": "Incomplete fragment of 'transcription factor-1'.",
+        "term": "factor-1"
+      },
+      {
+        "reason": "Incomplete fragment of 'transcription factor'.",
+        "term": "transcription"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "Lung adenocarcinoma immunohistochemistry markers",
+      "summary": "The topic focuses on histological classification (adenocarcinoma) and specific immunohistochemical markers (TTF-1 and Napsin A) used in lung cancer diagnosis."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Thyroid Transcription Factor-1 (TTF-1) is a standard immunohistochemical marker used to identify lung adenocarcinoma.",
+        "feature_type": "finding",
+        "name": "TTF-1 expression status",
+        "represented_values_or_categories": [
+          "positive"
+        ],
+        "supporting_terms": [
+          "ttf-1 thyroid transcription factor-1",
+          "---------------- ttf-1 thyroid transcription",
+          "ttf-1 thyroid",
+          "---------------- ttf-1",
+          "-------- ---------------- ttf-1"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Napsin A is a proteolytically activated aspartic proteinase used as a marker for lung adenocarcinoma.",
+        "feature_type": "finding",
+        "name": "Napsin A expression status",
+        "represented_values_or_categories": [
+          "positive"
+        ],
+        "supporting_terms": [
+          "napsin a positive"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The terms explicitly identify the histological type of the lung cancer.",
+        "feature_type": "diagnosis",
+        "name": "Histological subtype",
+        "represented_values_or_categories": [
+          "adenocarcinoma"
+        ],
+        "supporting_terms": [
+          "adenocarcinoma of",
+          "adenocarcinoma of the",
+          "adenocarcinoma"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "TTF-1 expression",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "TTF-1 expression status"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Napsin A expression",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Napsin A expression status"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Histology",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Histological subtype"
+        ]
+      }
+    ],
+    "topic_index": 99,
+    "topic_rank": 78
+  },
+  "raw_content": "{\n  \"topic_rank\": 78,\n  \"topic_index\": 99,\n  \"general_topic\": {\n    \"label\": \"Lung adenocarcinoma immunohistochemistry markers\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic focuses on histological classification (adenocarcinoma) and specific immunohistochemical markers (TTF-1 and Napsin A) used in lung cancer diagnosis.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"TTF-1 expression status\",\n      \"supporting_terms\": [\n        \"ttf-1 thyroid transcription factor-1\",\n        \"---------------- ttf-1 thyroid transcription\",\n        \"ttf-1 thyroid\",\n        \"---------------- ttf-1\",\n        \"-------- ---------------- ttf-1\"\n      ],\n      \"feature_type\": \"finding\",\n      \"represented_values_or_categories\": [\n        \"positive\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Thyroid Transcription Factor-1 (TTF-1) is a standard immunohistochemical marker used to identify lung adenocarcinoma.\"\n    },\n    {\n      \"name\": \"Napsin A expression status\",\n      \"supporting_terms\": [\n        \"napsin a positive\"\n      ],\n      \"feature_type\": \"finding\",\n      \"represented_values_or_categories\": [\n        \"positive\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Napsin A is a proteolytically activated aspartic proteinase used as a marker for lung adenocarcinoma.\"\n    },\n    {\n      \"name\": \"Histological subtype\",\n      \"supporting_terms\": [\n        \"adenocarcinoma of\",\n        \"adenocarcinoma of the\",\n        \"adenocarcinoma\"\n      ],\n      \"feature_type\": \"diagnosis\",\n      \"represented_values_or_categories\": [\n        \"adenocarcinoma\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms explicitly identify the histological type of the lung cancer.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"a positive\",\n      \"reason\": \"Fragmented phrase; likely part of a larger finding but lacks context on its own.\"\n    },\n    {\n      \"term\": \"factor-1\",\n      \"reason\": \"Incomplete fragment of 'transcription factor-1'.\"\n    },\n    {\n      \"term\": \"transcription\",\n      \"reason\": \"Incomplete fragment of 'transcription factor'.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"TTF-1 expression\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"TTF-1 expression status\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Napsin A expression\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Napsin A expression status\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Histology\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Histological subtype\"\n      ],\n      \"confidence\": \"high\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-830612403622ba85",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "adenocarcinoma of",
+    "a positive",
+    "napsin a positive",
+    "adenocarcinoma of the",
+    "adenocarcinoma",
+    "supports pulmonary",
+    "---------------- ttf-1 thyroid",
+    "ttf-1 thyroid transcription",
+    "ttf-1 thyroid",
+    "---------------- ttf-1",
+    "-------- ---------------- ttf-1",
+    "factor-1",
+    "transcription",
+    "thyroid transcription factor-1",
+    "thyroid transcription"
+  ],
+  "topic_index": 99,
+  "topic_rank": 78,
+  "usage": {
+    "completion_tokens": 809,
+    "prompt_tokens": 841,
+    "prompt_tokens_details": null,
+    "total_tokens": 1650
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 78, internal index 99\n\nTerms in this topic, ordered from highest to lowest loading:\n1. adenocarcinoma of\n2. a positive\n3. napsin a positive\n4. adenocarcinoma of the\n5. adenocarcinoma\n6. supports pulmonary\n7. ---------------- ttf-1 thyroid\n8. ttf-1 thyroid transcription\n9. ttf-1 thyroid\n10. ---------------- ttf-1\n11. -------- ---------------- ttf-1\n12. factor-1\n13. transcription\n14. thyroid transcription factor-1\n15. thyroid transcription\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 78,\n  \"topic_index\": 99,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

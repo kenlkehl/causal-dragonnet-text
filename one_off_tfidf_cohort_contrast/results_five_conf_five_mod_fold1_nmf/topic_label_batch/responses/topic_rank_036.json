@@ -1,0 +1,102 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 4.123419284820557,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Likely refers to Gray (unit of radiation dose), but lacks a numeric value to be a usable feature.",
+        "term": "gy"
+      },
+      {
+        "reason": "Ambiguous; could mean fracture or fraction (radiation dose), but lacks context.",
+        "term": "fx"
+      },
+      {
+        "reason": "A qualitative descriptor without a clear clinical subject in this context.",
+        "term": "improved"
+      },
+      {
+        "reason": "Grammatical fragment.",
+        "term": "to a"
+      },
+      {
+        "reason": "Formatting artifact/fragment.",
+        "term": "- palliative"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "History of palliative radiation therapy",
+      "summary": "The topic focuses on patients who have previously received palliative external-beam radiation therapy."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The terms consistently describe a history of receiving radiation for palliative purposes.",
+        "feature_type": "history",
+        "name": "Prior palliative radiation therapy",
+        "represented_values_or_categories": [
+          "prior"
+        ],
+        "supporting_terms": [
+          "palliative external-beam radiation",
+          "prior palliative radiation",
+          "previously irradiated",
+          "prior radiation",
+          "palliative external-beam"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "History of palliative radiation therapy",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Prior palliative radiation therapy"
+        ]
+      },
+      {
+        "confidence": "low",
+        "name": "Total cumulative radiation dose (Gy)",
+        "suggested_representation": "continuous",
+        "supporting_specific_features": []
+      }
+    ],
+    "topic_index": 19,
+    "topic_rank": 36
+  },
+  "raw_content": "{\n  \"topic_rank\": 36,\n  \"topic_index\": 19,\n  \"general_topic\": {\n    \"label\": \"History of palliative radiation therapy\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic focuses on patients who have previously received palliative external-beam radiation therapy.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Prior palliative radiation therapy\",\n      \"supporting_terms\": [\n        \"palliative external-beam radiation\",\n        \"prior palliative radiation\",\n        \"previously irradiated\",\n        \"prior radiation\",\n        \"palliative external-beam\"\n      ],\n      \"feature_type\": \"history\",\n      \"represented_values_or_categories\": [\n        \"prior\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms consistently describe a history of receiving radiation for palliative purposes.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"gy\",\n      \"reason\": \"Likely refers to Gray (unit of radiation dose), but lacks a numeric value to be a usable feature.\"\n    },\n    {\n      \"term\": \"fx\",\n      \"reason\": \"Ambiguous; could mean fracture or fraction (radiation dose), but lacks context.\"\n    },\n    {\n      \"term\": \"improved\",\n      \"reason\": \"A qualitative descriptor without a clear clinical subject in this context.\"\n    },\n    {\n      \"term\": \"to a\",\n      \"reason\": \"Grammatical fragment.\"\n    },\n    {\n      \"term\": \"- palliative\",\n      \"reason\": \"Formatting artifact/fragment.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"History of palliative radiation therapy\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Prior palliative radiation therapy\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Total cumulative radiation dose (Gy)\",\n      \"suggested_representation\": \"continuous\",\n      \"supporting_specific_features\": [],\n      \"confidence\": \"low\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-bfc33110146701bf",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "gy",
+    "palliative external-beam",
+    "palliative external-beam radiation",
+    "radiation",
+    "prior palliative radiation",
+    "prior palliative",
+    "radiation to a",
+    "received palliative",
+    "improved",
+    "palliative",
+    "fx",
+    "previously irradiated",
+    "- palliative",
+    "prior radiation",
+    "to a"
+  ],
+  "topic_index": 19,
+  "topic_rank": 36,
+  "usage": {
+    "completion_tokens": 527,
+    "prompt_tokens": 817,
+    "prompt_tokens_details": null,
+    "total_tokens": 1344
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 36, internal index 19\n\nTerms in this topic, ordered from highest to lowest loading:\n1. gy\n2. palliative external-beam\n3. palliative external-beam radiation\n4. radiation\n5. prior palliative radiation\n6. prior palliative\n7. radiation to a\n8. received palliative\n9. improved\n10. palliative\n11. fx\n12. previously irradiated\n13. - palliative\n14. prior radiation\n15. to a\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 36,\n  \"topic_index\": 19,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

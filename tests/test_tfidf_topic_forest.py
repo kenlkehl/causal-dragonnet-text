@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 
@@ -6,6 +7,9 @@ import pandas as pd
 import pytest
 from scipy import sparse
 
+from oracle_experiment_scripts.audit_tfidf_topic_oracle_recovery import (
+    topic_oracle_associations,
+)
 from oci.config import (
     AgenticFeatureSearchConfig,
     AppliedInferenceConfig,
@@ -23,9 +27,13 @@ from oci.inference.agentic_explicit_feature_forest import (
     VLLMExplicitFeatureExtractionProvider,
 )
 from oci.inference.tfidf_topic_agentic_forest import (
+    ORPHAN_NGRAM_LABEL_PROMPT_VERSION,
+    TfidfTopicAgenticForestRunner,
     TOPIC_GLOBAL_DEDUP_PROMPT_VERSION,
     TOPIC_NAME_HARMONIZATION_PROMPT_VERSION,
     TOPIC_VALUE_HARMONIZATION_PROMPT_VERSION,
+    _effect_evidence_coverage,
+    _registry_entry_state_hash,
     apply_registry_derivations,
     apply_topic_global_dedup,
     apply_topic_name_harmonization,
@@ -37,9 +45,11 @@ from oci.inference.tfidf_topic_agentic_forest import (
     render_topic_label_prompt,
     select_deferred_review_additions,
     select_initial_topic_evidence_registry,
+    select_topic_recovery_raw_ngrams,
     structured_review_gate,
     topic_harmonization_response_issues,
     run_tfidf_topic_agentic_forest,
+    validate_tfidf_topic_stage2_handoff,
 )
 from oci.inference.tfidf_topic_discovery import (
     ConsensusNMFTopicBank,
@@ -49,6 +59,13 @@ from oci.inference.tfidf_topic_discovery import (
     fit_tfidf_topic_context,
     fit_cross_fitted_nuisance_stack,
     unsigned_linear_screen,
+)
+from oci.inference.tfidf_topic_score_selection import (
+    benjamini_hochberg,
+    build_fit_side_orphan_ngram_clusters,
+    reselect_persisted_topic_scores,
+    score_effect_orphan_ngram_clusters,
+    score_topic_banks,
 )
 from oci.inference.tfidf_topic_stage1 import run_tfidf_topic_stage1
 
@@ -63,6 +80,28 @@ def _dense_contrast_reference(x, t, y, e, m):
     se = np.sqrt(np.maximum(0.0, np.mean(z**2, axis=0) - moment**2) / len(t))
     score = np.divide(moment, se, out=np.zeros_like(moment), where=se > 0)
     return moment, se, score
+
+
+def test_posthoc_topic_oracle_associations_are_absolute_and_row_order_invariant():
+    topics = np.asarray(
+        [
+            [0.0, 1.0, 4.0],
+            [1.0, 0.0, 4.0],
+            [2.0, 1.0, 4.0],
+            [3.0, 0.0, 4.0],
+            [4.0, 1.0, 4.0],
+            [5.0, 0.0, 4.0],
+        ]
+    )
+    oracle = np.column_stack([topics[:, 0], 1.0 - topics[:, 1]])
+    observed = topic_oracle_associations(topics, oracle)
+    assert observed[0] == pytest.approx(1.0)
+    assert observed[1] == pytest.approx(1.0)
+    assert observed[2] == pytest.approx(0.0)
+    order = np.asarray([4, 1, 5, 0, 3, 2])
+    np.testing.assert_allclose(
+        topic_oracle_associations(topics[order], oracle[order]), observed
+    )
 
 
 @pytest.mark.parametrize("continuous", [False, True])
@@ -99,6 +138,688 @@ def test_unsigned_screen_keeps_equal_positive_and_negative_coefficients():
     assert by_name.loc["positive", "unsigned_score"] == pytest.approx(
         by_name.loc["negative", "unsigned_score"]
     )
+
+
+def _score_test_topic(topic_id, terms):
+    return {
+        "topic_id": topic_id,
+        "terms": [
+            {
+                "term": term,
+                "loading": 1.0 / (index + 1),
+                "screen_rank": index + 1,
+                "signed_score": 1.0,
+            }
+            for index, term in enumerate(terms)
+        ],
+    }
+
+
+def _synthetic_topic_score_inputs(effect_direction=1.0):
+    rng = np.random.default_rng(718)
+    n_fit = 500
+    n_heldout = 400
+    confounder_fit = rng.binomial(1, 0.5, n_fit)
+    confounder_heldout = rng.binomial(1, 0.5, n_heldout)
+    modifier_fit = rng.binomial(1, 0.5, n_fit)
+    modifier_heldout = rng.binomial(1, 0.5, n_heldout)
+
+    def feature_block(indicator, n_rows):
+        present = rng.binomial(1, 0.88, (n_rows, 15)) * indicator[:, None]
+        return present * rng.uniform(0.6, 1.4, (n_rows, 15))
+
+    confounder_terms = [f"confounder_term_{index}" for index in range(15)]
+    modifier_terms = [f"modifier_term_{index}" for index in range(15)]
+    noise_terms = [f"noise_term_{index}" for index in range(15)]
+    feature_names = [*confounder_terms, *modifier_terms, *noise_terms]
+    fit_matrix = sparse.csr_matrix(
+        np.column_stack(
+            [
+                feature_block(confounder_fit, n_fit),
+                feature_block(modifier_fit, n_fit),
+                rng.binomial(1, 0.20, (n_fit, 15))
+                * rng.uniform(0.4, 1.0, (n_fit, 15)),
+            ]
+        )
+    )
+    heldout_matrix = sparse.csr_matrix(
+        np.column_stack(
+            [
+                feature_block(confounder_heldout, n_heldout),
+                feature_block(modifier_heldout, n_heldout),
+                rng.binomial(1, 0.20, (n_heldout, 15))
+                * rng.uniform(0.4, 1.0, (n_heldout, 15)),
+            ]
+        )
+    )
+
+    propensity_fit = 1.0 / (1.0 + np.exp(-(-1.0 + 2.2 * confounder_fit)))
+    propensity_heldout = 1.0 / (
+        1.0 + np.exp(-(-1.0 + 2.2 * confounder_heldout))
+    )
+    treatment_fit = rng.binomial(1, propensity_fit).astype(float)
+    treatment_heldout = rng.binomial(1, propensity_heldout).astype(float)
+    tau_fit = 0.1 + effect_direction * 1.5 * modifier_fit
+    tau_heldout = 0.1 + effect_direction * 1.5 * modifier_heldout
+    baseline_fit = 0.9 * confounder_fit
+    baseline_heldout = 0.9 * confounder_heldout
+    outcome_fit = (
+        baseline_fit
+        + tau_fit * treatment_fit
+        + rng.normal(0.0, 0.25, n_fit)
+    )
+    outcome_heldout = (
+        baseline_heldout
+        + tau_heldout * treatment_heldout
+        + rng.normal(0.0, 0.25, n_heldout)
+    )
+    outcome_prediction_fit = baseline_fit + propensity_fit * tau_fit
+    outcome_prediction_heldout = baseline_heldout + propensity_heldout * tau_heldout
+
+    topic_banks = {
+        "treatment": {
+            "topics": [
+                _score_test_topic("treatment_signal", confounder_terms),
+                _score_test_topic("treatment_noise", noise_terms),
+            ]
+        },
+        "outcome": {
+            "topics": [
+                _score_test_topic("outcome_signal", confounder_terms),
+                _score_test_topic("outcome_noise", noise_terms),
+            ]
+        },
+        "effect": {
+            "topics": [
+                _score_test_topic("effect_signal", modifier_terms),
+                _score_test_topic("effect_noise", noise_terms),
+            ]
+        },
+    }
+    fit_dense = fit_matrix.toarray()
+    heldout_dense = heldout_matrix.toarray()
+    fit_confounder_topic = np.mean(fit_dense[:, :15], axis=1)
+    heldout_confounder_topic = np.mean(heldout_dense[:, :15], axis=1)
+    fit_modifier_topic = np.mean(fit_dense[:, 15:30], axis=1)
+    heldout_modifier_topic = np.mean(heldout_dense[:, 15:30], axis=1)
+    fit_noise_topic = np.mean(fit_dense[:, 30:45], axis=1)
+    heldout_noise_topic = np.mean(heldout_dense[:, 30:45], axis=1)
+    return {
+        "fit_matrix": fit_matrix,
+        "heldout_matrix": heldout_matrix,
+        "feature_names": feature_names,
+        "topic_banks": topic_banks,
+        "fit_topic_values": {
+            "treatment": np.column_stack(
+                [fit_confounder_topic, fit_noise_topic]
+            ),
+            "outcome": np.column_stack(
+                [fit_confounder_topic, fit_noise_topic]
+            ),
+            "effect": np.column_stack([fit_modifier_topic, fit_noise_topic]),
+        },
+        "heldout_topic_values": {
+            "treatment": np.column_stack(
+                [heldout_confounder_topic, heldout_noise_topic]
+            ),
+            "outcome": np.column_stack(
+                [heldout_confounder_topic, heldout_noise_topic]
+            ),
+            "effect": np.column_stack(
+                [heldout_modifier_topic, heldout_noise_topic]
+            ),
+        },
+        "fit_treatment": treatment_fit,
+        "fit_outcome": outcome_fit,
+        "heldout_treatment": treatment_heldout,
+        "heldout_outcome": outcome_heldout,
+        "fit_propensity": propensity_fit,
+        "fit_outcome_prediction": outcome_prediction_fit,
+        "heldout_propensity": propensity_heldout,
+        "heldout_outcome_prediction": outcome_prediction_heldout,
+    }
+
+
+@pytest.mark.parametrize("effect_direction", [-1.0, 1.0])
+def test_all_topic_group_score_tests_find_nuisance_and_effect_signal(effect_direction):
+    inputs = _synthetic_topic_score_inputs(effect_direction)
+    config = TfidfTopicDiscoveryConfig(
+        min_df=1,
+        topic_count=2,
+        stability_repeats=0,
+        score_test_bootstrap_repeats=199,
+        score_test_bootstrap_top_topics=0,
+        score_test_bootstrap_chunk_size=40,
+        score_test_min_topics_per_bank=1,
+        score_test_max_topics_per_bank=1,
+    )
+    result = score_topic_banks(
+        **inputs,
+        config=config,
+        scope_id=f"synthetic_direction_{effect_direction}",
+    )
+    expected = {
+        "treatment": "treatment_signal",
+        "outcome": "outcome_signal",
+        "effect": "effect_signal",
+    }
+    for bank, topic_id in expected.items():
+        bank_result = result["banks"][bank]
+        assert bank_result["bootstrap_calibration"]["complete_topic_family"]
+        assert bank_result["bootstrap_calibration"]["complete_ngram_family"]
+        assert bank_result["bootstrap_calibration"]["bootstrapped_topic_count"] == 2
+        assert bank_result["unique_ngram_count"] == 30
+        assert bank_result["testable_unique_ngram_count"] == 30
+        assert bank_result["ngram_selection_count"] > 0
+        by_id = {row["topic_id"]: row for row in bank_result["topic_tests"]}
+        assert by_id[topic_id]["evidence_rank"] == 1
+        assert by_id[topic_id]["selected_for_agent"]
+        assert by_id[topic_id]["primary_p_source"] == (
+            "complete_family_multiplier_bootstrap"
+        )
+        assert "topic_familywise_p" in by_id[topic_id]
+        assert abs(by_id[topic_id]["topic_standardized_score"]) > 0
+        assert "candidate_familywise_energy_p" in by_id[topic_id]
+        assert by_id[topic_id]["selected_ngram_count"] > 0
+        assert all(
+            "ngram_fdr_q" in term and "ngram_evidence_rank" in term
+            for term in by_id[topic_id]["term_scores"]
+        )
+        assert bank_result["selected_topic_ids"] == [topic_id]
+
+
+def _synthetic_orphan_branch_inputs():
+    inputs = _synthetic_topic_score_inputs(effect_direction=1.0)
+    fit_base = inputs["fit_matrix"].toarray()
+    heldout_base = inputs["heldout_matrix"].toarray()
+    # These phrases deliberately encode the same patient signal as a modifier
+    # topic while remaining outside every topic's supplied 15-term summary.
+    fit_signal = fit_base[:, 15]
+    heldout_signal = heldout_base[:, 15]
+    rng = np.random.default_rng(922)
+    fit_noise = rng.binomial(1, 0.25, len(fit_signal))
+    heldout_noise = rng.binomial(1, 0.25, len(heldout_signal))
+    orphan_terms = [
+        "calculated nlr",
+        "baseline calculated nlr",
+        "low lymphocytes",
+        "administrative date",
+    ]
+    inputs["fit_matrix"] = sparse.csr_matrix(
+        np.column_stack(
+            [fit_base, fit_signal, fit_signal, fit_signal, fit_noise]
+        )
+    )
+    inputs["heldout_matrix"] = sparse.csr_matrix(
+        np.column_stack(
+            [
+                heldout_base,
+                heldout_signal,
+                heldout_signal,
+                heldout_signal,
+                heldout_noise,
+            ]
+        )
+    )
+    inputs["feature_names"] = [*inputs["feature_names"], *orphan_terms]
+    scores = pd.DataFrame(
+        {
+            "feature": inputs["feature_names"],
+            "signed_score": [0.0] * 45 + [3.2, 3.1, -2.9, 2.1],
+            "unsigned_score": [0.0] * 45 + [3.2, 3.1, 2.9, 2.1],
+            "combined_importance": [0.0] * 45 + [3.1, 3.0, 2.8, 2.0],
+            "eligible": [True] * 49,
+            "support_control": [20] * 49,
+            "support_treated": [20] * 49,
+            "nuisance_source_agreement": [1.0] * 49,
+            "subsample_selection_stability": [1.0] * 49,
+            "subsample_sign_agreement": [1.0] * 49,
+            "tail_contrast_sign_agreement": [1.0] * 49,
+        }
+    )
+    return inputs, scores
+
+
+def test_orphan_branch_deduplicates_nested_phrases_clusters_and_selects_signal():
+    inputs, scores = _synthetic_orphan_branch_inputs()
+    config = TfidfTopicDiscoveryConfig(
+        min_df=1,
+        topic_count=2,
+        stability_repeats=0,
+        score_test_bootstrap_repeats=199,
+        score_test_bootstrap_top_topics=0,
+        score_test_bootstrap_chunk_size=40,
+        orphan_ngram_min_abs_fit_score=2.0,
+        orphan_ngram_cluster_similarity_threshold=0.30,
+        orphan_ngram_max_selected_clusters=5,
+    )
+    represented = [
+        term["term"]
+        for topic in inputs["topic_banks"]["effect"]["topics"]
+        for term in topic["terms"]
+    ]
+    universe = build_fit_side_orphan_ngram_clusters(
+        fit_matrix=inputs["fit_matrix"],
+        feature_names=inputs["feature_names"],
+        effect_scores=scores,
+        represented_topic_terms=represented,
+        config=config,
+    )
+    assert universe["candidate_count_before_nested_deduplication"] == 4
+    assert universe["deduplicated_alias_count"] >= 1
+    assert all(1 <= len(cluster["terms"]) <= 15 for cluster in universe["clusters"])
+
+    result = score_effect_orphan_ngram_clusters(
+        fit_matrix=inputs["fit_matrix"],
+        heldout_matrix=inputs["heldout_matrix"],
+        feature_names=inputs["feature_names"],
+        effect_scores=scores,
+        effect_topics=inputs["topic_banks"]["effect"]["topics"],
+        fit_treatment=inputs["fit_treatment"],
+        fit_outcome=inputs["fit_outcome"],
+        heldout_treatment=inputs["heldout_treatment"],
+        heldout_outcome=inputs["heldout_outcome"],
+        fit_propensity=inputs["fit_propensity"],
+        fit_outcome_prediction=inputs["fit_outcome_prediction"],
+        heldout_propensity=inputs["heldout_propensity"],
+        heldout_outcome_prediction=inputs["heldout_outcome_prediction"],
+        config=config,
+    )
+    assert result["status"] == "completed"
+    assert not result["cluster_construction_uses_heldout_rows_or_labels"]
+    assert result["bootstrap_calibration"]["complete_term_group_family"]
+    assert result["selection_count"] >= 1
+    selected_terms = {
+        term["term"]
+        for cluster in result["selected_clusters"]
+        for term in cluster["term_scores"]
+    }
+    assert selected_terms & {
+        "calculated nlr",
+        "baseline calculated nlr",
+        "low lymphocytes",
+    }
+    assert not selected_terms & set(represented)
+
+
+def test_orphan_cluster_observed_score_is_heldout_row_order_invariant():
+    inputs, scores = _synthetic_orphan_branch_inputs()
+    config = TfidfTopicDiscoveryConfig(
+        min_df=1,
+        topic_count=2,
+        stability_repeats=0,
+        score_test_bootstrap_repeats=0,
+        orphan_ngram_max_selected_clusters=5,
+    )
+
+    def run(payload):
+        return score_effect_orphan_ngram_clusters(
+            fit_matrix=payload["fit_matrix"],
+            heldout_matrix=payload["heldout_matrix"],
+            feature_names=payload["feature_names"],
+            effect_scores=scores,
+            effect_topics=payload["topic_banks"]["effect"]["topics"],
+            fit_treatment=payload["fit_treatment"],
+            fit_outcome=payload["fit_outcome"],
+            heldout_treatment=payload["heldout_treatment"],
+            heldout_outcome=payload["heldout_outcome"],
+            fit_propensity=payload["fit_propensity"],
+            fit_outcome_prediction=payload["fit_outcome_prediction"],
+            heldout_propensity=payload["heldout_propensity"],
+            heldout_outcome_prediction=payload["heldout_outcome_prediction"],
+            config=config,
+        )
+
+    first = run(inputs)
+    order = np.random.default_rng(72).permutation(len(inputs["heldout_treatment"]))
+    reordered = dict(inputs)
+    reordered["heldout_matrix"] = inputs["heldout_matrix"][order]
+    for key in (
+        "heldout_treatment",
+        "heldout_outcome",
+        "heldout_propensity",
+        "heldout_outcome_prediction",
+    ):
+        reordered[key] = np.asarray(inputs[key])[order]
+    second = run(reordered)
+    first_by_id = {row["cluster_id"]: row for row in first["clusters"]}
+    second_by_id = {row["cluster_id"]: row for row in second["clusters"]}
+    assert set(first_by_id) == set(second_by_id)
+    for cluster_id in first_by_id:
+        assert first_by_id[cluster_id]["quadratic_statistic"] == pytest.approx(
+            second_by_id[cluster_id]["quadratic_statistic"]
+        )
+
+
+def test_ngram_score_family_deduplicates_terms_and_keeps_topic_provenance():
+    inputs = _synthetic_topic_score_inputs()
+    duplicate = inputs["topic_banks"]["treatment"]["topics"][0]["terms"][0][
+        "term"
+    ]
+    inputs["topic_banks"]["treatment"]["topics"][1]["terms"][0]["term"] = (
+        duplicate
+    )
+    result = score_topic_banks(
+        **inputs,
+        config=TfidfTopicDiscoveryConfig(
+            min_df=1,
+            topic_count=2,
+            stability_repeats=0,
+            score_test_bootstrap_repeats=49,
+            score_test_bootstrap_top_topics=0,
+            score_test_bootstrap_chunk_size=20,
+            score_test_min_topics_per_bank=1,
+            score_test_max_topics_per_bank=2,
+        ),
+        scope_id="duplicate_ngram_provenance",
+    )
+    treatment = result["banks"]["treatment"]
+    matches = [
+        row for row in treatment["ngram_tests"] if row["term"] == duplicate
+    ]
+    assert len(matches) == 1
+    assert matches[0]["topic_ids"] == ["treatment_noise", "treatment_signal"]
+    assert matches[0]["topic_occurrence_count"] == 2
+    assert treatment["unique_ngram_count"] == 29
+    occurrences = [
+        term
+        for topic in treatment["topic_tests"]
+        for term in topic["term_scores"]
+        if term["term"] == duplicate
+    ]
+    assert len(occurrences) == 2
+    assert {term["ngram_fdr_q"] for term in occurrences} == {
+        matches[0]["fdr_q"]
+    }
+
+
+def test_scalar_nmf_topic_route_survives_an_untestable_joint_term_group():
+    inputs = _synthetic_topic_score_inputs()
+    inputs["heldout_matrix"] = sparse.csr_matrix(
+        inputs["heldout_matrix"].shape, dtype=float
+    )
+    result = score_topic_banks(
+        **inputs,
+        config=TfidfTopicDiscoveryConfig(
+            min_df=1,
+            topic_count=2,
+            stability_repeats=0,
+            score_test_bootstrap_repeats=199,
+            score_test_bootstrap_top_topics=0,
+            score_test_min_topics_per_bank=0,
+            score_test_max_topics_per_bank=1,
+        ),
+        scope_id="scalar_topic_only",
+    )
+    expected = {
+        "treatment": "treatment_signal",
+        "outcome": "outcome_signal",
+        "effect": "effect_signal",
+    }
+    for bank, topic_id in expected.items():
+        by_id = {
+            row["topic_id"]: row
+            for row in result["banks"][bank]["topic_tests"]
+        }
+        assert by_id[topic_id]["topic_score_testable"]
+        assert by_id[topic_id]["quadratic_covariance_rank"] == 0
+        assert by_id[topic_id]["selected_for_agent"]
+        assert by_id[topic_id]["selection_reason"] == "nmf_topic_score_evidence"
+
+
+def test_joint_term_group_route_survives_an_untestable_scalar_topic_score():
+    inputs = _synthetic_topic_score_inputs()
+    inputs["heldout_topic_values"] = {
+        bank: np.zeros_like(values)
+        for bank, values in inputs["heldout_topic_values"].items()
+    }
+    result = score_topic_banks(
+        **inputs,
+        config=TfidfTopicDiscoveryConfig(
+            min_df=1,
+            topic_count=2,
+            stability_repeats=0,
+            score_test_bootstrap_repeats=199,
+            score_test_bootstrap_top_topics=0,
+            score_test_min_topics_per_bank=0,
+            score_test_max_topics_per_bank=1,
+        ),
+        scope_id="joint_term_group_only",
+    )
+    expected = {
+        "treatment": "treatment_signal",
+        "outcome": "outcome_signal",
+        "effect": "effect_signal",
+    }
+    for bank, topic_id in expected.items():
+        by_id = {
+            row["topic_id"]: row
+            for row in result["banks"][bank]["topic_tests"]
+        }
+        assert not by_id[topic_id]["topic_score_testable"]
+        assert by_id[topic_id]["quadratic_covariance_rank"] > 0
+        assert by_id[topic_id]["selected_for_agent"]
+        assert by_id[topic_id]["term_group_primary_p_source"] == (
+            "complete_family_multiplier_bootstrap"
+        )
+
+
+def test_persisted_score_reselection_changes_policy_without_recomputing_statistics():
+    inputs = _synthetic_topic_score_inputs()
+    config = TfidfTopicDiscoveryConfig(
+        min_df=1,
+        topic_count=2,
+        stability_repeats=0,
+        score_test_bootstrap_repeats=49,
+        score_test_bootstrap_top_topics=0,
+        score_test_min_topics_per_bank=1,
+        score_test_max_topics_per_bank=2,
+    )
+    original = score_topic_banks(
+        **inputs, config=config, scope_id="persisted_reselection"
+    )
+    original_statistic = original["banks"]["effect"]["topic_tests"][0][
+        "quadratic_statistic"
+    ]
+    migrated = reselect_persisted_topic_scores(original, config)
+
+    assert migrated["selection_recomputed_without_labels"]
+    assert not migrated["score_statistics_recomputed"]
+    assert migrated["banks"]["effect"]["topic_tests"][0][
+        "quadratic_statistic"
+    ] == pytest.approx(original_statistic)
+    assert "term_group_fdr_q" in migrated["banks"]["effect"]["topic_tests"][0]
+
+
+def test_persisted_orphan_reselection_changes_only_the_bounded_shortlist():
+    inputs, scores = _synthetic_orphan_branch_inputs()
+    original_config = TfidfTopicDiscoveryConfig(
+        min_df=1,
+        topic_count=2,
+        stability_repeats=0,
+        score_test_bootstrap_repeats=0,
+        score_test_min_topics_per_bank=1,
+        score_test_max_topics_per_bank=2,
+        orphan_ngram_min_abs_fit_score=2.0,
+        orphan_ngram_cluster_similarity_threshold=0.30,
+        orphan_ngram_min_selected_clusters=1,
+        orphan_ngram_max_selected_clusters=1,
+    )
+    original = score_topic_banks(
+        **inputs,
+        config=original_config,
+        scope_id="orphan_reselection",
+        raw_ngram_scores={"effect": scores},
+    )
+    orphan = original["effect_orphan_ngram_branch"]
+    assert orphan["cluster_count"] >= 2
+    original_statistics = {
+        row["cluster_id"]: (
+            row["quadratic_statistic"],
+            row["primary_p"],
+            row["fdr_q"],
+        )
+        for row in orphan["clusters"]
+    }
+
+    migrated = reselect_persisted_topic_scores(
+        original,
+        TfidfTopicDiscoveryConfig(
+            min_df=1,
+            topic_count=2,
+            stability_repeats=0,
+            score_test_bootstrap_repeats=0,
+            score_test_min_topics_per_bank=1,
+            score_test_max_topics_per_bank=2,
+            orphan_ngram_min_abs_fit_score=2.0,
+            orphan_ngram_cluster_similarity_threshold=0.30,
+            orphan_ngram_min_selected_clusters=2,
+            orphan_ngram_max_selected_clusters=2,
+        ),
+    )
+    migrated_orphan = migrated["effect_orphan_ngram_branch"]
+
+    assert migrated_orphan["selection_count"] == 2
+    assert len(migrated_orphan["selected_cluster_ids"]) == 2
+    assert migrated_orphan["selection_recomputed_without_labels"]
+    assert not migrated_orphan["score_statistics_recomputed"]
+    assert {
+        row["cluster_id"]: (
+            row["quadratic_statistic"],
+            row["primary_p"],
+            row["fdr_q"],
+        )
+        for row in migrated_orphan["clusters"]
+    } == original_statistics
+
+
+def test_topic_group_score_observed_statistics_are_row_order_invariant():
+    inputs = _synthetic_topic_score_inputs()
+    config = TfidfTopicDiscoveryConfig(
+        min_df=1,
+        topic_count=2,
+        stability_repeats=0,
+        score_test_bootstrap_repeats=0,
+        score_test_min_topics_per_bank=1,
+        score_test_max_topics_per_bank=1,
+    )
+    first = score_topic_banks(**inputs, config=config, scope_id="first")
+    order = np.random.default_rng(55).permutation(len(inputs["heldout_treatment"]))
+    reordered = dict(inputs)
+    reordered["heldout_matrix"] = inputs["heldout_matrix"][order]
+    for key in (
+        "heldout_treatment",
+        "heldout_outcome",
+        "heldout_propensity",
+        "heldout_outcome_prediction",
+    ):
+        reordered[key] = inputs[key][order]
+    reordered["heldout_topic_values"] = {
+        bank: values[order]
+        for bank, values in inputs["heldout_topic_values"].items()
+    }
+    second = score_topic_banks(**reordered, config=config, scope_id="second")
+    for bank in ("treatment", "outcome", "effect"):
+        first_by_id = {
+            row["topic_id"]: row for row in first["banks"][bank]["topic_tests"]
+        }
+        second_by_id = {
+            row["topic_id"]: row for row in second["banks"][bank]["topic_tests"]
+        }
+        for topic_id in first_by_id:
+            assert first_by_id[topic_id]["topic_standardized_score"] == pytest.approx(
+                second_by_id[topic_id]["topic_standardized_score"], rel=1e-10
+            )
+            assert first_by_id[topic_id]["quadratic_statistic"] == pytest.approx(
+                second_by_id[topic_id]["quadratic_statistic"], rel=1e-10
+            )
+        first_ngrams = {
+            row["term"]: row for row in first["banks"][bank]["ngram_tests"]
+        }
+        second_ngrams = {
+            row["term"]: row for row in second["banks"][bank]["ngram_tests"]
+        }
+        assert first_ngrams.keys() == second_ngrams.keys()
+        for term in first_ngrams:
+            assert first_ngrams[term]["heldout_standardized_score"] == pytest.approx(
+                second_ngrams[term]["heldout_standardized_score"], rel=1e-10
+            )
+
+
+def test_limited_topic_bootstrap_cannot_drive_post_selected_familywise_decision():
+    inputs = _synthetic_topic_score_inputs()
+    config = TfidfTopicDiscoveryConfig(
+        min_df=1,
+        topic_count=2,
+        stability_repeats=0,
+        score_test_bootstrap_repeats=99,
+        score_test_bootstrap_top_topics=1,
+        score_test_bootstrap_chunk_size=25,
+        score_test_fdr_level=0.0,
+        score_test_p_threshold=0.10,
+        score_test_min_topics_per_bank=0,
+        score_test_max_topics_per_bank=1,
+    )
+    result = score_topic_banks(
+        **inputs,
+        config=config,
+        scope_id="limited_bootstrap_audit",
+    )
+
+    for bank in ("treatment", "outcome", "effect"):
+        bank_result = result["banks"][bank]
+        assert not bank_result["bootstrap_calibration"]["complete_topic_family"]
+        assert not bank_result["bootstrap_calibration"]["complete_ngram_family"]
+        assert {
+            row["primary_p_source"] for row in bank_result["topic_tests"]
+        } == {"asymptotic_nmf_topic_score"}
+        assert {
+            row["primary_p_source"] for row in bank_result["ngram_tests"]
+        } == {"asymptotic_complete_unique_ngram_family"}
+        assert all(
+            row["selection_reason"] != "ngram_familywise_p"
+            for row in bank_result["ngram_tests"]
+        )
+        assert all(
+            row["selection_reason"] != "topic_familywise_p"
+            for row in bank_result["topic_tests"]
+        )
+
+
+def test_minimum_topic_fallback_never_selects_untestable_topic():
+    inputs = _synthetic_topic_score_inputs()
+    inputs["heldout_matrix"] = sparse.csr_matrix(
+        inputs["heldout_matrix"].shape, dtype=float
+    )
+    inputs["heldout_topic_values"] = {
+        bank: np.zeros_like(values)
+        for bank, values in inputs["heldout_topic_values"].items()
+    }
+    result = score_topic_banks(
+        **inputs,
+        config=TfidfTopicDiscoveryConfig(
+            min_df=1,
+            topic_count=2,
+            stability_repeats=0,
+            score_test_bootstrap_repeats=19,
+            score_test_min_topics_per_bank=2,
+            score_test_max_topics_per_bank=2,
+        ),
+        scope_id="untestable_topics",
+    )
+
+    for bank in ("treatment", "outcome", "effect"):
+        assert result["banks"][bank]["selected_topic_ids"] == []
+        assert result["banks"][bank]["selection_count"] == 0
+        assert all(
+            not row["selected_for_agent"]
+            for row in result["banks"][bank]["topic_tests"]
+        )
+
+
+def test_benjamini_hochberg_is_monotone_in_ranked_p_values():
+    adjusted = benjamini_hochberg([0.01, 0.04, 0.03, 0.20])
+    np.testing.assert_allclose(adjusted, [0.04, 0.0533333333, 0.0533333333, 0.20])
 
 
 def test_effect_support_and_stability_filters_are_applied():
@@ -219,12 +940,203 @@ def test_topic_prompt_has_exact_terms_traceability_and_no_forbidden_language():
         inner_fold=None,
         bank="effect",
         topic=topic,
+        score_test_evidence={
+            "source": "fixed_inner_score_test_policy_mapping",
+            "uses_outer_heldout_labels": False,
+            "matched_inner_evidence": [
+                {
+                    "inner_fold": 1,
+                    "primary_p": 0.02,
+                    "strongest_term_scores": [
+                        {
+                            "term": "term 0",
+                            "heldout_standardized_score": 2.4,
+                        }
+                    ],
+                }
+            ],
+        },
     )
     prompt = render_topic_label_prompt(context)
     assert len(context["topic_terms"]) == 15
     assert "supporting_terms" in prompt
+    assert "heldout_relevance_evidence" in prompt
+    assert "fixed_inner_score_test_policy_mapping" in prompt
     assert "causal" not in prompt.lower()
     assert "administrative" in prompt.lower()
+
+
+def test_orphan_ngram_prompt_is_bounded_traceable_and_not_a_topic_padding_hack():
+    topic = {
+        "topic_id": "effect_orphan_cluster_001",
+        "evidence_kind": "orphan_raw_ngram_cluster",
+        "terms": [
+            {
+                "term": "calculated nlr",
+                "fit_rank": 623,
+                "fit_signed_score": 2.14,
+            },
+            {
+                "term": "low lymphocytes",
+                "fit_rank": 575,
+                "fit_signed_score": -2.15,
+            },
+        ],
+    }
+    context = build_topic_label_context(
+        outer_fold=1,
+        scope="candidate_selection_inner_fit",
+        inner_fold=1,
+        bank="effect",
+        topic=topic,
+        prompt_version=ORPHAN_NGRAM_LABEL_PROMPT_VERSION,
+        score_test_evidence={"primary_p": 0.03},
+    )
+    prompt = render_topic_label_prompt(context)
+    assert len(context["topic_terms"]) == 2
+    assert "calculated nlr" in prompt
+    assert "low lymphocytes" in prompt
+    assert "not represented in the fitted topic summaries" in prompt
+    assert "causal" not in prompt.lower()
+
+
+def test_full_outer_orphan_jobs_are_mapped_from_fixed_inner_policy_without_labels(
+    tmp_path,
+):
+    raw_path = tmp_path / "effect_scores.parquet"
+    pd.DataFrame(
+        {
+            "feature": [
+                "topic represented phrase",
+                "squamous nsclc",
+                "frequent mitoses",
+            ],
+            "signed_score": [3.5, 3.1, 2.8],
+            "unsigned_score": [3.5, 3.1, 2.8],
+            "combined_importance": [3.5, 3.0, 2.7],
+            "eligible": [True, True, True],
+        }
+    ).to_parquet(raw_path, index=False)
+    runner = object.__new__(TfidfTopicAgenticForestRunner)
+    runner.nn_config = MultiModelForestConfig(
+        candidate_consistency_inner_folds=2,
+        tfidf_topic=TfidfTopicDiscoveryConfig(
+            min_df=1,
+            topic_count=2,
+            stability_repeats=0,
+            orphan_ngram_cluster_similarity_threshold=0.25,
+            orphan_ngram_full_min_inner_folds=1,
+        ),
+    )
+    row = {
+        "outer_fold": 1,
+        "discovery": {
+            "artifacts": {"ngram_scores": {"effect": str(raw_path)}},
+            "topic_banks": {
+                "effect": {
+                    "topics": [
+                        {
+                            "topic_id": "effect_topic_001",
+                            "terms": [{"term": "topic represented phrase"}],
+                        }
+                    ]
+                }
+            },
+        },
+    }
+    policy = {
+        "inner_fold_count": 2,
+        "topic_score_selection": {
+            "effect_orphan_ngram_branch": {
+                "signatures": [
+                    {
+                        "inner_fold": 1,
+                        "cluster_id": "effect_orphan_cluster_004",
+                        "terms": ["squamous nsclc -"],
+                        "primary_p": 0.02,
+                    }
+                ]
+            }
+        },
+    }
+    jobs, audit = runner._full_orphan_jobs_from_policy(row, policy)
+    assert audit["uses_outer_heldout_labels"] is False
+    assert audit["mapped_job_count"] == 1
+    assert len(jobs) == 1
+    bank, topic = jobs[0]
+    assert bank == "effect"
+    assert topic["_prompt_version"] == ORPHAN_NGRAM_LABEL_PROMPT_VERSION
+    assert {term["term"] for term in topic["terms"]} == {"squamous nsclc"}
+    assert topic["_selection_evidence"]["uses_outer_heldout_labels"] is False
+
+
+def test_recovery_raw_ngrams_prioritize_topic_ties_and_exclude_covered_terms():
+    topic = {
+        "topic_id": "effect_topic_001",
+        "terms": [
+            {"term": f"brain metastasis signal {index}"}
+            for index in range(15)
+        ],
+    }
+    scores = pd.DataFrame(
+        {
+            "feature": [
+                "global high rank noise",
+                "brain lesions present",
+                "metastasis surrounding edema",
+                "brain imaging finding",
+                "unrelated lower rank",
+            ],
+            "eligible": [True, True, True, True, True],
+        }
+    )
+    selected = select_topic_recovery_raw_ngrams(
+        scores,
+        topic,
+        excluded_terms=["brain lesions present"],
+        limit=3,
+    )
+    assert selected[:2] == [
+        "metastasis surrounding edema",
+        "brain imaging finding",
+    ]
+    assert "brain lesions present" not in selected
+    assert selected[2] == "global high rank noise"
+
+
+def test_recovery_raw_ngrams_reserve_global_slots_and_can_avoid_retries():
+    topic = {
+        "topic_id": "effect_topic_001",
+        "terms": [
+            {"term": f"brain metastasis signal {index}"}
+            for index in range(15)
+        ],
+    }
+    scores = pd.DataFrame(
+        {
+            "feature": [
+                "globally strongest unrelated contrast",
+                "brain focused first",
+                "brain focused second",
+                "brain focused third",
+                "metastasis focused fourth",
+                "second unrelated contrast",
+                "third unrelated contrast",
+                "fourth unrelated contrast",
+            ],
+            "eligible": [True] * 8,
+        }
+    )
+    first = select_topic_recovery_raw_ngrams(scores, topic, limit=4)
+    assert first[:2] == ["brain focused first", "brain focused second"]
+    assert "globally strongest unrelated contrast" in first
+    second = select_topic_recovery_raw_ngrams(
+        scores,
+        topic,
+        excluded_terms=first,
+        limit=4,
+    )
+    assert set(first).isdisjoint(second)
 
 
 def test_initial_review_registry_uses_evidence_mass_without_feature_count_cap():
@@ -422,6 +1334,102 @@ def test_structured_review_gate_uses_reconstruction_and_cohort_contrast():
     ) == 2
 
 
+def test_effect_raw_ngram_gate_does_not_hide_unmapped_stable_evidence(tmp_path):
+    score_path = tmp_path / "effect_scores.parquet"
+    pd.DataFrame(
+        {
+            "feature": ["raw_marker_a", "raw_marker_b"],
+            "eligible": [True, True],
+            "unsigned_score": [5.0, 4.0],
+        }
+    ).to_parquet(score_path, index=False)
+    topic = {
+        "topic_id": "effect_topic_000",
+        "terms": [
+            {"term": "raw_marker_a", "loading": 1.0, "signed_score": 2.0}
+        ],
+    }
+    metadata = {
+        "topic_banks": {
+            "effect": {
+                "topics": [topic],
+                "weak_or_unstable_raw_evidence": False,
+            }
+        },
+        "artifacts": {"ngram_scores": {"effect": str(score_path)}},
+    }
+    registry = [
+        {
+            "name": "marker_a",
+            "provenance": [
+                {
+                    "bank": "effect",
+                    "topic_id": "effect_topic_000",
+                    "supporting_terms": [{"term": "raw_marker_a"}],
+                }
+            ],
+        }
+    ]
+
+    coverage = _effect_evidence_coverage(
+        registry,
+        metadata,
+        candidate_evidence_universe=registry,
+    )
+
+    assert coverage["mappable_highest_ranked_raw_ngrams"] == ["raw_marker_a"]
+    assert coverage["unmapped_or_nonoperational_highest_ranked_raw_ngrams"] == [
+        "raw_marker_b"
+    ]
+    assert coverage["preserved_highest_ranked_raw_ngrams"] == ["raw_marker_a"]
+    assert coverage["highest_ranked_raw_ngram_preservation"] == 0.5
+
+
+def test_effect_coverage_cannot_drop_a_shortlisted_topic_without_a_candidate():
+    topics = [
+        {
+            "topic_id": topic_id,
+            "terms": [
+                {"term": f"term_{index}", "loading": 1.0, "signed_score": 1.0}
+            ],
+        }
+        for index, topic_id in enumerate(["effect_topic_000", "effect_topic_001"])
+    ]
+    metadata = {
+        "topic_banks": {"effect": {"topics": topics}},
+        "topic_score_tests": {
+            "banks": {
+                "effect": {
+                    "selected_topic_ids": [
+                        "effect_topic_000",
+                        "effect_topic_001",
+                    ]
+                }
+            }
+        },
+        "artifacts": {"ngram_scores": {}},
+    }
+    first = {
+        "name": "first_marker",
+        "provenance": [
+            {
+                "bank": "effect",
+                "topic_id": "effect_topic_000",
+                "supporting_terms": [{"term": "term_0"}],
+            }
+        ],
+    }
+
+    coverage = _effect_evidence_coverage(
+        [first], metadata, candidate_evidence_universe=[first]
+    )
+
+    assert coverage["covered_topic_ids"] == ["effect_topic_000"]
+    assert coverage["uncovered_topic_ids"] == ["effect_topic_001"]
+    assert coverage["coverage_fraction"] == pytest.approx(0.5)
+    assert coverage["shortlist_to_all_fitted_mass_fraction"] == pytest.approx(1.0)
+
+
 def test_name_and_value_harmonization_is_global_and_has_no_review_state():
     candidates = [
         {
@@ -449,6 +1457,35 @@ def test_name_and_value_harmonization_is_global_and_has_no_review_state():
     semantics = registry[0]["value_contract"]["missing_semantics"]
     assert len({semantics[key] for key in ("missing", "unknown", "absent", "not_documented")}) == 4
     assert "review" not in {entry["action"] for entry in registry}
+
+
+def test_registry_state_tracks_new_topic_provenance_and_role_without_contract_change():
+    registry, _ = harmonize_topic_candidates(
+        [
+            {
+                "name": "baseline_marker",
+                "type": "categorical",
+                "categories": ["low", "high"],
+                "roles": ["confounder"],
+                "description": "Baseline marker status.",
+                "provenance": [{"bank": "treatment", "topic_id": "t1"}],
+            }
+        ]
+    )
+    original = registry[0]
+    expanded = {
+        **original,
+        "roles": ["confounder", "effect_modifier"],
+        "provenance": [
+            *original["provenance"],
+            {"bank": "effect", "topic_id": "e2"},
+        ],
+    }
+
+    assert expanded["contract_hash"] == original["contract_hash"]
+    assert _registry_entry_state_hash(expanded) != _registry_entry_state_hash(
+        original
+    )
 
 
 def test_agent_name_harmonization_merges_true_aliases_and_preserves_role_union():
@@ -1064,6 +2101,11 @@ def test_fake_agent_nested_topic_workflow_is_fold_local_and_structured_only(tmp_
         minimum_subsample_selection_fraction=0.0,
         minimum_tail_sign_agreement=0.0,
         topic_label_parallelism=2,
+        score_test_bootstrap_repeats=49,
+        score_test_bootstrap_top_topics=0,
+        score_test_bootstrap_chunk_size=20,
+        score_test_min_topics_per_bank=1,
+        score_test_max_topics_per_bank=1,
     )
     config = AppliedInferenceConfig(
         dataset_path="in_memory_nested_topic_test",
@@ -1095,7 +2137,7 @@ def test_fake_agent_nested_topic_workflow_is_fold_local_and_structured_only(tmp_
                     )
                 ],
                 candidate_consistency_inner_folds=2,
-                extracted_feature_review_max_rounds=0,
+                extracted_feature_review_max_rounds=1,
                 parsimony_review_enabled=False,
                 cpus_total=1,
                 tfidf_topic=topic_config,
@@ -1114,7 +2156,11 @@ def test_fake_agent_nested_topic_workflow_is_fold_local_and_structured_only(tmp_
         def propose(self, context):
             self.contexts.append(context)
             version = context["prompt_version"]
-            if version in {"tfidf_topic_label_v2", "tfidf_topic_recovery_v2"}:
+            if version in {
+                "tfidf_topic_label_v2",
+                "tfidf_topic_recovery_v2",
+                ORPHAN_NGRAM_LABEL_PROMPT_VERSION,
+            }:
                 supporting = context["topic_terms"][0]["term"]
                 return {
                     "general_topic": "baseline marker",
@@ -1196,6 +2242,10 @@ def test_fake_agent_nested_topic_workflow_is_fold_local_and_structured_only(tmp_
 
     class FakeTopicEvaluator:
         def evaluate_split(self, train_df, test_df, specs, fold_id):
+            assert not any(
+                str(column).startswith("true_")
+                for column in [*train_df.columns, *test_df.columns]
+            )
             predictions = test_df[["_oci_row_id"]].copy()
             predictions["pred_ite_prob"] = 0.1
             predictions["pred_y0_prob"] = 0.4
@@ -1217,6 +2267,43 @@ def test_fake_agent_nested_topic_workflow_is_fold_local_and_structured_only(tmp_
         artifact_dir=tmp_path,
         handoff_path=handoff_path,
     )
+    handoff_rows = [
+        json.loads(line)
+        for line in handoff_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    for handoff_row in handoff_rows:
+        discovery = handoff_row["discovery"]
+        if handoff_row["scope"] == "candidate_selection_inner_fit":
+            score_path = discovery["artifacts"]["topic_score_tests"]
+            assert score_path
+            scores = json.loads(Path(score_path).read_text(encoding="utf-8"))
+            assert scores["status"] == "completed"
+            assert scores["uses_heldout_treatment_and_outcome"]
+            for bank in ("treatment", "outcome", "effect"):
+                bank_scores = scores["banks"][bank]
+                assert len(bank_scores["topic_tests"]) == 2
+                assert bank_scores["selection_count"] == 1
+                assert bank_scores["bootstrap_calibration"][
+                    "complete_topic_family"
+                ]
+        else:
+            assert discovery["artifacts"]["topic_score_tests"] is None
+            assert discovery["topic_score_tests"]["status"] == "not_run"
+            assert not discovery["topic_score_tests"][
+                "uses_heldout_treatment_and_outcome"
+            ]
+    preflight = validate_tfidf_topic_stage2_handoff(
+        dataset=dataset,
+        config=config,
+        handoff_path=handoff_path,
+    )
+    assert preflight["status"] == "passed"
+    assert preflight["exact_context_count"] == 6
+    assert preflight["inner_score_context_count"] == 4
+    assert preflight["full_outer_context_count"] == 2
+    assert preflight["outer_test_score_artifact_count"] == 0
+    assert preflight["llm_or_extraction_client_constructed"] is False
     agent = FakeTopicAgent()
     stage2_path = tmp_path / "stage2" / "agentic_predictions.parquet"
     run_tfidf_topic_agentic_forest(
@@ -1233,16 +2320,99 @@ def test_fake_agent_nested_topic_workflow_is_fold_local_and_structured_only(tmp_
     assert len(predictions) == len(dataset)
     assert predictions["_oci_row_id"].is_unique
     assert set(predictions["honest_outer_holdout"]) == {True}
+    assert not any(str(column).startswith("true_") for column in predictions.columns)
     for _, prediction_row in predictions.iterrows():
         row_id = int(prediction_row["_oci_row_id"])
         assert row_id not in set(map(int, prediction_row["forest_fit_row_ids"]))
         assert row_id not in set(map(int, prediction_row["stage1_nuisance_fit_row_ids"]))
     assert all("true_" not in json.dumps(context) for context in agent.contexts)
+    label_contexts = [
+        context
+        for context in agent.contexts
+        if context.get("prompt_version") == "tfidf_topic_label_v2"
+    ]
+    assert label_contexts
+    label_checkpoints = list(
+        (stage2_path.parent / "tfidf_topic_agentic_forest").rglob(
+            "topic_labels.jsonl"
+        )
+    )
+    assert label_checkpoints
+    for checkpoint in label_checkpoints:
+        for record in (
+            json.loads(line)
+            for line in checkpoint.read_text().splitlines()
+            if line.strip()
+        ):
+            assert record["model_identity"] == "fake-topic-agent"
+            assert record["request_settings_hash"]
+    label_groups = {}
+    for context in label_contexts:
+        key = (
+            context["outer_fold"],
+            context["scope"],
+            context["inner_fold"],
+            context["bank"],
+        )
+        label_groups.setdefault(key, []).append(context)
+        evidence = context["heldout_relevance_evidence"]
+        assert evidence
+        if context["scope"] == "full_outer_train":
+            assert evidence["source"] == "fixed_inner_score_test_policy_mapping"
+            assert not evidence["uses_outer_heldout_labels"]
+            assert evidence["matched_inner_evidence"]
+        else:
+            assert evidence["source"] == (
+                "exact_inner_heldout_topic_and_ngram_score_test"
+            )
+            assert evidence["uses_heldout_treatment_and_outcome"]
+    assert all(len(contexts) == 1 for contexts in label_groups.values())
+    recovery_contexts = [
+        context
+        for context in agent.contexts
+        if context.get("prompt_version") == "tfidf_topic_recovery_v2"
+    ]
+    assert recovery_contexts
+    assert any(
+        not context["heldout_relevance_evidence"].get(
+            "selected_for_agent", True
+        )
+        for context in recovery_contexts
+    )
+    assert all(len(context["topic_terms"]) == 15 for context in recovery_contexts)
     artifact_root = stage2_path.parent / "tfidf_topic_agentic_forest"
+    manifest = json.loads((artifact_root / "manifest.json").read_text())
+    frozen_hash = hashlib.sha256(stage2_path.read_bytes()).hexdigest()
+    assert manifest["schema_version"] == "tfidf_topic_agentic_forest_v7"
+    assert manifest["prediction_sha256_before_oracle_join"] == frozen_hash
+    assert not manifest["oracle_columns_consumed_by_modeling"]
+    posthoc = json.loads((artifact_root / "posthoc_oracle_metrics.json").read_text())
+    assert posthoc["all_outer_predictions_frozen_before_oracle_join"]
+    assert posthoc["frozen_prediction_sha256"] == frozen_hash
+    assert posthoc["overall"]["n"] == len(dataset)
+    posthoc_predictions = pd.read_parquet(
+        artifact_root / "posthoc_predictions_with_oracle.parquet"
+    )
+    assert "true_ite_prob" in posthoc_predictions.columns
+    recovered_registry_evidence = []
     for outer_fold in (1, 2):
         outer_dir = artifact_root / f"outer_fold_{outer_fold:03d}"
         assert (outer_dir / "inner_001" / "canonical_registry.json").exists()
         assert (outer_dir / "inner_002" / "canonical_registry.json").exists()
+        for inner_fold in (1, 2):
+            inner_registry = json.loads(
+                (
+                    outer_dir
+                    / f"inner_{inner_fold:03d}"
+                    / "canonical_registry.json"
+                ).read_text()
+            )
+            recovered_registry_evidence.extend(
+                round_row.get("changed_registry_entries", [])
+                for round_row in inner_registry.get("review_rounds", [])
+                if round_row.get("recovery_source")
+                == "targeted_source_topic_prompt"
+            )
         assert (outer_dir / "full_outer_train" / "harmonization" / "manifest.json").exists()
         registry = json.loads((outer_dir / "canonical_registry.json").read_text())
         assert registry["registry"]
@@ -1250,6 +2420,7 @@ def test_fake_agent_nested_topic_workflow_is_fold_local_and_structured_only(tmp_
             "extract",
             "derive",
         }
+    assert any(recovered_registry_evidence)
     assert not list(tmp_path.rglob("*htr*"))
     assert not list(tmp_path.rglob("*sentence_transformer*"))
     assert not list(tmp_path.rglob("*raw_text_forest*"))
@@ -1274,7 +2445,8 @@ def test_heldout_phrase_and_labels_cannot_change_fitted_topic_artifacts(tmp_path
             {
                 "_oci_row_id": 32 + index,
                 "clinical_text": (
-                    "outersecretphrase outersecretbigram baseline heldout document"
+                    "outersecretphrase outersecretbigram baseline heldout document "
+                    f"marker status token{index % 4} age ecog {index % 3}"
                 ),
                 "treatment_indicator": index % 2,
                 "outcome_indicator": (index // 2) % 2,
@@ -1298,6 +2470,9 @@ def test_heldout_phrase_and_labels_cannot_change_fitted_topic_artifacts(tmp_path
         minimum_nuisance_source_agreement=0.0,
         minimum_subsample_selection_fraction=0.0,
         minimum_tail_sign_agreement=0.0,
+        score_test_bootstrap_repeats=0,
+        score_test_min_topics_per_bank=1,
+        score_test_max_topics_per_bank=2,
     )
     view = BoWViewConfig(
         name="linear_1_3",
@@ -1344,6 +2519,62 @@ def test_heldout_phrase_and_labels_cannot_change_fitted_topic_artifacts(tmp_path
         np.testing.assert_allclose(first_topics[bank], second_topics[bank])
     prompt_text = json.dumps(first["topic_banks"])
     assert "outersecret" not in prompt_text
+
+    scored_first = fit_tfidf_topic_context(
+        fit_df=pd.DataFrame(fit_rows),
+        heldout_df=heldout,
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        outcome_type="binary",
+        views=[view],
+        nuisance_folds=2,
+        config=topic_config,
+        artifact_dir=tmp_path / "scored_first",
+        scope_id="scored_first",
+        enable_heldout_score_tests=True,
+    )
+    scored_second = fit_tfidf_topic_context(
+        fit_df=pd.DataFrame(fit_rows),
+        heldout_df=mutated,
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        outcome_type="binary",
+        views=[view],
+        nuisance_folds=2,
+        config=topic_config,
+        artifact_dir=tmp_path / "scored_second",
+        scope_id="scored_second",
+        enable_heldout_score_tests=True,
+    )
+    assert scored_first["common_vocabulary"] == scored_second["common_vocabulary"]
+    assert scored_first["topic_banks"] == scored_second["topic_banks"]
+    first_scores = json.loads(
+        Path(scored_first["artifacts"]["topic_score_tests"]).read_text(
+            encoding="utf-8"
+        )
+    )
+    second_scores = json.loads(
+        Path(scored_second["artifacts"]["topic_score_tests"]).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert first_scores["uses_heldout_treatment_and_outcome"]
+    assert second_scores["uses_heldout_treatment_and_outcome"]
+    first_moments = [
+        term["heldout_score_moment"]
+        for bank in first_scores["banks"].values()
+        for topic in bank["topic_tests"]
+        for term in topic["term_scores"]
+    ]
+    second_moments = [
+        term["heldout_score_moment"]
+        for bank in second_scores["banks"].values()
+        for topic in bank["topic_tests"]
+        for term in topic["term_scores"]
+    ]
+    assert not np.allclose(first_moments, second_moments)
 
 
 def test_v1_handoff_is_rejected(tmp_path):

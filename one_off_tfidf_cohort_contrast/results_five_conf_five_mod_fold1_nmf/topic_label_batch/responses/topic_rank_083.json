@@ -1,0 +1,153 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 7.353484869003296,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Fragmented phrase likely from a template or conjunction.",
+        "term": "lung or"
+      },
+      {
+        "reason": "Ambiguous; could refer to lymph node dissection or surgical technique.",
+        "term": "dissection"
+      },
+      {
+        "reason": "Anatomical location, but lacks clinical context in this topic.",
+        "term": "hemithorax"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "Post-operative status and staging in lung cancer",
+      "summary": "The topic focuses on clinical staging (Stage IIIA), surgical status (post-operative/adjuvant), and anatomical/functional findings (DLCO, mediastinal/hilar involvement) related to lung cancer management."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Explicit mention of TNM staging category IIIA.",
+        "feature_type": "categorical",
+        "name": "Cancer Stage",
+        "represented_values_or_categories": [
+          "Stage IIIA"
+        ],
+        "supporting_terms": [
+          "stage iiia",
+          "iiia",
+          "for stage iiia"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Terms describe the timing of treatment or clinical state relative to surgery.",
+        "feature_type": "categorical",
+        "name": "Surgical Status",
+        "represented_values_or_categories": [
+          "post-operative",
+          "pre-operative",
+          "adjuvant"
+        ],
+        "supporting_terms": [
+          "post-operative",
+          "stable postoperative",
+          "postoperative changes",
+          "- post-operative",
+          "pre-operative",
+          "adjuvant"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Diffusing capacity of the lungs for carbon monoxide, a standard pulmonary function test.",
+        "feature_type": "continuous",
+        "name": "DLCO",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "dlco"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "Refers to anatomical locations of lymph nodes or disease involvement.",
+        "feature_type": "categorical",
+        "name": "Mediastinal or Hilar Involvement",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "or hilar",
+          "mediastinal or hilar"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Cancer Stage",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Cancer Stage"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Surgical Status",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Surgical Status"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "DLCO",
+        "suggested_representation": "continuous",
+        "supporting_specific_features": [
+          "DLCO"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Mediastinal/Hilar Lymph Node Involvement",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Mediastinal or Hilar Involvement"
+        ]
+      }
+    ],
+    "topic_index": 74,
+    "topic_rank": 83
+  },
+  "raw_content": "{\n  \"topic_rank\": 83,\n  \"topic_index\": 74,\n  \"general_topic\": {\n    \"label\": \"Post-operative status and staging in lung cancer\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic focuses on clinical staging (Stage IIIA), surgical status (post-operative/adjuvant), and anatomical/functional findings (DLCO, mediastinal/hilar involvement) related to lung cancer management.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Cancer Stage\",\n      \"supporting_terms\": [\n        \"stage iiia\",\n        \"iiia\",\n        \"for stage iiia\"\n      ],\n      \"feature_type\": \"categorical\",\n      \"represented_values_or_categories\": [\n        \"Stage IIIA\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Explicit mention of TNM staging category IIIA.\"\n    },\n    {\n      \"name\": \"Surgical Status\",\n      \"supporting_terms\": [\n        \"post-operative\",\n        \"stable postoperative\",\n        \"postoperative changes\",\n        \"- post-operative\",\n        \"pre-operative\",\n        \"adjuvant\"\n      ],\n      \"feature_type\": \"categorical\",\n      \"represented_values_or_categories\": [\n        \"post-operative\",\n        \"pre-operative\",\n        \"adjuvant\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Terms describe the timing of treatment or clinical state relative to surgery.\"\n    },\n    {\n      \"name\": \"DLCO\",\n      \"supporting_terms\": [\n        \"dlco\"\n      ],\n      \"feature_type\": \"continuous\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Diffusing capacity of the lungs for carbon monoxide, a standard pulmonary function test.\"\n    },\n    {\n      \"name\": \"Mediastinal or Hilar Involvement\",\n      \"supporting_terms\": [\n        \"or hilar\",\n        \"mediastinal or hilar\"\n      ],\n      \"feature_type\": \"categorical\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Refers to anatomical locations of lymph nodes or disease involvement.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"lung or\",\n      \"reason\": \"Fragmented phrase likely from a template or conjunction.\"\n    },\n    {\n      \"term\": \"dissection\",\n      \"reason\": \"Ambiguous; could refer to lymph node dissection or surgical technique.\"\n    },\n    {\n      \"term\": \"hemithorax\",\n      \"reason\": \"Anatomical location, but lacks clinical context in this topic.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Cancer Stage\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Cancer Stage\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Surgical Status\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Surgical Status\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"DLCO\",\n      \"suggested_representation\": \"continuous\",\n      \"supporting_specific_features\": [\n        \"DLCO\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Mediastinal/Hilar Lymph Node Involvement\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Mediastinal or Hilar Involvement\"\n      ],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-ad9ab12d4cb667d0",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "stage iiia",
+    "iiia",
+    "for stage iiia",
+    "post-operative",
+    "stable postoperative",
+    "postoperative changes",
+    "dlco",
+    "pre-operative",
+    "lung or",
+    "adjuvant",
+    "or hilar",
+    "- post-operative",
+    "hemithorax",
+    "mediastinal or hilar",
+    "dissection"
+  ],
+  "topic_index": 74,
+  "topic_rank": 83,
+  "usage": {
+    "completion_tokens": 946,
+    "prompt_tokens": 824,
+    "prompt_tokens_details": null,
+    "total_tokens": 1770
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 83, internal index 74\n\nTerms in this topic, ordered from highest to lowest loading:\n1. stage iiia\n2. iiia\n3. for stage iiia\n4. post-operative\n5. stable postoperative\n6. postoperative changes\n7. dlco\n8. pre-operative\n9. lung or\n10. adjuvant\n11. or hilar\n12. - post-operative\n13. hemithorax\n14. mediastinal or hilar\n15. dissection\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 83,\n  \"topic_index\": 74,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

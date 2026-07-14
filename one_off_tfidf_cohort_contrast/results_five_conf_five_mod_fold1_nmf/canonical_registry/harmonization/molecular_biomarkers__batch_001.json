@@ -1,0 +1,493 @@
+{
+  "attempts": 1,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "candidate_mappings": [
+      {
+        "candidate_id": "C008",
+        "local_id": "F01",
+        "rationale": "Direct mapping to ALK status.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C040",
+        "local_id": "F02",
+        "rationale": "Part of CDKN2A status.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C041",
+        "local_id": "F02",
+        "rationale": "Specific type of CDKN2A status.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C042",
+        "local_id": "F02",
+        "rationale": "Part of CDKN2A status.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C047",
+        "local_id": "F03",
+        "rationale": "Direct mapping to CK5 IHC.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C079",
+        "local_id": "F05",
+        "rationale": "Direct mapping to EGFR amplification.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C080",
+        "local_id": "F04",
+        "rationale": "Specific EGFR mutation variant.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C081",
+        "local_id": "F04",
+        "rationale": "General EGFR mutation status.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C082",
+        "local_id": "F04",
+        "rationale": "General EGFR mutation/deletion status.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C100",
+        "local_id": "F06",
+        "rationale": "Direct mapping to germline status.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C132",
+        "local_id": "F07",
+        "rationale": "Direct mapping to Ki-67.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C133",
+        "local_id": "F08",
+        "rationale": "Specific KRAS mutation.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C134",
+        "local_id": "F08",
+        "rationale": "General KRAS status.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C166",
+        "local_id": "F09",
+        "rationale": "Part of MET genomic status.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C167",
+        "local_id": "F10",
+        "rationale": "Direct mapping to MET copy number.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C169",
+        "local_id": "F09",
+        "rationale": "Part of MET genomic status.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C173",
+        "local_id": "F08",
+        "rationale": "Driver status is a subset of KRAS mutation status.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C176",
+        "local_id": "F11",
+        "rationale": "Napsin A expression status.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C177",
+        "local_id": "F11",
+        "rationale": "Napsin A expression status.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C201",
+        "local_id": "F12",
+        "rationale": "Direct mapping to p40 IHC.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C207",
+        "local_id": "F14",
+        "rationale": "Direct mapping to PD-L1 amplification.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C208",
+        "local_id": "F13",
+        "rationale": "Direct mapping to PD-L1 expression level.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C209",
+        "local_id": "F13",
+        "rationale": "PD-L1 expression status.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C275",
+        "local_id": "F15",
+        "rationale": "TP53 mutation status.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C278",
+        "local_id": "F16",
+        "rationale": "Direct mapping to TTF-1 expression.",
+        "relation": "base_variable"
+      }
+    ],
+    "canonical_features": [
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "alk_mutation_status",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence or absence of ALK gene mutations.",
+        "display_name": "ALK mutation status",
+        "local_id": "F01",
+        "parent_object": null,
+        "rationale": "Standard binary biomarker for NSCLC.",
+        "source_candidate_ids": [
+          "C008"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "cdkn2a_status",
+        "categories": [
+          "deletion",
+          "homozygous_deletion",
+          "mutation",
+          "wild_type",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "Genomic alteration status of the CDKN2A gene, including deletions and mutations.",
+        "display_name": "CDKN2A status",
+        "local_id": "F02",
+        "parent_object": null,
+        "rationale": "Consolidates various CDKN2A alteration descriptions into a single categorical variable.",
+        "source_candidate_ids": [
+          "C040",
+          "C041",
+          "C042"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "ck5_expression_status",
+        "categories": [
+          "diffuse",
+          "cytoplasmic",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "Immunohistochemistry results for CK5 expression.",
+        "display_name": "CK5 expression status",
+        "local_id": "F03",
+        "parent_object": null,
+        "rationale": "Captures IHC pattern for CK5.",
+        "source_candidate_ids": [
+          "C047"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "egfr_mutation_status",
+        "categories": [
+          "l858r",
+          "deletion",
+          "wild_type",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "Presence of EGFR mutations, including specific variants like L858R or exon deletions.",
+        "display_name": "EGFR mutation status",
+        "local_id": "F04",
+        "parent_object": null,
+        "rationale": "Consolidates EGFR mutation types and general status.",
+        "source_candidate_ids": [
+          "C080",
+          "C081",
+          "C082"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "egfr_amplification_status",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of EGFR gene amplification.",
+        "display_name": "EGFR amplification status",
+        "local_id": "F05",
+        "parent_object": null,
+        "rationale": "Distinct from mutation status.",
+        "source_candidate_ids": [
+          "C079"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "germline_mutation_status",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of germline genetic mutations.",
+        "display_name": "Germline mutation status",
+        "local_id": "F06",
+        "parent_object": null,
+        "rationale": "General germline status.",
+        "source_candidate_ids": [
+          "C100"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "ki67_index",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "The Ki-67 proliferation index.",
+        "display_name": "Ki-67 index",
+        "local_id": "F07",
+        "parent_object": null,
+        "rationale": "Continuous measurement of proliferation.",
+        "source_candidate_ids": [
+          "C132"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "kras_mutation_status",
+        "categories": [
+          "g12c",
+          "other_mutation",
+          "wild_type",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "Presence of KRAS mutations, specifically noting G12C variants.",
+        "display_name": "KRAS mutation status",
+        "local_id": "F08",
+        "parent_object": null,
+        "rationale": "Consolidates KRAS mutation status and specific G12C driver status.",
+        "source_candidate_ids": [
+          "C133",
+          "C134",
+          "C173"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "met_genomic_status",
+        "categories": [
+          "amplification",
+          "loss",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "Status of MET gene including amplification, copy number, and loss.",
+        "display_name": "MET genomic status",
+        "local_id": "F09",
+        "parent_object": null,
+        "rationale": "Groups MET amplification and MET loss.",
+        "source_candidate_ids": [
+          "C166",
+          "C169"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "met_copy_number",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "The quantitative copy number of the MET gene.",
+        "display_name": "MET copy number",
+        "local_id": "F10",
+        "parent_object": null,
+        "rationale": "Distinct continuous measurement from binary amplification status.",
+        "source_candidate_ids": [
+          "C167"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "napsin_a_expression",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Immunohistochemistry status for Napsin A.",
+        "display_name": "Napsin A expression",
+        "local_id": "F11",
+        "parent_object": null,
+        "rationale": "Consolidates Napsin A positive/negative findings.",
+        "source_candidate_ids": [
+          "C176",
+          "C177"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "p40_expression_status",
+        "categories": [
+          "strong",
+          "weak",
+          "absent",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "Immunohistochemistry status for p40.",
+        "display_name": "p40 expression status",
+        "local_id": "F12",
+        "parent_object": null,
+        "rationale": "Captures p40 IHC intensity.",
+        "source_candidate_ids": [
+          "C201"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "pd_l1_expression",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "PD-L1 expression level or status.",
+        "display_name": "PD-L1 expression",
+        "local_id": "F13",
+        "parent_object": null,
+        "rationale": "PD-L1 expression is often reported as a continuous percentage.",
+        "source_candidate_ids": [
+          "C208",
+          "C209"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "pd_l1_amplification_status",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of PD-L1 gene amplification.",
+        "display_name": "PD-L1 amplification status",
+        "local_id": "F14",
+        "parent_object": null,
+        "rationale": "Distinct from protein expression.",
+        "source_candidate_ids": [
+          "C207"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "tp53_mutation_status",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of TP53 mutations.",
+        "display_name": "TP53 mutation status",
+        "local_id": "F15",
+        "parent_object": null,
+        "rationale": "Standard binary biomarker.",
+        "source_candidate_ids": [
+          "C275"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "ttf1_expression_status",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Immunohistochemistry status for TTF-1.",
+        "display_name": "TTF-1 expression status",
+        "local_id": "F16",
+        "parent_object": null,
+        "rationale": "Standard IHC biomarker for lung adenocarcinoma.",
+        "source_candidate_ids": [
+          "C278"
+        ]
+      }
+    ]
+  },
+  "raw_content": "{\n  \"canonical_features\": [\n    {\n      \"local_id\": \"F01\",\n      \"canonical_name\": \"alk_mutation_status\",\n      \"display_name\": \"ALK mutation status\",\n      \"description\": \"Presence or absence of ALK gene mutations.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C008\"\n      ],\n      \"rationale\": \"Standard binary biomarker for NSCLC.\"\n    },\n    {\n      \"local_id\": \"F02\",\n      \"canonical_name\": \"cdkn2a_status\",\n      \"display_name\": \"CDKN2A status\",\n      \"description\": \"Genomic alteration status of the CDKN2A gene, including deletions and mutations.\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"deletion\",\n        \"homozygous_deletion\",\n        \"mutation\",\n        \"wild_type\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C040\",\n        \"C041\",\n        \"C042\"\n      ],\n      \"rationale\": \"Consolidates various CDKN2A alteration descriptions into a single categorical variable.\"\n    },\n    {\n      \"local_id\": \"F03\",\n      \"canonical_name\": \"ck5_expression_status\",\n      \"display_name\": \"CK5 expression status\",\n      \"description\": \"Immunohistochemistry results for CK5 expression.\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"diffuse\",\n        \"cytoplasmic\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C047\"\n      ],\n      \"rationale\": \"Captures IHC pattern for CK5.\"\n    },\n    {\n      \"local_id\": \"F04\",\n      \"canonical_name\": \"egfr_mutation_status\",\n      \"display_name\": \"EGFR mutation status\",\n      \"description\": \"Presence of EGFR mutations, including specific variants like L858R or exon deletions.\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"l858r\",\n        \"deletion\",\n        \"wild_type\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C080\",\n        \"C081\",\n        \"C082\"\n      ],\n      \"rationale\": \"Consolidates EGFR mutation types and general status.\"\n    },\n    {\n      \"local_id\": \"F05\",\n      \"canonical_name\": \"egfr_amplification_status\",\n      \"display_name\": \"EGFR amplification status\",\n      \"description\": \"Presence of EGFR gene amplification.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C079\"\n      ],\n      \"rationale\": \"Distinct from mutation status.\"\n    },\n    {\n      \"local_id\": \"F06\",\n      \"canonical_name\": \"germline_mutation_status\",\n      \"display_name\": \"Germline mutation status\",\n      \"description\": \"Presence of germline genetic mutations.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C100\"\n      ],\n      \"rationale\": \"General germline status.\"\n    },\n    {\n      \"local_id\": \"F07\",\n      \"canonical_name\": \"ki67_index\",\n      \"display_name\": \"Ki-67 index\",\n      \"description\": \"The Ki-67 proliferation index.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C132\"\n      ],\n      \"rationale\": \"Continuous measurement of proliferation.\"\n    },\n    {\n      \"local_id\": \"F08\",\n      \"canonical_name\": \"kras_mutation_status\",\n      \"display_name\": \"KRAS mutation status\",\n      \"description\": \"Presence of KRAS mutations, specifically noting G12C variants.\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"g12c\",\n        \"other_mutation\",\n        \"wild_type\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C133\",\n        \"C134\",\n        \"C173\"\n      ],\n      \"rationale\": \"Consolidates KRAS mutation status and specific G12C driver status.\"\n    },\n    {\n      \"local_id\": \"F09\",\n      \"canonical_name\": \"met_genomic_status\",\n      \"display_name\": \"MET genomic status\",\n      \"description\": \"Status of MET gene including amplification, copy number, and loss.\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"amplification\",\n        \"loss\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C166\",\n        \"C169\"\n      ],\n      \"rationale\": \"Groups MET amplification and MET loss.\"\n    },\n    {\n      \"local_id\": \"F10\",\n      \"canonical_name\": \"met_copy_number\",\n      \"display_name\": \"MET copy number\",\n      \"description\": \"The quantitative copy number of the MET gene.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C167\"\n      ],\n      \"rationale\": \"Distinct continuous measurement from binary amplification status.\"\n    },\n    {\n      \"local_id\": \"F11\",\n      \"canonical_name\": \"napsin_a_expression\",\n      \"display_name\": \"Napsin A expression\",\n      \"description\": \"Immunohistochemistry status for Napsin A.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C176\",\n        \"C177\"\n      ],\n      \"rationale\": \"Consolidates Napsin A positive/negative findings.\"\n    },\n    {\n      \"local_id\": \"F12\",\n      \"canonical_name\": \"p40_expression_status\",\n      \"display_name\": \"p40 expression status\",\n      \"description\": \"Immunohistochemistry status for p40.\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"strong\",\n        \"weak\",\n        \"absent\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C201\"\n      ],\n      \"rationale\": \"Captures p40 IHC intensity.\"\n    },\n    {\n      \"local_id\": \"F13\",\n      \"canonical_name\": \"pd_l1_expression\",\n      \"display_name\": \"PD-L1 expression\",\n      \"description\": \"PD-L1 expression level or status.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C208\",\n        \"C209\"\n      ],\n      \"rationale\": \"PD-L1 expression is often reported as a continuous percentage.\"\n    },\n    {\n      \"local_id\": \"F14\",\n      \"canonical_name\": \"pd_l1_amplification_status\",\n      \"display_name\": \"PD-L1 amplification status\",\n      \"description\": \"Presence of PD-L1 gene amplification.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C207\"\n      ],\n      \"rationale\": \"Distinct from protein expression.\"\n    },\n    {\n      \"local_id\": \"F15\",\n      \"canonical_name\": \"tp53_mutation_status\",\n      \"display_name\": \"TP53 mutation status\",\n      \"description\": \"Presence of TP53 mutations.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C275\"\n      ],\n      \"rationale\": \"Standard binary biomarker.\"\n    },\n    {\n      \"local_id\": \"F16\",\n      \"canonical_name\": \"ttf1_expression_status\",\n      \"display_name\": \"TTF-1 expression status\",\n      \"description\": \"Immunohistochemistry status for TTF-1.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C278\"\n      ],\n      \"rationale\": \"Standard IHC biomarker for lung adenocarcinoma.\"\n    }\n  ],\n  \"candidate_mappings\": [\n    {\n      \"candidate_id\": \"C008\",\n      \"local_id\": \"F01\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct mapping to ALK status.\"\n    },\n    {\n      \"candidate_id\": \"C040\",\n      \"local_id\": \"F02\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Part of CDKN2A status.\"\n    },\n    {\n      \"candidate_id\": \"C041\",\n      \"local_id\": \"F02\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Specific type of CDKN2A status.\"\n    },\n    {\n      \"candidate_id\": \"C042\",\n      \"local_id\": \"F02\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Part of CDKN2A status.\"\n    },\n    {\n      \"candidate_id\": \"C047\",\n      \"local_id\": \"F03\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct mapping to CK5 IHC.\"\n    },\n    {\n      \"candidate_id\": \"C079\",\n      \"local_id\": \"F05\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct mapping to EGFR amplification.\"\n    },\n    {\n      \"candidate_id\": \"C080\",\n      \"local_id\": \"F04\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Specific EGFR mutation variant.\"\n    },\n    {\n      \"candidate_id\": \"C081\",\n      \"local_id\": \"F04\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"General EGFR mutation status.\"\n    },\n    {\n      \"candidate_id\": \"C082\",\n      \"local_id\": \"F04\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"General EGFR mutation/deletion status.\"\n    },\n    {\n      \"candidate_id\": \"C100\",\n      \"local_id\": \"F06\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct mapping to germline status.\"\n    },\n    {\n      \"candidate_id\": \"C132\",\n      \"local_id\": \"F07\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct mapping to Ki-67.\"\n    },\n    {\n      \"candidate_id\": \"C133\",\n      \"local_id\": \"F08\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Specific KRAS mutation.\"\n    },\n    {\n      \"candidate_id\": \"C134\",\n      \"local_id\": \"F08\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"General KRAS status.\"\n    },\n    {\n      \"candidate_id\": \"C166\",\n      \"local_id\": \"F09\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Part of MET genomic status.\"\n    },\n    {\n      \"candidate_id\": \"C167\",\n      \"local_id\": \"F10\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct mapping to MET copy number.\"\n    },\n    {\n      \"candidate_id\": \"C169\",\n      \"local_id\": \"F09\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Part of MET genomic status.\"\n    },\n    {\n      \"candidate_id\": \"C173\",\n      \"local_id\": \"F08\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Driver status is a subset of KRAS mutation status.\"\n    },\n    {\n      \"candidate_id\": \"C176\",\n      \"local_id\": \"F11\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Napsin A expression status.\"\n    },\n    {\n      \"candidate_id\": \"C177\",\n      \"local_id\": \"F11\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Napsin A expression status.\"\n    },\n    {\n      \"candidate_id\": \"C201\",\n      \"local_id\": \"F12\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct mapping to p40 IHC.\"\n    },\n    {\n      \"candidate_id\": \"C207\",\n      \"local_id\": \"F14\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct mapping to PD-L1 amplification.\"\n    },\n    {\n      \"candidate_id\": \"C208\",\n      \"local_id\": \"F13\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct mapping to PD-L1 expression level.\"\n    },\n    {\n      \"candidate_id\": \"C209\",\n      \"local_id\": \"F13\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"PD-L1 expression status.\"\n    },\n    {\n      \"candidate_id\": \"C275\",\n      \"local_id\": \"F15\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"TP53 mutation status.\"\n    },\n    {\n      \"candidate_id\": \"C278\",\n      \"local_id\": \"F16\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct mapping to TTF-1 expression.\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-9a9c1cc29a82f9f0",
+  "status": "complete",
+  "system_prompt": "You design conservative canonical clinical feature registries. The goal is to reduce redundant extraction while preserving clinically distinct variables. Use only supplied evidence. Return valid JSON only.",
+  "usage": {
+    "completion_tokens": 4107,
+    "prompt_tokens": 3947,
+    "prompt_tokens_details": null,
+    "total_tokens": 8054
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nDomain: molecular_biomarkers\n\nHarmonize the following candidate feature names. Apply these distinctions carefully:\n\n- Merge true aliases that ask for the same patient-level variable.\n- Represent categories or values of one variable under one canonical feature when appropriate.\n- Mark a feature `derive` only when it can be calculated from other canonical base variables without reading the clinical text again.\n- Keep clinically related but non-equivalent measurements or findings separate.\n- Use `subfield_of` to connect distinct fields that belong to one reusable clinical object.\n- Drop only clear artifacts or redundant aliases. Use `review` when a safe extraction contract cannot be specified.\n- Preserve provenance: every candidate ID must map exactly once.\n- Do not assign a role in the clinical task.\n\nAllowed data types: [\"binary\", \"categorical\", \"continuous\", \"count\", \"ordinal\", \"text\"]\nAllowed actions: [\"derive\", \"drop\", \"extract\", \"review\"]\nAllowed mapping relations: [\"alias_of\", \"base_variable\", \"derived_from\", \"drop\", \"related_but_distinct\", \"review\", \"subfield_of\"]\n\nFor binary features, categories must be [\"absent\", \"present\", \"unknown\"]. For categorical or ordinal features, provide a conservative explicit category list including \"unknown\". Continuous and count features have no categories. Text features should normally be marked `review`, not `extract`.\n\nFor derivations, use this schema when executable; otherwise use operation `not_automated`:\n{\"operation\": \"ratio | threshold | category_map | not_automated\", \"inputs\": [\"canonical_name\"], \"parameters\": {}}\n\nCandidates:\n[{\"candidate_id\": \"C008\", \"name\": \"ALK mutation status\", \"occurrence_count\": 1, \"topic_ranks\": [41], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"ALK mutation status\"], \"evidence_terms\": [\"no kras alk\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"no alk\"]}, {\"candidate_id\": \"C040\", \"name\": \"CDKN2A deletion status\", \"occurrence_count\": 1, \"topic_ranks\": [50], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"CDKN2A status\"], \"evidence_terms\": [\"cdkn2a deletion egfr\", \"cdkn2a\", \"and cdkn2a\", \"cdkn2a homozygous\"], \"feature_type_hints\": [\"genomic_alteration\"], \"represented_values_or_categories\": [\"deletion\", \"homozygous\"]}, {\"candidate_id\": \"C041\", \"name\": \"CDKN2A homozygous deletion\", \"occurrence_count\": 1, \"topic_ranks\": [41], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"CDKN2A status\"], \"evidence_terms\": [\"and cdkn2a\", \"cdkn2a\", \"3. cdkn2a\", \"3. cdkn2a homozygous\", \"deletion.\", \"deletion\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"homozygous deletion\"]}, {\"candidate_id\": \"C042\", \"name\": \"CDKN2A mutation status\", \"occurrence_count\": 1, \"topic_ranks\": [86], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"CDKN2A status\"], \"evidence_terms\": [\"cdkn2a\", \"cdkn2a homozygous\"], \"feature_type_hints\": [\"molecular_marker\"], \"represented_values_or_categories\": [\"homozygous\"]}, {\"candidate_id\": \"C047\", \"name\": \"CK5 immunohistochemistry status\", \"occurrence_count\": 1, \"topic_ranks\": [28], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"CK5 expression\"], \"evidence_terms\": [\"ck5 6 diffuse\", \"6 diffuse\", \"6 diffuse cytoplasmic\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"diffuse\", \"cytoplasmic\"]}, {\"candidate_id\": \"C079\", \"name\": \"EGFR amplification status\", \"occurrence_count\": 1, \"topic_ranks\": [10], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"EGFR amplification\"], \"evidence_terms\": [\"met amplification egfr\", \"amplification egfr\"], \"feature_type_hints\": [\"molecular_biomarker\"], \"represented_values_or_categories\": [\"amplification\"]}, {\"candidate_id\": \"C080\", \"name\": \"EGFR L858R mutation status\", \"occurrence_count\": 1, \"topic_ranks\": [84], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"EGFR L858R mutation status\"], \"evidence_terms\": [\"l858r\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"l858r\"]}, {\"candidate_id\": \"C082\", \"name\": \"EGFR mutation/deletion status\", \"occurrence_count\": 1, \"topic_ranks\": [50], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"EGFR deletion status\"], \"evidence_terms\": [\"deletion egfr\", \"deletion egfr wild-type\", \"deletion exons\", \"exons 1-2\", \"homozygous deletion exons\"], \"feature_type_hints\": [\"genomic_alteration\"], \"represented_values_or_categories\": [\"deletion\", \"wild-type\", \"exons 1-2\", \"homozygous deletion\"]}, {\"candidate_id\": \"C081\", \"name\": \"EGFR mutation status\", \"occurrence_count\": 2, \"topic_ranks\": [41, 42], \"representation_votes\": {\"binary\": 1, \"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"EGFR mutation status\"], \"evidence_terms\": [\"tagrisso\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"EGFR positive (implied by Tagrisso use)\"]}, {\"candidate_id\": \"C100\", \"name\": \"Germline Mutation Status\", \"occurrence_count\": 1, \"topic_ranks\": [16], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"low\", \"supporting_specific_features\": [\"Germline status\"], \"evidence_terms\": [\"germline\"], \"feature_type_hints\": [\"genetic_finding\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C132\", \"name\": \"Ki-67 index\", \"occurrence_count\": 1, \"topic_ranks\": [75], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Ki-67 proliferation index\"], \"evidence_terms\": [\"ki-67\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C133\", \"name\": \"KRAS G12C mutation status\", \"occurrence_count\": 3, \"topic_ranks\": [21, 46, 68], \"representation_votes\": {\"binary\": 3}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Genetic Mutation: G12C and TP53\", \"KRAS G12C mutation\", \"KRAS G12C mutation status\"], \"evidence_terms\": [\"kras g12c driver\", \"g12c driver\", \"a kras g12c\", \"by a kras\", \"kras g12c driver with\", \"g12c mutation tp53\", \"demonstrated kras g12c\", \"demonstrated kras\"], \"feature_type_hints\": [\"genetic_mutation\", \"genomic_alteration\"], \"represented_values_or_categories\": [\"KRAS G12C\", \"TP53\", \"G12C\"]}, {\"candidate_id\": \"C134\", \"name\": \"KRAS mutation status\", \"occurrence_count\": 6, \"topic_ranks\": [11, 41, 50, 59, 68, 86], \"representation_votes\": {\"categorical\": 3, \"binary\": 3}, \"confidence\": \"high\", \"supporting_specific_features\": [\"KRAS G12C mutation\", \"KRAS mutation status\"], \"evidence_terms\": [\"demonstrated kras\", \"demonstrated kras g12c\", \"no kras\", \"no kras alk\", \"nsclc kras\", \"squamous nsclc kras\"], \"feature_type_hints\": [\"molecular_marker\", \"categorical\", \"genomic_alteration\"], \"represented_values_or_categories\": [\"KRAS G12C\", \"no kras\", \"g12c\", \"KRAS status\", \"G12C\", \"present\"]}, {\"candidate_id\": \"C166\", \"name\": \"MET amplification status\", \"occurrence_count\": 2, \"topic_ranks\": [42, 68], \"representation_votes\": {\"binary\": 1, \"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"MET amplification\"], \"evidence_terms\": [\"met amplification\", \"and met amplification\", \"met amplification copy\", \"met amplification pd-l1\", \"met amplification egfr\", \"amplification copy\", \"amplification copy number\", \"and met\"], \"feature_type_hints\": [\"genetic_alteration\", \"genomic_alteration\"], \"represented_values_or_categories\": [\"amplification\", \"copy number\"]}, {\"candidate_id\": \"C167\", \"name\": \"MET copy number\", \"occurrence_count\": 1, \"topic_ranks\": [68], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"MET amplification\"], \"evidence_terms\": [\"met amplification copy\", \"amplification copy\", \"and met amplification\", \"amplification copy number\", \"met amplification\", \"and met\"], \"feature_type_hints\": [\"genomic_alteration\"], \"represented_values_or_categories\": [\"copy number\"]}, {\"candidate_id\": \"C169\", \"name\": \"MET loss status\", \"occurrence_count\": 1, \"topic_ranks\": [42], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"MET loss\"], \"evidence_terms\": [\"loss met\"], \"feature_type_hints\": [\"genetic_alteration\"], \"represented_values_or_categories\": [\"loss\"]}, {\"candidate_id\": \"C173\", \"name\": \"Molecular profile driver status\", \"occurrence_count\": 1, \"topic_ranks\": [21], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"KRAS G12C mutation status\"], \"evidence_terms\": [\"kras g12c driver\", \"g12c driver\", \"a kras g12c\", \"by a kras\", \"kras g12c driver with\"], \"feature_type_hints\": [\"genetic_mutation\"], \"represented_values_or_categories\": [\"KRAS G12C\"]}, {\"candidate_id\": \"C176\", \"name\": \"Napsin A expression\", \"occurrence_count\": 2, \"topic_ranks\": [78, 81], \"representation_votes\": {\"binary\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Napsin A expression status\"], \"evidence_terms\": [\"napsin a positive\"], \"feature_type_hints\": [\"finding\", \"immunohistochemistry\"], \"represented_values_or_categories\": [\"positive\"]}, {\"candidate_id\": \"C177\", \"name\": \"Napsin A status\", \"occurrence_count\": 1, \"topic_ranks\": [59], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Napsin A expression\"], \"evidence_terms\": [\"napsin a negative\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"negative\"]}, {\"candidate_id\": \"C201\", \"name\": \"p40 immunohistochemistry status\", \"occurrence_count\": 1, \"topic_ranks\": [28], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"p40 expression\"], \"evidence_terms\": [\"p40 strong\", \"---------------- p40 strong\", \"p40 strong nuclear\", \"positivity supports squamous\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"strong\", \"nuclear\"]}, {\"candidate_id\": \"C207\", \"name\": \"PD-L1 amplification status\", \"occurrence_count\": 1, \"topic_ranks\": [10], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"PD-L1 amplification\"], \"evidence_terms\": [\"met amplification pd-l1\", \"amplification pd-l1\"], \"feature_type_hints\": [\"molecular_biomarker\"], \"represented_values_or_categories\": [\"amplification\"]}, {\"candidate_id\": \"C208\", \"name\": \"PD-L1 expression\", \"occurrence_count\": 1, \"topic_ranks\": [20], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"PD-L1 expression level\"], \"evidence_terms\": [\"pd-l1 10%\"], \"feature_type_hints\": [\"biomarker\"], \"represented_values_or_categories\": [\"10%\"]}, {\"candidate_id\": \"C209\", \"name\": \"PD-L1 expression status\", \"occurrence_count\": 2, \"topic_ranks\": [42, 68], \"representation_votes\": {\"categorical\": 2}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"PD-L1 expression\"], \"evidence_terms\": [\"met amplification pd-l1\", \"amplification pd-l1\"], \"feature_type_hints\": [\"biomarker\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C275\", \"name\": \"TP53 Mutation Status\", \"occurrence_count\": 1, \"topic_ranks\": [46], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Genetic Mutation: G12C and TP53\"], \"evidence_terms\": [\"g12c mutation tp53\"], \"feature_type_hints\": [\"genetic_mutation\"], \"represented_values_or_categories\": [\"KRAS G12C\", \"TP53\"]}, {\"candidate_id\": \"C278\", \"name\": \"TTF-1 expression\", \"occurrence_count\": 2, \"topic_ranks\": [78, 81], \"representation_votes\": {\"binary\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"TTF-1 expression status\"], \"evidence_terms\": [\"ttf-1 thyroid transcription factor-1\", \"---------------- ttf-1 thyroid transcription\", \"ttf-1 thyroid\", \"---------------- ttf-1\", \"-------- ---------------- ttf-1\", \"---------------- ttf-1 clone\", \"ttf-1 clone\", \"ttf-1 clone 8g7g3\"], \"feature_type_hints\": [\"finding\", \"immunohistochemistry\"], \"represented_values_or_categories\": [\"positive\"]}]\n\nReturn:\n{\n  \"canonical_features\": [\n    {\n      \"local_id\": \"F01\",\n      \"canonical_name\": \"snake_case_name\",\n      \"display_name\": \"Readable name\",\n      \"description\": \"Precise extraction definition with aliases where useful\",\n      \"data_type\": \"binary | categorical | ordinal | continuous | count | text\",\n      \"categories\": [\"value\"] or null,\n      \"action\": \"extract | derive | drop | review\",\n      \"parent_object\": \"optional snake_case object name\" or null,\n      \"aliases\": [\"source wording\"],\n      \"derivation\": object or null,\n      \"source_candidate_ids\": [\"C001\"],\n      \"rationale\": \"short explanation\"\n    }\n  ],\n  \"candidate_mappings\": [\n    {\n      \"candidate_id\": \"C001\",\n      \"local_id\": \"F01\",\n      \"relation\": \"alias_of | base_variable | derived_from | subfield_of | related_but_distinct | drop | review\",\n      \"rationale\": \"short explanation\"\n    }\n  ]\n}"
+}

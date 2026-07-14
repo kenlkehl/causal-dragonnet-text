@@ -1,0 +1,95 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 4.603400707244873,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Incomplete grammatical phrase",
+        "term": "dissection followed"
+      },
+      {
+        "reason": "Incomplete grammatical phrase",
+        "term": "dissection followed by"
+      },
+      {
+        "reason": "Narrative filler/pronoun fragment",
+        "term": "he underwent"
+      }
+    ],
+    "general_topic": {
+      "coherence": "mostly_artifact",
+      "confidence": "medium",
+      "label": "Surgical procedure and treatment course fragments",
+      "summary": "The topic consists of fragmented grammatical structures related to surgical dissection and treatment cycles, likely representing snippets of procedural documentation rather than cohesive clinical concepts."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "The terms suggest the occurrence of a node dissection, a common surgical procedure in lung cancer staging/treatment.",
+        "feature_type": "procedure",
+        "name": "lymph node dissection",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "dissection followed",
+          "dissection followed by",
+          "node dissection followed"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "The term 'four cycles' refers to a specific count of treatment administration cycles.",
+        "feature_type": "count",
+        "name": "number of chemotherapy cycles",
+        "represented_values_or_categories": [
+          "four"
+        ],
+        "supporting_terms": [
+          "by four cycles"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "medium",
+        "name": "lymph_node_dissection_performed",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "lymph node dissection"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "treatment_cycle_count",
+        "suggested_representation": "count",
+        "supporting_specific_features": [
+          "number of chemotherapy cycles"
+        ]
+      }
+    ],
+    "topic_index": 20,
+    "topic_rank": 32
+  },
+  "raw_content": "{\n  \"topic_rank\": 32,\n  \"topic_index\": 20,\n  \"general_topic\": {\n    \"label\": \"Surgical procedure and treatment course fragments\",\n    \"coherence\": \"mostly_artifact\",\n    \"confidence\": \"medium\",\n    \"summary\": \"The topic consists of fragmented grammatical structures related to surgical dissection and treatment cycles, likely representing snippets of procedural documentation rather than cohesive clinical concepts.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"lymph node dissection\",\n      \"supporting_terms\": [\n        \"dissection followed\",\n        \"dissection followed by\",\n        \"node dissection followed\"\n      ],\n      \"feature_type\": \"procedure\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms suggest the occurrence of a node dissection, a common surgical procedure in lung cancer staging/treatment.\"\n    },\n    {\n      \"name\": \"number of chemotherapy cycles\",\n      \"supporting_terms\": [\n        \"by four cycles\"\n      ],\n      \"feature_type\": \"count\",\n      \"represented_values_or_categories\": [\n        \"four\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The term 'four cycles' refers to a specific count of treatment administration cycles.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"dissection followed\",\n      \"reason\": \"Incomplete grammatical phrase\"\n    },\n    {\n      \"term\": \"dissection followed by\",\n      \"reason\": \"Incomplete grammatical phrase\"\n    },\n    {\n      \"term\": \"he underwent\",\n      \"reason\": \"Narrative filler/pronoun fragment\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"lymph_node_dissection_performed\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"lymph node dissection\"\n      ],\n      \"confidence\": \"medium\"\n    },\n    {\n      \"name\": \"treatment_cycle_count\",\n      \"suggested_representation\": \"count\",\n      \"supporting_specific_features\": [\n        \"number of chemotherapy cycles\"\n      ],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-81483919db359c45",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "dissection followed",
+    "dissection followed by",
+    "node dissection followed",
+    "he underwent",
+    "by four cycles"
+  ],
+  "topic_index": 20,
+  "topic_rank": 32,
+  "usage": {
+    "completion_tokens": 566,
+    "prompt_tokens": 762,
+    "prompt_tokens_details": null,
+    "total_tokens": 1328
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 32, internal index 20\n\nTerms in this topic, ordered from highest to lowest loading:\n1. dissection followed\n2. dissection followed by\n3. node dissection followed\n4. he underwent\n5. by four cycles\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 32,\n  \"topic_index\": 20,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

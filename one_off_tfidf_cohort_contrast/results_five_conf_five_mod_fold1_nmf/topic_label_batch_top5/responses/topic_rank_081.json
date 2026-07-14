@@ -1,0 +1,93 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 4.788228273391724,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Refers to the specific antibody clone used in IHC testing, which is a technical detail rather than a patient-level clinical feature.",
+        "term": "clone"
+      },
+      {
+        "reason": "Contains formatting artifacts (dashes) and combines a technical reagent detail with a marker name.",
+        "term": "---------------- ttf-1 clone"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "Adenocarcinoma histology and TTF-1 immunohistochemistry",
+      "summary": "The topic focuses on lung adenocarcinoma histology and the specific immunohistochemical marker TTF-1 (Thyroid Transcription Factor-1)."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The terms refer to the histological classification of the tumor.",
+        "feature_type": "finding",
+        "name": "Adenocarcinoma histology",
+        "represented_values_or_categories": [
+          "adenocarcinoma"
+        ],
+        "supporting_terms": [
+          "adenocarcinoma of",
+          "adenocarcinoma of the"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "The terms refer to TTF-1, a common immunohistochemical marker used to confirm lung adenocarcinoma origin.",
+        "feature_type": "finding",
+        "name": "TTF-1 expression status",
+        "represented_values_or_categories": [
+          "TTF-1"
+        ],
+        "supporting_terms": [
+          "---------------- ttf-1 clone",
+          "ttf-1 clone"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Histological subtype",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Adenocarcinoma histology"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "TTF-1 immunohistochemistry status",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "TTF-1 expression status"
+        ]
+      }
+    ],
+    "topic_index": 54,
+    "topic_rank": 81
+  },
+  "raw_content": "{\n  \"topic_rank\": 81,\n  \"topic_index\": 54,\n  \"general_topic\": {\n    \"label\": \"Adenocarcinoma histology and TTF-1 immunohistochemistry\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic focuses on lung adenocarcinoma histology and the specific immunohistochemical marker TTF-1 (Thyroid Transcription Factor-1).\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Adenocarcinoma histology\",\n      \"supporting_terms\": [\n        \"adenocarcinoma of\",\n        \"adenocarcinoma of the\"\n      ],\n      \"feature_type\": \"finding\",\n      \"represented_values_or_categories\": [\n        \"adenocarcinoma\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms refer to the histological classification of the tumor.\"\n    },\n    {\n      \"name\": \"TTF-1 expression status\",\n      \"supporting_terms\": [\n        \"---------------- ttf-1 clone\",\n        \"ttf-1 clone\"\n      ],\n      \"feature_type\": \"finding\",\n      \"represented_values_or_categories\": [\n        \"TTF-1\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms refer to TTF-1, a common immunohistochemical marker used to confirm lung adenocarcinoma origin.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"clone\",\n      \"reason\": \"Refers to the specific antibody clone used in IHC testing, which is a technical detail rather than a patient-level clinical feature.\"\n    },\n    {\n      \"term\": \"---------------- ttf-1 clone\",\n      \"reason\": \"Contains formatting artifacts (dashes) and combines a technical reagent detail with a marker name.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Histological subtype\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Adenocarcinoma histology\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"TTF-1 immunohistochemistry status\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"TTF-1 expression status\"\n      ],\n      \"confidence\": \"high\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-82e6c069a5e6f7c5",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "adenocarcinoma of",
+    "adenocarcinoma of the",
+    "clone",
+    "---------------- ttf-1 clone",
+    "ttf-1 clone"
+  ],
+  "topic_index": 54,
+  "topic_rank": 81,
+  "usage": {
+    "completion_tokens": 582,
+    "prompt_tokens": 767,
+    "prompt_tokens_details": null,
+    "total_tokens": 1349
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 81, internal index 54\n\nTerms in this topic, ordered from highest to lowest loading:\n1. adenocarcinoma of\n2. adenocarcinoma of the\n3. clone\n4. ---------------- ttf-1 clone\n5. ttf-1 clone\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 81,\n  \"topic_index\": 54,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

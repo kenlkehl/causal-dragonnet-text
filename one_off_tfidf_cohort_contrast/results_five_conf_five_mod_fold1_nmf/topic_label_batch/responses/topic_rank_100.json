@@ -1,0 +1,166 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 7.13458514213562,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "While likely Gray (Gy), it is a lowercase fragment that could be an abbreviation for something else in different contexts.",
+        "term": "gy"
+      },
+      {
+        "reason": "Incomplete phrase; likely part of 'surrounding edema'.",
+        "term": "surrounding"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "Stereotactic Radiosurgery (SRS) of the brain",
+      "summary": "The topic describes intracranial stereotactic radiosurgery, including anatomical localization (frontal lobe), dosage/fractionation terminology (Gy, fx), and associated findings (edema)."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Represents the specific radiation therapy modality used for localized treatment.",
+        "feature_type": "procedure",
+        "name": "Stereotactic Radiosurgery",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "stereotactic",
+          "radiosurgery",
+          "stereotactic radiosurgery",
+          "srs",
+          "stereotactic radiosurgery srs",
+          "radiosurgery srs"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Gy (Gray) is the standard unit of absorbed radiation dose.",
+        "feature_type": "measurement",
+        "name": "Radiation Dose",
+        "represented_values_or_categories": [
+          "Gray (Gy)"
+        ],
+        "supporting_terms": [
+          "gy",
+          "gy in"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Refers to the number of doses (fractions) delivered during the radiation course.",
+        "feature_type": "measurement",
+        "name": "Radiation Fractionation",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "fractions",
+          "fx"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Refers to perilesional or surrounding edema, a common side effect or finding in brain metastases.",
+        "feature_type": "finding",
+        "name": "Surrounding Edema",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "surrounding edema."
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Specifies the anatomical region of the brain involved.",
+        "feature_type": "location",
+        "name": "Anatomical Location: Frontal Lobe",
+        "represented_values_or_categories": [
+          "frontal lobe"
+        ],
+        "supporting_terms": [
+          "frontal",
+          "frontal lobe"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "History of stereotactic radiosurgery",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Stereotactic Radiosurgery"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Radiation dose (Gy)",
+        "suggested_representation": "continuous",
+        "supporting_specific_features": [
+          "Radiation Dose"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Number of radiation fractions",
+        "suggested_representation": "count",
+        "supporting_specific_features": [
+          "Radiation Fractionation"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Presence of surrounding edema",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Surrounding Edema"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Brain lesion location",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Anatomical Location: Frontal Lobe"
+        ]
+      }
+    ],
+    "topic_index": 76,
+    "topic_rank": 100
+  },
+  "raw_content": "{\n  \"topic_rank\": 100,\n  \"topic_index\": 76,\n  \"general_topic\": {\n    \"label\": \"Stereotactic Radiosurgery (SRS) of the brain\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic describes intracranial stereotactic radiosurgery, including anatomical localization (frontal lobe), dosage/fractionation terminology (Gy, fx), and associated findings (edema).\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Stereotactic Radiosurgery\",\n      \"supporting_terms\": [\n        \"stereotactic\",\n        \"radiosurgery\",\n        \"stereotactic radiosurgery\",\n        \"srs\",\n        \"stereotactic radiosurgery srs\",\n        \"radiosurgery srs\"\n      ],\n      \"feature_type\": \"procedure\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Represents the specific radiation therapy modality used for localized treatment.\"\n    },\n    {\n      \"name\": \"Radiation Dose\",\n      \"supporting_terms\": [\n        \"gy\",\n        \"gy in\"\n      ],\n      \"feature_type\": \"measurement\",\n      \"represented_values_or_categories\": [\n        \"Gray (Gy)\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Gy (Gray) is the standard unit of absorbed radiation dose.\"\n    },\n    {\n      \"name\": \"Radiation Fractionation\",\n      \"supporting_terms\": [\n        \"fractions\",\n        \"fx\"\n      ],\n      \"feature_type\": \"measurement\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Refers to the number of doses (fractions) delivered during the radiation course.\"\n    },\n    {\n      \"name\": \"Surrounding Edema\",\n      \"supporting_terms\": [\n        \"surrounding edema.\"\n      ],\n      \"feature_type\": \"finding\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Refers to perilesional or surrounding edema, a common side effect or finding in brain metastases.\"\n    },\n    {\n      \"name\": \"Anatomical Location: Frontal Lobe\",\n      \"supporting_terms\": [\n        \"frontal\",\n        \"frontal lobe\"\n      ],\n      \"feature_type\": \"location\",\n      \"represented_values_or_categories\": [\n        \"frontal lobe\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Specifies the anatomical region of the brain involved.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"gy\",\n      \"reason\": \"While likely Gray (Gy), it is a lowercase fragment that could be an abbreviation for something else in different contexts.\"\n    },\n    {\n      \"term\": \"surrounding\",\n      \"reason\": \"Incomplete phrase; likely part of 'surrounding edema'.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"History of stereotactic radiosurgery\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Stereotactic Radiosurgery\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Radiation dose (Gy)\",\n      \"suggested_representation\": \"continuous\",\n      \"supporting_specific_features\": [\n        \"Radiation Dose\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Number of radiation fractions\",\n      \"suggested_representation\": \"count\",\n      \"supporting_specific_features\": [\n        \"Radiation Fractionation\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Presence of surrounding edema\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Surrounding Edema\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Brain lesion location\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Anatomical Location: Frontal Lobe\"\n      ],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-902bd6211948bfa8",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "frontal",
+    "gy",
+    "frontal lobe",
+    "stereotactic",
+    "radiosurgery",
+    "stereotactic radiosurgery",
+    "srs",
+    "radiation",
+    "fractions",
+    "gy in",
+    "stereotactic radiosurgery srs",
+    "radiosurgery srs",
+    "fx",
+    "surrounding edema.",
+    "surrounding"
+  ],
+  "topic_index": 76,
+  "topic_rank": 100,
+  "usage": {
+    "completion_tokens": 1075,
+    "prompt_tokens": 823,
+    "prompt_tokens_details": null,
+    "total_tokens": 1898
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 100, internal index 76\n\nTerms in this topic, ordered from highest to lowest loading:\n1. frontal\n2. gy\n3. frontal lobe\n4. stereotactic\n5. radiosurgery\n6. stereotactic radiosurgery\n7. srs\n8. radiation\n9. fractions\n10. gy in\n11. stereotactic radiosurgery srs\n12. radiosurgery srs\n13. fx\n14. surrounding edema.\n15. surrounding\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 100,\n  \"topic_index\": 76,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

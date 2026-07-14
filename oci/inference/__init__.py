@@ -34,6 +34,13 @@ def run_multi_model_forest(*args, **kwargs):
     return _run_multi_model_forest(*args, **kwargs)
 
 
+def run_tfidf_topic_score_forest(*args, **kwargs):
+    from .tfidf_topic_score_forest import (
+        run_tfidf_topic_score_forest as _run_topic_score_forest,
+    )
+    return _run_topic_score_forest(*args, **kwargs)
+
+
 __all__ = [
     'run_applied_inference',
     'run_applied_inference_forest',
@@ -41,4 +48,5 @@ __all__ = [
     'run_agentic_attention_variable_forest',
     'run_multi_model_agentic_forest',
     'run_multi_model_forest',
+    'run_tfidf_topic_score_forest',
 ]

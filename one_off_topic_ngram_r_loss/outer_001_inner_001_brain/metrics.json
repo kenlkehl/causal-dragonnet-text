@@ -1,0 +1,198 @@
+{
+  "scope": {
+    "outer_fold": 1,
+    "inner_fold": 1,
+    "scope_id": "outer_001_inner_001",
+    "fit_n": 533,
+    "heldout_n": 267
+  },
+  "selection": {
+    "oracle_assisted": true,
+    "heldout_labels_used_for_selection": false,
+    "oracle_modifier_column": "true_brain_metastases_status",
+    "positive_category": "Yes",
+    "association_kind": "orientation_free_auc",
+    "selected_topic_index_zero_based": 68,
+    "selected_topic_id": "effect_topic_069",
+    "training_association_strength": 0.9148692498568429,
+    "terms": [
+      {
+        "term": "with brain metastases",
+        "loading": 0.6265412924389958,
+        "screen_rank": 313,
+        "signed_score": 2.372373979458169,
+        "fit_document_support": 76,
+        "heldout_document_support": 31
+      },
+      {
+        "term": "with brain",
+        "loading": 0.5900140550306922,
+        "screen_rank": 164,
+        "signed_score": 2.544633916292125,
+        "fit_document_support": 94,
+        "heldout_document_support": 44
+      },
+      {
+        "term": "surrounding edema",
+        "loading": 0.1713711233374596,
+        "screen_rank": 57,
+        "signed_score": 2.820901336610574,
+        "fit_document_support": 125,
+        "heldout_document_support": 63
+      },
+      {
+        "term": "new weakness",
+        "loading": 0.11938987089862624,
+        "screen_rank": 367,
+        "signed_score": 2.2830077106211863,
+        "fit_document_support": 62,
+        "heldout_document_support": 28
+      },
+      {
+        "term": "frontal lobe",
+        "loading": 0.11377428247506409,
+        "screen_rank": 361,
+        "signed_score": 2.355201515721585,
+        "fit_document_support": 117,
+        "heldout_document_support": 60
+      },
+      {
+        "term": "no mass effect",
+        "loading": 0.10393428015446404,
+        "screen_rank": 73,
+        "signed_score": 2.7680044773275534,
+        "fit_document_support": 98,
+        "heldout_document_support": 50
+      },
+      {
+        "term": "susceptibility weighted",
+        "loading": 0.10212808150711301,
+        "screen_rank": 437,
+        "signed_score": 2.3008073708018917,
+        "fit_document_support": 173,
+        "heldout_document_support": 91
+      },
+      {
+        "term": "brain metastases treated",
+        "loading": 0.09415024808116519,
+        "screen_rank": 445,
+        "signed_score": 2.46634142000298,
+        "fit_document_support": 79,
+        "heldout_document_support": 31
+      },
+      {
+        "term": "metastases treated",
+        "loading": 0.09107595314217704,
+        "screen_rank": 243,
+        "signed_score": 2.483809568253398,
+        "fit_document_support": 80,
+        "heldout_document_support": 32
+      },
+      {
+        "term": "subcortical",
+        "loading": 0.09059144891118713,
+        "screen_rank": 236,
+        "signed_score": 2.480387611588339,
+        "fit_document_support": 97,
+        "heldout_document_support": 53
+      },
+      {
+        "term": "cerebellar 0",
+        "loading": 0.08691351477294003,
+        "screen_rank": 133,
+        "signed_score": 2.6055796355962144,
+        "fit_document_support": 42,
+        "heldout_document_support": 24
+      },
+      {
+        "term": "surrounding edema -",
+        "loading": 0.08015080937083556,
+        "screen_rank": 39,
+        "signed_score": 2.926479124557058,
+        "fit_document_support": 53,
+        "heldout_document_support": 24
+      },
+      {
+        "term": "- neurologic cranial",
+        "loading": 0.07847392299854115,
+        "screen_rank": 103,
+        "signed_score": 2.702075463211247,
+        "fit_document_support": 187,
+        "heldout_document_support": 99
+      },
+      {
+        "term": "the supratentorial",
+        "loading": 0.07765119881264196,
+        "screen_rank": 410,
+        "signed_score": 2.3344780386962305,
+        "fit_document_support": 61,
+        "heldout_document_support": 32
+      },
+      {
+        "term": "metastases treated with",
+        "loading": 0.06733469063271583,
+        "screen_rank": 486,
+        "signed_score": 2.454416487536019,
+        "fit_document_support": 78,
+        "heldout_document_support": 31
+      }
+    ]
+  },
+  "forest": {
+    "heterogeneity_feature_count": 15,
+    "heterogeneity_features": [
+      "with brain metastases",
+      "with brain",
+      "surrounding edema",
+      "new weakness",
+      "frontal lobe",
+      "no mass effect",
+      "susceptibility weighted",
+      "brain metastases treated",
+      "metastases treated",
+      "subcortical",
+      "cerebellar 0",
+      "surrounding edema -",
+      "- neurologic cranial",
+      "the supratentorial",
+      "metastases treated with"
+    ],
+    "adjustment_inputs": [
+      "treatment_stacked",
+      "outcome_stacked"
+    ],
+    "n_estimators": 200,
+    "max_depth": null,
+    "min_samples_leaf": 10,
+    "max_features": "sqrt",
+    "honest": true,
+    "tune_model": false,
+    "random_state": 1043,
+    "train_fitted_constant_effect": 0.016132434716110953,
+    "heldout_cate_mean": 0.004669679873981511,
+    "heldout_cate_sd": 0.08762612551886155
+  },
+  "r_loss_evaluation": {
+    "constant_r_loss": 0.1873882992848371,
+    "forest_r_loss": 0.18687851525247853,
+    "absolute_r_loss_reduction": 0.0005097840323585443,
+    "relative_r_loss_reduction": 0.002720468856935693,
+    "paired_standard_error": 0.002155380058153904,
+    "paired_wald_95_ci": [
+      -0.0037147608816231075,
+      0.004734328946340197
+    ],
+    "conditional_patient_bootstrap_95_ci": [
+      -0.0037507494512548467,
+      0.004688993799874648
+    ],
+    "one_sided_p_for_positive_reduction": 0.40651575738741375,
+    "paired_z_value": 0.23651700331456968,
+    "positive_loss_difference_fraction": 0.45318352059925093
+  },
+  "oracle_posthoc_evaluation": {
+    "posthoc_cate_pearson": 0.3211941262446795,
+    "posthoc_cate_spearman": 0.2616835684507825,
+    "posthoc_oracle_ite_sd": 0.17238262444239225
+  }
+}

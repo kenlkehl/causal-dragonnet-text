@@ -5,6 +5,7 @@ explicit-feature causal forest. The reported performance comes from outer CV;
 all feature-set decisions are made with inner CV on each outer-training split.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -57,7 +58,7 @@ logger = logging.getLogger(__name__)
 
 AGENT_PROMPT_VERSION = "agentic_explicit_feature_search_v1"
 BROAD_AGENT_PROMPT_VERSION = "agentic_explicit_feature_broad_screen_v2"
-EXTRACTION_PROMPT_VERSION = "explicit_features_v2"
+EXTRACTION_PROMPT_VERSION = "explicit_features_v3"
 VALID_ACTIONS = {"add", "remove", "update_role", "none"}
 VALID_ROLES = {"confounder", "effect_modifier"}
 VALID_TYPES = {"categorical", "continuous"}
@@ -145,6 +146,24 @@ def _discover_openai_compatible_model_name(
         f"Could not autodiscover {purpose} model from {server_url or 'configured server'}: "
         "/models returned no model ids. Provide an explicit model name instead."
     )
+
+
+def _endpoint_model_inventory_identity(models_by_url: Dict[str, str]) -> str:
+    """Return a cache/checkpoint identity for one possibly heterogeneous pool."""
+    normalized = {
+        str(url): str(model)
+        for url, model in sorted(models_by_url.items())
+        if str(url).strip() and str(model).strip()
+    }
+    if not normalized:
+        raise ValueError("Endpoint model inventory cannot be empty")
+    unique_models = sorted(set(normalized.values()))
+    if len(unique_models) == 1:
+        return unique_models[0]
+    digest = hashlib.sha256(
+        json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"heterogeneous_endpoint_model_pool:{digest}"
 
 
 @dataclass
@@ -1339,6 +1358,7 @@ class OpenAICompatibleFeatureSearchAgent:
         self._client = None
         self._client_pool: Optional[OpenAIClientPool] = None
         self._resolved_agent_model_name: Optional[str] = None
+        self._resolved_agent_models_by_url: Dict[str, str] = {}
         self.last_raw_response: Optional[str] = None
         self.last_response_trace: Optional[Dict[str, Any]] = None
 
@@ -1352,24 +1372,59 @@ class OpenAICompatibleFeatureSearchAgent:
             max_retries=0,
         )
 
-    def _resolve_agent_model_name(self) -> str:
+    def _resolve_agent_model_inventory(self) -> Dict[str, str]:
         configured = self.search_config.agent_model_name
-        if not _should_autodiscover_model_name(configured):
-            return str(configured)
+        self._ensure_client()
+        if self._client is not None:
+            server_url = str(
+                self.search_config.agent_server_url or "configured_direct_client"
+            )
+            if server_url not in self._resolved_agent_models_by_url:
+                model_name = (
+                    _discover_openai_compatible_model_name(
+                        self._client,
+                        server_url=server_url,
+                        purpose="agent proposal",
+                    )
+                    if _should_autodiscover_model_name(configured)
+                    else str(configured)
+                )
+                self._resolved_agent_models_by_url[server_url] = model_name
+            return dict(self._resolved_agent_models_by_url)
+
+        assert self._client_pool is not None
+        urls = list(self._client_pool.server_urls)
+        if set(self._resolved_agent_models_by_url) != set(urls):
+            resolved: Dict[str, str] = {}
+            for server_url in urls:
+                if _should_autodiscover_model_name(configured):
+                    client = self._client_pool.client_for_url(server_url)
+                    resolved[server_url] = _discover_openai_compatible_model_name(
+                        client,
+                        server_url=server_url,
+                        purpose="agent proposal",
+                    )
+                else:
+                    resolved[server_url] = str(configured)
+            self._resolved_agent_models_by_url = resolved
+        return dict(self._resolved_agent_models_by_url)
+
+    def _resolve_agent_model_name(self) -> str:
         if self._resolved_agent_model_name is None:
-            self._ensure_client()
-            client = self._client
-            server_url = self.search_config.agent_server_url
-            if client is None:
-                assert self._client_pool is not None
-                server_url = self._client_pool.first_url()
-                client = self._client_pool.client_for_url(server_url)
-            self._resolved_agent_model_name = _discover_openai_compatible_model_name(
-                client,
-                server_url=server_url,
-                purpose="agent proposal",
+            self._resolved_agent_model_name = _endpoint_model_inventory_identity(
+                self._resolve_agent_model_inventory()
             )
         return self._resolved_agent_model_name
+
+    def _agent_model_for_url(self, server_url: str) -> str:
+        inventory = self._resolve_agent_model_inventory()
+        if server_url in inventory:
+            return inventory[server_url]
+        if len(inventory) == 1:
+            return next(iter(inventory.values()))
+        raise RuntimeError(
+            f"No resolved agent model identity for endpoint {server_url!r}"
+        )
 
     def _create_completion(self, **kwargs: Any) -> Any:
         self._ensure_client()
@@ -1394,23 +1449,32 @@ class OpenAICompatibleFeatureSearchAgent:
 
         def operation(attempt: int) -> Any:
             server_url, client = self._client_pool.client_for_attempt(start_index, attempt)
+            request_kwargs = dict(kwargs)
+            request_kwargs["model"] = self._agent_model_for_url(server_url)
             prompt_chars = sum(
                 len(str(message.get("content", "")))
-                for message in kwargs.get("messages", [])
+                for message in request_kwargs.get("messages", [])
                 if isinstance(message, dict)
             )
             logger.info(
                 "Sending agent proposal request to %s model=%s prompt_chars=%.1fK "
                 "max_tokens=%s timeout=%s attempt=%s/%s",
                 server_url,
-                kwargs.get("model"),
+                request_kwargs.get("model"),
                 prompt_chars / 1000.0,
-                kwargs.get("max_tokens"),
+                request_kwargs.get("max_tokens"),
                 getattr(self.search_config, "agent_request_timeout", 900.0),
                 attempt + 1,
                 max_attempts,
             )
-            return client.chat.completions.create(**kwargs)
+            request_kwargs.update(
+                google_json_response_format_kwargs(
+                    api_key=self.search_config.agent_api_key,
+                    server_url=server_url,
+                    model_name=request_kwargs["model"],
+                )
+            )
+            return client.chat.completions.create(**request_kwargs)
 
         return call_with_exponential_backoff(operation, **retry_kwargs)
 
@@ -1437,6 +1501,17 @@ class OpenAICompatibleFeatureSearchAgent:
         is_parsimony_factor = (
             context.get("prompt_version") == _PARSIMONY_FACTOR_PROMPT_VERSION
         )
+        is_tfidf_topic_label = context.get("prompt_version") in {
+            "tfidf_topic_label_v2",
+            "tfidf_topic_recovery_v2",
+            "tfidf_orphan_ngram_label_v1",
+        }
+        is_tfidf_topic_harmonization = context.get("prompt_version") in {
+            "tfidf_topic_name_harmonization_v2",
+            "tfidf_topic_global_dedup_v2",
+            "tfidf_topic_value_harmonization_v2",
+            "tfidf_topic_value_repair_v2",
+        }
 
         for attempt_idx in range(max_repair_attempts + 1):
             response_kwargs = {
@@ -1445,6 +1520,21 @@ class OpenAICompatibleFeatureSearchAgent:
                 "temperature": self.search_config.agent_temperature,
                 "max_tokens": self.search_config.agent_max_tokens,
             }
+            enable_thinking = getattr(
+                self.search_config, "agent_enable_thinking", None
+            )
+            if (
+                enable_thinking is not None
+                and str(getattr(self.search_config, "agent_provider", "openai"))
+                .strip()
+                .lower()
+                == "openai"
+            ):
+                response_kwargs["extra_body"] = {
+                    "chat_template_kwargs": {
+                        "enable_thinking": bool(enable_thinking)
+                    }
+                }
             response_kwargs.update(
                 google_json_response_format_kwargs(
                     api_key=self.search_config.agent_api_key,
@@ -1474,6 +1564,8 @@ class OpenAICompatibleFeatureSearchAgent:
                     or is_value_harmonization
                     or is_concept_inventory
                     or is_parsimony_factor
+                    or is_tfidf_topic_label
+                    or is_tfidf_topic_harmonization
                 ):
                     parsed = parse_agent_json_object(content)
                     if is_value_harmonization:
@@ -1482,6 +1574,16 @@ class OpenAICompatibleFeatureSearchAgent:
                         issues = concept_inventory_response_issues(parsed, context)
                     elif is_parsimony_factor:
                         issues = parsimony_factor_response_issues(parsed, context)
+                    elif is_tfidf_topic_label:
+                        from .tfidf_topic_agentic_forest import topic_label_response_issues
+
+                        issues = topic_label_response_issues(parsed, context)
+                    elif is_tfidf_topic_harmonization:
+                        from .tfidf_topic_agentic_forest import (
+                            topic_harmonization_response_issues,
+                        )
+
+                        issues = topic_harmonization_response_issues(parsed, context)
                     else:
                         issues = consensus_disambiguation_response_issues(parsed)
                     if issues:
@@ -1507,6 +1609,20 @@ class OpenAICompatibleFeatureSearchAgent:
                         repair_prompt = build_concept_inventory_repair_prompt(issues)
                     elif is_parsimony_factor:
                         repair_prompt = build_parsimony_factor_repair_prompt(issues)
+                    elif is_tfidf_topic_label:
+                        repair_prompt = (
+                            "Repair the topic response as exactly one JSON object with "
+                            "general_topic, topic_quality, and proposals. Every proposal "
+                            "must cite one or more exact supplied supporting_terms. Problems: "
+                            + "; ".join(issues)
+                        )
+                    elif is_tfidf_topic_harmonization:
+                        repair_prompt = (
+                            "Repair the harmonization response as exactly one JSON object "
+                            "following the original response contract. Cover every required "
+                            "candidate exactly once, use only supplied ids/names, and never "
+                            "return a review state. Problems: " + "; ".join(issues)
+                        )
                     elif is_consensus_disambiguation:
                         repair_prompt = build_consensus_disambiguation_repair_prompt(issues)
                     else:
@@ -1815,6 +1931,17 @@ class CodexCLIFeatureSearchAgent:
         )
         is_concept_inventory = prompt_version in _CONCEPT_INVENTORY_PROMPT_VERSIONS
         is_parsimony_factor = prompt_version == _PARSIMONY_FACTOR_PROMPT_VERSION
+        is_tfidf_topic_label = prompt_version in {
+            "tfidf_topic_label_v2",
+            "tfidf_topic_recovery_v2",
+            "tfidf_orphan_ngram_label_v1",
+        }
+        is_tfidf_topic_harmonization = prompt_version in {
+            "tfidf_topic_name_harmonization_v2",
+            "tfidf_topic_global_dedup_v2",
+            "tfidf_topic_value_harmonization_v2",
+            "tfidf_topic_value_repair_v2",
+        }
 
         for attempt_idx in range(max_repair_attempts + 1):
             response = self._run(prompt)
@@ -1833,6 +1960,8 @@ class CodexCLIFeatureSearchAgent:
                     or is_value_harmonization
                     or is_concept_inventory
                     or is_parsimony_factor
+                    or is_tfidf_topic_label
+                    or is_tfidf_topic_harmonization
                 ):
                     parsed = parse_agent_json_object(content)
                     if is_value_harmonization:
@@ -1841,6 +1970,16 @@ class CodexCLIFeatureSearchAgent:
                         issues = concept_inventory_response_issues(parsed, context)
                     elif is_parsimony_factor:
                         issues = parsimony_factor_response_issues(parsed, context)
+                    elif is_tfidf_topic_label:
+                        from .tfidf_topic_agentic_forest import topic_label_response_issues
+
+                        issues = topic_label_response_issues(parsed, context)
+                    elif is_tfidf_topic_harmonization:
+                        from .tfidf_topic_agentic_forest import (
+                            topic_harmonization_response_issues,
+                        )
+
+                        issues = topic_harmonization_response_issues(parsed, context)
                     else:
                         issues = consensus_disambiguation_response_issues(parsed)
                     if issues:
@@ -1862,6 +2001,20 @@ class CodexCLIFeatureSearchAgent:
                         repair_prompt = build_concept_inventory_repair_prompt(issues)
                     elif is_parsimony_factor:
                         repair_prompt = build_parsimony_factor_repair_prompt(issues)
+                    elif is_tfidf_topic_label:
+                        repair_prompt = (
+                            "Repair the topic response as exactly one JSON object with "
+                            "general_topic, topic_quality, and proposals. Every proposal "
+                            "must cite exact supplied supporting_terms. Problems: "
+                            + "; ".join(issues)
+                        )
+                    elif is_tfidf_topic_harmonization:
+                        repair_prompt = (
+                            "Repair the harmonization response as exactly one JSON object "
+                            "following the original response contract. Cover every required "
+                            "candidate exactly once, use only supplied ids/names, and never "
+                            "return a review state. Problems: " + "; ".join(issues)
+                        )
                     elif is_consensus_disambiguation:
                         repair_prompt = build_consensus_disambiguation_repair_prompt(issues)
                     else:
@@ -1936,6 +2089,9 @@ class VLLMExplicitFeatureExtractionProvider:
         )
         self._column_fingerprints: Dict[str, str] = {}
         self._resolved_vllm_model_name: Optional[str] = None
+        self._resolved_vllm_models_by_url: Dict[str, str] = {}
+        self._active_text_hash: Optional[str] = None
+        self._active_patient_text_hashes: List[str] = []
 
     def ensure_features(
         self,
@@ -1943,6 +2099,20 @@ class VLLMExplicitFeatureExtractionProvider:
         specs: List[ExplicitFeatureSpec],
     ) -> pd.DataFrame:
         dataset = dataset.copy()
+        active_texts = [
+            str(value or "") for value in dataset[self.config.text_column].tolist()
+        ]
+        self._active_patient_text_hashes = [
+            hashlib.sha256(value.encode("utf-8")).hexdigest()
+            for value in active_texts
+        ]
+        self._active_text_hash = hashlib.sha256(
+            json.dumps(
+                active_texts,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
         missing_specs: List[ExplicitFeatureSpec] = []
         row_caches: Dict[str, pd.DataFrame] = {}
         for spec in specs:
@@ -1973,20 +2143,172 @@ class VLLMExplicitFeatureExtractionProvider:
             missing_specs.append(spec)
 
         if missing_specs:
-            if self.feature_config.cache_enabled:
-                extracted_df = self._extract_spec_group_resumable(
-                    dataset,
-                    missing_specs,
-                    row_caches,
-                )
-            else:
-                extracted_df = self._extract_spec_group_with_fallback(
-                    dataset,
-                    missing_specs,
-                )
-            self._merge_extracted_columns(dataset, extracted_df, missing_specs)
-            self._save_per_spec_caches(extracted_df, missing_specs)
+            for group in self._extraction_spec_groups(missing_specs):
+                if self.feature_config.cache_enabled:
+                    extracted_df = self._extract_spec_group_resumable(
+                        dataset,
+                        group,
+                        row_caches,
+                    )
+                else:
+                    extracted_df = self._extract_spec_group_with_fallback(dataset, group)
+                self._merge_extracted_columns(dataset, extracted_df, group)
+                self._save_per_spec_caches(extracted_df, group)
         return dataset
+
+    def _extraction_spec_groups(
+        self,
+        specs: List[ExplicitFeatureSpec],
+    ) -> List[List[ExplicitFeatureSpec]]:
+        """Group related contracts while enforcing the hard ten-variable cap."""
+        maximum = int(
+            getattr(self.feature_config, "max_variables_per_extraction_request", 10)
+        )
+        if not 1 <= maximum <= 10:
+            raise ValueError("max_variables_per_extraction_request must be in [1, 10]")
+        domains: Dict[str, List[ExplicitFeatureSpec]] = {}
+        domain_order: List[str] = []
+
+        def broad_domain_family(
+            domain: str, parent_object: str, feature_name: str
+        ) -> str:
+            """Normalize agent vocabulary into stable prompt-sized domains.
+
+            Name harmonization deliberately retains specific clinical domains in
+            each contract.  Agents nevertheless use near-synonyms (for example
+            ``radiology``, ``imaging``, and ``neuroimaging``), which otherwise
+            creates mostly singleton extraction requests.  These broad families
+            affect request packing only; the original domain/parent remains in
+            the feature contract and cache identity.
+            """
+            normalized_domain = re.sub(r"[^a-z0-9]+", "_", domain.lower()).strip("_")
+            name = re.sub(r"[^a-z0-9]+", "_", feature_name.lower()).strip("_")
+            parent = re.sub(r"[^a-z0-9]+", "_", parent_object.lower()).strip("_")
+
+            if any(
+                token in name
+                for token in (
+                    "treatment",
+                    "therapy",
+                    "regimen",
+                    "radiation_referral",
+                    "medication",
+                    "surgical_history",
+                    "procedure",
+                    "resection",
+                )
+            ):
+                return "treatment_procedures_and_care"
+            if normalized_domain in {
+                "imaging",
+                "radiology",
+                "neuroimaging",
+                "nuclear_medicine",
+            } or any(token in name for token in ("imaging", "suvmax")):
+                return "imaging_and_staging"
+            if normalized_domain in {
+                "hematology",
+                "laboratory",
+                "laboratory_medicine",
+                "platelet",
+                "renal",
+                "hepatic",
+                "chemistry",
+                "vital_signs",
+                "anthropometry",
+            } or any(
+                token in name
+                for token in (
+                    "count",
+                    "serum_",
+                    "creatinine",
+                    "hemoglobin",
+                    "albumin",
+                    "blood_pressure",
+                    "heart_rate",
+                    "respiratory_rate",
+                    "oxygen_saturation",
+                )
+            ):
+                return "laboratory_and_vital_measurements"
+            if normalized_domain in {
+                "oncology",
+                "cancer",
+                "genetics",
+                "genomics",
+                "molecular_oncology",
+                "pathology",
+                "histopathology",
+                "histology",
+                "tumor_biology",
+            }:
+                return "cancer_diagnosis_and_biology"
+            if normalized_domain in {
+                "respiratory",
+                "pulmonary",
+                "pulmonology",
+                "cardiovascular",
+                "gastrointestinal",
+                "neurology",
+                "musculoskeletal",
+                "symptoms",
+                "physical_examination",
+                "functional_status",
+                "performance_status",
+                "pain",
+            }:
+                return "symptoms_examination_and_function"
+            if normalized_domain in {
+                "surgical_history",
+                "oncology_treatment",
+                "treatment_administration",
+                "pharmacology",
+                "medication",
+                "medication_use",
+                "supportive_care",
+                "palliative_care",
+                "patient_behavior",
+            }:
+                return "treatment_procedures_and_care"
+            # Demographics, social history, comorbid history, preferences, and
+            # otherwise uncommon domains are still a coherent baseline-history
+            # request family.  Parent/name remain visible in every instruction.
+            return "demographics_history_and_preferences"
+
+        for spec in specs:
+            text = str(spec.description or spec.name).strip().lower()
+            structured = re.match(
+                r"^clinical_domain=([^;]+);\s*parent_object=([^:]+):",
+                text,
+            )
+            if structured:
+                # A prompt may contain variables from different reusable parent
+                # objects when they share a clinical domain. Packing at this
+                # level preserves clinical coherence while avoiding thousands of
+                # mostly singleton patient requests; the hard cap still applies.
+                source_domain = structured.group(1).strip()
+                parent_object = structured.group(2).strip()
+                domain = broad_domain_family(
+                    source_domain, parent_object, spec.name
+                )
+            elif ":" in text:
+                domain = text.split(":", 1)[0]
+            else:
+                # Legacy/prespecified specs do not carry structured grouping
+                # metadata. Pack them efficiently rather than inventing a domain
+                # from the first token of every feature name.
+                domain = "__ungrouped__"
+            if domain not in domains:
+                domains[domain] = []
+                domain_order.append(domain)
+            domains[domain].append(spec)
+        groups: List[List[ExplicitFeatureSpec]] = []
+        for domain in domain_order:
+            values = domains[domain]
+            groups.extend(values[start : start + maximum] for start in range(0, len(values), maximum))
+        if any(len(group) > 10 for group in groups):
+            raise RuntimeError("Extraction grouping exceeded the hard ten-variable cap")
+        return groups
 
     def _columns_available(self, dataset: pd.DataFrame, spec: ExplicitFeatureSpec) -> bool:
         value_col = f"explicit_feat_{spec.name}"
@@ -2031,10 +2353,24 @@ class VLLMExplicitFeatureExtractionProvider:
     ) -> Optional[pd.DataFrame]:
         if not self.feature_config.cache_enabled:
             return None
-        return self.cache.load_rows_if_valid(
+        positional = self.cache.load_rows_if_valid(
             self._dataset_cache_key(),
             self._cache_config([spec]),
             expected_rows=len(dataset),
+        )
+        patient = self.cache.load_patient_values(
+            self._dataset_cache_key(),
+            self._cache_config([spec]),
+            self._active_patient_text_hashes,
+        )
+        frames = [frame for frame in (patient, positional) if frame is not None]
+        if not frames:
+            return None
+        return (
+            pd.concat(frames, ignore_index=True)
+            .drop_duplicates(subset=["__oci_cache_row_index"], keep="last")
+            .sort_values("__oci_cache_row_index")
+            .reset_index(drop=True)
         )
 
     def _extract_spec_group_with_fallback(
@@ -2071,16 +2407,21 @@ class VLLMExplicitFeatureExtractionProvider:
             [spec.name for spec in specs],
         )
         model_name = self._resolve_vllm_model_name()
+        model_inventory = self._resolve_vllm_model_inventory()
         extractor = VLLMFeatureExtractor(
             specs=specs,
             mode=self.feature_config.vllm_mode,
             server_url=self.feature_config.vllm_server_url or "http://localhost:8000/v1",
             model_name=model_name,
+            model_names_by_url=model_inventory,
             tensor_parallel_size=self.feature_config.vllm_tensor_parallel_size,
             gpu_memory_utilization=self.feature_config.vllm_gpu_memory_utilization,
             download_dir=self.feature_config.vllm_download_dir,
             max_model_len=self.feature_config.vllm_max_model_len,
             vllm_reasoning_parser=self.feature_config.vllm_reasoning_parser,
+            vllm_enable_thinking=getattr(
+                self.feature_config, "vllm_enable_thinking", None
+            ),
             api_key=getattr(self.feature_config, "vllm_api_key", "EMPTY"),
             max_retries=self.feature_config.extraction_max_retries,
             retry_initial_delay=getattr(
@@ -2161,6 +2502,12 @@ class VLLMExplicitFeatureExtractionProvider:
                     batch_indices,
                     batch_extracted[[value_col, missing_col]].copy(),
                 )
+                self.cache.save_patient_values(
+                    self._dataset_cache_key(),
+                    self._cache_config([spec]),
+                    [self._active_patient_text_hashes[index] for index in batch_indices],
+                    batch_extracted[[value_col, missing_col]].copy(),
+                )
 
         return self._load_complete_rows_for_specs(dataset, specs)
 
@@ -2181,11 +2528,7 @@ class VLLMExplicitFeatureExtractionProvider:
     ) -> pd.DataFrame:
         frames = []
         for spec in specs:
-            rows_df = self.cache.load_rows_if_valid(
-                self._dataset_cache_key(),
-                self._cache_config([spec]),
-                expected_rows=len(dataset),
-            )
+            rows_df = self._load_cached_spec_rows(dataset, spec)
             complete = self.cache.rows_to_complete_dataframe(
                 rows_df,
                 expected_rows=len(dataset),
@@ -2236,48 +2579,75 @@ class VLLMExplicitFeatureExtractionProvider:
 
     def _cache_config(self, specs: List[ExplicitFeatureSpec]) -> Dict[str, Any]:
         model_name = self._resolve_vllm_model_name()
+        model_inventory = self._resolve_vllm_model_inventory()
         cache_config = {
             "features": [_spec_extraction_contract_dict(spec) for spec in specs],
             "prompt_template_version": EXTRACTION_PROMPT_VERSION,
             "vllm_model_name": model_name,
+            "vllm_endpoint_model_inventory": model_inventory,
             "vllm_max_model_len": self.feature_config.vllm_max_model_len,
             "vllm_reasoning_parser": resolve_vllm_reasoning_parser(
                 self.feature_config.vllm_reasoning_parser,
-                model_name,
+                next(iter(model_inventory.values())),
+            ),
+            "vllm_reasoning_parser_inventory": {
+                url: resolve_vllm_reasoning_parser(
+                    self.feature_config.vllm_reasoning_parser,
+                    endpoint_model,
+                )
+                for url, endpoint_model in model_inventory.items()
+            },
+            "vllm_enable_thinking": getattr(
+                self.feature_config, "vllm_enable_thinking", None
             ),
             "extraction_temperature": self.feature_config.extraction_temperature,
             "extraction_max_tokens": self.feature_config.extraction_max_tokens,
             "extraction_max_text_length": self.feature_config.extraction_max_text_length,
+            "patient_text_hash": self._active_text_hash,
+            "temporal_cutoff": "information documented before the treatment decision",
+            "max_variables_per_extraction_request": int(
+                getattr(self.feature_config, "max_variables_per_extraction_request", 10)
+            ),
+            "extraction_batch_size": int(self.feature_config.extraction_batch_size),
         }
         return cache_config
 
     def _spec_fingerprint(self, spec: ExplicitFeatureSpec) -> str:
         return json.dumps(self._cache_config([spec]), sort_keys=True, default=_json_default)
 
-    def _resolve_vllm_model_name(self) -> str:
+    def _resolve_vllm_model_inventory(self) -> Dict[str, str]:
         configured = self.feature_config.vllm_model_name
-        if not _should_autodiscover_model_name(configured):
-            return str(configured)
-        if self._resolved_vllm_model_name is not None:
-            return self._resolved_vllm_model_name
         mode = str(self.feature_config.vllm_mode or "server")
+        server_urls = parse_server_urls(self.feature_config.vllm_server_url)
+        if not _should_autodiscover_model_name(configured):
+            return {url: str(configured) for url in server_urls}
         if mode != "server":
             raise ValueError(
                 "vllm_model_name='auto' is only supported for vllm_mode='server'; "
                 f"got vllm_mode={mode!r}. Provide an explicit model name for this mode."
             )
-        server_url = parse_server_urls(self.feature_config.vllm_server_url)[0]
+        if set(self._resolved_vllm_models_by_url) == set(server_urls):
+            return dict(self._resolved_vllm_models_by_url)
         with OpenAIClientPool(
-            server_urls=[server_url],
+            server_urls=server_urls,
             api_key=getattr(self.feature_config, "vllm_api_key", "EMPTY"),
             timeout=getattr(self.feature_config, "extraction_request_timeout", 900.0),
             max_retries=0,
         ) as client_pool:
-            client = client_pool.client_for_url(server_url)
-            self._resolved_vllm_model_name = _discover_openai_compatible_model_name(
-                client,
-                server_url=server_url,
-                purpose="explicit feature extraction",
+            self._resolved_vllm_models_by_url = {
+                server_url: _discover_openai_compatible_model_name(
+                    client_pool.client_for_url(server_url),
+                    server_url=server_url,
+                    purpose="explicit feature extraction",
+                )
+                for server_url in server_urls
+            }
+        return dict(self._resolved_vllm_models_by_url)
+
+    def _resolve_vllm_model_name(self) -> str:
+        if self._resolved_vllm_model_name is None:
+            self._resolved_vllm_model_name = _endpoint_model_inventory_identity(
+                self._resolve_vllm_model_inventory()
             )
         return self._resolved_vllm_model_name
 
@@ -2307,6 +2677,12 @@ class CodexCLIExplicitFeatureExtractionProvider(VLLMExplicitFeatureExtractionPro
                 getattr(self.feature_config, "codex_cli_extra_args", [])
             ),
             "complete_document": True,
+            "patient_text_hash": self._active_text_hash,
+            "temporal_cutoff": "information documented before the treatment decision",
+            "max_variables_per_extraction_request": int(
+                getattr(self.feature_config, "max_variables_per_extraction_request", 10)
+            ),
+            "extraction_batch_size": int(self.feature_config.extraction_batch_size),
         }
 
     def _extract_spec_group(
@@ -2586,6 +2962,29 @@ def build_agent_prompt(
     search_config: AgenticFeatureSearchConfig,
 ) -> str:
     """Construct the proposal prompt sent to the LLM agent."""
+    if context.get("prompt_version") in {
+        "tfidf_topic_label_v2",
+        "tfidf_topic_recovery_v2",
+        "tfidf_orphan_ngram_label_v1",
+    }:
+        from .tfidf_topic_agentic_forest import render_topic_label_prompt
+
+        return render_topic_label_prompt(context)
+    if context.get("prompt_version") == "tfidf_topic_name_harmonization_v2":
+        from .tfidf_topic_agentic_forest import render_topic_name_harmonization_prompt
+
+        return render_topic_name_harmonization_prompt(context)
+    if context.get("prompt_version") == "tfidf_topic_global_dedup_v2":
+        from .tfidf_topic_agentic_forest import render_topic_global_dedup_prompt
+
+        return render_topic_global_dedup_prompt(context)
+    if context.get("prompt_version") in {
+        "tfidf_topic_value_harmonization_v2",
+        "tfidf_topic_value_repair_v2",
+    }:
+        from .tfidf_topic_agentic_forest import render_topic_value_harmonization_prompt
+
+        return render_topic_value_harmonization_prompt(context)
     if context.get("prompt_version") == "agentic_attention_consensus_disambiguation_v1":
         return build_attention_consensus_disambiguation_prompt(context, search_config)
 

@@ -1,0 +1,109 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 5.366567611694336,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Likely a fragment of '10^3/uL' (thousands per microliter), a unit of measurement, rather than a clinical feature.",
+        "term": "k ul"
+      },
+      {
+        "reason": "Fragment of 'uL' (microliter), a unit of volume.",
+        "term": "ul"
+      },
+      {
+        "reason": "Incomplete numeric fragment with trailing punctuation.",
+        "term": "150-400 -"
+      }
+    ],
+    "general_topic": {
+      "coherence": "mixed",
+      "confidence": "medium",
+      "label": "Hematologic laboratory reference ranges and ANC",
+      "summary": "The topic contains fragments of laboratory reference ranges (likely white blood cell counts or similar) and a specific mention of low absolute neutrophil count (ANC)."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The term 'low anc' explicitly refers to a low absolute neutrophil count, a critical hematologic parameter in chemotherapy patients.",
+        "feature_type": "finding",
+        "name": "Absolute Neutrophil Count (ANC)",
+        "represented_values_or_categories": [
+          "low"
+        ],
+        "supporting_terms": [
+          "low anc"
+        ]
+      },
+      {
+        "artifact_likelihood": "medium",
+        "confidence": "medium",
+        "explanation": "The terms represent numeric laboratory reference intervals, though the specific analyte (e.g., WBC, platelets, or neutrophils) is not explicitly named in the fragments.",
+        "feature_type": "measurement_range",
+        "name": "Laboratory Reference Range",
+        "represented_values_or_categories": [
+          "150-400",
+          "1.5-8.0"
+        ],
+        "supporting_terms": [
+          "reference 150-400",
+          "reference 1.5-8.0",
+          "ul reference 150-400",
+          "ul reference 1.5-8.0"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Absolute Neutrophil Count",
+        "suggested_representation": "continuous",
+        "supporting_specific_features": [
+          "Absolute Neutrophil Count (ANC)"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "White Blood Cell Count",
+        "suggested_representation": "continuous",
+        "supporting_specific_features": [
+          "Laboratory Reference Range"
+        ]
+      }
+    ],
+    "topic_index": 11,
+    "topic_rank": 96
+  },
+  "raw_content": "{\n  \"topic_rank\": 96,\n  \"topic_index\": 11,\n  \"general_topic\": {\n    \"label\": \"Hematologic laboratory reference ranges and ANC\",\n    \"coherence\": \"mixed\",\n    \"confidence\": \"medium\",\n    \"summary\": \"The topic contains fragments of laboratory reference ranges (likely white blood cell counts or similar) and a specific mention of low absolute neutrophil count (ANC).\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Absolute Neutrophil Count (ANC)\",\n      \"supporting_terms\": [\n        \"low anc\"\n      ],\n      \"feature_type\": \"finding\",\n      \"represented_values_or_categories\": [\n        \"low\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The term 'low anc' explicitly refers to a low absolute neutrophil count, a critical hematologic parameter in chemotherapy patients.\"\n    },\n    {\n      \"name\": \"Laboratory Reference Range\",\n      \"supporting_terms\": [\n        \"reference 150-400\",\n        \"reference 1.5-8.0\",\n        \"ul reference 150-400\",\n        \"ul reference 1.5-8.0\"\n      ],\n      \"feature_type\": \"measurement_range\",\n      \"represented_values_or_categories\": [\n        \"150-400\",\n        \"1.5-8.0\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"medium\",\n      \"explanation\": \"The terms represent numeric laboratory reference intervals, though the specific analyte (e.g., WBC, platelets, or neutrophils) is not explicitly named in the fragments.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"k ul\",\n      \"reason\": \"Likely a fragment of '10^3/uL' (thousands per microliter), a unit of measurement, rather than a clinical feature.\"\n    },\n    {\n      \"term\": \"ul\",\n      \"reason\": \"Fragment of 'uL' (microliter), a unit of volume.\"\n    },\n    {\n      \"term\": \"150-400 -\",\n      \"reason\": \"Incomplete numeric fragment with trailing punctuation.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Absolute Neutrophil Count\",\n      \"suggested_representation\": \"continuous\",\n      \"supporting_specific_features\": [\n        \"Absolute Neutrophil Count (ANC)\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"White Blood Cell Count\",\n      \"suggested_representation\": \"continuous\",\n      \"supporting_specific_features\": [\n        \"Laboratory Reference Range\"\n      ],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-b8022ad957d74c39",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "k ul",
+    "ul",
+    "k ul reference",
+    "ul reference",
+    "reference 150-400",
+    "reference 150-400 -",
+    "ul reference 150-400",
+    "150-400 -",
+    "150-400 - normal",
+    "reference 1.5-8.0 -",
+    "ul reference 1.5-8.0",
+    "reference 1.5-8.0",
+    "low anc",
+    "1.5-8.0 - low",
+    "5.5 k ul"
+  ],
+  "topic_index": 11,
+  "topic_rank": 96,
+  "usage": {
+    "completion_tokens": 684,
+    "prompt_tokens": 888,
+    "prompt_tokens_details": null,
+    "total_tokens": 1572
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 96, internal index 11\n\nTerms in this topic, ordered from highest to lowest loading:\n1. k ul\n2. ul\n3. k ul reference\n4. ul reference\n5. reference 150-400\n6. reference 150-400 -\n7. ul reference 150-400\n8. 150-400 -\n9. 150-400 - normal\n10. reference 1.5-8.0 -\n11. ul reference 1.5-8.0\n12. reference 1.5-8.0\n13. low anc\n14. 1.5-8.0 - low\n15. 5.5 k ul\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 96,\n  \"topic_index\": 11,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

@@ -1,0 +1,114 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 4.919600963592529,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Incomplete phrase/fragment",
+        "term": "mri was"
+      },
+      {
+        "reason": "Incomplete phrase/fragment",
+        "term": "mri no"
+      },
+      {
+        "reason": "Highly fragmented documentation shorthand",
+        "term": "heent no sore"
+      }
+    ],
+    "general_topic": {
+      "coherence": "mixed",
+      "confidence": "medium",
+      "label": "Negative imaging findings (Brain MRI) and HEENT symptoms",
+      "summary": "The topic contains two distinct clusters: negative brain MRI findings (relevant to metastatic screening) and minor HEENT/throat symptoms."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Terms indicate the results of brain MRI scans, specifically looking for intracranial findings/metastases.",
+        "feature_type": "finding",
+        "name": "Brain MRI finding",
+        "represented_values_or_categories": [
+          "negative"
+        ],
+        "supporting_terms": [
+          "mri was negative",
+          "brain mri was",
+          "brain mri no",
+          "negative for intracranial",
+          "mri no intracranial"
+        ]
+      },
+      {
+        "artifact_likelihood": "medium",
+        "confidence": "medium",
+        "explanation": "Terms refer to throat/sinus discomfort, though the phrasing is fragmented and includes negative findings.",
+        "feature_type": "symptom",
+        "name": "Sore throat",
+        "represented_values_or_categories": [
+          "present",
+          "absent"
+        ],
+        "supporting_terms": [
+          "sore throat sinus",
+          "throat sinus",
+          "no sore throat",
+          "no sore",
+          "heent no sore"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Brain metastasis status by MRI",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Brain MRI finding"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Sore throat presence",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Sore throat"
+        ]
+      }
+    ],
+    "topic_index": 57,
+    "topic_rank": 18
+  },
+  "raw_content": "{\n  \"topic_rank\": 18,\n  \"topic_index\": 57,\n  \"general_topic\": {\n    \"label\": \"Negative imaging findings (Brain MRI) and HEENT symptoms\",\n    \"coherence\": \"mixed\",\n    \"confidence\": \"medium\",\n    \"summary\": \"The topic contains two distinct clusters: negative brain MRI findings (relevant to metastatic screening) and minor HEENT/throat symptoms.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Brain MRI finding\",\n      \"supporting_terms\": [\n        \"mri was negative\",\n        \"brain mri was\",\n        \"brain mri no\",\n        \"negative for intracranial\",\n        \"mri no intracranial\"\n      ],\n      \"feature_type\": \"finding\",\n      \"represented_values_or_categories\": [\n        \"negative\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Terms indicate the results of brain MRI scans, specifically looking for intracranial findings/metastases.\"\n    },\n    {\n      \"name\": \"Sore throat\",\n      \"supporting_terms\": [\n        \"sore throat sinus\",\n        \"throat sinus\",\n        \"no sore throat\",\n        \"no sore\",\n        \"heent no sore\"\n      ],\n      \"feature_type\": \"symptom\",\n      \"represented_values_or_categories\": [\n        \"present\",\n        \"absent\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"medium\",\n      \"explanation\": \"Terms refer to throat/sinus discomfort, though the phrasing is fragmented and includes negative findings.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"mri was\",\n      \"reason\": \"Incomplete phrase/fragment\"\n    },\n    {\n      \"term\": \"mri no\",\n      \"reason\": \"Incomplete phrase/fragment\"\n    },\n    {\n      \"term\": \"heent no sore\",\n      \"reason\": \"Highly fragmented documentation shorthand\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Brain metastasis status by MRI\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Brain MRI finding\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Sore throat presence\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Sore throat\"\n      ],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-ad70b98128f287ea",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "was negative",
+    "was negative for",
+    "mri was negative",
+    "mri was",
+    "brain mri was",
+    "sore throat sinus",
+    "throat sinus",
+    "no sore throat",
+    "no sore",
+    "heent no sore",
+    "mri - no",
+    "brain mri no",
+    "negative for intracranial",
+    "mri no intracranial",
+    "mri no"
+  ],
+  "topic_index": 57,
+  "topic_rank": 18,
+  "usage": {
+    "completion_tokens": 621,
+    "prompt_tokens": 833,
+    "prompt_tokens_details": null,
+    "total_tokens": 1454
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 18, internal index 57\n\nTerms in this topic, ordered from highest to lowest loading:\n1. was negative\n2. was negative for\n3. mri was negative\n4. mri was\n5. brain mri was\n6. sore throat sinus\n7. throat sinus\n8. no sore throat\n9. no sore\n10. heent no sore\n11. mri - no\n12. brain mri no\n13. negative for intracranial\n14. mri no intracranial\n15. mri no\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 18,\n  \"topic_index\": 57,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

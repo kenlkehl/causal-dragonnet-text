@@ -1,0 +1,98 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 4.794106483459473,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Fragmented term; likely part of 'Napsin A positive' but lacks independent clinical meaning.",
+        "term": "a positive"
+      },
+      {
+        "reason": "Incomplete phrase/fragment.",
+        "term": "adenocarcinoma of"
+      },
+      {
+        "reason": "Incomplete phrase/fragment.",
+        "term": "adenocarcinoma of the"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "Adenocarcinoma histology and Napsin A expression",
+      "summary": "The topic focuses on the histological classification of adenocarcinoma and the immunohistochemical marker Napsin A."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The terms explicitly identify the histological subtype of the lung cancer.",
+        "feature_type": "histology",
+        "name": "Adenocarcinoma histology",
+        "represented_values_or_categories": [
+          "adenocarcinoma"
+        ],
+        "supporting_terms": [
+          "adenocarcinoma of",
+          "adenocarcinoma of the",
+          "adenocarcinoma"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Napsin A is a common immunohistochemical marker used to confirm adenocarcinoma in lung cancer cases.",
+        "feature_type": "biomarker",
+        "name": "Napsin A expression status",
+        "represented_values_or_categories": [
+          "positive"
+        ],
+        "supporting_terms": [
+          "napsin a positive",
+          "a positive"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Histological subtype",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Adenocarcinoma histology"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Napsin A expression",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Napsin A expression status"
+        ]
+      }
+    ],
+    "topic_index": 99,
+    "topic_rank": 78
+  },
+  "raw_content": "{\n  \"topic_rank\": 78,\n  \"topic_index\": 99,\n  \"general_topic\": {\n    \"label\": \"Adenocarcinoma histology and Napsin A expression\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic focuses on the histological classification of adenocarcinoma and the immunohistochemical marker Napsin A.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Adenocarcinoma histology\",\n      \"supporting_terms\": [\n        \"adenocarcinoma of\",\n        \"adenocarcinoma of the\",\n        \"adenocarcinoma\"\n      ],\n      \"feature_type\": \"histology\",\n      \"represented_values_or_categories\": [\n        \"adenocarcinoma\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms explicitly identify the histological subtype of the lung cancer.\"\n    },\n    {\n      \"name\": \"Napsin A expression status\",\n      \"supporting_terms\": [\n        \"napsin a positive\",\n        \"a positive\"\n      ],\n      \"feature_type\": \"biomarker\",\n      \"represented_values_or_categories\": [\n        \"positive\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Napsin A is a common immunohistochemical marker used to confirm adenocarcinoma in lung cancer cases.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"a positive\",\n      \"reason\": \"Fragmented term; likely part of 'Napsin A positive' but lacks independent clinical meaning.\"\n    },\n    {\n      \"term\": \"adenocarcinoma of\",\n      \"reason\": \"Incomplete phrase/fragment.\"\n    },\n    {\n      \"term\": \"adenocarcinoma of the\",\n      \"reason\": \"Incomplete phrase/fragment.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Histological subtype\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Adenocarcinoma histology\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Napsin A expression\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Napsin A expression status\"\n      ],\n      \"confidence\": \"high\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-886fcb5a475fa1ad",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "adenocarcinoma of",
+    "a positive",
+    "napsin a positive",
+    "adenocarcinoma of the",
+    "adenocarcinoma"
+  ],
+  "topic_index": 99,
+  "topic_rank": 78,
+  "usage": {
+    "completion_tokens": 584,
+    "prompt_tokens": 761,
+    "prompt_tokens_details": null,
+    "total_tokens": 1345
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 78, internal index 99\n\nTerms in this topic, ordered from highest to lowest loading:\n1. adenocarcinoma of\n2. a positive\n3. napsin a positive\n4. adenocarcinoma of the\n5. adenocarcinoma\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 78,\n  \"topic_index\": 99,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

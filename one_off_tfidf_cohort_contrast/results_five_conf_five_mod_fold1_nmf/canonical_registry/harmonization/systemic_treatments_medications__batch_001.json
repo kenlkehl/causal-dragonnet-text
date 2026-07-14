@@ -1,0 +1,373 @@
+{
+  "attempts": 1,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "candidate_mappings": [
+      {
+        "candidate_id": "C002",
+        "local_id": "F01",
+        "rationale": "Both refer to adjuvant history.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C003",
+        "local_id": "F01",
+        "rationale": "Both refer to adjuvant history.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C039",
+        "local_id": "F02",
+        "rationale": "Direct extraction of care intent.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C043",
+        "local_id": "F06",
+        "rationale": "Cycle interval is the same as cycle frequency.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C044",
+        "local_id": "F03",
+        "rationale": "Specific regimen type.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C052",
+        "local_id": "F04",
+        "rationale": "Count of cycles.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C063",
+        "local_id": "F05",
+        "rationale": "Ordinal cycle number.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C064",
+        "local_id": "F06",
+        "rationale": "Days since start is a different measurement than cycle interval.",
+        "relation": "related_but_distinct"
+      },
+      {
+        "candidate_id": "C073",
+        "local_id": "F06",
+        "rationale": "Frequency and interval are synonymous in this context.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C104",
+        "local_id": "F07",
+        "rationale": "Binary indicator of growth factor use.",
+        "relation": "subfield_of"
+      },
+      {
+        "candidate_id": "C105",
+        "local_id": "F07",
+        "rationale": "Categorical setting of growth factor use.",
+        "relation": "subfield_of"
+      },
+      {
+        "candidate_id": "C143",
+        "local_id": "F10",
+        "rationale": "Specific medication use.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C144",
+        "local_id": "F10",
+        "rationale": "Specific medication use.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C163",
+        "local_id": "F08",
+        "rationale": "Frequency is part of administration details.",
+        "relation": "subfield_of"
+      },
+      {
+        "candidate_id": "C164",
+        "local_id": "F08",
+        "rationale": "Route is part of administration details.",
+        "relation": "subfield_of"
+      },
+      {
+        "candidate_id": "C165",
+        "local_id": "F08",
+        "rationale": "Frequency is part of administration details.",
+        "relation": "subfield_of"
+      },
+      {
+        "candidate_id": "C168",
+        "local_id": "F10",
+        "rationale": "Specific medication class use.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C174",
+        "local_id": "F10",
+        "rationale": "Specific medication use.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C195",
+        "local_id": "F04",
+        "rationale": "Total cycles is synonymous with number of cycles.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C199",
+        "local_id": "F10",
+        "rationale": "Specific medication use.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C210",
+        "local_id": "F10",
+        "rationale": "Specific medication use.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C269",
+        "local_id": "F03",
+        "rationale": "Regimen type.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C276",
+        "local_id": "F06",
+        "rationale": "Frequency is synonymous with interval.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C277",
+        "local_id": "F09",
+        "rationale": "Direct extraction of response status.",
+        "relation": "base_variable"
+      }
+    ],
+    "canonical_features": [
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "adjuvant_treatment_history",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Indicates whether the patient has a history of adjuvant therapy.",
+        "display_name": "Adjuvant treatment history",
+        "local_id": "F01",
+        "parent_object": null,
+        "rationale": "C002 and C003 both refer to the status/setting of adjuvant therapy; merged into a single binary history variable.",
+        "source_candidate_ids": [
+          "C002",
+          "C003"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "care_intent",
+        "categories": [
+          "palliative",
+          "curative",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "The primary goal of treatment (e.g., palliative).",
+        "display_name": "Care intent",
+        "local_id": "F02",
+        "parent_object": null,
+        "rationale": "Captures the clinical intent of the treatment provided.",
+        "source_candidate_ids": [
+          "C039"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "chemotherapy_regimen_type",
+        "categories": [
+          "carboplatin + pemetrexed",
+          "taxane-based",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "The specific combination or type of chemotherapy regimen administered.",
+        "display_name": "Chemotherapy regimen type",
+        "local_id": "F03",
+        "parent_object": null,
+        "rationale": "Combines specific regimen descriptions and broad regimen types (taxane-based) into a single categorical field.",
+        "source_candidate_ids": [
+          "C044",
+          "C269"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "chemotherapy_cycle_count",
+        "categories": null,
+        "data_type": "count",
+        "derivation": null,
+        "description": "The total number of completed or planned chemotherapy cycles.",
+        "display_name": "Chemotherapy cycle count",
+        "local_id": "F04",
+        "parent_object": null,
+        "rationale": "Merges completed cycles and total number of cycles into a single count variable.",
+        "source_candidate_ids": [
+          "C052",
+          "C195"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "current_chemotherapy_cycle_number",
+        "categories": [
+          "1",
+          "2",
+          "3",
+          "4",
+          "unknown"
+        ],
+        "data_type": "ordinal",
+        "derivation": null,
+        "description": "The ordinal number of the current chemotherapy cycle being administered.",
+        "display_name": "Current chemotherapy cycle number",
+        "local_id": "F05",
+        "parent_object": null,
+        "rationale": "Represents the specific cycle number in a sequence.",
+        "source_candidate_ids": [
+          "C063"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "dosing cycle frequency",
+          "treatment cycle frequency"
+        ],
+        "canonical_name": "chemotherapy_cycle_interval",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "The frequency or interval between chemotherapy cycles.",
+        "display_name": "Chemotherapy cycle interval",
+        "local_id": "F06",
+        "parent_object": null,
+        "rationale": "Consolidates all mentions of cycle frequency/intervals (e.g., q21, q3 weeks) into one continuous measurement of time.",
+        "source_candidate_ids": [
+          "C043",
+          "C073",
+          "C276"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "growth_factor_support",
+        "categories": [
+          "outpatient",
+          "inpatient",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "Details regarding the administration and setting of growth factor support.",
+        "display_name": "Growth factor support",
+        "local_id": "F07",
+        "parent_object": "growth_factor_therapy",
+        "rationale": "C104 (binary) and C105 (categorical) are merged into a single categorical variable describing the support context.",
+        "source_candidate_ids": [
+          "C104",
+          "C105"
+        ]
+      },
+      {
+        "action": "review",
+        "aliases": [],
+        "canonical_name": "medication_administration_details",
+        "categories": null,
+        "data_type": "text",
+        "derivation": null,
+        "description": "Details regarding how a medication is administered, including route and frequency.",
+        "display_name": "Medication administration details",
+        "local_id": "F08",
+        "parent_object": "medication_administration",
+        "rationale": "Route and frequency are highly variable; a review of the text is safer than forced extraction into rigid categories for all medications.",
+        "source_candidate_ids": [
+          "C163",
+          "C164",
+          "C165"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "treatment_response_status",
+        "categories": [
+          "partial response",
+          "progressive disease",
+          "complete response",
+          "stable disease",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "The clinical assessment of how the patient responded to treatment.",
+        "display_name": "Treatment response status",
+        "local_id": "F09",
+        "parent_object": null,
+        "rationale": "Standard clinical assessment of response.",
+        "source_candidate_ids": [
+          "C277"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "medication_use",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of specific medications (e.g., Levetiracetam, Morphine, Ondansetron, Pembrolizumab, MET inhibitors).",
+        "display_name": "Medication use",
+        "local_id": "F10",
+        "parent_object": null,
+        "rationale": "These are distinct medications; while they share a 'use' concept, they are clinically distinct variables. They are grouped here as a template for medication extraction.",
+        "source_candidate_ids": [
+          "C143",
+          "C144",
+          "C168",
+          "C174",
+          "C199",
+          "C210"
+        ]
+      }
+    ]
+  },
+  "raw_content": "{\n  \"canonical_features\": [\n    {\n      \"local_id\": \"F01\",\n      \"canonical_name\": \"adjuvant_treatment_history\",\n      \"display_name\": \"Adjuvant treatment history\",\n      \"description\": \"Indicates whether the patient has a history of adjuvant therapy.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C002\",\n        \"C003\"\n      ],\n      \"rationale\": \"C002 and C003 both refer to the status/setting of adjuvant therapy; merged into a single binary history variable.\"\n    },\n    {\n      \"local_id\": \"F02\",\n      \"canonical_name\": \"care_intent\",\n      \"display_name\": \"Care intent\",\n      \"description\": \"The primary goal of treatment (e.g., palliative).\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"palliative\",\n        \"curative\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C039\"\n      ],\n      \"rationale\": \"Captures the clinical intent of the treatment provided.\"\n    },\n    {\n      \"local_id\": \"F03\",\n      \"canonical_name\": \"chemotherapy_regimen_type\",\n      \"display_name\": \"Chemotherapy regimen type\",\n      \"description\": \"The specific combination or type of chemotherapy regimen administered.\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"carboplatin + pemetrexed\",\n        \"taxane-based\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C044\",\n        \"C269\"\n      ],\n      \"rationale\": \"Combines specific regimen descriptions and broad regimen types (taxane-based) into a single categorical field.\"\n    },\n    {\n      \"local_id\": \"F04\",\n      \"canonical_name\": \"chemotherapy_cycle_count\",\n      \"display_name\": \"Chemotherapy cycle count\",\n      \"description\": \"The total number of completed or planned chemotherapy cycles.\",\n      \"data_type\": \"count\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C052\",\n        \"C195\"\n      ],\n      \"rationale\": \"Merges completed cycles and total number of cycles into a single count variable.\"\n    },\n    {\n      \"local_id\": \"F05\",\n      \"canonical_name\": \"current_chemotherapy_cycle_number\",\n      \"display_name\": \"Current chemotherapy cycle number\",\n      \"description\": \"The ordinal number of the current chemotherapy cycle being administered.\",\n      \"data_type\": \"ordinal\",\n      \"categories\": [\n        \"1\",\n        \"2\",\n        \"3\",\n        \"4\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C063\"\n      ],\n      \"rationale\": \"Represents the specific cycle number in a sequence.\"\n    },\n    {\n      \"local_id\": \"F06\",\n      \"canonical_name\": \"chemotherapy_cycle_interval\",\n      \"display_name\": \"Chemotherapy cycle interval\",\n      \"description\": \"The frequency or interval between chemotherapy cycles.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"dosing cycle frequency\",\n        \"treatment cycle frequency\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C043\",\n        \"C073\",\n        \"C276\"\n      ],\n      \"rationale\": \"Consolidates all mentions of cycle frequency/intervals (e.g., q21, q3 weeks) into one continuous measurement of time.\"\n    },\n    {\n      \"local_id\": \"F07\",\n      \"canonical_name\": \"growth_factor_support\",\n      \"display_name\": \"Growth factor support\",\n      \"description\": \"Details regarding the administration and setting of growth factor support.\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"outpatient\",\n        \"inpatient\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"growth_factor_therapy\",\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C104\",\n        \"C105\"\n      ],\n      \"rationale\": \"C104 (binary) and C105 (categorical) are merged into a single categorical variable describing the support context.\"\n    },\n    {\n      \"local_id\": \"F08\",\n      \"canonical_name\": \"medication_administration_details\",\n      \"display_name\": \"Medication administration details\",\n      \"description\": \"Details regarding how a medication is administered, including route and frequency.\",\n      \"data_type\": \"text\",\n      \"categories\": null,\n      \"action\": \"review\",\n      \"parent_object\": \"medication_administration\",\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C163\",\n        \"C164\",\n        \"C165\"\n      ],\n      \"rationale\": \"Route and frequency are highly variable; a review of the text is safer than forced extraction into rigid categories for all medications.\"\n    },\n    {\n      \"local_id\": \"F09\",\n      \"canonical_name\": \"treatment_response_status\",\n      \"display_name\": \"Treatment response status\",\n      \"description\": \"The clinical assessment of how the patient responded to treatment.\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"partial response\",\n        \"progressive disease\",\n        \"complete response\",\n        \"stable disease\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C277\"\n      ],\n      \"rationale\": \"Standard clinical assessment of response.\"\n    },\n    {\n      \"local_id\": \"F10\",\n      \"canonical_name\": \"medication_use\",\n      \"display_name\": \"Medication use\",\n      \"description\": \"Presence of specific medications (e.g., Levetiracetam, Morphine, Ondansetron, Pembrolizumab, MET inhibitors).\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C143\",\n        \"C144\",\n        \"C168\",\n        \"C174\",\n        \"C199\",\n        \"C210\"\n      ],\n      \"rationale\": \"These are distinct medications; while they share a 'use' concept, they are clinically distinct variables. They are grouped here as a template for medication extraction.\"\n    }\n  ],\n  \"candidate_mappings\": [\n    {\n      \"candidate_id\": \"C002\",\n      \"local_id\": \"F01\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Both refer to adjuvant history.\"\n    },\n    {\n      \"candidate_id\": \"C003\",\n      \"local_id\": \"F01\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Both refer to adjuvant history.\"\n    },\n    {\n      \"candidate_id\": \"C039\",\n      \"local_id\": \"F02\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct extraction of care intent.\"\n    },\n    {\n      \"candidate_id\": \"C043\",\n      \"local_id\": \"F06\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Cycle interval is the same as cycle frequency.\"\n    },\n    {\n      \"candidate_id\": \"C044\",\n      \"local_id\": \"F03\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Specific regimen type.\"\n    },\n    {\n      \"candidate_id\": \"C052\",\n      \"local_id\": \"F04\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Count of cycles.\"\n    },\n    {\n      \"candidate_id\": \"C063\",\n      \"local_id\": \"F05\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Ordinal cycle number.\"\n    },\n    {\n      \"candidate_id\": \"C064\",\n      \"local_id\": \"F06\",\n      \"relation\": \"related_but_distinct\",\n      \"rationale\": \"Days since start is a different measurement than cycle interval.\"\n    },\n    {\n      \"candidate_id\": \"C073\",\n      \"local_id\": \"F06\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Frequency and interval are synonymous in this context.\"\n    },\n    {\n      \"candidate_id\": \"C104\",\n      \"local_id\": \"F07\",\n      \"relation\": \"subfield_of\",\n      \"rationale\": \"Binary indicator of growth factor use.\"\n    },\n    {\n      \"candidate_id\": \"C105\",\n      \"local_id\": \"F07\",\n      \"relation\": \"subfield_of\",\n      \"rationale\": \"Categorical setting of growth factor use.\"\n    },\n    {\n      \"candidate_id\": \"C143\",\n      \"local_id\": \"F10\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Specific medication use.\"\n    },\n    {\n      \"candidate_id\": \"C144\",\n      \"local_id\": \"F10\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Specific medication use.\"\n    },\n    {\n      \"candidate_id\": \"C163\",\n      \"local_id\": \"F08\",\n      \"relation\": \"subfield_of\",\n      \"rationale\": \"Frequency is part of administration details.\"\n    },\n    {\n      \"candidate_id\": \"C164\",\n      \"local_id\": \"F08\",\n      \"relation\": \"subfield_of\",\n      \"rationale\": \"Route is part of administration details.\"\n    },\n    {\n      \"candidate_id\": \"C165\",\n      \"local_id\": \"F08\",\n      \"relation\": \"subfield_of\",\n      \"rationale\": \"Frequency is part of administration details.\"\n    },\n    {\n      \"candidate_id\": \"C168\",\n      \"local_id\": \"F10\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Specific medication class use.\"\n    },\n    {\n      \"candidate_id\": \"C174\",\n      \"local_id\": \"F10\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Specific medication use.\"\n    },\n    {\n      \"candidate_id\": \"C195\",\n      \"local_id\": \"F04\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Total cycles is synonymous with number of cycles.\"\n    },\n    {\n      \"candidate_id\": \"C199\",\n      \"local_id\": \"F10\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Specific medication use.\"\n    },\n    {\n      \"candidate_id\": \"C210\",\n      \"local_id\": \"F10\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Specific medication use.\"\n    },\n    {\n      \"candidate_id\": \"C269\",\n      \"local_id\": \"F03\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Regimen type.\"\n    },\n    {\n      \"candidate_id\": \"C276\",\n      \"local_id\": \"F06\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Frequency is synonymous with interval.\"\n    },\n    {\n      \"candidate_id\": \"C277\",\n      \"local_id\": \"F09\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct extraction of response status.\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-920e3718b9caea0c",
+  "status": "complete",
+  "system_prompt": "You design conservative canonical clinical feature registries. The goal is to reduce redundant extraction while preserving clinically distinct variables. Use only supplied evidence. Return valid JSON only.",
+  "usage": {
+    "completion_tokens": 3230,
+    "prompt_tokens": 3515,
+    "prompt_tokens_details": null,
+    "total_tokens": 6745
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nDomain: systemic_treatments_medications\n\nHarmonize the following candidate feature names. Apply these distinctions carefully:\n\n- Merge true aliases that ask for the same patient-level variable.\n- Represent categories or values of one variable under one canonical feature when appropriate.\n- Mark a feature `derive` only when it can be calculated from other canonical base variables without reading the clinical text again.\n- Keep clinically related but non-equivalent measurements or findings separate.\n- Use `subfield_of` to connect distinct fields that belong to one reusable clinical object.\n- Drop only clear artifacts or redundant aliases. Use `review` when a safe extraction contract cannot be specified.\n- Preserve provenance: every candidate ID must map exactly once.\n- Do not assign a role in the clinical task.\n\nAllowed data types: [\"binary\", \"categorical\", \"continuous\", \"count\", \"ordinal\", \"text\"]\nAllowed actions: [\"derive\", \"drop\", \"extract\", \"review\"]\nAllowed mapping relations: [\"alias_of\", \"base_variable\", \"derived_from\", \"drop\", \"related_but_distinct\", \"review\", \"subfield_of\"]\n\nFor binary features, categories must be [\"absent\", \"present\", \"unknown\"]. For categorical or ordinal features, provide a conservative explicit category list including \"unknown\". Continuous and count features have no categories. Text features should normally be marked `review`, not `extract`.\n\nFor derivations, use this schema when executable; otherwise use operation `not_automated`:\n{\"operation\": \"ratio | threshold | category_map | not_automated\", \"inputs\": [\"canonical_name\"], \"parameters\": {}}\n\nCandidates:\n[{\"candidate_id\": \"C002\", \"name\": \"Adjuvant treatment history\", \"occurrence_count\": 2, \"topic_ranks\": [52, 94], \"representation_votes\": {\"binary\": 2}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Adjuvant therapy status\"], \"evidence_terms\": [\"adjuvant\"], \"feature_type_hints\": [\"treatment_context\"], \"represented_values_or_categories\": [\"adjuvant\"]}, {\"candidate_id\": \"C003\", \"name\": \"Adjuvant treatment setting\", \"occurrence_count\": 2, \"topic_ranks\": [32, 99], \"representation_votes\": {\"binary\": 2}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Adjuvant therapy status\"], \"evidence_terms\": [\"adjuvant\"], \"feature_type_hints\": [\"treatment_setting\", \"treatment_context\"], \"represented_values_or_categories\": [\"adjuvant\"]}, {\"candidate_id\": \"C039\", \"name\": \"Care intent\", \"occurrence_count\": 1, \"topic_ranks\": [91], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Treatment intent\"], \"evidence_terms\": [\"palliative\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"palliative\"]}, {\"candidate_id\": \"C043\", \"name\": \"Chemotherapy cycle interval\", \"occurrence_count\": 1, \"topic_ranks\": [95], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Chemotherapy cycle frequency\"], \"evidence_terms\": [\"every 21\", \"every 21 days\", \"21 days\", \"q21\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"21 days\"]}, {\"candidate_id\": \"C044\", \"name\": \"Chemotherapy regimen type\", \"occurrence_count\": 1, \"topic_ranks\": [95], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Chemotherapy regimen\"], \"evidence_terms\": [\"cycles of carboplatin\", \"+ pemetrexed\", \"plus\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"carboplatin + pemetrexed\"]}, {\"candidate_id\": \"C052\", \"name\": \"Completed chemotherapy cycles\", \"occurrence_count\": 1, \"topic_ranks\": [95], \"representation_votes\": {\"count\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Number of chemotherapy cycles\"], \"evidence_terms\": [\"four cycles\", \"four cycles of\", \"four\"], \"feature_type_hints\": [\"count\"], \"represented_values_or_categories\": [\"4\"]}, {\"candidate_id\": \"C063\", \"name\": \"Current chemotherapy cycle number\", \"occurrence_count\": 1, \"topic_ranks\": [15], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Treatment cycle number\"], \"evidence_terms\": [\"cycle 2\", \"cycle 3\"], \"feature_type_hints\": [\"ordinal\"], \"represented_values_or_categories\": [\"cycle 2\", \"cycle 3\"]}, {\"candidate_id\": \"C064\", \"name\": \"Days since start of cycle\", \"occurrence_count\": 1, \"topic_ranks\": [15], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"low\", \"supporting_specific_features\": [], \"evidence_terms\": [], \"feature_type_hints\": [], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C073\", \"name\": \"Dosing cycle frequency\", \"occurrence_count\": 1, \"topic_ranks\": [20], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [], \"evidence_terms\": [], \"feature_type_hints\": [], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C104\", \"name\": \"Growth factor administration\", \"occurrence_count\": 1, \"topic_ranks\": [65], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Growth factor support\"], \"evidence_terms\": [\"growth-factor\", \"growth-factor support <new\", \"growth-factor support\", \"with outpatient growth-factor\", \"outpatient growth-factor support\"], \"feature_type_hints\": [\"treatment\"], \"represented_values_or_categories\": [\"outpatient\"]}, {\"candidate_id\": \"C105\", \"name\": \"Growth factor setting\", \"occurrence_count\": 1, \"topic_ranks\": [65], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Growth factor support\"], \"evidence_terms\": [\"growth-factor\", \"growth-factor support <new\", \"growth-factor support\", \"with outpatient growth-factor\", \"outpatient growth-factor support\"], \"feature_type_hints\": [\"treatment\"], \"represented_values_or_categories\": [\"outpatient\"]}, {\"candidate_id\": \"C143\", \"name\": \"Levetiracetam use\", \"occurrence_count\": 1, \"topic_ranks\": [39], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Levetiracetam dosage\"], \"evidence_terms\": [\"levetiracetam\", \"levetiracetam 500 mg\", \"levetiracetam 500\", \"500 mg bid\"], \"feature_type_hints\": [\"medication_dosage\"], \"represented_values_or_categories\": [\"500 mg\", \"bid\"]}, {\"candidate_id\": \"C144\", \"name\": \"Lisinopril dosage\", \"occurrence_count\": 1, \"topic_ranks\": [13], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Lisinopril use\"], \"evidence_terms\": [\"on lisinopril 10\", \"controlled on lisinopril\"], \"feature_type_hints\": [\"medication\"], \"represented_values_or_categories\": [\"lisinopril\"]}, {\"candidate_id\": \"C163\", \"name\": \"Medication administration frequency\", \"occurrence_count\": 1, \"topic_ranks\": [92], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Medication dosing frequency\"], \"evidence_terms\": [\"po q8 h\", \"q8 h\", \"po q8\", \"mg po q8\", \"q8\", \"q8 h prn\", \"h prn\"], \"feature_type_hints\": [\"dosage_instruction\"], \"represented_values_or_categories\": [\"q8 h\", \"prn\"]}, {\"candidate_id\": \"C164\", \"name\": \"Medication administration route\", \"occurrence_count\": 1, \"topic_ranks\": [45], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Medication administration route\"], \"evidence_terms\": [\"po q6\", \"mg po q6\", \"po q6 h\", \"po q8 h\", \"mg po q8\", \"po q8\"], \"feature_type_hints\": [\"route\"], \"represented_values_or_categories\": [\"oral (po)\"]}, {\"candidate_id\": \"C165\", \"name\": \"Medication dosing frequency\", \"occurrence_count\": 1, \"topic_ranks\": [45], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Medication administration frequency\"], \"evidence_terms\": [\"q6 h prn\", \"h prn\", \"q6\", \"q6 h\", \"q8 h\", \"q8\"], \"feature_type_hints\": [\"frequency\"], \"represented_values_or_categories\": [\"every 6 hours\", \"every 8 hours\", \"as needed (prn)\"]}, {\"candidate_id\": \"C168\", \"name\": \"MET inhibitor therapy\", \"occurrence_count\": 1, \"topic_ranks\": [42], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Capmatinib use\", \"Tepotinib use\"], \"evidence_terms\": [\"capmatinib\", \"e.g. capmatinib\", \"inhibitors e.g. capmatinib\", \"tepotinib\", \"capmatinib tepotinib\"], \"feature_type_hints\": [\"medication\"], \"represented_values_or_categories\": [\"use\"]}, {\"candidate_id\": \"C174\", \"name\": \"Morphine use\", \"occurrence_count\": 1, \"topic_ranks\": [9], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Morphine administration\"], \"evidence_terms\": [\"oral morphine\", \"morphine\", \"low-dose oral morphine\", \"low-dose oral\", \"mg iv\"], \"feature_type_hints\": [\"medication\"], \"represented_values_or_categories\": [\"oral\", \"iv\", \"low-dose\"]}, {\"candidate_id\": \"C195\", \"name\": \"Number of treatment cycles\", \"occurrence_count\": 1, \"topic_ranks\": [32], \"representation_votes\": {\"count\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Treatment cycle count\"], \"evidence_terms\": [\"by four cycles\", \"by four\", \"followed by four\"], \"feature_type_hints\": [\"dosage_or_duration\"], \"represented_values_or_categories\": [\"4 cycles\"]}, {\"candidate_id\": \"C199\", \"name\": \"Ondansetron administration\", \"occurrence_count\": 1, \"topic_ranks\": [91], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Ondansetron dosage\"], \"evidence_terms\": [\"ondansetron 4\", \"ondansetron 4 mg\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"4 mg\"]}, {\"candidate_id\": \"C210\", \"name\": \"Pembrolizumab use\", \"occurrence_count\": 1, \"topic_ranks\": [35], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Pembrolizumab administration\"], \"evidence_terms\": [\"pembro\"], \"feature_type_hints\": [\"medication\"], \"represented_values_or_categories\": [\"pembrolizumab\"]}, {\"candidate_id\": \"C269\", \"name\": \"Taxane-based regimen use\", \"occurrence_count\": 1, \"topic_ranks\": [65], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Taxane-based chemotherapy\"], \"evidence_terms\": [\"taxane-based\"], \"feature_type_hints\": [\"treatment_regimen\"], \"represented_values_or_categories\": [\"taxane-based\"]}, {\"candidate_id\": \"C276\", \"name\": \"Treatment cycle frequency\", \"occurrence_count\": 1, \"topic_ranks\": [35], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Intravenous dosing frequency\"], \"evidence_terms\": [\"iv q3 weeks\", \"iv q3\", \"q3\", \"q3 weeks\", \"mg iv q3\"], \"feature_type_hints\": [\"dosage_schedule\"], \"represented_values_or_categories\": [\"q3 weeks\"]}, {\"candidate_id\": \"C277\", \"name\": \"Treatment response status\", \"occurrence_count\": 1, \"topic_ranks\": [95], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Treatment response\"], \"evidence_terms\": [\"a partial\", \"a partial response\", \"partial response per\", \"progressive disease after\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"partial response\", \"progressive disease\"]}]\n\nReturn:\n{\n  \"canonical_features\": [\n    {\n      \"local_id\": \"F01\",\n      \"canonical_name\": \"snake_case_name\",\n      \"display_name\": \"Readable name\",\n      \"description\": \"Precise extraction definition with aliases where useful\",\n      \"data_type\": \"binary | categorical | ordinal | continuous | count | text\",\n      \"categories\": [\"value\"] or null,\n      \"action\": \"extract | derive | drop | review\",\n      \"parent_object\": \"optional snake_case object name\" or null,\n      \"aliases\": [\"source wording\"],\n      \"derivation\": object or null,\n      \"source_candidate_ids\": [\"C001\"],\n      \"rationale\": \"short explanation\"\n    }\n  ],\n  \"candidate_mappings\": [\n    {\n      \"candidate_id\": \"C001\",\n      \"local_id\": \"F01\",\n      \"relation\": \"alias_of | base_variable | derived_from | subfield_of | related_but_distinct | drop | review\",\n      \"rationale\": \"short explanation\"\n    }\n  ]\n}"
+}

@@ -1,0 +1,288 @@
+candidate_id,rationale,relation,canonical_id,source_name,source_topic_ranks
+C001,C001 is the canonical name for ANC.,alias_of,laboratory_vitals__absolute_neutrophil_count,Absolute Neutrophil Count,"33,96"
+C002,Both refer to adjuvant history.,alias_of,systemic_treatments_medications__adjuvant_treatment_history,Adjuvant treatment history,"52,94"
+C003,Both refer to adjuvant history.,alias_of,systemic_treatments_medications__adjuvant_treatment_history,Adjuvant treatment setting,"32,99"
+C004,Alias for adrenal gland metastasis.,alias_of,imaging_disease_sites__adrenal_gland_metastasis,Adrenal gland metastasis,31
+C005,Alias for adrenal gland metastasis.,alias_of,imaging_disease_sites__adrenal_gland_metastasis,Adrenal metastasis presence,69
+C006,Age is a standard demographic variable.,alias_of,demographics_social__age,Age,"16,29,48,71,76,77,80"
+C007,Directly maps to alcohol intake frequency.,base_variable,demographics_social__alcohol_intake_frequency,Alcohol intake frequency,"37,98"
+C008,Direct mapping to ALK status.,base_variable,molecular_biomarkers__alk_mutation_status,ALK mutation status,41
+C009,Alias for ambulation status.,alias_of,functional_performance__ambulation_status,Ambulation Ability,23
+C010,Alias for ambulation status.,alias_of,functional_performance__ambulation_status,Ambulatory capacity,56
+C011,Refers to lung/nodule location.,alias_of,imaging_disease_sites__lung_nodule_location,Anatomical location,7
+C012,Alias for brain metastasis location.,alias_of,imaging_disease_sites__brain_metastasis_location,Anatomical location of brain metastases,"27,74"
+C013,Alias for brain metastasis location.,alias_of,imaging_disease_sites__brain_metastasis_location,Anatomical site of brain metastasis,85
+C014,Direct extraction of anemia status.,base_variable,laboratory_vitals__anemia_status,Anemia status,79
+C015,Anxiety severity is a more specific version of anxiety status.,alias_of,symptoms_patient_reported__anxiety_severity,Anxiety severity,3
+C016,Anxiety status is the base concept.,base_variable,symptoms_patient_reported__anxiety_severity,Anxiety status,"1,9"
+C017,"ADC is a measurement related to FDG/SUV context, but here treated as a separate continuous value if needed; however, SUVmax is the primary quantitative feature.",alias_of,imaging_disease_sites__suvmax,Apparent Diffusion Coefficient (ADC) value,43
+C018,Direct symptom.,base_variable,symptoms_patient_reported__appetite_loss,Appetite loss,25
+C019,AST is an alias for Aspartate Aminotransferase.,alias_of,laboratory_vitals__aspartate_aminotransferase,AST,46
+C020,AST level is an alias for AST.,alias_of,laboratory_vitals__aspartate_aminotransferase,AST level,"2,82"
+C021,"Cardiac function is a status/finding, not a specific lab measurement like AST.",related_but_distinct,laboratory_vitals__aspartate_aminotransferase,Baseline cardiac function status,30
+C022,"Pulmonary function status is a clinical assessment, whereas DLCO is a specific measurement.",related_but_distinct,laboratory_vitals__dlco,Baseline pulmonary function status,30
+C023,Biological sex is a synonym for sex in this context.,alias_of,demographics_social__biological_sex,Biological sex,"37,72,98"
+C024,Redundant alias for biological sex.,alias_of,demographics_social__biological_sex,biological_sex,67
+C025,BUN is a standard lab measurement.,base_variable,laboratory_vitals__blood_urea_nitrogen,Blood Urea Nitrogen,"58,82"
+C026,BMI is a distinct measurement.,base_variable,demographics_social__body_mass_index,Body Mass Index,62
+C027,Weight is a base measurement.,base_variable,demographics_social__body_weight,Body weight,62
+C028,Describes the same clinical finding of bone pain/metastasis.,alias_of,symptoms_patient_reported__bone_pain,Bone pain or symptomatic bone metastasis,34
+C029,Describes the same clinical finding of bone pain.,alias_of,symptoms_patient_reported__bone_pain,Bone pain presence,9
+C030,Alias for brain lesion diameter.,alias_of,imaging_disease_sites__brain_lesion_diameter,Brain lesion diameter,14
+C031,Alias for brain metastasis location.,alias_of,imaging_disease_sites__brain_metastasis_location,Brain lesion location,"14,100"
+C032,Alias for brain metastasis presence.,alias_of,imaging_disease_sites__brain_metastasis_presence,Brain metastases presence,39
+C033,Alias for brain metastasis location.,alias_of,imaging_disease_sites__brain_metastasis_location,Brain metastasis location,"4,53,55"
+C034,Alias for brain metastasis presence.,alias_of,imaging_disease_sites__brain_metastasis_presence,Brain metastasis presence,"11,77"
+C035,Alias for brain metastasis presence.,alias_of,imaging_disease_sites__brain_metastasis_presence,Brain metastasis status by MRI,18
+C036,Alias for lesion calcification.,alias_of,imaging_disease_sites__lesion_calcification,Calcification presence,76
+C037,Directly represents the diagnosis date.,base_variable,diagnosis_stage_histology__cancer_diagnosis_date,Cancer Diagnosis Date,90
+C038,Base variable for cancer stage.,base_variable,diagnosis_stage_histology__cancer_stage,Cancer Stage,"80,83,90"
+C039,Direct extraction of care intent.,base_variable,systemic_treatments_medications__care_intent,Care intent,91
+C040,Part of CDKN2A status.,alias_of,molecular_biomarkers__cdkn2a_status,CDKN2A deletion status,50
+C041,Specific type of CDKN2A status.,alias_of,molecular_biomarkers__cdkn2a_status,CDKN2A homozygous deletion,41
+C042,Part of CDKN2A status.,alias_of,molecular_biomarkers__cdkn2a_status,CDKN2A mutation status,86
+C043,Cycle interval is the same as cycle frequency.,alias_of,systemic_treatments_medications__chemotherapy_cycle_interval,Chemotherapy cycle interval,95
+C044,Specific regimen type.,base_variable,systemic_treatments_medications__chemotherapy_regimen_type,Chemotherapy regimen type,95
+C045,Direct symptom.,base_variable,symptoms_patient_reported__chest_pain,Chest pain,17
+C046,Direct symptom.,base_variable,symptoms_patient_reported__chills,Chills,17
+C047,Direct mapping to CK5 IHC.,base_variable,molecular_biomarkers__ck5_expression_status,CK5 immunohistochemistry status,28
+C048,Clinical stage is a type of cancer stage.,alias_of,diagnosis_stage_histology__cancer_stage,Clinical Stage,86
+C049,General term for cognitive function score.,alias_of,functional_performance__cognitive_function_score,Cognitive function,25
+C050,The primary score variable.,base_variable,functional_performance__cognitive_function_score,Cognitive function score,8
+C051,CBC is a high-level test container.,base_variable,laboratory_vitals__complete_blood_count,Complete Blood Count,61
+C052,Count of cycles.,base_variable,systemic_treatments_medications__chemotherapy_cycle_count,Completed chemotherapy cycles,95
+C053,Direct symptom.,base_variable,symptoms_patient_reported__constipation,Constipation,25
+C054,Constipation incidence is a variation of constipation presence.,alias_of,symptoms_patient_reported__constipation,Constipation incidence,8
+C055,Refers to MRI modality.,alias_of,imaging_disease_sites__imaging_modality,Contrast-enhanced MRI status,89
+C056,Base cough symptom.,base_variable,symptoms_patient_reported__cough,Cough,"3,54,79"
+C057,Cough frequency is a characteristic of cough.,alias_of,symptoms_patient_reported__cough,Cough frequency,17
+C058,Cough severity is a characteristic of cough.,alias_of,symptoms_patient_reported__cough,Cough severity,20
+C059,Cough type is a characteristic of cough.,alias_of,symptoms_patient_reported__cough,Cough severity/type,10
+C060,Alias for brain lesion count.,alias_of,imaging_disease_sites__brain_lesion_count,Count of enhancing brain lesions,53
+C061,Text-derived CT findings are too broad for a canonical feature.,review,imaging_disease_sites__unclassified_ct_findings,CT imaging findings,37
+C062,Refers to imaging modality.,alias_of,imaging_disease_sites__imaging_modality,CT imaging type,19
+C063,Ordinal cycle number.,base_variable,systemic_treatments_medications__current_chemotherapy_cycle_number,Current chemotherapy cycle number,15
+C064,Days since start is a different measurement than cycle interval.,related_but_distinct,systemic_treatments_medications__chemotherapy_cycle_interval,Days since start of cycle,15
+C065,Identifies the diagnosis type.,base_variable,diagnosis_stage_histology__diagnosis_type,Diagnosis Type,16
+C066,Direct symptom.,base_variable,symptoms_patient_reported__diarrhea,Diarrhea,"2,25"
+C067,Diarrhea incidence is a variation of diarrhea presence.,alias_of,symptoms_patient_reported__diarrhea,Diarrhea incidence,8
+C068,Refers to imaging modality (DWI).,alias_of,imaging_disease_sites__imaging_modality,Diffusion-Weighted Imaging (DWI) availability,43
+C069,Base variable for recurrence status.,base_variable,diagnosis_stage_histology__disease_recurrence_status,Disease recurrence status,"26,66"
+C070,Direct symptom.,base_variable,symptoms_patient_reported__dizziness,Dizziness,47
+C071,DLCO is the canonical name.,alias_of,laboratory_vitals__dlco,DLCO,83
+C072,DLCO measurement is an alias.,alias_of,laboratory_vitals__dlco,DLCO measurement,30
+C073,Frequency and interval are synonymous in this context.,alias_of,systemic_treatments_medications__chemotherapy_cycle_interval,Dosing cycle frequency,20
+C074,Dry cough is a type of cough.,alias_of,symptoms_patient_reported__cough,Dry cough,88
+C075,Base dyspnea symptom.,base_variable,symptoms_patient_reported__dyspnea,Dyspnea,"3,40,54"
+C076,Dyspnea severity is a characteristic of dyspnea.,alias_of,symptoms_patient_reported__dyspnea,Dyspnea severity,38
+C077,Standardized ECOG scale.,base_variable,functional_performance__ecog_performance_status,ECOG Performance Status,"9,23"
+C078,eGFR is an alias for estimated glomerular filtration rate.,alias_of,laboratory_vitals__estimated_glomerular_filtration_rate,eGFR,44
+C079,Direct mapping to EGFR amplification.,base_variable,molecular_biomarkers__egfr_amplification_status,EGFR amplification status,10
+C080,Specific EGFR mutation variant.,alias_of,molecular_biomarkers__egfr_mutation_status,EGFR L858R mutation status,84
+C081,General EGFR mutation status.,alias_of,molecular_biomarkers__egfr_mutation_status,EGFR mutation status,"41,42"
+C082,General EGFR mutation/deletion status.,alias_of,molecular_biomarkers__egfr_mutation_status,EGFR mutation/deletion status,50
+C083,General term for emotional function score.,alias_of,functional_performance__emotional_function_score,Emotional function,25
+C084,The primary score variable.,base_variable,functional_performance__emotional_function_score,Emotional function score,8
+C085,Creatinine clearance is a distinct renal measurement.,alias_of,laboratory_vitals__creatinine_clearance,Estimated Creatinine Clearance,"46,64"
+C086,eGFR is an alias.,alias_of,laboratory_vitals__estimated_glomerular_filtration_rate,estimated glomerular filtration rate (eGFR),72
+C087,Evidence of recurrence is an indicator of status.,alias_of,diagnosis_stage_histology__disease_recurrence_status,Evidence of disease recurrence,60
+C088,Extra-axial fluid collection is a specific finding that may require review.,review,imaging_disease_sites__unclassified_extra_axial_findings,Extra-axial fluid collection status,97
+C089,Fatigue is the base concept for fatigue severity.,alias_of,symptoms_patient_reported__fatigue_severity,Fatigue,40
+C090,Fatigue severity is the specific variable.,base_variable,symptoms_patient_reported__fatigue_severity,Fatigue severity,"6,23,35"
+C091,Alias for FDG avidity.,alias_of,imaging_disease_sites__fdg_avidity,FDG avidity status,"12,93"
+C092,Alias for FDG avidity.,alias_of,imaging_disease_sites__fdg_avidity,FDG-avidity,19
+C093,Direct symptom.,base_variable,symptoms_patient_reported__fever,Fever,17
+C094,Direct symptom.,base_variable,symptoms_patient_reported__focal_neurological_deficit,Focal neurological deficit,47
+C095,Describes functional status limitations.,alias_of,functional_performance__functional_status,Functional Limitation Status,23
+C096,Describes functional mobility/tolerance.,alias_of,functional_performance__functional_status,Functional mobility/exercise tolerance,38
+C097,General functional status.,base_variable,functional_performance__functional_status,Functional status,"40,54"
+C098,Describes functional status limitations.,alias_of,functional_performance__functional_status,Functional status limitation,57
+C099,Gait deficit is a type of focal neurological deficit.,alias_of,symptoms_patient_reported__focal_neurological_deficit,Gait deficit presence,39
+C100,Direct mapping to germline status.,base_variable,molecular_biomarkers__germline_mutation_status,Germline Mutation Status,16
+C101,Global health status measurement.,base_variable,functional_performance__global_health_status,Global health status,6
+C102,GFR proxy is an alias for eGFR.,alias_of,laboratory_vitals__estimated_glomerular_filtration_rate,Glomerular Filtration Rate,58
+C103,C103 is the primary source for the documentation status feature.,base_variable,administrative_artifact__goals_of_care_documentation,Goals of care documentation,57
+C104,Binary indicator of growth factor use.,subfield_of,systemic_treatments_medications__growth_factor_support,Growth factor administration,65
+C105,Categorical setting of growth factor use.,subfield_of,systemic_treatments_medications__growth_factor_support,Growth factor setting,65
+C106,Direct symptom.,base_variable,symptoms_patient_reported__headache,Headache,47
+C107,Heart rate is a vital sign.,base_variable,laboratory_vitals__heart_rate,Heart rate,54
+C108,Hemoglobin level is an alias.,alias_of,laboratory_vitals__hemoglobin,Hemoglobin,79
+C109,Hemoglobin level is an alias.,alias_of,laboratory_vitals__hemoglobin,Hemoglobin level,"64,75"
+C110,Direct symptom.,base_variable,symptoms_patient_reported__hemoptysis,Hemoptysis,"3,38,66"
+C111,Hepatic segment location.,alias_of,imaging_disease_sites__hepatic_lesion_location,Hepatic lesion location,51
+C112,Base variable for histology.,base_variable,diagnosis_stage_histology__histologic_subtype,Histologic subtype,59
+C113,Histological subtype is an alias for histology.,alias_of,diagnosis_stage_histology__histologic_subtype,Histological subtype,81
+C114,Specific subtype mention.,alias_of,diagnosis_stage_histology__histologic_subtype,Histological subtype: Adenocarcinoma,94
+C115,Histology is an alias for histologic subtype.,alias_of,diagnosis_stage_histology__histologic_subtype,Histology,78
+C116,Histology of lung tumor is an alias.,alias_of,diagnosis_stage_histology__histologic_subtype,Histology of lung tumor,52
+C117,Histology subtype is an alias.,alias_of,diagnosis_stage_histology__histologic_subtype,Histology subtype,86
+C118,Direct match.,base_variable,procedures_surgery_radiation__history_of_blood_transfusion,History of blood transfusion,79
+C119,Specific lobectomy type is a subset of lobectomy history.,alias_of,procedures_surgery_radiation__history_of_lobectomy,History of left lower lobectomy,52
+C120,General lobectomy history.,alias_of,procedures_surgery_radiation__history_of_lobectomy,History of lobectomy,"66,87,99"
+C121,Specific lobectomy type is a subset of lobectomy history.,alias_of,procedures_surgery_radiation__history_of_lobectomy,History of lower lobectomy,94
+C122,Direct match for palliative radiation.,base_variable,procedures_surgery_radiation__history_of_palliative_radiation_therapy,History of palliative radiation therapy,36
+C123,Direct match for SRS.,base_variable,procedures_surgery_radiation__history_of_stereotactic_radiosurgery,History of stereotactic radiosurgery,"53,55,63,100"
+C124,SRS for brain metastases is a type of SRS.,alias_of,procedures_surgery_radiation__history_of_stereotactic_radiosurgery,History of stereotactic radiosurgery for brain metastases,74
+C125,Direct match for WBRT.,base_variable,procedures_surgery_radiation__history_of_whole_brain_radiation_therapy,History of whole-brain radiation therapy,27
+C126,Hyperlipidemia status is a clinical finding.,base_variable,laboratory_vitals__hyperlipidemia_status,Hyperlipidemia presence,13
+C127,Hypertension control is a categorical status.,base_variable,laboratory_vitals__hypertension_control_status,Hypertension control status,13
+C128,Refers to imaging modality (SWI).,alias_of,imaging_disease_sites__imaging_modality,Imaging modality used,14
+C129,Alias for brain metastasis presence.,alias_of,imaging_disease_sites__brain_metastasis_presence,Intracranial metastasis,49
+C130,Alias for brain metastasis presence.,alias_of,imaging_disease_sites__brain_metastasis_presence,Intracranial metastasis presence,9
+C131,Alias for brain lesion enhancement.,alias_of,imaging_disease_sites__brain_lesion_enhancement,Intracranial metastatic enhancement,75
+C132,Direct mapping to Ki-67.,base_variable,molecular_biomarkers__ki67_index,Ki-67 index,75
+C133,Specific KRAS mutation.,alias_of,molecular_biomarkers__kras_mutation_status,KRAS G12C mutation status,"21,46,68"
+C134,General KRAS status.,alias_of,molecular_biomarkers__kras_mutation_status,KRAS mutation status,"11,41,50,59,68,86"
+C135,Alias for brain lesion diameter.,alias_of,imaging_disease_sites__brain_lesion_diameter,Largest brain lesion diameter,55
+C136,Alias for hepatic lesion diameter.,alias_of,imaging_disease_sites__hepatic_lesion_diameter,Largest hepatic lesion diameter,51
+C137,Alias for brain metastasis location.,alias_of,imaging_disease_sites__brain_metastasis_location,Laterality of brain metastasis,85
+C138,LDH is a standard lab measurement.,base_variable,laboratory_vitals__lactate_dehydrogenase,LDH level,54
+C139,Alias for adrenal gland metastasis.,alias_of,imaging_disease_sites__adrenal_gland_metastasis,Left adrenal metastasis,69
+C140,Alias for lung nodule diameter.,alias_of,imaging_disease_sites__lung_nodule_diameter,Lesion diameter,4
+C141,Alias for lesion enhancement pattern.,alias_of,imaging_disease_sites__lung_nodule_characteristics,Lesion enhancement pattern,2
+C142,Alias for lesion enhancement status.,alias_of,imaging_disease_sites__lung_nodule_characteristics,Lesion enhancement status,4
+C143,Specific medication use.,base_variable,systemic_treatments_medications__medication_use,Levetiracetam use,39
+C144,Specific medication use.,base_variable,systemic_treatments_medications__medication_use,Lisinopril dosage,13
+C145,Alias for liver metastasis.,alias_of,imaging_disease_sites__liver_metastasis,Liver metastasis,31
+C146,Living arrangement is a social determinant.,base_variable,demographics_social__living_arrangement,Living arrangement,"29,88,98"
+C147,Lobectomy performed is a subset of lobectomy history.,alias_of,procedures_surgery_radiation__history_of_lobectomy,Lobectomy performed,"32,73"
+C148,Dissection extent is part of dissection status.,alias_of,procedures_surgery_radiation__lymph_node_dissection_status,Lymph node dissection extent,26
+C149,Dissection status is the canonical variable.,alias_of,procedures_surgery_radiation__lymph_node_dissection_status,Lymph node dissection status,"52,73,97"
+C150,Low confidence and no evidence terms provided.,review,diagnosis_stage_histology__lymph_node_involvement,Lymph Node Involvement,46
+C151,Alias for lymph node metastasis.,alias_of,imaging_disease_sites__lymph_node_metastasis,Lymph node metastasis,31
+C152,Alias for lymph node short axis diameter.,alias_of,imaging_disease_sites__lymph_node_short_axis_diameter,Lymph node short axis diameter,22
+C153,Alias for lymph node metastasis.,alias_of,imaging_disease_sites__lymph_node_metastasis,Lymphadenopathy presence,76
+C154,Marital status is a distinct demographic variable.,base_variable,demographics_social__marital_status,Marital status,29
+C155,Primary candidate for maternal history.,base_variable,other__maternal_breast_cancer_history,Maternal history of breast cancer,48
+C156,Alias for SUVmax.,alias_of,imaging_disease_sites__suvmax,Maximum SUV (SUVmax),12
+C157,Mediastinal dissection is a specific category of dissection status.,alias_of,procedures_surgery_radiation__lymph_node_dissection_status,Mediastinal lymph node dissection,94
+C158,Mediastinal dissection is a specific category of dissection status.,alias_of,procedures_surgery_radiation__lymph_node_dissection_status,Mediastinal lymph node dissection performed,"32,99"
+C159,Alias for mediastinal/hilar lymphadenopathy.,alias_of,imaging_disease_sites__mediastinal_hilar_lymphadenopathy,Mediastinal or Hilar Lymphadenopathy,82
+C160,Alias for mediastinal/hilar lymphadenopathy.,alias_of,imaging_disease_sites__mediastinal_hilar_lymphadenopathy,Mediastinal or hilar lymphadenopathy status,22
+C161,Alias for mediastinal/hilar lymphadenopathy.,alias_of,imaging_disease_sites__mediastinal_hilar_lymphadenopathy,Mediastinal/Hilar Lymph Node Involvement,83
+C162,Alias for mediastinal/hilar lymphadenopathy.,alias_of,imaging_disease_sites__mediastinal_hilar_lymphadenopathy,Mediastinal/Hilar lymphadenopathy,"24,31"
+C163,Frequency is part of administration details.,subfield_of,systemic_treatments_medications__medication_administration_details,Medication administration frequency,92
+C164,Route is part of administration details.,subfield_of,systemic_treatments_medications__medication_administration_details,Medication administration route,45
+C165,Frequency is part of administration details.,subfield_of,systemic_treatments_medications__medication_administration_details,Medication dosing frequency,45
+C166,Part of MET genomic status.,alias_of,molecular_biomarkers__met_genomic_status,MET amplification status,"42,68"
+C167,Direct mapping to MET copy number.,base_variable,molecular_biomarkers__met_copy_number,MET copy number,68
+C168,Specific medication class use.,base_variable,systemic_treatments_medications__medication_use,MET inhibitor therapy,42
+C169,Part of MET genomic status.,alias_of,molecular_biomarkers__met_genomic_status,MET loss status,42
+C170,Alias for brain metastasis location.,alias_of,imaging_disease_sites__brain_metastasis_location,Metastatic site: Cerebellum,63
+C171,Alias for brain metastasis location.,alias_of,imaging_disease_sites__brain_metastasis_location,Metastatic site: Frontal lobe,63
+C172,Base variable for mitotic activity.,base_variable,diagnosis_stage_histology__mitotic_activity,Mitotic activity,59
+C173,Driver status is a subset of KRAS mutation status.,alias_of,molecular_biomarkers__kras_mutation_status,Molecular profile driver status,21
+C174,Specific medication use.,base_variable,systemic_treatments_medications__medication_use,Morphine use,9
+C175,"Myelosuppression is a broad clinical finding, whereas Neutropenia grade is a specific measurement.",related_but_distinct,laboratory_vitals__neutropenia_grade,Myelosuppression,24
+C176,Napsin A expression status.,alias_of,molecular_biomarkers__napsin_a_expression,Napsin A expression,"78,81"
+C177,Napsin A expression status.,alias_of,molecular_biomarkers__napsin_a_expression,Napsin A status,59
+C178,Nausea presence is part of nausea severity.,alias_of,symptoms_patient_reported__nausea_severity,Nausea,"2,40"
+C179,Nausea grade is a synonym for nausea severity.,alias_of,symptoms_patient_reported__nausea_severity,Nausea grade,24
+C180,Nausea severity is the specific variable.,alias_of,symptoms_patient_reported__nausea_severity,Nausea severity,6
+C181,Neurological exam finding.,base_variable,functional_performance__neurological_exam_status,Neurological exam status,47
+C182,Neurological focal deficits is a synonym for focal neurological deficit.,alias_of,symptoms_patient_reported__focal_neurological_deficit,Neurological focal deficits,"24,49"
+C183,Neutropenia (the condition) is related to but distinct from the grade (the ordinal value).,related_but_distinct,laboratory_vitals__neutropenia_grade,Neutropenia,79
+C184,Neutropenia grade is the canonical ordinal feature.,base_variable,laboratory_vitals__neutropenia_grade,Neutropenia grade,20
+C185,Alias for lung nodule diameter.,alias_of,imaging_disease_sites__lung_nodule_diameter,New pulmonary nodule diameter,60
+C186,Alias for lymph node metastasis.,alias_of,imaging_disease_sites__lymph_node_metastasis,Nodal involvement status,11
+C187,Alias for lymph node metastasis.,alias_of,imaging_disease_sites__lymph_node_metastasis,Nodal Metastasis Status,16
+C188,Alias for lesion calcification.,alias_of,imaging_disease_sites__lesion_calcification,Nodule calcification,70
+C189,Alias for lung nodule enhancement.,alias_of,imaging_disease_sites__lung_nodule_characteristics,Nodule enhancement status,60
+C190,Alias for lung nodule location.,alias_of,imaging_disease_sites__lung_nodule_location,Nodule location,70
+C191,Alias for lung nodule morphology.,alias_of,imaging_disease_sites__lung_nodule_characteristics,Nodule morphology,70
+C192,NSCLC histological subtype is an alias.,alias_of,diagnosis_stage_histology__histologic_subtype,NSCLC histological subtype,28
+C193,NSCLC Histology is an alias.,alias_of,diagnosis_stage_histology__histologic_subtype,NSCLC Histology,82
+C194,Direct match for radiation fractions.,base_variable,procedures_surgery_radiation__radiation_fractionation_count,Number of radiation fractions,100
+C195,Total cycles is synonymous with number of cycles.,alias_of,systemic_treatments_medications__chemotherapy_cycle_count,Number of treatment cycles,32
+C196,Primary candidate for tumor response.,base_variable,other__objective_tumor_response,Objective tumor response,35
+C197,Occupation is a distinct demographic variable.,base_variable,demographics_social__occupation,Occupation,48
+C198,Occupational function assessment.,base_variable,functional_performance__occupational_functional_status,Occupational functional status,56
+C199,Specific medication use.,base_variable,systemic_treatments_medications__medication_use,Ondansetron administration,91
+C200,Alias for osteoblastic bone lesion.,alias_of,imaging_disease_sites__osteoblastic_lesion,Osteoblastic bone lesions,49
+C201,Direct mapping to p40 IHC.,base_variable,molecular_biomarkers__p40_expression_status,p40 immunohistochemistry status,28
+C202,Pain is the base concept for pain severity.,alias_of,symptoms_patient_reported__pain_severity,Pain,40
+C203,Pain severity is the specific variable.,base_variable,symptoms_patient_reported__pain_severity,Pain severity,6
+C204,Primary candidate for palliative care status.,base_variable,other__palliative_care_involvement,Palliative Care Status,"5,84"
+C205,Direct symptom.,base_variable,symptoms_patient_reported__palpitations,Palpitations,3
+C206,Patient age is an alias for age.,alias_of,demographics_social__age,Patient age,20
+C207,Direct mapping to PD-L1 amplification.,base_variable,molecular_biomarkers__pd_l1_amplification_status,PD-L1 amplification status,10
+C208,Direct mapping to PD-L1 expression level.,base_variable,molecular_biomarkers__pd_l1_expression,PD-L1 expression,20
+C209,PD-L1 expression status.,alias_of,molecular_biomarkers__pd_l1_expression,PD-L1 expression status,"42,68"
+C210,Specific medication use.,base_variable,systemic_treatments_medications__medication_use,Pembrolizumab use,35
+C211,Alias for perilesional edema.,alias_of,imaging_disease_sites__brain_perilesional_edema,Perilesional edema presence,53
+C212,Physical function score.,base_variable,functional_performance__physical_function_score,Physical function score,8
+C213,Platelet count is a standard lab measurement.,base_variable,laboratory_vitals__platelet_count,Platelet count,"2,44,75,88"
+C214,Alias for pleural effusion.,alias_of,imaging_disease_sites__pleural_effusion,Pleural effusion,31
+C215,Post-operative changes are related to surgical status but are findings rather than status.,related_but_distinct,procedures_surgery_radiation__radiation_oncology_involvement,Post-operative surgical changes,87
+C216,Post-surgical status is the canonical variable.,alias_of,procedures_surgery_radiation__radiation_oncology_involvement,Post-surgical status,99
+C217,Direct match.,base_variable,procedures_surgery_radiation__postoperative_mediastinal_radiation,Postoperative mediastinal radiation,73
+C218,Potassium is an electrolyte.,base_variable,laboratory_vitals__potassium,Potassium,61
+C219,Direct match for lab status.,base_variable,procedures_surgery_radiation__pre_cycle_laboratory_status,Pre-cycle laboratory status,15
+C220,Alias for brain metastasis presence.,alias_of,imaging_disease_sites__brain_metastasis_presence,Presence of brain metastases,"27,53,55,63,74,85"
+C221,Presence of diarrhea is a variation of diarrhea.,alias_of,symptoms_patient_reported__diarrhea,Presence of diarrhea,64
+C222,Alias for brain lesion enhancement.,alias_of,imaging_disease_sites__brain_lesion_enhancement,Presence of enhancing brain lesions,14
+C223,Alias for FDG avidity.,alias_of,imaging_disease_sites__fdg_avidity,Presence of FDG-avid lesions,75
+C224,Alias for liver metastasis.,alias_of,imaging_disease_sites__liver_metastasis,Presence of hepatic metastasis,51
+C225,Alias for brain metastasis presence.,alias_of,imaging_disease_sites__brain_metastasis_presence,Presence of intracranial metastases,24
+C226,Alias for mass effect.,alias_of,imaging_disease_sites__mass_effect,Presence of mass effect,53
+C227,Alias for pleural effusion.,alias_of,imaging_disease_sites__pleural_effusion,Presence of mediastinal thickening or effusion,22
+C228,Alias for imaging modality.,alias_of,imaging_disease_sites__imaging_modality,"Presence of MRI sequences (T1, T2, FLAIR, DWI)",89
+C229,"Refers to presence of a specific type of nodule, which is a subset of nodule characteristics.",related_but_distinct,imaging_disease_sites__lung_nodule_characteristics,Presence of new solid pulmonary nodule,60
+C230,Alias for perilesional edema.,alias_of,imaging_disease_sites__brain_perilesional_edema,Presence of peritumoral edema,27
+C231,Direct symptom.,base_variable,symptoms_patient_reported__rash,Presence of rash,1
+C232,Presence of residual/recurrent disease is a status indicator.,alias_of,diagnosis_stage_histology__disease_recurrence_status,Presence of residual or recurrent disease,87
+C233,Alias for splenic metastasis.,alias_of,imaging_disease_sites__splenic_metastasis,Presence of splenic lesion,51
+C234,Alias for perilesional edema.,alias_of,imaging_disease_sites__brain_perilesional_edema,Presence of surrounding edema,100
+C235,Presence of vomiting is a variation of vomiting.,base_variable,symptoms_patient_reported__vomiting,Presence of vomiting,64
+C236,Base variable for tumor location.,base_variable,diagnosis_stage_histology__tumor_anatomical_location,Primary tumor anatomical location,11
+C237,Direct match for radiation dose.,base_variable,procedures_surgery_radiation__radiation_dose_gy,Radiation dose (Gy),"73,100"
+C238,Radiation dose for brain metastases is a subset of radiation dose.,alias_of,procedures_surgery_radiation__radiation_dose_gy,Radiation dose for brain metastases,74
+C239,Fractionation schedule is represented by the count of fractions.,alias_of,procedures_surgery_radiation__radiation_fractionation_count,Radiation fractionation schedule,91
+C240,Referral status is part of oncology involvement.,alias_of,procedures_surgery_radiation__surgical_status,Radiation oncology referral status,34
+C241,Treatment involvement is part of oncology involvement.,alias_of,procedures_surgery_radiation__surgical_status,Radiation Oncology Treatment,5
+C242,Redundant with specific radiation history features.,drop,procedures_surgery_radiation__radiation_therapy_history,Radiation therapy history,"64,77,82"
+C243,Direct match.,base_variable,procedures_surgery_radiation__radiopharmaceutical_dose,Radiopharmaceutical dose,93
+C244,"Recent imaging availability is a temporal metadata field, not a clinical feature of the disease itself.",review,imaging_disease_sites__unclassified_temporal_metadata,Recent imaging availability,71
+C245,"Renal function status is a clinical interpretation, while BUN is a specific measurement.",related_but_distinct,laboratory_vitals__blood_urea_nitrogen,Renal Function Status,58
+C246,Residual disease presence is a status indicator.,alias_of,diagnosis_stage_histology__disease_recurrence_status,Residual disease presence,26
+C247,Alias for adrenal gland metastasis.,alias_of,imaging_disease_sites__adrenal_gland_metastasis,Right adrenal metastasis,69
+C248,Role function assessment.,base_variable,functional_performance__role_function,Role function,25
+C249,Direct representation of seizure status.,base_variable,diagnosis_stage_histology__seizure_disorder_status,Seizure disorder status,39
+C250,Describes assistance level for self-care.,alias_of,functional_performance__self_care_status,Self-care assistance level,57
+C251,Describes independence in self-care.,alias_of,functional_performance__self_care_status,Self-care independence,56
+C252,Serum albumin is a standard lab measurement.,base_variable,laboratory_vitals__serum_albumin,Serum Albumin,46
+C253,Serum calcium is an electrolyte.,base_variable,laboratory_vitals__serum_calcium,Serum calcium level,34
+C254,Serum sodium is an electrolyte.,base_variable,laboratory_vitals__serum_sodium,Serum Sodium,82
+C255,Sex is an alias for biological sex.,alias_of,demographics_social__biological_sex,Sex,"16,44,71,77,80,90"
+C256,Smoking status is a standard clinical feature.,base_variable,demographics_social__smoking_status,Smoking status,77
+C257,Social function score.,base_variable,functional_performance__social_function_score,Social function score,8
+C258,Direct symptom.,base_variable,symptoms_patient_reported__sore_throat,Sore throat presence,"18,92"
+C259,Spirometry result is an alias for the spirometry test category.,alias_of,laboratory_vitals__spirometry,Spirometry result,30
+C260,Spirometry results is an alias.,alias_of,laboratory_vitals__spirometry,Spirometry results,38
+C261,Alias for splenic metastasis.,alias_of,imaging_disease_sites__splenic_metastasis,Spleen metastasis,31
+C262,Stereotactic radiation history is SRS history.,alias_of,procedures_surgery_radiation__history_of_stereotactic_radiosurgery,Stereotactic radiation therapy history,34
+C263,Surgical status is the canonical variable.,alias_of,procedures_surgery_radiation__radiation_oncology_involvement,Surgical Status,83
+C264,Surveillance imaging occurrence is a procedural/study design feature.,review,imaging_disease_sites__unclassified_procedural_features,Surveillance imaging occurrence,92
+C265,Alias for SUVmax.,alias_of,imaging_disease_sites__suvmax,SUVmax,"7,19,70,93"
+C266,Systemic symptoms is too vague and lacks specific evidence.,drop,symptoms_patient_reported__systemic_symptoms,Systemic symptoms,17
+C267,Systemic symptoms presence is too vague.,drop,symptoms_patient_reported__systemic_symptoms_presence,Systemic symptoms presence,57
+C268,Systolic blood pressure is a vital sign.,base_variable,laboratory_vitals__systolic_blood_pressure,Systolic blood pressure,62
+C269,Regimen type.,base_variable,systemic_treatments_medications__chemotherapy_regimen_type,Taxane-based regimen use,65
+C270,Thoracic PET/CT findings is a text-based summary field.,review,imaging_disease_sites__unclassified_text_summaries,Thoracic PET/CT findings,12
+C271,Primary candidate for time since diagnosis.,base_variable,other__time_since_diagnosis,Time since diagnosis,1
+C272,TNM stage is a type of cancer stage.,alias_of,diagnosis_stage_histology__cancer_stage,TNM Stage,"11,86"
+C273,Cumulative dose is a radiation dose.,alias_of,procedures_surgery_radiation__radiation_dose_gy,Total cumulative radiation dose (Gy),36
+C274,Total radiation dose is a radiation dose.,alias_of,procedures_surgery_radiation__radiation_dose_gy,Total radiation dose (Gy),91
+C275,TP53 mutation status.,alias_of,molecular_biomarkers__tp53_mutation_status,TP53 Mutation Status,46
+C276,Frequency is synonymous with interval.,alias_of,systemic_treatments_medications__chemotherapy_cycle_interval,Treatment cycle frequency,35
+C277,Direct extraction of response status.,base_variable,systemic_treatments_medications__treatment_response_status,Treatment response status,95
+C278,Direct mapping to TTF-1 expression.,base_variable,molecular_biomarkers__ttf1_expression_status,TTF-1 expression,"78,81"
+C279,Tumor anatomical location is an alias.,alias_of,diagnosis_stage_histology__tumor_anatomical_location,Tumor anatomical location,59
+C280,Alias for tumor diameter.,alias_of,imaging_disease_sites__tumor_diameter,Tumor diameter,7
+C281,Alias for lung nodule location.,alias_of,imaging_disease_sites__lung_nodule_location,Tumor location,64
+C282,Alias for tumor diameter.,alias_of,imaging_disease_sites__tumor_diameter,Tumor size,77
+C283,Direct symptom.,base_variable,symptoms_patient_reported__unexplained_weight_loss,Unexplained weight loss,66
+C284,Direct symptom.,base_variable,symptoms_patient_reported__vomiting,Vomiting,2
+C285,Direct symptom.,base_variable,symptoms_patient_reported__wheezing,Wheezing,3
+C286,Wheezing presence is a variation of wheezing.,alias_of,symptoms_patient_reported__wheezing,Wheezing presence,10
+C287,WBC count is a standard lab measurement.,base_variable,laboratory_vitals__white_blood_cell_count,White Blood Cell Count,"33,49,64,96"

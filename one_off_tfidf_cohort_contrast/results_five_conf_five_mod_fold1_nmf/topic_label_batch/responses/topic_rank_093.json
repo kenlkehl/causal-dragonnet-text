@@ -1,0 +1,144 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 6.930055141448975,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Likely a fragment of a technical parameter or dosage instruction; 'mci' is ambiguous in this context.",
+        "term": "10 mci"
+      },
+      {
+        "reason": "Grammatical fragment from a template or sentence.",
+        "term": "and anatomic"
+      },
+      {
+        "reason": "Grammatical fragment.",
+        "term": "correction and anatomic"
+      },
+      {
+        "reason": "Grammatical fragment.",
+        "term": "attenuation correction and"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "PET/CT imaging and FDG uptake metrics",
+      "summary": "The topic focuses on Positron Emission Tomography (PET) imaging, specifically regarding FDG (fluorodeoxyglucose) uptake, SUVmax measurements, and technical parameters like tracer activity (MBq) and attenuation correction."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Standardized Uptake Value maximum, a quantitative measure of FDG uptake in PET imaging.",
+        "feature_type": "continuous",
+        "name": "SUVmax",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "suvmax"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Refers to the metabolic activity of glucose uptake as visualized by PET.",
+        "feature_type": "categorical",
+        "name": "FDG uptake",
+        "represented_values_or_categories": [
+          "fdg-avid"
+        ],
+        "supporting_terms": [
+          "fdg",
+          "fdg uptake",
+          "fdg-avid"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "Refers to the radioactivity dose administered, measured in Megabecquerels (MBq).",
+        "feature_type": "continuous",
+        "name": "Tracer activity",
+        "represented_values_or_categories": [
+          "370 mbq"
+        ],
+        "supporting_terms": [
+          "mbq",
+          "370 mbq",
+          "370"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The imaging modality used for assessment.",
+        "feature_type": "categorical",
+        "name": "PET/CT imaging modality",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "pet ct",
+          "pet"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "SUVmax",
+        "suggested_representation": "continuous",
+        "supporting_specific_features": [
+          "SUVmax"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "FDG avidity status",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "FDG uptake"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Radiopharmaceutical dose",
+        "suggested_representation": "continuous",
+        "supporting_specific_features": [
+          "Tracer activity"
+        ]
+      }
+    ],
+    "topic_index": 94,
+    "topic_rank": 93
+  },
+  "raw_content": "{\n  \"topic_rank\": 93,\n  \"topic_index\": 94,\n  \"general_topic\": {\n    \"label\": \"PET/CT imaging and FDG uptake metrics\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic focuses on Positron Emission Tomography (PET) imaging, specifically regarding FDG (fluorodeoxyglucose) uptake, SUVmax measurements, and technical parameters like tracer activity (MBq) and attenuation correction.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"SUVmax\",\n      \"supporting_terms\": [\n        \"suvmax\"\n      ],\n      \"feature_type\": \"continuous\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Standardized Uptake Value maximum, a quantitative measure of FDG uptake in PET imaging.\"\n    },\n    {\n      \"name\": \"FDG uptake\",\n      \"supporting_terms\": [\n        \"fdg\",\n        \"fdg uptake\",\n        \"fdg-avid\"\n      ],\n      \"feature_type\": \"categorical\",\n      \"represented_values_or_categories\": [\n        \"fdg-avid\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Refers to the metabolic activity of glucose uptake as visualized by PET.\"\n    },\n    {\n      \"name\": \"Tracer activity\",\n      \"supporting_terms\": [\n        \"mbq\",\n        \"370 mbq\",\n        \"370\"\n      ],\n      \"feature_type\": \"continuous\",\n      \"represented_values_or_categories\": [\n        \"370 mbq\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Refers to the radioactivity dose administered, measured in Megabecquerels (MBq).\"\n    },\n    {\n      \"name\": \"PET/CT imaging modality\",\n      \"supporting_terms\": [\n        \"pet ct\",\n        \"pet\"\n      ],\n      \"feature_type\": \"categorical\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The imaging modality used for assessment.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"10 mci\",\n      \"reason\": \"Likely a fragment of a technical parameter or dosage instruction; 'mci' is ambiguous in this context.\"\n    },\n    {\n      \"term\": \"and anatomic\",\n      \"reason\": \"Grammatical fragment from a template or sentence.\"\n    },\n    {\n      \"term\": \"correction and anatomic\",\n      \"reason\": \"Grammatical fragment.\"\n    },\n    {\n      \"term\": \"attenuation correction and\",\n      \"reason\": \"Grammatical fragment.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"SUVmax\",\n      \"suggested_representation\": \"continuous\",\n      \"supporting_specific_features\": [\n        \"SUVmax\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"FDG avidity status\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"FDG uptake\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Radiopharmaceutical dose\",\n      \"suggested_representation\": \"continuous\",\n      \"supporting_specific_features\": [\n        \"Tracer activity\"\n      ],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-b7c31ca6b44e11d1",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "fdg",
+    "suvmax",
+    "fdg uptake",
+    "pet ct",
+    "pet",
+    "uptake",
+    "fdg-avid",
+    "mbq",
+    "10 mci",
+    "370",
+    "370 mbq",
+    "and anatomic",
+    "correction and anatomic",
+    "mci",
+    "attenuation correction and"
+  ],
+  "topic_index": 94,
+  "topic_rank": 93,
+  "usage": {
+    "completion_tokens": 889,
+    "prompt_tokens": 827,
+    "prompt_tokens_details": null,
+    "total_tokens": 1716
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 93, internal index 94\n\nTerms in this topic, ordered from highest to lowest loading:\n1. fdg\n2. suvmax\n3. fdg uptake\n4. pet ct\n5. pet\n6. uptake\n7. fdg-avid\n8. mbq\n9. 10 mci\n10. 370\n11. 370 mbq\n12. and anatomic\n13. correction and anatomic\n14. mci\n15. attenuation correction and\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 93,\n  \"topic_index\": 94,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

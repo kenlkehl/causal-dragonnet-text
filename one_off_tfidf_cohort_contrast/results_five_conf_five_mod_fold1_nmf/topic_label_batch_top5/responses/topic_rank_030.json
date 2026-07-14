@@ -1,0 +1,89 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 4.143508672714233,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "Pulmonary Function Testing",
+      "summary": "The topic focuses exclusively on pulmonary function assessments, specifically spirometry and diffusing capacity."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Represents the measurement of lung volumes and airflow rates.",
+        "feature_type": "diagnostic_procedure",
+        "name": "Spirometry",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "spirometry",
+          "tests spirometry",
+          "function tests spirometry",
+          "pulmonary function tests"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Diffusing capacity of the lungs for carbon monoxide, a specific component of pulmonary function testing.",
+        "feature_type": "measurement",
+        "name": "DLCO",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "dlco"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Spirometry results",
+        "suggested_representation": "text-derived",
+        "supporting_specific_features": [
+          "Spirometry"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "DLCO measurement",
+        "suggested_representation": "continuous",
+        "supporting_specific_features": [
+          "DLCO"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Pulmonary function test status",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Spirometry"
+        ]
+      }
+    ],
+    "topic_index": 79,
+    "topic_rank": 30
+  },
+  "raw_content": "{\n  \"topic_rank\": 30,\n  \"topic_index\": 79,\n  \"general_topic\": {\n    \"label\": \"Pulmonary Function Testing\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic focuses exclusively on pulmonary function assessments, specifically spirometry and diffusing capacity.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Spirometry\",\n      \"supporting_terms\": [\n        \"spirometry\",\n        \"tests spirometry\",\n        \"function tests spirometry\",\n        \"pulmonary function tests\"\n      ],\n      \"feature_type\": \"diagnostic_procedure\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Represents the measurement of lung volumes and airflow rates.\"\n    },\n    {\n      \"name\": \"DLCO\",\n      \"supporting_terms\": [\n        \"dlco\"\n      ],\n      \"feature_type\": \"measurement\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Diffusing capacity of the lungs for carbon monoxide, a specific component of pulmonary function testing.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Spirometry results\",\n      \"suggested_representation\": \"text-derived\",\n      \"supporting_specific_features\": [\n        \"Spirometry\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"DLCO measurement\",\n      \"suggested_representation\": \"continuous\",\n      \"supporting_specific_features\": [\n        \"DLCO\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Pulmonary function test status\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Spirometry\"\n      ],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-b3437573a724d43b",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "spirometry",
+    "dlco",
+    "tests spirometry",
+    "function tests spirometry",
+    "pulmonary function tests"
+  ],
+  "topic_index": 79,
+  "topic_rank": 30,
+  "usage": {
+    "completion_tokens": 504,
+    "prompt_tokens": 763,
+    "prompt_tokens_details": null,
+    "total_tokens": 1267
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 30, internal index 79\n\nTerms in this topic, ordered from highest to lowest loading:\n1. spirometry\n2. dlco\n3. tests spirometry\n4. function tests spirometry\n5. pulmonary function tests\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 30,\n  \"topic_index\": 79,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

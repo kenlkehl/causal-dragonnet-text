@@ -1,0 +1,81 @@
+feature,coefficient,direction
+control::meq,-0.02127648354104035,negative
+treated::miller,-0.017855664830879383,negative
+treated::john,-0.017668770588550837,negative
+treated::age 70,-0.017306065499872184,negative
+treated::patient john,-0.016517727693356857,negative
+control::mitchell,-0.015702273681866826,negative
+treated::pemetrexed,-0.015594618211407575,negative
+treated::pemetrexed 500,-0.015580669297585406,negative
+treated::age 60,-0.014765024436455824,negative
+control::related pneumonitis,-0.014329149399503948,negative
+control::mediastinal station,-0.013899587194118069,negative
+control::chronic obstructive,-0.013746555990688327,negative
+control::meq reference,-0.013590944944653122,negative
+treated::miller age,-0.013576397877874045,negative
+control::nl,-0.013521264080851738,negative
+control::harold,-0.013398447731829919,negative
+control::t2bn3m1c,-0.01325675153536956,negative
+control::obstructive pulmonary,-0.013109801436839973,negative
+treated::john miller,-0.012949686314914412,negative
+treated::q3 wk,-0.012924600119582375,negative
+treated::iliac bone,-0.012779411553768518,negative
+control::82,-0.012503515472320778,negative
+control::iv t2bn3m1c,-0.012394173023565273,negative
+treated::patient samuel,-0.012350810781293405,negative
+treated::cytopenias,-0.012278462744860667,negative
+control::meq meq,-0.012220463878591912,negative
+control::pneumonitis,-0.012200572291136117,negative
+treated::109,-0.012173996134010132,negative
+treated::carboplatin pemetrexed,-0.012044191113462574,negative
+treated::samuel,-0.012038442789135958,negative
+treated::eleanor,-0.01199972265615233,negative
+treated::76 mmhg,-0.011980189376587588,negative
+control::patient harold,-0.011907446702187479,negative
+treated::128 76,-0.011900640922924132,negative
+treated::carbo taxol,-0.011819796355779259,negative
+treated::wk,-0.011736593011460305,negative
+treated::adrenal nodule,-0.011679096044842423,negative
+control::alp 80,-0.01165093358974617,negative
+control::78 mother,-0.011621663459362528,negative
+control::40 pack,-0.011599266021725679,negative
+treated::high pd,0.027279035265413983,positive
+treated::l1 50,0.024690359553432243,positive
+treated::alvarez,0.020188178748961064,positive
+treated::left frontal,0.016008416518524003,positive
+control::crest,0.01581522212102958,positive
+control::iliac crest,0.01581522212102958,positive
+treated::tps 50,0.01524624676559161,positive
+treated::right pleural,0.014936658697192653,positive
+control::patel age,0.013910816409054366,positive
+treated::patient michael,0.01372413738829249,positive
+control::r273c stk11,0.013361446277480685,positive
+treated::frontal,0.013211605554942694,positive
+treated::tps 60,0.013026645016792413,positive
+control::vaf 28,0.012890279829461468,positive
+treated::michael,0.012796542801611625,positive
+treated::cerebellar,0.012620296417928079,positive
+control::vaf 32,0.01261508878415154,positive
+treated::high expression,0.012536769885332954,positive
+treated::iliac wing,0.012491753755521072,positive
+treated::wing,0.012491753755521072,positive
+treated::age 63,0.012407019319518542,positive
+control::g12c tp53,0.012387512997568332,positive
+control::patel,0.012231360573740956,positive
+treated::alvarez is,0.012189422753885838,positive
+control::r273c vaf,0.01215079529448799,positive
+control::vi,0.011891243907375029,positive
+control::segment vi,0.011881643980152783,positive
+treated::63,0.011879814952713875,positive
+treated::age 49,0.01184510185065187,positive
+treated::expression 50,0.01181665513184227,positive
+treated::alvarez age,0.011771638584013058,positive
+treated::age 55,0.01176535138874865,positive
+control::66,0.011731264673007587,positive
+treated::michael alvarez,0.011578704352037665,positive
+control::m1,0.011557824105695131,positive
+treated::50,0.011440766054715034,positive
+treated::left iliac,0.01141340270715167,positive
+treated::javier,0.011363362494558639,positive
+treated::daniel,0.011083959520152226,positive
+treated::lesions past,0.010962034170991246,positive

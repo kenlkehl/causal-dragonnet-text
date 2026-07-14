@@ -1,0 +1,74 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 3.326279640197754,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Fragmented phrase that is grammatically incomplete and lacks a clear clinical noun, though it likely refers to symptoms at rest.",
+        "term": "rest mild"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "Exertional dyspnea severity",
+      "summary": "The topic focuses on the presence and severity of shortness of breath occurring during physical exertion."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The terms describe shortness of breath triggered by exertion, with specific mention of mild intensity.",
+        "feature_type": "symptom",
+        "name": "Exertional dyspnea",
+        "represented_values_or_categories": [
+          "mild"
+        ],
+        "supporting_terms": [
+          "exertional dyspnea",
+          "mild exertional dyspnea",
+          "exertional"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Dyspnea on exertion",
+        "suggested_representation": "ordinal",
+        "supporting_specific_features": [
+          "Exertional dyspnea"
+        ]
+      },
+      {
+        "confidence": "low",
+        "name": "Dyspnea at rest",
+        "suggested_representation": "binary",
+        "supporting_specific_features": []
+      }
+    ],
+    "topic_index": 49,
+    "topic_rank": 38
+  },
+  "raw_content": "{\n  \"topic_rank\": 38,\n  \"topic_index\": 49,\n  \"general_topic\": {\n    \"label\": \"Exertional dyspnea severity\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic focuses on the presence and severity of shortness of breath occurring during physical exertion.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Exertional dyspnea\",\n      \"supporting_terms\": [\n        \"exertional dyspnea\",\n        \"mild exertional dyspnea\",\n        \"exertional\"\n      ],\n      \"feature_type\": \"symptom\",\n      \"represented_values_or_categories\": [\n        \"mild\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms describe shortness of breath triggered by exertion, with specific mention of mild intensity.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"rest mild\",\n      \"reason\": \"Fragmented phrase that is grammatically incomplete and lacks a clear clinical noun, though it likely refers to symptoms at rest.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Dyspnea on exertion\",\n      \"suggested_representation\": \"ordinal\",\n      \"supporting_specific_features\": [\n        \"Exertional dyspnea\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Dyspnea at rest\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [],\n      \"confidence\": \"low\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-87b01847bb8348b0",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "exertional",
+    "mild exertional",
+    "exertional dyspnea",
+    "mild exertional dyspnea",
+    "rest mild"
+  ],
+  "topic_index": 49,
+  "topic_rank": 38,
+  "usage": {
+    "completion_tokens": 413,
+    "prompt_tokens": 767,
+    "prompt_tokens_details": null,
+    "total_tokens": 1180
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 38, internal index 49\n\nTerms in this topic, ordered from highest to lowest loading:\n1. exertional\n2. mild exertional\n3. exertional dyspnea\n4. mild exertional dyspnea\n5. rest mild\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 38,\n  \"topic_index\": 49,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

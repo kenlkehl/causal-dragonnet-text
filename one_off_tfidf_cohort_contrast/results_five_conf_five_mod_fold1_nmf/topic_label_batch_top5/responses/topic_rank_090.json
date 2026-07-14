@@ -1,0 +1,94 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 4.427961587905884,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Pronoun fragment, likely part of natural language text.",
+        "term": "she"
+      },
+      {
+        "reason": "Contains 'mrn' (Medical Record Number), which is a patient identifier/artifact.",
+        "term": "female mrn"
+      },
+      {
+        "reason": "Narrative phrase fragment used in clinical documentation.",
+        "term": "she reports"
+      }
+    ],
+    "general_topic": {
+      "coherence": "mixed",
+      "confidence": "medium",
+      "label": "Patient Demographics and Gender",
+      "summary": "The topic contains terms related to patient gender and pronouns, mixed with fragments of clinical documentation and identifiers."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The terms explicitly identify female gender/sex.",
+        "feature_type": "categorical",
+        "name": "Sex",
+        "represented_values_or_categories": [
+          "female"
+        ],
+        "supporting_terms": [
+          "female",
+          "female mrn"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "The phrase 'woman with stage' indicates the presence of cancer staging information, though the specific stage value is not provided in the terms.",
+        "feature_type": "ordinal",
+        "name": "Cancer Stage",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "woman with stage"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Sex",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Sex"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Cancer Stage",
+        "suggested_representation": "ordinal",
+        "supporting_specific_features": [
+          "Cancer Stage"
+        ]
+      }
+    ],
+    "topic_index": 84,
+    "topic_rank": 90
+  },
+  "raw_content": "{\n  \"topic_rank\": 90,\n  \"topic_index\": 84,\n  \"general_topic\": {\n    \"label\": \"Patient Demographics and Gender\",\n    \"coherence\": \"mixed\",\n    \"confidence\": \"medium\",\n    \"summary\": \"The topic contains terms related to patient gender and pronouns, mixed with fragments of clinical documentation and identifiers.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Sex\",\n      \"supporting_terms\": [\n        \"female\",\n        \"female mrn\"\n      ],\n      \"feature_type\": \"categorical\",\n      \"represented_values_or_categories\": [\n        \"female\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms explicitly identify female gender/sex.\"\n    },\n    {\n      \"name\": \"Cancer Stage\",\n      \"supporting_terms\": [\n        \"woman with stage\"\n      ],\n      \"feature_type\": \"ordinal\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The phrase 'woman with stage' indicates the presence of cancer staging information, though the specific stage value is not provided in the terms.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"she\",\n      \"reason\": \"Pronoun fragment, likely part of natural language text.\"\n    },\n    {\n      \"term\": \"female mrn\",\n      \"reason\": \"Contains 'mrn' (Medical Record Number), which is a patient identifier/artifact.\"\n    },\n    {\n      \"term\": \"she reports\",\n      \"reason\": \"Narrative phrase fragment used in clinical documentation.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Sex\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Sex\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Cancer Stage\",\n      \"suggested_representation\": \"ordinal\",\n      \"supporting_specific_features\": [\n        \"Cancer Stage\"\n      ],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-a35f359ce4803ad2",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "she",
+    "female",
+    "female mrn",
+    "woman with stage",
+    "she reports"
+  ],
+  "topic_index": 84,
+  "topic_rank": 90,
+  "usage": {
+    "completion_tokens": 543,
+    "prompt_tokens": 759,
+    "prompt_tokens_details": null,
+    "total_tokens": 1302
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 90, internal index 84\n\nTerms in this topic, ordered from highest to lowest loading:\n1. she\n2. female\n3. female mrn\n4. woman with stage\n5. she reports\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 90,\n  \"topic_index\": 84,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

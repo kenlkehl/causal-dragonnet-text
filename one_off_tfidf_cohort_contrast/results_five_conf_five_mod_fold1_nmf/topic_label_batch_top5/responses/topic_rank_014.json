@@ -1,0 +1,94 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 4.631686687469482,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Incomplete phrase, likely a fragment of a measurement.",
+        "term": "frontal 1.2"
+      },
+      {
+        "reason": "Incomplete phrase, likely a fragment of a measurement.",
+        "term": "hemisphere 0.9"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "Brain/Cerebellar Lesion Measurement",
+      "summary": "The topic describes measurements of lesions or structures within the cerebral or cerebellar hemispheres."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "The terms suggest a measurement of 0.9 cm associated with the cerebellar hemisphere.",
+        "feature_type": "measurement",
+        "name": "Cerebellar hemisphere lesion size",
+        "represented_values_or_categories": [
+          "0.9 cm"
+        ],
+        "supporting_terms": [
+          "cerebellar hemisphere 0.9",
+          "hemisphere 0.9 cm",
+          "hemisphere 0.9"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "The terms suggest a measurement of 1.2 cm associated with the frontal region.",
+        "feature_type": "measurement",
+        "name": "Frontal lesion size",
+        "represented_values_or_categories": [
+          "1.2 cm"
+        ],
+        "supporting_terms": [
+          "frontal 1.2 cm",
+          "frontal 1.2"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "medium",
+        "name": "Cerebellar hemisphere lesion diameter",
+        "suggested_representation": "continuous",
+        "supporting_specific_features": [
+          "Cerebellar hemisphere lesion size"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Frontal lobe lesion diameter",
+        "suggested_representation": "continuous",
+        "supporting_specific_features": [
+          "Frontal lesion size"
+        ]
+      }
+    ],
+    "topic_index": 82,
+    "topic_rank": 14
+  },
+  "raw_content": "{\n  \"topic_rank\": 14,\n  \"topic_index\": 82,\n  \"general_topic\": {\n    \"label\": \"Brain/Cerebellar Lesion Measurement\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic describes measurements of lesions or structures within the cerebral or cerebellar hemispheres.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Cerebellar hemisphere lesion size\",\n      \"supporting_terms\": [\n        \"cerebellar hemisphere 0.9\",\n        \"hemisphere 0.9 cm\",\n        \"hemisphere 0.9\"\n      ],\n      \"feature_type\": \"measurement\",\n      \"represented_values_or_categories\": [\n        \"0.9 cm\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms suggest a measurement of 0.9 cm associated with the cerebellar hemisphere.\"\n    },\n    {\n      \"name\": \"Frontal lesion size\",\n      \"supporting_terms\": [\n        \"frontal 1.2 cm\",\n        \"frontal 1.2\"\n      ],\n      \"feature_type\": \"measurement\",\n      \"represented_values_or_categories\": [\n        \"1.2 cm\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms suggest a measurement of 1.2 cm associated with the frontal region.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"frontal 1.2\",\n      \"reason\": \"Incomplete phrase, likely a fragment of a measurement.\"\n    },\n    {\n      \"term\": \"hemisphere 0.9\",\n      \"reason\": \"Incomplete phrase, likely a fragment of a measurement.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Cerebellar hemisphere lesion diameter\",\n      \"suggested_representation\": \"continuous\",\n      \"supporting_specific_features\": [\n        \"Cerebellar hemisphere lesion size\"\n      ],\n      \"confidence\": \"medium\"\n    },\n    {\n      \"name\": \"Frontal lobe lesion diameter\",\n      \"suggested_representation\": \"continuous\",\n      \"supporting_specific_features\": [\n        \"Frontal lesion size\"\n      ],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-af475a3f1c5ac4f2",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "frontal 1.2 cm",
+    "frontal 1.2",
+    "hemisphere 0.9 cm",
+    "hemisphere 0.9",
+    "cerebellar hemisphere 0.9"
+  ],
+  "topic_index": 82,
+  "topic_rank": 14,
+  "usage": {
+    "completion_tokens": 577,
+    "prompt_tokens": 777,
+    "prompt_tokens_details": null,
+    "total_tokens": 1354
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 14, internal index 82\n\nTerms in this topic, ordered from highest to lowest loading:\n1. frontal 1.2 cm\n2. frontal 1.2\n3. hemisphere 0.9 cm\n4. hemisphere 0.9\n5. cerebellar hemisphere 0.9\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 14,\n  \"topic_index\": 82,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

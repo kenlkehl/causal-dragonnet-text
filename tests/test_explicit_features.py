@@ -168,6 +168,42 @@ def test_build_extraction_prompt_truncates_to_note_tail():
     assert "beginning age 44" not in prompt
 
 
+def test_extraction_prompt_distinguishes_unknown_from_not_documented():
+    specs = [
+        ExplicitFeatureSpec(
+            name="marker_status",
+            type="categorical",
+            categories=["negative", "positive", "unknown", "not_documented"],
+            roles=["confounder"],
+        ),
+    ]
+
+    prompt = build_extraction_prompt("Marker testing was indeterminate.", specs)
+
+    assert 'Use "unknown" only when the note explicitly says' in prompt
+    assert 'Use "not_documented" when the note does not state' in prompt
+    assert "For continuous fields" in prompt
+
+
+def test_parse_extraction_response_accepts_quoted_null_as_missing():
+    specs = [
+        ExplicitFeatureSpec(name="age", type="continuous", roles=["confounder"]),
+        ExplicitFeatureSpec(
+            name="marker_status",
+            type="categorical",
+            categories=["negative", "positive", "unknown", "not_documented"],
+            roles=["confounder"],
+        ),
+    ]
+
+    parsed = parse_extraction_response(
+        '{"age": "null", "marker_status": "null"}', specs
+    )
+
+    assert parsed["age"].value is None and parsed["age"].is_missing
+    assert parsed["marker_status"].value is None and parsed["marker_status"].is_missing
+
+
 def test_parse_extraction_response_maps_categorical_value_aliases():
     specs = [
         ExplicitFeatureSpec(
@@ -304,6 +340,48 @@ def test_vllm_feature_extractor_request_does_not_set_timeout():
     assert result["age"].is_missing is False
 
 
+def test_vllm_feature_extractor_can_disable_chat_template_thinking():
+    calls = {}
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.update(kwargs)
+
+            class Message:
+                content = '{"age": 41}'
+
+            class Choice:
+                message = Message()
+
+            class Response:
+                choices = [Choice()]
+
+            return Response()
+
+    class FakeClient:
+        class Chat:
+            completions = FakeCompletions()
+
+        chat = Chat()
+
+    extractor = VLLMFeatureExtractor(
+        specs=[
+            ExplicitFeatureSpec(name="age", type="continuous", roles=["confounder"]),
+        ],
+        mode="server",
+        vllm_enable_thinking=False,
+        max_retries=1,
+    )
+    extractor._client = FakeClient()
+
+    result = extractor._extract_single_server("Age: 41")
+
+    assert calls["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": False}
+    }
+    assert result["age"].value == 41.0
+
+
 def test_vllm_feature_extractor_requests_json_response_format_for_google_agent_platform():
     calls = {}
 
@@ -400,6 +478,46 @@ def test_vllm_feature_extractor_repairs_malformed_extraction_json():
     assert '"age": <number-or-null>' in repair_messages[2]["content"]
 
 
+def test_vllm_feature_extractor_accepts_schema_complete_null_without_retry():
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+
+            class Message:
+                content = '{"age": null}'
+
+            class Choice:
+                message = Message()
+
+            class Response:
+                choices = [Choice()]
+
+            return Response()
+
+    class FakeClient:
+        class Chat:
+            completions = FakeCompletions()
+
+        chat = Chat()
+
+    extractor = VLLMFeatureExtractor(
+        specs=[
+            ExplicitFeatureSpec(name="age", type="continuous", roles=["confounder"]),
+        ],
+        mode="server",
+        max_retries=3,
+    )
+    extractor._client = FakeClient()
+
+    result = extractor._extract_single_server("Age is not documented")
+
+    assert len(calls) == 1
+    assert result["age"].value is None
+    assert result["age"].is_missing is True
+
+
 def test_vllm_feature_extractor_retries_next_server(monkeypatch):
     calls = []
 
@@ -408,7 +526,7 @@ def test_vllm_feature_extractor_retries_next_server(monkeypatch):
             self.base_url = base_url
 
         def create(self, **kwargs):
-            calls.append(self.base_url)
+            calls.append((self.base_url, kwargs["model"]))
             if self.base_url == "http://server-a/v1":
                 raise TimeoutError("server overloaded")
 
@@ -438,6 +556,11 @@ def test_vllm_feature_extractor_retries_next_server(monkeypatch):
         ],
         mode="server",
         server_url="http://server-a/v1,http://server-b/v1",
+        model_name="heterogeneous-pool",
+        model_names_by_url={
+            "http://server-a/v1": "served-model-a",
+            "http://server-b/v1": "served-model-b",
+        },
         max_retries=2,
         retry_initial_delay=0.0,
     )
@@ -450,7 +573,10 @@ def test_vllm_feature_extractor_retries_next_server(monkeypatch):
         "http://server-a/v1",
         "http://server-b/v1",
     ]
-    assert calls == ["http://server-a/v1", "http://server-b/v1"]
+    assert calls == [
+        ("http://server-a/v1", "served-model-a"),
+        ("http://server-b/v1", "served-model-b"),
+    ]
     assert result["age"].value == 41.0
     assert result["age"].is_missing is False
 

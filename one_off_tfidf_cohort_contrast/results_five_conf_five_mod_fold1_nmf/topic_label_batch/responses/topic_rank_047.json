@@ -1,0 +1,164 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 7.985823392868042,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Contains punctuation and trailing hyphen, likely a fragment of a template or note.",
+        "term": "deficits. -"
+      },
+      {
+        "reason": "Incomplete term, likely part of 'grossly intact'.",
+        "term": "grossly"
+      },
+      {
+        "reason": "Fragmented phrase, likely part of 'neurologic no deficits'.",
+        "term": "neurologic no"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "Neurological symptoms and examination findings",
+      "summary": "The topic focuses on neurological assessment, specifically mentioning dizziness, headaches, focal deficits, and the status of a neurological examination (grossly intact)."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The terms consistently refer to the presence or absence of dizziness.",
+        "feature_type": "symptom",
+        "name": "Dizziness",
+        "represented_values_or_categories": [
+          "present",
+          "absent"
+        ],
+        "supporting_terms": [
+          "dizziness or",
+          "dizziness or focal",
+          "dizziness",
+          "headaches dizziness",
+          "no headaches dizziness",
+          "headaches dizziness or"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The terms indicate the presence or absence of headaches, often co-occurring with dizziness in the text fragments.",
+        "feature_type": "symptom",
+        "name": "Headache",
+        "represented_values_or_categories": [
+          "present",
+          "absent"
+        ],
+        "supporting_terms": [
+          "headaches dizziness",
+          "no headaches dizziness",
+          "headaches dizziness or"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The terms refer to the presence or absence of focal neurological deficits.",
+        "feature_type": "finding",
+        "name": "Focal neurological deficit",
+        "represented_values_or_categories": [
+          "present",
+          "absent"
+        ],
+        "supporting_terms": [
+          "dizziness or focal",
+          "or focal deficits.",
+          "focal deficits. -",
+          "focal deficits.",
+          "neurologic no"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "Refers to the qualitative result of a neurological exam being 'grossly intact'.",
+        "feature_type": "finding",
+        "name": "Neurological examination status",
+        "represented_values_or_categories": [
+          "grossly intact"
+        ],
+        "supporting_terms": [
+          "grossly intact",
+          "neurologic grossly",
+          "neurologic grossly intact",
+          "grossly"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Dizziness",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Dizziness"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Headache",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Headache"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Focal neurological deficit",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Focal neurological deficit"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Neurological exam status",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Neurological examination status"
+        ]
+      }
+    ],
+    "topic_index": 33,
+    "topic_rank": 47
+  },
+  "raw_content": "{\n  \"topic_rank\": 47,\n  \"topic_index\": 33,\n  \"general_topic\": {\n    \"label\": \"Neurological symptoms and examination findings\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic focuses on neurological assessment, specifically mentioning dizziness, headaches, focal deficits, and the status of a neurological examination (grossly intact).\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Dizziness\",\n      \"supporting_terms\": [\n        \"dizziness or\",\n        \"dizziness or focal\",\n        \"dizziness\",\n        \"headaches dizziness\",\n        \"no headaches dizziness\",\n        \"headaches dizziness or\"\n      ],\n      \"feature_type\": \"symptom\",\n      \"represented_values_or_categories\": [\n        \"present\",\n        \"absent\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms consistently refer to the presence or absence of dizziness.\"\n    },\n    {\n      \"name\": \"Headache\",\n      \"supporting_terms\": [\n        \"headaches dizziness\",\n        \"no headaches dizziness\",\n        \"headaches dizziness or\"\n      ],\n      \"feature_type\": \"symptom\",\n      \"represented_values_or_categories\": [\n        \"present\",\n        \"absent\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms indicate the presence or absence of headaches, often co-occurring with dizziness in the text fragments.\"\n    },\n    {\n      \"name\": \"Focal neurological deficit\",\n      \"supporting_terms\": [\n        \"dizziness or focal\",\n        \"or focal deficits.\",\n        \"focal deficits. -\",\n        \"focal deficits.\",\n        \"neurologic no\"\n      ],\n      \"feature_type\": \"finding\",\n      \"represented_values_or_categories\": [\n        \"present\",\n        \"absent\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms refer to the presence or absence of focal neurological deficits.\"\n    },\n    {\n      \"name\": \"Neurological examination status\",\n      \"supporting_terms\": [\n        \"grossly intact\",\n        \"neurologic grossly\",\n        \"neurologic grossly intact\",\n        \"grossly\"\n      ],\n      \"feature_type\": \"finding\",\n      \"represented_values_or_categories\": [\n        \"grossly intact\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Refers to the qualitative result of a neurological exam being 'grossly intact'.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"deficits. -\",\n      \"reason\": \"Contains punctuation and trailing hyphen, likely a fragment of a template or note.\"\n    },\n    {\n      \"term\": \"grossly\",\n      \"reason\": \"Incomplete term, likely part of 'grossly intact'.\"\n    },\n    {\n      \"term\": \"neurologic no\",\n      \"reason\": \"Fragmented phrase, likely part of 'neurologic no deficits'.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Dizziness\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Dizziness\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Headache\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Headache\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Focal neurological deficit\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Focal neurological deficit\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Neurological exam status\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Neurological examination status\"\n      ],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-85dc8051774dcc5f",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "dizziness or",
+    "dizziness or focal",
+    "dizziness",
+    "headaches dizziness",
+    "no headaches dizziness",
+    "headaches dizziness or",
+    "or focal deficits.",
+    "focal deficits. -",
+    "deficits. -",
+    "focal deficits.",
+    "grossly intact",
+    "neurologic grossly",
+    "- neurologic no",
+    "neurologic grossly intact",
+    "grossly"
+  ],
+  "topic_index": 33,
+  "topic_rank": 47,
+  "usage": {
+    "completion_tokens": 1008,
+    "prompt_tokens": 824,
+    "prompt_tokens_details": null,
+    "total_tokens": 1832
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 47, internal index 33\n\nTerms in this topic, ordered from highest to lowest loading:\n1. dizziness or\n2. dizziness or focal\n3. dizziness\n4. headaches dizziness\n5. no headaches dizziness\n6. headaches dizziness or\n7. or focal deficits.\n8. focal deficits. -\n9. deficits. -\n10. focal deficits.\n11. grossly intact\n12. neurologic grossly\n13. - neurologic no\n14. neurologic grossly intact\n15. grossly\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 47,\n  \"topic_index\": 33,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

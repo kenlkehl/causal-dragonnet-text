@@ -1,0 +1,259 @@
+{
+  "attempts": 1,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "assignments": [
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C041",
+        "domain": "molecular_biomarkers",
+        "preliminary_normalized_name": "cdkn2a_homozygous_deletion"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C042",
+        "domain": "molecular_biomarkers",
+        "preliminary_normalized_name": "cdkn2a_mutation_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C043",
+        "domain": "systemic_treatments_medications",
+        "preliminary_normalized_name": "chemotherapy_cycle_interval"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C044",
+        "domain": "systemic_treatments_medications",
+        "preliminary_normalized_name": "chemotherapy_regimen_type"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C045",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "chest_pain"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C046",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "chills"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C047",
+        "domain": "molecular_biomarkers",
+        "preliminary_normalized_name": "ck5_immunohistochemistry_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C048",
+        "domain": "diagnosis_stage_histology",
+        "preliminary_normalized_name": "clinical_stage"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C049",
+        "domain": "functional_performance",
+        "preliminary_normalized_name": "cognitive_function"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C050",
+        "domain": "functional_performance",
+        "preliminary_normalized_name": "cognitive_function_score"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C051",
+        "domain": "laboratory_vitals",
+        "preliminary_normalized_name": "complete_blood_count"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C052",
+        "domain": "systemic_treatments_medications",
+        "preliminary_normalized_name": "completed_chemotherapy_cycles"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C053",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "constipation"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C054",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "constipation_incidence"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C055",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "contrast_enhanced_mri_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C056",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "cough"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C057",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "cough_frequency"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C058",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "cough_severity"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C059",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "cough_severity_type"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C060",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "count_of_enhancing_brain_lesions"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C061",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "ct_imaging_findings"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C062",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "ct_imaging_type"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C063",
+        "domain": "systemic_treatments_medications",
+        "preliminary_normalized_name": "current_chemotherapy_cycle_number"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C064",
+        "domain": "systemic_treatments_medications",
+        "preliminary_normalized_name": "days_since_start_of_cycle"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C065",
+        "domain": "diagnosis_stage_histology",
+        "preliminary_normalized_name": "diagnosis_type"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C066",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "diarrhea"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C067",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "diarrhea_incidence"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C068",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "diffusion_weighted_imaging_availability"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C069",
+        "domain": "diagnosis_stage_histology",
+        "preliminary_normalized_name": "disease_recurrence_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C070",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "dizziness"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C071",
+        "domain": "laboratory_vitals",
+        "preliminary_normalized_name": "dlco"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C072",
+        "domain": "laboratory_vitals",
+        "preliminary_normalized_name": "dlco_measurement"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C073",
+        "domain": "systemic_treatments_medications",
+        "preliminary_normalized_name": "dosing_cycle_frequency"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C074",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "dry_cough"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C075",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "dyspnea"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C076",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "dyspnea_severity"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C077",
+        "domain": "functional_performance",
+        "preliminary_normalized_name": "ecog_performance_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C078",
+        "domain": "laboratory_vitals",
+        "preliminary_normalized_name": "egfr"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C079",
+        "domain": "molecular_biomarkers",
+        "preliminary_normalized_name": "egfr_amplification_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C080",
+        "domain": "molecular_biomarkers",
+        "preliminary_normalized_name": "egfr_l858r_mutation_status"
+      }
+    ]
+  },
+  "raw_content": "{\n  \"assignments\": [\n    {\n      \"candidate_id\": \"C041\",\n      \"domain\": \"molecular_biomarkers\",\n      \"preliminary_normalized_name\": \"cdkn2a_homozygous_deletion\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C042\",\n      \"domain\": \"molecular_biomarkers\",\n      \"preliminary_normalized_name\": \"cdkn2a_mutation_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C043\",\n      \"domain\": \"systemic_treatments_medications\",\n      \"preliminary_normalized_name\": \"chemotherapy_cycle_interval\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C044\",\n      \"domain\": \"systemic_treatments_medications\",\n      \"preliminary_normalized_name\": \"chemotherapy_regimen_type\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C045\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"chest_pain\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C046\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"chills\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C047\",\n      \"domain\": \"molecular_biomarkers\",\n      \"preliminary_normalized_name\": \"ck5_immunohistochemistry_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C048\",\n      \"domain\": \"diagnosis_stage_histology\",\n      \"preliminary_normalized_name\": \"clinical_stage\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C049\",\n      \"domain\": \"functional_performance\",\n      \"preliminary_normalized_name\": \"cognitive_function\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C050\",\n      \"domain\": \"functional_performance\",\n      \"preliminary_normalized_name\": \"cognitive_function_score\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C051\",\n      \"domain\": \"laboratory_vitals\",\n      \"preliminary_normalized_name\": \"complete_blood_count\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C052\",\n      \"domain\": \"systemic_treatments_medications\",\n      \"preliminary_normalized_name\": \"completed_chemotherapy_cycles\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C053\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"constipation\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C054\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"constipation_incidence\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C055\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"contrast_enhanced_mri_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C056\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"cough\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C057\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"cough_frequency\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C058\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"cough_severity\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C059\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"cough_severity_type\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C060\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"count_of_enhancing_brain_lesions\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C061\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"ct_imaging_findings\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C062\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"ct_imaging_type\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C063\",\n      \"domain\": \"systemic_treatments_medications\",\n      \"preliminary_normalized_name\": \"current_chemotherapy_cycle_number\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C064\",\n      \"domain\": \"systemic_treatments_medications\",\n      \"preliminary_normalized_name\": \"days_since_start_of_cycle\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C065\",\n      \"domain\": \"diagnosis_stage_histology\",\n      \"preliminary_normalized_name\": \"diagnosis_type\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C066\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"diarrhea\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C067\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"diarrhea_incidence\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C068\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"diffusion_weighted_imaging_availability\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C069\",\n      \"domain\": \"diagnosis_stage_histology\",\n      \"preliminary_normalized_name\": \"disease_recurrence_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C070\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"dizziness\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C071\",\n      \"domain\": \"laboratory_vitals\",\n      \"preliminary_normalized_name\": \"dlco\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C072\",\n      \"domain\": \"laboratory_vitals\",\n      \"preliminary_normalized_name\": \"dlco_measurement\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C073\",\n      \"domain\": \"systemic_treatments_medications\",\n      \"preliminary_normalized_name\": \"dosing_cycle_frequency\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C074\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"dry_cough\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C075\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"dyspnea\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C076\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"dyspnea_severity\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C077\",\n      \"domain\": \"functional_performance\",\n      \"preliminary_normalized_name\": \"ecog_performance_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C078\",\n      \"domain\": \"laboratory_vitals\",\n      \"preliminary_normalized_name\": \"egfr\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C079\",\n      \"domain\": \"molecular_biomarkers\",\n      \"preliminary_normalized_name\": \"egfr_amplification_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C080\",\n      \"domain\": \"molecular_biomarkers\",\n      \"preliminary_normalized_name\": \"egfr_l858r_mutation_status\",\n      \"artifact_likelihood\": \"low\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-81f9a50a8e710448",
+  "status": "complete",
+  "system_prompt": "You organize proposed clinical feature names into broad domains before harmonization. Use only the supplied evidence. Every candidate ID must appear exactly once. Return valid JSON only.",
+  "usage": {
+    "completion_tokens": 2411,
+    "prompt_tokens": 4944,
+    "prompt_tokens_details": null,
+    "total_tokens": 7355
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nAssign every candidate to exactly one of these domains:\n[\"demographics_social\", \"diagnosis_stage_histology\", \"molecular_biomarkers\", \"imaging_disease_sites\", \"laboratory_vitals\", \"symptoms_patient_reported\", \"functional_performance\", \"systemic_treatments_medications\", \"procedures_surgery_radiation\", \"administrative_artifact\", \"other\"]\n\nUse `administrative_artifact` only for identifiers, note-template structure, or nonclinical administrative fragments. A clinically meaningful variable that may merely be unimportant should remain in its clinical domain.\n\nCandidates:\n[{\"candidate_id\": \"C041\", \"name\": \"CDKN2A homozygous deletion\", \"occurrence_count\": 1, \"topic_ranks\": [41], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"CDKN2A status\"], \"evidence_terms\": [\"and cdkn2a\", \"cdkn2a\", \"3. cdkn2a\", \"3. cdkn2a homozygous\", \"deletion.\", \"deletion\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"homozygous deletion\"]}, {\"candidate_id\": \"C042\", \"name\": \"CDKN2A mutation status\", \"occurrence_count\": 1, \"topic_ranks\": [86], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"CDKN2A status\"], \"evidence_terms\": [\"cdkn2a\", \"cdkn2a homozygous\"], \"feature_type_hints\": [\"molecular_marker\"], \"represented_values_or_categories\": [\"homozygous\"]}, {\"candidate_id\": \"C043\", \"name\": \"Chemotherapy cycle interval\", \"occurrence_count\": 1, \"topic_ranks\": [95], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Chemotherapy cycle frequency\"], \"evidence_terms\": [\"every 21\", \"every 21 days\", \"21 days\", \"q21\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"21 days\"]}, {\"candidate_id\": \"C044\", \"name\": \"Chemotherapy regimen type\", \"occurrence_count\": 1, \"topic_ranks\": [95], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Chemotherapy regimen\"], \"evidence_terms\": [\"cycles of carboplatin\", \"+ pemetrexed\", \"plus\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"carboplatin + pemetrexed\"]}, {\"candidate_id\": \"C045\", \"name\": \"Chest pain\", \"occurrence_count\": 1, \"topic_ranks\": [17], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Chest pain\"], \"evidence_terms\": [\"chills chest pain\", \"chills chest\", \"fever chills chest\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C046\", \"name\": \"Chills\", \"occurrence_count\": 1, \"topic_ranks\": [17], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Chills\"], \"evidence_terms\": [\"chills chest pain\", \"chills chest\", \"fever chills chest\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C047\", \"name\": \"CK5 immunohistochemistry status\", \"occurrence_count\": 1, \"topic_ranks\": [28], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"CK5 expression\"], \"evidence_terms\": [\"ck5 6 diffuse\", \"6 diffuse\", \"6 diffuse cytoplasmic\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"diffuse\", \"cytoplasmic\"]}, {\"candidate_id\": \"C048\", \"name\": \"Clinical Stage\", \"occurrence_count\": 1, \"topic_ranks\": [86], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Cancer Stage\"], \"evidence_terms\": [\"iv squamous\", \"stage iv squamous\", \"iv squamous nsclc\", \"iv squamous non-small\"], \"feature_type_hints\": [\"clinical_stage\"], \"represented_values_or_categories\": [\"IV\"]}, {\"candidate_id\": \"C049\", \"name\": \"Cognitive function\", \"occurrence_count\": 1, \"topic_ranks\": [25], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Cognitive function\"], \"evidence_terms\": [\"cognitive function 75\"], \"feature_type_hints\": [\"functional_status\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C050\", \"name\": \"Cognitive function score\", \"occurrence_count\": 1, \"topic_ranks\": [8], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Cognitive function\"], \"evidence_terms\": [\"cognitive function 60\", \"50 100 cognitive\"], \"feature_type_hints\": [\"functional_status\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C051\", \"name\": \"Complete Blood Count\", \"occurrence_count\": 1, \"topic_ranks\": [61], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Complete Blood Count\"], \"evidence_terms\": [\"laboratory results cbc\", \"results cbc\", \"results cbc -\"], \"feature_type_hints\": [\"laboratory_test\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C052\", \"name\": \"Completed chemotherapy cycles\", \"occurrence_count\": 1, \"topic_ranks\": [95], \"representation_votes\": {\"count\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Number of chemotherapy cycles\"], \"evidence_terms\": [\"four cycles\", \"four cycles of\", \"four\"], \"feature_type_hints\": [\"count\"], \"represented_values_or_categories\": [\"4\"]}, {\"candidate_id\": \"C053\", \"name\": \"Constipation\", \"occurrence_count\": 1, \"topic_ranks\": [25], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Constipation\"], \"evidence_terms\": [\"20 100 constipation\", \"100 constipation 10\", \"constipation 10 100\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C054\", \"name\": \"Constipation incidence\", \"occurrence_count\": 1, \"topic_ranks\": [8], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Constipation\"], \"evidence_terms\": [\"100 constipation 20\", \"constipation 20 100\", \"constipation 20\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C055\", \"name\": \"Contrast-enhanced MRI status\", \"occurrence_count\": 1, \"topic_ranks\": [89], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Post-contrast T1-weighted imaging\"], \"evidence_terms\": [\"post-contrast t1-weighted\", \"post-contrast t1-weighted images\"], \"feature_type_hints\": [\"imaging_modality\"], \"represented_values_or_categories\": [\"post-contrast\"]}, {\"candidate_id\": \"C056\", \"name\": \"Cough\", \"occurrence_count\": 3, \"topic_ranks\": [3, 54, 79], \"representation_votes\": {\"binary\": 3}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Cough\", \"Respiratory symptoms\"], \"evidence_terms\": [\"respiratory cough dyspnea\", \"exertion hemoptysis wheezing\", \"exertion hemoptysis\", \"on exertion hemoptysis\", \"wheezing cardiovascular none\", \"cough or\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"cough\", \"dyspnea\", \"hemoptysis\", \"wheezing\", \"on exertion\"]}, {\"candidate_id\": \"C057\", \"name\": \"Cough frequency\", \"occurrence_count\": 1, \"topic_ranks\": [17], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Dry cough\"], \"evidence_terms\": [\"dry cough\", \"occasional dry cough\", \"occasional dry\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"occasional\"]}, {\"candidate_id\": \"C058\", \"name\": \"Cough severity\", \"occurrence_count\": 1, \"topic_ranks\": [20], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Cough severity\"], \"evidence_terms\": [\"mild cough\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"mild\"]}, {\"candidate_id\": \"C059\", \"name\": \"Cough severity/type\", \"occurrence_count\": 1, \"topic_ranks\": [10], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Cough\"], \"evidence_terms\": [\"occasional dry cough\", \"dry cough\", \"occasional dry\", \"dry\", \"dry cough no\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"dry\", \"occasional\"]}, {\"candidate_id\": \"C060\", \"name\": \"Count of enhancing brain lesions\", \"occurrence_count\": 1, \"topic_ranks\": [53], \"representation_votes\": {\"count\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Number of enhancing lesions\"], \"evidence_terms\": [\"three enhancing\", \"three enhancing lesions\"], \"feature_type_hints\": [\"count\"], \"represented_values_or_categories\": [\"3\"]}, {\"candidate_id\": \"C061\", \"name\": \"CT imaging findings\", \"occurrence_count\": 1, \"topic_ranks\": [37], \"representation_votes\": {\"text-derived\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Imaging findings\"], \"evidence_terms\": [\"ct identified a\"], \"feature_type_hints\": [\"text-derived\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C062\", \"name\": \"CT imaging type\", \"occurrence_count\": 1, \"topic_ranks\": [19], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"PET/CT imaging modality\"], \"evidence_terms\": [\"pet ct\", \"pet\", \"low-dose ct obtained\"], \"feature_type_hints\": [\"procedure\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C063\", \"name\": \"Current chemotherapy cycle number\", \"occurrence_count\": 1, \"topic_ranks\": [15], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Treatment cycle number\"], \"evidence_terms\": [\"cycle 2\", \"cycle 3\"], \"feature_type_hints\": [\"ordinal\"], \"represented_values_or_categories\": [\"cycle 2\", \"cycle 3\"]}, {\"candidate_id\": \"C064\", \"name\": \"Days since start of cycle\", \"occurrence_count\": 1, \"topic_ranks\": [15], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"low\", \"supporting_specific_features\": [], \"evidence_terms\": [], \"feature_type_hints\": [], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C065\", \"name\": \"Diagnosis Type\", \"occurrence_count\": 1, \"topic_ranks\": [16], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Non-small cell lung cancer diagnosis\"], \"evidence_terms\": [\"diagnosis non-small cell\", \"diagnosis non-small\", \"primary diagnosis non-small\"], \"feature_type_hints\": [\"diagnosis\"], \"represented_values_or_categories\": [\"non-small cell\"]}, {\"candidate_id\": \"C066\", \"name\": \"Diarrhea\", \"occurrence_count\": 2, \"topic_ranks\": [2, 25], \"representation_votes\": {\"binary\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Diarrhea\"], \"evidence_terms\": [\"diarrhea or\", \"10 100 diarrhea\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C067\", \"name\": \"Diarrhea incidence\", \"occurrence_count\": 1, \"topic_ranks\": [8], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Diarrhea\"], \"evidence_terms\": [\"20 100 diarrhea\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C068\", \"name\": \"Diffusion-Weighted Imaging (DWI) availability\", \"occurrence_count\": 1, \"topic_ranks\": [43], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Diffusion-Weighted Imaging (DWI)\"], \"evidence_terms\": [\"dwi with apparent\", \"dwi with\", \"diffusion-weighted imaging\", \"imaging dwi with\", \"imaging dwi\"], \"feature_type_hints\": [\"imaging_modality\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C069\", \"name\": \"Disease recurrence status\", \"occurrence_count\": 2, \"topic_ranks\": [26, 66], \"representation_votes\": {\"binary\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Residual or recurrent disease status\", \"Signs of disease recurrence\"], \"evidence_terms\": [\"residual or\", \"or recurrent\", \"residual or recurrent\", \"no residual or\", \"no residual\", \"recurrence\", \"signs of recurrence\", \"recurrence new cough\", \"recurrence new\"], \"feature_type_hints\": [\"categorical\", \"clinical_finding\"], \"represented_values_or_categories\": [\"residual\", \"recurrent\", \"no residual\"]}, {\"candidate_id\": \"C070\", \"name\": \"Dizziness\", \"occurrence_count\": 1, \"topic_ranks\": [47], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Dizziness\"], \"evidence_terms\": [\"dizziness or\", \"dizziness or focal\", \"dizziness\", \"headaches dizziness\", \"no headaches dizziness\", \"headaches dizziness or\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"present\", \"absent\"]}, {\"candidate_id\": \"C071\", \"name\": \"DLCO\", \"occurrence_count\": 1, \"topic_ranks\": [83], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"DLCO\"], \"evidence_terms\": [\"dlco\"], \"feature_type_hints\": [\"continuous\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C072\", \"name\": \"DLCO measurement\", \"occurrence_count\": 1, \"topic_ranks\": [30], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"DLCO\"], \"evidence_terms\": [\"dlco\", \"spirometry dlco\", \"tests spirometry dlco\", \"dlco to\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C073\", \"name\": \"Dosing cycle frequency\", \"occurrence_count\": 1, \"topic_ranks\": [20], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [], \"evidence_terms\": [], \"feature_type_hints\": [], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C074\", \"name\": \"Dry cough\", \"occurrence_count\": 1, \"topic_ranks\": [88], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Dry cough\"], \"evidence_terms\": [\"dry cough\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"present\"]}, {\"candidate_id\": \"C075\", \"name\": \"Dyspnea\", \"occurrence_count\": 3, \"topic_ranks\": [3, 40, 54], \"representation_votes\": {\"binary\": 2, \"ordinal\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Dyspnea\", \"Respiratory symptoms\"], \"evidence_terms\": [\"respiratory cough dyspnea\", \"exertion hemoptysis wheezing\", \"exertion hemoptysis\", \"on exertion hemoptysis\", \"wheezing cardiovascular none\", \"20 100 dyspnea\", \"20 dyspnea\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"cough\", \"dyspnea\", \"hemoptysis\", \"wheezing\", \"on exertion\"]}, {\"candidate_id\": \"C076\", \"name\": \"Dyspnea severity\", \"occurrence_count\": 1, \"topic_ranks\": [38], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Exertional dyspnea\"], \"evidence_terms\": [\"exertional\", \"mild exertional\", \"exertional dyspnea\", \"mild exertional dyspnea\", \"rest mild\", \"at rest mild\", \"rest mild exertional\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"mild\", \"at rest\"]}, {\"candidate_id\": \"C077\", \"name\": \"ECOG Performance Status\", \"occurrence_count\": 2, \"topic_ranks\": [9, 23], \"representation_votes\": {\"ordinal\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"ECOG Performance Status\"], \"evidence_terms\": [\"performance status 2\", \"status 2\", \"status 2 -\", \"4. ecog performance\"], \"feature_type_hints\": [\"ordinal\"], \"represented_values_or_categories\": [\"2\"]}, {\"candidate_id\": \"C078\", \"name\": \"eGFR\", \"occurrence_count\": 1, \"topic_ranks\": [44], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"eGFR\"], \"evidence_terms\": [\"0.6-1.2 egfr\", \"dl 0.6-1.2 egfr\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"0.6-1.2\"]}, {\"candidate_id\": \"C079\", \"name\": \"EGFR amplification status\", \"occurrence_count\": 1, \"topic_ranks\": [10], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"EGFR amplification\"], \"evidence_terms\": [\"met amplification egfr\", \"amplification egfr\"], \"feature_type_hints\": [\"molecular_biomarker\"], \"represented_values_or_categories\": [\"amplification\"]}, {\"candidate_id\": \"C080\", \"name\": \"EGFR L858R mutation status\", \"occurrence_count\": 1, \"topic_ranks\": [84], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"EGFR L858R mutation status\"], \"evidence_terms\": [\"l858r\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"l858r\"]}]\n\nReturn:\n{\n  \"assignments\": [\n    {\n      \"candidate_id\": \"C001\",\n      \"domain\": \"one allowed domain\",\n      \"preliminary_normalized_name\": \"concise snake_case name\",\n      \"artifact_likelihood\": \"high | medium | low\"\n    }\n  ]\n}"
+}

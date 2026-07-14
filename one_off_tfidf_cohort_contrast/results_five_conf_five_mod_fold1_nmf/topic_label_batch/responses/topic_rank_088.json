@@ -1,0 +1,133 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 5.980999708175659,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Numeric fragment with no clinical context.",
+        "term": "0."
+      },
+      {
+        "reason": "Incomplete phrase, likely a documentation template artifact.",
+        "term": "studies -"
+      }
+    ],
+    "general_topic": {
+      "coherence": "mixed",
+      "confidence": "medium",
+      "label": "Platelet counts, respiratory symptoms, and social support",
+      "summary": "The topic contains fragmented laboratory values for platelet counts, a respiratory symptom, and social living arrangements."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The terms represent platelet counts (plt) with specific numeric values and units (k/uL).",
+        "feature_type": "measurement",
+        "name": "Platelet count",
+        "represented_values_or_categories": [
+          "240 k/uL",
+          "260 k/uL"
+        ],
+        "supporting_terms": [
+          "plt 240 k",
+          "240 k",
+          "plt 240",
+          "dl plt 240",
+          "240 k l",
+          "240 k ul",
+          "plt 260 k",
+          "260 k ul",
+          "dl plt 260"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "A specific respiratory symptom is explicitly mentioned.",
+        "feature_type": "symptom",
+        "name": "Dry cough",
+        "represented_values_or_categories": [
+          "present"
+        ],
+        "supporting_terms": [
+          "dry cough"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "Terms describe the patient's social support or living arrangement regarding a spouse.",
+        "feature_type": "social_determinant",
+        "name": "Living situation",
+        "represented_values_or_categories": [
+          "lives with spouse"
+        ],
+        "supporting_terms": [
+          "spouse",
+          "with spouse",
+          "lives with spouse"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Platelet count",
+        "suggested_representation": "continuous",
+        "supporting_specific_features": [
+          "Platelet count"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Dry cough",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Dry cough"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Living arrangement",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Living situation"
+        ]
+      }
+    ],
+    "topic_index": 77,
+    "topic_rank": 88
+  },
+  "raw_content": "{\n  \"topic_rank\": 88,\n  \"topic_index\": 77,\n  \"general_topic\": {\n    \"label\": \"Platelet counts, respiratory symptoms, and social support\",\n    \"coherence\": \"mixed\",\n    \"confidence\": \"medium\",\n    \"summary\": \"The topic contains fragmented laboratory values for platelet counts, a respiratory symptom, and social living arrangements.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Platelet count\",\n      \"supporting_terms\": [\n        \"plt 240 k\",\n        \"240 k\",\n        \"plt 240\",\n        \"dl plt 240\",\n        \"240 k l\",\n        \"240 k ul\",\n        \"plt 260 k\",\n        \"260 k ul\",\n        \"dl plt 260\"\n      ],\n      \"feature_type\": \"measurement\",\n      \"represented_values_or_categories\": [\n        \"240 k/uL\",\n        \"260 k/uL\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms represent platelet counts (plt) with specific numeric values and units (k/uL).\"\n    },\n    {\n      \"name\": \"Dry cough\",\n      \"supporting_terms\": [\n        \"dry cough\"\n      ],\n      \"feature_type\": \"symptom\",\n      \"represented_values_or_categories\": [\n        \"present\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"A specific respiratory symptom is explicitly mentioned.\"\n    },\n    {\n      \"name\": \"Living situation\",\n      \"supporting_terms\": [\n        \"spouse\",\n        \"with spouse\",\n        \"lives with spouse\"\n      ],\n      \"feature_type\": \"social_determinant\",\n      \"represented_values_or_categories\": [\n        \"lives with spouse\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Terms describe the patient's social support or living arrangement regarding a spouse.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"0.\",\n      \"reason\": \"Numeric fragment with no clinical context.\"\n    },\n    {\n      \"term\": \"studies -\",\n      \"reason\": \"Incomplete phrase, likely a documentation template artifact.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Platelet count\",\n      \"suggested_representation\": \"continuous\",\n      \"supporting_specific_features\": [\n        \"Platelet count\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Dry cough\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Dry cough\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Living arrangement\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Living situation\"\n      ],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-aeb10cedebc58578",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "plt 240 k",
+    "240 k",
+    "plt 240",
+    "dl plt 240",
+    "240 k l",
+    "240 k ul",
+    "0.",
+    "dry cough",
+    "plt 260 k",
+    "spouse",
+    "with spouse",
+    "lives with spouse",
+    "studies -",
+    "260 k ul",
+    "dl plt 260"
+  ],
+  "topic_index": 77,
+  "topic_rank": 88,
+  "usage": {
+    "completion_tokens": 771,
+    "prompt_tokens": 850,
+    "prompt_tokens_details": null,
+    "total_tokens": 1621
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 88, internal index 77\n\nTerms in this topic, ordered from highest to lowest loading:\n1. plt 240 k\n2. 240 k\n3. plt 240\n4. dl plt 240\n5. 240 k l\n6. 240 k ul\n7. 0.\n8. dry cough\n9. plt 260 k\n10. spouse\n11. with spouse\n12. lives with spouse\n13. studies -\n14. 260 k ul\n15. dl plt 260\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 88,\n  \"topic_index\": 77,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

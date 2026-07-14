@@ -1,0 +1,160 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 7.753816843032837,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Likely a documentation template artifact combining age and encounter metadata.",
+        "term": "64 encounter type"
+      },
+      {
+        "reason": "Fragmented text combining age and encounter type.",
+        "term": "64 encounter"
+      },
+      {
+        "reason": "Fragmented text combining age and encounter type.",
+        "term": "age 64 encounter"
+      },
+      {
+        "reason": "Likely a documentation template artifact.",
+        "term": "65 encounter type"
+      },
+      {
+        "reason": "Likely a documentation template artifact.",
+        "term": "age 65 encounter"
+      },
+      {
+        "reason": "Fragmented text.",
+        "term": "65 encounter"
+      },
+      {
+        "reason": "Incomplete phrase, likely referring to bowel wall thickness or integrity, but lacks sufficient context.",
+        "term": "bowel no wall"
+      }
+    ],
+    "general_topic": {
+      "coherence": "mixed",
+      "confidence": "medium",
+      "label": "Patient age and miscellaneous radiographic findings",
+      "summary": "The topic is split between highly repetitive age-related demographic fragments and unrelated clinical findings such as lymphadenopathy and calcification."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The terms clearly represent patient age, though they are heavily fragmented by encounter-related noise.",
+        "feature_type": "demographic",
+        "name": "Age",
+        "represented_values_or_categories": [
+          "64",
+          "65"
+        ],
+        "supporting_terms": [
+          "age 64",
+          "at age 64",
+          "64-year-old",
+          "age 65",
+          "at age 65"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Represents the absence of lymphadenopathy, a relevant finding in metastatic NSCLC staging.",
+        "feature_type": "finding",
+        "name": "Lymphadenopathy status",
+        "represented_values_or_categories": [
+          "no lymphadenopathy"
+        ],
+        "supporting_terms": [
+          "no lymphadenopathy. -"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "Represents the presence of calcification, a radiographic finding.",
+        "feature_type": "finding",
+        "name": "Calcification",
+        "represented_values_or_categories": [
+          "present"
+        ],
+        "supporting_terms": [
+          "calcification."
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "Refers to a location (typically neurological/brain imaging), which may be incidental or relevant to metastatic spread.",
+        "feature_type": "finding",
+        "name": "Extra-axial finding",
+        "represented_values_or_categories": [
+          "extra-axial"
+        ],
+        "supporting_terms": [
+          "extra-axial"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Age",
+        "suggested_representation": "continuous",
+        "supporting_specific_features": [
+          "Age"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Lymphadenopathy presence",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Lymphadenopathy status"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Calcification presence",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Calcification"
+        ]
+      }
+    ],
+    "topic_index": 89,
+    "topic_rank": 76
+  },
+  "raw_content": "{\n  \"topic_rank\": 76,\n  \"topic_index\": 89,\n  \"general_topic\": {\n    \"label\": \"Patient age and miscellaneous radiographic findings\",\n    \"coherence\": \"mixed\",\n    \"confidence\": \"medium\",\n    \"summary\": \"The topic is split between highly repetitive age-related demographic fragments and unrelated clinical findings such as lymphadenopathy and calcification.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Age\",\n      \"supporting_terms\": [\n        \"age 64\",\n        \"at age 64\",\n        \"64-year-old\",\n        \"age 65\",\n        \"at age 65\"\n      ],\n      \"feature_type\": \"demographic\",\n      \"represented_values_or_categories\": [\n        \"64\",\n        \"65\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms clearly represent patient age, though they are heavily fragmented by encounter-related noise.\"\n    },\n    {\n      \"name\": \"Lymphadenopathy status\",\n      \"supporting_terms\": [\n        \"no lymphadenopathy. -\"\n      ],\n      \"feature_type\": \"finding\",\n      \"represented_values_or_categories\": [\n        \"no lymphadenopathy\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Represents the absence of lymphadenopathy, a relevant finding in metastatic NSCLC staging.\"\n    },\n    {\n      \"name\": \"Calcification\",\n      \"supporting_terms\": [\n        \"calcification.\"\n      ],\n      \"feature_type\": \"finding\",\n      \"represented_values_or_categories\": [\n        \"present\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Represents the presence of calcification, a radiographic finding.\"\n    },\n    {\n      \"name\": \"Extra-axial finding\",\n      \"supporting_terms\": [\n        \"extra-axial\"\n      ],\n      \"feature_type\": \"finding\",\n      \"represented_values_or_categories\": [\n        \"extra-axial\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Refers to a location (typically neurological/brain imaging), which may be incidental or relevant to metastatic spread.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"64 encounter type\",\n      \"reason\": \"Likely a documentation template artifact combining age and encounter metadata.\"\n    },\n    {\n      \"term\": \"64 encounter\",\n      \"reason\": \"Fragmented text combining age and encounter type.\"\n    },\n    {\n      \"term\": \"age 64 encounter\",\n      \"reason\": \"Fragmented text combining age and encounter type.\"\n    },\n    {\n      \"term\": \"65 encounter type\",\n      \"reason\": \"Likely a documentation template artifact.\"\n    },\n    {\n      \"term\": \"age 65 encounter\",\n      \"reason\": \"Likely a documentation template artifact.\"\n    },\n    {\n      \"term\": \"65 encounter\",\n      \"reason\": \"Fragmented text.\"\n    },\n    {\n      \"term\": \"bowel no wall\",\n      \"reason\": \"Incomplete phrase, likely referring to bowel wall thickness or integrity, but lacks sufficient context.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Age\",\n      \"suggested_representation\": \"continuous\",\n      \"supporting_specific_features\": [\n        \"Age\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Lymphadenopathy presence\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Lymphadenopathy status\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Calcification presence\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Calcification\"\n      ],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-9808525ce04e1ccb",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "age 64",
+    "at age 64",
+    "64-year-old",
+    "age 65",
+    "at age 65",
+    "64 encounter type",
+    "64 encounter",
+    "age 64 encounter",
+    "65 encounter type",
+    "age 65 encounter",
+    "65 encounter",
+    "no lymphadenopathy. -",
+    "calcification.",
+    "extra-axial",
+    "bowel no wall"
+  ],
+  "topic_index": 89,
+  "topic_rank": 76,
+  "usage": {
+    "completion_tokens": 999,
+    "prompt_tokens": 853,
+    "prompt_tokens_details": null,
+    "total_tokens": 1852
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 76, internal index 89\n\nTerms in this topic, ordered from highest to lowest loading:\n1. age 64\n2. at age 64\n3. 64-year-old\n4. age 65\n5. at age 65\n6. 64 encounter type\n7. 64 encounter\n8. age 64 encounter\n9. 65 encounter type\n10. age 65 encounter\n11. 65 encounter\n12. no lymphadenopathy. -\n13. calcification.\n14. extra-axial\n15. bowel no wall\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 76,\n  \"topic_index\": 89,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

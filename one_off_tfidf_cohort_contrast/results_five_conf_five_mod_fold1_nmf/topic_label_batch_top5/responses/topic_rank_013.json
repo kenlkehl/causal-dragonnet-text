@@ -1,0 +1,93 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 4.3153674602508545,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Contains punctuation fragments and lacks a specific drug or value.",
+        "term": "mg daily. -"
+      },
+      {
+        "reason": "Contains punctuation fragments.",
+        "term": "nightly. -"
+      }
+    ],
+    "general_topic": {
+      "coherence": "mostly_artifact",
+      "confidence": "high",
+      "label": "Medication dosing frequency and amount",
+      "summary": "The topic consists of fragments of medication dosing instructions (dosage amounts and frequency) without any associated drug names or clinical context."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "medium",
+        "confidence": "medium",
+        "explanation": "The terms indicate a daily dosage amount in milligrams, though the specific medication is not identified.",
+        "feature_type": "measurement",
+        "name": "Daily dosage amount",
+        "represented_values_or_categories": [
+          "10 mg"
+        ],
+        "supporting_terms": [
+          "mg daily.",
+          "10 mg daily."
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "The terms specify a frequency of administration (nightly).",
+        "feature_type": "frequency",
+        "name": "Dosing frequency",
+        "represented_values_or_categories": [
+          "nightly"
+        ],
+        "supporting_terms": [
+          "nightly. -",
+          "nightly."
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "medium",
+        "name": "Daily medication dosage",
+        "suggested_representation": "continuous",
+        "supporting_specific_features": [
+          "Daily dosage amount"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Medication administration frequency",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Dosing frequency"
+        ]
+      }
+    ],
+    "topic_index": 15,
+    "topic_rank": 13
+  },
+  "raw_content": "{\n  \"topic_rank\": 13,\n  \"topic_index\": 15,\n  \"general_topic\": {\n    \"label\": \"Medication dosing frequency and amount\",\n    \"coherence\": \"mostly_artifact\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic consists of fragments of medication dosing instructions (dosage amounts and frequency) without any associated drug names or clinical context.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Daily dosage amount\",\n      \"supporting_terms\": [\n        \"mg daily.\",\n        \"10 mg daily.\"\n      ],\n      \"feature_type\": \"measurement\",\n      \"represented_values_or_categories\": [\n        \"10 mg\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"medium\",\n      \"explanation\": \"The terms indicate a daily dosage amount in milligrams, though the specific medication is not identified.\"\n    },\n    {\n      \"name\": \"Dosing frequency\",\n      \"supporting_terms\": [\n        \"nightly. -\",\n        \"nightly.\"\n      ],\n      \"feature_type\": \"frequency\",\n      \"represented_values_or_categories\": [\n        \"nightly\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms specify a frequency of administration (nightly).\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"mg daily. -\",\n      \"reason\": \"Contains punctuation fragments and lacks a specific drug or value.\"\n    },\n    {\n      \"term\": \"nightly. -\",\n      \"reason\": \"Contains punctuation fragments.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Daily medication dosage\",\n      \"suggested_representation\": \"continuous\",\n      \"supporting_specific_features\": [\n        \"Daily dosage amount\"\n      ],\n      \"confidence\": \"medium\"\n    },\n    {\n      \"name\": \"Medication administration frequency\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Dosing frequency\"\n      ],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-b2e2bfa3a5d53673",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "mg daily.",
+    "mg daily. -",
+    "10 mg daily.",
+    "nightly. -",
+    "nightly."
+  ],
+  "topic_index": 15,
+  "topic_rank": 13,
+  "usage": {
+    "completion_tokens": 533,
+    "prompt_tokens": 767,
+    "prompt_tokens_details": null,
+    "total_tokens": 1300
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 13, internal index 15\n\nTerms in this topic, ordered from highest to lowest loading:\n1. mg daily.\n2. mg daily. -\n3. 10 mg daily.\n4. nightly. -\n5. nightly.\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 13,\n  \"topic_index\": 15,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

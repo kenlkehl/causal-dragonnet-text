@@ -1,0 +1,259 @@
+{
+  "attempts": 1,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "assignments": [
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C241",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "radiation_oncology_treatment"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C242",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "radiation_therapy_history"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C243",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "radiopharmaceutical_dose"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C244",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "recent_imaging_availability"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C245",
+        "domain": "laboratory_vitals",
+        "preliminary_normalized_name": "renal_function_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C246",
+        "domain": "diagnosis_stage_histology",
+        "preliminary_normalized_name": "residual_disease_presence"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C247",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "right_adrenal_metastasis"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C248",
+        "domain": "functional_performance",
+        "preliminary_normalized_name": "role_function"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C249",
+        "domain": "diagnosis_stage_histology",
+        "preliminary_normalized_name": "seizure_disorder_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C250",
+        "domain": "functional_performance",
+        "preliminary_normalized_name": "self_care_assistance_level"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C251",
+        "domain": "functional_performance",
+        "preliminary_normalized_name": "self_care_independence"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C252",
+        "domain": "laboratory_vitals",
+        "preliminary_normalized_name": "serum_albumin"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C253",
+        "domain": "laboratory_vitals",
+        "preliminary_normalized_name": "serum_calcium_level"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C254",
+        "domain": "laboratory_vitals",
+        "preliminary_normalized_name": "serum_sodium"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C255",
+        "domain": "demographics_social",
+        "preliminary_normalized_name": "sex"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C256",
+        "domain": "demographics_social",
+        "preliminary_normalized_name": "smoking_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C257",
+        "domain": "functional_performance",
+        "preliminary_normalized_name": "social_function_score"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C258",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "sore_throat_presence"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C259",
+        "domain": "laboratory_vitals",
+        "preliminary_normalized_name": "spirometry_result"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C260",
+        "domain": "laboratory_vitals",
+        "preliminary_normalized_name": "spirometry_results"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C261",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "spleen_metastasis"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C262",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "stereotactic_radiation_therapy_history"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C263",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "surgical_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C264",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "surveillance_imaging_occurrence"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C265",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "suvmax"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C266",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "systemic_symptoms"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C267",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "systemic_symptoms_presence"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C268",
+        "domain": "laboratory_vitals",
+        "preliminary_normalized_name": "systolic_blood_pressure"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C269",
+        "domain": "systemic_treatments_medications",
+        "preliminary_normalized_name": "taxane_based_regimen_use"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C270",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "thoracic_pet_ct_findings"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C271",
+        "domain": "other",
+        "preliminary_normalized_name": "time_since_diagnosis"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C272",
+        "domain": "diagnosis_stage_histology",
+        "preliminary_normalized_name": "tnm_stage"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C273",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "total_cumulative_radiation_dose_gy"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C274",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "total_radiation_dose_gy"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C275",
+        "domain": "molecular_biomarkers",
+        "preliminary_normalized_name": "tp53_mutation_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C276",
+        "domain": "systemic_treatments_medications",
+        "preliminary_normalized_name": "treatment_cycle_frequency"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C277",
+        "domain": "systemic_treatments_medications",
+        "preliminary_normalized_name": "treatment_response_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C278",
+        "domain": "molecular_biomarkers",
+        "preliminary_normalized_name": "ttf_1_expression"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C279",
+        "domain": "diagnosis_stage_histology",
+        "preliminary_normalized_name": "tumor_anatomical_location"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C280",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "tumor_diameter"
+      }
+    ]
+  },
+  "raw_content": "{\n  \"assignments\": [\n    {\n      \"candidate_id\": \"C241\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"radiation_oncology_treatment\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C242\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"radiation_therapy_history\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C243\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"radiopharmaceutical_dose\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C244\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"recent_imaging_availability\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C245\",\n      \"domain\": \"laboratory_vitals\",\n      \"preliminary_normalized_name\": \"renal_function_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C246\",\n      \"domain\": \"diagnosis_stage_histology\",\n      \"preliminary_normalized_name\": \"residual_disease_presence\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C247\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"right_adrenal_metastasis\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C248\",\n      \"domain\": \"functional_performance\",\n      \"preliminary_normalized_name\": \"role_function\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C249\",\n      \"domain\": \"diagnosis_stage_histology\",\n      \"preliminary_normalized_name\": \"seizure_disorder_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C250\",\n      \"domain\": \"functional_performance\",\n      \"preliminary_normalized_name\": \"self_care_assistance_level\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C251\",\n      \"domain\": \"functional_performance\",\n      \"preliminary_normalized_name\": \"self_care_independence\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C252\",\n      \"domain\": \"laboratory_vitals\",\n      \"preliminary_normalized_name\": \"serum_albumin\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C253\",\n      \"domain\": \"laboratory_vitals\",\n      \"preliminary_normalized_name\": \"serum_calcium_level\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C254\",\n      \"domain\": \"laboratory_vitals\",\n      \"preliminary_normalized_name\": \"serum_sodium\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C255\",\n      \"domain\": \"demographics_social\",\n      \"preliminary_normalized_name\": \"sex\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C256\",\n      \"domain\": \"demographics_social\",\n      \"preliminary_normalized_name\": \"smoking_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C257\",\n      \"domain\": \"functional_performance\",\n      \"preliminary_normalized_name\": \"social_function_score\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C258\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"sore_throat_presence\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C259\",\n      \"domain\": \"laboratory_vitals\",\n      \"preliminary_normalized_name\": \"spirometry_result\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C260\",\n      \"domain\": \"laboratory_vitals\",\n      \"preliminary_normalized_name\": \"spirometry_results\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C261\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"spleen_metastasis\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C262\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"stereotactic_radiation_therapy_history\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C263\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"surgical_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C264\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"surveillance_imaging_occurrence\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C265\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"suvmax\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C266\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"systemic_symptoms\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C267\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"systemic_symptoms_presence\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C268\",\n      \"domain\": \"laboratory_vitals\",\n      \"preliminary_normalized_name\": \"systolic_blood_pressure\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C269\",\n      \"domain\": \"systemic_treatments_medications\",\n      \"preliminary_normalized_name\": \"taxane_based_regimen_use\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C270\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"thoracic_pet_ct_findings\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C271\",\n      \"domain\": \"other\",\n      \"preliminary_normalized_name\": \"time_since_diagnosis\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C272\",\n      \"domain\": \"diagnosis_stage_histology\",\n      \"preliminary_normalized_name\": \"tnm_stage\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C273\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"total_cumulative_radiation_dose_gy\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C274\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"total_radiation_dose_gy\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C275\",\n      \"domain\": \"molecular_biomarkers\",\n      \"preliminary_normalized_name\": \"tp53_mutation_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C276\",\n      \"domain\": \"systemic_treatments_medications\",\n      \"preliminary_normalized_name\": \"treatment_cycle_frequency\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C277\",\n      \"domain\": \"systemic_treatments_medications\",\n      \"preliminary_normalized_name\": \"treatment_response_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C278\",\n      \"domain\": \"molecular_biomarkers\",\n      \"preliminary_normalized_name\": \"ttf_1_expression\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C279\",\n      \"domain\": \"diagnosis_stage_histology\",\n      \"preliminary_normalized_name\": \"tumor_anatomical_location\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C280\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"tumor_diameter\",\n      \"artifact_likelihood\": \"low\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-8b0253b382179a6c",
+  "status": "complete",
+  "system_prompt": "You organize proposed clinical feature names into broad domains before harmonization. Use only the supplied evidence. Every candidate ID must appear exactly once. Return valid JSON only.",
+  "usage": {
+    "completion_tokens": 2385,
+    "prompt_tokens": 4864,
+    "prompt_tokens_details": null,
+    "total_tokens": 7249
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nAssign every candidate to exactly one of these domains:\n[\"demographics_social\", \"diagnosis_stage_histology\", \"molecular_biomarkers\", \"imaging_disease_sites\", \"laboratory_vitals\", \"symptoms_patient_reported\", \"functional_performance\", \"systemic_treatments_medications\", \"procedures_surgery_radiation\", \"administrative_artifact\", \"other\"]\n\nUse `administrative_artifact` only for identifiers, note-template structure, or nonclinical administrative fragments. A clinically meaningful variable that may merely be unimportant should remain in its clinical domain.\n\nCandidates:\n[{\"candidate_id\": \"C241\", \"name\": \"Radiation Oncology Treatment\", \"occurrence_count\": 1, \"topic_ranks\": [5], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Radiation Oncology Involvement\"], \"evidence_terms\": [\"radiation oncology\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"radiation oncology\"]}, {\"candidate_id\": \"C242\", \"name\": \"Radiation therapy history\", \"occurrence_count\": 3, \"topic_ranks\": [64, 77, 82], \"representation_votes\": {\"binary\": 3}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Radiation therapy\", \"Radiation therapy history\"], \"evidence_terms\": [\"radiation\"], \"feature_type_hints\": [\"treatment\", \"treatment_history\"], \"represented_values_or_categories\": [\"radiation\"]}, {\"candidate_id\": \"C243\", \"name\": \"Radiopharmaceutical dose\", \"occurrence_count\": 1, \"topic_ranks\": [93], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Tracer activity\"], \"evidence_terms\": [\"mbq\", \"370 mbq\", \"370\"], \"feature_type_hints\": [\"continuous\"], \"represented_values_or_categories\": [\"370 mbq\"]}, {\"candidate_id\": \"C244\", \"name\": \"Recent imaging availability\", \"occurrence_count\": 1, \"topic_ranks\": [71], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Recent imaging\"], \"evidence_terms\": [\"recent imaging.\"], \"feature_type_hints\": [\"text-derived\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C245\", \"name\": \"Renal Function Status\", \"occurrence_count\": 1, \"topic_ranks\": [58], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Blood Urea Nitrogen (BUN)\"], \"evidence_terms\": [\"bun 22 mg\", \"bun 22\", \"22 mg dl\", \"high bun\"], \"feature_type_hints\": [\"laboratory_measurement\"], \"represented_values_or_categories\": [\"22 mg/dL\", \"high\"]}, {\"candidate_id\": \"C246\", \"name\": \"Residual disease presence\", \"occurrence_count\": 1, \"topic_ranks\": [26], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Residual or recurrent disease status\"], \"evidence_terms\": [\"residual or\", \"or recurrent\", \"residual or recurrent\", \"no residual or\", \"no residual\", \"recurrence\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"residual\", \"recurrent\", \"no residual\"]}, {\"candidate_id\": \"C247\", \"name\": \"Right adrenal metastasis\", \"occurrence_count\": 1, \"topic_ranks\": [69], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Right adrenal metastasis\"], \"evidence_terms\": [\"right adrenal\", \"- right adrenal\", \"right adrenal gland\", \"right adrenal lesion\", \"the right adrenal\", \"right adrenal metastasis\", \"adrenal metastasis.\", \"cm right adrenal\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"right\"]}, {\"candidate_id\": \"C248\", \"name\": \"Role function\", \"occurrence_count\": 1, \"topic_ranks\": [25], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"low\", \"supporting_specific_features\": [], \"evidence_terms\": [], \"feature_type_hints\": [], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C249\", \"name\": \"Seizure disorder status\", \"occurrence_count\": 1, \"topic_ranks\": [39], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Seizure disorder\"], \"evidence_terms\": [\"seizure\", \"seizure disorder\"], \"feature_type_hints\": [\"condition\"], \"represented_values_or_categories\": [\"seizure\"]}, {\"candidate_id\": \"C250\", \"name\": \"Self-care assistance level\", \"occurrence_count\": 1, \"topic_ranks\": [57], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Self-care assistance level\"], \"evidence_terms\": [\"self-care\", \"assistance\", \"3 - limited\"], \"feature_type_hints\": [\"ordinal\"], \"represented_values_or_categories\": [\"limited\"]}, {\"candidate_id\": \"C251\", \"name\": \"Self-care independence\", \"occurrence_count\": 1, \"topic_ranks\": [56], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Self-care ability\"], \"evidence_terms\": [\"capable of self-care\", \"of self-care but\", \"self-care but unable\", \"of self-care\"], \"feature_type_hints\": [\"functional status\"], \"represented_values_or_categories\": [\"capable\", \"unable\"]}, {\"candidate_id\": \"C252\", \"name\": \"Serum Albumin\", \"occurrence_count\": 1, \"topic_ranks\": [46], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Albumin\"], \"evidence_terms\": [\"albumin 3.9\", \"albumin 3.9 g\", \"3.9 g\", \"3.9 g dl\", \"3.9\", \"normal albumin 3.9\", \"l albumin 3.9\", \"3.9 g dl.\", \"3.8\"], \"feature_type_hints\": [\"laboratory_measurement\"], \"represented_values_or_categories\": [\"3.9 g/dL\", \"3.8 g/dL\"]}, {\"candidate_id\": \"C253\", \"name\": \"Serum calcium level\", \"occurrence_count\": 1, \"topic_ranks\": [34], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"low\", \"supporting_specific_features\": [\"Calcium level\"], \"evidence_terms\": [\"- calcium\"], \"feature_type_hints\": [\"continuous\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C254\", \"name\": \"Serum Sodium\", \"occurrence_count\": 1, \"topic_ranks\": [82], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Sodium level\"], \"evidence_terms\": [\"138 meq\", \"138 meq l\", \"na 138 meq\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"138 meq/l\"]}, {\"candidate_id\": \"C255\", \"name\": \"Sex\", \"occurrence_count\": 6, \"topic_ranks\": [16, 44, 71, 77, 80, 90], \"representation_votes\": {\"categorical\": 6}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Biological Sex\", \"Demographics\", \"Sex\"], \"evidence_terms\": [\"- sex age\", \"- sex\", \"sex age\", \"male -\", \"female\", \"female mrn\", \"woman\", \"male\", \"woman with stage\", \"sex female\"], \"feature_type_hints\": [\"demographic\", \"categorical\", \"demographics\"], \"represented_values_or_categories\": [\"male\", \"female\", \"sex\", \"age\"]}, {\"candidate_id\": \"C256\", \"name\": \"Smoking status\", \"occurrence_count\": 1, \"topic_ranks\": [77], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Smoking history\"], \"evidence_terms\": [\"smoking history\"], \"feature_type_hints\": [\"social_history\"], \"represented_values_or_categories\": [\"smoking history\"]}, {\"candidate_id\": \"C257\", \"name\": \"Social function score\", \"occurrence_count\": 1, \"topic_ranks\": [8], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Social function\"], \"evidence_terms\": [\"60 100 social\"], \"feature_type_hints\": [\"functional_status\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C258\", \"name\": \"Sore throat presence\", \"occurrence_count\": 2, \"topic_ranks\": [18, 92], \"representation_votes\": {\"binary\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Sore throat\"], \"evidence_terms\": [\"sore throat sinus\", \"throat sinus\", \"no sore throat\", \"no sore\", \"heent no sore\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"present\", \"absent\"]}, {\"candidate_id\": \"C259\", \"name\": \"Spirometry result\", \"occurrence_count\": 1, \"topic_ranks\": [30], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Spirometry\"], \"evidence_terms\": [\"spirometry\", \"tests spirometry\", \"function tests spirometry\", \"pulmonary function tests\", \"spirometry dlco\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C260\", \"name\": \"Spirometry results\", \"occurrence_count\": 1, \"topic_ranks\": [38], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Spirometry\"], \"evidence_terms\": [\"spirometry\"], \"feature_type_hints\": [\"diagnostic_test\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C261\", \"name\": \"Spleen metastasis\", \"occurrence_count\": 1, \"topic_ranks\": [31], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Spleen involvement\"], \"evidence_terms\": [\"spleen adrenal\", \"spleen adrenal glands\", \"liver spleen adrenal\"], \"feature_type_hints\": [\"anatomical_location\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C262\", \"name\": \"Stereotactic radiation therapy history\", \"occurrence_count\": 1, \"topic_ranks\": [34], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Stereotactic radiation therapy\"], \"evidence_terms\": [\"stereotactic\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"stereotactic\"]}, {\"candidate_id\": \"C263\", \"name\": \"Surgical Status\", \"occurrence_count\": 1, \"topic_ranks\": [83], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Surgical Status\"], \"evidence_terms\": [\"post-operative\", \"stable postoperative\", \"postoperative changes\", \"- post-operative\", \"pre-operative\", \"adjuvant\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"post-operative\", \"pre-operative\", \"adjuvant\"]}, {\"candidate_id\": \"C264\", \"name\": \"Surveillance imaging occurrence\", \"occurrence_count\": 1, \"topic_ranks\": [92], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Surveillance imaging\"], \"evidence_terms\": [\"surveillance imaging at\", \"imaging at age\", \"imaging at\"], \"feature_type_hints\": [\"procedure\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C265\", \"name\": \"SUVmax\", \"occurrence_count\": 4, \"topic_ranks\": [7, 19, 70, 93], \"representation_votes\": {\"continuous\": 4}, \"confidence\": \"high\", \"supporting_specific_features\": [\"FDG uptake\", \"SUVmax\"], \"evidence_terms\": [\"fdg uptake. -\", \"fdg uptake.\", \"fdg\", \"suvmax\", \"suvmax =\"], \"feature_type_hints\": [\"quantitative_measurement\", \"measurement\", \"continuous\"], \"represented_values_or_categories\": [\"suvmax\"]}, {\"candidate_id\": \"C266\", \"name\": \"Systemic symptoms\", \"occurrence_count\": 1, \"topic_ranks\": [17], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"low\", \"supporting_specific_features\": [], \"evidence_terms\": [], \"feature_type_hints\": [], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C267\", \"name\": \"Systemic symptoms presence\", \"occurrence_count\": 1, \"topic_ranks\": [57], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"low\", \"supporting_specific_features\": [], \"evidence_terms\": [], \"feature_type_hints\": [], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C268\", \"name\": \"Systolic blood pressure\", \"occurrence_count\": 1, \"topic_ranks\": [62], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Blood pressure\"], \"evidence_terms\": [\"--- bp 128\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"128\"]}, {\"candidate_id\": \"C269\", \"name\": \"Taxane-based regimen use\", \"occurrence_count\": 1, \"topic_ranks\": [65], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Taxane-based chemotherapy\"], \"evidence_terms\": [\"taxane-based\"], \"feature_type_hints\": [\"treatment_regimen\"], \"represented_values_or_categories\": [\"taxane-based\"]}, {\"candidate_id\": \"C270\", \"name\": \"Thoracic PET/CT findings\", \"occurrence_count\": 1, \"topic_ranks\": [12], \"representation_votes\": {\"text-derived\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Thoracic imaging findings\"], \"evidence_terms\": [\"thorax -\", \"findings thorax -\", \"findings thorax\", \"thorax - right\"], \"feature_type_hints\": [\"text-derived\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C271\", \"name\": \"Time since diagnosis\", \"occurrence_count\": 1, \"topic_ranks\": [1], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"low\", \"supporting_specific_features\": [], \"evidence_terms\": [], \"feature_type_hints\": [], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C272\", \"name\": \"TNM Stage\", \"occurrence_count\": 2, \"topic_ranks\": [11, 86], \"representation_votes\": {\"categorical\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"TNM Stage\"], \"evidence_terms\": [\"iv t3 n2\"], \"feature_type_hints\": [\"clinical_stage\", \"tnm_classification\"], \"represented_values_or_categories\": [\"Stage IV\", \"T3\", \"N2\"]}, {\"candidate_id\": \"C273\", \"name\": \"Total cumulative radiation dose (Gy)\", \"occurrence_count\": 1, \"topic_ranks\": [36], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"low\", \"supporting_specific_features\": [], \"evidence_terms\": [], \"feature_type_hints\": [], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C274\", \"name\": \"Total radiation dose (Gy)\", \"occurrence_count\": 1, \"topic_ranks\": [91], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Radiation dose\"], \"evidence_terms\": [\"gy\", \"gy in\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"Gy\"]}, {\"candidate_id\": \"C275\", \"name\": \"TP53 Mutation Status\", \"occurrence_count\": 1, \"topic_ranks\": [46], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Genetic Mutation: G12C and TP53\"], \"evidence_terms\": [\"g12c mutation tp53\"], \"feature_type_hints\": [\"genetic_mutation\"], \"represented_values_or_categories\": [\"KRAS G12C\", \"TP53\"]}, {\"candidate_id\": \"C276\", \"name\": \"Treatment cycle frequency\", \"occurrence_count\": 1, \"topic_ranks\": [35], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Intravenous dosing frequency\"], \"evidence_terms\": [\"iv q3 weeks\", \"iv q3\", \"q3\", \"q3 weeks\", \"mg iv q3\"], \"feature_type_hints\": [\"dosage_schedule\"], \"represented_values_or_categories\": [\"q3 weeks\"]}, {\"candidate_id\": \"C277\", \"name\": \"Treatment response status\", \"occurrence_count\": 1, \"topic_ranks\": [95], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Treatment response\"], \"evidence_terms\": [\"a partial\", \"a partial response\", \"partial response per\", \"progressive disease after\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"partial response\", \"progressive disease\"]}, {\"candidate_id\": \"C278\", \"name\": \"TTF-1 expression\", \"occurrence_count\": 2, \"topic_ranks\": [78, 81], \"representation_votes\": {\"binary\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"TTF-1 expression status\"], \"evidence_terms\": [\"ttf-1 thyroid transcription factor-1\", \"---------------- ttf-1 thyroid transcription\", \"ttf-1 thyroid\", \"---------------- ttf-1\", \"-------- ---------------- ttf-1\", \"---------------- ttf-1 clone\", \"ttf-1 clone\", \"ttf-1 clone 8g7g3\"], \"feature_type_hints\": [\"finding\", \"immunohistochemistry\"], \"represented_values_or_categories\": [\"positive\"]}, {\"candidate_id\": \"C279\", \"name\": \"Tumor anatomical location\", \"occurrence_count\": 1, \"topic_ranks\": [59], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Tumor location\"], \"evidence_terms\": [\"lower lobe\", \"the right lower\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"lower lobe\", \"right lower lobe\"]}, {\"candidate_id\": \"C280\", \"name\": \"Tumor diameter\", \"occurrence_count\": 1, \"topic_ranks\": [7], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Lesion size\"], \"evidence_terms\": [\"3.8 cm\", \"3.8\", \"measuring 3.8\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"3.8 cm\"]}]\n\nReturn:\n{\n  \"assignments\": [\n    {\n      \"candidate_id\": \"C001\",\n      \"domain\": \"one allowed domain\",\n      \"preliminary_normalized_name\": \"concise snake_case name\",\n      \"artifact_likelihood\": \"high | medium | low\"\n    }\n  ]\n}"
+}

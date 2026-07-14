@@ -1,0 +1,6 @@
+variable,hit,n_hits,best_feature,best_direction,best_coefficient,best_abs_rank_within_direction,all_hit_features
+histology_type,True,10,treated::large cell,positive,0.0254738074433415,1.0,control::squamous cell; control::squamous nsclc; control::cell carcinoma; control::iv squamous; control::in squamous; treated::differentiated adenocarcinoma; control::metastatic squamous; treated::large cell; treated::cell carcinoma; treated::other histology
+egfr_mutation_status,True,2,treated::deletion egfr,positive,0.0146802586946081,34.0,treated::l858r; treated::deletion egfr
+baseline_nlr,True,4,treated::neutrophils,negative,-0.0118383143933637,105.0,treated::neutrophils; treated::low lymphocytes; treated::neutrophils 103; treated::lymphocytes ul
+brain_metastases_status,True,15,treated::right cerebellar,positive,0.018892635123622,5.0,treated::of intracranial; treated::right cerebellar; treated::brain metastases; treated::cerebellar; treated::definitive intracranial; treated::frontal lobe; treated::cerebellar hemisphere; treated::frontal; treated::frontal and; treated::intracranial disease; treated::known brain; treated::two brain; treated::with brain; treated::to brain; control::cerebellar metastasis
+baseline_hemoglobin,False,0,,,,,

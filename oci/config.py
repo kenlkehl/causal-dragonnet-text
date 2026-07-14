@@ -24,6 +24,92 @@ MULTI_MODEL_FEATURE_DISCOVERY_METHODS = (
     "embedding_contrast",
 )
 
+# The integrated ``multi_model_forest`` runner has a deliberately narrower v2
+# contract than the legacy ``multi_model_agentic_forest`` runner. Keep the
+# legacy normalizer readable for old configuration files, but never use it to
+# validate the new pathway.
+TFIDF_TOPIC_FEATURE_DISCOVERY_METHODS = (
+    "bow",
+    "tfidf_topic_contrast",
+)
+
+
+def normalize_tfidf_topic_feature_discovery_methods(
+    methods: Any,
+    *,
+    source: str = "feature_discovery_methods",
+) -> List[str]:
+    """Normalize discovery methods for the v2 TF-IDF-topic pathway."""
+    if methods is None:
+        return list(TFIDF_TOPIC_FEATURE_DISCOVERY_METHODS)
+    if isinstance(methods, str):
+        raw_values = [methods]
+    elif isinstance(methods, (list, tuple, set)):
+        raw_values = list(methods)
+    else:
+        raw_values = [methods]
+    tokens = [
+        token.strip().lower().replace("-", "_")
+        for raw in raw_values
+        for token in str(raw).replace(";", ",").split(",")
+        if token.strip()
+    ]
+    if "all" in tokens:
+        return list(TFIDF_TOPIC_FEATURE_DISCOVERY_METHODS)
+    aliases = {
+        "bow": "bow",
+        "bag_of_words": "bow",
+        "bagofwords": "bow",
+        "tfidf": "bow",
+        "tf_idf": "bow",
+        "tfidf_topic_contrast": "tfidf_topic_contrast",
+        "tfidf_topics": "tfidf_topic_contrast",
+        "topic_contrast": "tfidf_topic_contrast",
+        "topics": "tfidf_topic_contrast",
+    }
+    legacy = {
+        "htr",
+        "htr_evidence",
+        "hierarchical_transformer",
+        "embedding",
+        "embeddings",
+        "embedding_contrast",
+        "matched_pair_uplift",
+        "uplift",
+        "r_learner",
+        "rlearner",
+    }
+    normalized: List[str] = []
+    for token in tokens:
+        if token in legacy:
+            raise ValueError(
+                f"{source}={token!r} is a legacy discovery method and is not "
+                "available in multi_model_forest v2. Use 'bow' and "
+                "'tfidf_topic_contrast'; use the legacy runner only to read or "
+                "reproduce old artifacts."
+            )
+        canonical = aliases.get(token)
+        if canonical is None:
+            raise ValueError(
+                f"Unknown {source} entry {token!r}; expected one or more of "
+                f"{list(TFIDF_TOPIC_FEATURE_DISCOVERY_METHODS)}"
+            )
+        if canonical not in normalized:
+            normalized.append(canonical)
+    if not normalized:
+        raise ValueError(
+            f"{source} must include at least one of "
+            f"{list(TFIDF_TOPIC_FEATURE_DISCOVERY_METHODS)}"
+        )
+    missing = set(TFIDF_TOPIC_FEATURE_DISCOVERY_METHODS) - set(normalized)
+    if missing:
+        raise ValueError(
+            "multi_model_forest v2 requires both deterministic BoW nuisance "
+            "modeling and TF-IDF topic contrast discovery; missing "
+            f"{sorted(missing)}"
+        )
+    return normalized
+
 _MULTI_MODEL_FEATURE_DISCOVERY_METHOD_ALIASES = {
     "bow": {
         "bow",
@@ -195,7 +281,8 @@ class ExplicitFeatureExtractionConfig:
     # - "python_api": Use vLLM Python API directly (no server, in-process)
     vllm_mode: str = "server"
     vllm_server_url: Optional[str] = "http://localhost:8000/v1"
-    # Set to "auto" in server mode to use the first id returned by /v1/models.
+    # Set to "auto" in server mode to discover each configured endpoint's
+    # first /v1/models id; heterogeneous endpoint pools retain per-URL ids.
     vllm_model_name: str = "Qwen/Qwen2.5-7B-Instruct"
     vllm_api_key: str = "EMPTY"
     vllm_tensor_parallel_size: int = 1
@@ -203,9 +290,14 @@ class ExplicitFeatureExtractionConfig:
     vllm_download_dir: Optional[str] = None  # Model download directory
     vllm_max_model_len: Optional[int] = None  # Max context length for start_server/python_api
     vllm_reasoning_parser: Optional[str] = "auto"  # vLLM reasoning parser, or auto/none
+    # None leaves the endpoint's chat-template reasoning behavior unchanged.
+    vllm_enable_thinking: Optional[bool] = None
 
     # Extraction settings
     extraction_batch_size: int = 32
+    # Maximum variables in one extraction schema. This is independent of
+    # extraction_batch_size, which controls patient/request concurrency.
+    max_variables_per_extraction_request: int = 10
     extraction_max_retries: int = 3  # Retries per patient before marking as missing
     extraction_retry_initial_delay: float = 1.0
     extraction_retry_max_delay: float = 30.0
@@ -229,6 +321,15 @@ class ExplicitFeatureExtractionConfig:
     featurizer_output_dim: int = 64
     featurizer_hidden_dim: int = 128
     featurizer_dropout: float = 0.1
+
+    def __post_init__(self):
+        if not 1 <= int(self.max_variables_per_extraction_request) <= 10:
+            raise ValueError(
+                "explicit_features.max_variables_per_extraction_request must be in [1, 10]"
+            )
+        self.max_variables_per_extraction_request = int(
+            self.max_variables_per_extraction_request
+        )
 
 
 def parse_explicit_feature_spec_entries(
@@ -619,11 +720,13 @@ class AgenticFeatureSearchConfig:
     # LLM proposal agent settings. The endpoint is OpenAI-compatible so it can
     # point to vLLM, OpenAI, or another compatible local server.
     agent_server_url: Optional[str] = "http://localhost:8000/v1"
-    # Set to "auto" to use the first id returned by the server's /v1/models.
+    # Set to "auto" to discover each configured endpoint's first /v1/models id.
     agent_model_name: str = "Qwen/Qwen2.5-7B-Instruct"
     agent_api_key: str = "EMPTY"
     agent_temperature: float = 0.0
     agent_max_tokens: int = 25000
+    # None leaves the endpoint's chat-template reasoning behavior unchanged.
+    agent_enable_thinking: Optional[bool] = None
     agent_schema_repair_attempts: int = 1
     agent_request_max_retries: int = 3
     agent_retry_initial_delay: float = 1.0
@@ -900,6 +1003,166 @@ def default_multi_model_bow_views() -> List[BoWViewConfig]:
             ngram_range_max=2,
         ),
     ]
+
+
+@dataclass
+class TfidfTopicDiscoveryConfig:
+    """Deterministic nuisance, contrast, and consensus-NMF settings."""
+
+    max_features: int = 30000
+    ngram_range_min: int = 1
+    ngram_range_max: int = 3
+    min_df: int = 5
+    max_df: float = 0.98
+    sublinear_tf: bool = True
+    top_fraction: float = 0.10
+    topic_count: int = 100
+    topic_seeds: List[int] = field(default_factory=lambda: [42, 43, 44])
+    terms_per_topic: int = 15
+    nmf_init: str = "nndsvdar"
+    nmf_solver: str = "cd"
+    nmf_beta_loss: str = "frobenius"
+    nmf_max_iter: int = 400
+    nmf_tol: float = 1e-4
+    importance_weight_min: float = 0.5
+    importance_weight_max: float = 2.0
+    stability_repeats: int = 30
+    stability_fraction: float = 0.75
+    minimum_arm_document_support: int = 2
+    minimum_nuisance_source_agreement: float = 0.50
+    minimum_subsample_selection_fraction: float = 0.20
+    minimum_tail_sign_agreement: float = 0.50
+    topic_label_parallelism: int = 8
+    initial_effect_coverage_target: float = 0.80
+    topic_reconstruction_tolerance: float = 0.03
+    contrast_coverage_tolerance: float = 0.05
+    # Honest inner-held-out group score tests used to filter topics before
+    # agent labeling.  Every bank retains a bounded evidence-ranked set; the
+    # minimum is a power safeguard rather than a significance claim.
+    score_test_enabled: bool = True
+    score_test_bootstrap_repeats: int = 500
+    # Zero means every fitted topic.  Production defaults to the complete
+    # family so a topic is never chosen for bootstrap calibration after its
+    # held-out statistic has already been inspected.  A positive limit is an
+    # explicitly approximate/debug mode; selection then falls back to the
+    # asymptotic p-values shared by the complete family.
+    score_test_bootstrap_top_topics: int = 0
+    score_test_bootstrap_chunk_size: int = 100
+    score_test_fdr_level: float = 0.20
+    score_test_p_threshold: float = 0.10
+    score_test_min_topics_per_bank: int = 5
+    score_test_max_topics_per_bank: int = 20
+    score_test_full_topic_min_inner_folds: int = 1
+    # Sparse skip connection around NMF. Candidate groups are built only from
+    # stable fit-side effect n-grams that are absent from every fitted topic's
+    # 15-term summary, then tested once on the exact inner-held-out rows.
+    orphan_ngram_enabled: bool = True
+    orphan_ngram_min_abs_fit_score: float = 2.0
+    orphan_ngram_cluster_similarity_threshold: float = 0.25
+    orphan_ngram_cluster_max_terms: int = 15
+    orphan_ngram_cluster_neighbors: int = 20
+    orphan_ngram_fdr_level: float = 0.20
+    orphan_ngram_p_threshold: float = 0.10
+    orphan_ngram_min_selected_clusters: int = 5
+    orphan_ngram_max_selected_clusters: int = 20
+    orphan_ngram_full_min_inner_folds: int = 1
+    prompt_version: str = "tfidf_topic_label_v2"
+    random_state: int = 42
+
+    def __post_init__(self):
+        if self.max_features < 1:
+            raise ValueError("tfidf_topic.max_features must be >= 1")
+        if self.ngram_range_min < 1 or self.ngram_range_max < self.ngram_range_min:
+            raise ValueError("tfidf_topic ngram range is invalid")
+        if self.min_df < 1:
+            raise ValueError("tfidf_topic.min_df must be >= 1")
+        if not 0.0 < self.max_df <= 1.0:
+            raise ValueError("tfidf_topic.max_df must be in (0, 1]")
+        if not 0.0 < self.top_fraction <= 1.0:
+            raise ValueError("tfidf_topic.top_fraction must be in (0, 1]")
+        if self.topic_count < 1:
+            raise ValueError("tfidf_topic.topic_count must be >= 1")
+        self.topic_seeds = [int(seed) for seed in self.topic_seeds]
+        if not self.topic_seeds:
+            raise ValueError("tfidf_topic.topic_seeds must not be empty")
+        if self.terms_per_topic != 15:
+            raise ValueError("tfidf_topic.terms_per_topic must be exactly 15")
+        if self.nmf_init != "nndsvdar" or self.nmf_solver != "cd":
+            raise ValueError("tfidf_topic v2 requires nndsvdar coordinate-descent NMF")
+        if self.nmf_beta_loss != "frobenius":
+            raise ValueError("tfidf_topic v2 requires the Frobenius objective")
+        if self.nmf_max_iter < 1 or self.nmf_tol <= 0.0:
+            raise ValueError("tfidf_topic NMF convergence settings are invalid")
+        if self.stability_repeats < 0:
+            raise ValueError("tfidf_topic.stability_repeats must be >= 0")
+        if not 0.0 < self.stability_fraction <= 1.0:
+            raise ValueError("tfidf_topic.stability_fraction must be in (0, 1]")
+        if self.topic_label_parallelism < 1:
+            raise ValueError("tfidf_topic.topic_label_parallelism must be >= 1")
+        if self.score_test_bootstrap_repeats < 0:
+            raise ValueError("tfidf_topic.score_test_bootstrap_repeats must be >= 0")
+        if self.score_test_bootstrap_top_topics < 0:
+            raise ValueError("tfidf_topic.score_test_bootstrap_top_topics must be >= 0")
+        if self.score_test_bootstrap_chunk_size < 1:
+            raise ValueError("tfidf_topic.score_test_bootstrap_chunk_size must be >= 1")
+        if self.score_test_min_topics_per_bank < 0:
+            raise ValueError("tfidf_topic.score_test_min_topics_per_bank must be >= 0")
+        if self.score_test_max_topics_per_bank < self.score_test_min_topics_per_bank:
+            raise ValueError(
+                "tfidf_topic.score_test_max_topics_per_bank must be >= "
+                "score_test_min_topics_per_bank"
+            )
+        if self.score_test_full_topic_min_inner_folds < 1:
+            raise ValueError(
+                "tfidf_topic.score_test_full_topic_min_inner_folds must be >= 1"
+            )
+        if float(self.orphan_ngram_min_abs_fit_score) < 0.0:
+            raise ValueError(
+                "tfidf_topic.orphan_ngram_min_abs_fit_score must be >= 0"
+            )
+        if not 1 <= int(self.orphan_ngram_cluster_max_terms) <= 15:
+            raise ValueError(
+                "tfidf_topic.orphan_ngram_cluster_max_terms must be in [1, 15]"
+            )
+        if int(self.orphan_ngram_cluster_neighbors) < 1:
+            raise ValueError(
+                "tfidf_topic.orphan_ngram_cluster_neighbors must be >= 1"
+            )
+        if int(self.orphan_ngram_max_selected_clusters) < 0:
+            raise ValueError(
+                "tfidf_topic.orphan_ngram_max_selected_clusters must be >= 0"
+            )
+        if not 0 <= int(self.orphan_ngram_min_selected_clusters) <= int(
+            self.orphan_ngram_max_selected_clusters
+        ):
+            raise ValueError(
+                "tfidf_topic.orphan_ngram_min_selected_clusters must be in "
+                "[0, orphan_ngram_max_selected_clusters]"
+            )
+        if int(self.orphan_ngram_full_min_inner_folds) < 1:
+            raise ValueError(
+                "tfidf_topic.orphan_ngram_full_min_inner_folds must be >= 1"
+            )
+        if self.orphan_ngram_enabled and not self.score_test_enabled:
+            raise ValueError(
+                "tfidf_topic.orphan_ngram_enabled requires score_test_enabled"
+            )
+        for field_name in (
+            "minimum_nuisance_source_agreement",
+            "minimum_subsample_selection_fraction",
+            "minimum_tail_sign_agreement",
+            "initial_effect_coverage_target",
+            "topic_reconstruction_tolerance",
+            "contrast_coverage_tolerance",
+            "score_test_fdr_level",
+            "score_test_p_threshold",
+            "orphan_ngram_cluster_similarity_threshold",
+            "orphan_ngram_fdr_level",
+            "orphan_ngram_p_threshold",
+        ):
+            value = float(getattr(self, field_name))
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"tfidf_topic.{field_name} must be in [0, 1]")
 
 
 @dataclass
@@ -1258,8 +1521,8 @@ class MultiModelAgenticForestConfig:
 class MultiModelForestConfig(MultiModelAgenticForestConfig):
     """Configuration for the integrated two-stage multi-model forest path."""
 
-    # Outer-fold execution backend. "threads" preserves historical behavior;
-    # "processes"/"loky" makes outer folds visible as joblib worker processes.
+    tfidf_topic: TfidfTopicDiscoveryConfig = field(default_factory=TfidfTopicDiscoveryConfig)
+    # Outer-fold execution backend for CPU-only TF-IDF/NMF contexts.
     outer_parallel_backend: str = "threads"
     # Optional overrides for the two nested fold families. When unset, the legacy
     # fold_parallelism setting is used for both.
@@ -1287,7 +1550,45 @@ class MultiModelForestConfig(MultiModelAgenticForestConfig):
     matched_pair_htr_attention_pairs_per_fold: int = 16
 
     def __post_init__(self):
-        super().__post_init__()
+        raw_methods = self.feature_discovery_methods
+        raw_tokens = {
+            str(value).strip().lower().replace("-", "_")
+            for value in (
+                raw_methods
+                if isinstance(raw_methods, (list, tuple, set))
+                else ([] if raw_methods is None else [raw_methods])
+            )
+        }
+        v2_requested = raw_methods is None or bool(
+            raw_tokens & {"tfidf_topic_contrast", "tfidf_topics", "topic_contrast", "topics"}
+        )
+        if v2_requested:
+            selected = normalize_tfidf_topic_feature_discovery_methods(
+                raw_methods,
+                source="multi_model_forest.feature_discovery_methods",
+            )
+            # Prevent the legacy parent from enabling neural/embedding evidence.
+            self.feature_discovery_methods = None
+            self.bow_discovery_enabled = True
+            self.htr_evidence_enabled = False
+            self.htr_evidence_disable_reason = "not part of multi_model_forest v2"
+            if isinstance(self.embedding_contrast, dict):
+                self.embedding_contrast = EmbeddingContrastDiscoveryConfig(
+                    **self.embedding_contrast
+                )
+            self.embedding_contrast.enabled = False
+            self.embedding_contrast.disable_reason = "not part of multi_model_forest v2"
+            super().__post_init__()
+            self.feature_discovery_methods = selected
+            self.matched_pair_uplift_enabled = False
+            self.matched_pair_bow_enabled = False
+            self.matched_pair_htr_enabled = False
+        else:
+            # Old objects remain parseable for artifact reproduction. The v2
+            # integrated runner performs its own strict method validation.
+            super().__post_init__()
+        if isinstance(self.tfidf_topic, dict):
+            self.tfidf_topic = TfidfTopicDiscoveryConfig(**self.tfidf_topic)
         backend = str(self.outer_parallel_backend).strip().lower()
         if backend not in {"threads", "processes", "loky"}:
             raise ValueError(

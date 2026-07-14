@@ -1,0 +1,111 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 5.843451738357544,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "The addition of '- core' may refer to a biopsy core or the center of a lesion, making the exact clinical entity slightly ambiguous.",
+        "term": "firm. - core"
+      }
+    ],
+    "general_topic": {
+      "coherence": "mixed",
+      "confidence": "medium",
+      "label": "Lesion morphology and size",
+      "summary": "The terms suggest descriptions of a physical lesion or mass, specifically regarding its texture (firm), color (tan-white), and size (0.7 cm)."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The term 'firm' is repeated across multiple terms, indicating a consistent description of tissue texture/consistency.",
+        "feature_type": "physical_finding",
+        "name": "Lesion consistency",
+        "represented_values_or_categories": [
+          "firm"
+        ],
+        "supporting_terms": [
+          "firm.",
+          "firm. -",
+          "tan-white firm. -",
+          "firm. - core"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "The term 'tan-white' describes the visual appearance/color of a lesion or tissue.",
+        "feature_type": "physical_finding",
+        "name": "Lesion color",
+        "represented_values_or_categories": [
+          "tan-white"
+        ],
+        "supporting_terms": [
+          "tan-white firm. -"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "A specific measurement of length/diameter is provided.",
+        "feature_type": "measurement",
+        "name": "Lesion size",
+        "represented_values_or_categories": [
+          "0.7 cm"
+        ],
+        "supporting_terms": [
+          "0.7 cm"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Lesion consistency",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Lesion consistency"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Lesion color",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Lesion color"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Lesion diameter",
+        "suggested_representation": "continuous",
+        "supporting_specific_features": [
+          "Lesion size"
+        ]
+      }
+    ],
+    "topic_index": 60,
+    "topic_rank": 77
+  },
+  "raw_content": "{\n  \"topic_rank\": 77,\n  \"topic_index\": 60,\n  \"general_topic\": {\n    \"label\": \"Lesion morphology and size\",\n    \"coherence\": \"mixed\",\n    \"confidence\": \"medium\",\n    \"summary\": \"The terms suggest descriptions of a physical lesion or mass, specifically regarding its texture (firm), color (tan-white), and size (0.7 cm).\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Lesion consistency\",\n      \"supporting_terms\": [\n        \"firm.\",\n        \"firm. -\",\n        \"tan-white firm. -\",\n        \"firm. - core\"\n      ],\n      \"feature_type\": \"physical_finding\",\n      \"represented_values_or_categories\": [\n        \"firm\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The term 'firm' is repeated across multiple terms, indicating a consistent description of tissue texture/consistency.\"\n    },\n    {\n      \"name\": \"Lesion color\",\n      \"supporting_terms\": [\n        \"tan-white firm. -\"\n      ],\n      \"feature_type\": \"physical_finding\",\n      \"represented_values_or_categories\": [\n        \"tan-white\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The term 'tan-white' describes the visual appearance/color of a lesion or tissue.\"\n    },\n    {\n      \"name\": \"Lesion size\",\n      \"supporting_terms\": [\n        \"0.7 cm\"\n      ],\n      \"feature_type\": \"measurement\",\n      \"represented_values_or_categories\": [\n        \"0.7 cm\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"A specific measurement of length/diameter is provided.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"firm. - core\",\n      \"reason\": \"The addition of '- core' may refer to a biopsy core or the center of a lesion, making the exact clinical entity slightly ambiguous.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Lesion consistency\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Lesion consistency\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Lesion color\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Lesion color\"\n      ],\n      \"confidence\": \"medium\"\n    },\n    {\n      \"name\": \"Lesion diameter\",\n      \"suggested_representation\": \"continuous\",\n      \"supporting_specific_features\": [\n        \"Lesion size\"\n      ],\n      \"confidence\": \"high\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-9c4b5ac779295c03",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "firm.",
+    "firm. -",
+    "tan-white firm. -",
+    "firm. - core",
+    "0.7 cm"
+  ],
+  "topic_index": 60,
+  "topic_rank": 77,
+  "usage": {
+    "completion_tokens": 708,
+    "prompt_tokens": 769,
+    "prompt_tokens_details": null,
+    "total_tokens": 1477
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 77, internal index 60\n\nTerms in this topic, ordered from highest to lowest loading:\n1. firm.\n2. firm. -\n3. tan-white firm. -\n4. firm. - core\n5. 0.7 cm\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 77,\n  \"topic_index\": 60,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

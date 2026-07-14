@@ -1,0 +1,134 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 6.278523206710815,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Contains a numeric fragment likely from a template or list index.",
+        "term": "2 ambulatory capable"
+      },
+      {
+        "reason": "Fragmentary phrase lacking a subject or specific context.",
+        "term": "but unable"
+      },
+      {
+        "reason": "Fragmentary phrase resulting from text splitting.",
+        "term": "of self-care but"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "Functional Status and Activities of Daily Living",
+      "summary": "The topic focuses on a patient's ability to perform self-care, work activities, and ambulatory functions, which are core components of performance status assessments (e.g., ECOG or Karnofsky)."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Terms describe the patient's capacity to manage personal care independently.",
+        "feature_type": "functional status",
+        "name": "Self-care ability",
+        "represented_values_or_categories": [
+          "capable",
+          "unable"
+        ],
+        "supporting_terms": [
+          "capable of self-care",
+          "of self-care but",
+          "self-care but unable",
+          "of self-care"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Terms relate to the patient's ability to walk or move independently.",
+        "feature_type": "functional status",
+        "name": "Ambulatory status",
+        "represented_values_or_categories": [
+          "capable"
+        ],
+        "supporting_terms": [
+          "ambulatory capable of",
+          "ambulatory capable",
+          "2 ambulatory capable"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Terms refer to the patient's ability to engage in occupational or productive activities.",
+        "feature_type": "functional status",
+        "name": "Work capacity",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "out work activities",
+          "out work",
+          "carry out work",
+          "work activities",
+          "work"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Self-care independence",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Self-care ability"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Ambulatory capacity",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Ambulatory status"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Occupational functional status",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Work capacity"
+        ]
+      }
+    ],
+    "topic_index": 6,
+    "topic_rank": 56
+  },
+  "raw_content": "{\n  \"topic_rank\": 56,\n  \"topic_index\": 6,\n  \"general_topic\": {\n    \"label\": \"Functional Status and Activities of Daily Living\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic focuses on a patient's ability to perform self-care, work activities, and ambulatory functions, which are core components of performance status assessments (e.g., ECOG or Karnofsky).\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Self-care ability\",\n      \"supporting_terms\": [\n        \"capable of self-care\",\n        \"of self-care but\",\n        \"self-care but unable\",\n        \"of self-care\"\n      ],\n      \"feature_type\": \"functional status\",\n      \"represented_values_or_categories\": [\n        \"capable\",\n        \"unable\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Terms describe the patient's capacity to manage personal care independently.\"\n    },\n    {\n      \"name\": \"Ambulatory status\",\n      \"supporting_terms\": [\n        \"ambulatory capable of\",\n        \"ambulatory capable\",\n        \"2 ambulatory capable\"\n      ],\n      \"feature_type\": \"functional status\",\n      \"represented_values_or_categories\": [\n        \"capable\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Terms relate to the patient's ability to walk or move independently.\"\n    },\n    {\n      \"name\": \"Work capacity\",\n      \"supporting_terms\": [\n        \"out work activities\",\n        \"out work\",\n        \"carry out work\",\n        \"work activities\",\n        \"work\"\n      ],\n      \"feature_type\": \"functional status\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Terms refer to the patient's ability to engage in occupational or productive activities.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"2 ambulatory capable\",\n      \"reason\": \"Contains a numeric fragment likely from a template or list index.\"\n    },\n    {\n      \"term\": \"but unable\",\n      \"reason\": \"Fragmentary phrase lacking a subject or specific context.\"\n    },\n    {\n      \"term\": \"of self-care but\",\n      \"reason\": \"Fragmentary phrase resulting from text splitting.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Self-care independence\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Self-care ability\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Ambulatory capacity\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Ambulatory status\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Occupational functional status\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Work capacity\"\n      ],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-878e4ee249e0d24d",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "out work activities",
+    "ambulatory capable of",
+    "ambulatory capable",
+    "out work",
+    "carry out work",
+    "2 ambulatory capable",
+    "of self-care but",
+    "self-care but unable",
+    "work activities",
+    "unable to carry",
+    "but unable",
+    "but unable to",
+    "capable of self-care",
+    "of self-care",
+    "work"
+  ],
+  "topic_index": 6,
+  "topic_rank": 56,
+  "usage": {
+    "completion_tokens": 795,
+    "prompt_tokens": 830,
+    "prompt_tokens_details": null,
+    "total_tokens": 1625
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 56, internal index 6\n\nTerms in this topic, ordered from highest to lowest loading:\n1. out work activities\n2. ambulatory capable of\n3. ambulatory capable\n4. out work\n5. carry out work\n6. 2 ambulatory capable\n7. of self-care but\n8. self-care but unable\n9. work activities\n10. unable to carry\n11. but unable\n12. but unable to\n13. capable of self-care\n14. of self-care\n15. work\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 56,\n  \"topic_index\": 6,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

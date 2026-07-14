@@ -13,7 +13,7 @@ import json
 import logging
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import joblib
 import numpy as np
@@ -40,6 +40,10 @@ from sklearn.metrics import (
 from sklearn.model_selection import KFold, StratifiedKFold
 
 from ..config import BoWViewConfig, TfidfTopicDiscoveryConfig
+from .tfidf_topic_score_selection import (
+    TOPIC_SCORE_TEST_SCHEMA_VERSION,
+    score_topic_banks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1127,6 +1131,96 @@ def _strata(treatment: np.ndarray, outcome: np.ndarray, *, outcome_binary: bool)
     return treatment.astype(int) * (int(np.max(outcome_group)) + 1) + outcome_group
 
 
+def compact_topic_score_tests(score_tests: Mapping[str, Any]) -> Dict[str, Any]:
+    """Build the small handoff view while retaining auditable score evidence."""
+    compact: Dict[str, Any] = {
+        "schema_version": score_tests.get(
+            "schema_version", TOPIC_SCORE_TEST_SCHEMA_VERSION
+        ),
+        "status": score_tests.get("status", "not_run"),
+        "reason": score_tests.get("reason"),
+        "uses_heldout_treatment_and_outcome": bool(
+            score_tests.get("uses_heldout_treatment_and_outcome", False)
+        ),
+        "banks": {},
+    }
+    for bank_name, bank_result in (score_tests.get("banks") or {}).items():
+        compact["banks"][bank_name] = {
+            key: bank_result.get(key)
+            for key in (
+                "selected_topic_ids",
+                "selection_count",
+                "selection_rule",
+                "fdr_level",
+                "p_threshold",
+                "minimum_topics",
+                "maximum_topics",
+                "complete_family_multiplier_bootstrap",
+                "complete_term_group_multiplier_bootstrap",
+                "selected_ngram_terms",
+                "ngram_selection_count",
+                "ngram_selection_rule",
+                "unique_ngram_count",
+                "testable_unique_ngram_count",
+            )
+        }
+        compact["banks"][bank_name]["bootstrap_calibration"] = (
+            bank_result.get("bootstrap_calibration") or {}
+        )
+        compact["banks"][bank_name]["topic_ranking"] = [
+            {
+                key: topic_result.get(key)
+                for key in (
+                    "topic_id",
+                    "evidence_rank",
+                    "selected_for_agent",
+                    "selection_reason",
+                    "primary_p",
+                    "primary_p_source",
+                    "fdr_q",
+                    "familywise_p",
+                    "topic_score_testable",
+                    "topic_score_moment",
+                    "topic_standardized_score",
+                    "topic_unadjusted_two_sided_p",
+                    "topic_familywise_p",
+                    "term_group_primary_p",
+                    "term_group_primary_p_source",
+                    "term_group_fdr_q",
+                    "term_group_familywise_p",
+                    "quadratic_statistic_per_rank",
+                    "maximum_absolute_standardized_score",
+                    "selected_ngram_count",
+                    "selected_ngram_terms",
+                )
+            }
+            for topic_result in bank_result.get("topic_tests", [])
+        ]
+    orphan = score_tests.get("effect_orphan_ngram_branch") or {}
+    compact["effect_orphan_ngram_branch"] = {
+        key: orphan.get(key)
+        for key in (
+            "status",
+            "candidate_definition",
+            "topic_term_exclusion_is_fit_side",
+            "cluster_construction_uses_heldout_rows_or_labels",
+            "candidate_count_before_topic_exclusion",
+            "represented_topic_term_exclusion_count",
+            "candidate_count_before_nested_deduplication",
+            "deduplicated_alias_count",
+            "representative_count",
+            "cluster_count",
+            "selected_cluster_ids",
+            "selected_clusters",
+            "selection_count",
+            "selection_rule",
+            "minimum_selected_clusters",
+            "maximum_selected_clusters",
+        )
+    }
+    return compact
+
+
 def fit_tfidf_topic_context(
     *,
     fit_df: pd.DataFrame,
@@ -1140,6 +1234,7 @@ def fit_tfidf_topic_context(
     config: TfidfTopicDiscoveryConfig,
     artifact_dir: Path,
     scope_id: str,
+    enable_heldout_score_tests: bool = False,
 ) -> Dict[str, Any]:
     """Fit one exact context and transform its externally held-out row set."""
     artifact_dir = Path(artifact_dir)
@@ -1282,6 +1377,45 @@ def fit_tfidf_topic_context(
         bank_metadata[bank_name] = bank.metadata()
         bank_metadata[bank_name]["weak_or_unstable_raw_evidence"] = False
 
+    topic_score_tests: Dict[str, Any] = {
+        "schema_version": TOPIC_SCORE_TEST_SCHEMA_VERSION,
+        "status": "not_run",
+        "reason": "heldout_labels_reserved_or_score_tests_disabled",
+        "uses_heldout_treatment_and_outcome": False,
+        "banks": {},
+    }
+    topic_score_tests_path: Optional[Path] = None
+    if bool(config.score_test_enabled) and bool(enable_heldout_score_tests):
+        # This block is used only for exact candidate-selection inner contexts.
+        # Full outer contexts never read outer-held-out treatment or outcome.
+        topic_score_tests = score_topic_banks(
+            fit_matrix=common_fit,
+            heldout_matrix=common_heldout,
+            feature_names=feature_names,
+            topic_banks=bank_metadata,
+            fit_topic_values=fit_topic_values,
+            heldout_topic_values=heldout_topic_values,
+            fit_treatment=treatment,
+            fit_outcome=outcome,
+            heldout_treatment=heldout_df[treatment_column].to_numpy(dtype=float),
+            heldout_outcome=heldout_df[outcome_column].to_numpy(dtype=float),
+            fit_propensity=treatment_result["stacked_oof"],
+            fit_outcome_prediction=outcome_result["stacked_oof"],
+            heldout_propensity=external_e,
+            heldout_outcome_prediction=external_m,
+            config=config,
+            scope_id=scope_id,
+            raw_ngram_scores=score_frames,
+        )
+        topic_score_tests["status"] = "completed"
+        topic_score_tests_path = artifact_dir / "topic_score_tests.json"
+        topic_score_tests_path.write_text(
+            json.dumps(topic_score_tests, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    compact_score_tests = compact_topic_score_tests(topic_score_tests)
+
     fitted = FittedTopicContext(
         common_vectorizer=vectorizer,
         treatment_stack=treatment_result["fitted"],
@@ -1358,12 +1492,17 @@ def fit_tfidf_topic_context(
             },
         },
         "topic_banks": bank_metadata,
+        "heldout_score_tests_enabled": bool(enable_heldout_score_tests),
+        "topic_score_tests": compact_score_tests,
         "artifacts": {
             "fitted_context": str(model_path),
             "ngram_scores": score_paths,
             "fit_topic_values": str(fit_topics_path),
             "heldout_topic_values": str(heldout_topics_path),
             "nuisance_predictions": str(nuisance_path),
+            "topic_score_tests": (
+                None if topic_score_tests_path is None else str(topic_score_tests_path)
+            ),
         },
     }
     metadata_path = artifact_dir / "context_metadata.json"

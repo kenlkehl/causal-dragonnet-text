@@ -1,0 +1,174 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 9.312076568603516,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Ambiguous; could refer to weight loss, hair loss, or be a fragment of appetite loss.",
+        "term": "loss 20"
+      },
+      {
+        "reason": "Fragmented; lacks a specific domain of function.",
+        "term": "function 65 100"
+      },
+      {
+        "reason": "Fragmented; likely refers to 'role function' but is heavily obscured by numeric noise.",
+        "term": "70 100 role"
+      },
+      {
+        "reason": "Likely refers to financial toxicity, but the term is highly fragmented and lacks clinical specificity in this context.",
+        "term": "financial 5 100"
+      },
+      {
+        "reason": "Purely numeric noise/template artifact.",
+        "term": "20 100"
+      }
+    ],
+    "general_topic": {
+      "coherence": "mixed",
+      "confidence": "medium",
+      "label": "Gastrointestinal symptoms and functional status",
+      "summary": "The topic contains fragments of gastrointestinal side effects (appetite, constipation, diarrhea) and various aspects of functional status (cognitive, emotional, role), though it is heavily obscured by numeric noise and template fragments."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Directly identifies a common side effect in oncology patients.",
+        "feature_type": "symptom",
+        "name": "Appetite loss",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "appetite loss 20"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Repetitive terms indicating constipation, likely a side effect of treatment.",
+        "feature_type": "symptom",
+        "name": "Constipation",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "20 100 constipation",
+          "100 constipation 10",
+          "constipation 10 100"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Identifies diarrhea as a potential clinical symptom.",
+        "feature_type": "symptom",
+        "name": "Diarrhea",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "10 100 diarrhea"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Refers to cognitive assessment, relevant for assessing treatment toxicity or disease progression.",
+        "feature_type": "functional_status",
+        "name": "Cognitive function",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "cognitive function 75"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Refers to psychological or emotional well-being/functioning.",
+        "feature_type": "functional_status",
+        "name": "Emotional function",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "emotional function 65"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Appetite loss",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Appetite loss"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Constipation",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Constipation"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Diarrhea",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Diarrhea"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Cognitive function",
+        "suggested_representation": "ordinal",
+        "supporting_specific_features": [
+          "Cognitive function"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Emotional function",
+        "suggested_representation": "ordinal",
+        "supporting_specific_features": [
+          "Emotional function"
+        ]
+      },
+      {
+        "confidence": "low",
+        "name": "Role function",
+        "suggested_representation": "ordinal",
+        "supporting_specific_features": []
+      }
+    ],
+    "topic_index": 43,
+    "topic_rank": 25
+  },
+  "raw_content": "{\n  \"topic_rank\": 25,\n  \"topic_index\": 43,\n  \"general_topic\": {\n    \"label\": \"Gastrointestinal symptoms and functional status\",\n    \"coherence\": \"mixed\",\n    \"confidence\": \"medium\",\n    \"summary\": \"The topic contains fragments of gastrointestinal side effects (appetite, constipation, diarrhea) and various aspects of functional status (cognitive, emotional, role), though it is heavily obscured by numeric noise and template fragments.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Appetite loss\",\n      \"supporting_terms\": [\n        \"appetite loss 20\"\n      ],\n      \"feature_type\": \"symptom\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Directly identifies a common side effect in oncology patients.\"\n    },\n    {\n      \"name\": \"Constipation\",\n      \"supporting_terms\": [\n        \"20 100 constipation\",\n        \"100 constipation 10\",\n        \"constipation 10 100\"\n      ],\n      \"feature_type\": \"symptom\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Repetitive terms indicating constipation, likely a side effect of treatment.\"\n    },\n    {\n      \"name\": \"Diarrhea\",\n      \"supporting_terms\": [\n        \"10 100 diarrhea\"\n      ],\n      \"feature_type\": \"symptom\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Identifies diarrhea as a potential clinical symptom.\"\n    },\n    {\n      \"name\": \"Cognitive function\",\n      \"supporting_terms\": [\n        \"cognitive function 75\"\n      ],\n      \"feature_type\": \"functional_status\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Refers to cognitive assessment, relevant for assessing treatment toxicity or disease progression.\"\n    },\n    {\n      \"name\": \"Emotional function\",\n      \"supporting_terms\": [\n        \"emotional function 65\"\n      ],\n      \"feature_type\": \"functional_status\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Refers to psychological or emotional well-being/functioning.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"loss 20\",\n      \"reason\": \"Ambiguous; could refer to weight loss, hair loss, or be a fragment of appetite loss.\"\n    },\n    {\n      \"term\": \"function 65 100\",\n      \"reason\": \"Fragmented; lacks a specific domain of function.\"\n    },\n    {\n      \"term\": \"70 100 role\",\n      \"reason\": \"Fragmented; likely refers to 'role function' but is heavily obscured by numeric noise.\"\n    },\n    {\n      \"term\": \"financial 5 100\",\n      \"reason\": \"Likely refers to financial toxicity, but the term is highly fragmented and lacks clinical specificity in this context.\"\n    },\n    {\n      \"term\": \"20 100\",\n      \"reason\": \"Purely numeric noise/template artifact.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Appetite loss\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Appetite loss\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Constipation\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Constipation\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Diarrhea\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Diarrhea\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Cognitive function\",\n      \"suggested_representation\": \"ordinal\",\n      \"supporting_specific_features\": [\n        \"Cognitive function\"\n      ],\n      \"confidence\": \"medium\"\n    },\n    {\n      \"name\": \"Emotional function\",\n      \"suggested_representation\": \"ordinal\",\n      \"supporting_specific_features\": [\n        \"Emotional function\"\n      ],\n      \"confidence\": \"medium\"\n    },\n    {\n      \"name\": \"Role function\",\n      \"suggested_representation\": \"ordinal\",\n      \"supporting_specific_features\": [],\n      \"confidence\": \"low\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-bae66a5a47913034",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "appetite loss 20",
+    "loss 20",
+    "loss 20 100",
+    "20 100 constipation",
+    "10 100 diarrhea",
+    "100 constipation 10",
+    "constipation 10 100",
+    "5 100 financial",
+    "function 65 100",
+    "function 70",
+    "cognitive function 75",
+    "65 100",
+    "emotional function 65",
+    "70 100 role",
+    "function 70 100"
+  ],
+  "topic_index": 43,
+  "topic_rank": 25,
+  "usage": {
+    "completion_tokens": 1188,
+    "prompt_tokens": 886,
+    "prompt_tokens_details": null,
+    "total_tokens": 2074
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 25, internal index 43\n\nTerms in this topic, ordered from highest to lowest loading:\n1. appetite loss 20\n2. loss 20\n3. loss 20 100\n4. 20 100 constipation\n5. 10 100 diarrhea\n6. 100 constipation 10\n7. constipation 10 100\n8. 5 100 financial\n9. function 65 100\n10. function 70\n11. cognitive function 75\n12. 65 100\n13. emotional function 65\n14. 70 100 role\n15. function 70 100\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 25,\n  \"topic_index\": 43,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

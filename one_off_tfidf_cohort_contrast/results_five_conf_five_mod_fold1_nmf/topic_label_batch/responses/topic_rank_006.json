@@ -1,0 +1,151 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 7.241655588150024,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Numeric fragments without clinical context.",
+        "term": "75 100"
+      },
+      {
+        "reason": "Numeric fragments without clinical context.",
+        "term": "65 100"
+      },
+      {
+        "reason": "Isolated numeric fragment.",
+        "term": "40"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "Patient-reported symptoms and toxicity",
+      "summary": "The topic focuses on patient-reported outcomes (PROs) related to fatigue, nausea, and pain, specifically referencing the PRO-CTCAE assessment tool."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Terms explicitly reference fatigue as measured by the PRO-CTCAE instrument.",
+        "feature_type": "symptom",
+        "name": "Fatigue",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "pro-ctcae fatigue",
+          "pro-ctcae fatigue -",
+          "instrument pro-ctcae fatigue"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Terms indicate the presence and severity (moderate) of nausea.",
+        "feature_type": "symptom",
+        "name": "Nausea",
+        "represented_values_or_categories": [
+          "moderate"
+        ],
+        "supporting_terms": [
+          "moderate nausea",
+          "moderate nausea -",
+          "4 moderate nausea"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Terms indicate the presence and severity (mild) of pain.",
+        "feature_type": "symptom",
+        "name": "Pain",
+        "represented_values_or_categories": [
+          "mild"
+        ],
+        "supporting_terms": [
+          "pain 45",
+          "100 pain 45",
+          "pain 45 100",
+          "4 mild pain"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "Refers to general health or global health status, likely a component of a PRO instrument.",
+        "feature_type": "patient_reported_outcome",
+        "name": "Global Health Status",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "global health 40",
+          "health 40"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Fatigue severity",
+        "suggested_representation": "ordinal",
+        "supporting_specific_features": [
+          "Fatigue"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Nausea severity",
+        "suggested_representation": "ordinal",
+        "supporting_specific_features": [
+          "Nausea"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Pain severity",
+        "suggested_representation": "ordinal",
+        "supporting_specific_features": [
+          "Pain"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Global health status",
+        "suggested_representation": "continuous",
+        "supporting_specific_features": [
+          "Global Health Status"
+        ]
+      }
+    ],
+    "topic_index": 23,
+    "topic_rank": 6
+  },
+  "raw_content": "{\n  \"topic_rank\": 6,\n  \"topic_index\": 23,\n  \"general_topic\": {\n    \"label\": \"Patient-reported symptoms and toxicity\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic focuses on patient-reported outcomes (PROs) related to fatigue, nausea, and pain, specifically referencing the PRO-CTCAE assessment tool.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Fatigue\",\n      \"supporting_terms\": [\n        \"pro-ctcae fatigue\",\n        \"pro-ctcae fatigue -\",\n        \"instrument pro-ctcae fatigue\"\n      ],\n      \"feature_type\": \"symptom\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Terms explicitly reference fatigue as measured by the PRO-CTCAE instrument.\"\n    },\n    {\n      \"name\": \"Nausea\",\n      \"supporting_terms\": [\n        \"moderate nausea\",\n        \"moderate nausea -\",\n        \"4 moderate nausea\"\n      ],\n      \"feature_type\": \"symptom\",\n      \"represented_values_or_categories\": [\n        \"moderate\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Terms indicate the presence and severity (moderate) of nausea.\"\n    },\n    {\n      \"name\": \"Pain\",\n      \"supporting_terms\": [\n        \"pain 45\",\n        \"100 pain 45\",\n        \"pain 45 100\",\n        \"4 mild pain\"\n      ],\n      \"feature_type\": \"symptom\",\n      \"represented_values_or_categories\": [\n        \"mild\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Terms indicate the presence and severity (mild) of pain.\"\n    },\n    {\n      \"name\": \"Global Health Status\",\n      \"supporting_terms\": [\n        \"global health 40\",\n        \"health 40\"\n      ],\n      \"feature_type\": \"patient_reported_outcome\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Refers to general health or global health status, likely a component of a PRO instrument.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"75 100\",\n      \"reason\": \"Numeric fragments without clinical context.\"\n    },\n    {\n      \"term\": \"65 100\",\n      \"reason\": \"Numeric fragments without clinical context.\"\n    },\n    {\n      \"term\": \"40\",\n      \"reason\": \"Isolated numeric fragment.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Fatigue severity\",\n      \"suggested_representation\": \"ordinal\",\n      \"supporting_specific_features\": [\n        \"Fatigue\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Nausea severity\",\n      \"suggested_representation\": \"ordinal\",\n      \"supporting_specific_features\": [\n        \"Nausea\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Pain severity\",\n      \"suggested_representation\": \"ordinal\",\n      \"supporting_specific_features\": [\n        \"Pain\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Global health status\",\n      \"suggested_representation\": \"continuous\",\n      \"supporting_specific_features\": [\n        \"Global Health Status\"\n      ],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-9ebf63bd61c8b6b9",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "global health 40",
+    "health 40",
+    "pro-ctcae fatigue",
+    "pro-ctcae fatigue -",
+    "instrument pro-ctcae fatigue",
+    "moderate nausea",
+    "pain 45",
+    "moderate nausea -",
+    "4 moderate nausea",
+    "100 pain 45",
+    "pain 45 100",
+    "75 100",
+    "65 100",
+    "4 mild pain",
+    "40"
+  ],
+  "topic_index": 23,
+  "topic_rank": 6,
+  "usage": {
+    "completion_tokens": 924,
+    "prompt_tokens": 862,
+    "prompt_tokens_details": null,
+    "total_tokens": 1786
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 6, internal index 23\n\nTerms in this topic, ordered from highest to lowest loading:\n1. global health 40\n2. health 40\n3. pro-ctcae fatigue\n4. pro-ctcae fatigue -\n5. instrument pro-ctcae fatigue\n6. moderate nausea\n7. pain 45\n8. moderate nausea -\n9. 4 moderate nausea\n10. 100 pain 45\n11. pain 45 100\n12. 75 100\n13. 65 100\n14. 4 mild pain\n15. 40\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 6,\n  \"topic_index\": 23,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

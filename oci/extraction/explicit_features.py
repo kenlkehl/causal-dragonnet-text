@@ -49,7 +49,7 @@ import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import pandas as pd
 from tqdm import tqdm
@@ -116,6 +116,15 @@ def _category_match_key(value: Any) -> str:
     text = text.replace("\u2265", ">=").replace("\u2264", "<=")
     text = re.sub(r"[\s_-]+", "", text)
     return text
+
+
+def _is_null_like(value: Any) -> bool:
+    """Accept common quoted JSON-null spellings as conservative missing values."""
+    if value is None:
+        return True
+    if not isinstance(value, str):
+        return False
+    return value.strip().lower() in {"null", "none", "n/a", "na"}
 
 
 def _categorical_value_map(spec: ExplicitFeatureSpec) -> Dict[str, str]:
@@ -191,9 +200,17 @@ def build_extraction_prompt(
             alias_instruction = (
                 f"\n   Value aliases to canonicalize: {alias_text}" if alias_text else ""
             )
+            missing_instruction = (
+                "\n   Use \"unknown\" only when the note explicitly says the value is "
+                "unknown or indeterminate. Use \"not_documented\" when the note "
+                "does not state this value before treatment."
+                if {"unknown", "not_documented"}.issubset(set(categories))
+                else ""
+            )
             instructions.append(
                 f"{i}. {name} (categorical): {description}\n"
                 f"   Valid values: {cat_list}"
+                f"{missing_instruction}"
                 f"{alias_instruction}"
             )
             json_fields.append(f'"{name}": "<category>"')
@@ -212,8 +229,8 @@ def build_extraction_prompt(
     if max_text_length is not None and len(text) > int(max_text_length):
         text = text[-int(max_text_length) :]
 
-    prompt = f"""Read this clinical note and extract the following patient characteristics.
-Use only information available before or at treatment initiation. If the value is not explicitly stated or cannot be inferred from pre-treatment information, return null for that field.
+    prompt = f"""Read this complete clinical note and extract the following patient characteristics.
+Use only information available before or at treatment initiation. Do not guess. For categorical fields, follow each field's unknown/not_documented policy. For continuous fields that are not explicitly stated or cannot be deterministically converted, return null.
 
 {instructions_text}
 
@@ -315,7 +332,7 @@ def _parse_extraction_response_with_issues(
 
         if conf_type == "categorical":
             categories = spec.categories or []
-            if value is None:
+            if _is_null_like(value):
                 result[name] = ExplicitFeatureValue(
                     name=name, type=conf_type, value=None, is_missing=True
                 )
@@ -336,7 +353,7 @@ def _parse_extraction_response_with_issues(
                         name=name, type=conf_type, value=None, is_missing=True
                     )
         else:  # continuous
-            if value is None:
+            if _is_null_like(value):
                 result[name] = ExplicitFeatureValue(
                     name=name, type=conf_type, value=None, is_missing=True
                 )
@@ -429,11 +446,13 @@ class VLLMFeatureExtractor:
         mode: str = "server",
         server_url: str = "http://localhost:8000/v1",
         model_name: str = "Qwen/Qwen2.5-7B-Instruct",
+        model_names_by_url: Optional[Mapping[str, str]] = None,
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.9,
         download_dir: Optional[str] = None,
         max_model_len: Optional[int] = None,
         vllm_reasoning_parser: Optional[str] = "auto",
+        vllm_enable_thinking: Optional[bool] = None,
         api_key: str = "EMPTY",
         max_retries: int = 3,
         retry_initial_delay: float = 1.0,
@@ -451,11 +470,13 @@ class VLLMFeatureExtractor:
             mode: "server", "start_server", or "python_api"
             server_url: URL for vLLM server (used in server modes)
             model_name: Model name/path for vLLM
+            model_names_by_url: Optional per-endpoint model ids for heterogeneous pools
             tensor_parallel_size: Number of GPUs for tensor parallelism
             gpu_memory_utilization: GPU memory fraction to use
             download_dir: Model download directory
             max_model_len: Maximum model context length (for start_server/python_api)
             vllm_reasoning_parser: vLLM reasoning parser name, "auto", or disabled with None/"none"
+            vllm_enable_thinking: Optional chat-template reasoning switch for server requests
             api_key: API key (use "EMPTY" for local vLLM)
             max_retries: Maximum retries per patient before marking as missing
             retry_initial_delay: Initial exponential backoff delay after request failures
@@ -476,14 +497,32 @@ class VLLMFeatureExtractor:
         self.server_urls = parse_server_urls(server_url)
         self.server_url = self.server_urls[0]
         self.model_name = model_name
+        supplied_inventory = {
+            str(url): str(endpoint_model)
+            for url, endpoint_model in (model_names_by_url or {}).items()
+        }
+        missing_inventory = [
+            url for url in self.server_urls
+            if supplied_inventory and url not in supplied_inventory
+        ]
+        if missing_inventory:
+            raise ValueError(
+                "model_names_by_url is missing configured endpoint(s): "
+                f"{missing_inventory}"
+            )
+        self.model_names_by_url = {
+            url: supplied_inventory.get(url, str(model_name))
+            for url in self.server_urls
+        }
         self.tensor_parallel_size = tensor_parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
         self.download_dir = download_dir
         self.max_model_len = max_model_len
         self.vllm_reasoning_parser = resolve_vllm_reasoning_parser(
             vllm_reasoning_parser,
-            model_name,
+            next(iter(self.model_names_by_url.values())),
         )
+        self.vllm_enable_thinking = vllm_enable_thinking
         self.api_key = api_key
         self.max_retries = max_retries
         self.retry_initial_delay = retry_initial_delay
@@ -501,9 +540,11 @@ class VLLMFeatureExtractor:
         self._server_process = None
 
         logger.info(
-            "VLLMFeatureExtractor initialized: mode=%s, model=%s, reasoning_parser=%s",
+            "VLLMFeatureExtractor initialized: mode=%s, model=%s, "
+            "endpoint_models=%s, reasoning_parser=%s",
             mode,
             model_name,
+            self.model_names_by_url,
             self.vllm_reasoning_parser,
         )
         logger.info(f"Extracting {len(specs)} features: {[s.name for s in specs]}")
@@ -617,18 +658,29 @@ class VLLMFeatureExtractor:
                     )
                     logger.debug("Sending explicit feature extraction request to %s", server_url)
                 else:
+                    server_url = self.server_url
                     client = self._client
+                request_model_name = self.model_names_by_url.get(
+                    server_url,
+                    self.model_name,
+                )
                 response_kwargs = {
-                    "model": self.model_name,
+                    "model": request_model_name,
                     "messages": messages,
                     "temperature": self.temperature,
                     "max_tokens": self.max_tokens,
                 }
+                if self.vllm_enable_thinking is not None:
+                    response_kwargs["extra_body"] = {
+                        "chat_template_kwargs": {
+                            "enable_thinking": bool(self.vllm_enable_thinking)
+                        }
+                    }
                 response_kwargs.update(
                     google_json_response_format_kwargs(
                         api_key=self.api_key,
-                        server_url=self.server_url,
-                        model_name=self.model_name,
+                        server_url=server_url,
+                        model_name=request_model_name,
                     )
                 )
                 response = client.chat.completions.create(**response_kwargs)
@@ -670,8 +722,13 @@ class VLLMFeatureExtractor:
                             ]
                         )
                         continue
-                    # Return immediately if all values extracted
-                    if all(not v.is_missing for v in result.values()):
+                    # A schema-complete null is a valid conservative extraction,
+                    # not a request failure.  Retrying it pressures the model to
+                    # guess undocumented values and can multiply server work by
+                    # ``max_retries`` for sparse clinical variables.  Retry only
+                    # malformed/incomplete schemas; once parsing has no issues,
+                    # accept the result exactly as returned.
+                    if not parsed.issues:
                         return result
             except Exception as e:
                 logger.debug(f"Extraction attempt {attempt + 1} failed: {e}")
@@ -867,6 +924,7 @@ def extract_explicit_features(
     download_dir: Optional[str] = None,
     max_model_len: Optional[int] = None,
     vllm_reasoning_parser: Optional[str] = "auto",
+    vllm_enable_thinking: Optional[bool] = None,
     max_retries: int = 3,
     retry_initial_delay: float = 1.0,
     retry_max_delay: float = 30.0,
@@ -890,6 +948,7 @@ def extract_explicit_features(
         download_dir: Model download directory
         max_model_len: Maximum model context length (for start_server/python_api)
         vllm_reasoning_parser: vLLM reasoning parser name, "auto", or disabled with None/"none"
+        vllm_enable_thinking: Optional chat-template reasoning switch for server requests
         max_retries: Retries per patient before marking as missing
         retry_initial_delay: Initial exponential backoff delay after request failures
         retry_max_delay: Maximum exponential backoff delay after request failures
@@ -913,6 +972,7 @@ def extract_explicit_features(
         download_dir=download_dir,
         max_model_len=max_model_len,
         vllm_reasoning_parser=vllm_reasoning_parser,
+        vllm_enable_thinking=vllm_enable_thinking,
         max_retries=max_retries,
         retry_initial_delay=retry_initial_delay,
         retry_max_delay=retry_max_delay,

@@ -22,6 +22,7 @@ from ..config import (
     AgenticAttentionVariableForestConfig,
     AppliedInferenceConfig,
     MultiModelForestConfig,
+    normalize_tfidf_topic_feature_discovery_methods,
 )
 from .embedding_contrast_discovery import EmbeddingContrastEvidenceGenerator
 from .multi_model_agentic_forest import (
@@ -33,6 +34,11 @@ from .multi_model_agentic_forest import (
     run_multi_model_agentic_forest_from_handoff,
 )
 from .multi_model_forest_stage1 import MultiModelForestStage1Runner
+from .tfidf_topic_agentic_forest import (
+    run_tfidf_topic_agentic_forest,
+    validate_tfidf_topic_stage2_handoff,
+)
+from .tfidf_topic_stage1 import run_tfidf_topic_stage1
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +193,10 @@ class MultiModelForestRunner:
             "multi_model_forest",
             MultiModelForestConfig(),
         )
+        normalize_tfidf_topic_feature_discovery_methods(
+            self.nn_config.feature_discovery_methods,
+            source="multi_model_forest.feature_discovery_methods",
+        )
         cpus = cpus_total if cpus_total is not None else self.nn_config.cpus_total
         jobs_per_gpu = (
             htr_jobs_per_gpu
@@ -198,8 +208,8 @@ class MultiModelForestRunner:
             num_workers=self.num_workers,
             gpu_ids=self.gpu_ids,
             htr_jobs_per_gpu=int(jobs_per_gpu),
-            htr_enabled=self._htr_enabled(),
-            embedding_enabled=self._embedding_contrast_enabled(),
+            htr_enabled=False,
+            embedding_enabled=False,
         )
 
     @property
@@ -233,11 +243,15 @@ class MultiModelForestRunner:
         if self._stage1_complete() and not self.force_stage1:
             logger.info("Reusing complete multi-model forest Stage 1 at %s", self.artifact_dir)
             return
-        self._prepare_htr_sentence_encoder_barrier()
         self._write_stage_config(self.artifact_dir / "stage1_config.json")
-        self._prepare_embedding_cache_barrier()
-        self._run_primary_text_model_forest()
-        self._build_handoff()
+        self.handoff_dir.mkdir(parents=True, exist_ok=True)
+        run_tfidf_topic_stage1(
+            dataset=self.dataset.drop(columns=["_oci_row_id"], errors="ignore"),
+            config=self.config,
+            output_path=self.output_path,
+            artifact_dir=self.artifact_dir,
+            handoff_path=self.handoff_path,
+        )
 
     def run_stage2(self) -> None:
         if not self.handoff_path.exists():
@@ -250,17 +264,19 @@ class MultiModelForestRunner:
             return
         self.stage2_dir.mkdir(parents=True, exist_ok=True)
         self._write_stage_config(self.stage2_dir / "stage2_config.json")
-        with _serial_torch_worker_environment():
-            run_multi_model_agentic_forest_from_handoff(
-                self.dataset.drop(columns=["_oci_row_id"], errors="ignore"),
-                self.config,
-                self.stage2_prediction_path,
-                self.handoff_path,
-                device=self.device,
-                gpu_ids=self.gpu_ids,
-                num_workers=self.plan.cpu_loky_workers,
-                resume=not self.force_stage2,
-            )
+        preflight = validate_tfidf_topic_stage2_handoff(
+            dataset=self.dataset.drop(columns=["_oci_row_id"], errors="ignore"),
+            config=self.config,
+            handoff_path=self.handoff_path,
+        )
+        _write_json(self.stage2_dir / "stage2_preflight.json", preflight)
+        run_tfidf_topic_agentic_forest(
+            dataset=self.dataset.drop(columns=["_oci_row_id"], errors="ignore"),
+            config=self.config,
+            output_path=self.stage2_prediction_path,
+            handoff_path=self.handoff_path,
+            resume=not self.force_stage2,
+        )
         if self.stage2_prediction_path.exists():
             shutil.copyfile(
                 self.stage2_prediction_path,
@@ -268,11 +284,11 @@ class MultiModelForestRunner:
             )
         metrics_path = (
             self.stage2_prediction_path.parent
-            / "multi_model_agentic_forest"
-            / "outer_cv_metrics.csv"
+            / "tfidf_topic_agentic_forest"
+            / "outer_metrics.jsonl"
         )
         if metrics_path.exists():
-            metrics_df = pd.read_csv(metrics_path)
+            metrics_df = pd.read_json(metrics_path, lines=True)
             _write_json(
                 self.stage2_dir / "agentic_metrics.json",
                 {
@@ -445,6 +461,14 @@ class MultiModelForestRunner:
         self,
         rows: Sequence[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
+        del rows
+        raise RuntimeError(
+            "multi_model_forest v2 refuses to clone full-outer evidence into "
+            "missing inner contexts. Rerun deterministic Stage 1 to create every "
+            "exact candidate-selection inner-fit handoff."
+        )
+        # Legacy implementation retained below only so old serialized source
+        # references remain readable; it is intentionally unreachable in v2.
         expanded: List[Dict[str, Any]] = [copy.deepcopy(row) for row in rows]
         existing_keys = {int(row.get("fold_key", row.get("outer_fold", 0))) for row in expanded}
         by_outer: Dict[int, Dict[str, Any]] = {}

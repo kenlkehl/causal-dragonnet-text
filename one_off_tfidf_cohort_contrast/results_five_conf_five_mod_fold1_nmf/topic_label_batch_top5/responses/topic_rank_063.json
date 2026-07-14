@@ -1,0 +1,83 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 3.8636176586151123,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Contains a leading hyphen, likely a formatting artifact from a list or template.",
+        "term": "- right frontal"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "Neuroanatomical location (Brain)",
+      "summary": "The terms consistently refer to specific anatomical regions of the brain, specifically the frontal lobe and cerebellum."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The terms describe a specific anatomical location in the brain, which is highly relevant for identifying metastatic sites in NSCLC.",
+        "feature_type": "anatomical_location",
+        "name": "Right frontal lobe",
+        "represented_values_or_categories": [
+          "right frontal lobe"
+        ],
+        "supporting_terms": [
+          "right frontal",
+          "right frontal lobe",
+          "- right frontal",
+          "frontal"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Refers to the cerebellum, a specific region of the brain.",
+        "feature_type": "anatomical_location",
+        "name": "Cerebellum",
+        "represented_values_or_categories": [
+          "cerebellar"
+        ],
+        "supporting_terms": [
+          "cerebellar"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Brain metastasis location",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Right frontal lobe",
+          "Cerebellum"
+        ]
+      }
+    ],
+    "topic_index": 17,
+    "topic_rank": 63
+  },
+  "raw_content": "{\n  \"topic_rank\": 63,\n  \"topic_index\": 17,\n  \"general_topic\": {\n    \"label\": \"Neuroanatomical location (Brain)\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The terms consistently refer to specific anatomical regions of the brain, specifically the frontal lobe and cerebellum.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Right frontal lobe\",\n      \"supporting_terms\": [\n        \"right frontal\",\n        \"right frontal lobe\",\n        \"- right frontal\",\n        \"frontal\"\n      ],\n      \"feature_type\": \"anatomical_location\",\n      \"represented_values_or_categories\": [\n        \"right frontal lobe\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms describe a specific anatomical location in the brain, which is highly relevant for identifying metastatic sites in NSCLC.\"\n    },\n    {\n      \"name\": \"Cerebellum\",\n      \"supporting_terms\": [\n        \"cerebellar\"\n      ],\n      \"feature_type\": \"anatomical_location\",\n      \"represented_values_or_categories\": [\n        \"cerebellar\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Refers to the cerebellum, a specific region of the brain.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"- right frontal\",\n      \"reason\": \"Contains a leading hyphen, likely a formatting artifact from a list or template.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Brain metastasis location\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Right frontal lobe\",\n        \"Cerebellum\"\n      ],\n      \"confidence\": \"high\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-a49cda10c7a0dd4d",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "right frontal",
+    "right frontal lobe",
+    "cerebellar",
+    "- right frontal",
+    "frontal"
+  ],
+  "topic_index": 17,
+  "topic_rank": 63,
+  "usage": {
+    "completion_tokens": 467,
+    "prompt_tokens": 759,
+    "prompt_tokens_details": null,
+    "total_tokens": 1226
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 63, internal index 17\n\nTerms in this topic, ordered from highest to lowest loading:\n1. right frontal\n2. right frontal lobe\n3. cerebellar\n4. - right frontal\n5. frontal\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 63,\n  \"topic_index\": 17,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

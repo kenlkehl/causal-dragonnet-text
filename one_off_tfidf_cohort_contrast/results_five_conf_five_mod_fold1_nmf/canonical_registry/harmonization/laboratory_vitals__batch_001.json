@@ -1,0 +1,629 @@
+{
+  "attempts": 1,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "candidate_mappings": [
+      {
+        "candidate_id": "C001",
+        "local_id": "F01",
+        "rationale": "C001 is the canonical name for ANC.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C014",
+        "local_id": "F02",
+        "rationale": "Direct extraction of anemia status.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C019",
+        "local_id": "F03",
+        "rationale": "AST is an alias for Aspartate Aminotransferase.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C020",
+        "local_id": "F03",
+        "rationale": "AST level is an alias for AST.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C021",
+        "local_id": "F03",
+        "rationale": "Cardiac function is a status/finding, not a specific lab measurement like AST.",
+        "relation": "related_but_distinct"
+      },
+      {
+        "candidate_id": "C022",
+        "local_id": "F06",
+        "rationale": "Pulmonary function status is a clinical assessment, whereas DLCO is a specific measurement.",
+        "relation": "related_but_distinct"
+      },
+      {
+        "candidate_id": "C025",
+        "local_id": "F04",
+        "rationale": "BUN is a standard lab measurement.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C051",
+        "local_id": "F05",
+        "rationale": "CBC is a high-level test container.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C071",
+        "local_id": "F06",
+        "rationale": "DLCO is the canonical name.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C072",
+        "local_id": "F06",
+        "rationale": "DLCO measurement is an alias.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C078",
+        "local_id": "F08",
+        "rationale": "eGFR is an alias for estimated glomerular filtration rate.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C085",
+        "local_id": "F09",
+        "rationale": "Creatinine clearance is a distinct renal measurement.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C086",
+        "local_id": "F08",
+        "rationale": "eGFR is an alias.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C102",
+        "local_id": "F08",
+        "rationale": "GFR proxy is an alias for eGFR.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C107",
+        "local_id": "F10",
+        "rationale": "Heart rate is a vital sign.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C108",
+        "local_id": "F11",
+        "rationale": "Hemoglobin level is an alias.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C109",
+        "local_id": "F11",
+        "rationale": "Hemoglobin level is an alias.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C126",
+        "local_id": "F12",
+        "rationale": "Hyperlipidemia status is a clinical finding.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C127",
+        "local_id": "F13",
+        "rationale": "Hypertension control is a categorical status.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C138",
+        "local_id": "F14",
+        "rationale": "LDH is a standard lab measurement.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C175",
+        "local_id": "F15",
+        "rationale": "Myelosuppression is a broad clinical finding, whereas Neutropenia grade is a specific measurement.",
+        "relation": "related_but_distinct"
+      },
+      {
+        "candidate_id": "C183",
+        "local_id": "F15",
+        "rationale": "Neutropenia (the condition) is related to but distinct from the grade (the ordinal value).",
+        "relation": "related_but_distinct"
+      },
+      {
+        "candidate_id": "C184",
+        "local_id": "F15",
+        "rationale": "Neutropenia grade is the canonical ordinal feature.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C213",
+        "local_id": "F16",
+        "rationale": "Platelet count is a standard lab measurement.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C218",
+        "local_id": "F17",
+        "rationale": "Potassium is an electrolyte.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C245",
+        "local_id": "F04",
+        "rationale": "Renal function status is a clinical interpretation, while BUN is a specific measurement.",
+        "relation": "related_but_distinct"
+      },
+      {
+        "candidate_id": "C252",
+        "local_id": "F18",
+        "rationale": "Serum albumin is a standard lab measurement.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C253",
+        "local_id": "F19",
+        "rationale": "Serum calcium is an electrolyte.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C254",
+        "local_id": "F20",
+        "rationale": "Serum sodium is an electrolyte.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C259",
+        "local_id": "F07",
+        "rationale": "Spirometry result is an alias for the spirometry test category.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C260",
+        "local_id": "F07",
+        "rationale": "Spirometry results is an alias.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C268",
+        "local_id": "F21",
+        "rationale": "Systolic blood pressure is a vital sign.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C287",
+        "local_id": "F22",
+        "rationale": "WBC count is a standard lab measurement.",
+        "relation": "base_variable"
+      }
+    ],
+    "canonical_features": [
+      {
+        "action": "extract",
+        "aliases": [
+          "ANC",
+          "absolute neutrophil count (ANC)"
+        ],
+        "canonical_name": "absolute_neutrophil_count",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "The total number of neutrophils in a volume of blood, often used to assess neutropenia.",
+        "display_name": "Absolute Neutrophil Count",
+        "local_id": "F01",
+        "parent_object": null,
+        "rationale": "Core hematological measurement for assessing myelosuppression.",
+        "source_candidate_ids": [
+          "C001"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "anemia"
+        ],
+        "canonical_name": "anemia_status",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Clinical presence or absence of anemia.",
+        "display_name": "Anemia Status",
+        "local_id": "F02",
+        "parent_object": null,
+        "rationale": "Binary clinical finding.",
+        "source_candidate_ids": [
+          "C014"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "AST",
+          "AST level"
+        ],
+        "canonical_name": "aspartate_aminotransferase",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "An enzyme found in high concentrations in the liver.",
+        "display_name": "Aspartate Aminotransferase (AST)",
+        "local_id": "F03",
+        "parent_object": null,
+        "rationale": "Liver function marker.",
+        "source_candidate_ids": [
+          "C019",
+          "C020"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "BUN"
+        ],
+        "canonical_name": "blood_urea_nitrogen",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "A measure of urea nitrogen in the blood, used to assess kidney function.",
+        "display_name": "Blood Urea Nitrogen (BUN)",
+        "local_id": "F04",
+        "parent_object": null,
+        "rationale": "Renal function marker.",
+        "source_candidate_ids": [
+          "C025"
+        ]
+      },
+      {
+        "action": "review",
+        "aliases": [],
+        "canonical_name": "complete_blood_count",
+        "categories": null,
+        "data_type": "text",
+        "derivation": null,
+        "description": "A panel of tests that measure the different components of blood.",
+        "display_name": "Complete Blood Count",
+        "local_id": "F05",
+        "parent_object": null,
+        "rationale": "CBC is a collection of tests; individual components like WBC or Platelets are extracted separately.",
+        "source_candidate_ids": [
+          "C051"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "DLCO measurement"
+        ],
+        "canonical_name": "dlco",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "Diffusing capacity of the lungs for carbon monoxide.",
+        "display_name": "DLCO",
+        "local_id": "F06",
+        "parent_object": "spirometry",
+        "rationale": "Specific pulmonary function measurement.",
+        "source_candidate_ids": [
+          "C071",
+          "C072"
+        ]
+      },
+      {
+        "action": "review",
+        "aliases": [
+          "Spirometry result",
+          "Spirometry results"
+        ],
+        "canonical_name": "spirometry",
+        "categories": null,
+        "data_type": "text",
+        "derivation": null,
+        "description": "A test that shows how much air you can inhale and exhale and how fast you can exhale.",
+        "display_name": "Spirometry",
+        "local_id": "F07",
+        "parent_object": null,
+        "rationale": "Broad category for pulmonary function tests.",
+        "source_candidate_ids": [
+          "C259",
+          "C260"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "eGFR",
+          "Glomerular Filtration Rate (GFR) proxy"
+        ],
+        "canonical_name": "estimated_glomerular_filtration_rate",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "A calculation used to estimate how well the kidneys are filtering blood.",
+        "display_name": "Estimated Glomerular Filtration Rate (eGFR)",
+        "local_id": "F08",
+        "parent_object": null,
+        "rationale": "Standardized measure of renal function.",
+        "source_candidate_ids": [
+          "C078",
+          "C086",
+          "C102"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Estimated Creatinine Clearance"
+        ],
+        "canonical_name": "creatinine_clearance",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "A measure of how well the kidneys are filtering creatinine from the blood.",
+        "display_name": "Creatinine Clearance",
+        "local_id": "F09",
+        "parent_object": null,
+        "rationale": "Distinct from eGFR, often calculated via Cockcroft-Gault.",
+        "source_candidate_ids": [
+          "C085"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "heart_rate",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "The number of times the heart beats per minute.",
+        "display_name": "Heart Rate",
+        "local_id": "F10",
+        "parent_object": null,
+        "rationale": "Vital sign.",
+        "source_candidate_ids": [
+          "C107"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Hemoglobin level"
+        ],
+        "canonical_name": "hemoglobin",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "A protein in red blood cells that carries oxygen.",
+        "display_name": "Hemoglobin",
+        "local_id": "F11",
+        "parent_object": null,
+        "rationale": "Key hematological marker.",
+        "source_candidate_ids": [
+          "C108",
+          "C109"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Hyperlipidemia presence"
+        ],
+        "canonical_name": "hyperlipidemia_status",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of high levels of lipids in the blood.",
+        "display_name": "Hyperlipidemia Status",
+        "local_id": "F12",
+        "parent_object": null,
+        "rationale": "Clinical condition.",
+        "source_candidate_ids": [
+          "C126"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Hypertension control status"
+        ],
+        "canonical_name": "hypertension_control_status",
+        "categories": [
+          "controlled",
+          "uncontrolled",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "The status of blood pressure management.",
+        "display_name": "Hypertension Control Status",
+        "local_id": "F13",
+        "parent_object": null,
+        "rationale": "Categorical status of a condition.",
+        "source_candidate_ids": [
+          "C127"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "LDH level"
+        ],
+        "canonical_name": "lactate_dehydrogenase",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "An enzyme that helps convert sugar into energy.",
+        "display_name": "Lactate Dehydrogenase (LDH)",
+        "local_id": "F14",
+        "parent_object": null,
+        "rationale": "Enzyme marker often used in oncology.",
+        "source_candidate_ids": [
+          "C138"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Neutropenia grade"
+        ],
+        "canonical_name": "neutropenia_grade",
+        "categories": [
+          "grade 1",
+          "grade 2",
+          "grade 3",
+          "grade 4",
+          "unknown"
+        ],
+        "data_type": "ordinal",
+        "derivation": "not_automated",
+        "description": "The severity of neutropenia based on absolute neutrophil count.",
+        "display_name": "Neutropenia Grade",
+        "local_id": "F15",
+        "parent_object": null,
+        "rationale": "Ordinal classification of neutropenia.",
+        "source_candidate_ids": [
+          "C184"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "platelet_count",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "The number of platelets in a volume of blood.",
+        "display_name": "Platelet Count",
+        "local_id": "F16",
+        "parent_object": null,
+        "rationale": "Key hematological marker.",
+        "source_candidate_ids": [
+          "C213"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "potassium",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "Concentration of potassium in the blood.",
+        "display_name": "Potassium",
+        "local_id": "F17",
+        "parent_object": null,
+        "rationale": "Electrolyte measurement.",
+        "source_candidate_ids": [
+          "C218"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "serum_albumin",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "The main protein in human blood plasma.",
+        "display_name": "Serum Albumin",
+        "local_id": "F18",
+        "parent_object": null,
+        "rationale": "Nutritional and liver function marker.",
+        "source_candidate_ids": [
+          "C252"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Serum calcium level"
+        ],
+        "canonical_name": "serum_calcium",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "The amount of calcium in the blood.",
+        "display_name": "Serum Calcium",
+        "local_id": "F19",
+        "parent_object": null,
+        "rationale": "Electrolyte measurement.",
+        "source_candidate_ids": [
+          "C253"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Serum Sodium"
+        ],
+        "canonical_name": "serum_sodium",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "The amount of sodium in the blood.",
+        "display_name": "Serum Sodium",
+        "local_id": "F20",
+        "parent_object": null,
+        "rationale": "Electrolyte measurement.",
+        "source_candidate_ids": [
+          "C254"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "systolic_blood_pressure",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "The pressure in your arteries when your heart beats.",
+        "display_name": "Systolic Blood Pressure",
+        "local_id": "F21",
+        "parent_object": null,
+        "rationale": "Vital sign.",
+        "source_candidate_ids": [
+          "C268"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "white_blood_cell_count",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "The total number of white blood cells in a volume of blood.",
+        "display_name": "White Blood Cell Count",
+        "local_id": "F22",
+        "parent_object": null,
+        "rationale": "Key hematological marker.",
+        "source_candidate_ids": [
+          "C287"
+        ]
+      }
+    ]
+  },
+  "raw_content": "{\n  \"canonical_features\": [\n    {\n      \"local_id\": \"F01\",\n      \"canonical_name\": \"absolute_neutrophil_count\",\n      \"display_name\": \"Absolute Neutrophil Count\",\n      \"description\": \"The total number of neutrophils in a volume of blood, often used to assess neutropenia.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"ANC\",\n        \"absolute neutrophil count (ANC)\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C001\"\n      ],\n      \"rationale\": \"Core hematological measurement for assessing myelosuppression.\"\n    },\n    {\n      \"local_id\": \"F02\",\n      \"canonical_name\": \"anemia_status\",\n      \"display_name\": \"Anemia Status\",\n      \"description\": \"Clinical presence or absence of anemia.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"anemia\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C014\"\n      ],\n      \"rationale\": \"Binary clinical finding.\"\n    },\n    {\n      \"local_id\": \"F03\",\n      \"canonical_name\": \"aspartate_aminotransferase\",\n      \"display_name\": \"Aspartate Aminotransferase (AST)\",\n      \"description\": \"An enzyme found in high concentrations in the liver.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"AST\",\n        \"AST level\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C019\",\n        \"C020\"\n      ],\n      \"rationale\": \"Liver function marker.\"\n    },\n    {\n      \"local_id\": \"F04\",\n      \"canonical_name\": \"blood_urea_nitrogen\",\n      \"display_name\": \"Blood Urea Nitrogen (BUN)\",\n      \"description\": \"A measure of urea nitrogen in the blood, used to assess kidney function.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"BUN\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C025\"\n      ],\n      \"rationale\": \"Renal function marker.\"\n    },\n    {\n      \"local_id\": \"F05\",\n      \"canonical_name\": \"complete_blood_count\",\n      \"display_name\": \"Complete Blood Count\",\n      \"description\": \"A panel of tests that measure the different components of blood.\",\n      \"data_type\": \"text\",\n      \"categories\": null,\n      \"action\": \"review\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C051\"\n      ],\n      \"rationale\": \"CBC is a collection of tests; individual components like WBC or Platelets are extracted separately.\"\n    },\n    {\n      \"local_id\": \"F06\",\n      \"canonical_name\": \"dlco\",\n      \"display_name\": \"DLCO\",\n      \"description\": \"Diffusing capacity of the lungs for carbon monoxide.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": \"spirometry\",\n      \"aliases\": [\n        \"DLCO measurement\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C071\",\n        \"C072\"\n      ],\n      \"rationale\": \"Specific pulmonary function measurement.\"\n    },\n    {\n      \"local_id\": \"F07\",\n      \"canonical_name\": \"spirometry\",\n      \"display_name\": \"Spirometry\",\n      \"description\": \"A test that shows how much air you can inhale and exhale and how fast you can exhale.\",\n      \"data_type\": \"text\",\n      \"categories\": null,\n      \"action\": \"review\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"Spirometry result\",\n        \"Spirometry results\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C259\",\n        \"C260\"\n      ],\n      \"rationale\": \"Broad category for pulmonary function tests.\"\n    },\n    {\n      \"local_id\": \"F08\",\n      \"canonical_name\": \"estimated_glomerular_filtration_rate\",\n      \"display_name\": \"Estimated Glomerular Filtration Rate (eGFR)\",\n      \"description\": \"A calculation used to estimate how well the kidneys are filtering blood.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"eGFR\",\n        \"Glomerular Filtration Rate (GFR) proxy\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C078\",\n        \"C086\",\n        \"C102\"\n      ],\n      \"rationale\": \"Standardized measure of renal function.\"\n    },\n    {\n      \"local_id\": \"F09\",\n      \"canonical_name\": \"creatinine_clearance\",\n      \"display_name\": \"Creatinine Clearance\",\n      \"description\": \"A measure of how well the kidneys are filtering creatinine from the blood.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"Estimated Creatinine Clearance\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C085\"\n      ],\n      \"rationale\": \"Distinct from eGFR, often calculated via Cockcroft-Gault.\"\n    },\n    {\n      \"local_id\": \"F10\",\n      \"canonical_name\": \"heart_rate\",\n      \"display_name\": \"Heart Rate\",\n      \"description\": \"The number of times the heart beats per minute.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C107\"\n      ],\n      \"rationale\": \"Vital sign.\"\n    },\n    {\n      \"local_id\": \"F11\",\n      \"canonical_name\": \"hemoglobin\",\n      \"display_name\": \"Hemoglobin\",\n      \"description\": \"A protein in red blood cells that carries oxygen.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"Hemoglobin level\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C108\",\n        \"C109\"\n      ],\n      \"rationale\": \"Key hematological marker.\"\n    },\n    {\n      \"local_id\": \"F12\",\n      \"canonical_name\": \"hyperlipidemia_status\",\n      \"display_name\": \"Hyperlipidemia Status\",\n      \"description\": \"Presence of high levels of lipids in the blood.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"Hyperlipidemia presence\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C126\"\n      ],\n      \"rationale\": \"Clinical condition.\"\n    },\n    {\n      \"local_id\": \"F13\",\n      \"canonical_name\": \"hypertension_control_status\",\n      \"display_name\": \"Hypertension Control Status\",\n      \"description\": \"The status of blood pressure management.\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"controlled\",\n        \"uncontrolled\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"Hypertension control status\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C127\"\n      ],\n      \"rationale\": \"Categorical status of a condition.\"\n    },\n    {\n      \"local_id\": \"F14\",\n      \"canonical_name\": \"lactate_dehydrogenase\",\n      \"display_name\": \"Lactate Dehydrogenase (LDH)\",\n      \"description\": \"An enzyme that helps convert sugar into energy.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"LDH level\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C138\"\n      ],\n      \"rationale\": \"Enzyme marker often used in oncology.\"\n    },\n    {\n      \"local_id\": \"F15\",\n      \"canonical_name\": \"neutropenia_grade\",\n      \"display_name\": \"Neutropenia Grade\",\n      \"description\": \"The severity of neutropenia based on absolute neutrophil count.\",\n      \"data_type\": \"ordinal\",\n      \"categories\": [\n        \"grade 1\",\n        \"grade 2\",\n        \"grade 3\",\n        \"grade 4\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"Neutropenia grade\"\n      ],\n      \"derivation\": \"not_automated\",\n      \"source_candidate_ids\": [\n        \"C184\"\n      ],\n      \"rationale\": \"Ordinal classification of neutropenia.\"\n    },\n    {\n      \"local_id\": \"F16\",\n      \"canonical_name\": \"platelet_count\",\n      \"display_name\": \"Platelet Count\",\n      \"description\": \"The number of platelets in a volume of blood.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C213\"\n      ],\n      \"rationale\": \"Key hematological marker.\"\n    },\n    {\n      \"local_id\": \"F17\",\n      \"canonical_name\": \"potassium\",\n      \"display_name\": \"Potassium\",\n      \"description\": \"Concentration of potassium in the blood.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C218\"\n      ],\n      \"rationale\": \"Electrolyte measurement.\"\n    },\n    {\n      \"local_id\": \"F18\",\n      \"canonical_name\": \"serum_albumin\",\n      \"display_name\": \"Serum Albumin\",\n      \"description\": \"The main protein in human blood plasma.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C252\"\n      ],\n      \"rationale\": \"Nutritional and liver function marker.\"\n    },\n    {\n      \"local_id\": \"F19\",\n      \"canonical_name\": \"serum_calcium\",\n      \"display_name\": \"Serum Calcium\",\n      \"description\": \"The amount of calcium in the blood.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"Serum calcium level\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C253\"\n      ],\n      \"rationale\": \"Electrolyte measurement.\"\n    },\n    {\n      \"local_id\": \"F20\",\n      \"canonical_name\": \"serum_sodium\",\n      \"display_name\": \"Serum Sodium\",\n      \"description\": \"The amount of sodium in the blood.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"Serum Sodium\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C254\"\n      ],\n      \"rationale\": \"Electrolyte measurement.\"\n    },\n    {\n      \"local_id\": \"F21\",\n      \"canonical_name\": \"systolic_blood_pressure\",\n      \"display_name\": \"Systolic Blood Pressure\",\n      \"description\": \"The pressure in your arteries when your heart beats.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C268\"\n      ],\n      \"rationale\": \"Vital sign.\"\n    },\n    {\n      \"local_id\": \"F22\",\n      \"canonical_name\": \"white_blood_cell_count\",\n      \"display_name\": \"White Blood Cell Count\",\n      \"description\": \"The total number of white blood cells in a volume of blood.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C287\"\n      ],\n      \"rationale\": \"Key hematological marker.\"\n    }\n  ],\n  \"candidate_mappings\": [\n    {\n      \"candidate_id\": \"C001\",\n      \"local_id\": \"F01\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"C001 is the canonical name for ANC.\"\n    },\n    {\n      \"candidate_id\": \"C014\",\n      \"local_id\": \"F02\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct extraction of anemia status.\"\n    },\n    {\n      \"candidate_id\": \"C019\",\n      \"local_id\": \"F03\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"AST is an alias for Aspartate Aminotransferase.\"\n    },\n    {\n      \"candidate_id\": \"C020\",\n      \"local_id\": \"F03\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"AST level is an alias for AST.\"\n    },\n    {\n      \"candidate_id\": \"C021\",\n      \"local_id\": \"F03\",\n      \"relation\": \"related_but_distinct\",\n      \"rationale\": \"Cardiac function is a status/finding, not a specific lab measurement like AST.\"\n    },\n    {\n      \"candidate_id\": \"C022\",\n      \"local_id\": \"F06\",\n      \"relation\": \"related_but_distinct\",\n      \"rationale\": \"Pulmonary function status is a clinical assessment, whereas DLCO is a specific measurement.\"\n    },\n    {\n      \"candidate_id\": \"C025\",\n      \"local_id\": \"F04\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"BUN is a standard lab measurement.\"\n    },\n    {\n      \"candidate_id\": \"C051\",\n      \"local_id\": \"F05\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"CBC is a high-level test container.\"\n    },\n    {\n      \"candidate_id\": \"C071\",\n      \"local_id\": \"F06\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"DLCO is the canonical name.\"\n    },\n    {\n      \"candidate_id\": \"C072\",\n      \"local_id\": \"F06\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"DLCO measurement is an alias.\"\n    },\n    {\n      \"candidate_id\": \"C078\",\n      \"local_id\": \"F08\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"eGFR is an alias for estimated glomerular filtration rate.\"\n    },\n    {\n      \"candidate_id\": \"C085\",\n      \"local_id\": \"F09\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Creatinine clearance is a distinct renal measurement.\"\n    },\n    {\n      \"candidate_id\": \"C086\",\n      \"local_id\": \"F08\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"eGFR is an alias.\"\n    },\n    {\n      \"candidate_id\": \"C102\",\n      \"local_id\": \"F08\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"GFR proxy is an alias for eGFR.\"\n    },\n    {\n      \"candidate_id\": \"C107\",\n      \"local_id\": \"F10\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Heart rate is a vital sign.\"\n    },\n    {\n      \"candidate_id\": \"C108\",\n      \"local_id\": \"F11\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Hemoglobin level is an alias.\"\n    },\n    {\n      \"candidate_id\": \"C109\",\n      \"local_id\": \"F11\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Hemoglobin level is an alias.\"\n    },\n    {\n      \"candidate_id\": \"C126\",\n      \"local_id\": \"F12\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Hyperlipidemia status is a clinical finding.\"\n    },\n    {\n      \"candidate_id\": \"C127\",\n      \"local_id\": \"F13\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Hypertension control is a categorical status.\"\n    },\n    {\n      \"candidate_id\": \"C138\",\n      \"local_id\": \"F14\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"LDH is a standard lab measurement.\"\n    },\n    {\n      \"candidate_id\": \"C175\",\n      \"local_id\": \"F15\",\n      \"relation\": \"related_but_distinct\",\n      \"rationale\": \"Myelosuppression is a broad clinical finding, whereas Neutropenia grade is a specific measurement.\"\n    },\n    {\n      \"candidate_id\": \"C183\",\n      \"local_id\": \"F15\",\n      \"relation\": \"related_but_distinct\",\n      \"rationale\": \"Neutropenia (the condition) is related to but distinct from the grade (the ordinal value).\"\n    },\n    {\n      \"candidate_id\": \"C184\",\n      \"local_id\": \"F15\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Neutropenia grade is the canonical ordinal feature.\"\n    },\n    {\n      \"candidate_id\": \"C213\",\n      \"local_id\": \"F16\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Platelet count is a standard lab measurement.\"\n    },\n    {\n      \"candidate_id\": \"C218\",\n      \"local_id\": \"F17\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Potassium is an electrolyte.\"\n    },\n    {\n      \"candidate_id\": \"C245\",\n      \"local_id\": \"F04\",\n      \"relation\": \"related_but_distinct\",\n      \"rationale\": \"Renal function status is a clinical interpretation, while BUN is a specific measurement.\"\n    },\n    {\n      \"candidate_id\": \"C252\",\n      \"local_id\": \"F18\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Serum albumin is a standard lab measurement.\"\n    },\n    {\n      \"candidate_id\": \"C253\",\n      \"local_id\": \"F19\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Serum calcium is an electrolyte.\"\n    },\n    {\n      \"candidate_id\": \"C254\",\n      \"local_id\": \"F20\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Serum sodium is an electrolyte.\"\n    },\n    {\n      \"candidate_id\": \"C259\",\n      \"local_id\": \"F07\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Spirometry result is an alias for the spirometry test category.\"\n    },\n    {\n      \"candidate_id\": \"C260\",\n      \"local_id\": \"F07\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Spirometry results is an alias.\"\n    },\n    {\n      \"candidate_id\": \"C268\",\n      \"local_id\": \"F21\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Systolic blood pressure is a vital sign.\"\n    },\n    {\n      \"candidate_id\": \"C287\",\n      \"local_id\": \"F22\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"WBC count is a standard lab measurement.\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-993e3d9004735bbf",
+  "status": "complete",
+  "system_prompt": "You design conservative canonical clinical feature registries. The goal is to reduce redundant extraction while preserving clinically distinct variables. Use only supplied evidence. Return valid JSON only.",
+  "usage": {
+    "completion_tokens": 5431,
+    "prompt_tokens": 4834,
+    "prompt_tokens_details": null,
+    "total_tokens": 10265
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nDomain: laboratory_vitals\n\nHarmonize the following candidate feature names. Apply these distinctions carefully:\n\n- Merge true aliases that ask for the same patient-level variable.\n- Represent categories or values of one variable under one canonical feature when appropriate.\n- Mark a feature `derive` only when it can be calculated from other canonical base variables without reading the clinical text again.\n- Keep clinically related but non-equivalent measurements or findings separate.\n- Use `subfield_of` to connect distinct fields that belong to one reusable clinical object.\n- Drop only clear artifacts or redundant aliases. Use `review` when a safe extraction contract cannot be specified.\n- Preserve provenance: every candidate ID must map exactly once.\n- Do not assign a role in the clinical task.\n\nAllowed data types: [\"binary\", \"categorical\", \"continuous\", \"count\", \"ordinal\", \"text\"]\nAllowed actions: [\"derive\", \"drop\", \"extract\", \"review\"]\nAllowed mapping relations: [\"alias_of\", \"base_variable\", \"derived_from\", \"drop\", \"related_but_distinct\", \"review\", \"subfield_of\"]\n\nFor binary features, categories must be [\"absent\", \"present\", \"unknown\"]. For categorical or ordinal features, provide a conservative explicit category list including \"unknown\". Continuous and count features have no categories. Text features should normally be marked `review`, not `extract`.\n\nFor derivations, use this schema when executable; otherwise use operation `not_automated`:\n{\"operation\": \"ratio | threshold | category_map | not_automated\", \"inputs\": [\"canonical_name\"], \"parameters\": {}}\n\nCandidates:\n[{\"candidate_id\": \"C001\", \"name\": \"Absolute Neutrophil Count\", \"occurrence_count\": 2, \"topic_ranks\": [33, 96], \"representation_votes\": {\"continuous\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Absolute Neutrophil Count\", \"Absolute Neutrophil Count (ANC)\"], \"evidence_terms\": [\"anc 5.0\", \"anc 5.0 k\", \"low anc\"], \"feature_type_hints\": [\"measurement\", \"finding\"], \"represented_values_or_categories\": [\"5.0 k\", \"low\"]}, {\"candidate_id\": \"C014\", \"name\": \"Anemia status\", \"occurrence_count\": 1, \"topic_ranks\": [79], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Anemia\"], \"evidence_terms\": [\"- anemia\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C019\", \"name\": \"AST\", \"occurrence_count\": 1, \"topic_ranks\": [46], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"AST\"], \"evidence_terms\": [\"ast 32 u\"], \"feature_type_hints\": [\"laboratory_measurement\"], \"represented_values_or_categories\": [\"32 U/L\"]}, {\"candidate_id\": \"C020\", \"name\": \"AST level\", \"occurrence_count\": 2, \"topic_ranks\": [2, 82], \"representation_votes\": {\"continuous\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Aspartate Aminotransferase (AST)\", \"AST\"], \"evidence_terms\": [\"mg dl ast\", \"dl ast\", \"ast 32 u\"], \"feature_type_hints\": [\"laboratory_measurement\", \"measurement\"], \"represented_values_or_categories\": [\"32 u\"]}, {\"candidate_id\": \"C021\", \"name\": \"Baseline cardiac function status\", \"occurrence_count\": 1, \"topic_ranks\": [30], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Baseline cardiac function\"], \"evidence_terms\": [\"baseline cardiac\"], \"feature_type_hints\": [\"measurement_status\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C022\", \"name\": \"Baseline pulmonary function status\", \"occurrence_count\": 1, \"topic_ranks\": [30], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Baseline pulmonary function\"], \"evidence_terms\": [\"baseline pulmonary function\", \"baseline pulmonary\"], \"feature_type_hints\": [\"measurement_status\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C025\", \"name\": \"Blood Urea Nitrogen\", \"occurrence_count\": 2, \"topic_ranks\": [58, 82], \"representation_votes\": {\"continuous\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Blood Urea Nitrogen (BUN)\"], \"evidence_terms\": [\"bun 22 mg\", \"bun 22\", \"22 mg dl\", \"high bun\"], \"feature_type_hints\": [\"laboratory_measurement\", \"finding\"], \"represented_values_or_categories\": [\"22 mg/dL\", \"high\"]}, {\"candidate_id\": \"C051\", \"name\": \"Complete Blood Count\", \"occurrence_count\": 1, \"topic_ranks\": [61], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Complete Blood Count\"], \"evidence_terms\": [\"laboratory results cbc\", \"results cbc\", \"results cbc -\"], \"feature_type_hints\": [\"laboratory_test\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C071\", \"name\": \"DLCO\", \"occurrence_count\": 1, \"topic_ranks\": [83], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"DLCO\"], \"evidence_terms\": [\"dlco\"], \"feature_type_hints\": [\"continuous\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C072\", \"name\": \"DLCO measurement\", \"occurrence_count\": 1, \"topic_ranks\": [30], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"DLCO\"], \"evidence_terms\": [\"dlco\", \"spirometry dlco\", \"tests spirometry dlco\", \"dlco to\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C078\", \"name\": \"eGFR\", \"occurrence_count\": 1, \"topic_ranks\": [44], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"eGFR\"], \"evidence_terms\": [\"0.6-1.2 egfr\", \"dl 0.6-1.2 egfr\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"0.6-1.2\"]}, {\"candidate_id\": \"C085\", \"name\": \"Estimated Creatinine Clearance\", \"occurrence_count\": 2, \"topic_ranks\": [46, 64], \"representation_votes\": {\"continuous\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Cockcroft-Gault\", \"Cockcroft-Gault Creatinine Clearance\"], \"evidence_terms\": [\"cockcroft-gault\", \"ml min cockcroft-gault\", \"min cockcroft-gault\"], \"feature_type_hints\": [\"clinical_calculation_method\", \"measurement\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C086\", \"name\": \"estimated glomerular filtration rate (eGFR)\", \"occurrence_count\": 1, \"topic_ranks\": [72], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"eGFR\"], \"evidence_terms\": [\"dl 0.6-1.3 egfr\", \"0.6-1.3 egfr\", \"0.6-1.3 egfr ckd-epi\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"0.6-1.3\"]}, {\"candidate_id\": \"C102\", \"name\": \"Glomerular Filtration Rate\", \"occurrence_count\": 1, \"topic_ranks\": [58], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Glomerular Filtration Rate (GFR) proxy\"], \"evidence_terms\": [\"45 ml min\", \"48 ml min\", \"44 ml min\"], \"feature_type_hints\": [\"laboratory_measurement\"], \"represented_values_or_categories\": [\"44 ml/min\", \"45 ml/min\", \"48 ml/min\"]}, {\"candidate_id\": \"C107\", \"name\": \"Heart rate\", \"occurrence_count\": 1, \"topic_ranks\": [54], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Heart rate\"], \"evidence_terms\": [\"hr 88 bpm\", \"88 bpm\", \"mmhg hr 88\"], \"feature_type_hints\": [\"vital_sign\"], \"represented_values_or_categories\": [\"88 bpm\"]}, {\"candidate_id\": \"C108\", \"name\": \"Hemoglobin\", \"occurrence_count\": 1, \"topic_ranks\": [79], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Hemoglobin level\"], \"evidence_terms\": [\"10.8 g dl\", \"10.8 g\", \"hgb 10.8 g\", \"hgb 10.8\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"10.8 g/dL\"]}, {\"candidate_id\": \"C109\", \"name\": \"Hemoglobin level\", \"occurrence_count\": 2, \"topic_ranks\": [64, 75], \"representation_votes\": {\"continuous\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Hemoglobin\"], \"evidence_terms\": [\"hgb 12.8\", \"hgb 12.8 g\", \"12.8 g\", \"12.8 g dl\", \"12.8\", \"hgb 13.8\", \"hgb 13.8 g\", \"13.8\", \"13.8 g\", \"13.8 g dl\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"12.8 g/dL\", \"13.8 g/dL\"]}, {\"candidate_id\": \"C126\", \"name\": \"Hyperlipidemia presence\", \"occurrence_count\": 1, \"topic_ranks\": [13], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"low\", \"supporting_specific_features\": [\"Hyperlipidemia\"], \"evidence_terms\": [\"daily. - hyperlipidemia\"], \"feature_type_hints\": [\"condition\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C127\", \"name\": \"Hypertension control status\", \"occurrence_count\": 1, \"topic_ranks\": [13], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Hypertension status\"], \"evidence_terms\": [\"hypertension. - no\", \"controlled on lisinopril\"], \"feature_type_hints\": [\"condition\"], \"represented_values_or_categories\": [\"no\", \"controlled\"]}, {\"candidate_id\": \"C138\", \"name\": \"LDH level\", \"occurrence_count\": 1, \"topic_ranks\": [54], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Lactate dehydrogenase (LDH)\"], \"evidence_terms\": [\"ldh in\"], \"feature_type_hints\": [\"laboratory_measurement\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C175\", \"name\": \"Myelosuppression\", \"occurrence_count\": 1, \"topic_ranks\": [24], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Myelosuppression\"], \"evidence_terms\": [\"myelosuppression nausea\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"myelosuppression\"]}, {\"candidate_id\": \"C183\", \"name\": \"Neutropenia\", \"occurrence_count\": 1, \"topic_ranks\": [79], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Absolute Neutrophil Count (ANC)\"], \"evidence_terms\": [\"low anc\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"low\"]}, {\"candidate_id\": \"C184\", \"name\": \"Neutropenia grade\", \"occurrence_count\": 1, \"topic_ranks\": [20], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Neutropenia grade\"], \"evidence_terms\": [\"neutropenia grade\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C213\", \"name\": \"Platelet count\", \"occurrence_count\": 4, \"topic_ranks\": [2, 44, 75, 88], \"representation_votes\": {\"continuous\": 4}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Platelet count\"], \"evidence_terms\": [\"dl plt 260\", \"12.0-16.0 platelets\", \"dl 12.0-16.0 platelets\", \"plt 230 k\", \"plt 240 k\", \"240 k\", \"plt 240\", \"dl plt 240\", \"240 k l\", \"240 k ul\", \"plt 260 k\", \"260 k ul\"], \"feature_type_hints\": [\"laboratory_measurement\", \"measurement\"], \"represented_values_or_categories\": [\"260\", \"12.0-16.0\", \"230 k/uL\", \"240 k/uL\", \"260 k/uL\"]}, {\"candidate_id\": \"C218\", \"name\": \"Potassium\", \"occurrence_count\": 1, \"topic_ranks\": [61], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"low\", \"supporting_specific_features\": [], \"evidence_terms\": [], \"feature_type_hints\": [], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C245\", \"name\": \"Renal Function Status\", \"occurrence_count\": 1, \"topic_ranks\": [58], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Blood Urea Nitrogen (BUN)\"], \"evidence_terms\": [\"bun 22 mg\", \"bun 22\", \"22 mg dl\", \"high bun\"], \"feature_type_hints\": [\"laboratory_measurement\"], \"represented_values_or_categories\": [\"22 mg/dL\", \"high\"]}, {\"candidate_id\": \"C252\", \"name\": \"Serum Albumin\", \"occurrence_count\": 1, \"topic_ranks\": [46], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Albumin\"], \"evidence_terms\": [\"albumin 3.9\", \"albumin 3.9 g\", \"3.9 g\", \"3.9 g dl\", \"3.9\", \"normal albumin 3.9\", \"l albumin 3.9\", \"3.9 g dl.\", \"3.8\"], \"feature_type_hints\": [\"laboratory_measurement\"], \"represented_values_or_categories\": [\"3.9 g/dL\", \"3.8 g/dL\"]}, {\"candidate_id\": \"C253\", \"name\": \"Serum calcium level\", \"occurrence_count\": 1, \"topic_ranks\": [34], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"low\", \"supporting_specific_features\": [\"Calcium level\"], \"evidence_terms\": [\"- calcium\"], \"feature_type_hints\": [\"continuous\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C254\", \"name\": \"Serum Sodium\", \"occurrence_count\": 1, \"topic_ranks\": [82], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Sodium level\"], \"evidence_terms\": [\"138 meq\", \"138 meq l\", \"na 138 meq\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"138 meq/l\"]}, {\"candidate_id\": \"C259\", \"name\": \"Spirometry result\", \"occurrence_count\": 1, \"topic_ranks\": [30], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Spirometry\"], \"evidence_terms\": [\"spirometry\", \"tests spirometry\", \"function tests spirometry\", \"pulmonary function tests\", \"spirometry dlco\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C260\", \"name\": \"Spirometry results\", \"occurrence_count\": 1, \"topic_ranks\": [38], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Spirometry\"], \"evidence_terms\": [\"spirometry\"], \"feature_type_hints\": [\"diagnostic_test\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C268\", \"name\": \"Systolic blood pressure\", \"occurrence_count\": 1, \"topic_ranks\": [62], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Blood pressure\"], \"evidence_terms\": [\"--- bp 128\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"128\"]}, {\"candidate_id\": \"C287\", \"name\": \"White Blood Cell Count\", \"occurrence_count\": 4, \"topic_ranks\": [33, 49, 64, 96], \"representation_votes\": {\"continuous\": 4}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Laboratory Reference Range\", \"White Blood Cell Count\"], \"evidence_terms\": [\"wbc 7.5\", \"wbc 7.5 k\", \"cbc wbc 7.5\", \"7.5 k ul\", \"wbc 9.0 k\", \"cbc wbc 9.0\", \"wbc 9.0\", \"9.0 k\", \"wbc 6.2\", \"reference 150-400\", \"reference 1.5-8.0\", \"ul reference 150-400\", \"ul reference 1.5-8.0\"], \"feature_type_hints\": [\"measurement\", \"measurement_range\"], \"represented_values_or_categories\": [\"7.5 k/uL\", \"9.0 k/uL\", \"6.2\", \"150-400\", \"1.5-8.0\"]}]\n\nReturn:\n{\n  \"canonical_features\": [\n    {\n      \"local_id\": \"F01\",\n      \"canonical_name\": \"snake_case_name\",\n      \"display_name\": \"Readable name\",\n      \"description\": \"Precise extraction definition with aliases where useful\",\n      \"data_type\": \"binary | categorical | ordinal | continuous | count | text\",\n      \"categories\": [\"value\"] or null,\n      \"action\": \"extract | derive | drop | review\",\n      \"parent_object\": \"optional snake_case object name\" or null,\n      \"aliases\": [\"source wording\"],\n      \"derivation\": object or null,\n      \"source_candidate_ids\": [\"C001\"],\n      \"rationale\": \"short explanation\"\n    }\n  ],\n  \"candidate_mappings\": [\n    {\n      \"candidate_id\": \"C001\",\n      \"local_id\": \"F01\",\n      \"relation\": \"alias_of | base_variable | derived_from | subfield_of | related_but_distinct | drop | review\",\n      \"rationale\": \"short explanation\"\n    }\n  ]\n}"
+}

@@ -1,0 +1,172 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 9.20281434059143,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Numeric fragment, likely a template artifact or score.",
+        "term": "75 100"
+      },
+      {
+        "reason": "Ambiguous; could be a score or a template fragment.",
+        "term": "function 75"
+      },
+      {
+        "reason": "Contains numeric noise.",
+        "term": "20 100 dyspnea"
+      },
+      {
+        "reason": "Isolated numeric fragment.",
+        "term": "75"
+      }
+    ],
+    "general_topic": {
+      "coherence": "mixed",
+      "confidence": "medium",
+      "label": "Treatment-related adverse events and functional status",
+      "summary": "The topic contains clear clinical symptoms (nausea, pain, dyspnea, fatigue) and mentions of 'function', but is heavily cluttered with numeric fragments and template artifacts."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Repetitive mentions of nausea suggest it is a primary symptom captured in the text.",
+        "feature_type": "symptom",
+        "name": "Nausea",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "nausea 10",
+          "nausea 10 100",
+          "100 nausea 10"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Repetitive mentions of pain suggest it is a primary symptom captured in the text.",
+        "feature_type": "symptom",
+        "name": "Pain",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "pain 20",
+          "pain 20 100",
+          "100 pain 20"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Dyspnea is explicitly mentioned alongside numeric fragments.",
+        "feature_type": "symptom",
+        "name": "Dyspnea",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "20 100 dyspnea",
+          "20 dyspnea"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Fatigue is explicitly linked to the PRO-CTCAE (Patient-Reported Outcomes version of the Common Terminology Criteria for Adverse Events) assessment tool.",
+        "feature_type": "symptom",
+        "name": "Fatigue",
+        "represented_values_or_categories": [
+          "pro-ctcae"
+        ],
+        "supporting_terms": [
+          "pro-ctcae fatigue"
+        ]
+      },
+      {
+        "artifact_likelihood": "medium",
+        "confidence": "medium",
+        "explanation": "The term 'function' appears frequently with numeric fragments, likely referring to functional status or performance status.",
+        "feature_type": "clinical_assessment",
+        "name": "Functional status",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "function 75 100",
+          "function 75",
+          "function 70",
+          "function 70 100"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Nausea",
+        "suggested_representation": "ordinal",
+        "supporting_specific_features": [
+          "Nausea"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Pain",
+        "suggested_representation": "ordinal",
+        "supporting_specific_features": [
+          "Pain"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Dyspnea",
+        "suggested_representation": "ordinal",
+        "supporting_specific_features": [
+          "Dyspnea"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Fatigue",
+        "suggested_representation": "ordinal",
+        "supporting_specific_features": [
+          "Fatigue"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Functional status",
+        "suggested_representation": "ordinal",
+        "supporting_specific_features": [
+          "Functional status"
+        ]
+      }
+    ],
+    "topic_index": 69,
+    "topic_rank": 40
+  },
+  "raw_content": "{\n  \"topic_rank\": 40,\n  \"topic_index\": 69,\n  \"general_topic\": {\n    \"label\": \"Treatment-related adverse events and functional status\",\n    \"coherence\": \"mixed\",\n    \"confidence\": \"medium\",\n    \"summary\": \"The topic contains clear clinical symptoms (nausea, pain, dyspnea, fatigue) and mentions of 'function', but is heavily cluttered with numeric fragments and template artifacts.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Nausea\",\n      \"supporting_terms\": [\n        \"nausea 10\",\n        \"nausea 10 100\",\n        \"100 nausea 10\"\n      ],\n      \"feature_type\": \"symptom\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Repetitive mentions of nausea suggest it is a primary symptom captured in the text.\"\n    },\n    {\n      \"name\": \"Pain\",\n      \"supporting_terms\": [\n        \"pain 20\",\n        \"pain 20 100\",\n        \"100 pain 20\"\n      ],\n      \"feature_type\": \"symptom\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Repetitive mentions of pain suggest it is a primary symptom captured in the text.\"\n    },\n    {\n      \"name\": \"Dyspnea\",\n      \"supporting_terms\": [\n        \"20 100 dyspnea\",\n        \"20 dyspnea\"\n      ],\n      \"feature_type\": \"symptom\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Dyspnea is explicitly mentioned alongside numeric fragments.\"\n    },\n    {\n      \"name\": \"Fatigue\",\n      \"supporting_terms\": [\n        \"pro-ctcae fatigue\"\n      ],\n      \"feature_type\": \"symptom\",\n      \"represented_values_or_categories\": [\n        \"pro-ctcae\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Fatigue is explicitly linked to the PRO-CTCAE (Patient-Reported Outcomes version of the Common Terminology Criteria for Adverse Events) assessment tool.\"\n    },\n    {\n      \"name\": \"Functional status\",\n      \"supporting_terms\": [\n        \"function 75 100\",\n        \"function 75\",\n        \"function 70\",\n        \"function 70 100\"\n      ],\n      \"feature_type\": \"clinical_assessment\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"medium\",\n      \"explanation\": \"The term 'function' appears frequently with numeric fragments, likely referring to functional status or performance status.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"75 100\",\n      \"reason\": \"Numeric fragment, likely a template artifact or score.\"\n    },\n    {\n      \"term\": \"function 75\",\n      \"reason\": \"Ambiguous; could be a score or a template fragment.\"\n    },\n    {\n      \"term\": \"20 100 dyspnea\",\n      \"reason\": \"Contains numeric noise.\"\n    },\n    {\n      \"term\": \"75\",\n      \"reason\": \"Isolated numeric fragment.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Nausea\",\n      \"suggested_representation\": \"ordinal\",\n      \"supporting_specific_features\": [\n        \"Nausea\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Pain\",\n      \"suggested_representation\": \"ordinal\",\n      \"supporting_specific_features\": [\n        \"Pain\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Dyspnea\",\n      \"suggested_representation\": \"ordinal\",\n      \"supporting_specific_features\": [\n        \"Dyspnea\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Fatigue\",\n      \"suggested_representation\": \"ordinal\",\n      \"supporting_specific_features\": [\n        \"Fatigue\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Functional status\",\n      \"suggested_representation\": \"ordinal\",\n      \"supporting_specific_features\": [\n        \"Functional status\"\n      ],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-a01942fd62749fde",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "75 100",
+    "nausea 10",
+    "pain 20",
+    "function 75 100",
+    "function 75",
+    "function 70",
+    "20 100 dyspnea",
+    "nausea 10 100",
+    "75",
+    "100 nausea 10",
+    "function 70 100",
+    "pain 20 100",
+    "100 pain 20",
+    "20 dyspnea",
+    "pro-ctcae fatigue"
+  ],
+  "topic_index": 69,
+  "topic_rank": 40,
+  "usage": {
+    "completion_tokens": 1156,
+    "prompt_tokens": 881,
+    "prompt_tokens_details": null,
+    "total_tokens": 2037
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 40, internal index 69\n\nTerms in this topic, ordered from highest to lowest loading:\n1. 75 100\n2. nausea 10\n3. pain 20\n4. function 75 100\n5. function 75\n6. function 70\n7. 20 100 dyspnea\n8. nausea 10 100\n9. 75\n10. 100 nausea 10\n11. function 70 100\n12. pain 20 100\n13. 100 pain 20\n14. 20 dyspnea\n15. pro-ctcae fatigue\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 40,\n  \"topic_index\": 69,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

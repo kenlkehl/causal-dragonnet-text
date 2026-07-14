@@ -1,0 +1,364 @@
+{
+  "attempts": 1,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "candidate_mappings": [
+      {
+        "candidate_id": "C037",
+        "local_id": "F01",
+        "rationale": "Directly represents the diagnosis date.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C038",
+        "local_id": "F02",
+        "rationale": "Base variable for cancer stage.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C048",
+        "local_id": "F02",
+        "rationale": "Clinical stage is a type of cancer stage.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C272",
+        "local_id": "F02",
+        "rationale": "TNM stage is a type of cancer stage.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C065",
+        "local_id": "F03",
+        "rationale": "Identifies the diagnosis type.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C069",
+        "local_id": "F04",
+        "rationale": "Base variable for recurrence status.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C087",
+        "local_id": "F04",
+        "rationale": "Evidence of recurrence is an indicator of status.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C232",
+        "local_id": "F04",
+        "rationale": "Presence of residual/recurrent disease is a status indicator.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C246",
+        "local_id": "F04",
+        "rationale": "Residual disease presence is a status indicator.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C112",
+        "local_id": "F05",
+        "rationale": "Base variable for histology.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C113",
+        "local_id": "F05",
+        "rationale": "Histological subtype is an alias for histology.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C114",
+        "local_id": "F05",
+        "rationale": "Specific subtype mention.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C115",
+        "local_id": "F05",
+        "rationale": "Histology is an alias for histologic subtype.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C116",
+        "local_id": "F05",
+        "rationale": "Histology of lung tumor is an alias.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C117",
+        "local_id": "F05",
+        "rationale": "Histology subtype is an alias.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C192",
+        "local_id": "F05",
+        "rationale": "NSCLC histological subtype is an alias.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C193",
+        "local_id": "F05",
+        "rationale": "NSCLC Histology is an alias.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C150",
+        "local_id": "F06",
+        "rationale": "Low confidence and no evidence terms provided.",
+        "relation": "review"
+      },
+      {
+        "candidate_id": "C172",
+        "local_id": "F07",
+        "rationale": "Base variable for mitotic activity.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C236",
+        "local_id": "F08",
+        "rationale": "Base variable for tumor location.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C279",
+        "local_id": "F08",
+        "rationale": "Tumor anatomical location is an alias.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C249",
+        "local_id": "F09",
+        "rationale": "Direct representation of seizure status.",
+        "relation": "base_variable"
+      }
+    ],
+    "canonical_features": [
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "cancer_diagnosis_date",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "The date on which the cancer was diagnosed.",
+        "display_name": "Cancer Diagnosis Date",
+        "local_id": "F01",
+        "parent_object": null,
+        "rationale": "Unique temporal variable for diagnosis.",
+        "source_candidate_ids": [
+          "C037"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "clinical stage",
+          "tnm stage"
+        ],
+        "canonical_name": "cancer_stage",
+        "categories": [
+          "Stage I",
+          "Stage II",
+          "Stage III",
+          "Stage IV",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "The clinical or TNM stage of the cancer.",
+        "display_name": "Cancer Stage",
+        "local_id": "F02",
+        "parent_object": null,
+        "rationale": "Consolidates various stage representations (Clinical, TNM, Cancer Stage) into a single staging variable.",
+        "source_candidate_ids": [
+          "C038",
+          "C048",
+          "C272"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "diagnosis_type",
+        "categories": [
+          "non-small cell",
+          "small cell",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "The primary diagnosis type, specifically identifying if it is non-small cell lung cancer.",
+        "display_name": "Diagnosis Type",
+        "local_id": "F03",
+        "parent_object": null,
+        "rationale": "Identifies the specific disease type mentioned in the context of NSCLC.",
+        "source_candidate_ids": [
+          "C065"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "evidence of disease recurrence",
+          "residual disease presence"
+        ],
+        "canonical_name": "disease_recurrence_status",
+        "categories": [
+          "residual",
+          "recurrent",
+          "absent",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "Indicates whether the disease is residual, recurrent, or no longer present.",
+        "display_name": "Disease Recurrence Status",
+        "local_id": "F04",
+        "parent_object": null,
+        "rationale": "Merges various indicators of disease recurrence and residual status into a single categorical variable.",
+        "source_candidate_ids": [
+          "C069",
+          "C087",
+          "C232",
+          "C246"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "histology",
+          "histological subtype",
+          "nsclc histological subtype",
+          "nsclc histology"
+        ],
+        "canonical_name": "histologic_subtype",
+        "categories": [
+          "adenocarcinoma",
+          "squamous cell carcinoma",
+          "large-cell",
+          "non-squamous",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "The specific histological classification of the lung tumor.",
+        "display_name": "Histologic Subtype",
+        "local_id": "F05",
+        "parent_object": null,
+        "rationale": "Consolidates all histology and subtype mentions into one canonical feature.",
+        "source_candidate_ids": [
+          "C112",
+          "C113",
+          "C114",
+          "C115",
+          "C116",
+          "C117",
+          "C192",
+          "C193"
+        ]
+      },
+      {
+        "action": "review",
+        "aliases": [],
+        "canonical_name": "lymph_node_involvement",
+        "categories": [
+          "present",
+          "absent",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "Presence or extent of lymph node involvement.",
+        "display_name": "Lymph Node Involvement",
+        "local_id": "F06",
+        "parent_object": null,
+        "rationale": "Low confidence and missing evidence terms; requires manual review.",
+        "source_candidate_ids": [
+          "C150"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "mitotic rate"
+        ],
+        "canonical_name": "mitotic_activity",
+        "categories": [
+          "low",
+          "moderate",
+          "frequent",
+          "unknown"
+        ],
+        "data_type": "ordinal",
+        "derivation": null,
+        "description": "The rate or level of mitotic activity observed in the tumor.",
+        "display_name": "Mitotic Activity",
+        "local_id": "F07",
+        "parent_object": null,
+        "rationale": "Captures mitotic activity as an ordinal measurement.",
+        "source_candidate_ids": [
+          "C172"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "primary tumor anatomical location"
+        ],
+        "canonical_name": "tumor_anatomical_location",
+        "categories": [
+          "lower lobe",
+          "right lower lobe",
+          "left lower lobe",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "The anatomical site of the primary tumor.",
+        "display_name": "Tumor Anatomical Location",
+        "local_id": "F08",
+        "parent_object": null,
+        "rationale": "Consolidates tumor location descriptions.",
+        "source_candidate_ids": [
+          "C236",
+          "C279"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "seizure_disorder_status",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of a seizure disorder.",
+        "display_name": "Seizure Disorder Status",
+        "local_id": "F09",
+        "parent_object": null,
+        "rationale": "Standard binary indicator for a comorbid condition.",
+        "source_candidate_ids": [
+          "C249"
+        ]
+      }
+    ]
+  },
+  "raw_content": "{\n  \"canonical_features\": [\n    {\n      \"local_id\": \"F01\",\n      \"canonical_name\": \"cancer_diagnosis_date\",\n      \"display_name\": \"Cancer Diagnosis Date\",\n      \"description\": \"The date on which the cancer was diagnosed.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C037\"\n      ],\n      \"rationale\": \"Unique temporal variable for diagnosis.\"\n    },\n    {\n      \"local_id\": \"F02\",\n      \"canonical_name\": \"cancer_stage\",\n      \"display_name\": \"Cancer Stage\",\n      \"description\": \"The clinical or TNM stage of the cancer.\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"Stage I\",\n        \"Stage II\",\n        \"Stage III\",\n        \"Stage IV\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"clinical stage\",\n        \"tnm stage\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C038\",\n        \"C048\",\n        \"C272\"\n      ],\n      \"rationale\": \"Consolidates various stage representations (Clinical, TNM, Cancer Stage) into a single staging variable.\"\n    },\n    {\n      \"local_id\": \"F03\",\n      \"canonical_name\": \"diagnosis_type\",\n      \"display_name\": \"Diagnosis Type\",\n      \"description\": \"The primary diagnosis type, specifically identifying if it is non-small cell lung cancer.\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"non-small cell\",\n        \"small cell\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C065\"\n      ],\n      \"rationale\": \"Identifies the specific disease type mentioned in the context of NSCLC.\"\n    },\n    {\n      \"local_id\": \"F04\",\n      \"canonical_name\": \"disease_recurrence_status\",\n      \"display_name\": \"Disease Recurrence Status\",\n      \"description\": \"Indicates whether the disease is residual, recurrent, or no longer present.\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"residual\",\n        \"recurrent\",\n        \"absent\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"evidence of disease recurrence\",\n        \"residual disease presence\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C069\",\n        \"C087\",\n        \"C232\",\n        \"C246\"\n      ],\n      \"rationale\": \"Merges various indicators of disease recurrence and residual status into a single categorical variable.\"\n    },\n    {\n      \"local_id\": \"F05\",\n      \"canonical_name\": \"histologic_subtype\",\n      \"display_name\": \"Histologic Subtype\",\n      \"description\": \"The specific histological classification of the lung tumor.\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"adenocarcinoma\",\n        \"squamous cell carcinoma\",\n        \"large-cell\",\n        \"non-squamous\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"histology\",\n        \"histological subtype\",\n        \"nsclc histological subtype\",\n        \"nsclc histology\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C112\",\n        \"C113\",\n        \"C114\",\n        \"C115\",\n        \"C116\",\n        \"C117\",\n        \"C192\",\n        \"C193\"\n      ],\n      \"rationale\": \"Consolidates all histology and subtype mentions into one canonical feature.\"\n    },\n    {\n      \"local_id\": \"F06\",\n      \"canonical_name\": \"lymph_node_involvement\",\n      \"display_name\": \"Lymph Node Involvement\",\n      \"description\": \"Presence or extent of lymph node involvement.\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"present\",\n        \"absent\",\n        \"unknown\"\n      ],\n      \"action\": \"review\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C150\"\n      ],\n      \"rationale\": \"Low confidence and missing evidence terms; requires manual review.\"\n    },\n    {\n      \"local_id\": \"F07\",\n      \"canonical_name\": \"mitotic_activity\",\n      \"display_name\": \"Mitotic Activity\",\n      \"description\": \"The rate or level of mitotic activity observed in the tumor.\",\n      \"data_type\": \"ordinal\",\n      \"categories\": [\n        \"low\",\n        \"moderate\",\n        \"frequent\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"mitotic rate\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C172\"\n      ],\n      \"rationale\": \"Captures mitotic activity as an ordinal measurement.\"\n    },\n    {\n      \"local_id\": \"F08\",\n      \"canonical_name\": \"tumor_anatomical_location\",\n      \"display_name\": \"Tumor Anatomical Location\",\n      \"description\": \"The anatomical site of the primary tumor.\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"lower lobe\",\n        \"right lower lobe\",\n        \"left lower lobe\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"primary tumor anatomical location\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C236\",\n        \"C279\"\n      ],\n      \"rationale\": \"Consolidates tumor location descriptions.\"\n    },\n    {\n      \"local_id\": \"F09\",\n      \"canonical_name\": \"seizure_disorder_status\",\n      \"display_name\": \"Seizure Disorder Status\",\n      \"description\": \"Presence of a seizure disorder.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C249\"\n      ],\n      \"rationale\": \"Standard binary indicator for a comorbid condition.\"\n    }\n  ],\n  \"candidate_mappings\": [\n    {\n      \"candidate_id\": \"C037\",\n      \"local_id\": \"F01\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Directly represents the diagnosis date.\"\n    },\n    {\n      \"candidate_id\": \"C038\",\n      \"local_id\": \"F02\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Base variable for cancer stage.\"\n    },\n    {\n      \"candidate_id\": \"C048\",\n      \"local_id\": \"F02\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Clinical stage is a type of cancer stage.\"\n    },\n    {\n      \"candidate_id\": \"C272\",\n      \"local_id\": \"F02\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"TNM stage is a type of cancer stage.\"\n    },\n    {\n      \"candidate_id\": \"C065\",\n      \"local_id\": \"F03\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Identifies the diagnosis type.\"\n    },\n    {\n      \"candidate_id\": \"C069\",\n      \"local_id\": \"F04\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Base variable for recurrence status.\"\n    },\n    {\n      \"candidate_id\": \"C087\",\n      \"local_id\": \"F04\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Evidence of recurrence is an indicator of status.\"\n    },\n    {\n      \"candidate_id\": \"C232\",\n      \"local_id\": \"F04\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Presence of residual/recurrent disease is a status indicator.\"\n    },\n    {\n      \"candidate_id\": \"C246\",\n      \"local_id\": \"F04\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Residual disease presence is a status indicator.\"\n    },\n    {\n      \"candidate_id\": \"C112\",\n      \"local_id\": \"F05\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Base variable for histology.\"\n    },\n    {\n      \"candidate_id\": \"C113\",\n      \"local_id\": \"F05\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Histological subtype is an alias for histology.\"\n    },\n    {\n      \"candidate_id\": \"C114\",\n      \"local_id\": \"F05\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Specific subtype mention.\"\n    },\n    {\n      \"candidate_id\": \"C115\",\n      \"local_id\": \"F05\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Histology is an alias for histologic subtype.\"\n    },\n    {\n      \"candidate_id\": \"C116\",\n      \"local_id\": \"F05\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Histology of lung tumor is an alias.\"\n    },\n    {\n      \"candidate_id\": \"C117\",\n      \"local_id\": \"F05\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Histology subtype is an alias.\"\n    },\n    {\n      \"candidate_id\": \"C192\",\n      \"local_id\": \"F05\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"NSCLC histological subtype is an alias.\"\n    },\n    {\n      \"candidate_id\": \"C193\",\n      \"local_id\": \"F05\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"NSCLC Histology is an alias.\"\n    },\n    {\n      \"candidate_id\": \"C150\",\n      \"local_id\": \"F06\",\n      \"relation\": \"review\",\n      \"rationale\": \"Low confidence and no evidence terms provided.\"\n    },\n    {\n      \"candidate_id\": \"C172\",\n      \"local_id\": \"F07\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Base variable for mitotic activity.\"\n    },\n    {\n      \"candidate_id\": \"C236\",\n      \"local_id\": \"F08\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Base variable for tumor location.\"\n    },\n    {\n      \"candidate_id\": \"C279\",\n      \"local_id\": \"F08\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Tumor anatomical location is an alias.\"\n    },\n    {\n      \"candidate_id\": \"C249\",\n      \"local_id\": \"F09\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct representation of seizure status.\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-b725546489694347",
+  "status": "complete",
+  "system_prompt": "You design conservative canonical clinical feature registries. The goal is to reduce redundant extraction while preserving clinically distinct variables. Use only supplied evidence. Return valid JSON only.",
+  "usage": {
+    "completion_tokens": 2971,
+    "prompt_tokens": 3236,
+    "prompt_tokens_details": null,
+    "total_tokens": 6207
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nDomain: diagnosis_stage_histology\n\nHarmonize the following candidate feature names. Apply these distinctions carefully:\n\n- Merge true aliases that ask for the same patient-level variable.\n- Represent categories or values of one variable under one canonical feature when appropriate.\n- Mark a feature `derive` only when it can be calculated from other canonical base variables without reading the clinical text again.\n- Keep clinically related but non-equivalent measurements or findings separate.\n- Use `subfield_of` to connect distinct fields that belong to one reusable clinical object.\n- Drop only clear artifacts or redundant aliases. Use `review` when a safe extraction contract cannot be specified.\n- Preserve provenance: every candidate ID must map exactly once.\n- Do not assign a role in the clinical task.\n\nAllowed data types: [\"binary\", \"categorical\", \"continuous\", \"count\", \"ordinal\", \"text\"]\nAllowed actions: [\"derive\", \"drop\", \"extract\", \"review\"]\nAllowed mapping relations: [\"alias_of\", \"base_variable\", \"derived_from\", \"drop\", \"related_but_distinct\", \"review\", \"subfield_of\"]\n\nFor binary features, categories must be [\"absent\", \"present\", \"unknown\"]. For categorical or ordinal features, provide a conservative explicit category list including \"unknown\". Continuous and count features have no categories. Text features should normally be marked `review`, not `extract`.\n\nFor derivations, use this schema when executable; otherwise use operation `not_automated`:\n{\"operation\": \"ratio | threshold | category_map | not_automated\", \"inputs\": [\"canonical_name\"], \"parameters\": {}}\n\nCandidates:\n[{\"candidate_id\": \"C037\", \"name\": \"Cancer Diagnosis Date\", \"occurrence_count\": 1, \"topic_ranks\": [90], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Cancer Diagnosis Status\"], \"evidence_terms\": [\"cancer diagnosed\", \"cancer diagnosed at\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"diagnosed\"]}, {\"candidate_id\": \"C038\", \"name\": \"Cancer Stage\", \"occurrence_count\": 3, \"topic_ranks\": [80, 83, 90], \"representation_votes\": {\"categorical\": 2, \"ordinal\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Cancer Stage\"], \"evidence_terms\": [\"woman with stage\", \"stage iiia\", \"iiia\", \"for stage iiia\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"Stage IIIA\"]}, {\"candidate_id\": \"C048\", \"name\": \"Clinical Stage\", \"occurrence_count\": 1, \"topic_ranks\": [86], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Cancer Stage\"], \"evidence_terms\": [\"iv squamous\", \"stage iv squamous\", \"iv squamous nsclc\", \"iv squamous non-small\"], \"feature_type_hints\": [\"clinical_stage\"], \"represented_values_or_categories\": [\"IV\"]}, {\"candidate_id\": \"C065\", \"name\": \"Diagnosis Type\", \"occurrence_count\": 1, \"topic_ranks\": [16], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Non-small cell lung cancer diagnosis\"], \"evidence_terms\": [\"diagnosis non-small cell\", \"diagnosis non-small\", \"primary diagnosis non-small\"], \"feature_type_hints\": [\"diagnosis\"], \"represented_values_or_categories\": [\"non-small cell\"]}, {\"candidate_id\": \"C069\", \"name\": \"Disease recurrence status\", \"occurrence_count\": 2, \"topic_ranks\": [26, 66], \"representation_votes\": {\"binary\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Residual or recurrent disease status\", \"Signs of disease recurrence\"], \"evidence_terms\": [\"residual or\", \"or recurrent\", \"residual or recurrent\", \"no residual or\", \"no residual\", \"recurrence\", \"signs of recurrence\", \"recurrence new cough\", \"recurrence new\"], \"feature_type_hints\": [\"categorical\", \"clinical_finding\"], \"represented_values_or_categories\": [\"residual\", \"recurrent\", \"no residual\"]}, {\"candidate_id\": \"C087\", \"name\": \"Evidence of disease recurrence\", \"occurrence_count\": 1, \"topic_ranks\": [60], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Disease recurrence\"], \"evidence_terms\": [\"recurrence\"], \"feature_type_hints\": [\"status\"], \"represented_values_or_categories\": [\"recurrence\"]}, {\"candidate_id\": \"C112\", \"name\": \"Histologic subtype\", \"occurrence_count\": 1, \"topic_ranks\": [59], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Histologic subtype\"], \"evidence_terms\": [\"iv large-cell nsclc\", \"iv large-cell non-small\", \"negative no squamous\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"large-cell\", \"non-squamous\"]}, {\"candidate_id\": \"C113\", \"name\": \"Histological subtype\", \"occurrence_count\": 1, \"topic_ranks\": [81], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Lung adenocarcinoma histology\"], \"evidence_terms\": [\"adenocarcinoma of\", \"adenocarcinoma of the\", \"adenocarcinoma\"], \"feature_type_hints\": [\"histology\"], \"represented_values_or_categories\": [\"adenocarcinoma\"]}, {\"candidate_id\": \"C114\", \"name\": \"Histological subtype: Adenocarcinoma\", \"occurrence_count\": 1, \"topic_ranks\": [94], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Lower-lobe adenocarcinoma\"], \"evidence_terms\": [\"lower-lobe adenocarcinoma\"], \"feature_type_hints\": [\"diagnosis\"], \"represented_values_or_categories\": [\"adenocarcinoma\"]}, {\"candidate_id\": \"C115\", \"name\": \"Histology\", \"occurrence_count\": 1, \"topic_ranks\": [78], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Histological subtype\"], \"evidence_terms\": [\"adenocarcinoma of\", \"adenocarcinoma of the\", \"adenocarcinoma\"], \"feature_type_hints\": [\"diagnosis\"], \"represented_values_or_categories\": [\"adenocarcinoma\"]}, {\"candidate_id\": \"C116\", \"name\": \"Histology of lung tumor\", \"occurrence_count\": 1, \"topic_ranks\": [52], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Left lower-lobe adenocarcinoma\"], \"evidence_terms\": [\"left lower-lobe adenocarcinoma\", \"lower-lobe adenocarcinoma\"], \"feature_type_hints\": [\"diagnosis\"], \"represented_values_or_categories\": [\"adenocarcinoma\"]}, {\"candidate_id\": \"C117\", \"name\": \"Histology subtype\", \"occurrence_count\": 1, \"topic_ranks\": [86], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Histology: Squamous cell carcinoma\"], \"evidence_terms\": [\"iv squamous\", \"stage iv squamous\", \"iv squamous nsclc\", \"cell carcinoma\", \"iv squamous non-small\", \"squamous nsclc.\", \"supports squamous\"], \"feature_type_hints\": [\"histology\"], \"represented_values_or_categories\": [\"squamous\"]}, {\"candidate_id\": \"C150\", \"name\": \"Lymph Node Involvement\", \"occurrence_count\": 1, \"topic_ranks\": [46], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"low\", \"supporting_specific_features\": [], \"evidence_terms\": [], \"feature_type_hints\": [], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C172\", \"name\": \"Mitotic activity\", \"occurrence_count\": 1, \"topic_ranks\": [59], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Mitotic rate\"], \"evidence_terms\": [\"frequent mitoses\"], \"feature_type_hints\": [\"ordinal\"], \"represented_values_or_categories\": [\"frequent\"]}, {\"candidate_id\": \"C192\", \"name\": \"NSCLC histological subtype\", \"occurrence_count\": 1, \"topic_ranks\": [28], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Histological subtype\"], \"evidence_terms\": [\"cell carcinoma\", \"squamous histology.\", \"negative excludes adenocarcinoma\", \"supports squamous\", \"squamous nsclc.\", \"supports squamous differentiation\", \"histology\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"squamous cell carcinoma\", \"adenocarcinoma\"]}, {\"candidate_id\": \"C193\", \"name\": \"NSCLC Histology\", \"occurrence_count\": 1, \"topic_ranks\": [82], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Histology subtype\"], \"evidence_terms\": [\"squamous nsclc. -\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"squamous\"]}, {\"candidate_id\": \"C232\", \"name\": \"Presence of residual or recurrent disease\", \"occurrence_count\": 1, \"topic_ranks\": [87], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Residual or recurrent disease status\"], \"evidence_terms\": [\"residual or\", \"no residual or\", \"no residual\", \"or recurrent\", \"residual or recurrent\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"residual\", \"no residual\", \"recurrent\"]}, {\"candidate_id\": \"C236\", \"name\": \"Primary tumor anatomical location\", \"occurrence_count\": 1, \"topic_ranks\": [11], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Tumor location\"], \"evidence_terms\": [\"lower lobe\", \"the right lower\", \"lower lobe. -\"], \"feature_type_hints\": [\"anatomical_site\"], \"represented_values_or_categories\": [\"lower lobe\", \"right lower lobe\"]}, {\"candidate_id\": \"C246\", \"name\": \"Residual disease presence\", \"occurrence_count\": 1, \"topic_ranks\": [26], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Residual or recurrent disease status\"], \"evidence_terms\": [\"residual or\", \"or recurrent\", \"residual or recurrent\", \"no residual or\", \"no residual\", \"recurrence\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"residual\", \"recurrent\", \"no residual\"]}, {\"candidate_id\": \"C249\", \"name\": \"Seizure disorder status\", \"occurrence_count\": 1, \"topic_ranks\": [39], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Seizure disorder\"], \"evidence_terms\": [\"seizure\", \"seizure disorder\"], \"feature_type_hints\": [\"condition\"], \"represented_values_or_categories\": [\"seizure\"]}, {\"candidate_id\": \"C272\", \"name\": \"TNM Stage\", \"occurrence_count\": 2, \"topic_ranks\": [11, 86], \"representation_votes\": {\"categorical\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"TNM Stage\"], \"evidence_terms\": [\"iv t3 n2\"], \"feature_type_hints\": [\"clinical_stage\", \"tnm_classification\"], \"represented_values_or_categories\": [\"Stage IV\", \"T3\", \"N2\"]}, {\"candidate_id\": \"C279\", \"name\": \"Tumor anatomical location\", \"occurrence_count\": 1, \"topic_ranks\": [59], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Tumor location\"], \"evidence_terms\": [\"lower lobe\", \"the right lower\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"lower lobe\", \"right lower lobe\"]}]\n\nReturn:\n{\n  \"canonical_features\": [\n    {\n      \"local_id\": \"F01\",\n      \"canonical_name\": \"snake_case_name\",\n      \"display_name\": \"Readable name\",\n      \"description\": \"Precise extraction definition with aliases where useful\",\n      \"data_type\": \"binary | categorical | ordinal | continuous | count | text\",\n      \"categories\": [\"value\"] or null,\n      \"action\": \"extract | derive | drop | review\",\n      \"parent_object\": \"optional snake_case object name\" or null,\n      \"aliases\": [\"source wording\"],\n      \"derivation\": object or null,\n      \"source_candidate_ids\": [\"C001\"],\n      \"rationale\": \"short explanation\"\n    }\n  ],\n  \"candidate_mappings\": [\n    {\n      \"candidate_id\": \"C001\",\n      \"local_id\": \"F01\",\n      \"relation\": \"alias_of | base_variable | derived_from | subfield_of | related_but_distinct | drop | review\",\n      \"rationale\": \"short explanation\"\n    }\n  ]\n}"
+}

@@ -1,0 +1,120 @@
+{
+  "dataset": "synthetic_data/example_synthetic_datasets/five_confounders_five_effect_modifiers_nsclc_with_structured/dataset.parquet",
+  "honest_nuisance": "one_off_uplift_five/honest_tfidf_nuisance_predictions.parquet",
+  "text_col": "clinical_text",
+  "text_max_chars": 24000,
+  "seed": 731,
+  "device": "cuda:1",
+  "outer_fold": {
+    "train_rows": 800,
+    "test_rows": 200,
+    "test_treated_rows": 105,
+    "test_control_rows": 95
+  },
+  "htr": {
+    "sentence_model": "/home/klkehl/.cache/huggingface/hub/models--unsloth--bge-small-en-v1.5/snapshots/7382f1122c10708a1faa0bbe548674a14b1ffe7e",
+    "sentence_backend": "transformers",
+    "sentence_pooling": "token_attention",
+    "freeze_sentence_encoder": true,
+    "effect_folds": 2,
+    "effect_epochs": 4,
+    "batch_size": 8,
+    "chunk_size_words": 96,
+    "chunk_overlap_words": 24,
+    "max_chunks": 96,
+    "max_chunk_length": 128,
+    "htr_layers": 1,
+    "htr_dim": 128
+  },
+  "pair_matching": {
+    "propensity_caliper": 0.05,
+    "outcome_caliper": 0.05,
+    "max_controls_per_candidate": 3,
+    "nearest_fallback_controls": 1
+  },
+  "inner_evidence": [
+    {
+      "outer_fold": 1,
+      "inner_fold": 1,
+      "source_family": "htr_pair_uplift",
+      "objective": "matched_pair_uplift_delta_logit",
+      "target_name": "treated_observed_outcome",
+      "train_rows": 400,
+      "heldout_rows": 400,
+      "outer_test_rows": 200,
+      "matched_pair_train_rows": 146,
+      "heldout_candidate_pair_rows": 1163,
+      "outer_test_candidate_pair_rows": 580,
+      "heldout_treated_auroc": 0.7381814804495217,
+      "prediction_provenance": "inner_fold_pair_model_heldout_and_outer_test"
+    },
+    {
+      "outer_fold": 1,
+      "inner_fold": 2,
+      "source_family": "htr_pair_uplift",
+      "objective": "matched_pair_uplift_delta_logit",
+      "target_name": "treated_observed_outcome",
+      "train_rows": 400,
+      "heldout_rows": 400,
+      "outer_test_rows": 200,
+      "matched_pair_train_rows": 148,
+      "heldout_candidate_pair_rows": 1170,
+      "outer_test_candidate_pair_rows": 578,
+      "heldout_treated_auroc": 0.7541308658294779,
+      "prediction_provenance": "inner_fold_pair_model_heldout_and_outer_test"
+    }
+  ],
+  "train_oof_metrics": {
+    "train_candidate_control_mean": 2.91625,
+    "test_candidate_control_mean": 2.895,
+    "treated_oof": {
+      "n_eval": 416,
+      "auroc": 0.74588592800374,
+      "brier": 0.2233232862247871,
+      "log_loss": 0.6389193925557171
+    },
+    "delta_logit_true_ite_corr": -0.02924728249176057
+  },
+  "outer_test_actual_treated": {
+    "baseline_matched_control_prob": {
+      "n": 105,
+      "auroc": 0.6804842259721203,
+      "brier": 0.23430415333532545,
+      "log_loss": 0.6612340056943087
+    },
+    "htr_uplift_prob": {
+      "n": 105,
+      "auroc": 0.66507703595011,
+      "brier": 0.23381996708560626,
+      "log_loss": 0.6603420598907083
+    }
+  },
+  "outer_test_delta_vs_truth": {
+    "delta_logit_vs_true_delta_logit": {
+      "pearson": 0.038607973339324,
+      "spearman": 0.06861321533038327
+    },
+    "delta_prob_vs_true_ite_prob": {
+      "pearson": -0.0881819727645385,
+      "spearman": -0.12990774769369234
+    }
+  },
+  "prediction_distribution": {
+    "delta_logit_mean": 0.0980047561104099,
+    "delta_logit_std": 0.0059695836369816945,
+    "treated_prob_mean": 0.4754682306917957,
+    "treated_prob_std": 0.07553001954918145,
+    "candidate_controls_mean": 2.895
+  },
+  "attention": {
+    "rows": 444,
+    "rows_with_token_summary": 435,
+    "known_modifier_hit_rows": {
+      "histology_type": 113,
+      "egfr_mutation_status": 119,
+      "baseline_nlr": 17,
+      "brain_metastases_status": 47,
+      "baseline_hemoglobin": 52
+    }
+  }
+}

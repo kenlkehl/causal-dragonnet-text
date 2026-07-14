@@ -1,0 +1,140 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 7.0980284214019775,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Fragmentary term; likely part of a description of activity (e.g., 'climbing stairs') but lacks clinical context on its own.",
+        "term": "stairs."
+      },
+      {
+        "reason": "Documentation template fragment/procedural text rather than a clinical feature.",
+        "term": "complaint follow-up after"
+      },
+      {
+        "reason": "Ambiguous; could refer to a patient's ability to walk or a specific activity, but lacks sufficient detail.",
+        "term": "walk"
+      },
+      {
+        "reason": "Fragmentary; likely refers to climbing stairs, but is incomplete.",
+        "term": "climbing"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "Respiratory symptoms and functional capacity",
+      "summary": "The topic focuses on respiratory symptoms, specifically dyspnea related to exertion and hemoptysis, alongside indicators of physical activity and breathing function."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The terms describe shortness of breath occurring during physical activity, with varying degrees of severity and presence at rest.",
+        "feature_type": "symptom",
+        "name": "Exertional dyspnea",
+        "represented_values_or_categories": [
+          "mild",
+          "at rest"
+        ],
+        "supporting_terms": [
+          "exertional",
+          "mild exertional",
+          "exertional dyspnea",
+          "mild exertional dyspnea",
+          "rest mild",
+          "at rest mild",
+          "rest mild exertional"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The terms explicitly identify the coughing up of blood.",
+        "feature_type": "symptom",
+        "name": "Sputum hemoptysis",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "sputum hemoptysis",
+          "cough sputum hemoptysis"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Refers to a pulmonary function test used to assess lung capacity.",
+        "feature_type": "diagnostic_test",
+        "name": "Spirometry",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "spirometry"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Dyspnea severity",
+        "suggested_representation": "ordinal",
+        "supporting_specific_features": [
+          "Exertional dyspnea"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Hemoptysis",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Sputum hemoptysis"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Spirometry results",
+        "suggested_representation": "continuous",
+        "supporting_specific_features": [
+          "Spirometry"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Functional mobility/exercise tolerance",
+        "suggested_representation": "ordinal",
+        "supporting_specific_features": []
+      }
+    ],
+    "topic_index": 49,
+    "topic_rank": 38
+  },
+  "raw_content": "{\n  \"topic_rank\": 38,\n  \"topic_index\": 49,\n  \"general_topic\": {\n    \"label\": \"Respiratory symptoms and functional capacity\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic focuses on respiratory symptoms, specifically dyspnea related to exertion and hemoptysis, alongside indicators of physical activity and breathing function.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Exertional dyspnea\",\n      \"supporting_terms\": [\n        \"exertional\",\n        \"mild exertional\",\n        \"exertional dyspnea\",\n        \"mild exertional dyspnea\",\n        \"rest mild\",\n        \"at rest mild\",\n        \"rest mild exertional\"\n      ],\n      \"feature_type\": \"symptom\",\n      \"represented_values_or_categories\": [\n        \"mild\",\n        \"at rest\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms describe shortness of breath occurring during physical activity, with varying degrees of severity and presence at rest.\"\n    },\n    {\n      \"name\": \"Sputum hemoptysis\",\n      \"supporting_terms\": [\n        \"sputum hemoptysis\",\n        \"cough sputum hemoptysis\"\n      ],\n      \"feature_type\": \"symptom\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms explicitly identify the coughing up of blood.\"\n    },\n    {\n      \"name\": \"Spirometry\",\n      \"supporting_terms\": [\n        \"spirometry\"\n      ],\n      \"feature_type\": \"diagnostic_test\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Refers to a pulmonary function test used to assess lung capacity.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"stairs.\",\n    \"reason\": \"Fragmentary term; likely part of a description of activity (e.g., 'climbing stairs') but lacks clinical context on its own.\"\n    },\n    {\n      \"term\": \"complaint follow-up after\",\n      \"reason\": \"Documentation template fragment/procedural text rather than a clinical feature.\"\n    },\n    {\n      \"term\": \"walk\",\n      \"reason\": \"Ambiguous; could refer to a patient's ability to walk or a specific activity, but lacks sufficient detail.\"\n    },\n    {\n      \"term\": \"climbing\",\n      \"reason\": \"Fragmentary; likely refers to climbing stairs, but is incomplete.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Dyspnea severity\",\n      \"suggested_representation\": \"ordinal\",\n      \"supporting_specific_features\": [\n        \"Exertional dyspnea\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Hemoptysis\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Sputum hemoptysis\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Spirometry results\",\n      \"suggested_representation\": \"continuous\",\n      \"supporting_specific_features\": [\n        \"Spirometry\"\n      ],\n      \"confidence\": \"medium\"\n    },\n    {\n      \"name\": \"Functional mobility/exercise tolerance\",\n      \"suggested_representation\": \"ordinal\",\n      \"supporting_specific_features\": [],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-bdcaacabe079fb39",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "exertional",
+    "mild exertional",
+    "exertional dyspnea",
+    "mild exertional dyspnea",
+    "rest mild",
+    "at rest mild",
+    "rest mild exertional",
+    "sputum hemoptysis",
+    "cough sputum hemoptysis",
+    "stairs.",
+    "complaint follow-up after",
+    "walk",
+    "breathing",
+    "spirometry",
+    "climbing"
+  ],
+  "topic_index": 49,
+  "topic_rank": 38,
+  "usage": {
+    "completion_tokens": 894,
+    "prompt_tokens": 831,
+    "prompt_tokens_details": null,
+    "total_tokens": 1725
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 38, internal index 49\n\nTerms in this topic, ordered from highest to lowest loading:\n1. exertional\n2. mild exertional\n3. exertional dyspnea\n4. mild exertional dyspnea\n5. rest mild\n6. at rest mild\n7. rest mild exertional\n8. sputum hemoptysis\n9. cough sputum hemoptysis\n10. stairs.\n11. complaint follow-up after\n12. walk\n13. breathing\n14. spirometry\n15. climbing\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 38,\n  \"topic_index\": 49,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

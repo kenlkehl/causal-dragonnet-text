@@ -1,0 +1,158 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 7.524107217788696,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Incomplete phrase due to text segmentation",
+        "term": "lower lobectomy with"
+      },
+      {
+        "reason": "Fragmented term",
+        "term": "post left"
+      },
+      {
+        "reason": "Fragmented term",
+        "term": "a left lower"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "History of lung resection and adenocarcinoma",
+      "summary": "The topic focuses on surgical history involving left lower lobectomy, specifically in the context of adenocarcinoma and associated node dissection."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The terms consistently describe a specific surgical procedure (lobectomy) on the left lower lobe.",
+        "feature_type": "surgical_procedure",
+        "name": "Left lower lobectomy",
+        "represented_values_or_categories": [
+          "left lower lobectomy"
+        ],
+        "supporting_terms": [
+          "left lower lobectomy",
+          "lower lobectomy",
+          "lower lobectomy with",
+          "history - left",
+          "underwent a left",
+          "post left lower",
+          "post left",
+          "status post left",
+          "prior left",
+          "a left lower",
+          "lower lobectomy and"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The terms specify a histological diagnosis of adenocarcinoma located in the lower lobe.",
+        "feature_type": "diagnosis",
+        "name": "Left lower-lobe adenocarcinoma",
+        "represented_values_or_categories": [
+          "adenocarcinoma"
+        ],
+        "supporting_terms": [
+          "left lower-lobe adenocarcinoma",
+          "lower-lobe adenocarcinoma"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "Refers to the surgical removal of lymph nodes, likely associated with the lobectomy.",
+        "feature_type": "surgical_procedure",
+        "name": "Node dissection",
+        "represented_values_or_categories": [
+          "node dissection"
+        ],
+        "supporting_terms": [
+          "node dissection"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "Indicates whether treatments were administered in an adjuvant setting following surgery.",
+        "feature_type": "treatment_context",
+        "name": "Adjuvant therapy status",
+        "represented_values_or_categories": [
+          "adjuvant"
+        ],
+        "supporting_terms": [
+          "adjuvant"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "History of left lower lobectomy",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Left lower lobectomy"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Histology of lung tumor",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Left lower-lobe adenocarcinoma"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Lymph node dissection status",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Node dissection"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Adjuvant treatment history",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Adjuvant therapy status"
+        ]
+      }
+    ],
+    "topic_index": 13,
+    "topic_rank": 52
+  },
+  "raw_content": "{\n  \"topic_rank\": 52,\n  \"topic_index\": 13,\n  \"general_topic\": {\n    \"label\": \"History of lung resection and adenocarcinoma\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic focuses on surgical history involving left lower lobectomy, specifically in the context of adenocarcinoma and associated node dissection.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Left lower lobectomy\",\n      \"supporting_terms\": [\n        \"left lower lobectomy\",\n        \"lower lobectomy\",\n        \"lower lobectomy with\",\n        \"history - left\",\n        \"underwent a left\",\n        \"post left lower\",\n        \"post left\",\n        \"status post left\",\n        \"prior left\",\n        \"a left lower\",\n        \"lower lobectomy and\"\n      ],\n      \"feature_type\": \"surgical_procedure\",\n      \"represented_values_or_categories\": [\n        \"left lower lobectomy\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms consistently describe a specific surgical procedure (lobectomy) on the left lower lobe.\"\n    },\n    {\n      \"name\": \"Left lower-lobe adenocarcinoma\",\n      \"supporting_terms\": [\n        \"left lower-lobe adenocarcinoma\",\n        \"lower-lobe adenocarcinoma\"\n      ],\n      \"feature_type\": \"diagnosis\",\n      \"represented_values_or_categories\": [\n        \"adenocarcinoma\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms specify a histological diagnosis of adenocarcinoma located in the lower lobe.\"\n    },\n    {\n      \"name\": \"Node dissection\",\n      \"supporting_terms\": [\n        \"node dissection\"\n      ],\n      \"feature_type\": \"surgical_procedure\",\n      \"represented_values_or_categories\": [\n        \"node dissection\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Refers to the surgical removal of lymph nodes, likely associated with the lobectomy.\"\n    },\n    {\n      \"name\": \"Adjuvant therapy status\",\n      \"supporting_terms\": [\n        \"adjuvant\"\n      ],\n      \"feature_type\": \"treatment_context\",\n      \"represented_values_or_categories\": [\n        \"adjuvant\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Indicates whether treatments were administered in an adjuvant setting following surgery.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"lower lobectomy with\",\n      \"reason\": \"Incomplete phrase due to text segmentation\"\n    },\n    {\n      \"term\": \"post left\",\n      \"reason\": \"Fragmented term\"\n    },\n    {\n      \"term\": \"a left lower\",\n      \"reason\": \"Fragmented term\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"History of left lower lobectomy\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Left lower lobectomy\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Histology of lung tumor\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Left lower-lobe adenocarcinoma\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Lymph node dissection status\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Node dissection\"\n      ],\n      \"confidence\": \"medium\"\n    },\n    {\n      \"name\": \"Adjuvant treatment history\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Adjuvant therapy status\"\n      ],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-b1d193079881eeff",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "left lower lobectomy",
+    "lower lobectomy",
+    "lower lobectomy with",
+    "history - left",
+    "left lower-lobe adenocarcinoma",
+    "underwent a left",
+    "post left lower",
+    "post left",
+    "status post left",
+    "prior left",
+    "a left lower",
+    "lower lobectomy and",
+    "lower-lobe adenocarcinoma",
+    "adjuvant",
+    "node dissection"
+  ],
+  "topic_index": 13,
+  "topic_rank": 52,
+  "usage": {
+    "completion_tokens": 957,
+    "prompt_tokens": 831,
+    "prompt_tokens_details": null,
+    "total_tokens": 1788
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 52, internal index 13\n\nTerms in this topic, ordered from highest to lowest loading:\n1. left lower lobectomy\n2. lower lobectomy\n3. lower lobectomy with\n4. history - left\n5. left lower-lobe adenocarcinoma\n6. underwent a left\n7. post left lower\n8. post left\n9. status post left\n10. prior left\n11. a left lower\n12. lower lobectomy and\n13. lower-lobe adenocarcinoma\n14. adjuvant\n15. node dissection\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 52,\n  \"topic_index\": 13,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

@@ -1,0 +1,1064 @@
+{
+  "attempts": 1,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "candidate_mappings": [
+      {
+        "candidate_id": "C004",
+        "local_id": "F01",
+        "rationale": "Alias for adrenal gland metastasis.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C005",
+        "local_id": "F01",
+        "rationale": "Alias for adrenal gland metastasis.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C011",
+        "local_id": "F16",
+        "rationale": "Refers to lung/nodule location.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C012",
+        "local_id": "F03",
+        "rationale": "Alias for brain metastasis location.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C013",
+        "local_id": "F03",
+        "rationale": "Alias for brain metastasis location.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C017",
+        "local_id": "F18",
+        "rationale": "ADC is a measurement related to FDG/SUV context, but here treated as a separate continuous value if needed; however, SUVmax is the primary quantitative feature.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C030",
+        "local_id": "F04",
+        "rationale": "Alias for brain lesion diameter.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C031",
+        "local_id": "F03",
+        "rationale": "Alias for brain metastasis location.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C032",
+        "local_id": "F02",
+        "rationale": "Alias for brain metastasis presence.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C033",
+        "local_id": "F03",
+        "rationale": "Alias for brain metastasis location.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C034",
+        "local_id": "F02",
+        "rationale": "Alias for brain metastasis presence.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C035",
+        "local_id": "F02",
+        "rationale": "Alias for brain metastasis presence.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C036",
+        "local_id": "F20",
+        "rationale": "Alias for lesion calcification.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C055",
+        "local_id": "F19",
+        "rationale": "Refers to MRI modality.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C060",
+        "local_id": "F05",
+        "rationale": "Alias for brain lesion count.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C061",
+        "local_id": "F27",
+        "rationale": "Text-derived CT findings are too broad for a canonical feature.",
+        "relation": "review"
+      },
+      {
+        "candidate_id": "C062",
+        "local_id": "F19",
+        "rationale": "Refers to imaging modality.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C068",
+        "local_id": "F19",
+        "rationale": "Refers to imaging modality (DWI).",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C088",
+        "local_id": "F28",
+        "rationale": "Extra-axial fluid collection is a specific finding that may require review.",
+        "relation": "review"
+      },
+      {
+        "candidate_id": "C091",
+        "local_id": "F17",
+        "rationale": "Alias for FDG avidity.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C092",
+        "local_id": "F17",
+        "rationale": "Alias for FDG avidity.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C111",
+        "local_id": "F10",
+        "rationale": "Hepatic segment location.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C128",
+        "local_id": "F19",
+        "rationale": "Refers to imaging modality (SWI).",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C129",
+        "local_id": "F02",
+        "rationale": "Alias for brain metastasis presence.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C130",
+        "local_id": "F02",
+        "rationale": "Alias for brain metastasis presence.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C131",
+        "local_id": "F06",
+        "rationale": "Alias for brain lesion enhancement.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C135",
+        "local_id": "F04",
+        "rationale": "Alias for brain lesion diameter.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C136",
+        "local_id": "F09",
+        "rationale": "Alias for hepatic lesion diameter.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C137",
+        "local_id": "F03",
+        "rationale": "Alias for brain metastasis location.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C139",
+        "local_id": "F01",
+        "rationale": "Alias for adrenal gland metastasis.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C140",
+        "local_id": "F15",
+        "rationale": "Alias for lung nodule diameter.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C141",
+        "local_id": "F14",
+        "rationale": "Alias for lesion enhancement pattern.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C142",
+        "local_id": "F14",
+        "rationale": "Alias for lesion enhancement status.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C145",
+        "local_id": "F08",
+        "rationale": "Alias for liver metastasis.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C151",
+        "local_id": "F11",
+        "rationale": "Alias for lymph node metastasis.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C152",
+        "local_id": "F13",
+        "rationale": "Alias for lymph node short axis diameter.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C153",
+        "local_id": "F11",
+        "rationale": "Alias for lymph node metastasis.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C156",
+        "local_id": "F18",
+        "rationale": "Alias for SUVmax.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C159",
+        "local_id": "F12",
+        "rationale": "Alias for mediastinal/hilar lymphadenopathy.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C160",
+        "local_id": "F12",
+        "rationale": "Alias for mediastinal/hilar lymphadenopathy.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C161",
+        "local_id": "F12",
+        "rationale": "Alias for mediastinal/hilar lymphadenopathy.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C162",
+        "local_id": "F12",
+        "rationale": "Alias for mediastinal/hilar lymphadenopathy.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C170",
+        "local_id": "F03",
+        "rationale": "Alias for brain metastasis location.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C171",
+        "local_id": "F03",
+        "rationale": "Alias for brain metastasis location.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C185",
+        "local_id": "F15",
+        "rationale": "Alias for lung nodule diameter.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C186",
+        "local_id": "F11",
+        "rationale": "Alias for lymph node metastasis.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C187",
+        "local_id": "F11",
+        "rationale": "Alias for lymph node metastasis.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C188",
+        "local_id": "F20",
+        "rationale": "Alias for lesion calcification.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C189",
+        "local_id": "F14",
+        "rationale": "Alias for lung nodule enhancement.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C190",
+        "local_id": "F16",
+        "rationale": "Alias for lung nodule location.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C191",
+        "local_id": "F14",
+        "rationale": "Alias for lung nodule morphology.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C200",
+        "local_id": "F23",
+        "rationale": "Alias for osteoblastic bone lesion.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C211",
+        "local_id": "F07",
+        "rationale": "Alias for perilesional edema.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C214",
+        "local_id": "F22",
+        "rationale": "Alias for pleural effusion.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C220",
+        "local_id": "F02",
+        "rationale": "Alias for brain metastasis presence.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C222",
+        "local_id": "F06",
+        "rationale": "Alias for brain lesion enhancement.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C223",
+        "local_id": "F17",
+        "rationale": "Alias for FDG avidity.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C224",
+        "local_id": "F08",
+        "rationale": "Alias for liver metastasis.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C225",
+        "local_id": "F02",
+        "rationale": "Alias for brain metastasis presence.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C226",
+        "local_id": "F24",
+        "rationale": "Alias for mass effect.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C227",
+        "local_id": "F22",
+        "rationale": "Alias for pleural effusion.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C228",
+        "local_id": "F19",
+        "rationale": "Alias for imaging modality.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C229",
+        "local_id": "F14",
+        "rationale": "Refers to presence of a specific type of nodule, which is a subset of nodule characteristics.",
+        "relation": "related_but_distinct"
+      },
+      {
+        "candidate_id": "C230",
+        "local_id": "F07",
+        "rationale": "Alias for perilesional edema.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C233",
+        "local_id": "F21",
+        "rationale": "Alias for splenic metastasis.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C234",
+        "local_id": "F07",
+        "rationale": "Alias for perilesional edema.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C244",
+        "local_id": "F29",
+        "rationale": "Recent imaging availability is a temporal metadata field, not a clinical feature of the disease itself.",
+        "relation": "review"
+      },
+      {
+        "candidate_id": "C247",
+        "local_id": "F01",
+        "rationale": "Alias for adrenal gland metastasis.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C261",
+        "local_id": "F21",
+        "rationale": "Alias for splenic metastasis.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C264",
+        "local_id": "F30",
+        "rationale": "Surveillance imaging occurrence is a procedural/study design feature.",
+        "relation": "review"
+      },
+      {
+        "candidate_id": "C265",
+        "local_id": "F18",
+        "rationale": "Alias for SUVmax.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C270",
+        "local_id": "F31",
+        "rationale": "Thoracic PET/CT findings is a text-based summary field.",
+        "relation": "review"
+      },
+      {
+        "candidate_id": "C280",
+        "local_id": "F25",
+        "rationale": "Alias for tumor diameter.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C281",
+        "local_id": "F16",
+        "rationale": "Alias for lung nodule location.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C282",
+        "local_id": "F25",
+        "rationale": "Alias for tumor diameter.",
+        "relation": "alias_of"
+      }
+    ],
+    "canonical_features": [
+      {
+        "action": "extract",
+        "aliases": [
+          "Adrenal metastasis presence",
+          "Left adrenal metastasis",
+          "Right adrenal metastasis",
+          "Right adrenal metastasis"
+        ],
+        "canonical_name": "adrenal_gland_metastasis",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of metastatic involvement in the adrenal glands.",
+        "display_name": "Adrenal gland metastasis",
+        "local_id": "F01",
+        "parent_object": null,
+        "rationale": "Consolidates various mentions of adrenal gland involvement into a single binary feature.",
+        "source_candidate_ids": [
+          "C004",
+          "C005",
+          "C139",
+          "C247"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Brain metastases presence",
+          "Brain metastasis status",
+          "Brain metastasis presence",
+          "Intracranial metastasis",
+          "Intracranial metastasis presence",
+          "Presence of brain metastases",
+          "Presence of intracranial metastases"
+        ],
+        "canonical_name": "brain_metastasis_presence",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of intracranial metastatic disease.",
+        "display_name": "Brain metastasis presence",
+        "local_id": "F02",
+        "parent_object": null,
+        "rationale": "Merges all indicators of intracranial/brain metastatic status.",
+        "source_candidate_ids": [
+          "C032",
+          "C034",
+          "C035",
+          "C129",
+          "C130",
+          "C220",
+          "C225"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Anatomical location of brain metastases",
+          "Anatomical site of brain metastasis",
+          "Brain lesion location",
+          "Brain metastasis location",
+          "Laterality of brain metastasis"
+        ],
+        "canonical_name": "brain_metastasis_location",
+        "categories": [
+          "cerebellum",
+          "frontal lobe",
+          "occipital lobe",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "Anatomical site of brain metastases.",
+        "display_name": "Brain metastasis location",
+        "local_id": "F03",
+        "parent_object": "brain_metastasis_presence",
+        "rationale": "Captures the specific anatomical location of brain lesions.",
+        "source_candidate_ids": [
+          "C012",
+          "C013",
+          "C031",
+          "C033",
+          "C137",
+          "C170",
+          "C171"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Brain lesion diameter",
+          "Largest brain lesion diameter"
+        ],
+        "canonical_name": "brain_lesion_diameter",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "The diameter of brain lesions.",
+        "display_name": "Brain lesion diameter",
+        "local_id": "F04",
+        "parent_object": "brain_metastasis_presence",
+        "rationale": "Measures the size of brain lesions.",
+        "source_candidate_ids": [
+          "C030",
+          "C135"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Count of enhancing brain lesions"
+        ],
+        "canonical_name": "brain_lesion_count",
+        "categories": null,
+        "data_type": "count",
+        "derivation": null,
+        "description": "Number of enhancing brain lesions.",
+        "display_name": "Brain lesion count",
+        "local_id": "F05",
+        "parent_object": "brain_metastasis_presence",
+        "rationale": "Quantifies the number of lesions found in the brain.",
+        "source_candidate_ids": [
+          "C060"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Intracranial metastatic enhancement",
+          "Presence of enhancing brain lesions"
+        ],
+        "canonical_name": "brain_lesion_enhancement",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of enhancement in brain lesions.",
+        "display_name": "Brain lesion enhancement",
+        "local_id": "F06",
+        "parent_object": "brain_metastasis_presence",
+        "rationale": "Distinguishes whether brain lesions show enhancement.",
+        "source_candidate_ids": [
+          "C131",
+          "C222"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Perilesional edema presence",
+          "Presence of peritumoral edema",
+          "Presence of surrounding edema"
+        ],
+        "canonical_name": "brain_perilesional_edema",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of edema surrounding brain lesions.",
+        "display_name": "Perilesional edema",
+        "local_id": "F07",
+        "parent_object": "brain_metastasis_presence",
+        "rationale": "Identifies edema associated with brain lesions.",
+        "source_candidate_ids": [
+          "C211",
+          "C230",
+          "C234"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Liver metastasis",
+          "Presence of hepatic metastasis"
+        ],
+        "canonical_name": "liver_metastasis",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of metastatic involvement in the liver.",
+        "display_name": "Liver metastasis",
+        "local_id": "F08",
+        "parent_object": null,
+        "rationale": "Identifies liver involvement.",
+        "source_candidate_ids": [
+          "C145",
+          "C224"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Largest hepatic lesion diameter"
+        ],
+        "canonical_name": "hepatic_lesion_diameter",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "Diameter of hepatic lesions.",
+        "display_name": "Hepatic lesion diameter",
+        "local_id": "F09",
+        "parent_object": "liver_metastasis",
+        "rationale": "Measures the size of liver lesions.",
+        "source_candidate_ids": [
+          "C136"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "hepatic_lesion_location",
+        "categories": [
+          "segment VII",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "Anatomical segment location of hepatic lesions.",
+        "display_name": "Hepatic lesion location",
+        "local_id": "F10",
+        "parent_object": "liver_metastasis",
+        "rationale": "Specifies the segment of the liver involved.",
+        "source_candidate_ids": [
+          "C111"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Lymph node metastasis",
+          "Lymph node involvement",
+          "Nodal involvement status",
+          "Nodal Metastasis Status",
+          "Lymphadenopathy presence"
+        ],
+        "canonical_name": "lymph_node_metastasis",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of metastatic involvement in lymph nodes.",
+        "display_name": "Lymph node metastasis",
+        "local_id": "F11",
+        "parent_object": null,
+        "rationale": "Consolidates lymph node involvement features.",
+        "source_candidate_ids": [
+          "C151",
+          "C153",
+          "C186",
+          "C187"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Mediastinal/Hilar Lymph Node Involvement",
+          "Mediastinal/Hilar lymphadenopathy",
+          "Mediastinal or Hilar Lymphadenopathy",
+          "Mediastinal or hilar lymphadenopathy status"
+        ],
+        "canonical_name": "mediastinal_hilar_lymphadenopathy",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of lymphadenopathy in the mediastinal or hilar regions.",
+        "display_name": "Mediastinal/Hilar lymphadenopathy",
+        "local_id": "F12",
+        "parent_object": null,
+        "rationale": "Specific to mediastinal and hilar lymph node status.",
+        "source_candidate_ids": [
+          "C159",
+          "C160",
+          "C161",
+          "C162"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "lymph_node_short_axis_diameter",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "Short axis diameter of lymph nodes.",
+        "display_name": "Lymph node short axis diameter",
+        "local_id": "F13",
+        "parent_object": "lymph_node_metastasis",
+        "rationale": "Quantitative measurement of lymph node size.",
+        "source_candidate_ids": [
+          "C152"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Nodule morphology",
+          "Nodule enhancement status",
+          "Nodule enhancement pattern"
+        ],
+        "canonical_name": "lung_nodule_characteristics",
+        "categories": [
+          "solid",
+          "well-circumscribed",
+          "enhancing",
+          "non-enhancing",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "Morphological and enhancement characteristics of pulmonary nodules.",
+        "display_name": "Lung nodule characteristics",
+        "local_id": "F14",
+        "parent_object": null,
+        "rationale": "Combines morphology and enhancement of lung nodules.",
+        "source_candidate_ids": [
+          "C189",
+          "C191"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "New pulmonary nodule diameter",
+          "Lesion diameter"
+        ],
+        "canonical_name": "lung_nodule_diameter",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "Diameter of pulmonary nodules.",
+        "display_name": "Lung nodule diameter",
+        "local_id": "F15",
+        "parent_object": null,
+        "rationale": "Measures the size of lung nodules.",
+        "source_candidate_ids": [
+          "C140",
+          "C185"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Nodule location",
+          "Tumor location"
+        ],
+        "canonical_name": "lung_nodule_location",
+        "categories": [
+          "lower lobe",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "Anatomical location of lung nodules.",
+        "display_name": "Lung nodule location",
+        "local_id": "F16",
+        "parent_object": null,
+        "rationale": "Identifies the lobe or location of lung nodules.",
+        "source_candidate_ids": [
+          "C011",
+          "C190",
+          "C281"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "FDG-avidity",
+          "FDG avidity status",
+          "Presence of FDG-avid lesions"
+        ],
+        "canonical_name": "fdg_avidity",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Status of FDG uptake in lesions.",
+        "display_name": "FDG avidity",
+        "local_id": "F17",
+        "parent_object": null,
+        "rationale": "Indicates if lesions are FDG-avid.",
+        "source_candidate_ids": [
+          "C091",
+          "C092",
+          "C223"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "suvmax",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "Maximum Standardized Uptake Value (SUVmax).",
+        "display_name": "SUVmax",
+        "local_id": "F18",
+        "parent_object": "fdg_avidity",
+        "rationale": "Quantitative measurement of FDG uptake intensity.",
+        "source_candidate_ids": [
+          "C156",
+          "C265"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Imaging modality used",
+          "CT imaging type",
+          "Contrast-enhanced MRI status",
+          "Diffusion-Weighted Imaging (DWI) availability",
+          "Presence of MRI sequences (T1, T2, FLAIR, DWI)"
+        ],
+        "canonical_name": "imaging_modality",
+        "categories": [
+          "CT",
+          "MRI",
+          "PET/CT",
+          "SWI",
+          "DWI",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "The type of imaging modality used (e.g., CT, MRI, PET/CT).",
+        "display_name": "Imaging modality",
+        "local_id": "F19",
+        "parent_object": null,
+        "rationale": "Captures the imaging technique used for the study.",
+        "source_candidate_ids": [
+          "C055",
+          "C062",
+          "C068",
+          "C128",
+          "C228"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Calcification presence",
+          "Nodule calcification"
+        ],
+        "canonical_name": "lesion_calcification",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of calcification within a lesion.",
+        "display_name": "Lesion calcification",
+        "local_id": "F20",
+        "parent_object": null,
+        "rationale": "Identifies calcified lesions.",
+        "source_candidate_ids": [
+          "C036",
+          "C188"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Presence of splenic lesion"
+        ],
+        "canonical_name": "splenic_metastasis",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of metastatic involvement in the spleen.",
+        "display_name": "Splenic metastasis",
+        "local_id": "F21",
+        "parent_object": null,
+        "rationale": "Identifies splenic involvement.",
+        "source_candidate_ids": [
+          "C233",
+          "C261"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Presence of mediastinal thickening or effusion"
+        ],
+        "canonical_name": "pleural_effusion",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of pleural effusion or thickening.",
+        "display_name": "Pleural effusion",
+        "local_id": "F22",
+        "parent_object": null,
+        "rationale": "Identifies pleural involvement.",
+        "source_candidate_ids": [
+          "C214",
+          "C227"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "osteoblastic_lesion",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of osteoblastic activity or lesions in bone.",
+        "display_name": "Osteoblastic bone lesion",
+        "local_id": "F23",
+        "parent_object": null,
+        "rationale": "Identifies bone involvement.",
+        "source_candidate_ids": [
+          "C200"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "mass_effect",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of mass effect caused by a lesion.",
+        "display_name": "Mass effect",
+        "local_id": "F24",
+        "parent_object": null,
+        "rationale": "Identifies if a lesion is causing mass effect.",
+        "source_candidate_ids": [
+          "C226"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "Tumor size"
+        ],
+        "canonical_name": "tumor_diameter",
+        "categories": null,
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "The diameter of the primary tumor.",
+        "display_name": "Tumor diameter",
+        "local_id": "F25",
+        "parent_object": null,
+        "rationale": "Measures the size of the primary tumor.",
+        "source_candidate_ids": [
+          "C280",
+          "C282"
+        ]
+      }
+    ]
+  },
+  "raw_content": "{\n  \"canonical_features\": [\n    {\n      \"local_id\": \"F01\",\n      \"canonical_name\": \"adrenal_gland_metastasis\",\n      \"display_name\": \"Adrenal gland metastasis\",\n      \"description\": \"Presence of metastatic involvement in the adrenal glands.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"Adrenal metastasis presence\",\n        \"Left adrenal metastasis\",\n        \"Right adrenal metastasis\",\n        \"Right adrenal metastasis\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C004\",\n        \"C005\",\n        \"C139\",\n        \"C247\"\n      ],\n      \"rationale\": \"Consolidates various mentions of adrenal gland involvement into a single binary feature.\"\n    },\n    {\n      \"local_id\": \"F02\",\n      \"canonical_name\": \"brain_metastasis_presence\",\n      \"display_name\": \"Brain metastasis presence\",\n      \"description\": \"Presence of intracranial metastatic disease.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"Brain metastases presence\",\n        \"Brain metastasis status\",\n        \"Brain metastasis presence\",\n        \"Intracranial metastasis\",\n        \"Intracranial metastasis presence\",\n        \"Presence of brain metastases\",\n        \"Presence of intracranial metastases\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C032\",\n        \"C034\",\n        \"C035\",\n        \"C129\",\n        \"C130\",\n        \"C220\",\n        \"C225\"\n      ],\n      \"rationale\": \"Merges all indicators of intracranial/brain metastatic status.\"\n    },\n    {\n      \"local_id\": \"F03\",\n      \"canonical_name\": \"brain_metastasis_location\",\n      \"display_name\": \"Brain metastasis location\",\n      \"description\": \"Anatomical site of brain metastases.\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"cerebellum\",\n        \"frontal lobe\",\n        \"occipital lobe\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"brain_metastasis_presence\",\n      \"aliases\": [\n        \"Anatomical location of brain metastases\",\n        \"Anatomical site of brain metastasis\",\n        \"Brain lesion location\",\n        \"Brain metastasis location\",\n        \"Laterality of brain metastasis\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C012\",\n        \"C013\",\n        \"C031\",\n        \"C033\",\n        \"C137\",\n        \"C170\",\n        \"C171\"\n      ],\n      \"rationale\": \"Captures the specific anatomical location of brain lesions.\"\n    },\n    {\n      \"local_id\": \"F04\",\n      \"canonical_name\": \"brain_lesion_diameter\",\n      \"display_name\": \"Brain lesion diameter\",\n      \"description\": \"The diameter of brain lesions.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": \"brain_metastasis_presence\",\n      \"aliases\": [\n        \"Brain lesion diameter\",\n        \"Largest brain lesion diameter\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C030\",\n        \"C135\"\n      ],\n      \"rationale\": \"Measures the size of brain lesions.\"\n    },\n    {\n      \"local_id\": \"F05\",\n      \"canonical_name\": \"brain_lesion_count\",\n      \"display_name\": \"Brain lesion count\",\n      \"description\": \"Number of enhancing brain lesions.\",\n      \"data_type\": \"count\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": \"brain_metastasis_presence\",\n      \"aliases\": [\n        \"Count of enhancing brain lesions\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C060\"\n      ],\n      \"rationale\": \"Quantifies the number of lesions found in the brain.\"\n    },\n    {\n      \"local_id\": \"F06\",\n      \"canonical_name\": \"brain_lesion_enhancement\",\n      \"display_name\": \"Brain lesion enhancement\",\n      \"description\": \"Presence of enhancement in brain lesions.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"brain_metastasis_presence\",\n      \"aliases\": [\n        \"Intracranial metastatic enhancement\",\n        \"Presence of enhancing brain lesions\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C131\",\n        \"C222\"\n      ],\n      \"rationale\": \"Distinguishes whether brain lesions show enhancement.\"\n    },\n    {\n      \"local_id\": \"F07\",\n      \"canonical_name\": \"brain_perilesional_edema\",\n      \"display_name\": \"Perilesional edema\",\n      \"description\": \"Presence of edema surrounding brain lesions.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"brain_metastasis_presence\",\n      \"aliases\": [\n        \"Perilesional edema presence\",\n        \"Presence of peritumoral edema\",\n        \"Presence of surrounding edema\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C211\",\n        \"C230\",\n        \"C234\"\n      ],\n      \"rationale\": \"Identifies edema associated with brain lesions.\"\n    },\n    {\n      \"local_id\": \"F08\",\n      \"canonical_name\": \"liver_metastasis\",\n      \"display_name\": \"Liver metastasis\",\n      \"description\": \"Presence of metastatic involvement in the liver.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"Liver metastasis\",\n        \"Presence of hepatic metastasis\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C145\",\n        \"C224\"\n      ],\n      \"rationale\": \"Identifies liver involvement.\"\n    },\n    {\n      \"local_id\": \"F09\",\n      \"canonical_name\": \"hepatic_lesion_diameter\",\n      \"display_name\": \"Hepatic lesion diameter\",\n      \"description\": \"Diameter of hepatic lesions.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": \"liver_metastasis\",\n      \"aliases\": [\n        \"Largest hepatic lesion diameter\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C136\"\n      ],\n      \"rationale\": \"Measures the size of liver lesions.\"\n    },\n    {\n      \"local_id\": \"F10\",\n      \"canonical_name\": \"hepatic_lesion_location\",\n      \"display_name\": \"Hepatic lesion location\",\n      \"description\": \"Anatomical segment location of hepatic lesions.\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"segment VII\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"liver_metastasis\",\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C111\"\n      ],\n      \"rationale\": \"Specifies the segment of the liver involved.\"\n    },\n    {\n      \"local_id\": \"F11\",\n      \"canonical_name\": \"lymph_node_metastasis\",\n      \"display_name\": \"Lymph node metastasis\",\n      \"description\": \"Presence of metastatic involvement in lymph nodes.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"Lymph node metastasis\",\n        \"Lymph node involvement\",\n        \"Nodal involvement status\",\n        \"Nodal Metastasis Status\",\n        \"Lymphadenopathy presence\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C151\",\n        \"C153\",\n        \"C186\",\n        \"C187\"\n      ],\n      \"rationale\": \"Consolidates lymph node involvement features.\"\n    },\n    {\n      \"local_id\": \"F12\",\n      \"canonical_name\": \"mediastinal_hilar_lymphadenopathy\",\n      \"display_name\": \"Mediastinal/Hilar lymphadenopathy\",\n      \"description\": \"Presence of lymphadenopathy in the mediastinal or hilar regions.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"Mediastinal/Hilar Lymph Node Involvement\",\n        \"Mediastinal/Hilar lymphadenopathy\",\n        \"Mediastinal or Hilar Lymphadenopathy\",\n        \"Mediastinal or hilar lymphadenopathy status\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C159\",\n        \"C160\",\n        \"C161\",\n        \"C162\"\n      ],\n      \"rationale\": \"Specific to mediastinal and hilar lymph node status.\"\n    },\n    {\n      \"local_id\": \"F13\",\n      \"canonical_name\": \"lymph_node_short_axis_diameter\",\n      \"display_name\": \"Lymph node short axis diameter\",\n      \"description\": \"Short axis diameter of lymph nodes.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": \"lymph_node_metastasis\",\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C152\"\n      ],\n      \"rationale\": \"Quantitative measurement of lymph node size.\"\n    },\n    {\n      \"local_id\": \"F14\",\n      \"canonical_name\": \"lung_nodule_characteristics\",\n      \"display_name\": \"Lung nodule characteristics\",\n      \"description\": \"Morphological and enhancement characteristics of pulmonary nodules.\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"solid\",\n        \"well-circumscribed\",\n        \"enhancing\",\n        \"non-enhancing\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"Nodule morphology\",\n        \"Nodule enhancement status\",\n        \"Nodule enhancement pattern\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C189\",\n        \"C191\"\n      ],\n      \"rationale\": \"Combines morphology and enhancement of lung nodules.\"\n    },\n    {\n      \"local_id\": \"F15\",\n      \"canonical_name\": \"lung_nodule_diameter\",\n      \"display_name\": \"Lung nodule diameter\",\n      \"description\": \"Diameter of pulmonary nodules.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"New pulmonary nodule diameter\",\n        \"Lesion diameter\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C140\",\n        \"C185\"\n      ],\n      \"rationale\": \"Measures the size of lung nodules.\"\n    },\n    {\n      \"local_id\": \"F16\",\n      \"canonical_name\": \"lung_nodule_location\",\n      \"display_name\": \"Lung nodule location\",\n      \"description\": \"Anatomical location of lung nodules.\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"lower lobe\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"Nodule location\",\n        \"Tumor location\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C011\",\n        \"C190\",\n        \"C281\"\n      ],\n      \"rationale\": \"Identifies the lobe or location of lung nodules.\"\n    },\n    {\n      \"local_id\": \"F17\",\n      \"canonical_name\": \"fdg_avidity\",\n      \"display_name\": \"FDG avidity\",\n      \"description\": \"Status of FDG uptake in lesions.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"FDG-avidity\",\n        \"FDG avidity status\",\n        \"Presence of FDG-avid lesions\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C091\",\n        \"C092\",\n        \"C223\"\n      ],\n      \"rationale\": \"Indicates if lesions are FDG-avid.\"\n    },\n    {\n      \"local_id\": \"F18\",\n      \"canonical_name\": \"suvmax\",\n      \"display_name\": \"SUVmax\",\n      \"description\": \"Maximum Standardized Uptake Value (SUVmax).\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": \"fdg_avidity\",\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C156\",\n        \"C265\"\n      ],\n      \"rationale\": \"Quantitative measurement of FDG uptake intensity.\"\n    },\n    {\n      \"local_id\": \"F19\",\n      \"canonical_name\": \"imaging_modality\",\n      \"display_name\": \"Imaging modality\",\n      \"description\": \"The type of imaging modality used (e.g., CT, MRI, PET/CT).\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"CT\",\n        \"MRI\",\n        \"PET/CT\",\n        \"SWI\",\n        \"DWI\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"Imaging modality used\",\n        \"CT imaging type\",\n        \"Contrast-enhanced MRI status\",\n        \"Diffusion-Weighted Imaging (DWI) availability\",\n        \"Presence of MRI sequences (T1, T2, FLAIR, DWI)\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C055\",\n        \"C062\",\n        \"C068\",\n        \"C128\",\n        \"C228\"\n      ],\n      \"rationale\": \"Captures the imaging technique used for the study.\"\n    },\n    {\n      \"local_id\": \"F20\",\n      \"canonical_name\": \"lesion_calcification\",\n      \"display_name\": \"Lesion calcification\",\n      \"description\": \"Presence of calcification within a lesion.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"Calcification presence\",\n        \"Nodule calcification\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C036\",\n        \"C188\"\n      ],\n      \"rationale\": \"Identifies calcified lesions.\"\n    },\n    {\n      \"local_id\": \"F21\",\n      \"canonical_name\": \"splenic_metastasis\",\n      \"display_name\": \"Splenic metastasis\",\n      \"description\": \"Presence of metastatic involvement in the spleen.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"Presence of splenic lesion\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C233\",\n        \"C261\"\n      ],\n      \"rationale\": \"Identifies splenic involvement.\"\n    },\n    {\n      \"local_id\": \"F22\",\n      \"canonical_name\": \"pleural_effusion\",\n      \"display_name\": \"Pleural effusion\",\n      \"description\": \"Presence of pleural effusion or thickening.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"Presence of mediastinal thickening or effusion\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C214\",\n        \"C227\"\n      ],\n      \"rationale\": \"Identifies pleural involvement.\"\n    },\n    {\n      \"local_id\": \"F23\",\n      \"canonical_name\": \"osteoblastic_lesion\",\n      \"display_name\": \"Osteoblastic bone lesion\",\n      \"description\": \"Presence of osteoblastic activity or lesions in bone.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C200\"\n      ],\n      \"rationale\": \"Identifies bone involvement.\"\n    },\n    {\n      \"local_id\": \"F24\",\n      \"canonical_name\": \"mass_effect\",\n      \"display_name\": \"Mass effect\",\n      \"description\": \"Presence of mass effect caused by a lesion.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C226\"\n      ],\n      \"rationale\": \"Identifies if a lesion is causing mass effect.\"\n    },\n    {\n      \"local_id\": \"F25\",\n      \"canonical_name\": \"tumor_diameter\",\n      \"display_name\": \"Tumor diameter\",\n      \"description\": \"The diameter of the primary tumor.\",\n      \"data_type\": \"continuous\",\n      \"categories\": null,\n      \"action\": \"extract\",\n      \"parent_object\": null,\n      \"aliases\": [\n        \"Tumor size\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C280\",\n        \"C282\"\n      ],\n      \"rationale\": \"Measures the size of the primary tumor.\"\n    }\n  ],\n  \"candidate_mappings\": [\n    {\n      \"candidate_id\": \"C004\",\n      \"local_id\": \"F01\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for adrenal gland metastasis.\"\n    },\n    {\n      \"candidate_id\": \"C005\",\n      \"local_id\": \"F01\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for adrenal gland metastasis.\"\n    },\n    {\n      \"candidate_id\": \"C011\",\n      \"local_id\": \"F16\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Refers to lung/nodule location.\"\n    },\n    {\n      \"candidate_id\": \"C012\",\n      \"local_id\": \"F03\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for brain metastasis location.\"\n    },\n    {\n      \"candidate_id\": \"C013\",\n      \"local_id\": \"F03\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for brain metastasis location.\"\n    },\n    {\n      \"candidate_id\": \"C017\",\n      \"local_id\": \"F18\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"ADC is a measurement related to FDG/SUV context, but here treated as a separate continuous value if needed; however, SUVmax is the primary quantitative feature.\"\n    },\n    {\n      \"candidate_id\": \"C030\",\n      \"local_id\": \"F04\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for brain lesion diameter.\"\n    },\n    {\n      \"candidate_id\": \"C031\",\n      \"local_id\": \"F03\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for brain metastasis location.\"\n    },\n    {\n      \"candidate_id\": \"C032\",\n      \"local_id\": \"F02\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for brain metastasis presence.\"\n    },\n    {\n      \"candidate_id\": \"C033\",\n      \"local_id\": \"F03\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for brain metastasis location.\"\n    },\n    {\n      \"candidate_id\": \"C034\",\n      \"local_id\": \"F02\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for brain metastasis presence.\"\n    },\n    {\n      \"candidate_id\": \"C035\",\n      \"local_id\": \"F02\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for brain metastasis presence.\"\n    },\n    {\n      \"candidate_id\": \"C036\",\n      \"local_id\": \"F20\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for lesion calcification.\"\n    },\n    {\n      \"candidate_id\": \"C055\",\n      \"local_id\": \"F19\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Refers to MRI modality.\"\n    },\n    {\n      \"candidate_id\": \"C060\",\n      \"local_id\": \"F05\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for brain lesion count.\"\n    },\n    {\n      \"candidate_id\": \"C061\",\n      \"local_id\": \"F27\",\n      \"relation\": \"review\",\n      \"rationale\": \"Text-derived CT findings are too broad for a canonical feature.\"\n    },\n    {\n      \"candidate_id\": \"C062\",\n      \"local_id\": \"F19\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Refers to imaging modality.\"\n    },\n    {\n      \"candidate_id\": \"C068\",\n      \"local_id\": \"F19\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Refers to imaging modality (DWI).\"\n    },\n    {\n      \"candidate_id\": \"C088\",\n      \"local_id\": \"F28\",\n      \"relation\": \"review\",\n      \"rationale\": \"Extra-axial fluid collection is a specific finding that may require review.\"\n    },\n    {\n      \"candidate_id\": \"C091\",\n      \"local_id\": \"F17\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for FDG avidity.\"\n    },\n    {\n      \"candidate_id\": \"C092\",\n      \"local_id\": \"F17\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for FDG avidity.\"\n    },\n    {\n      \"candidate_id\": \"C111\",\n      \"local_id\": \"F10\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Hepatic segment location.\"\n    },\n    {\n      \"candidate_id\": \"C128\",\n      \"local_id\": \"F19\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Refers to imaging modality (SWI).\"\n    },\n    {\n      \"candidate_id\": \"C129\",\n      \"local_id\": \"F02\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for brain metastasis presence.\"\n    },\n    {\n      \"candidate_id\": \"C130\",\n      \"local_id\": \"F02\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for brain metastasis presence.\"\n    },\n    {\n      \"candidate_id\": \"C131\",\n      \"local_id\": \"F06\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for brain lesion enhancement.\"\n    },\n    {\n      \"candidate_id\": \"C135\",\n      \"local_id\": \"F04\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for brain lesion diameter.\"\n    },\n    {\n      \"candidate_id\": \"C136\",\n      \"local_id\": \"F09\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for hepatic lesion diameter.\"\n    },\n    {\n      \"candidate_id\": \"C137\",\n      \"local_id\": \"F03\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for brain metastasis location.\"\n    },\n    {\n      \"candidate_id\": \"C139\",\n      \"local_id\": \"F01\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for adrenal gland metastasis.\"\n    },\n    {\n      \"candidate_id\": \"C140\",\n      \"local_id\": \"F15\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for lung nodule diameter.\"\n    },\n    {\n      \"candidate_id\": \"C141\",\n      \"local_id\": \"F14\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for lesion enhancement pattern.\"\n    },\n    {\n      \"candidate_id\": \"C142\",\n      \"local_id\": \"F14\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for lesion enhancement status.\"\n    },\n    {\n      \"candidate_id\": \"C145\",\n      \"local_id\": \"F08\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for liver metastasis.\"\n    },\n    {\n      \"candidate_id\": \"C151\",\n      \"local_id\": \"F11\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for lymph node metastasis.\"\n    },\n    {\n      \"candidate_id\": \"C152\",\n      \"local_id\": \"F13\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for lymph node short axis diameter.\"\n    },\n    {\n      \"candidate_id\": \"C153\",\n      \"local_id\": \"F11\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for lymph node metastasis.\"\n    },\n    {\n      \"candidate_id\": \"C156\",\n      \"local_id\": \"F18\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for SUVmax.\"\n    },\n    {\n      \"candidate_id\": \"C159\",\n      \"local_id\": \"F12\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for mediastinal/hilar lymphadenopathy.\"\n    },\n    {\n      \"candidate_id\": \"C160\",\n      \"local_id\": \"F12\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for mediastinal/hilar lymphadenopathy.\"\n    },\n    {\n      \"candidate_id\": \"C161\",\n      \"local_id\": \"F12\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for mediastinal/hilar lymphadenopathy.\"\n    },\n    {\n      \"candidate_id\": \"C162\",\n      \"local_id\": \"F12\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for mediastinal/hilar lymphadenopathy.\"\n    },\n    {\n      \"candidate_id\": \"C170\",\n      \"local_id\": \"F03\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for brain metastasis location.\"\n    },\n    {\n      \"candidate_id\": \"C171\",\n      \"local_id\": \"F03\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for brain metastasis location.\"\n    },\n    {\n      \"candidate_id\": \"C185\",\n      \"local_id\": \"F15\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for lung nodule diameter.\"\n    },\n    {\n      \"candidate_id\": \"C186\",\n      \"local_id\": \"F11\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for lymph node metastasis.\"\n    },\n    {\n      \"candidate_id\": \"C187\",\n      \"local_id\": \"F11\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for lymph node metastasis.\"\n    },\n    {\n      \"candidate_id\": \"C188\",\n      \"local_id\": \"F20\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for lesion calcification.\"\n    },\n    {\n      \"candidate_id\": \"C189\",\n      \"local_id\": \"F14\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for lung nodule enhancement.\"\n    },\n    {\n      \"candidate_id\": \"C190\",\n      \"local_id\": \"F16\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for lung nodule location.\"\n    },\n    {\n      \"candidate_id\": \"C191\",\n      \"local_id\": \"F14\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for lung nodule morphology.\"\n    },\n    {\n      \"candidate_id\": \"C200\",\n      \"local_id\": \"F23\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for osteoblastic bone lesion.\"\n    },\n    {\n      \"candidate_id\": \"C211\",\n      \"local_id\": \"F07\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for perilesional edema.\"\n    },\n    {\n      \"candidate_id\": \"C214\",\n      \"local_id\": \"F22\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for pleural effusion.\"\n    },\n    {\n      \"candidate_id\": \"C220\",\n      \"local_id\": \"F02\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for brain metastasis presence.\"\n    },\n    {\n      \"candidate_id\": \"C222\",\n      \"local_id\": \"F06\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for brain lesion enhancement.\"\n    },\n    {\n      \"candidate_id\": \"C223\",\n      \"local_id\": \"F17\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for FDG avidity.\"\n    },\n    {\n      \"candidate_id\": \"C224\",\n      \"local_id\": \"F08\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for liver metastasis.\"\n    },\n    {\n      \"candidate_id\": \"C225\",\n      \"local_id\": \"F02\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for brain metastasis presence.\"\n    },\n    {\n      \"candidate_id\": \"C226\",\n      \"local_id\": \"F24\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for mass effect.\"\n    },\n    {\n      \"candidate_id\": \"C227\",\n      \"local_id\": \"F22\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for pleural effusion.\"\n    },\n    {\n      \"candidate_id\": \"C228\",\n      \"local_id\": \"F19\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for imaging modality.\"\n    },\n    {\n      \"candidate_id\": \"C229\",\n      \"local_id\": \"F14\",\n      \"relation\": \"related_but_distinct\",\n      \"rationale\": \"Refers to presence of a specific type of nodule, which is a subset of nodule characteristics.\"\n    },\n    {\n      \"candidate_id\": \"C230\",\n      \"local_id\": \"F07\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for perilesional edema.\"\n    },\n    {\n      \"candidate_id\": \"C233\",\n      \"local_id\": \"F21\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for splenic metastasis.\"\n    },\n    {\n      \"candidate_id\": \"C234\",\n      \"local_id\": \"F07\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for perilesional edema.\"\n    },\n    {\n      \"candidate_id\": \"C244\",\n      \"local_id\": \"F29\",\n      \"relation\": \"review\",\n      \"rationale\": \"Recent imaging availability is a temporal metadata field, not a clinical feature of the disease itself.\"\n    },\n    {\n      \"candidate_id\": \"C247\",\n      \"local_id\": \"F01\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for adrenal gland metastasis.\"\n    },\n    {\n      \"candidate_id\": \"C261\",\n      \"local_id\": \"F21\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for splenic metastasis.\"\n    },\n    {\n      \"candidate_id\": \"C264\",\n      \"local_id\": \"F30\",\n      \"relation\": \"review\",\n      \"rationale\": \"Surveillance imaging occurrence is a procedural/study design feature.\"\n    },\n    {\n      \"candidate_id\": \"C265\",\n      \"local_id\": \"F18\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for SUVmax.\"\n    },\n    {\n      \"candidate_id\": \"C270\",\n      \"local_id\": \"F31\",\n      \"relation\": \"review\",\n      \"rationale\": \"Thoracic PET/CT findings is a text-based summary field.\"\n    },\n    {\n      \"candidate_id\": \"C280\",\n      \"local_id\": \"F25\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for tumor diameter.\"\n    },\n    {\n      \"candidate_id\": \"C281\",\n      \"local_id\": \"F16\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for lung nodule location.\"\n    },\n    {\n      \"candidate_id\": \"C282\",\n      \"local_id\": \"F25\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for tumor diameter.\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-a4f3b0b9e5dea838",
+  "status": "complete",
+  "system_prompt": "You design conservative canonical clinical feature registries. The goal is to reduce redundant extraction while preserving clinically distinct variables. Use only supplied evidence. Return valid JSON only.",
+  "usage": {
+    "completion_tokens": 9068,
+    "prompt_tokens": 9699,
+    "prompt_tokens_details": null,
+    "total_tokens": 18767
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nDomain: imaging_disease_sites\n\nHarmonize the following candidate feature names. Apply these distinctions carefully:\n\n- Merge true aliases that ask for the same patient-level variable.\n- Represent categories or values of one variable under one canonical feature when appropriate.\n- Mark a feature `derive` only when it can be calculated from other canonical base variables without reading the clinical text again.\n- Keep clinically related but non-equivalent measurements or findings separate.\n- Use `subfield_of` to connect distinct fields that belong to one reusable clinical object.\n- Drop only clear artifacts or redundant aliases. Use `review` when a safe extraction contract cannot be specified.\n- Preserve provenance: every candidate ID must map exactly once.\n- Do not assign a role in the clinical task.\n\nAllowed data types: [\"binary\", \"categorical\", \"continuous\", \"count\", \"ordinal\", \"text\"]\nAllowed actions: [\"derive\", \"drop\", \"extract\", \"review\"]\nAllowed mapping relations: [\"alias_of\", \"base_variable\", \"derived_from\", \"drop\", \"related_but_distinct\", \"review\", \"subfield_of\"]\n\nFor binary features, categories must be [\"absent\", \"present\", \"unknown\"]. For categorical or ordinal features, provide a conservative explicit category list including \"unknown\". Continuous and count features have no categories. Text features should normally be marked `review`, not `extract`.\n\nFor derivations, use this schema when executable; otherwise use operation `not_automated`:\n{\"operation\": \"ratio | threshold | category_map | not_automated\", \"inputs\": [\"canonical_name\"], \"parameters\": {}}\n\nCandidates:\n[{\"candidate_id\": \"C004\", \"name\": \"Adrenal gland metastasis\", \"occurrence_count\": 1, \"topic_ranks\": [31], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Adrenal gland involvement\"], \"evidence_terms\": [\"adrenal glands and\", \"spleen adrenal\", \"spleen adrenal glands\", \"liver adrenal\", \"liver adrenal glands\", \"liver spleen adrenal\"], \"feature_type_hints\": [\"anatomical_location\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C005\", \"name\": \"Adrenal metastasis presence\", \"occurrence_count\": 1, \"topic_ranks\": [69], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Left adrenal metastasis\", \"Right adrenal metastasis\"], \"evidence_terms\": [\"right adrenal\", \"- right adrenal\", \"right adrenal gland\", \"right adrenal lesion\", \"the right adrenal\", \"right adrenal metastasis\", \"adrenal metastasis.\", \"cm right adrenal\", \"left adrenal metastasis.\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"right\", \"left\"]}, {\"candidate_id\": \"C011\", \"name\": \"Anatomical location\", \"occurrence_count\": 1, \"topic_ranks\": [7], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Lesion location\"], \"evidence_terms\": [\"lower lobe\", \"lower\"], \"feature_type_hints\": [\"anatomical_location\"], \"represented_values_or_categories\": [\"lower lobe\"]}, {\"candidate_id\": \"C012\", \"name\": \"Anatomical location of brain metastases\", \"occurrence_count\": 2, \"topic_ranks\": [27, 74], \"representation_votes\": {\"categorical\": 2}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Cerebellar involvement\", \"Frontal lobe involvement\"], \"evidence_terms\": [\"frontal\", \"frontal lobe\", \"cerebellar\"], \"feature_type_hints\": [\"location\"], \"represented_values_or_categories\": [\"frontal lobe\", \"cerebellum\"]}, {\"candidate_id\": \"C013\", \"name\": \"Anatomical site of brain metastasis\", \"occurrence_count\": 1, \"topic_ranks\": [85], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Cerebellar metastasis\", \"Frontal lobe metastasis\"], \"evidence_terms\": [\"right cerebellar\", \"cerebellar\", \"hemisphere\", \"right cerebellar hemisphere\", \"cerebellar hemisphere\", \"cm right cerebellar\", \"frontal\", \"enhancing lesions left\", \"frontal lobe\", \"- left frontal\"], \"feature_type_hints\": [\"anatomical_location\"], \"represented_values_or_categories\": [\"right cerebellar hemisphere\", \"left frontal lobe\"]}, {\"candidate_id\": \"C017\", \"name\": \"Apparent Diffusion Coefficient (ADC) value\", \"occurrence_count\": 1, \"topic_ranks\": [43], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Apparent Diffusion Coefficient (ADC)\"], \"evidence_terms\": [\"diffusion coefficient\", \"apparent diffusion coefficient\", \"apparent diffusion\", \"diffusion coefficient adc\", \"coefficient adc\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C030\", \"name\": \"Brain lesion diameter\", \"occurrence_count\": 1, \"topic_ranks\": [14], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Lesion size (cerebellar hemisphere)\", \"Lesion size (frontal)\"], \"evidence_terms\": [\"frontal 1.2 cm\", \"frontal 1.2\", \"hemisphere 0.9 cm\", \"hemisphere 0.9\", \"cerebellar hemisphere 0.9\", \"0.9 cm\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"1.2 cm\", \"0.9 cm\"]}, {\"candidate_id\": \"C031\", \"name\": \"Brain lesion location\", \"occurrence_count\": 2, \"topic_ranks\": [14, 100], \"representation_votes\": {\"categorical\": 2}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Anatomical Location: Frontal Lobe\", \"Enhancing lesion location\"], \"evidence_terms\": [\"enhancing lesions left\", \"frontal\", \"frontal lobe\"], \"feature_type_hints\": [\"location\"], \"represented_values_or_categories\": [\"left\", \"frontal lobe\"]}, {\"candidate_id\": \"C032\", \"name\": \"Brain metastases presence\", \"occurrence_count\": 1, \"topic_ranks\": [39], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Brain metastases\"], \"evidence_terms\": [\"secondary to brain metastases\", \"to brain metastases\", \"intracranial disease\"], \"feature_type_hints\": [\"condition\"], \"represented_values_or_categories\": [\"intracranial disease\"]}, {\"candidate_id\": \"C033\", \"name\": \"Brain metastasis location\", \"occurrence_count\": 3, \"topic_ranks\": [4, 53, 55], \"representation_votes\": {\"categorical\": 3}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Anatomical location of brain lesion\", \"Lesion location: cerebellar hemisphere\", \"Lesion location: Cerebellum\", \"Lesion location: Occipital lobe\"], \"evidence_terms\": [\"hemisphere 0.9\", \"cerebellar hemisphere 0.9\", \"hemisphere 0.9 cm\", \"frontal\", \"frontal lobe\", \"left occipital\", \"occipital\", \"occipital lobe\", \"right cerebellar\", \"cerebellar\", \"right cerebellar hemisphere\", \"hemisphere\", \"cerebellar hemisphere\"], \"feature_type_hints\": [\"categorical\", \"location\", \"anatomical_location\"], \"represented_values_or_categories\": [\"cerebellar hemisphere\", \"frontal lobe\", \"left occipital\", \"right cerebellar hemisphere\"]}, {\"candidate_id\": \"C034\", \"name\": \"Brain metastasis presence\", \"occurrence_count\": 2, \"topic_ranks\": [11, 77], \"representation_votes\": {\"binary\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Brain metastases\", \"Brain metastasis status\"], \"evidence_terms\": [\"no brain\", \"brain metastases.\"], \"feature_type_hints\": [\"clinical_finding\", \"comorbidity\"], \"represented_values_or_categories\": [\"no brain metastasis\", \"present\"]}, {\"candidate_id\": \"C035\", \"name\": \"Brain metastasis status by MRI\", \"occurrence_count\": 1, \"topic_ranks\": [18], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Brain MRI finding\"], \"evidence_terms\": [\"mri was negative\", \"brain mri was\", \"brain mri no\", \"negative for intracranial\", \"mri no intracranial\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"negative\"]}, {\"candidate_id\": \"C036\", \"name\": \"Calcification presence\", \"occurrence_count\": 1, \"topic_ranks\": [76], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Calcification\"], \"evidence_terms\": [\"calcification.\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"present\"]}, {\"candidate_id\": \"C055\", \"name\": \"Contrast-enhanced MRI status\", \"occurrence_count\": 1, \"topic_ranks\": [89], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Post-contrast T1-weighted imaging\"], \"evidence_terms\": [\"post-contrast t1-weighted\", \"post-contrast t1-weighted images\"], \"feature_type_hints\": [\"imaging_modality\"], \"represented_values_or_categories\": [\"post-contrast\"]}, {\"candidate_id\": \"C060\", \"name\": \"Count of enhancing brain lesions\", \"occurrence_count\": 1, \"topic_ranks\": [53], \"representation_votes\": {\"count\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Number of enhancing lesions\"], \"evidence_terms\": [\"three enhancing\", \"three enhancing lesions\"], \"feature_type_hints\": [\"count\"], \"represented_values_or_categories\": [\"3\"]}, {\"candidate_id\": \"C061\", \"name\": \"CT imaging findings\", \"occurrence_count\": 1, \"topic_ranks\": [37], \"representation_votes\": {\"text-derived\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Imaging findings\"], \"evidence_terms\": [\"ct identified a\"], \"feature_type_hints\": [\"text-derived\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C062\", \"name\": \"CT imaging type\", \"occurrence_count\": 1, \"topic_ranks\": [19], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"PET/CT imaging modality\"], \"evidence_terms\": [\"pet ct\", \"pet\", \"low-dose ct obtained\"], \"feature_type_hints\": [\"procedure\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C068\", \"name\": \"Diffusion-Weighted Imaging (DWI) availability\", \"occurrence_count\": 1, \"topic_ranks\": [43], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Diffusion-Weighted Imaging (DWI)\"], \"evidence_terms\": [\"dwi with apparent\", \"dwi with\", \"diffusion-weighted imaging\", \"imaging dwi with\", \"imaging dwi\"], \"feature_type_hints\": [\"imaging_modality\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C088\", \"name\": \"Extra-axial fluid collection status\", \"occurrence_count\": 1, \"topic_ranks\": [97], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Extra-axial fluid collection\"], \"evidence_terms\": [\"extra-axial fluid\", \"no extra-axial fluid\", \"extra-axial fluid collections\", \"fluid collections\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"present\", \"absent\"]}, {\"candidate_id\": \"C092\", \"name\": \"FDG-avidity\", \"occurrence_count\": 1, \"topic_ranks\": [19], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"FDG uptake\"], \"evidence_terms\": [\"fdg\", \"fdg uptake\", \"fdg-avid\", \"uptake\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C091\", \"name\": \"FDG avidity status\", \"occurrence_count\": 2, \"topic_ranks\": [12, 93], \"representation_votes\": {\"binary\": 1, \"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"FDG uptake\", \"FDG uptake intensity\"], \"evidence_terms\": [\"fdg\", \"fdg uptake\", \"fdg-avid\", \"uptake\", \"uptake. -\", \"FDG uptake.\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"fdg-avid\"]}, {\"candidate_id\": \"C111\", \"name\": \"Hepatic lesion location\", \"occurrence_count\": 1, \"topic_ranks\": [51], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Hepatic segment location\"], \"evidence_terms\": [\"segment vii\", \"vii\", \"in segment vii\", \"segment\", \"hepatic segment\", \"in hepatic segment\"], \"feature_type_hints\": [\"location\"], \"represented_values_or_categories\": [\"segment VII\"]}, {\"candidate_id\": \"C128\", \"name\": \"Imaging modality used\", \"occurrence_count\": 1, \"topic_ranks\": [14], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Imaging modality (SWI)\"], \"evidence_terms\": [\"swi\", \"susceptibility-weighted imaging\", \"on swi.\", \"swi.\", \"imaging swi\", \"susceptibility-weighted imaging swi\", \"susceptibility-weighted\"], \"feature_type_hints\": [\"modality\"], \"represented_values_or_categories\": [\"susceptibility-weighted imaging\"]}, {\"candidate_id\": \"C129\", \"name\": \"Intracranial metastasis\", \"occurrence_count\": 1, \"topic_ranks\": [49], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Intracranial involvement\"], \"evidence_terms\": [\"evidence of intracranial\", \"or focal deficits.\", \"of intracranial\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C130\", \"name\": \"Intracranial metastasis presence\", \"occurrence_count\": 1, \"topic_ranks\": [9], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Intracranial involvement\"], \"evidence_terms\": [\"evidence of intracranial\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C131\", \"name\": \"Intracranial metastatic enhancement\", \"occurrence_count\": 1, \"topic_ranks\": [75], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Intracranial enhancement status\"], \"evidence_terms\": [\"no enhancing intracranial\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"no enhancing\"]}, {\"candidate_id\": \"C135\", \"name\": \"Largest brain lesion diameter\", \"occurrence_count\": 1, \"topic_ranks\": [55], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Lesion size\"], \"evidence_terms\": [\"0.7 cm\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"0.7 cm\"]}, {\"candidate_id\": \"C136\", \"name\": \"Largest hepatic lesion diameter\", \"occurrence_count\": 1, \"topic_ranks\": [51], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Hepatic lesion size\"], \"evidence_terms\": [\"1.2 cm hypodense\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"1.2 cm\"]}, {\"candidate_id\": \"C137\", \"name\": \"Laterality of brain metastasis\", \"occurrence_count\": 1, \"topic_ranks\": [85], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Cerebellar metastasis\", \"Frontal lobe metastasis\"], \"evidence_terms\": [\"right cerebellar\", \"cerebellar\", \"hemisphere\", \"right cerebellar hemisphere\", \"cerebellar hemisphere\", \"cm right cerebellar\", \"frontal\", \"enhancing lesions left\", \"frontal lobe\", \"- left frontal\"], \"feature_type_hints\": [\"anatomical_location\"], \"represented_values_or_categories\": [\"right cerebellar hemisphere\", \"left frontal lobe\"]}, {\"candidate_id\": \"C139\", \"name\": \"Left adrenal metastasis\", \"occurrence_count\": 1, \"topic_ranks\": [69], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Left adrenal metastasis\"], \"evidence_terms\": [\"left adrenal metastasis.\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"left\"]}, {\"candidate_id\": \"C140\", \"name\": \"Lesion diameter\", \"occurrence_count\": 1, \"topic_ranks\": [4], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Lesion size\"], \"evidence_terms\": [\"0.9 cm\", \"0.9 cm .\", \"0.9\", \"0.9 cm and\", \"lesions 1.2\", \"lesions 1.2 cm\", \"cm 0.9\", \"cm 0.9 cm\", \"and 0.9\", \"0.7 cm\", \"0.9 cm 0.8\"], \"feature_type_hints\": [\"continuous\"], \"represented_values_or_categories\": [\"0.7 cm\", \"0.8 cm\", \"0.9 cm\", \"1.2 cm\"]}, {\"candidate_id\": \"C141\", \"name\": \"Lesion enhancement pattern\", \"occurrence_count\": 1, \"topic_ranks\": [2], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Tumor enhancement pattern\"], \"evidence_terms\": [\"demonstrates heterogeneous enhancement\"], \"feature_type_hints\": [\"imaging_finding\"], \"represented_values_or_categories\": [\"heterogeneous enhancement\"]}, {\"candidate_id\": \"C142\", \"name\": \"Lesion enhancement status\", \"occurrence_count\": 1, \"topic_ranks\": [4], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Lesion enhancement pattern\"], \"evidence_terms\": [\"two enhancing\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"enhancing\"]}, {\"candidate_id\": \"C145\", \"name\": \"Liver metastasis\", \"occurrence_count\": 1, \"topic_ranks\": [31], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Liver involvement\"], \"evidence_terms\": [\"liver adrenal\", \"liver adrenal glands\", \"liver spleen adrenal\"], \"feature_type_hints\": [\"anatomical_location\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C151\", \"name\": \"Lymph node metastasis\", \"occurrence_count\": 1, \"topic_ranks\": [31], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Lymph node involvement\"], \"evidence_terms\": [\"node\", \"lymph node\"], \"feature_type_hints\": [\"anatomical_location\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C152\", \"name\": \"Lymph node short axis diameter\", \"occurrence_count\": 1, \"topic_ranks\": [22], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Lymph node short axis diameter\"], \"evidence_terms\": [\"short axis <=\", \"axis <=\", \"lymph nodes short\", \"nodes short axis\", \"nodes short\", \"mm .\", \"8 mm .\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"<= 8 mm\"]}, {\"candidate_id\": \"C153\", \"name\": \"Lymphadenopathy presence\", \"occurrence_count\": 1, \"topic_ranks\": [76], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Lymphadenopathy status\"], \"evidence_terms\": [\"no lymphadenopathy. -\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"no lymphadenopathy\"]}, {\"candidate_id\": \"C156\", \"name\": \"Maximum SUV (SUVmax)\", \"occurrence_count\": 1, \"topic_ranks\": [12], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"SUVmax\"], \"evidence_terms\": [\"suvmax\", \"suvmax =\"], \"feature_type_hints\": [\"continuous\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C161\", \"name\": \"Mediastinal/Hilar Lymph Node Involvement\", \"occurrence_count\": 1, \"topic_ranks\": [83], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Mediastinal or Hilar Involvement\"], \"evidence_terms\": [\"or hilar\", \"mediastinal or hilar\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C162\", \"name\": \"Mediastinal/Hilar lymphadenopathy\", \"occurrence_count\": 2, \"topic_ranks\": [24, 31], \"representation_votes\": {\"binary\": 2}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Mediastinal or hilar lymphadenopathy/mass\"], \"evidence_terms\": [\"mediastinal or hilar\", \"or hilar\", \"mediastinal or\"], \"feature_type_hints\": [\"anatomical_location\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C159\", \"name\": \"Mediastinal or Hilar Lymphadenopathy\", \"occurrence_count\": 1, \"topic_ranks\": [82], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Lymph node location\"], \"evidence_terms\": [\"node\", \"mediastinal or hilar\", \"or hilar\"], \"feature_type_hints\": [\"anatomical_location\"], \"represented_values_or_categories\": [\"mediastinal\", \"hilar\"]}, {\"candidate_id\": \"C160\", \"name\": \"Mediastinal or hilar lymphadenopathy status\", \"occurrence_count\": 1, \"topic_ranks\": [22], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Mediastinal or hilar lymphadenopathy\"], \"evidence_terms\": [\"or hilar lymph\", \"enlarged mediastinal or\", \"mediastinal or hilar\", \"or hilar\", \"mediastinum hilum no\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"enlarged\", \"no\"]}, {\"candidate_id\": \"C170\", \"name\": \"Metastatic site: Cerebellum\", \"occurrence_count\": 1, \"topic_ranks\": [63], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Cerebellar metastasis\"], \"evidence_terms\": [\"cerebellar\", \"cerebellar hemisphere\", \"cm left cerebellar\"], \"feature_type_hints\": [\"anatomical_location\"], \"represented_values_or_categories\": [\"left cerebellar hemisphere\"]}, {\"candidate_id\": \"C171\", \"name\": \"Metastatic site: Frontal lobe\", \"occurrence_count\": 1, \"topic_ranks\": [63], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Frontal lobe metastasis\"], \"evidence_terms\": [\"right frontal\", \"right frontal lobe\", \"- right frontal\", \"frontal\", \"frontal lobe\", \"the right frontal\"], \"feature_type_hints\": [\"anatomical_location\"], \"represented_values_or_categories\": [\"right frontal lobe\"]}, {\"candidate_id\": \"C185\", \"name\": \"New pulmonary nodule diameter\", \"occurrence_count\": 1, \"topic_ranks\": [60], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"New pulmonary nodule size\"], \"evidence_terms\": [\"new 2.5 cm\", \"new 2.5\", \"2.5 cm\", \"2.5\", \"a new 2.5\", \"measuring 2.5 cm\", \"a 2.5\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"2.5 cm\"]}, {\"candidate_id\": \"C186\", \"name\": \"Nodal involvement status\", \"occurrence_count\": 1, \"topic_ranks\": [11], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Lymph node involvement\"], \"evidence_terms\": [\"node\", \"lymph node\"], \"feature_type_hints\": [\"anatomical_site\"], \"represented_values_or_categories\": [\"lymph node\"]}, {\"candidate_id\": \"C187\", \"name\": \"Nodal Metastasis Status\", \"occurrence_count\": 1, \"topic_ranks\": [16], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Nodal metastasis\"], \"evidence_terms\": [\"nodal metastasis.\", \"nodal metastasis. 3.\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C188\", \"name\": \"Nodule calcification\", \"occurrence_count\": 1, \"topic_ranks\": [70], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Nodule calcification status\"], \"evidence_terms\": [\"calcification.\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"calcification\"]}, {\"candidate_id\": \"C189\", \"name\": \"Nodule enhancement status\", \"occurrence_count\": 1, \"topic_ranks\": [60], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Nodule enhancement pattern\"], \"evidence_terms\": [\"- no enhancing\"], \"feature_type_hints\": [\"characteristic\"], \"represented_values_or_categories\": [\"no enhancing\"]}, {\"candidate_id\": \"C190\", \"name\": \"Nodule location\", \"occurrence_count\": 1, \"topic_ranks\": [70], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Nodule anatomical location\"], \"evidence_terms\": [\"lobe nodule\", \"lower lobe nodule\", \"lower lobe\"], \"feature_type_hints\": [\"location\"], \"represented_values_or_categories\": [\"lower lobe\"]}, {\"candidate_id\": \"C191\", \"name\": \"Nodule morphology\", \"occurrence_count\": 1, \"topic_ranks\": [70], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Lung nodule morphology\"], \"evidence_terms\": [\"lobe nodule\", \"lower lobe nodule\", \"solid nodule in\", \"nodule in\", \"lobe nodule and\", \"nodule in the\", \"cm solid nodule\", \"well-circumscribed\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"solid\", \"well-circumscribed\"]}, {\"candidate_id\": \"C200\", \"name\": \"Osteoblastic bone lesions\", \"occurrence_count\": 1, \"topic_ranks\": [49], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Osteoblastic activity\"], \"evidence_terms\": [\"osteoblastic\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C211\", \"name\": \"Perilesional edema presence\", \"occurrence_count\": 1, \"topic_ranks\": [53], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Perilesional edema\"], \"evidence_terms\": [\"perilesional edema\", \"perilesional edema.\", \"perilesional\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C214\", \"name\": \"Pleural effusion\", \"occurrence_count\": 1, \"topic_ranks\": [31], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Pleural effusion or thickening\"], \"evidence_terms\": [\"thickening or effusion.\", \"or effusion.\"], \"feature_type_hints\": [\"clinical_finding\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C220\", \"name\": \"Presence of brain metastases\", \"occurrence_count\": 6, \"topic_ranks\": [27, 53, 55, 63, 74, 85], \"representation_votes\": {\"binary\": 6}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Brain metastases\"], \"evidence_terms\": [\"with brain metastases\", \"brain metastases.\", \"brain metastases\", \"with brain metastases.\", \"known brain\", \"three enhancing lesions\", \"brain metastases treated\", \"- brain metastases\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"presence\", \"three enhancing lesions\", \"present\"]}, {\"candidate_id\": \"C222\", \"name\": \"Presence of enhancing brain lesions\", \"occurrence_count\": 1, \"topic_ranks\": [14], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Enhancing lesion location\"], \"evidence_terms\": [\"enhancing lesions left\"], \"feature_type_hints\": [\"location\"], \"represented_values_or_categories\": [\"left\"]}, {\"candidate_id\": \"C223\", \"name\": \"Presence of FDG-avid lesions\", \"occurrence_count\": 1, \"topic_ranks\": [75], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"FDG-avid lesions\"], \"evidence_terms\": [\"fdg-avid lesions in\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C224\", \"name\": \"Presence of hepatic metastasis\", \"occurrence_count\": 1, \"topic_ranks\": [51], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Hepatic metastasis\"], \"evidence_terms\": [\"hepatic metastasis.\", \"hepatic lesion in\", \"lesion in hepatic\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"metastasis\"]}, {\"candidate_id\": \"C225\", \"name\": \"Presence of intracranial metastases\", \"occurrence_count\": 1, \"topic_ranks\": [24], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Intracranial disease status\"], \"evidence_terms\": [\"intracranial disease\", \"no brain\", \"lesions are\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"presence of intracranial disease\", \"absence of brain lesions\"]}, {\"candidate_id\": \"C226\", \"name\": \"Presence of mass effect\", \"occurrence_count\": 1, \"topic_ranks\": [53], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Mass effect\"], \"evidence_terms\": [\"mass effect\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C227\", \"name\": \"Presence of mediastinal thickening or effusion\", \"occurrence_count\": 1, \"topic_ranks\": [22], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Mediastinal thickening or effusion\"], \"evidence_terms\": [\"thickening or effusion.\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"thickening\", \"effusion\"]}, {\"candidate_id\": \"C228\", \"name\": \"Presence of MRI sequences (T1, T2, FLAIR, DWI)\", \"occurrence_count\": 1, \"topic_ranks\": [89], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Diffusion-Weighted Imaging (DWI)\", \"FLAIR imaging\", \"T1-weighted imaging\", \"T2-weighted imaging\"], \"evidence_terms\": [\"t1-weighted\", \"t1-weighted t2-weighted\", \"t1-weighted images\", \"t2-weighted\", \"t2-weighted flair\", \"t1-weighted t2-weighted flair\", \"flair diffusion-weighted\", \"flair diffusion-weighted imaging\", \"diffusion-weighted\", \"diffusion-weighted imaging dwi\", \"imaging dwi\"], \"feature_type_hints\": [\"imaging_modality\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C229\", \"name\": \"Presence of new solid pulmonary nodule\", \"occurrence_count\": 1, \"topic_ranks\": [60], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Presence of new solid pulmonary nodule\"], \"evidence_terms\": [\"ct identified a\", \"ct identified\", \"solid nodule in\", \"nodule in the\", \"nodule in\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"solid nodule\"]}, {\"candidate_id\": \"C230\", \"name\": \"Presence of peritumoral edema\", \"occurrence_count\": 1, \"topic_ranks\": [27], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Peritumoral edema\"], \"evidence_terms\": [\"surrounding edema.\", \"surrounding edema. -\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"presence\"]}, {\"candidate_id\": \"C233\", \"name\": \"Presence of splenic lesion\", \"occurrence_count\": 1, \"topic_ranks\": [51], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Splenic lesion\"], \"evidence_terms\": [\"- spleen\", \"identified. - spleen\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C234\", \"name\": \"Presence of surrounding edema\", \"occurrence_count\": 1, \"topic_ranks\": [100], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Surrounding Edema\"], \"evidence_terms\": [\"surrounding edema.\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C244\", \"name\": \"Recent imaging availability\", \"occurrence_count\": 1, \"topic_ranks\": [71], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Recent imaging\"], \"evidence_terms\": [\"recent imaging.\"], \"feature_type_hints\": [\"text-derived\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C247\", \"name\": \"Right adrenal metastasis\", \"occurrence_count\": 1, \"topic_ranks\": [69], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Right adrenal metastasis\"], \"evidence_terms\": [\"right adrenal\", \"- right adrenal\", \"right adrenal gland\", \"right adrenal lesion\", \"the right adrenal\", \"right adrenal metastasis\", \"adrenal metastasis.\", \"cm right adrenal\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"right\"]}, {\"candidate_id\": \"C261\", \"name\": \"Spleen metastasis\", \"occurrence_count\": 1, \"topic_ranks\": [31], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Spleen involvement\"], \"evidence_terms\": [\"spleen adrenal\", \"spleen adrenal glands\", \"liver spleen adrenal\"], \"feature_type_hints\": [\"anatomical_location\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C264\", \"name\": \"Surveillance imaging occurrence\", \"occurrence_count\": 1, \"topic_ranks\": [92], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Surveillance imaging\"], \"evidence_terms\": [\"surveillance imaging at\", \"imaging at age\", \"imaging at\"], \"feature_type_hints\": [\"procedure\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C265\", \"name\": \"SUVmax\", \"occurrence_count\": 4, \"topic_ranks\": [7, 19, 70, 93], \"representation_votes\": {\"continuous\": 4}, \"confidence\": \"high\", \"supporting_specific_features\": [\"FDG uptake\", \"SUVmax\"], \"evidence_terms\": [\"fdg uptake. -\", \"fdg uptake.\", \"fdg\", \"suvmax\", \"suvmax =\"], \"feature_type_hints\": [\"quantitative_measurement\", \"measurement\", \"continuous\"], \"represented_values_or_categories\": [\"suvmax\"]}, {\"candidate_id\": \"C270\", \"name\": \"Thoracic PET/CT findings\", \"occurrence_count\": 1, \"topic_ranks\": [12], \"representation_votes\": {\"text-derived\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Thoracic imaging findings\"], \"evidence_terms\": [\"thorax -\", \"findings thorax -\", \"findings thorax\", \"thorax - right\"], \"feature_type_hints\": [\"text-derived\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C280\", \"name\": \"Tumor diameter\", \"occurrence_count\": 1, \"topic_ranks\": [7], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Lesion size\"], \"evidence_terms\": [\"3.8 cm\", \"3.8\", \"measuring 3.8\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"3.8 cm\"]}, {\"candidate_id\": \"C281\", \"name\": \"Tumor location\", \"occurrence_count\": 1, \"topic_ranks\": [64], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Lung lobe location\"], \"evidence_terms\": [\"lower lobe\", \"lower\"], \"feature_type_hints\": [\"anatomical_location\"], \"represented_values_or_categories\": [\"lower lobe\"]}, {\"candidate_id\": \"C282\", \"name\": \"Tumor size\", \"occurrence_count\": 1, \"topic_ranks\": [77], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Tumor size\"], \"evidence_terms\": [\"0.7 cm\", \"0.9 cm\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"0.7 cm\", \"0.9 cm\"]}]\n\nReturn:\n{\n  \"canonical_features\": [\n    {\n      \"local_id\": \"F01\",\n      \"canonical_name\": \"snake_case_name\",\n      \"display_name\": \"Readable name\",\n      \"description\": \"Precise extraction definition with aliases where useful\",\n      \"data_type\": \"binary | categorical | ordinal | continuous | count | text\",\n      \"categories\": [\"value\"] or null,\n      \"action\": \"extract | derive | drop | review\",\n      \"parent_object\": \"optional snake_case object name\" or null,\n      \"aliases\": [\"source wording\"],\n      \"derivation\": object or null,\n      \"source_candidate_ids\": [\"C001\"],\n      \"rationale\": \"short explanation\"\n    }\n  ],\n  \"candidate_mappings\": [\n    {\n      \"candidate_id\": \"C001\",\n      \"local_id\": \"F01\",\n      \"relation\": \"alias_of | base_variable | derived_from | subfield_of | related_but_distinct | drop | review\",\n      \"rationale\": \"short explanation\"\n    }\n  ]\n}"
+}

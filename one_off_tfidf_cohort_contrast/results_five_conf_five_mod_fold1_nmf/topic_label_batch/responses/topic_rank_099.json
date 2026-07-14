@@ -1,0 +1,148 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 6.536503553390503,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Too non-specific; could refer to any anatomical dissection.",
+        "term": "dissection"
+      },
+      {
+        "reason": "Fragmented term; lacks anatomical specificity without context.",
+        "term": "node"
+      },
+      {
+        "reason": "Anatomical finding/structure rather than a specific clinical feature or procedure on its own.",
+        "term": "lymph node"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "Surgical history and mediastinal lymph node dissection",
+      "summary": "The topic focuses on surgical interventions related to lung resection (lobectomy) and the associated lymph node dissection, particularly in the mediastinal region, often in a post-surgical context."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Refers to the surgical removal of a lobe of the lung.",
+        "feature_type": "procedure",
+        "name": "Lobectomy",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "lobectomy with",
+          "lobectomy with mediastinal",
+          "lobectomy",
+          "post-lobectomy"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Refers to the surgical removal of lymph nodes in the mediastinum, a critical staging component in lung cancer.",
+        "feature_type": "procedure",
+        "name": "Mediastinal lymph node dissection",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "node dissection",
+          "lymph node dissection",
+          "with mediastinal lymph",
+          "with mediastinal",
+          "mediastinal lymph node",
+          "node dissection and"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "Indicates the patient's state following a surgical procedure.",
+        "feature_type": "clinical_status",
+        "name": "Post-surgical status",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "post-surgical",
+          "post-surgical changes"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "Indicates whether the patient is receiving treatment in an adjuvant setting (post-surgery).",
+        "feature_type": "treatment_context",
+        "name": "Adjuvant therapy status",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "adjuvant"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "History of lobectomy",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Lobectomy"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Mediastinal lymph node dissection performed",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Mediastinal lymph node dissection"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Post-surgical status",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Post-surgical status"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Adjuvant treatment setting",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Adjuvant therapy status"
+        ]
+      }
+    ],
+    "topic_index": 53,
+    "topic_rank": 99
+  },
+  "raw_content": "{\n  \"topic_rank\": 99,\n  \"topic_index\": 53,\n  \"general_topic\": {\n    \"label\": \"Surgical history and mediastinal lymph node dissection\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic focuses on surgical interventions related to lung resection (lobectomy) and the associated lymph node dissection, particularly in the mediastinal region, often in a post-surgical context.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Lobectomy\",\n      \"supporting_terms\": [\n        \"lobectomy with\",\n        \"lobectomy with mediastinal\",\n        \"lobectomy\",\n        \"post-lobectomy\"\n      ],\n      \"feature_type\": \"procedure\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Refers to the surgical removal of a lobe of the lung.\"\n    },\n    {\n      \"name\": \"Mediastinal lymph node dissection\",\n      \"supporting_terms\": [\n        \"node dissection\",\n        \"lymph node dissection\",\n        \"with mediastinal lymph\",\n        \"with mediastinal\",\n        \"mediastinal lymph node\",\n        \"node dissection and\"\n      ],\n      \"feature_type\": \"procedure\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Refers to the surgical removal of lymph nodes in the mediastinum, a critical staging component in lung cancer.\"\n    },\n    {\n      \"name\": \"Post-surgical status\",\n      \"supporting_terms\": [\n        \"post-surgical\",\n        \"post-surgical changes\"\n      ],\n      \"feature_type\": \"clinical_status\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Indicates the patient's state following a surgical procedure.\"\n    },\n    {\n      \"name\": \"Adjuvant therapy status\",\n      \"supporting_terms\": [\n        \"adjuvant\"\n      ],\n      \"feature_type\": \"treatment_context\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Indicates whether the patient is receiving treatment in an adjuvant setting (post-surgery).\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"dissection\",\n      \"reason\": \"Too non-specific; could refer to any anatomical dissection.\"\n    },\n    {\n      \"term\": \"node\",\n      \"reason\": \"Fragmented term; lacks anatomical specificity without context.\"\n    },\n    {\n      \"term\": \"lymph node\",\n      \"reason\": \"Anatomical finding/structure rather than a specific clinical feature or procedure on its own.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"History of lobectomy\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Lobectomy\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Mediastinal lymph node dissection performed\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Mediastinal lymph node dissection\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Post-surgical status\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Post-surgical status\"\n      ],\n      \"confidence\": \"medium\"\n    },\n    {\n      \"name\": \"Adjuvant treatment setting\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Adjuvant therapy status\"\n      ],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-91e62936aaaf336d",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "node dissection",
+    "lymph node dissection",
+    "dissection",
+    "lobectomy with",
+    "with mediastinal lymph",
+    "lobectomy with mediastinal",
+    "mediastinal lymph node",
+    "adjuvant",
+    "lobectomy",
+    "node",
+    "post-surgical",
+    "lymph node",
+    "node dissection and",
+    "post-surgical changes",
+    "post-lobectomy"
+  ],
+  "topic_index": 53,
+  "topic_rank": 99,
+  "usage": {
+    "completion_tokens": 944,
+    "prompt_tokens": 827,
+    "prompt_tokens_details": null,
+    "total_tokens": 1771
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 99, internal index 53\n\nTerms in this topic, ordered from highest to lowest loading:\n1. node dissection\n2. lymph node dissection\n3. dissection\n4. lobectomy with\n5. with mediastinal lymph\n6. lobectomy with mediastinal\n7. mediastinal lymph node\n8. adjuvant\n9. lobectomy\n10. node\n11. post-surgical\n12. lymph node\n13. node dissection and\n14. post-surgical changes\n15. post-lobectomy\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 99,\n  \"topic_index\": 53,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

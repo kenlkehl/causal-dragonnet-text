@@ -1,0 +1,131 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 6.063749074935913,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Repetitive dosing fragment without a specific medication or value.",
+        "term": "mg daily."
+      },
+      {
+        "reason": "Dosing fragment without a specific medication context.",
+        "term": "10 mg daily."
+      },
+      {
+        "reason": "Fragmented temporal instruction.",
+        "term": "nightly. -"
+      },
+      {
+        "reason": "Dosing fragment without a specific medication context.",
+        "term": "20 mg nightly."
+      }
+    ],
+    "general_topic": {
+      "coherence": "mixed",
+      "confidence": "medium",
+      "label": "Medication dosing and hypertension management",
+      "summary": "The topic contains fragmented dosing instructions (mg daily/nightly) and mentions of hypertension management via lisinopril, but is heavily diluted by repetitive dosing fragments."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The terms explicitly identify the use of the ACE inhibitor lisinopril.",
+        "feature_type": "medication",
+        "name": "Lisinopril use",
+        "represented_values_or_categories": [
+          "lisinopril"
+        ],
+        "supporting_terms": [
+          "on lisinopril 10",
+          "controlled on lisinopril"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "The terms suggest documentation of hypertension presence or control status.",
+        "feature_type": "condition",
+        "name": "Hypertension status",
+        "represented_values_or_categories": [
+          "no",
+          "controlled"
+        ],
+        "supporting_terms": [
+          "hypertension. - no",
+          "controlled on lisinopril"
+        ]
+      },
+      {
+        "artifact_likelihood": "medium",
+        "confidence": "low",
+        "explanation": "Hyperlipidemia is mentioned, but it is attached to a dosing fragment, making its clinical relevance to the topic unclear.",
+        "feature_type": "condition",
+        "name": "Hyperlipidemia",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "daily. - hyperlipidemia"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "medium",
+        "name": "Lisinopril dosage",
+        "suggested_representation": "continuous",
+        "supporting_specific_features": [
+          "Lisinopril use"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Hypertension control status",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Hypertension status"
+        ]
+      },
+      {
+        "confidence": "low",
+        "name": "Hyperlipidemia presence",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Hyperlipidemia"
+        ]
+      }
+    ],
+    "topic_index": 15,
+    "topic_rank": 13
+  },
+  "raw_content": "{\n  \"topic_rank\": 13,\n  \"topic_index\": 15,\n  \"general_topic\": {\n    \"label\": \"Medication dosing and hypertension management\",\n    \"coherence\": \"mixed\",\n    \"confidence\": \"medium\",\n    \"summary\": \"The topic contains fragmented dosing instructions (mg daily/nightly) and mentions of hypertension management via lisinopril, but is heavily diluted by repetitive dosing fragments.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Lisinopril use\",\n      \"supporting_terms\": [\n        \"on lisinopril 10\",\n        \"controlled on lisinopril\"\n      ],\n      \"feature_type\": \"medication\",\n      \"represented_values_or_categories\": [\n        \"lisinopril\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms explicitly identify the use of the ACE inhibitor lisinopril.\"\n    },\n    {\n      \"name\": \"Hypertension status\",\n      \"supporting_terms\": [\n        \"hypertension. - no\",\n        \"controlled on lisinopril\"\n      ],\n      \"feature_type\": \"condition\",\n      \"represented_values_or_categories\": [\n        \"no\",\n        \"controlled\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms suggest documentation of hypertension presence or control status.\"\n    },\n    {\n      \"name\": \"Hyperlipidemia\",\n      \"supporting_terms\": [\n        \"daily. - hyperlipidemia\"\n      ],\n      \"feature_type\": \"condition\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"low\",\n      \"artifact_likelihood\": \"medium\",\n      \"explanation\": \"Hyperlipidemia is mentioned, but it is attached to a dosing fragment, making its clinical relevance to the topic unclear.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"mg daily.\",\n      \"reason\": \"Repetitive dosing fragment without a specific medication or value.\"\n    },\n    {\n      \"term\": \"10 mg daily.\",\n      \"reason\": \"Dosing fragment without a specific medication context.\"\n    },\n    {\n      \"term\": \"nightly. -\",\n      \"reason\": \"Fragmented temporal instruction.\"\n    },\n    {\n      \"term\": \"20 mg nightly.\",\n      \"reason\": \"Dosing fragment without a specific medication context.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Lisinopril dosage\",\n      \"suggested_representation\": \"continuous\",\n      \"supporting_specific_features\": [\n        \"Lisinopril use\"\n      ],\n      \"confidence\": \"medium\"\n    },\n    {\n      \"name\": \"Hypertension control status\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Hypertension status\"\n      ],\n      \"confidence\": \"medium\"\n    },\n    {\n      \"name\": \"Hyperlipidemia presence\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Hyperlipidemia\"\n      ],\n      \"confidence\": \"low\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-a441e782092c9c47",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "mg daily.",
+    "mg daily. -",
+    "10 mg daily.",
+    "nightly. -",
+    "nightly.",
+    "20 mg nightly.",
+    "mg nightly.",
+    "mg nightly. -",
+    "daily. - hyperlipidemia",
+    "daily.",
+    "daily. -",
+    "on lisinopril 10",
+    "controlled on lisinopril",
+    "hypertension. - no",
+    "controlled on"
+  ],
+  "topic_index": 15,
+  "topic_rank": 13,
+  "usage": {
+    "completion_tokens": 784,
+    "prompt_tokens": 846,
+    "prompt_tokens_details": null,
+    "total_tokens": 1630
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 13, internal index 15\n\nTerms in this topic, ordered from highest to lowest loading:\n1. mg daily.\n2. mg daily. -\n3. 10 mg daily.\n4. nightly. -\n5. nightly.\n6. 20 mg nightly.\n7. mg nightly.\n8. mg nightly. -\n9. daily. - hyperlipidemia\n10. daily.\n11. daily. -\n12. on lisinopril 10\n13. controlled on lisinopril\n14. hypertension. - no\n15. controlled on\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 13,\n  \"topic_index\": 15,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

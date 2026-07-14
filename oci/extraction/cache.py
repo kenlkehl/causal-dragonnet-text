@@ -16,6 +16,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 ROW_INDEX_COLUMN = "__oci_cache_row_index"
+PATIENT_TEXT_HASH_COLUMN = "__oci_patient_text_hash"
 
 
 def _compute_config_hash(config: Dict[str, Any]) -> str:
@@ -43,13 +44,33 @@ def _compute_config_hash(config: Dict[str, Any]) -> str:
         ],
         'prompt_template_version': config.get('prompt_template_version', ''),
         'vllm_model_name': config.get('vllm_model_name', ''),
+        'vllm_endpoint_model_inventory': config.get(
+            'vllm_endpoint_model_inventory', {}
+        ),
+        'vllm_max_model_len': config.get('vllm_max_model_len'),
         'vllm_reasoning_parser': config.get('vllm_reasoning_parser', ''),
+        'vllm_reasoning_parser_inventory': config.get(
+            'vllm_reasoning_parser_inventory', {}
+        ),
+        'vllm_enable_thinking': config.get('vllm_enable_thinking'),
         'extraction_temperature': config.get('extraction_temperature', 0.0),
         'extraction_max_tokens': config.get('extraction_max_tokens', 1024),
         'extraction_max_text_length': config.get(
             'extraction_max_text_length',
             config.get('max_text_length', 400000),
         ),
+        'patient_text_hash': config.get('patient_text_hash', ''),
+        'temporal_cutoff': config.get('temporal_cutoff', ''),
+        'max_variables_per_extraction_request': config.get(
+            'max_variables_per_extraction_request', 10
+        ),
+        'extraction_batch_size': config.get('extraction_batch_size'),
+        'extraction_provider': config.get('extraction_provider', ''),
+        'codex_cli_executable': config.get('codex_cli_executable', ''),
+        'codex_cli_model_name': config.get('codex_cli_model_name', ''),
+        'codex_cli_reasoning_effort': config.get('codex_cli_reasoning_effort', ''),
+        'codex_cli_extra_args': config.get('codex_cli_extra_args', []),
+        'complete_document': config.get('complete_document', False),
     }
     config_str = json.dumps(hash_dict, sort_keys=True)
     return hashlib.md5(config_str.encode()).hexdigest()[:12]
@@ -94,6 +115,19 @@ class ExtractionCache:
     def _get_row_cache_path(self, dataset_path: str, config: Dict[str, Any]) -> Path:
         """Get partial row-level cache file path for given dataset and config."""
         return self._get_cache_path_with_prefix(dataset_path, config, "extraction_rows")
+
+    def _get_patient_cache_path(
+        self, dataset_path: str, config: Dict[str, Any]
+    ) -> Path:
+        """Get a fold-independent cache path for one exact feature contract."""
+        contract_config = dict(config)
+        # The individual text hash is stored as a row key below. Excluding the
+        # aggregate frame hash lets identical patients/contracts be reused across
+        # folds without sharing any label- or fold-adaptive state.
+        contract_config["patient_text_hash"] = ""
+        return self._get_cache_path_with_prefix(
+            dataset_path, contract_config, "extraction_patients"
+        )
 
     def _get_cache_path_with_prefix(
         self,
@@ -297,6 +331,95 @@ class ExtractionCache:
             f"Saved extraction row cache to: {cache_path} "
             f"({len(row_df)} processed rows)"
         )
+        return cache_path
+
+    def load_patient_values(
+        self,
+        dataset_path: str,
+        config: Dict[str, Any],
+        patient_text_hashes: Sequence[str],
+    ) -> Optional[pd.DataFrame]:
+        """Load exact patient/text + feature-contract cache hits positionally."""
+        cache_path = self._get_patient_cache_path(dataset_path, config)
+        if not cache_path.exists():
+            return None
+        expected_cols = self._expected_columns(config)
+        try:
+            cached = pd.read_parquet(cache_path)
+            required = {PATIENT_TEXT_HASH_COLUMN, *expected_cols}
+            if not required.issubset(cached.columns):
+                logger.warning(
+                    "Patient extraction cache missing columns %s; invalidating read",
+                    sorted(required - set(cached.columns)),
+                )
+                return None
+            cached = cached.drop_duplicates(
+                subset=[PATIENT_TEXT_HASH_COLUMN], keep="last"
+            ).set_index(PATIENT_TEXT_HASH_COLUMN)
+            rows: List[Dict[str, Any]] = []
+            for position, text_hash in enumerate(patient_text_hashes):
+                if str(text_hash) not in cached.index:
+                    continue
+                value = cached.loc[str(text_hash)]
+                if isinstance(value, pd.DataFrame):
+                    value = value.iloc[-1]
+                rows.append(
+                    {
+                        ROW_INDEX_COLUMN: int(position),
+                        **{column: value[column] for column in expected_cols},
+                    }
+                )
+            if not rows:
+                return None
+            return pd.DataFrame(rows, columns=[ROW_INDEX_COLUMN, *expected_cols])
+        except Exception as exc:
+            logger.warning("Error loading patient extraction cache: %s", exc)
+            return None
+
+    def save_patient_values(
+        self,
+        dataset_path: str,
+        config: Dict[str, Any],
+        patient_text_hashes: Sequence[str],
+        extracted_df: pd.DataFrame,
+    ) -> Path:
+        """Atomically merge label-free exact patient/contract extraction values."""
+        hashes = [str(value) for value in patient_text_hashes]
+        if len(hashes) != len(extracted_df):
+            raise ValueError(
+                "patient_text_hashes length must match extracted_df rows: "
+                f"{len(hashes)} != {len(extracted_df)}"
+            )
+        expected_cols = self._expected_columns(config)
+        missing_cols = set(expected_cols) - set(extracted_df.columns)
+        if missing_cols:
+            raise ValueError(
+                f"extracted_df missing expected columns: {sorted(missing_cols)}"
+            )
+        cache_path = self._get_patient_cache_path(dataset_path, config)
+        values = extracted_df[expected_cols].copy().reset_index(drop=True)
+        values.insert(0, PATIENT_TEXT_HASH_COLUMN, hashes)
+        if cache_path.exists():
+            try:
+                existing = pd.read_parquet(cache_path)
+                if {PATIENT_TEXT_HASH_COLUMN, *expected_cols}.issubset(
+                    existing.columns
+                ):
+                    values = pd.concat(
+                        [existing[[PATIENT_TEXT_HASH_COLUMN, *expected_cols]], values],
+                        ignore_index=True,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Ignoring unreadable patient extraction cache during merge: %s",
+                    exc,
+                )
+        values = values.drop_duplicates(
+            subset=[PATIENT_TEXT_HASH_COLUMN], keep="last"
+        ).reset_index(drop=True)
+        temporary = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        values.to_parquet(temporary, index=False)
+        temporary.replace(cache_path)
         return cache_path
 
     def rows_to_complete_dataframe(

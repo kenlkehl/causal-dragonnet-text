@@ -1,0 +1,144 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 6.484502077102661,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Fragmentary text likely from a sentence structure.",
+        "term": "and right cerebellar"
+      },
+      {
+        "reason": "Fragmentary text containing punctuation.",
+        "term": "- right cerebellar"
+      },
+      {
+        "reason": "Incomplete fragment, possibly a measurement (cm) or part of a larger phrase.",
+        "term": "cm right cerebellar"
+      },
+      {
+        "reason": "Grammatical fragment.",
+        "term": "and right"
+      },
+      {
+        "reason": "Grammatical fragment.",
+        "term": "cm and right"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "Brain metastases and intracranial localization",
+      "summary": "The topic focuses on the presence and anatomical localization of brain metastases, specifically mentioning the cerebellum and frontal lobe."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Direct mention of brain metastases as a clinical finding.",
+        "feature_type": "finding",
+        "name": "Brain metastases",
+        "represented_values_or_categories": [
+          "present"
+        ],
+        "supporting_terms": [
+          "brain metastases"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Terms describe lesions or involvement specifically in the cerebellar hemisphere, with a focus on the right side.",
+        "feature_type": "anatomical_location",
+        "name": "Cerebellar metastasis",
+        "represented_values_or_categories": [
+          "right cerebellar hemisphere"
+        ],
+        "supporting_terms": [
+          "right cerebellar",
+          "cerebellar",
+          "hemisphere",
+          "right cerebellar hemisphere",
+          "cerebellar hemisphere",
+          "cm right cerebellar"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Terms indicate enhancing lesions located in the left frontal lobe.",
+        "feature_type": "anatomical_location",
+        "name": "Frontal lobe metastasis",
+        "represented_values_or_categories": [
+          "left frontal lobe"
+        ],
+        "supporting_terms": [
+          "frontal",
+          "enhancing lesions left",
+          "frontal lobe",
+          "- left frontal"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Presence of brain metastases",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Brain metastases"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Anatomical site of brain metastasis",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Cerebellar metastasis",
+          "Frontal lobe metastasis"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Laterality of brain metastasis",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Cerebellar metastasis",
+          "Frontal lobe metastasis"
+        ]
+      }
+    ],
+    "topic_index": 1,
+    "topic_rank": 85
+  },
+  "raw_content": "{\n  \"topic_rank\": 85,\n  \"topic_index\": 1,\n  \"general_topic\": {\n    \"label\": \"Brain metastases and intracranial localization\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic focuses on the presence and anatomical localization of brain metastases, specifically mentioning the cerebellum and frontal lobe.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Brain metastases\",\n      \"supporting_terms\": [\n        \"brain metastases\"\n      ],\n      \"feature_type\": \"finding\",\n      \"represented_values_or_categories\": [\n        \"present\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Direct mention of brain metastases as a clinical finding.\"\n    },\n    {\n      \"name\": \"Cerebellar metastasis\",\n      \"supporting_terms\": [\n        \"right cerebellar\",\n        \"cerebellar\",\n        \"hemisphere\",\n        \"right cerebellar hemisphere\",\n        \"cerebellar hemisphere\",\n        \"cm right cerebellar\"\n      ],\n      \"feature_type\": \"anatomical_location\",\n      \"represented_values_or_categories\": [\n        \"right cerebellar hemisphere\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Terms describe lesions or involvement specifically in the cerebellar hemisphere, with a focus on the right side.\"\n    },\n    {\n      \"name\": \"Frontal lobe metastasis\",\n      \"supporting_terms\": [\n        \"frontal\",\n        \"enhancing lesions left\",\n        \"frontal lobe\",\n        \"- left frontal\"\n      ],\n      \"feature_type\": \"anatomical_location\",\n      \"represented_values_or_categories\": [\n        \"left frontal lobe\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Terms indicate enhancing lesions located in the left frontal lobe.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"and right cerebellar\",\n      \"reason\": \"Fragmentary text likely from a sentence structure.\"\n    },\n    {\n      \"term\": \"- right cerebellar\",\n      \"reason\": \"Fragmentary text containing punctuation.\"\n    },\n    {\n      \"term\": \"cm right cerebellar\",\n      \"reason\": \"Incomplete fragment, possibly a measurement (cm) or part of a larger phrase.\"\n    },\n    {\n      \"term\": \"and right\",\n      \"reason\": \"Grammatical fragment.\"\n    },\n    {\n      \"term\": \"cm and right\",\n      \"reason\": \"Grammatical fragment.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Presence of brain metastases\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Brain metastases\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Anatomical site of brain metastasis\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Cerebellar metastasis\",\n        \"Frontal lobe metastasis\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Laterality of brain metastasis\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Cerebellar metastasis\",\n        \"Frontal lobe metastasis\"\n      ],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-aa0c8b82be910abe",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "right cerebellar",
+    "cerebellar",
+    "hemisphere",
+    "right cerebellar hemisphere",
+    "cerebellar hemisphere",
+    "and right cerebellar",
+    "- right cerebellar",
+    "frontal",
+    "enhancing lesions left",
+    "frontal lobe",
+    "and right",
+    "cm right cerebellar",
+    "brain metastases",
+    "- left frontal",
+    "cm and right"
+  ],
+  "topic_index": 1,
+  "topic_rank": 85,
+  "usage": {
+    "completion_tokens": 832,
+    "prompt_tokens": 817,
+    "prompt_tokens_details": null,
+    "total_tokens": 1649
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 85, internal index 1\n\nTerms in this topic, ordered from highest to lowest loading:\n1. right cerebellar\n2. cerebellar\n3. hemisphere\n4. right cerebellar hemisphere\n5. cerebellar hemisphere\n6. and right cerebellar\n7. - right cerebellar\n8. frontal\n9. enhancing lesions left\n10. frontal lobe\n11. and right\n12. cm right cerebellar\n13. brain metastases\n14. - left frontal\n15. cm and right\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 85,\n  \"topic_index\": 1,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

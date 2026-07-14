@@ -1,0 +1,501 @@
+feature,coefficient,direction
+control::left iliac,-0.02947660612410001,negative
+control::age 79,-0.022049247650022103,negative
+control::iliac,-0.021531042287759664,negative
+control::79,-0.020997949614099308,negative
+treated::dry cough,-0.018838621150801736,negative
+treated::declined,-0.018712246949627,negative
+control::lytic lesion,-0.018527554779235372,negative
+treated::lobectomy,-0.018332615431159507,negative
+treated::adjuvant,-0.018072032703767525,negative
+treated::pemetrexed,-0.018066962492202052,negative
+control::78 year,-0.017963205140251456,negative
+control::squamous cell,-0.017753698931663734,negative
+treated::appears,-0.01746363866676477,negative
+control::alendronate,-0.01737581859596941,negative
+treated::harold,-0.017374782081775612,negative
+treated::four cycles,-0.01730998143308758,negative
+treated::left upper,-0.01727372979239022,negative
+treated::given ecog,-0.017093925973808877,negative
+control::bone metastasis,-0.016878385020178802,negative
+treated::spo2 94,-0.016433525544757948,negative
+treated::age 73,-0.016334873016486954,negative
+treated::oriented appears,-0.015941475155898957,negative
+treated::met copy,-0.01582718256613841,negative
+treated::dry,-0.015822196348594077,negative
+treated::observation,-0.015673090639845406,negative
+treated::94 on,-0.015654520717631532,negative
+control::cisplatin vinorelbine,-0.0155738127891183,negative
+treated::patient harold,-0.015446399220003834,negative
+treated::stage iiia,-0.015426870880568756,negative
+treated::dyspnea and,-0.015210595251384832,negative
+treated::cisplatin pemetrexed,-0.015049807902605378,negative
+treated::nad appears,-0.015025540978654234,negative
+treated::fatigued,-0.014987614423996574,negative
+treated::has declined,-0.014934246041643923,negative
+control::contrast performed,-0.01493262520898645,negative
+treated::iiia,-0.014798134856072714,negative
+treated::due to,-0.01463391116331978,negative
+control::squamous nsclc,-0.014368588114753512,negative
+control::back pain,-0.014217381249305243,negative
+control::min bun,-0.014197800559986968,negative
+treated::ambulation,-0.014136204788672849,negative
+treated::jensen,-0.014118089172975384,negative
+treated::71,-0.01405915336681412,negative
+treated::carboplatin,-0.014035827240167019,negative
+treated::appears mildly,-0.013966791456439549,negative
+treated::harold jensen,-0.01392332903308659,negative
+control::denosumab,-0.0138313837598286,negative
+treated::age 60,-0.013810115376753342,negative
+treated::lumbar,-0.013800176633415723,negative
+control::from myocardial,-0.013781782816777218,negative
+treated::decreased appetite,-0.013730261281699538,negative
+control::iliac wing,-0.013695445474548302,negative
+control::wing,-0.013695445474548302,negative
+treated::dizziness or,-0.013658905717243191,negative
+control::eleanor mitchell,-0.013650743694095427,negative
+control::hepatic metastases,-0.01360655734990706,negative
+treated::bp 128,-0.013491539333662752,negative
+treated::due,-0.013358155202987325,negative
+treated::128,-0.013350032671185662,negative
+control::solitary lytic,-0.013349239832208308,negative
+treated::94,-0.013340957007640337,negative
+control::robert miller,-0.013303615802830284,negative
+control::vinorelbine cycles,-0.01328848764494252,negative
+treated::iv on,-0.01323587950180792,negative
+treated::cisplatin,-0.013191332508219205,negative
+treated::lower lobectomy,-0.013177689542053112,negative
+control::fgfr1,-0.01316333503552351,negative
+treated::decline,-0.013150013494065596,negative
+treated::occasional dry,-0.01312873387567347,negative
+control::iliac crest,-0.013069252960511216,negative
+control::crest,-0.013069252960511216,negative
+control::cell carcinoma,-0.012901646997288954,negative
+treated::carboplatin pemetrexed,-0.012823976720549881,negative
+control::osseous metastasis,-0.012820082672242725,negative
+control::paraplatin,-0.012786255092145912,negative
+treated::post lobectomy,-0.012773749248560352,negative
+control::calcium,-0.012715146891131762,negative
+control::age 73,-0.012688297908794412,negative
+control::cough mild,-0.012687798691611183,negative
+treated::kras wild,-0.012680805708737045,negative
+treated::dyspnea 55,-0.012664235122694411,negative
+control::john doe,-0.012567969686293777,negative
+treated::pemetrexed cycles,-0.012440737942536027,negative
+treated::every 21,-0.012436343447886428,negative
+control::lymph μl,-0.012378642575340425,negative
+treated::four,-0.012362847910397228,negative
+control::age 80,-0.012346274157207088,negative
+treated::appears fatigued,-0.01226942031389533,negative
+treated::adjuvant cisplatin,-0.012232434494960559,negative
+control::lobectomy no,-0.01220530461781417,negative
+control::acquired pneumonia,-0.012172333544971332,negative
+control::71,-0.012155732624796573,negative
+control::min spo2,-0.012151512201196483,negative
+treated::lobectomy with,-0.01213381232893437,negative
+control::deceased from,-0.01210927040650552,negative
+control::74,-0.012032529280114711,negative
+control::calcium vitamin,-0.012027327580909774,negative
+control::iv squamous,-0.012027207692341927,negative
+treated::iiia right,-0.01198272182625908,negative
+control::pneumothorax chest,-0.011965159120315675,negative
+control::kg weight,-0.01192074743160457,negative
+treated::solitary,-0.011916721361326474,negative
+treated::prednisone,-0.011906188927885333,negative
+control::at 78,-0.01187305749487188,negative
+treated::neutrophils,-0.011838314393363717,negative
+treated::74,-0.011830423066549028,negative
+treated::low lymphocytes,-0.011789661002461255,negative
+treated::line carboplatin,-0.011784310321115633,negative
+treated::neutrophils 103,-0.011783762833756373,negative
+control::44,-0.011769683946545602,negative
+control::osteopenia,-0.011766341297343198,negative
+control::community acquired,-0.011737475768251453,negative
+control::vertebral body,-0.011703398713241225,negative
+control::community,-0.011695884425291935,negative
+control::77,-0.011661653942854013,negative
+control::vaf tp53,-0.011654069049555772,negative
+control::is 78,-0.011640039384474464,negative
+treated::neuropathic,-0.01162339865959254,negative
+control::fgfr1 amplification,-0.011622482638487043,negative
+control::age 76,-0.011583097745729442,negative
+control::doe,-0.011580894928437413,negative
+control::pain calcium,-0.011577250575727397,negative
+treated::lobectomy and,-0.01156934826876626,negative
+treated::l3,-0.011558088850563624,negative
+treated::84 bpm,-0.01155449117156487,negative
+control::bone health,-0.011538446890467048,negative
+control::body consistent,-0.011528902140553621,negative
+treated::type kras,-0.011509095631248233,negative
+control::opioid,-0.011499656539861323,negative
+treated::t3n2m1,-0.011490188325650148,negative
+control::dyspnea 55,-0.011485229502727424,negative
+control::therapy indicated,-0.011463166399026644,negative
+control::fusion assay,-0.011405473502675123,negative
+treated::mitchell,-0.011361988764605044,negative
+control::for bone,-0.01135887367202548,negative
+treated::hip,-0.011352122711703081,negative
+treated::101 ml,-0.011344905825788423,negative
+control::ttf negative,-0.011326796332801923,negative
+control::bronchodilator,-0.011309098888896639,negative
+control::af,-0.011307252600363263,negative
+treated::metastasis stable,-0.011296151190729894,negative
+treated::l858r,-0.011296108118875794,negative
+treated::r175h,-0.011289666191621873,negative
+control::94,-0.01126102945859293,negative
+treated::albuterol,-0.011260639918566932,negative
+control::36 heent,-0.011245944929881894,negative
+treated::or illicit,-0.011234422598013015,negative
+control::mild tenderness,-0.011211454474397774,negative
+control::atorvastatin chronic,-0.011195237923825313,negative
+treated::fatigue weight,-0.011169980809906659,negative
+control::the t8,-0.011138100832096424,negative
+control::outpatient csf,-0.011135963684750822,negative
+control::hilar nodal,-0.011084151754777154,negative
+control::in left,-0.011077063857408295,negative
+control::and goals,-0.011056809218843472,negative
+control::q4,-0.0110483956944532,negative
+treated::hr 84,-0.011040152575675992,negative
+control::pain and,-0.011018663733808824,negative
+treated::for ambulation,-0.011017480349198248,negative
+control::tenderness over,-0.011016393965532351,negative
+treated::ul,-0.01100807753320123,negative
+treated::low tmb,-0.011000940315577181,negative
+control::gemzar,-0.010998727480827246,negative
+treated::dl ast,-0.010989779045744129,negative
+treated::and family,-0.010982533082663386,negative
+control::proximal,-0.010967084450000693,negative
+treated::upper lobe,-0.010962589658393454,negative
+treated::oral,-0.010959680168353735,negative
+treated::exertional,-0.01094835570442244,negative
+control::blocks,-0.01092813139859534,negative
+control::distances,-0.010904670159282115,negative
+treated::in left,-0.010902323934953807,negative
+treated::node dissection,-0.010899184776622892,negative
+treated::consult,-0.010884307163011392,negative
+control::in squamous,-0.010876927315007045,negative
+treated::mutation cdkn2a,-0.010873865053112948,negative
+treated::differentiated adenocarcinoma,-0.010864492253666915,negative
+control::over the,-0.010855758010206574,negative
+control::radiation to,-0.010832306366451367,negative
+treated::by adjuvant,-0.01082558128682586,negative
+treated::deficits laboratory,-0.010822055623655166,negative
+control::stable left,-0.010819742255228589,negative
+treated::number gain,-0.010800007805213221,negative
+control::and osseous,-0.010776783483526304,negative
+treated::21 days,-0.010769001157048456,negative
+treated::upper field,-0.010768855320583434,negative
+control::alendronate 70,-0.010764558851045028,negative
+treated::inhaler puffs,-0.01074738509423937,negative
+control::morphine,-0.010742142849752627,negative
+treated::respiratory dyspnea,-0.010735126847314038,negative
+control::james connor,-0.010733063359974806,negative
+control::iliac lesion,-0.010695737450060437,negative
+control::in paraffin,-0.010690669470132662,negative
+control::connor,-0.010633133527581318,negative
+control::age 68,-0.010618808554247855,negative
+treated::alt 22,-0.010615579640130749,negative
+control::t8 vertebral,-0.010596510132708526,negative
+treated::inhaler,-0.01059538784464598,negative
+control::short distances,-0.010594385592129378,negative
+control::neut μl,-0.01059220608896707,negative
+control::μl lymph,-0.010565758397397975,negative
+treated::or pleuritic,-0.010558989896581479,negative
+treated::eleanor mitchell,-0.01055507483806595,negative
+control::in single,-0.010542262193417497,negative
+treated::and an,-0.010541991538509656,negative
+control::cdkn2a loss,-0.010534564233894593,negative
+treated::chills chest,-0.010518416441241041,negative
+treated::kg weight,-0.010504342776398033,negative
+treated::mitchell age,-0.010503772589923537,negative
+treated::plus,-0.010485117306875173,negative
+control::metastasis to,-0.010476876606914784,negative
+control::70 mg,-0.010473170694848289,negative
+treated::supplements,-0.010454079929685348,negative
+control::osteoarthritis,-0.010447535220126659,negative
+treated::known lytic,-0.010435202752965469,negative
+treated::osteopenia,-0.01043440150697886,negative
+control::age 75,-0.010428047857999258,negative
+treated::met amplification,-0.010424711390953117,negative
+treated::on day,-0.010418979119809687,negative
+treated::fatigue 70,-0.010416316067284569,negative
+treated::illness harold,-0.010399787876361793,negative
+treated::requires,-0.010397974614648793,negative
+treated::loss met,-0.010397374559649718,negative
+treated::with solitary,-0.010374482768290146,negative
+control::and dyspnea,-0.010374435409654277,negative
+treated::eleanor,-0.0103720192771187,negative
+treated::requires assistance,-0.010366774732649561,negative
+control::tissue attenuation,-0.010351695107385242,negative
+treated::of intracranial,-0.01035101235724743,negative
+control::of bone,-0.010349751419078448,negative
+control::infiltrates,-0.01034575990295883,negative
+control::ray,-0.010339660602365098,negative
+treated::alcohol or,-0.01029983850343599,negative
+treated::declined to,-0.010291851792156609,negative
+control::optimize,-0.010279328769014235,negative
+treated::age 71,-0.01027351254646519,negative
+treated::enlarged hyperchromatic,-0.010257487634876924,negative
+treated::dizziness,-0.010249277159118077,negative
+control::paclitaxel,-0.010235451781612658,negative
+treated::albuterol inhaler,-0.010230338677556397,negative
+treated::to ecog,-0.010203990714803556,negative
+control::platinol vinorelbine,-0.010199518058687435,negative
+control::otherwise stable,-0.010194102252601549,negative
+treated::lymphocytes ul,-0.01018997521820247,negative
+control::metastatic squamous,-0.010181427608390723,negative
+control::bilaterally sensation,-0.010178910772336269,negative
+control::no swelling,-0.010172583577260379,negative
+treated::with some,-0.010171676075441088,negative
+treated::diagnosis gross,-0.010114718412386238,negative
+control::low back,-0.010112280000144276,negative
+treated::large cell,0.025473807443341517,positive
+treated::patient michael,0.022693313539168723,positive
+treated::michael thompson,0.019434015415089875,positive
+treated::radiosurgery,0.019264347291372306,positive
+treated::right cerebellar,0.018892635123622083,positive
+treated::seizure,0.018892348987206042,positive
+control::64,0.0188246204239546,positive
+treated::stereotactic radiosurgery,0.01881543671914311,positive
+control::12 mut,0.018764708544743287,positive
+treated::brain metastases,0.01854282221123876,positive
+treated::michael,0.018167027043338193,positive
+control::platinum free,0.018159888102842924,positive
+control::bilateral pulmonary,0.0176357273661804,positive
+treated::122 78,0.01741627196264069,positive
+treated::metastases treated,0.01740701526661143,positive
+treated::cell carcinoma,0.01739901472467458,positive
+treated::122,0.017303932906207967,positive
+treated::large,0.01726363619112625,positive
+control::tmb 12,0.017226813317808586,positive
+treated::cell nsclc,0.01695067343860989,positive
+control::free doublet,0.016925007358050453,positive
+treated::bp 122,0.01687621165537206,positive
+treated::non platinum,0.016412232513074426,positive
+treated::stereotactic,0.016380068546028782,positive
+treated::levetiracetam,0.016326770381484716,positive
+control::loss tp53,0.01593618499333952,positive
+control::age 64,0.015835030771039413,positive
+treated::srs,0.01577005780151076,positive
+treated::and right,0.015500921185493857,positive
+treated::109,0.015078237158883411,positive
+treated::appearing nad,0.015060099453298696,positive
+treated::appearing,0.014880631049945574,positive
+treated::well appearing,0.014796219321584496,positive
+treated::deletion egfr,0.014680258694608149,positive
+treated::iv large,0.014576799176454804,positive
+control::martinez,0.01449990930536599,positive
+treated::with stereotactic,0.014421363739887207,positive
+treated::left parietal,0.01439909500830943,positive
+control::68 ml,0.014238016366146154,positive
+treated::treated lesions,0.014194368897978548,positive
+control::g12c stk11,0.014142427855448678,positive
+treated::cerebellar,0.013982170071579045,positive
+treated::rib pain,0.013895325069339567,positive
+treated::definitive intracranial,0.013886391015127801,positive
+control::james whitaker,0.013770729032026472,positive
+treated::poorly differentiated,0.01375744384678718,positive
+treated::illness michael,0.01375448983065773,positive
+treated::age 57,0.013433927244275777,positive
+control::endocrine,0.013327462420536113,positive
+control::dose adjustment,0.013253406193874849,positive
+treated::m1c,0.013217323629600498,positive
+control::eleanor martinez,0.013171177375120859,positive
+treated::or rales,0.013165494143207284,positive
+control::adjustment,0.013143002570919961,positive
+control::toes,0.013129655877961822,positive
+control::cisplatin etoposide,0.012990839378833536,positive
+treated::poorly,0.012952785486694951,positive
+control::age 52,0.012945423062163397,positive
+treated::other histology,0.012891883031658648,positive
+treated::frontal lobe,0.012868055058436877,positive
+treated::parietal,0.012812697799639011,positive
+treated::james miller,0.012740903674837845,positive
+treated::general well,0.012717717199413415,positive
+treated::denies dyspnea,0.012653476464575262,positive
+control::mutation stk11,0.012576908968970868,positive
+treated::cerebellar hemisphere,0.01257530812185239,positive
+treated::post srs,0.012560934593910066,positive
+treated::carcinoma of,0.01250309073651697,positive
+treated::cancer large,0.012489261177595603,positive
+treated::n2 m1c,0.012462129492918585,positive
+treated::frontal,0.012381364667060118,positive
+treated::systemic disease,0.012379493157569341,positive
+control::polyuria,0.012375773811544838,positive
+treated::hemisphere cm,0.01236095572019902,positive
+control::burden 12,0.012355121276484332,positive
+control::adrenal nodule,0.012334745023856229,positive
+treated::age 55,0.01232715730817071,positive
+control::etoposide,0.012307472394350701,positive
+control::works,0.012299768674643514,positive
+treated::loss 25,0.012297381474447438,positive
+treated::g12c,0.012291507226034821,positive
+treated::keap1,0.012243198821518983,positive
+treated::stk11 keap1,0.012176999343251903,positive
+treated::85 100,0.012168756408506254,positive
+treated::frontal and,0.0121415284472421,positive
+control::part time,0.012132123969337981,positive
+control::cisplatin pemetrexed,0.012120281838873303,positive
+treated::platinum doublet,0.012084641428834222,positive
+control::polydipsia,0.012080556633178509,positive
+control::age 65,0.012066964847760504,positive
+control::ul,0.011973804457098801,positive
+treated::thompson,0.011973435182062774,positive
+treated::kras g12c,0.01185897004404277,positive
+control::for crcl,0.011830314326561784,positive
+treated::nausea 100,0.01181224195096771,positive
+treated::fully,0.01180514114671013,positive
+treated::gy,0.011777717130501401,positive
+control::ul reference,0.011753822254777769,positive
+control::function tp53,0.01174172239708529,positive
+control::markers cea,0.011650648430799491,positive
+treated::were detected,0.011624892216913048,positive
+treated::radiosurgery to,0.011606762400615733,positive
+control::crcl,0.011566898400217303,positive
+control::endocrine none,0.011520292157677676,positive
+treated::right adrenal,0.011519122704957077,positive
+control::polyuria polydipsia,0.011515554269798492,positive
+treated::bronchoscopic,0.01148284250982617,positive
+treated::miller,0.011422087631398,positive
+control::function 78,0.011421192013221964,positive
+treated::levetiracetam 500,0.011419399403657814,positive
+control::subcutaneous,0.011416345484103032,positive
+control::122,0.011409826202420698,positive
+control::bilateral adrenal,0.011398470745917058,positive
+treated::hemisphere,0.011347021722521807,positive
+treated::alc μl,0.011335164982937263,positive
+control::85,0.011321126872651164,positive
+control::bob,0.011276493877408889,positive
+treated::strategies for,0.01122793364057607,positive
+treated::function 80,0.01117303378333512,positive
+control::bp 122,0.011169726175687929,positive
+treated::age 66,0.011143870589557184,positive
+treated::cell non,0.011090210914571309,positive
+control::therapy 30,0.011074469108224615,positive
+treated::rivera age,0.01103483052044487,positive
+treated::intracranial disease,0.011023562896238572,positive
+control::with dose,0.011022430005291786,positive
+treated::edema right,0.011015404426543673,positive
+control::neuropathy grade,0.01101072278549575,positive
+treated::painful right,0.010950972535423414,positive
+treated::oncology social,0.010930895523328196,positive
+treated::age 40,0.010926029861808031,positive
+control::time as,0.010924192179643546,positive
+treated::colorectal,0.010917318755821886,positive
+control::at 62,0.010913030838338857,positive
+treated::and cdkn2a,0.010892878097714189,positive
+treated::to painful,0.010840850540070163,positive
+control::humeral,0.010797299015518458,positive
+control::none polyuria,0.010786998356258555,positive
+control::iv kras,0.010773386862598227,positive
+control::therapy if,0.010763113749238691,positive
+treated::age 56,0.010748600968691822,positive
+control::node cm,0.010731680062803828,positive
+control::63,0.010715235287046149,positive
+treated::nsclc other,0.010705292966798759,positive
+control::post operative,0.01068560520605234,positive
+control::49,0.010678661691994036,positive
+treated::minimum,0.010667422427766743,positive
+treated::known brain,0.010634001818115751,positive
+treated::pain dyspnea,0.010627140600291681,positive
+control::mild peripheral,0.010624381061824822,positive
+treated::g12c mutant,0.010599716951546212,positive
+control::122 78,0.010594319670613658,positive
+control::left cm,0.010570318222204913,positive
+control::harold thompson,0.010556340745201061,positive
+treated::care plan,0.010544927408986084,positive
+treated::platinum naive,0.010523764392055367,positive
+control::two enhancing,0.010512797844188548,positive
+control::55 ml,0.010484450753981826,positive
+treated::gene nucleotide,0.010472534308642013,positive
+control::61,0.010448120695763535,positive
+treated::92 ml,0.010447313400660315,positive
+treated::disease related,0.010440731584770647,positive
+control::up order,0.010439883724750819,positive
+control::robert bob,0.010423771889950572,positive
+control::adrenal nodules,0.010371584181864249,positive
+treated::two brain,0.010340043037230174,positive
+treated::fully active,0.010336322875873282,positive
+treated::vaf stk11,0.010332883431466816,positive
+control::left scapular,0.010322723506529059,positive
+control::52,0.01030338655199092,positive
+treated::cm right,0.010294270122629444,positive
+treated::iv t2an3m1c,0.010287210186864217,positive
+treated::t2an3m1c,0.010274588203412698,positive
+control::age 51,0.010270086044196458,positive
+treated::with brain,0.0102366788903191,positive
+treated::nad ecog,0.010199735492200882,positive
+control::agents and,0.010157255182711478,positive
+treated::fractions,0.010153316946638317,positive
+control::ramirez,0.010143147467001819,positive
+treated::chemotherapy treatment,0.010137924574817669,positive
+control::dl ca,0.010123779719362286,positive
+control::peripheral neuropathy,0.010107431013959717,positive
+control::neutropenic,0.01008863163049352,positive
+treated::loss pd,0.010075817625202984,positive
+treated::with platinum,0.01005433912414545,positive
+control::cm consistent,0.01004400019937572,positive
+control::john miller,0.010026212231097415,positive
+control::subsequent,0.010004449630736349,positive
+control::hypermetabolic,0.009995205364736763,positive
+control::crcl 50,0.009994387926727808,positive
+treated::on levetiracetam,0.009974134483242742,positive
+treated::profile kras,0.009945205760661747,positive
+treated::severity none,0.009944897025379425,positive
+control::age 55,0.009940780126640644,positive
+treated::but the,0.009921543050085763,positive
+treated::prior palliative,0.009913337794576703,positive
+control::on existing,0.009904385011530237,positive
+control::osteoblastic lesions,0.009899325531631068,positive
+control::containing,0.009897748826271448,positive
+control::chemotherapy infusion,0.009888782405505196,positive
+control::favored,0.009827484468592391,positive
+control::shows no,0.00981944262360574,positive
+control::function 85,0.009815215618708345,positive
+treated::parietal lobe,0.009806145825078733,positive
+control::nodules are,0.009805743756412365,positive
+treated::of adherence,0.009774185838230498,positive
+control::infusion for,0.009774161860601102,positive
+control::dyspnea 35,0.009773421983258593,positive
+treated::metastases stable,0.00976311069044231,positive
+treated::inhibitors or,0.009762264457856093,positive
+treated::73 ml,0.009757587094075924,positive
+treated::hr 72,0.009740651122211183,positive
+treated::on separate,0.009736822400211315,positive
+control::required for,0.009735869911907957,positive
+treated::to right,0.009711673703428802,positive
+control::order pd,0.009700063353666563,positive
+treated::michael is,0.009682378398083644,positive
+treated::painful,0.00967037683298965,positive
+control::58 ml,0.00967028687989371,positive
+treated::to brain,0.009668071281175873,positive
+control::works part,0.00965120443849816,positive
+treated::rales,0.00965087602638253,positive
+control::for lung,0.00964853686179094,positive
+control::surgeries,0.009644108938433964,positive
+control::64 complete,0.009643782172649972,positive
+control::distal,0.009642451263703847,positive
+control::type at,0.009631481200948847,positive
+treated::72 bpm,0.009609174384296522,positive
+control::denies weight,0.009600853765632734,positive
+control::cerebellar metastasis,0.009598937714906044,positive
+control::m1c non,0.009579006063735076,positive
+control::ffpe tissue,0.00957377200389221,positive
+treated::stage iiib,0.009569784853227983,positive
+control::right cm,0.00956801365885863,positive
+treated::cell cycle,0.009566926691114409,positive
+treated::80 100,0.009564055922680333,positive
+control::regarding,0.009556253845499615,positive
+control::plt 230,0.009549629690800122,positive
+treated::service clinical,0.009541816693673578,positive
+treated::function 85,0.009539660879402855,positive
+treated::rales cardiovascular,0.009538393582905313,positive
+treated::vaf tp53,0.00953799059683895,positive
+control::34g gly12cys,0.009528412594310821,positive
+control::etc,0.009526384642767925,positive
+control::lymphatic none,0.009521508537770517,positive
+treated::of large,0.009520784418650901,positive
+control::harold,0.009514200993615907,positive
+treated::adrenal nodules,0.00949934458673369,positive
+control::gly12cys,0.009484407363389626,positive
+control::detect low,0.009480379120198923,positive

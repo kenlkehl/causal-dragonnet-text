@@ -1,0 +1,117 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 5.955899477005005,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Incomplete fragment of a dosing instruction.",
+        "term": "h prn"
+      },
+      {
+        "reason": "Incomplete fragment of a dosing frequency.",
+        "term": "q6"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "Medication administration frequency and route",
+      "summary": "The terms consist of fragments of medical dosing instructions, specifically frequency (q6h) and route/condition (prn, po)."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The terms 'q6', 'q6 h', and 'q6 h prn' refer to the standard medical abbreviation for 'every 6 hours'.",
+        "feature_type": "frequency",
+        "name": "Dosing frequency",
+        "represented_values_or_categories": [
+          "every 6 hours"
+        ],
+        "supporting_terms": [
+          "q6 h prn",
+          "h prn",
+          "q6",
+          "q6 h",
+          "po q6"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "'po' is the standard abbreviation for 'per os', meaning by mouth.",
+        "feature_type": "route",
+        "name": "Administration route",
+        "represented_values_or_categories": [
+          "per os (oral)"
+        ],
+        "supporting_terms": [
+          "po q6"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "'prn' is the standard abbreviation for 'pro re nata', meaning as needed.",
+        "feature_type": "condition",
+        "name": "Dosing condition",
+        "represented_values_or_categories": [
+          "as needed"
+        ],
+        "supporting_terms": [
+          "q6 h prn",
+          "h prn"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Medication administration frequency",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Dosing frequency"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Medication administration route",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Administration route"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Medication administration condition",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Dosing condition"
+        ]
+      }
+    ],
+    "topic_index": 73,
+    "topic_rank": 45
+  },
+  "raw_content": "{\n  \"topic_rank\": 45,\n  \"topic_index\": 73,\n  \"general_topic\": {\n    \"label\": \"Medication administration frequency and route\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The terms consist of fragments of medical dosing instructions, specifically frequency (q6h) and route/condition (prn, po).\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Dosing frequency\",\n      \"supporting_terms\": [\n        \"q6 h prn\",\n        \"h prn\",\n        \"q6\",\n        \"q6 h\",\n        \"po q6\"\n      ],\n      \"feature_type\": \"frequency\",\n      \"represented_values_or_categories\": [\n        \"every 6 hours\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms 'q6', 'q6 h', and 'q6 h prn' refer to the standard medical abbreviation for 'every 6 hours'.\"\n    },\n    {\n      \"name\": \"Administration route\",\n      \"supporting_terms\": [\n        \"po q6\"\n      ],\n      \"feature_type\": \"route\",\n      \"represented_values_or_categories\": [\n        \"per os (oral)\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"'po' is the standard abbreviation for 'per os', meaning by mouth.\"\n    },\n    {\n      \"name\": \"Dosing condition\",\n      \"supporting_terms\": [\n        \"q6 h prn\",\n        \"h prn\"\n      ],\n      \"feature_type\": \"condition\",\n      \"represented_values_or_categories\": [\n        \"as needed\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"'prn' is the standard abbreviation for 'pro re nata', meaning as needed.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"h prn\",\n      \"reason\": \"Incomplete fragment of a dosing instruction.\"\n    },\n    {\n      \"term\": \"q6\",\n      \"reason\": \"Incomplete fragment of a dosing frequency.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Medication administration frequency\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Dosing frequency\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Medication administration route\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Administration route\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Medication administration condition\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Dosing condition\"\n      ],\n      \"confidence\": \"high\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-84a76a9ad7e0bf2c",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "q6 h prn",
+    "h prn",
+    "q6",
+    "q6 h",
+    "po q6"
+  ],
+  "topic_index": 73,
+  "topic_rank": 45,
+  "usage": {
+    "completion_tokens": 738,
+    "prompt_tokens": 765,
+    "prompt_tokens_details": null,
+    "total_tokens": 1503
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 45, internal index 73\n\nTerms in this topic, ordered from highest to lowest loading:\n1. q6 h prn\n2. h prn\n3. q6\n4. q6 h\n5. po q6\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 45,\n  \"topic_index\": 73,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

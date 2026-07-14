@@ -1,0 +1,404 @@
+{
+  "attempts": 1,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "candidate_mappings": [
+      {
+        "candidate_id": "C009",
+        "local_id": "F01",
+        "rationale": "Alias for ambulation status.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C010",
+        "local_id": "F01",
+        "rationale": "Alias for ambulation status.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C049",
+        "local_id": "F02",
+        "rationale": "General term for cognitive function score.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C050",
+        "local_id": "F02",
+        "rationale": "The primary score variable.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C077",
+        "local_id": "F03",
+        "rationale": "Standardized ECOG scale.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C083",
+        "local_id": "F04",
+        "rationale": "General term for emotional function score.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C084",
+        "local_id": "F04",
+        "rationale": "The primary score variable.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C095",
+        "local_id": "F05",
+        "rationale": "Describes functional status limitations.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C096",
+        "local_id": "F05",
+        "rationale": "Describes functional mobility/tolerance.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C097",
+        "local_id": "F05",
+        "rationale": "General functional status.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C098",
+        "local_id": "F05",
+        "rationale": "Describes functional status limitations.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C101",
+        "local_id": "F06",
+        "rationale": "Global health status measurement.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C181",
+        "local_id": "F07",
+        "rationale": "Neurological exam finding.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C198",
+        "local_id": "F08",
+        "rationale": "Occupational function assessment.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C212",
+        "local_id": "F09",
+        "rationale": "Physical function score.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C248",
+        "local_id": "F10",
+        "rationale": "Role function assessment.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C250",
+        "local_id": "F11",
+        "rationale": "Describes assistance level for self-care.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C251",
+        "local_id": "F11",
+        "rationale": "Describes independence in self-care.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C257",
+        "local_id": "F12",
+        "rationale": "Social function score.",
+        "relation": "base_variable"
+      }
+    ],
+    "canonical_features": [
+      {
+        "action": "extract",
+        "aliases": [
+          "ambulation ability",
+          "ambulatory capacity"
+        ],
+        "canonical_name": "ambulation_status",
+        "categories": [
+          "ambulatory",
+          "non-ambulatory",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "Patient's ability to walk or move independently.",
+        "display_name": "Ambulation Status",
+        "local_id": "F01",
+        "parent_object": "functional_performance",
+        "rationale": "C009 and C010 both describe the patient's capacity for ambulation.",
+        "source_candidate_ids": [
+          "C009",
+          "C010"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "cognitive function"
+        ],
+        "canonical_name": "cognitive_function_score",
+        "categories": [
+          "low",
+          "medium",
+          "high",
+          "unknown"
+        ],
+        "data_type": "ordinal",
+        "derivation": null,
+        "description": "Numerical or ordinal assessment of cognitive performance.",
+        "display_name": "Cognitive Function Score",
+        "local_id": "F02",
+        "parent_object": "functional_performance",
+        "rationale": "Both candidates refer to cognitive function assessments; score is the more specific representation of the evidence provided.",
+        "source_candidate_ids": [
+          "C049",
+          "C050"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "performance status"
+        ],
+        "canonical_name": "ecog_performance_status",
+        "categories": [
+          "0",
+          "1",
+          "2",
+          "3",
+          "4",
+          "unknown"
+        ],
+        "data_type": "ordinal",
+        "derivation": null,
+        "description": "Eastern Cooperative Oncology Group (ECOG) performance status scale.",
+        "display_name": "ECOG Performance Status",
+        "local_id": "F03",
+        "parent_object": "functional_performance",
+        "rationale": "Standardized clinical scale for performance status.",
+        "source_candidate_ids": [
+          "C077"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "emotional function"
+        ],
+        "canonical_name": "emotional_function_score",
+        "categories": [
+          "low",
+          "medium",
+          "high",
+          "unknown"
+        ],
+        "data_type": "ordinal",
+        "derivation": null,
+        "description": "Assessment of emotional well-being or function.",
+        "display_name": "Emotional Function Score",
+        "local_id": "F04",
+        "parent_object": "functional_performance",
+        "rationale": "Merges general emotional function and specific scores into one ordinal feature.",
+        "source_candidate_ids": [
+          "C083",
+          "C084"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "functional limitation status",
+          "functional status limitation",
+          "functional mobility/exercise tolerance"
+        ],
+        "canonical_name": "functional_status",
+        "categories": [
+          "limited",
+          "unlimited",
+          "unknown"
+        ],
+        "data_type": "ordinal",
+        "derivation": null,
+        "description": "General assessment of functional capacity and limitations.",
+        "display_name": "Functional Status",
+        "local_id": "F05",
+        "parent_object": "functional_performance",
+        "rationale": "These candidates all describe general functional capacity or limitations.",
+        "source_candidate_ids": [
+          "C095",
+          "C096",
+          "C097",
+          "C098"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": null,
+        "canonical_name": "global_health_status",
+        "data_type": "continuous",
+        "derivation": null,
+        "description": "Overall assessment of the patient's health status.",
+        "display_name": "Global Health Status",
+        "local_id": "F06",
+        "parent_object": "functional_performance",
+        "rationale": "Continuous measurement of overall health.",
+        "source_candidate_ids": [
+          "C101"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": null,
+        "canonical_name": "neurological_exam_status",
+        "categories": [
+          "intact",
+          "impaired",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "Findings from a neurological examination.",
+        "display_name": "Neurological Exam Status",
+        "local_id": "F07",
+        "parent_object": "functional_performance",
+        "rationale": "Specific clinical finding regarding neurological integrity.",
+        "source_candidate_ids": [
+          "C181"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "work capacity"
+        ],
+        "canonical_name": "occupational_functional_status",
+        "categories": [
+          "capable",
+          "incapable",
+          "unknown"
+        ],
+        "data_type": "categorical",
+        "derivation": null,
+        "description": "Ability to perform work-related activities.",
+        "display_name": "Occupational Functional Status",
+        "local_id": "F08",
+        "parent_object": "functional_performance",
+        "rationale": "Distinct from general functional status as it focuses on work.",
+        "source_candidate_ids": [
+          "C198"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": null,
+        "canonical_name": "physical_function_score",
+        "categories": [
+          "low",
+          "medium",
+          "high",
+          "unknown"
+        ],
+        "data_type": "ordinal",
+        "derivation": null,
+        "description": "Score representing physical functional capacity.",
+        "display_name": "Physical Function Score",
+        "local_id": "F09",
+        "parent_object": "functional_performance",
+        "rationale": "Specific physical function metric.",
+        "source_candidate_ids": [
+          "C212"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": null,
+        "canonical_name": "role_function",
+        "categories": [
+          "low",
+          "medium",
+          "high",
+          "unknown"
+        ],
+        "data_type": "ordinal",
+        "derivation": null,
+        "description": "Ability to perform roles (e.g., work, social, family).",
+        "display_name": "Role Function",
+        "local_id": "F10",
+        "parent_object": "functional_performance",
+        "rationale": "Distinct role-based functional assessment.",
+        "source_candidate_ids": [
+          "C248"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "self-care assistance level",
+          "self-care independence"
+        ],
+        "canonical_name": "self_care_status",
+        "categories": [
+          "independent",
+          "limited",
+          "dependent",
+          "unknown"
+        ],
+        "data_type": "ordinal",
+        "derivation": null,
+        "description": "Independence or assistance required for self-care activities.",
+        "display_name": "Self-care Status",
+        "local_id": "F11",
+        "parent_object": "functional_performance",
+        "rationale": "Merges assistance level and independence into a single scale of self-care ability.",
+        "source_candidate_ids": [
+          "C250",
+          "C251"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": null,
+        "canonical_name": "social_function_score",
+        "categories": [
+          "low",
+          "medium",
+          "high",
+          "unknown"
+        ],
+        "data_type": "ordinal",
+        "derivation": null,
+        "description": "Score representing social functional capacity.",
+        "display_name": "Social Function Score",
+        "local_id": "F12",
+        "parent_object": "functional_performance",
+        "rationale": "Specific social function metric.",
+        "source_candidate_ids": [
+          "C257"
+        ]
+      }
+    ]
+  },
+  "raw_content": "{\n  \"canonical_features\": [\n    {\n      \"local_id\": \"F01\",\n      \"canonical_name\": \"ambulation_status\",\n      \"display_name\": \"Ambulation Status\",\n      \"description\": \"Patient's ability to walk or move independently.\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"ambulatory\",\n        \"non-ambulatory\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"functional_performance\",\n      \"aliases\": [\n        \"ambulation ability\",\n        \"ambulatory capacity\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C009\",\n        \"C010\"\n      ],\n      \"rationale\": \"C009 and C010 both describe the patient's capacity for ambulation.\"\n    },\n    {\n      \"local_id\": \"F02\",\n      \"canonical_name\": \"cognitive_function_score\",\n      \"display_name\": \"Cognitive Function Score\",\n      \"description\": \"Numerical or ordinal assessment of cognitive performance.\",\n      \"data_type\": \"ordinal\",\n      \"categories\": [\n        \"low\",\n        \"medium\",\n        \"high\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"functional_performance\",\n      \"aliases\": [\n        \"cognitive function\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C049\",\n        \"C050\"\n      ],\n      \"rationale\": \"Both candidates refer to cognitive function assessments; score is the more specific representation of the evidence provided.\"\n    },\n    {\n      \"local_id\": \"F03\",\n      \"canonical_name\": \"ecog_performance_status\",\n      \"display_name\": \"ECOG Performance Status\",\n      \"description\": \"Eastern Cooperative Oncology Group (ECOG) performance status scale.\",\n      \"data_type\": \"ordinal\",\n      \"categories\": [\n        \"0\",\n        \"1\",\n        \"2\",\n        \"3\",\n        \"4\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"functional_performance\",\n      \"aliases\": [\n        \"performance status\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C077\"\n      ],\n      \"rationale\": \"Standardized clinical scale for performance status.\"\n    },\n    {\n      \"local_id\": \"F04\",\n      \"canonical_name\": \"emotional_function_score\",\n      \"display_name\": \"Emotional Function Score\",\n      \"description\": \"Assessment of emotional well-being or function.\",\n      \"data_type\": \"ordinal\",\n      \"categories\": [\n        \"low\",\n        \"medium\",\n        \"high\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"functional_performance\",\n      \"aliases\": [\n        \"emotional function\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C083\",\n        \"C084\"\n      ],\n      \"rationale\": \"Merges general emotional function and specific scores into one ordinal feature.\"\n    },\n    {\n      \"local_id\": \"F05\",\n      \"canonical_name\": \"functional_status\",\n      \"display_name\": \"Functional Status\",\n      \"description\": \"General assessment of functional capacity and limitations.\",\n      \"data_type\": \"ordinal\",\n      \"categories\": [\n        \"limited\",\n        \"unlimited\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"functional_performance\",\n      \"aliases\": [\n        \"functional limitation status\",\n        \"functional status limitation\",\n        \"functional mobility/exercise tolerance\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C095\",\n        \"C096\",\n        \"C097\",\n        \"C098\"\n      ],\n      \"rationale\": \"These candidates all describe general functional capacity or limitations.\"\n    },\n    {\n      \"local_id\": \"F06\",\n      \"canonical_name\": \"global_health_status\",\n      \"display_name\": \"Global Health Status\",\n      \"description\": \"Overall assessment of the patient's health status.\",\n      \"data_type\": \"continuous\",\n      \"action\": \"extract\",\n      \"parent_object\": \"functional_performance\",\n      \"aliases\": null,\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C101\"\n      ],\n      \"rationale\": \"Continuous measurement of overall health.\"\n    },\n    {\n      \"local_id\": \"F07\",\n      \"canonical_name\": \"neurological_exam_status\",\n      \"display_name\": \"Neurological Exam Status\",\n      \"description\": \"Findings from a neurological examination.\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"intact\",\n        \"impaired\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"functional_performance\",\n      \"aliases\": null,\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C181\"\n      ],\n      \"rationale\": \"Specific clinical finding regarding neurological integrity.\"\n    },\n    {\n      \"local_id\": \"F08\",\n      \"canonical_name\": \"occupational_functional_status\",\n      \"display_name\": \"Occupational Functional Status\",\n      \"description\": \"Ability to perform work-related activities.\",\n      \"data_type\": \"categorical\",\n      \"categories\": [\n        \"capable\",\n        \"incapable\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"functional_performance\",\n      \"aliases\": [\n        \"work capacity\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C198\"\n      ],\n      \"rationale\": \"Distinct from general functional status as it focuses on work.\"\n    },\n    {\n      \"local_id\": \"F09\",\n      \"canonical_name\": \"physical_function_score\",\n      \"display_name\": \"Physical Function Score\",\n      \"description\": \"Score representing physical functional capacity.\",\n      \"data_type\": \"ordinal\",\n      \"categories\": [\n        \"low\",\n        \"medium\",\n        \"high\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"functional_performance\",\n      \"aliases\": null,\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C212\"\n      ],\n      \"rationale\": \"Specific physical function metric.\"\n    },\n    {\n      \"local_id\": \"F10\",\n      \"canonical_name\": \"role_function\",\n      \"display_name\": \"Role Function\",\n      \"description\": \"Ability to perform roles (e.g., work, social, family).\",\n      \"data_type\": \"ordinal\",\n      \"categories\": [\n        \"low\",\n        \"medium\",\n        \"high\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"functional_performance\",\n      \"aliases\": null,\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C248\"\n      ],\n      \"rationale\": \"Distinct role-based functional assessment.\"\n    },\n    {\n      \"local_id\": \"F11\",\n      \"canonical_name\": \"self_care_status\",\n      \"display_name\": \"Self-care Status\",\n      \"description\": \"Independence or assistance required for self-care activities.\",\n      \"data_type\": \"ordinal\",\n      \"categories\": [\n        \"independent\",\n        \"limited\",\n        \"dependent\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"functional_performance\",\n      \"aliases\": [\n        \"self-care assistance level\",\n        \"self-care independence\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C250\",\n        \"C251\"\n      ],\n      \"rationale\": \"Merges assistance level and independence into a single scale of self-care ability.\"\n    },\n    {\n      \"local_id\": \"F12\",\n      \"canonical_name\": \"social_function_score\",\n      \"display_name\": \"Social Function Score\",\n      \"description\": \"Score representing social functional capacity.\",\n      \"data_type\": \"ordinal\",\n      \"categories\": [\n        \"low\",\n        \"medium\",\n        \"high\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"functional_performance\",\n      \"aliases\": null,\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C257\"\n      ],\n      \"rationale\": \"Specific social function metric.\"\n    }\n  ],\n  \"candidate_mappings\": [\n    {\n      \"candidate_id\": \"C009\",\n      \"local_id\": \"F01\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for ambulation status.\"\n    },\n    {\n      \"candidate_id\": \"C010\",\n      \"local_id\": \"F01\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Alias for ambulation status.\"\n    },\n    {\n      \"candidate_id\": \"C049\",\n      \"local_id\": \"F02\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"General term for cognitive function score.\"\n    },\n    {\n      \"candidate_id\": \"C050\",\n      \"local_id\": \"F02\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"The primary score variable.\"\n    },\n    {\n      \"candidate_id\": \"C077\",\n      \"local_id\": \"F03\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Standardized ECOG scale.\"\n    },\n    {\n      \"candidate_id\": \"C083\",\n      \"local_id\": \"F04\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"General term for emotional function score.\"\n    },\n    {\n      \"candidate_id\": \"C084\",\n      \"local_id\": \"F04\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"The primary score variable.\"\n    },\n    {\n      \"candidate_id\": \"C095\",\n      \"local_id\": \"F05\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Describes functional status limitations.\"\n    },\n    {\n      \"candidate_id\": \"C096\",\n      \"local_id\": \"F05\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Describes functional mobility/tolerance.\"\n    },\n    {\n      \"candidate_id\": \"C097\",\n      \"local_id\": \"F05\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"General functional status.\"\n    },\n    {\n      \"candidate_id\": \"C098\",\n      \"local_id\": \"F05\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Describes functional status limitations.\"\n    },\n    {\n      \"candidate_id\": \"C101\",\n      \"local_id\": \"F06\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Global health status measurement.\"\n    },\n    {\n      \"candidate_id\": \"C181\",\n      \"local_id\": \"F07\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Neurological exam finding.\"\n    },\n    {\n      \"candidate_id\": \"C198\",\n      \"local_id\": \"F08\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Occupational function assessment.\"\n    },\n    {\n      \"candidate_id\": \"C212\",\n      \"local_id\": \"F09\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Physical function score.\"\n    },\n    {\n      \"candidate_id\": \"C248\",\n      \"local_id\": \"F10\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Role function assessment.\"\n    },\n    {\n      \"candidate_id\": \"C250\",\n      \"local_id\": \"F11\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Describes assistance level for self-care.\"\n    },\n    {\n      \"candidate_id\": \"C251\",\n      \"local_id\": \"F11\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Describes independence in self-care.\"\n    },\n    {\n      \"candidate_id\": \"C257\",\n      \"local_id\": \"F12\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Social function score.\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-97f32f7703129159",
+  "status": "complete",
+  "system_prompt": "You design conservative canonical clinical feature registries. The goal is to reduce redundant extraction while preserving clinically distinct variables. Use only supplied evidence. Return valid JSON only.",
+  "usage": {
+    "completion_tokens": 3221,
+    "prompt_tokens": 2729,
+    "prompt_tokens_details": null,
+    "total_tokens": 5950
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nDomain: functional_performance\n\nHarmonize the following candidate feature names. Apply these distinctions carefully:\n\n- Merge true aliases that ask for the same patient-level variable.\n- Represent categories or values of one variable under one canonical feature when appropriate.\n- Mark a feature `derive` only when it can be calculated from other canonical base variables without reading the clinical text again.\n- Keep clinically related but non-equivalent measurements or findings separate.\n- Use `subfield_of` to connect distinct fields that belong to one reusable clinical object.\n- Drop only clear artifacts or redundant aliases. Use `review` when a safe extraction contract cannot be specified.\n- Preserve provenance: every candidate ID must map exactly once.\n- Do not assign a role in the clinical task.\n\nAllowed data types: [\"binary\", \"categorical\", \"continuous\", \"count\", \"ordinal\", \"text\"]\nAllowed actions: [\"derive\", \"drop\", \"extract\", \"review\"]\nAllowed mapping relations: [\"alias_of\", \"base_variable\", \"derived_from\", \"drop\", \"related_but_distinct\", \"review\", \"subfield_of\"]\n\nFor binary features, categories must be [\"absent\", \"present\", \"unknown\"]. For categorical or ordinal features, provide a conservative explicit category list including \"unknown\". Continuous and count features have no categories. Text features should normally be marked `review`, not `extract`.\n\nFor derivations, use this schema when executable; otherwise use operation `not_automated`:\n{\"operation\": \"ratio | threshold | category_map | not_automated\", \"inputs\": [\"canonical_name\"], \"parameters\": {}}\n\nCandidates:\n[{\"candidate_id\": \"C009\", \"name\": \"Ambulation Ability\", \"occurrence_count\": 1, \"topic_ranks\": [23], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Ambulation Status\"], \"evidence_terms\": [\"2 ambulatory\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"ambulatory\"]}, {\"candidate_id\": \"C010\", \"name\": \"Ambulatory capacity\", \"occurrence_count\": 1, \"topic_ranks\": [56], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Ambulatory status\"], \"evidence_terms\": [\"ambulatory capable of\", \"ambulatory capable\", \"2 ambulatory capable\"], \"feature_type_hints\": [\"functional status\"], \"represented_values_or_categories\": [\"capable\"]}, {\"candidate_id\": \"C049\", \"name\": \"Cognitive function\", \"occurrence_count\": 1, \"topic_ranks\": [25], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Cognitive function\"], \"evidence_terms\": [\"cognitive function 75\"], \"feature_type_hints\": [\"functional_status\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C050\", \"name\": \"Cognitive function score\", \"occurrence_count\": 1, \"topic_ranks\": [8], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Cognitive function\"], \"evidence_terms\": [\"cognitive function 60\", \"50 100 cognitive\"], \"feature_type_hints\": [\"functional_status\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C077\", \"name\": \"ECOG Performance Status\", \"occurrence_count\": 2, \"topic_ranks\": [9, 23], \"representation_votes\": {\"ordinal\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"ECOG Performance Status\"], \"evidence_terms\": [\"performance status 2\", \"status 2\", \"status 2 -\", \"4. ecog performance\"], \"feature_type_hints\": [\"ordinal\"], \"represented_values_or_categories\": [\"2\"]}, {\"candidate_id\": \"C083\", \"name\": \"Emotional function\", \"occurrence_count\": 1, \"topic_ranks\": [25], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Emotional function\"], \"evidence_terms\": [\"emotional function 65\"], \"feature_type_hints\": [\"functional_status\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C084\", \"name\": \"Emotional function score\", \"occurrence_count\": 1, \"topic_ranks\": [8], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Emotional function\"], \"evidence_terms\": [\"emotional function 50\"], \"feature_type_hints\": [\"functional_status\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C095\", \"name\": \"Functional Limitation Status\", \"occurrence_count\": 1, \"topic_ranks\": [23], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Functional Status\"], \"evidence_terms\": [\"2 - functional\", \"- functional\", \"functional but limited\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"limited\"]}, {\"candidate_id\": \"C096\", \"name\": \"Functional mobility/exercise tolerance\", \"occurrence_count\": 1, \"topic_ranks\": [38], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [], \"evidence_terms\": [], \"feature_type_hints\": [], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C097\", \"name\": \"Functional status\", \"occurrence_count\": 2, \"topic_ranks\": [40, 54], \"representation_votes\": {\"ordinal\": 2}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Functional status\"], \"evidence_terms\": [\"function 75 100\", \"function 75\", \"function 70\", \"function 70 100\", \"limited functional\", \"- limited functional\", \"- limited\", \"3 - limited\"], \"feature_type_hints\": [\"clinical_assessment\", \"clinical_status\"], \"represented_values_or_categories\": [\"limited\"]}, {\"candidate_id\": \"C098\", \"name\": \"Functional status limitation\", \"occurrence_count\": 1, \"topic_ranks\": [57], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Functional status\"], \"evidence_terms\": [\"limited functional\", \"- limited functional\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"limited\"]}, {\"candidate_id\": \"C101\", \"name\": \"Global health status\", \"occurrence_count\": 1, \"topic_ranks\": [6], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Global Health Status\"], \"evidence_terms\": [\"global health 40\", \"health 40\"], \"feature_type_hints\": [\"patient_reported_outcome\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C181\", \"name\": \"Neurological exam status\", \"occurrence_count\": 1, \"topic_ranks\": [47], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Neurological examination status\"], \"evidence_terms\": [\"grossly intact\", \"neurologic grossly\", \"neurologic grossly intact\", \"grossly\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"grossly intact\"]}, {\"candidate_id\": \"C198\", \"name\": \"Occupational functional status\", \"occurrence_count\": 1, \"topic_ranks\": [56], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Work capacity\"], \"evidence_terms\": [\"out work activities\", \"out work\", \"carry out work\", \"work activities\", \"work\"], \"feature_type_hints\": [\"functional status\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C212\", \"name\": \"Physical function score\", \"occurrence_count\": 1, \"topic_ranks\": [8], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Physical function\"], \"evidence_terms\": [\"physical function 55\"], \"feature_type_hints\": [\"functional_status\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C248\", \"name\": \"Role function\", \"occurrence_count\": 1, \"topic_ranks\": [25], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"low\", \"supporting_specific_features\": [], \"evidence_terms\": [], \"feature_type_hints\": [], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C250\", \"name\": \"Self-care assistance level\", \"occurrence_count\": 1, \"topic_ranks\": [57], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Self-care assistance level\"], \"evidence_terms\": [\"self-care\", \"assistance\", \"3 - limited\"], \"feature_type_hints\": [\"ordinal\"], \"represented_values_or_categories\": [\"limited\"]}, {\"candidate_id\": \"C251\", \"name\": \"Self-care independence\", \"occurrence_count\": 1, \"topic_ranks\": [56], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Self-care ability\"], \"evidence_terms\": [\"capable of self-care\", \"of self-care but\", \"self-care but unable\", \"of self-care\"], \"feature_type_hints\": [\"functional status\"], \"represented_values_or_categories\": [\"capable\", \"unable\"]}, {\"candidate_id\": \"C257\", \"name\": \"Social function score\", \"occurrence_count\": 1, \"topic_ranks\": [8], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Social function\"], \"evidence_terms\": [\"60 100 social\"], \"feature_type_hints\": [\"functional_status\"], \"represented_values_or_categories\": []}]\n\nReturn:\n{\n  \"canonical_features\": [\n    {\n      \"local_id\": \"F01\",\n      \"canonical_name\": \"snake_case_name\",\n      \"display_name\": \"Readable name\",\n      \"description\": \"Precise extraction definition with aliases where useful\",\n      \"data_type\": \"binary | categorical | ordinal | continuous | count | text\",\n      \"categories\": [\"value\"] or null,\n      \"action\": \"extract | derive | drop | review\",\n      \"parent_object\": \"optional snake_case object name\" or null,\n      \"aliases\": [\"source wording\"],\n      \"derivation\": object or null,\n      \"source_candidate_ids\": [\"C001\"],\n      \"rationale\": \"short explanation\"\n    }\n  ],\n  \"candidate_mappings\": [\n    {\n      \"candidate_id\": \"C001\",\n      \"local_id\": \"F01\",\n      \"relation\": \"alias_of | base_variable | derived_from | subfield_of | related_but_distinct | drop | review\",\n      \"rationale\": \"short explanation\"\n    }\n  ]\n}"
+}

@@ -1,0 +1,106 @@
+{
+  "concepts": [
+    {
+      "name": "PD-L1 Expression Level",
+      "supporting_phrases": [
+        "pd-l1 <1",
+        "low pd-l1 expression",
+        "high pd-l1 expression",
+        "high pd-l1",
+        "pd-l1 <1 %.",
+        "<1",
+        "1 % low",
+        "tps >="
+      ],
+      "direction": "mixed",
+      "confidence": "high",
+      "artifact_likelihood": "low",
+      "rationale": "Strong correlation between PD-L1 expression levels (TPS) and treatment response."
+    },
+    {
+      "name": "NSCLC Pathology",
+      "supporting_phrases": [
+        "carcinoma adenocarcinoma",
+        "lung carcinoma adenocarcinoma",
+        "- metastatic nsclc",
+        "cancer nsclc -",
+        "lobe primary nsclc"
+      ],
+      "direction": "higher",
+      "confidence": "high",
+      "artifact_likelihood": "low",
+      "rationale": "Specific lung cancer subtypes/stages associated with higher benefit."
+    },
+    {
+      "name": "Vena Cava Involvement",
+      "supporting_phrases": [
+        "cava",
+        "vena cava",
+        "superior vena cava",
+        "vena",
+        "superior vena"
+      ],
+      "direction": "lower",
+      "confidence": "medium",
+      "artifact_likelihood": "low",
+      "rationale": "Anatomical location involving the vena cava correlates with lower benefit."
+    },
+    {
+      "name": "Syndrome/Symptom Burden",
+      "supporting_phrases": [
+        "syndromes --- physical",
+        "neurologic symptoms or",
+        "syndromes ---",
+        "cancer syndromes ---",
+        "pain palpitations or"
+      ],
+      "direction": "lower",
+      "confidence": "medium",
+      "artifact_likelihood": "medium",
+      "rationale": "Presence of physical or neurologic syndromes correlates with reduced benefit."
+    },
+    {
+      "name": "Spinal Canal Involvement",
+      "supporting_phrases": [
+        "canal",
+        "spinal",
+        "spinal canal"
+      ],
+      "direction": "higher",
+      "confidence": "medium",
+      "artifact_likelihood": "low",
+      "rationale": "Spinal canal-related findings correlate with higher benefit."
+    },
+    {
+      "name": "Lung Involvement",
+      "supporting_phrases": [
+        "lung no",
+        "lung no new"
+      ],
+      "direction": "higher",
+      "confidence": "low",
+      "artifact_likelihood": "high",
+      "rationale": "Phrases likely truncated or part of negative findings."
+    },
+    {
+      "name": "Renal Function",
+      "supporting_phrases": [
+        "kidneys"
+      ],
+      "direction": "higher",
+      "confidence": "low",
+      "artifact_likelihood": "medium",
+      "rationale": "Single-word mention of kidneys lacks sufficient context."
+    }
+  ],
+  "assessment": {
+    "most_credible_modifier": "PD-L1 Expression Level (consistent directionality and high z-scores across multiple threshold variants).",
+    "likely_artifacts": [
+      "nkda social history (clinical note template)",
+      "55. (numerical artifact)",
+      "hour <new (template artifact)",
+      "is within (grammatical fragment)",
+      "reasonable (subjective descriptor)"
+    ]
+  }
+}

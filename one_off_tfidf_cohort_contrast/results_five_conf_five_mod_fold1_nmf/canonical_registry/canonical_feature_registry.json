@@ -1,0 +1,5130 @@
+{
+  "candidate_mappings": [
+    {
+      "candidate_id": "C001",
+      "canonical_id": "laboratory_vitals__absolute_neutrophil_count",
+      "rationale": "C001 is the canonical name for ANC.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C002",
+      "canonical_id": "systemic_treatments_medications__adjuvant_treatment_history",
+      "rationale": "Both refer to adjuvant history.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C003",
+      "canonical_id": "systemic_treatments_medications__adjuvant_treatment_history",
+      "rationale": "Both refer to adjuvant history.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C004",
+      "canonical_id": "imaging_disease_sites__adrenal_gland_metastasis",
+      "rationale": "Alias for adrenal gland metastasis.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C005",
+      "canonical_id": "imaging_disease_sites__adrenal_gland_metastasis",
+      "rationale": "Alias for adrenal gland metastasis.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C006",
+      "canonical_id": "demographics_social__age",
+      "rationale": "Age is a standard demographic variable.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C007",
+      "canonical_id": "demographics_social__alcohol_intake_frequency",
+      "rationale": "Directly maps to alcohol intake frequency.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C008",
+      "canonical_id": "molecular_biomarkers__alk_mutation_status",
+      "rationale": "Direct mapping to ALK status.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C009",
+      "canonical_id": "functional_performance__ambulation_status",
+      "rationale": "Alias for ambulation status.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C010",
+      "canonical_id": "functional_performance__ambulation_status",
+      "rationale": "Alias for ambulation status.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C011",
+      "canonical_id": "imaging_disease_sites__lung_nodule_location",
+      "rationale": "Refers to lung/nodule location.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C012",
+      "canonical_id": "imaging_disease_sites__brain_metastasis_location",
+      "rationale": "Alias for brain metastasis location.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C013",
+      "canonical_id": "imaging_disease_sites__brain_metastasis_location",
+      "rationale": "Alias for brain metastasis location.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C014",
+      "canonical_id": "laboratory_vitals__anemia_status",
+      "rationale": "Direct extraction of anemia status.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C015",
+      "canonical_id": "symptoms_patient_reported__anxiety_severity",
+      "rationale": "Anxiety severity is a more specific version of anxiety status.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C016",
+      "canonical_id": "symptoms_patient_reported__anxiety_severity",
+      "rationale": "Anxiety status is the base concept.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C017",
+      "canonical_id": "imaging_disease_sites__suvmax",
+      "rationale": "ADC is a measurement related to FDG/SUV context, but here treated as a separate continuous value if needed; however, SUVmax is the primary quantitative feature.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C018",
+      "canonical_id": "symptoms_patient_reported__appetite_loss",
+      "rationale": "Direct symptom.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C019",
+      "canonical_id": "laboratory_vitals__aspartate_aminotransferase",
+      "rationale": "AST is an alias for Aspartate Aminotransferase.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C020",
+      "canonical_id": "laboratory_vitals__aspartate_aminotransferase",
+      "rationale": "AST level is an alias for AST.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C021",
+      "canonical_id": "laboratory_vitals__aspartate_aminotransferase",
+      "rationale": "Cardiac function is a status/finding, not a specific lab measurement like AST.",
+      "relation": "related_but_distinct"
+    },
+    {
+      "candidate_id": "C022",
+      "canonical_id": "laboratory_vitals__dlco",
+      "rationale": "Pulmonary function status is a clinical assessment, whereas DLCO is a specific measurement.",
+      "relation": "related_but_distinct"
+    },
+    {
+      "candidate_id": "C023",
+      "canonical_id": "demographics_social__biological_sex",
+      "rationale": "Biological sex is a synonym for sex in this context.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C024",
+      "canonical_id": "demographics_social__biological_sex",
+      "rationale": "Redundant alias for biological sex.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C025",
+      "canonical_id": "laboratory_vitals__blood_urea_nitrogen",
+      "rationale": "BUN is a standard lab measurement.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C026",
+      "canonical_id": "demographics_social__body_mass_index",
+      "rationale": "BMI is a distinct measurement.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C027",
+      "canonical_id": "demographics_social__body_weight",
+      "rationale": "Weight is a base measurement.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C028",
+      "canonical_id": "symptoms_patient_reported__bone_pain",
+      "rationale": "Describes the same clinical finding of bone pain/metastasis.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C029",
+      "canonical_id": "symptoms_patient_reported__bone_pain",
+      "rationale": "Describes the same clinical finding of bone pain.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C030",
+      "canonical_id": "imaging_disease_sites__brain_lesion_diameter",
+      "rationale": "Alias for brain lesion diameter.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C031",
+      "canonical_id": "imaging_disease_sites__brain_metastasis_location",
+      "rationale": "Alias for brain metastasis location.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C032",
+      "canonical_id": "imaging_disease_sites__brain_metastasis_presence",
+      "rationale": "Alias for brain metastasis presence.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C033",
+      "canonical_id": "imaging_disease_sites__brain_metastasis_location",
+      "rationale": "Alias for brain metastasis location.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C034",
+      "canonical_id": "imaging_disease_sites__brain_metastasis_presence",
+      "rationale": "Alias for brain metastasis presence.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C035",
+      "canonical_id": "imaging_disease_sites__brain_metastasis_presence",
+      "rationale": "Alias for brain metastasis presence.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C036",
+      "canonical_id": "imaging_disease_sites__lesion_calcification",
+      "rationale": "Alias for lesion calcification.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C037",
+      "canonical_id": "diagnosis_stage_histology__cancer_diagnosis_date",
+      "rationale": "Directly represents the diagnosis date.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C038",
+      "canonical_id": "diagnosis_stage_histology__cancer_stage",
+      "rationale": "Base variable for cancer stage.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C039",
+      "canonical_id": "systemic_treatments_medications__care_intent",
+      "rationale": "Direct extraction of care intent.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C040",
+      "canonical_id": "molecular_biomarkers__cdkn2a_status",
+      "rationale": "Part of CDKN2A status.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C041",
+      "canonical_id": "molecular_biomarkers__cdkn2a_status",
+      "rationale": "Specific type of CDKN2A status.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C042",
+      "canonical_id": "molecular_biomarkers__cdkn2a_status",
+      "rationale": "Part of CDKN2A status.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C043",
+      "canonical_id": "systemic_treatments_medications__chemotherapy_cycle_interval",
+      "rationale": "Cycle interval is the same as cycle frequency.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C044",
+      "canonical_id": "systemic_treatments_medications__chemotherapy_regimen_type",
+      "rationale": "Specific regimen type.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C045",
+      "canonical_id": "symptoms_patient_reported__chest_pain",
+      "rationale": "Direct symptom.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C046",
+      "canonical_id": "symptoms_patient_reported__chills",
+      "rationale": "Direct symptom.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C047",
+      "canonical_id": "molecular_biomarkers__ck5_expression_status",
+      "rationale": "Direct mapping to CK5 IHC.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C048",
+      "canonical_id": "diagnosis_stage_histology__cancer_stage",
+      "rationale": "Clinical stage is a type of cancer stage.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C049",
+      "canonical_id": "functional_performance__cognitive_function_score",
+      "rationale": "General term for cognitive function score.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C050",
+      "canonical_id": "functional_performance__cognitive_function_score",
+      "rationale": "The primary score variable.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C051",
+      "canonical_id": "laboratory_vitals__complete_blood_count",
+      "rationale": "CBC is a high-level test container.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C052",
+      "canonical_id": "systemic_treatments_medications__chemotherapy_cycle_count",
+      "rationale": "Count of cycles.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C053",
+      "canonical_id": "symptoms_patient_reported__constipation",
+      "rationale": "Direct symptom.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C054",
+      "canonical_id": "symptoms_patient_reported__constipation",
+      "rationale": "Constipation incidence is a variation of constipation presence.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C055",
+      "canonical_id": "imaging_disease_sites__imaging_modality",
+      "rationale": "Refers to MRI modality.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C056",
+      "canonical_id": "symptoms_patient_reported__cough",
+      "rationale": "Base cough symptom.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C057",
+      "canonical_id": "symptoms_patient_reported__cough",
+      "rationale": "Cough frequency is a characteristic of cough.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C058",
+      "canonical_id": "symptoms_patient_reported__cough",
+      "rationale": "Cough severity is a characteristic of cough.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C059",
+      "canonical_id": "symptoms_patient_reported__cough",
+      "rationale": "Cough type is a characteristic of cough.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C060",
+      "canonical_id": "imaging_disease_sites__brain_lesion_count",
+      "rationale": "Alias for brain lesion count.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C061",
+      "canonical_id": "imaging_disease_sites__unclassified_ct_findings",
+      "rationale": "Text-derived CT findings are too broad for a canonical feature.",
+      "relation": "review"
+    },
+    {
+      "candidate_id": "C062",
+      "canonical_id": "imaging_disease_sites__imaging_modality",
+      "rationale": "Refers to imaging modality.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C063",
+      "canonical_id": "systemic_treatments_medications__current_chemotherapy_cycle_number",
+      "rationale": "Ordinal cycle number.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C064",
+      "canonical_id": "systemic_treatments_medications__chemotherapy_cycle_interval",
+      "rationale": "Days since start is a different measurement than cycle interval.",
+      "relation": "related_but_distinct"
+    },
+    {
+      "candidate_id": "C065",
+      "canonical_id": "diagnosis_stage_histology__diagnosis_type",
+      "rationale": "Identifies the diagnosis type.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C066",
+      "canonical_id": "symptoms_patient_reported__diarrhea",
+      "rationale": "Direct symptom.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C067",
+      "canonical_id": "symptoms_patient_reported__diarrhea",
+      "rationale": "Diarrhea incidence is a variation of diarrhea presence.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C068",
+      "canonical_id": "imaging_disease_sites__imaging_modality",
+      "rationale": "Refers to imaging modality (DWI).",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C069",
+      "canonical_id": "diagnosis_stage_histology__disease_recurrence_status",
+      "rationale": "Base variable for recurrence status.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C070",
+      "canonical_id": "symptoms_patient_reported__dizziness",
+      "rationale": "Direct symptom.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C071",
+      "canonical_id": "laboratory_vitals__dlco",
+      "rationale": "DLCO is the canonical name.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C072",
+      "canonical_id": "laboratory_vitals__dlco",
+      "rationale": "DLCO measurement is an alias.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C073",
+      "canonical_id": "systemic_treatments_medications__chemotherapy_cycle_interval",
+      "rationale": "Frequency and interval are synonymous in this context.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C074",
+      "canonical_id": "symptoms_patient_reported__cough",
+      "rationale": "Dry cough is a type of cough.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C075",
+      "canonical_id": "symptoms_patient_reported__dyspnea",
+      "rationale": "Base dyspnea symptom.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C076",
+      "canonical_id": "symptoms_patient_reported__dyspnea",
+      "rationale": "Dyspnea severity is a characteristic of dyspnea.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C077",
+      "canonical_id": "functional_performance__ecog_performance_status",
+      "rationale": "Standardized ECOG scale.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C078",
+      "canonical_id": "laboratory_vitals__estimated_glomerular_filtration_rate",
+      "rationale": "eGFR is an alias for estimated glomerular filtration rate.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C079",
+      "canonical_id": "molecular_biomarkers__egfr_amplification_status",
+      "rationale": "Direct mapping to EGFR amplification.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C080",
+      "canonical_id": "molecular_biomarkers__egfr_mutation_status",
+      "rationale": "Specific EGFR mutation variant.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C081",
+      "canonical_id": "molecular_biomarkers__egfr_mutation_status",
+      "rationale": "General EGFR mutation status.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C082",
+      "canonical_id": "molecular_biomarkers__egfr_mutation_status",
+      "rationale": "General EGFR mutation/deletion status.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C083",
+      "canonical_id": "functional_performance__emotional_function_score",
+      "rationale": "General term for emotional function score.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C084",
+      "canonical_id": "functional_performance__emotional_function_score",
+      "rationale": "The primary score variable.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C085",
+      "canonical_id": "laboratory_vitals__creatinine_clearance",
+      "rationale": "Creatinine clearance is a distinct renal measurement.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C086",
+      "canonical_id": "laboratory_vitals__estimated_glomerular_filtration_rate",
+      "rationale": "eGFR is an alias.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C087",
+      "canonical_id": "diagnosis_stage_histology__disease_recurrence_status",
+      "rationale": "Evidence of recurrence is an indicator of status.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C088",
+      "canonical_id": "imaging_disease_sites__unclassified_extra_axial_findings",
+      "rationale": "Extra-axial fluid collection is a specific finding that may require review.",
+      "relation": "review"
+    },
+    {
+      "candidate_id": "C089",
+      "canonical_id": "symptoms_patient_reported__fatigue_severity",
+      "rationale": "Fatigue is the base concept for fatigue severity.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C090",
+      "canonical_id": "symptoms_patient_reported__fatigue_severity",
+      "rationale": "Fatigue severity is the specific variable.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C091",
+      "canonical_id": "imaging_disease_sites__fdg_avidity",
+      "rationale": "Alias for FDG avidity.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C092",
+      "canonical_id": "imaging_disease_sites__fdg_avidity",
+      "rationale": "Alias for FDG avidity.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C093",
+      "canonical_id": "symptoms_patient_reported__fever",
+      "rationale": "Direct symptom.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C094",
+      "canonical_id": "symptoms_patient_reported__focal_neurological_deficit",
+      "rationale": "Direct symptom.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C095",
+      "canonical_id": "functional_performance__functional_status",
+      "rationale": "Describes functional status limitations.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C096",
+      "canonical_id": "functional_performance__functional_status",
+      "rationale": "Describes functional mobility/tolerance.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C097",
+      "canonical_id": "functional_performance__functional_status",
+      "rationale": "General functional status.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C098",
+      "canonical_id": "functional_performance__functional_status",
+      "rationale": "Describes functional status limitations.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C099",
+      "canonical_id": "symptoms_patient_reported__focal_neurological_deficit",
+      "rationale": "Gait deficit is a type of focal neurological deficit.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C100",
+      "canonical_id": "molecular_biomarkers__germline_mutation_status",
+      "rationale": "Direct mapping to germline status.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C101",
+      "canonical_id": "functional_performance__global_health_status",
+      "rationale": "Global health status measurement.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C102",
+      "canonical_id": "laboratory_vitals__estimated_glomerular_filtration_rate",
+      "rationale": "GFR proxy is an alias for eGFR.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C103",
+      "canonical_id": "administrative_artifact__goals_of_care_documentation",
+      "rationale": "C103 is the primary source for the documentation status feature.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C104",
+      "canonical_id": "systemic_treatments_medications__growth_factor_support",
+      "rationale": "Binary indicator of growth factor use.",
+      "relation": "subfield_of"
+    },
+    {
+      "candidate_id": "C105",
+      "canonical_id": "systemic_treatments_medications__growth_factor_support",
+      "rationale": "Categorical setting of growth factor use.",
+      "relation": "subfield_of"
+    },
+    {
+      "candidate_id": "C106",
+      "canonical_id": "symptoms_patient_reported__headache",
+      "rationale": "Direct symptom.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C107",
+      "canonical_id": "laboratory_vitals__heart_rate",
+      "rationale": "Heart rate is a vital sign.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C108",
+      "canonical_id": "laboratory_vitals__hemoglobin",
+      "rationale": "Hemoglobin level is an alias.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C109",
+      "canonical_id": "laboratory_vitals__hemoglobin",
+      "rationale": "Hemoglobin level is an alias.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C110",
+      "canonical_id": "symptoms_patient_reported__hemoptysis",
+      "rationale": "Direct symptom.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C111",
+      "canonical_id": "imaging_disease_sites__hepatic_lesion_location",
+      "rationale": "Hepatic segment location.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C112",
+      "canonical_id": "diagnosis_stage_histology__histologic_subtype",
+      "rationale": "Base variable for histology.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C113",
+      "canonical_id": "diagnosis_stage_histology__histologic_subtype",
+      "rationale": "Histological subtype is an alias for histology.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C114",
+      "canonical_id": "diagnosis_stage_histology__histologic_subtype",
+      "rationale": "Specific subtype mention.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C115",
+      "canonical_id": "diagnosis_stage_histology__histologic_subtype",
+      "rationale": "Histology is an alias for histologic subtype.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C116",
+      "canonical_id": "diagnosis_stage_histology__histologic_subtype",
+      "rationale": "Histology of lung tumor is an alias.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C117",
+      "canonical_id": "diagnosis_stage_histology__histologic_subtype",
+      "rationale": "Histology subtype is an alias.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C118",
+      "canonical_id": "procedures_surgery_radiation__history_of_blood_transfusion",
+      "rationale": "Direct match.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C119",
+      "canonical_id": "procedures_surgery_radiation__history_of_lobectomy",
+      "rationale": "Specific lobectomy type is a subset of lobectomy history.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C120",
+      "canonical_id": "procedures_surgery_radiation__history_of_lobectomy",
+      "rationale": "General lobectomy history.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C121",
+      "canonical_id": "procedures_surgery_radiation__history_of_lobectomy",
+      "rationale": "Specific lobectomy type is a subset of lobectomy history.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C122",
+      "canonical_id": "procedures_surgery_radiation__history_of_palliative_radiation_therapy",
+      "rationale": "Direct match for palliative radiation.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C123",
+      "canonical_id": "procedures_surgery_radiation__history_of_stereotactic_radiosurgery",
+      "rationale": "Direct match for SRS.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C124",
+      "canonical_id": "procedures_surgery_radiation__history_of_stereotactic_radiosurgery",
+      "rationale": "SRS for brain metastases is a type of SRS.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C125",
+      "canonical_id": "procedures_surgery_radiation__history_of_whole_brain_radiation_therapy",
+      "rationale": "Direct match for WBRT.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C126",
+      "canonical_id": "laboratory_vitals__hyperlipidemia_status",
+      "rationale": "Hyperlipidemia status is a clinical finding.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C127",
+      "canonical_id": "laboratory_vitals__hypertension_control_status",
+      "rationale": "Hypertension control is a categorical status.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C128",
+      "canonical_id": "imaging_disease_sites__imaging_modality",
+      "rationale": "Refers to imaging modality (SWI).",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C129",
+      "canonical_id": "imaging_disease_sites__brain_metastasis_presence",
+      "rationale": "Alias for brain metastasis presence.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C130",
+      "canonical_id": "imaging_disease_sites__brain_metastasis_presence",
+      "rationale": "Alias for brain metastasis presence.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C131",
+      "canonical_id": "imaging_disease_sites__brain_lesion_enhancement",
+      "rationale": "Alias for brain lesion enhancement.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C132",
+      "canonical_id": "molecular_biomarkers__ki67_index",
+      "rationale": "Direct mapping to Ki-67.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C133",
+      "canonical_id": "molecular_biomarkers__kras_mutation_status",
+      "rationale": "Specific KRAS mutation.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C134",
+      "canonical_id": "molecular_biomarkers__kras_mutation_status",
+      "rationale": "General KRAS status.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C135",
+      "canonical_id": "imaging_disease_sites__brain_lesion_diameter",
+      "rationale": "Alias for brain lesion diameter.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C136",
+      "canonical_id": "imaging_disease_sites__hepatic_lesion_diameter",
+      "rationale": "Alias for hepatic lesion diameter.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C137",
+      "canonical_id": "imaging_disease_sites__brain_metastasis_location",
+      "rationale": "Alias for brain metastasis location.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C138",
+      "canonical_id": "laboratory_vitals__lactate_dehydrogenase",
+      "rationale": "LDH is a standard lab measurement.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C139",
+      "canonical_id": "imaging_disease_sites__adrenal_gland_metastasis",
+      "rationale": "Alias for adrenal gland metastasis.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C140",
+      "canonical_id": "imaging_disease_sites__lung_nodule_diameter",
+      "rationale": "Alias for lung nodule diameter.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C141",
+      "canonical_id": "imaging_disease_sites__lung_nodule_characteristics",
+      "rationale": "Alias for lesion enhancement pattern.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C142",
+      "canonical_id": "imaging_disease_sites__lung_nodule_characteristics",
+      "rationale": "Alias for lesion enhancement status.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C143",
+      "canonical_id": "systemic_treatments_medications__medication_use",
+      "rationale": "Specific medication use.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C144",
+      "canonical_id": "systemic_treatments_medications__medication_use",
+      "rationale": "Specific medication use.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C145",
+      "canonical_id": "imaging_disease_sites__liver_metastasis",
+      "rationale": "Alias for liver metastasis.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C146",
+      "canonical_id": "demographics_social__living_arrangement",
+      "rationale": "Living arrangement is a social determinant.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C147",
+      "canonical_id": "procedures_surgery_radiation__history_of_lobectomy",
+      "rationale": "Lobectomy performed is a subset of lobectomy history.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C148",
+      "canonical_id": "procedures_surgery_radiation__lymph_node_dissection_status",
+      "rationale": "Dissection extent is part of dissection status.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C149",
+      "canonical_id": "procedures_surgery_radiation__lymph_node_dissection_status",
+      "rationale": "Dissection status is the canonical variable.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C150",
+      "canonical_id": "diagnosis_stage_histology__lymph_node_involvement",
+      "rationale": "Low confidence and no evidence terms provided.",
+      "relation": "review"
+    },
+    {
+      "candidate_id": "C151",
+      "canonical_id": "imaging_disease_sites__lymph_node_metastasis",
+      "rationale": "Alias for lymph node metastasis.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C152",
+      "canonical_id": "imaging_disease_sites__lymph_node_short_axis_diameter",
+      "rationale": "Alias for lymph node short axis diameter.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C153",
+      "canonical_id": "imaging_disease_sites__lymph_node_metastasis",
+      "rationale": "Alias for lymph node metastasis.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C154",
+      "canonical_id": "demographics_social__marital_status",
+      "rationale": "Marital status is a distinct demographic variable.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C155",
+      "canonical_id": "other__maternal_breast_cancer_history",
+      "rationale": "Primary candidate for maternal history.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C156",
+      "canonical_id": "imaging_disease_sites__suvmax",
+      "rationale": "Alias for SUVmax.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C157",
+      "canonical_id": "procedures_surgery_radiation__lymph_node_dissection_status",
+      "rationale": "Mediastinal dissection is a specific category of dissection status.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C158",
+      "canonical_id": "procedures_surgery_radiation__lymph_node_dissection_status",
+      "rationale": "Mediastinal dissection is a specific category of dissection status.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C159",
+      "canonical_id": "imaging_disease_sites__mediastinal_hilar_lymphadenopathy",
+      "rationale": "Alias for mediastinal/hilar lymphadenopathy.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C160",
+      "canonical_id": "imaging_disease_sites__mediastinal_hilar_lymphadenopathy",
+      "rationale": "Alias for mediastinal/hilar lymphadenopathy.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C161",
+      "canonical_id": "imaging_disease_sites__mediastinal_hilar_lymphadenopathy",
+      "rationale": "Alias for mediastinal/hilar lymphadenopathy.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C162",
+      "canonical_id": "imaging_disease_sites__mediastinal_hilar_lymphadenopathy",
+      "rationale": "Alias for mediastinal/hilar lymphadenopathy.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C163",
+      "canonical_id": "systemic_treatments_medications__medication_administration_details",
+      "rationale": "Frequency is part of administration details.",
+      "relation": "subfield_of"
+    },
+    {
+      "candidate_id": "C164",
+      "canonical_id": "systemic_treatments_medications__medication_administration_details",
+      "rationale": "Route is part of administration details.",
+      "relation": "subfield_of"
+    },
+    {
+      "candidate_id": "C165",
+      "canonical_id": "systemic_treatments_medications__medication_administration_details",
+      "rationale": "Frequency is part of administration details.",
+      "relation": "subfield_of"
+    },
+    {
+      "candidate_id": "C166",
+      "canonical_id": "molecular_biomarkers__met_genomic_status",
+      "rationale": "Part of MET genomic status.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C167",
+      "canonical_id": "molecular_biomarkers__met_copy_number",
+      "rationale": "Direct mapping to MET copy number.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C168",
+      "canonical_id": "systemic_treatments_medications__medication_use",
+      "rationale": "Specific medication class use.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C169",
+      "canonical_id": "molecular_biomarkers__met_genomic_status",
+      "rationale": "Part of MET genomic status.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C170",
+      "canonical_id": "imaging_disease_sites__brain_metastasis_location",
+      "rationale": "Alias for brain metastasis location.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C171",
+      "canonical_id": "imaging_disease_sites__brain_metastasis_location",
+      "rationale": "Alias for brain metastasis location.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C172",
+      "canonical_id": "diagnosis_stage_histology__mitotic_activity",
+      "rationale": "Base variable for mitotic activity.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C173",
+      "canonical_id": "molecular_biomarkers__kras_mutation_status",
+      "rationale": "Driver status is a subset of KRAS mutation status.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C174",
+      "canonical_id": "systemic_treatments_medications__medication_use",
+      "rationale": "Specific medication use.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C175",
+      "canonical_id": "laboratory_vitals__neutropenia_grade",
+      "rationale": "Myelosuppression is a broad clinical finding, whereas Neutropenia grade is a specific measurement.",
+      "relation": "related_but_distinct"
+    },
+    {
+      "candidate_id": "C176",
+      "canonical_id": "molecular_biomarkers__napsin_a_expression",
+      "rationale": "Napsin A expression status.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C177",
+      "canonical_id": "molecular_biomarkers__napsin_a_expression",
+      "rationale": "Napsin A expression status.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C178",
+      "canonical_id": "symptoms_patient_reported__nausea_severity",
+      "rationale": "Nausea presence is part of nausea severity.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C179",
+      "canonical_id": "symptoms_patient_reported__nausea_severity",
+      "rationale": "Nausea grade is a synonym for nausea severity.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C180",
+      "canonical_id": "symptoms_patient_reported__nausea_severity",
+      "rationale": "Nausea severity is the specific variable.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C181",
+      "canonical_id": "functional_performance__neurological_exam_status",
+      "rationale": "Neurological exam finding.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C182",
+      "canonical_id": "symptoms_patient_reported__focal_neurological_deficit",
+      "rationale": "Neurological focal deficits is a synonym for focal neurological deficit.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C183",
+      "canonical_id": "laboratory_vitals__neutropenia_grade",
+      "rationale": "Neutropenia (the condition) is related to but distinct from the grade (the ordinal value).",
+      "relation": "related_but_distinct"
+    },
+    {
+      "candidate_id": "C184",
+      "canonical_id": "laboratory_vitals__neutropenia_grade",
+      "rationale": "Neutropenia grade is the canonical ordinal feature.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C185",
+      "canonical_id": "imaging_disease_sites__lung_nodule_diameter",
+      "rationale": "Alias for lung nodule diameter.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C186",
+      "canonical_id": "imaging_disease_sites__lymph_node_metastasis",
+      "rationale": "Alias for lymph node metastasis.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C187",
+      "canonical_id": "imaging_disease_sites__lymph_node_metastasis",
+      "rationale": "Alias for lymph node metastasis.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C188",
+      "canonical_id": "imaging_disease_sites__lesion_calcification",
+      "rationale": "Alias for lesion calcification.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C189",
+      "canonical_id": "imaging_disease_sites__lung_nodule_characteristics",
+      "rationale": "Alias for lung nodule enhancement.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C190",
+      "canonical_id": "imaging_disease_sites__lung_nodule_location",
+      "rationale": "Alias for lung nodule location.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C191",
+      "canonical_id": "imaging_disease_sites__lung_nodule_characteristics",
+      "rationale": "Alias for lung nodule morphology.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C192",
+      "canonical_id": "diagnosis_stage_histology__histologic_subtype",
+      "rationale": "NSCLC histological subtype is an alias.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C193",
+      "canonical_id": "diagnosis_stage_histology__histologic_subtype",
+      "rationale": "NSCLC Histology is an alias.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C194",
+      "canonical_id": "procedures_surgery_radiation__radiation_fractionation_count",
+      "rationale": "Direct match for radiation fractions.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C195",
+      "canonical_id": "systemic_treatments_medications__chemotherapy_cycle_count",
+      "rationale": "Total cycles is synonymous with number of cycles.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C196",
+      "canonical_id": "other__objective_tumor_response",
+      "rationale": "Primary candidate for tumor response.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C197",
+      "canonical_id": "demographics_social__occupation",
+      "rationale": "Occupation is a distinct demographic variable.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C198",
+      "canonical_id": "functional_performance__occupational_functional_status",
+      "rationale": "Occupational function assessment.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C199",
+      "canonical_id": "systemic_treatments_medications__medication_use",
+      "rationale": "Specific medication use.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C200",
+      "canonical_id": "imaging_disease_sites__osteoblastic_lesion",
+      "rationale": "Alias for osteoblastic bone lesion.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C201",
+      "canonical_id": "molecular_biomarkers__p40_expression_status",
+      "rationale": "Direct mapping to p40 IHC.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C202",
+      "canonical_id": "symptoms_patient_reported__pain_severity",
+      "rationale": "Pain is the base concept for pain severity.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C203",
+      "canonical_id": "symptoms_patient_reported__pain_severity",
+      "rationale": "Pain severity is the specific variable.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C204",
+      "canonical_id": "other__palliative_care_involvement",
+      "rationale": "Primary candidate for palliative care status.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C205",
+      "canonical_id": "symptoms_patient_reported__palpitations",
+      "rationale": "Direct symptom.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C206",
+      "canonical_id": "demographics_social__age",
+      "rationale": "Patient age is an alias for age.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C207",
+      "canonical_id": "molecular_biomarkers__pd_l1_amplification_status",
+      "rationale": "Direct mapping to PD-L1 amplification.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C208",
+      "canonical_id": "molecular_biomarkers__pd_l1_expression",
+      "rationale": "Direct mapping to PD-L1 expression level.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C209",
+      "canonical_id": "molecular_biomarkers__pd_l1_expression",
+      "rationale": "PD-L1 expression status.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C210",
+      "canonical_id": "systemic_treatments_medications__medication_use",
+      "rationale": "Specific medication use.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C211",
+      "canonical_id": "imaging_disease_sites__brain_perilesional_edema",
+      "rationale": "Alias for perilesional edema.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C212",
+      "canonical_id": "functional_performance__physical_function_score",
+      "rationale": "Physical function score.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C213",
+      "canonical_id": "laboratory_vitals__platelet_count",
+      "rationale": "Platelet count is a standard lab measurement.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C214",
+      "canonical_id": "imaging_disease_sites__pleural_effusion",
+      "rationale": "Alias for pleural effusion.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C215",
+      "canonical_id": "procedures_surgery_radiation__radiation_oncology_involvement",
+      "rationale": "Post-operative changes are related to surgical status but are findings rather than status.",
+      "relation": "related_but_distinct"
+    },
+    {
+      "candidate_id": "C216",
+      "canonical_id": "procedures_surgery_radiation__radiation_oncology_involvement",
+      "rationale": "Post-surgical status is the canonical variable.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C217",
+      "canonical_id": "procedures_surgery_radiation__postoperative_mediastinal_radiation",
+      "rationale": "Direct match.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C218",
+      "canonical_id": "laboratory_vitals__potassium",
+      "rationale": "Potassium is an electrolyte.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C219",
+      "canonical_id": "procedures_surgery_radiation__pre_cycle_laboratory_status",
+      "rationale": "Direct match for lab status.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C220",
+      "canonical_id": "imaging_disease_sites__brain_metastasis_presence",
+      "rationale": "Alias for brain metastasis presence.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C221",
+      "canonical_id": "symptoms_patient_reported__diarrhea",
+      "rationale": "Presence of diarrhea is a variation of diarrhea.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C222",
+      "canonical_id": "imaging_disease_sites__brain_lesion_enhancement",
+      "rationale": "Alias for brain lesion enhancement.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C223",
+      "canonical_id": "imaging_disease_sites__fdg_avidity",
+      "rationale": "Alias for FDG avidity.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C224",
+      "canonical_id": "imaging_disease_sites__liver_metastasis",
+      "rationale": "Alias for liver metastasis.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C225",
+      "canonical_id": "imaging_disease_sites__brain_metastasis_presence",
+      "rationale": "Alias for brain metastasis presence.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C226",
+      "canonical_id": "imaging_disease_sites__mass_effect",
+      "rationale": "Alias for mass effect.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C227",
+      "canonical_id": "imaging_disease_sites__pleural_effusion",
+      "rationale": "Alias for pleural effusion.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C228",
+      "canonical_id": "imaging_disease_sites__imaging_modality",
+      "rationale": "Alias for imaging modality.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C229",
+      "canonical_id": "imaging_disease_sites__lung_nodule_characteristics",
+      "rationale": "Refers to presence of a specific type of nodule, which is a subset of nodule characteristics.",
+      "relation": "related_but_distinct"
+    },
+    {
+      "candidate_id": "C230",
+      "canonical_id": "imaging_disease_sites__brain_perilesional_edema",
+      "rationale": "Alias for perilesional edema.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C231",
+      "canonical_id": "symptoms_patient_reported__rash",
+      "rationale": "Direct symptom.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C232",
+      "canonical_id": "diagnosis_stage_histology__disease_recurrence_status",
+      "rationale": "Presence of residual/recurrent disease is a status indicator.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C233",
+      "canonical_id": "imaging_disease_sites__splenic_metastasis",
+      "rationale": "Alias for splenic metastasis.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C234",
+      "canonical_id": "imaging_disease_sites__brain_perilesional_edema",
+      "rationale": "Alias for perilesional edema.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C235",
+      "canonical_id": "symptoms_patient_reported__vomiting",
+      "rationale": "Presence of vomiting is a variation of vomiting.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C236",
+      "canonical_id": "diagnosis_stage_histology__tumor_anatomical_location",
+      "rationale": "Base variable for tumor location.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C237",
+      "canonical_id": "procedures_surgery_radiation__radiation_dose_gy",
+      "rationale": "Direct match for radiation dose.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C238",
+      "canonical_id": "procedures_surgery_radiation__radiation_dose_gy",
+      "rationale": "Radiation dose for brain metastases is a subset of radiation dose.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C239",
+      "canonical_id": "procedures_surgery_radiation__radiation_fractionation_count",
+      "rationale": "Fractionation schedule is represented by the count of fractions.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C240",
+      "canonical_id": "procedures_surgery_radiation__surgical_status",
+      "rationale": "Referral status is part of oncology involvement.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C241",
+      "canonical_id": "procedures_surgery_radiation__surgical_status",
+      "rationale": "Treatment involvement is part of oncology involvement.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C242",
+      "canonical_id": "procedures_surgery_radiation__radiation_therapy_history",
+      "rationale": "Redundant with specific radiation history features.",
+      "relation": "drop"
+    },
+    {
+      "candidate_id": "C243",
+      "canonical_id": "procedures_surgery_radiation__radiopharmaceutical_dose",
+      "rationale": "Direct match.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C244",
+      "canonical_id": "imaging_disease_sites__unclassified_temporal_metadata",
+      "rationale": "Recent imaging availability is a temporal metadata field, not a clinical feature of the disease itself.",
+      "relation": "review"
+    },
+    {
+      "candidate_id": "C245",
+      "canonical_id": "laboratory_vitals__blood_urea_nitrogen",
+      "rationale": "Renal function status is a clinical interpretation, while BUN is a specific measurement.",
+      "relation": "related_but_distinct"
+    },
+    {
+      "candidate_id": "C246",
+      "canonical_id": "diagnosis_stage_histology__disease_recurrence_status",
+      "rationale": "Residual disease presence is a status indicator.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C247",
+      "canonical_id": "imaging_disease_sites__adrenal_gland_metastasis",
+      "rationale": "Alias for adrenal gland metastasis.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C248",
+      "canonical_id": "functional_performance__role_function",
+      "rationale": "Role function assessment.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C249",
+      "canonical_id": "diagnosis_stage_histology__seizure_disorder_status",
+      "rationale": "Direct representation of seizure status.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C250",
+      "canonical_id": "functional_performance__self_care_status",
+      "rationale": "Describes assistance level for self-care.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C251",
+      "canonical_id": "functional_performance__self_care_status",
+      "rationale": "Describes independence in self-care.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C252",
+      "canonical_id": "laboratory_vitals__serum_albumin",
+      "rationale": "Serum albumin is a standard lab measurement.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C253",
+      "canonical_id": "laboratory_vitals__serum_calcium",
+      "rationale": "Serum calcium is an electrolyte.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C254",
+      "canonical_id": "laboratory_vitals__serum_sodium",
+      "rationale": "Serum sodium is an electrolyte.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C255",
+      "canonical_id": "demographics_social__biological_sex",
+      "rationale": "Sex is an alias for biological sex.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C256",
+      "canonical_id": "demographics_social__smoking_status",
+      "rationale": "Smoking status is a standard clinical feature.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C257",
+      "canonical_id": "functional_performance__social_function_score",
+      "rationale": "Social function score.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C258",
+      "canonical_id": "symptoms_patient_reported__sore_throat",
+      "rationale": "Direct symptom.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C259",
+      "canonical_id": "laboratory_vitals__spirometry",
+      "rationale": "Spirometry result is an alias for the spirometry test category.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C260",
+      "canonical_id": "laboratory_vitals__spirometry",
+      "rationale": "Spirometry results is an alias.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C261",
+      "canonical_id": "imaging_disease_sites__splenic_metastasis",
+      "rationale": "Alias for splenic metastasis.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C262",
+      "canonical_id": "procedures_surgery_radiation__history_of_stereotactic_radiosurgery",
+      "rationale": "Stereotactic radiation history is SRS history.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C263",
+      "canonical_id": "procedures_surgery_radiation__radiation_oncology_involvement",
+      "rationale": "Surgical status is the canonical variable.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C264",
+      "canonical_id": "imaging_disease_sites__unclassified_procedural_features",
+      "rationale": "Surveillance imaging occurrence is a procedural/study design feature.",
+      "relation": "review"
+    },
+    {
+      "candidate_id": "C265",
+      "canonical_id": "imaging_disease_sites__suvmax",
+      "rationale": "Alias for SUVmax.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C266",
+      "canonical_id": "symptoms_patient_reported__systemic_symptoms",
+      "rationale": "Systemic symptoms is too vague and lacks specific evidence.",
+      "relation": "drop"
+    },
+    {
+      "candidate_id": "C267",
+      "canonical_id": "symptoms_patient_reported__systemic_symptoms_presence",
+      "rationale": "Systemic symptoms presence is too vague.",
+      "relation": "drop"
+    },
+    {
+      "candidate_id": "C268",
+      "canonical_id": "laboratory_vitals__systolic_blood_pressure",
+      "rationale": "Systolic blood pressure is a vital sign.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C269",
+      "canonical_id": "systemic_treatments_medications__chemotherapy_regimen_type",
+      "rationale": "Regimen type.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C270",
+      "canonical_id": "imaging_disease_sites__unclassified_text_summaries",
+      "rationale": "Thoracic PET/CT findings is a text-based summary field.",
+      "relation": "review"
+    },
+    {
+      "candidate_id": "C271",
+      "canonical_id": "other__time_since_diagnosis",
+      "rationale": "Primary candidate for time since diagnosis.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C272",
+      "canonical_id": "diagnosis_stage_histology__cancer_stage",
+      "rationale": "TNM stage is a type of cancer stage.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C273",
+      "canonical_id": "procedures_surgery_radiation__radiation_dose_gy",
+      "rationale": "Cumulative dose is a radiation dose.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C274",
+      "canonical_id": "procedures_surgery_radiation__radiation_dose_gy",
+      "rationale": "Total radiation dose is a radiation dose.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C275",
+      "canonical_id": "molecular_biomarkers__tp53_mutation_status",
+      "rationale": "TP53 mutation status.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C276",
+      "canonical_id": "systemic_treatments_medications__chemotherapy_cycle_interval",
+      "rationale": "Frequency is synonymous with interval.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C277",
+      "canonical_id": "systemic_treatments_medications__treatment_response_status",
+      "rationale": "Direct extraction of response status.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C278",
+      "canonical_id": "molecular_biomarkers__ttf1_expression_status",
+      "rationale": "Direct mapping to TTF-1 expression.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C279",
+      "canonical_id": "diagnosis_stage_histology__tumor_anatomical_location",
+      "rationale": "Tumor anatomical location is an alias.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C280",
+      "canonical_id": "imaging_disease_sites__tumor_diameter",
+      "rationale": "Alias for tumor diameter.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C281",
+      "canonical_id": "imaging_disease_sites__lung_nodule_location",
+      "rationale": "Alias for lung nodule location.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C282",
+      "canonical_id": "imaging_disease_sites__tumor_diameter",
+      "rationale": "Alias for tumor diameter.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C283",
+      "canonical_id": "symptoms_patient_reported__unexplained_weight_loss",
+      "rationale": "Direct symptom.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C284",
+      "canonical_id": "symptoms_patient_reported__vomiting",
+      "rationale": "Direct symptom.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C285",
+      "canonical_id": "symptoms_patient_reported__wheezing",
+      "rationale": "Direct symptom.",
+      "relation": "base_variable"
+    },
+    {
+      "candidate_id": "C286",
+      "canonical_id": "symptoms_patient_reported__wheezing",
+      "rationale": "Wheezing presence is a variation of wheezing.",
+      "relation": "alias_of"
+    },
+    {
+      "candidate_id": "C287",
+      "canonical_id": "laboratory_vitals__white_blood_cell_count",
+      "rationale": "WBC count is a standard lab measurement.",
+      "relation": "base_variable"
+    }
+  ],
+  "canonical_features": [
+    {
+      "action": "review",
+      "aliases": [
+        "Goals of care"
+      ],
+      "canonical_id": "administrative_artifact__goals_of_care_documentation",
+      "canonical_name": "goals_of_care_documentation",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "administrative_artifact",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence or absence of documentation regarding the patient's goals of care.",
+      "display_name": "Goals of care documentation",
+      "parent_object": null,
+      "rationale": "The candidate suggests a text-derived feature regarding documentation status; marked as review because a safe extraction contract for text-based documentation status cannot be specified without further schema.",
+      "source_candidate_ids": [
+        "C103"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "demographics_social__age",
+      "canonical_name": "age",
+      "categories": null,
+      "clinical_domain": "demographics_social",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "The age of the patient.",
+      "display_name": "Age",
+      "parent_object": null,
+      "rationale": "Consolidates all age-related continuous measurements.",
+      "source_candidate_ids": [
+        "C006",
+        "C206"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "demographics_social__alcohol_intake_frequency",
+      "canonical_name": "alcohol_intake_frequency",
+      "categories": [
+        "never",
+        "occasional",
+        "moderate",
+        "heavy",
+        "unknown"
+      ],
+      "clinical_domain": "demographics_social",
+      "data_type": "ordinal",
+      "derivation": null,
+      "description": "Frequency of alcohol consumption.",
+      "display_name": "Alcohol Intake Frequency",
+      "parent_object": null,
+      "rationale": "Maintains alcohol frequency as a distinct social history feature.",
+      "source_candidate_ids": [
+        "C007"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "demographics_social__biological_sex",
+      "canonical_name": "biological_sex",
+      "categories": [
+        "male",
+        "female",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "demographics_social",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "The biological sex of the patient.",
+      "display_name": "Biological Sex",
+      "parent_object": null,
+      "rationale": "Consolidates sex and biological sex into a single categorical variable.",
+      "source_candidate_ids": [
+        "C023",
+        "C024",
+        "C255"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "demographics_social__body_mass_index",
+      "canonical_name": "body_mass_index",
+      "categories": null,
+      "clinical_domain": "demographics_social",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "The patient's Body Mass Index (BMI).",
+      "display_name": "Body Mass Index",
+      "parent_object": null,
+      "rationale": "BMI is a distinct measurement from weight.",
+      "source_candidate_ids": [
+        "C026"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "demographics_social__body_weight",
+      "canonical_name": "body_weight",
+      "categories": null,
+      "clinical_domain": "demographics_social",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "The patient's weight.",
+      "display_name": "Body Weight",
+      "parent_object": null,
+      "rationale": "Weight is a base measurement.",
+      "source_candidate_ids": [
+        "C027"
+      ]
+    },
+    {
+      "action": "review",
+      "aliases": [],
+      "canonical_id": "demographics_social__living_arrangement",
+      "canonical_name": "living_arrangement",
+      "categories": null,
+      "clinical_domain": "demographics_social",
+      "data_type": "text",
+      "derivation": null,
+      "description": "Description of the patient's living situation.",
+      "display_name": "Living Arrangement",
+      "parent_object": null,
+      "rationale": "Living arrangement is often described in free text (e.g., 'single-family home') and requires review.",
+      "source_candidate_ids": [
+        "C146"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "demographics_social__marital_status",
+      "canonical_name": "marital_status",
+      "categories": [
+        "single",
+        "married",
+        "divorced",
+        "widowed",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "demographics_social",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "The patient's marital status.",
+      "display_name": "Marital Status",
+      "parent_object": null,
+      "rationale": "Marital status is a distinct demographic variable.",
+      "source_candidate_ids": [
+        "C154"
+      ]
+    },
+    {
+      "action": "review",
+      "aliases": [],
+      "canonical_id": "demographics_social__occupation",
+      "canonical_name": "occupation",
+      "categories": null,
+      "clinical_domain": "demographics_social",
+      "data_type": "text",
+      "derivation": null,
+      "description": "The patient's current or former occupation.",
+      "display_name": "Occupation",
+      "parent_object": null,
+      "rationale": "Occupation is best captured as text due to high variability.",
+      "source_candidate_ids": [
+        "C197"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "demographics_social__smoking_status",
+      "canonical_name": "smoking_status",
+      "categories": [
+        "never",
+        "former",
+        "current",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "demographics_social",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "The patient's smoking history.",
+      "display_name": "Smoking Status",
+      "parent_object": null,
+      "rationale": "Smoking status is a critical clinical variable for NSCLC.",
+      "source_candidate_ids": [
+        "C256"
+      ]
+    },
+    {
+      "action": "review",
+      "aliases": [],
+      "canonical_id": "diagnosis_stage_histology__cancer_diagnosis_date",
+      "canonical_name": "cancer_diagnosis_date",
+      "categories": null,
+      "clinical_domain": "diagnosis_stage_histology",
+      "data_type": "text",
+      "derivation": null,
+      "description": "The date on which the cancer was diagnosed.",
+      "display_name": "Cancer Diagnosis Date",
+      "parent_object": null,
+      "rationale": "Unique temporal variable for diagnosis.",
+      "source_candidate_ids": [
+        "C037"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "clinical stage",
+        "tnm stage"
+      ],
+      "canonical_id": "diagnosis_stage_histology__cancer_stage",
+      "canonical_name": "cancer_stage",
+      "categories": [
+        "Stage I",
+        "Stage II",
+        "Stage III",
+        "Stage IV",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "diagnosis_stage_histology",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "The clinical or TNM stage of the cancer.",
+      "display_name": "Cancer Stage",
+      "parent_object": null,
+      "rationale": "Consolidates various stage representations (Clinical, TNM, Cancer Stage) into a single staging variable.",
+      "source_candidate_ids": [
+        "C038",
+        "C048",
+        "C272"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "diagnosis_stage_histology__diagnosis_type",
+      "canonical_name": "diagnosis_type",
+      "categories": [
+        "non-small cell",
+        "small cell",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "diagnosis_stage_histology",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "The primary diagnosis type, specifically identifying if it is non-small cell lung cancer.",
+      "display_name": "Diagnosis Type",
+      "parent_object": null,
+      "rationale": "Identifies the specific disease type mentioned in the context of NSCLC.",
+      "source_candidate_ids": [
+        "C065"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "evidence of disease recurrence",
+        "residual disease presence"
+      ],
+      "canonical_id": "diagnosis_stage_histology__disease_recurrence_status",
+      "canonical_name": "disease_recurrence_status",
+      "categories": [
+        "residual",
+        "recurrent",
+        "absent",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "diagnosis_stage_histology",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "Indicates whether the disease is residual, recurrent, or no longer present.",
+      "display_name": "Disease Recurrence Status",
+      "parent_object": null,
+      "rationale": "Merges various indicators of disease recurrence and residual status into a single categorical variable.",
+      "source_candidate_ids": [
+        "C069",
+        "C087",
+        "C232",
+        "C246"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "histological subtype",
+        "histology",
+        "nsclc histological subtype",
+        "nsclc histology"
+      ],
+      "canonical_id": "diagnosis_stage_histology__histologic_subtype",
+      "canonical_name": "histologic_subtype",
+      "categories": [
+        "adenocarcinoma",
+        "squamous cell carcinoma",
+        "large-cell",
+        "non-squamous",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "diagnosis_stage_histology",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "The specific histological classification of the lung tumor.",
+      "display_name": "Histologic Subtype",
+      "parent_object": null,
+      "rationale": "Consolidates all histology and subtype mentions into one canonical feature.",
+      "source_candidate_ids": [
+        "C112",
+        "C113",
+        "C114",
+        "C115",
+        "C116",
+        "C117",
+        "C192",
+        "C193"
+      ]
+    },
+    {
+      "action": "review",
+      "aliases": [],
+      "canonical_id": "diagnosis_stage_histology__lymph_node_involvement",
+      "canonical_name": "lymph_node_involvement",
+      "categories": [
+        "present",
+        "absent",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "diagnosis_stage_histology",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "Presence or extent of lymph node involvement.",
+      "display_name": "Lymph Node Involvement",
+      "parent_object": null,
+      "rationale": "Low confidence and missing evidence terms; requires manual review.",
+      "source_candidate_ids": [
+        "C150"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "mitotic rate"
+      ],
+      "canonical_id": "diagnosis_stage_histology__mitotic_activity",
+      "canonical_name": "mitotic_activity",
+      "categories": [
+        "low",
+        "moderate",
+        "frequent",
+        "unknown"
+      ],
+      "clinical_domain": "diagnosis_stage_histology",
+      "data_type": "ordinal",
+      "derivation": null,
+      "description": "The rate or level of mitotic activity observed in the tumor.",
+      "display_name": "Mitotic Activity",
+      "parent_object": null,
+      "rationale": "Captures mitotic activity as an ordinal measurement.",
+      "source_candidate_ids": [
+        "C172"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "diagnosis_stage_histology__seizure_disorder_status",
+      "canonical_name": "seizure_disorder_status",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "diagnosis_stage_histology",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of a seizure disorder.",
+      "display_name": "Seizure Disorder Status",
+      "parent_object": null,
+      "rationale": "Standard binary indicator for a comorbid condition.",
+      "source_candidate_ids": [
+        "C249"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "primary tumor anatomical location"
+      ],
+      "canonical_id": "diagnosis_stage_histology__tumor_anatomical_location",
+      "canonical_name": "tumor_anatomical_location",
+      "categories": [
+        "lower lobe",
+        "right lower lobe",
+        "left lower lobe",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "diagnosis_stage_histology",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "The anatomical site of the primary tumor.",
+      "display_name": "Tumor Anatomical Location",
+      "parent_object": null,
+      "rationale": "Consolidates tumor location descriptions.",
+      "source_candidate_ids": [
+        "C236",
+        "C279"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "ambulation ability",
+        "ambulatory capacity"
+      ],
+      "canonical_id": "functional_performance__ambulation_status",
+      "canonical_name": "ambulation_status",
+      "categories": [
+        "ambulatory",
+        "non-ambulatory",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "functional_performance",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "Patient's ability to walk or move independently.",
+      "display_name": "Ambulation Status",
+      "parent_object": "functional_performance",
+      "rationale": "C009 and C010 both describe the patient's capacity for ambulation.",
+      "source_candidate_ids": [
+        "C009",
+        "C010"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "cognitive function"
+      ],
+      "canonical_id": "functional_performance__cognitive_function_score",
+      "canonical_name": "cognitive_function_score",
+      "categories": [
+        "low",
+        "medium",
+        "high",
+        "unknown"
+      ],
+      "clinical_domain": "functional_performance",
+      "data_type": "ordinal",
+      "derivation": null,
+      "description": "Numerical or ordinal assessment of cognitive performance.",
+      "display_name": "Cognitive Function Score",
+      "parent_object": "functional_performance",
+      "rationale": "Both candidates refer to cognitive function assessments; score is the more specific representation of the evidence provided.",
+      "source_candidate_ids": [
+        "C049",
+        "C050"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "performance status"
+      ],
+      "canonical_id": "functional_performance__ecog_performance_status",
+      "canonical_name": "ecog_performance_status",
+      "categories": [
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "unknown"
+      ],
+      "clinical_domain": "functional_performance",
+      "data_type": "ordinal",
+      "derivation": null,
+      "description": "Eastern Cooperative Oncology Group (ECOG) performance status scale.",
+      "display_name": "ECOG Performance Status",
+      "parent_object": "functional_performance",
+      "rationale": "Standardized clinical scale for performance status.",
+      "source_candidate_ids": [
+        "C077"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "emotional function"
+      ],
+      "canonical_id": "functional_performance__emotional_function_score",
+      "canonical_name": "emotional_function_score",
+      "categories": [
+        "low",
+        "medium",
+        "high",
+        "unknown"
+      ],
+      "clinical_domain": "functional_performance",
+      "data_type": "ordinal",
+      "derivation": null,
+      "description": "Assessment of emotional well-being or function.",
+      "display_name": "Emotional Function Score",
+      "parent_object": "functional_performance",
+      "rationale": "Merges general emotional function and specific scores into one ordinal feature.",
+      "source_candidate_ids": [
+        "C083",
+        "C084"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "functional limitation status",
+        "functional mobility/exercise tolerance",
+        "functional status limitation"
+      ],
+      "canonical_id": "functional_performance__functional_status",
+      "canonical_name": "functional_status",
+      "categories": [
+        "limited",
+        "unlimited",
+        "unknown"
+      ],
+      "clinical_domain": "functional_performance",
+      "data_type": "ordinal",
+      "derivation": null,
+      "description": "General assessment of functional capacity and limitations.",
+      "display_name": "Functional Status",
+      "parent_object": "functional_performance",
+      "rationale": "These candidates all describe general functional capacity or limitations.",
+      "source_candidate_ids": [
+        "C095",
+        "C096",
+        "C097",
+        "C098"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "functional_performance__global_health_status",
+      "canonical_name": "global_health_status",
+      "categories": null,
+      "clinical_domain": "functional_performance",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "Overall assessment of the patient's health status.",
+      "display_name": "Global Health Status",
+      "parent_object": "functional_performance",
+      "rationale": "Continuous measurement of overall health.",
+      "source_candidate_ids": [
+        "C101"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "functional_performance__neurological_exam_status",
+      "canonical_name": "neurological_exam_status",
+      "categories": [
+        "intact",
+        "impaired",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "functional_performance",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "Findings from a neurological examination.",
+      "display_name": "Neurological Exam Status",
+      "parent_object": "functional_performance",
+      "rationale": "Specific clinical finding regarding neurological integrity.",
+      "source_candidate_ids": [
+        "C181"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "work capacity"
+      ],
+      "canonical_id": "functional_performance__occupational_functional_status",
+      "canonical_name": "occupational_functional_status",
+      "categories": [
+        "capable",
+        "incapable",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "functional_performance",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "Ability to perform work-related activities.",
+      "display_name": "Occupational Functional Status",
+      "parent_object": "functional_performance",
+      "rationale": "Distinct from general functional status as it focuses on work.",
+      "source_candidate_ids": [
+        "C198"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "functional_performance__physical_function_score",
+      "canonical_name": "physical_function_score",
+      "categories": [
+        "low",
+        "medium",
+        "high",
+        "unknown"
+      ],
+      "clinical_domain": "functional_performance",
+      "data_type": "ordinal",
+      "derivation": null,
+      "description": "Score representing physical functional capacity.",
+      "display_name": "Physical Function Score",
+      "parent_object": "functional_performance",
+      "rationale": "Specific physical function metric.",
+      "source_candidate_ids": [
+        "C212"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "functional_performance__role_function",
+      "canonical_name": "role_function",
+      "categories": [
+        "low",
+        "medium",
+        "high",
+        "unknown"
+      ],
+      "clinical_domain": "functional_performance",
+      "data_type": "ordinal",
+      "derivation": null,
+      "description": "Ability to perform roles (e.g., work, social, family).",
+      "display_name": "Role Function",
+      "parent_object": "functional_performance",
+      "rationale": "Distinct role-based functional assessment.",
+      "source_candidate_ids": [
+        "C248"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "self-care assistance level",
+        "self-care independence"
+      ],
+      "canonical_id": "functional_performance__self_care_status",
+      "canonical_name": "self_care_status",
+      "categories": [
+        "independent",
+        "limited",
+        "dependent",
+        "unknown"
+      ],
+      "clinical_domain": "functional_performance",
+      "data_type": "ordinal",
+      "derivation": null,
+      "description": "Independence or assistance required for self-care activities.",
+      "display_name": "Self-care Status",
+      "parent_object": "functional_performance",
+      "rationale": "Merges assistance level and independence into a single scale of self-care ability.",
+      "source_candidate_ids": [
+        "C250",
+        "C251"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "functional_performance__social_function_score",
+      "canonical_name": "social_function_score",
+      "categories": [
+        "low",
+        "medium",
+        "high",
+        "unknown"
+      ],
+      "clinical_domain": "functional_performance",
+      "data_type": "ordinal",
+      "derivation": null,
+      "description": "Score representing social functional capacity.",
+      "display_name": "Social Function Score",
+      "parent_object": "functional_performance",
+      "rationale": "Specific social function metric.",
+      "source_candidate_ids": [
+        "C257"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Adrenal metastasis presence",
+        "Left adrenal metastasis",
+        "Right adrenal metastasis"
+      ],
+      "canonical_id": "imaging_disease_sites__adrenal_gland_metastasis",
+      "canonical_name": "adrenal_gland_metastasis",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of metastatic involvement in the adrenal glands.",
+      "display_name": "Adrenal gland metastasis",
+      "parent_object": null,
+      "rationale": "Consolidates various mentions of adrenal gland involvement into a single binary feature.",
+      "source_candidate_ids": [
+        "C004",
+        "C005",
+        "C139",
+        "C247"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Count of enhancing brain lesions"
+      ],
+      "canonical_id": "imaging_disease_sites__brain_lesion_count",
+      "canonical_name": "brain_lesion_count",
+      "categories": null,
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "count",
+      "derivation": null,
+      "description": "Number of enhancing brain lesions.",
+      "display_name": "Brain lesion count",
+      "parent_object": "brain_metastasis_presence",
+      "rationale": "Quantifies the number of lesions found in the brain.",
+      "source_candidate_ids": [
+        "C060"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Brain lesion diameter",
+        "Largest brain lesion diameter"
+      ],
+      "canonical_id": "imaging_disease_sites__brain_lesion_diameter",
+      "canonical_name": "brain_lesion_diameter",
+      "categories": null,
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "The diameter of brain lesions.",
+      "display_name": "Brain lesion diameter",
+      "parent_object": "brain_metastasis_presence",
+      "rationale": "Measures the size of brain lesions.",
+      "source_candidate_ids": [
+        "C030",
+        "C135"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Intracranial metastatic enhancement",
+        "Presence of enhancing brain lesions"
+      ],
+      "canonical_id": "imaging_disease_sites__brain_lesion_enhancement",
+      "canonical_name": "brain_lesion_enhancement",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of enhancement in brain lesions.",
+      "display_name": "Brain lesion enhancement",
+      "parent_object": "brain_metastasis_presence",
+      "rationale": "Distinguishes whether brain lesions show enhancement.",
+      "source_candidate_ids": [
+        "C131",
+        "C222"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Anatomical location of brain metastases",
+        "Anatomical site of brain metastasis",
+        "Brain lesion location",
+        "Brain metastasis location",
+        "Laterality of brain metastasis"
+      ],
+      "canonical_id": "imaging_disease_sites__brain_metastasis_location",
+      "canonical_name": "brain_metastasis_location",
+      "categories": [
+        "cerebellum",
+        "frontal lobe",
+        "occipital lobe",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "Anatomical site of brain metastases.",
+      "display_name": "Brain metastasis location",
+      "parent_object": "brain_metastasis_presence",
+      "rationale": "Captures the specific anatomical location of brain lesions.",
+      "source_candidate_ids": [
+        "C012",
+        "C013",
+        "C031",
+        "C033",
+        "C137",
+        "C170",
+        "C171"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Brain metastases presence",
+        "Brain metastasis presence",
+        "Brain metastasis status",
+        "Intracranial metastasis",
+        "Intracranial metastasis presence",
+        "Presence of brain metastases",
+        "Presence of intracranial metastases"
+      ],
+      "canonical_id": "imaging_disease_sites__brain_metastasis_presence",
+      "canonical_name": "brain_metastasis_presence",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of intracranial metastatic disease.",
+      "display_name": "Brain metastasis presence",
+      "parent_object": null,
+      "rationale": "Merges all indicators of intracranial/brain metastatic status.",
+      "source_candidate_ids": [
+        "C032",
+        "C034",
+        "C035",
+        "C129",
+        "C130",
+        "C220",
+        "C225"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Perilesional edema presence",
+        "Presence of peritumoral edema",
+        "Presence of surrounding edema"
+      ],
+      "canonical_id": "imaging_disease_sites__brain_perilesional_edema",
+      "canonical_name": "brain_perilesional_edema",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of edema surrounding brain lesions.",
+      "display_name": "Perilesional edema",
+      "parent_object": "brain_metastasis_presence",
+      "rationale": "Identifies edema associated with brain lesions.",
+      "source_candidate_ids": [
+        "C211",
+        "C230",
+        "C234"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "FDG avidity status",
+        "FDG-avidity",
+        "Presence of FDG-avid lesions"
+      ],
+      "canonical_id": "imaging_disease_sites__fdg_avidity",
+      "canonical_name": "fdg_avidity",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Status of FDG uptake in lesions.",
+      "display_name": "FDG avidity",
+      "parent_object": null,
+      "rationale": "Indicates if lesions are FDG-avid.",
+      "source_candidate_ids": [
+        "C091",
+        "C092",
+        "C223"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "imaging_disease_sites__hepatic_lesion_diameter",
+      "canonical_name": "hepatic_lesion_diameter",
+      "categories": null,
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "Diameter of hepatic lesions.",
+      "display_name": "Hepatic lesion diameter",
+      "parent_object": "liver_metastasis",
+      "rationale": "Measures the size of liver lesions.",
+      "source_candidate_ids": [
+        "C136"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "imaging_disease_sites__hepatic_lesion_location",
+      "canonical_name": "hepatic_lesion_location",
+      "categories": [
+        "segment VII",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "Anatomical segment location of hepatic lesions.",
+      "display_name": "Hepatic lesion location",
+      "parent_object": "liver_metastasis",
+      "rationale": "Specifies the segment of the liver involved.",
+      "source_candidate_ids": [
+        "C111"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Contrast-enhanced MRI status",
+        "CT imaging type",
+        "Diffusion-Weighted Imaging (DWI) availability",
+        "Imaging modality used",
+        "Presence of MRI sequences (T1, T2, FLAIR, DWI)"
+      ],
+      "canonical_id": "imaging_disease_sites__imaging_modality",
+      "canonical_name": "imaging_modality",
+      "categories": [
+        "CT",
+        "MRI",
+        "PET/CT",
+        "SWI",
+        "DWI",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "The type of imaging modality used (e.g., CT, MRI, PET/CT).",
+      "display_name": "Imaging modality",
+      "parent_object": null,
+      "rationale": "Captures the imaging technique used for the study.",
+      "source_candidate_ids": [
+        "C055",
+        "C062",
+        "C068",
+        "C128",
+        "C228"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Calcification presence",
+        "Nodule calcification"
+      ],
+      "canonical_id": "imaging_disease_sites__lesion_calcification",
+      "canonical_name": "lesion_calcification",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of calcification within a lesion.",
+      "display_name": "Lesion calcification",
+      "parent_object": null,
+      "rationale": "Identifies calcified lesions.",
+      "source_candidate_ids": [
+        "C036",
+        "C188"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Liver metastasis",
+        "Presence of hepatic metastasis"
+      ],
+      "canonical_id": "imaging_disease_sites__liver_metastasis",
+      "canonical_name": "liver_metastasis",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of metastatic involvement in the liver.",
+      "display_name": "Liver metastasis",
+      "parent_object": null,
+      "rationale": "Identifies liver involvement.",
+      "source_candidate_ids": [
+        "C145",
+        "C224"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Nodule enhancement pattern",
+        "Nodule enhancement status",
+        "Nodule morphology"
+      ],
+      "canonical_id": "imaging_disease_sites__lung_nodule_characteristics",
+      "canonical_name": "lung_nodule_characteristics",
+      "categories": [
+        "solid",
+        "well-circumscribed",
+        "enhancing",
+        "non-enhancing",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "Morphological and enhancement characteristics of pulmonary nodules.",
+      "display_name": "Lung nodule characteristics",
+      "parent_object": null,
+      "rationale": "Combines morphology and enhancement of lung nodules.",
+      "source_candidate_ids": [
+        "C189",
+        "C191"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Lesion diameter",
+        "New pulmonary nodule diameter"
+      ],
+      "canonical_id": "imaging_disease_sites__lung_nodule_diameter",
+      "canonical_name": "lung_nodule_diameter",
+      "categories": null,
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "Diameter of pulmonary nodules.",
+      "display_name": "Lung nodule diameter",
+      "parent_object": null,
+      "rationale": "Measures the size of lung nodules.",
+      "source_candidate_ids": [
+        "C140",
+        "C185"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Nodule location",
+        "Tumor location"
+      ],
+      "canonical_id": "imaging_disease_sites__lung_nodule_location",
+      "canonical_name": "lung_nodule_location",
+      "categories": [
+        "lower lobe",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "Anatomical location of lung nodules.",
+      "display_name": "Lung nodule location",
+      "parent_object": null,
+      "rationale": "Identifies the lobe or location of lung nodules.",
+      "source_candidate_ids": [
+        "C011",
+        "C190",
+        "C281"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Lymph node involvement",
+        "Lymph node metastasis",
+        "Lymphadenopathy presence",
+        "Nodal involvement status",
+        "Nodal Metastasis Status"
+      ],
+      "canonical_id": "imaging_disease_sites__lymph_node_metastasis",
+      "canonical_name": "lymph_node_metastasis",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of metastatic involvement in lymph nodes.",
+      "display_name": "Lymph node metastasis",
+      "parent_object": null,
+      "rationale": "Consolidates lymph node involvement features.",
+      "source_candidate_ids": [
+        "C151",
+        "C153",
+        "C186",
+        "C187"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "imaging_disease_sites__lymph_node_short_axis_diameter",
+      "canonical_name": "lymph_node_short_axis_diameter",
+      "categories": null,
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "Short axis diameter of lymph nodes.",
+      "display_name": "Lymph node short axis diameter",
+      "parent_object": "lymph_node_metastasis",
+      "rationale": "Quantitative measurement of lymph node size.",
+      "source_candidate_ids": [
+        "C152"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "imaging_disease_sites__mass_effect",
+      "canonical_name": "mass_effect",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of mass effect caused by a lesion.",
+      "display_name": "Mass effect",
+      "parent_object": null,
+      "rationale": "Identifies if a lesion is causing mass effect.",
+      "source_candidate_ids": [
+        "C226"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Mediastinal or Hilar Lymphadenopathy",
+        "Mediastinal or hilar lymphadenopathy status",
+        "Mediastinal/Hilar Lymph Node Involvement",
+        "Mediastinal/Hilar lymphadenopathy"
+      ],
+      "canonical_id": "imaging_disease_sites__mediastinal_hilar_lymphadenopathy",
+      "canonical_name": "mediastinal_hilar_lymphadenopathy",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of lymphadenopathy in the mediastinal or hilar regions.",
+      "display_name": "Mediastinal/Hilar lymphadenopathy",
+      "parent_object": null,
+      "rationale": "Specific to mediastinal and hilar lymph node status.",
+      "source_candidate_ids": [
+        "C159",
+        "C160",
+        "C161",
+        "C162"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "imaging_disease_sites__osteoblastic_lesion",
+      "canonical_name": "osteoblastic_lesion",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of osteoblastic activity or lesions in bone.",
+      "display_name": "Osteoblastic bone lesion",
+      "parent_object": null,
+      "rationale": "Identifies bone involvement.",
+      "source_candidate_ids": [
+        "C200"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Presence of mediastinal thickening or effusion"
+      ],
+      "canonical_id": "imaging_disease_sites__pleural_effusion",
+      "canonical_name": "pleural_effusion",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of pleural effusion or thickening.",
+      "display_name": "Pleural effusion",
+      "parent_object": null,
+      "rationale": "Identifies pleural involvement.",
+      "source_candidate_ids": [
+        "C214",
+        "C227"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Presence of splenic lesion"
+      ],
+      "canonical_id": "imaging_disease_sites__splenic_metastasis",
+      "canonical_name": "splenic_metastasis",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of metastatic involvement in the spleen.",
+      "display_name": "Splenic metastasis",
+      "parent_object": null,
+      "rationale": "Identifies splenic involvement.",
+      "source_candidate_ids": [
+        "C233",
+        "C261"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "imaging_disease_sites__suvmax",
+      "canonical_name": "suvmax",
+      "categories": null,
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "Maximum Standardized Uptake Value (SUVmax).",
+      "display_name": "SUVmax",
+      "parent_object": "fdg_avidity",
+      "rationale": "Quantitative measurement of FDG uptake intensity.",
+      "source_candidate_ids": [
+        "C156",
+        "C265"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Tumor size"
+      ],
+      "canonical_id": "imaging_disease_sites__tumor_diameter",
+      "canonical_name": "tumor_diameter",
+      "categories": null,
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "The diameter of the primary tumor.",
+      "display_name": "Tumor diameter",
+      "parent_object": null,
+      "rationale": "Measures the size of the primary tumor.",
+      "source_candidate_ids": [
+        "C280",
+        "C282"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "imaging_disease_sites__unclassified_ct_findings",
+      "canonical_name": "unclassified_ct_findings",
+      "categories": [
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "Broad CT findings that do not map to specific features.",
+      "display_name": "Unclassified CT findings",
+      "parent_object": null,
+      "rationale": "Catch-all for broad text-derived findings.",
+      "source_candidate_ids": [
+        "C061"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "imaging_disease_sites__unclassified_extra_axial_findings",
+      "canonical_name": "unclassified_extra_axial_findings",
+      "categories": [
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "Extra-axial findings requiring review.",
+      "display_name": "Unclassified extra-axial findings",
+      "parent_object": null,
+      "rationale": "Catch-all for specific findings requiring review.",
+      "source_candidate_ids": [
+        "C088"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "imaging_disease_sites__unclassified_procedural_features",
+      "canonical_name": "unclassified_procedural_features",
+      "categories": [
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "Procedural or study design features.",
+      "display_name": "Unclassified procedural features",
+      "parent_object": null,
+      "rationale": "Catch-all for procedural features.",
+      "source_candidate_ids": [
+        "C264"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "imaging_disease_sites__unclassified_temporal_metadata",
+      "canonical_name": "unclassified_temporal_metadata",
+      "categories": [
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "Temporal metadata not part of clinical disease features.",
+      "display_name": "Unclassified temporal metadata",
+      "parent_object": null,
+      "rationale": "Catch-all for temporal metadata.",
+      "source_candidate_ids": [
+        "C244"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "imaging_disease_sites__unclassified_text_summaries",
+      "canonical_name": "unclassified_text_summaries",
+      "categories": [
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "imaging_disease_sites",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "Text-based summary fields.",
+      "display_name": "Unclassified text summaries",
+      "parent_object": null,
+      "rationale": "Catch-all for text-based summary fields.",
+      "source_candidate_ids": [
+        "C270"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "absolute neutrophil count (ANC)",
+        "ANC"
+      ],
+      "canonical_id": "laboratory_vitals__absolute_neutrophil_count",
+      "canonical_name": "absolute_neutrophil_count",
+      "categories": null,
+      "clinical_domain": "laboratory_vitals",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "The total number of neutrophils in a volume of blood, often used to assess neutropenia.",
+      "display_name": "Absolute Neutrophil Count",
+      "parent_object": null,
+      "rationale": "Core hematological measurement for assessing myelosuppression.",
+      "source_candidate_ids": [
+        "C001"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "anemia"
+      ],
+      "canonical_id": "laboratory_vitals__anemia_status",
+      "canonical_name": "anemia_status",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "laboratory_vitals",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Clinical presence or absence of anemia.",
+      "display_name": "Anemia Status",
+      "parent_object": null,
+      "rationale": "Binary clinical finding.",
+      "source_candidate_ids": [
+        "C014"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "AST",
+        "AST level"
+      ],
+      "canonical_id": "laboratory_vitals__aspartate_aminotransferase",
+      "canonical_name": "aspartate_aminotransferase",
+      "categories": null,
+      "clinical_domain": "laboratory_vitals",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "An enzyme found in high concentrations in the liver.",
+      "display_name": "Aspartate Aminotransferase (AST)",
+      "parent_object": null,
+      "rationale": "Liver function marker.",
+      "source_candidate_ids": [
+        "C019",
+        "C020"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "BUN"
+      ],
+      "canonical_id": "laboratory_vitals__blood_urea_nitrogen",
+      "canonical_name": "blood_urea_nitrogen",
+      "categories": null,
+      "clinical_domain": "laboratory_vitals",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "A measure of urea nitrogen in the blood, used to assess kidney function.",
+      "display_name": "Blood Urea Nitrogen (BUN)",
+      "parent_object": null,
+      "rationale": "Renal function marker.",
+      "source_candidate_ids": [
+        "C025"
+      ]
+    },
+    {
+      "action": "review",
+      "aliases": [],
+      "canonical_id": "laboratory_vitals__complete_blood_count",
+      "canonical_name": "complete_blood_count",
+      "categories": null,
+      "clinical_domain": "laboratory_vitals",
+      "data_type": "text",
+      "derivation": null,
+      "description": "A panel of tests that measure the different components of blood.",
+      "display_name": "Complete Blood Count",
+      "parent_object": null,
+      "rationale": "CBC is a collection of tests; individual components like WBC or Platelets are extracted separately.",
+      "source_candidate_ids": [
+        "C051"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Estimated Creatinine Clearance"
+      ],
+      "canonical_id": "laboratory_vitals__creatinine_clearance",
+      "canonical_name": "creatinine_clearance",
+      "categories": null,
+      "clinical_domain": "laboratory_vitals",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "A measure of how well the kidneys are filtering creatinine from the blood.",
+      "display_name": "Creatinine Clearance",
+      "parent_object": null,
+      "rationale": "Distinct from eGFR, often calculated via Cockcroft-Gault.",
+      "source_candidate_ids": [
+        "C085"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "DLCO measurement"
+      ],
+      "canonical_id": "laboratory_vitals__dlco",
+      "canonical_name": "dlco",
+      "categories": null,
+      "clinical_domain": "laboratory_vitals",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "Diffusing capacity of the lungs for carbon monoxide.",
+      "display_name": "DLCO",
+      "parent_object": "spirometry",
+      "rationale": "Specific pulmonary function measurement.",
+      "source_candidate_ids": [
+        "C071",
+        "C072"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "eGFR",
+        "Glomerular Filtration Rate (GFR) proxy"
+      ],
+      "canonical_id": "laboratory_vitals__estimated_glomerular_filtration_rate",
+      "canonical_name": "estimated_glomerular_filtration_rate",
+      "categories": null,
+      "clinical_domain": "laboratory_vitals",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "A calculation used to estimate how well the kidneys are filtering blood.",
+      "display_name": "Estimated Glomerular Filtration Rate (eGFR)",
+      "parent_object": null,
+      "rationale": "Standardized measure of renal function.",
+      "source_candidate_ids": [
+        "C078",
+        "C086",
+        "C102"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "laboratory_vitals__heart_rate",
+      "canonical_name": "heart_rate",
+      "categories": null,
+      "clinical_domain": "laboratory_vitals",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "The number of times the heart beats per minute.",
+      "display_name": "Heart Rate",
+      "parent_object": null,
+      "rationale": "Vital sign.",
+      "source_candidate_ids": [
+        "C107"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Hemoglobin level"
+      ],
+      "canonical_id": "laboratory_vitals__hemoglobin",
+      "canonical_name": "hemoglobin",
+      "categories": null,
+      "clinical_domain": "laboratory_vitals",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "A protein in red blood cells that carries oxygen.",
+      "display_name": "Hemoglobin",
+      "parent_object": null,
+      "rationale": "Key hematological marker.",
+      "source_candidate_ids": [
+        "C108",
+        "C109"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Hyperlipidemia presence"
+      ],
+      "canonical_id": "laboratory_vitals__hyperlipidemia_status",
+      "canonical_name": "hyperlipidemia_status",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "laboratory_vitals",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of high levels of lipids in the blood.",
+      "display_name": "Hyperlipidemia Status",
+      "parent_object": null,
+      "rationale": "Clinical condition.",
+      "source_candidate_ids": [
+        "C126"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Hypertension control status"
+      ],
+      "canonical_id": "laboratory_vitals__hypertension_control_status",
+      "canonical_name": "hypertension_control_status",
+      "categories": [
+        "controlled",
+        "uncontrolled",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "laboratory_vitals",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "The status of blood pressure management.",
+      "display_name": "Hypertension Control Status",
+      "parent_object": null,
+      "rationale": "Categorical status of a condition.",
+      "source_candidate_ids": [
+        "C127"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "LDH level"
+      ],
+      "canonical_id": "laboratory_vitals__lactate_dehydrogenase",
+      "canonical_name": "lactate_dehydrogenase",
+      "categories": null,
+      "clinical_domain": "laboratory_vitals",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "An enzyme that helps convert sugar into energy.",
+      "display_name": "Lactate Dehydrogenase (LDH)",
+      "parent_object": null,
+      "rationale": "Enzyme marker often used in oncology.",
+      "source_candidate_ids": [
+        "C138"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Neutropenia grade"
+      ],
+      "canonical_id": "laboratory_vitals__neutropenia_grade",
+      "canonical_name": "neutropenia_grade",
+      "categories": [
+        "grade 0",
+        "grade 1",
+        "grade 2",
+        "grade 3",
+        "grade 4",
+        "unknown"
+      ],
+      "clinical_domain": "laboratory_vitals",
+      "data_type": "ordinal",
+      "derivation": "not_automated",
+      "description": "The severity of neutropenia based on absolute neutrophil count.",
+      "display_name": "Neutropenia Grade",
+      "parent_object": null,
+      "rationale": "Ordinal classification of neutropenia.",
+      "source_candidate_ids": [
+        "C184"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "laboratory_vitals__platelet_count",
+      "canonical_name": "platelet_count",
+      "categories": null,
+      "clinical_domain": "laboratory_vitals",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "The number of platelets in a volume of blood.",
+      "display_name": "Platelet Count",
+      "parent_object": null,
+      "rationale": "Key hematological marker.",
+      "source_candidate_ids": [
+        "C213"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "laboratory_vitals__potassium",
+      "canonical_name": "potassium",
+      "categories": null,
+      "clinical_domain": "laboratory_vitals",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "Concentration of potassium in the blood.",
+      "display_name": "Potassium",
+      "parent_object": null,
+      "rationale": "Electrolyte measurement.",
+      "source_candidate_ids": [
+        "C218"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "laboratory_vitals__serum_albumin",
+      "canonical_name": "serum_albumin",
+      "categories": null,
+      "clinical_domain": "laboratory_vitals",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "The main protein in human blood plasma.",
+      "display_name": "Serum Albumin",
+      "parent_object": null,
+      "rationale": "Nutritional and liver function marker.",
+      "source_candidate_ids": [
+        "C252"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Serum calcium level"
+      ],
+      "canonical_id": "laboratory_vitals__serum_calcium",
+      "canonical_name": "serum_calcium",
+      "categories": null,
+      "clinical_domain": "laboratory_vitals",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "The amount of calcium in the blood.",
+      "display_name": "Serum Calcium",
+      "parent_object": null,
+      "rationale": "Electrolyte measurement.",
+      "source_candidate_ids": [
+        "C253"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Serum Sodium"
+      ],
+      "canonical_id": "laboratory_vitals__serum_sodium",
+      "canonical_name": "serum_sodium",
+      "categories": null,
+      "clinical_domain": "laboratory_vitals",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "The amount of sodium in the blood.",
+      "display_name": "Serum Sodium",
+      "parent_object": null,
+      "rationale": "Electrolyte measurement.",
+      "source_candidate_ids": [
+        "C254"
+      ]
+    },
+    {
+      "action": "review",
+      "aliases": [
+        "Spirometry result",
+        "Spirometry results"
+      ],
+      "canonical_id": "laboratory_vitals__spirometry",
+      "canonical_name": "spirometry",
+      "categories": null,
+      "clinical_domain": "laboratory_vitals",
+      "data_type": "text",
+      "derivation": null,
+      "description": "A test that shows how much air you can inhale and exhale and how fast you can exhale.",
+      "display_name": "Spirometry",
+      "parent_object": null,
+      "rationale": "Broad category for pulmonary function tests.",
+      "source_candidate_ids": [
+        "C259",
+        "C260"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "laboratory_vitals__systolic_blood_pressure",
+      "canonical_name": "systolic_blood_pressure",
+      "categories": null,
+      "clinical_domain": "laboratory_vitals",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "The pressure in your arteries when your heart beats.",
+      "display_name": "Systolic Blood Pressure",
+      "parent_object": null,
+      "rationale": "Vital sign.",
+      "source_candidate_ids": [
+        "C268"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "laboratory_vitals__white_blood_cell_count",
+      "canonical_name": "white_blood_cell_count",
+      "categories": null,
+      "clinical_domain": "laboratory_vitals",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "The total number of white blood cells in a volume of blood.",
+      "display_name": "White Blood Cell Count",
+      "parent_object": null,
+      "rationale": "Key hematological marker.",
+      "source_candidate_ids": [
+        "C287"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "molecular_biomarkers__alk_mutation_status",
+      "canonical_name": "alk_mutation_status",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "molecular_biomarkers",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence or absence of ALK gene mutations.",
+      "display_name": "ALK mutation status",
+      "parent_object": null,
+      "rationale": "Standard binary biomarker for NSCLC.",
+      "source_candidate_ids": [
+        "C008"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "molecular_biomarkers__cdkn2a_status",
+      "canonical_name": "cdkn2a_status",
+      "categories": [
+        "deletion",
+        "homozygous_deletion",
+        "mutation",
+        "wild_type",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "molecular_biomarkers",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "Genomic alteration status of the CDKN2A gene, including deletions and mutations.",
+      "display_name": "CDKN2A status",
+      "parent_object": null,
+      "rationale": "Consolidates various CDKN2A alteration descriptions into a single categorical variable.",
+      "source_candidate_ids": [
+        "C040",
+        "C041",
+        "C042"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "molecular_biomarkers__ck5_expression_status",
+      "canonical_name": "ck5_expression_status",
+      "categories": [
+        "diffuse",
+        "cytoplasmic",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "molecular_biomarkers",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "Immunohistochemistry results for CK5 expression.",
+      "display_name": "CK5 expression status",
+      "parent_object": null,
+      "rationale": "Captures IHC pattern for CK5.",
+      "source_candidate_ids": [
+        "C047"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "molecular_biomarkers__egfr_amplification_status",
+      "canonical_name": "egfr_amplification_status",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "molecular_biomarkers",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of EGFR gene amplification.",
+      "display_name": "EGFR amplification status",
+      "parent_object": null,
+      "rationale": "Distinct from mutation status.",
+      "source_candidate_ids": [
+        "C079"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "molecular_biomarkers__egfr_mutation_status",
+      "canonical_name": "egfr_mutation_status",
+      "categories": [
+        "l858r",
+        "deletion",
+        "wild_type",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "molecular_biomarkers",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "Presence of EGFR mutations, including specific variants like L858R or exon deletions.",
+      "display_name": "EGFR mutation status",
+      "parent_object": null,
+      "rationale": "Consolidates EGFR mutation types and general status.",
+      "source_candidate_ids": [
+        "C080",
+        "C081",
+        "C082"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "molecular_biomarkers__germline_mutation_status",
+      "canonical_name": "germline_mutation_status",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "molecular_biomarkers",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of germline genetic mutations.",
+      "display_name": "Germline mutation status",
+      "parent_object": null,
+      "rationale": "General germline status.",
+      "source_candidate_ids": [
+        "C100"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "molecular_biomarkers__ki67_index",
+      "canonical_name": "ki67_index",
+      "categories": null,
+      "clinical_domain": "molecular_biomarkers",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "The Ki-67 proliferation index.",
+      "display_name": "Ki-67 index",
+      "parent_object": null,
+      "rationale": "Continuous measurement of proliferation.",
+      "source_candidate_ids": [
+        "C132"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "molecular_biomarkers__kras_mutation_status",
+      "canonical_name": "kras_mutation_status",
+      "categories": [
+        "g12c",
+        "other_mutation",
+        "wild_type",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "molecular_biomarkers",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "Presence of KRAS mutations, specifically noting G12C variants.",
+      "display_name": "KRAS mutation status",
+      "parent_object": null,
+      "rationale": "Consolidates KRAS mutation status and specific G12C driver status.",
+      "source_candidate_ids": [
+        "C133",
+        "C134",
+        "C173"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "molecular_biomarkers__met_copy_number",
+      "canonical_name": "met_copy_number",
+      "categories": null,
+      "clinical_domain": "molecular_biomarkers",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "The quantitative copy number of the MET gene.",
+      "display_name": "MET copy number",
+      "parent_object": null,
+      "rationale": "Distinct continuous measurement from binary amplification status.",
+      "source_candidate_ids": [
+        "C167"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "molecular_biomarkers__met_genomic_status",
+      "canonical_name": "met_genomic_status",
+      "categories": [
+        "amplification",
+        "loss",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "molecular_biomarkers",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "Status of MET gene including amplification, copy number, and loss.",
+      "display_name": "MET genomic status",
+      "parent_object": null,
+      "rationale": "Groups MET amplification and MET loss.",
+      "source_candidate_ids": [
+        "C166",
+        "C169"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "molecular_biomarkers__napsin_a_expression",
+      "canonical_name": "napsin_a_expression",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "molecular_biomarkers",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Immunohistochemistry status for Napsin A.",
+      "display_name": "Napsin A expression",
+      "parent_object": null,
+      "rationale": "Consolidates Napsin A positive/negative findings.",
+      "source_candidate_ids": [
+        "C176",
+        "C177"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "molecular_biomarkers__p40_expression_status",
+      "canonical_name": "p40_expression_status",
+      "categories": [
+        "strong",
+        "weak",
+        "absent",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "molecular_biomarkers",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "Immunohistochemistry status for p40.",
+      "display_name": "p40 expression status",
+      "parent_object": null,
+      "rationale": "Captures p40 IHC intensity.",
+      "source_candidate_ids": [
+        "C201"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "molecular_biomarkers__pd_l1_amplification_status",
+      "canonical_name": "pd_l1_amplification_status",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "molecular_biomarkers",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of PD-L1 gene amplification.",
+      "display_name": "PD-L1 amplification status",
+      "parent_object": null,
+      "rationale": "Distinct from protein expression.",
+      "source_candidate_ids": [
+        "C207"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "molecular_biomarkers__pd_l1_expression",
+      "canonical_name": "pd_l1_expression",
+      "categories": null,
+      "clinical_domain": "molecular_biomarkers",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "PD-L1 expression level or status.",
+      "display_name": "PD-L1 expression",
+      "parent_object": null,
+      "rationale": "PD-L1 expression is often reported as a continuous percentage.",
+      "source_candidate_ids": [
+        "C208",
+        "C209"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "molecular_biomarkers__tp53_mutation_status",
+      "canonical_name": "tp53_mutation_status",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "molecular_biomarkers",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of TP53 mutations.",
+      "display_name": "TP53 mutation status",
+      "parent_object": null,
+      "rationale": "Standard binary biomarker.",
+      "source_candidate_ids": [
+        "C275"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "molecular_biomarkers__ttf1_expression_status",
+      "canonical_name": "ttf1_expression_status",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "molecular_biomarkers",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Immunohistochemistry status for TTF-1.",
+      "display_name": "TTF-1 expression status",
+      "parent_object": null,
+      "rationale": "Standard IHC biomarker for lung adenocarcinoma.",
+      "source_candidate_ids": [
+        "C278"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Family history of breast cancer"
+      ],
+      "canonical_id": "other__maternal_breast_cancer_history",
+      "canonical_name": "maternal_breast_cancer_history",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "other",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Indicates whether the patient's mother had a history of breast cancer.",
+      "display_name": "Maternal history of breast cancer",
+      "parent_object": "family_history",
+      "rationale": "Specific maternal history is a distinct clinical variable from general family history.",
+      "source_candidate_ids": [
+        "C155"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Tumor response"
+      ],
+      "canonical_id": "other__objective_tumor_response",
+      "canonical_name": "objective_tumor_response",
+      "categories": [
+        "complete response",
+        "partial response",
+        "stable disease",
+        "progressive disease",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "other",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "The measured change in tumor size following treatment according to standardized criteria.",
+      "display_name": "Objective tumor response",
+      "parent_object": "treatment_outcome",
+      "rationale": "Standard clinical outcome variable for oncology studies.",
+      "source_candidate_ids": [
+        "C196"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "Palliative care involvement",
+        "Palliative Care Involvement",
+        "Palliative Care Status"
+      ],
+      "canonical_id": "other__palliative_care_involvement",
+      "canonical_name": "palliative_care_involvement",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "other",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Indicates whether the patient is receiving palliative care services.",
+      "display_name": "Palliative care involvement",
+      "parent_object": null,
+      "rationale": "Merged redundant candidates regarding palliative care status into a single binary variable.",
+      "source_candidate_ids": [
+        "C204"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "other__time_since_diagnosis",
+      "canonical_name": "time_since_diagnosis",
+      "categories": null,
+      "clinical_domain": "other",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "The duration of time from the initial diagnosis to the time of assessment or study entry.",
+      "display_name": "Time since diagnosis",
+      "parent_object": null,
+      "rationale": "Continuous variable representing disease duration.",
+      "source_candidate_ids": [
+        "C271"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "procedures_surgery_radiation__history_of_blood_transfusion",
+      "canonical_name": "history_of_blood_transfusion",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "procedures_surgery_radiation",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of a history of blood transfusion.",
+      "display_name": "History of blood transfusion",
+      "parent_object": null,
+      "rationale": "Direct extraction of transfusion history.",
+      "source_candidate_ids": [
+        "C118"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "procedures_surgery_radiation__history_of_lobectomy",
+      "canonical_name": "history_of_lobectomy",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "procedures_surgery_radiation",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "History of any lobectomy procedure, including specific lobes.",
+      "display_name": "History of lobectomy",
+      "parent_object": null,
+      "rationale": "Consolidates various lobectomy descriptions (left lower, lower, etc.) into a single binary indicator of lobectomy history.",
+      "source_candidate_ids": [
+        "C119",
+        "C120",
+        "C121",
+        "C147"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "procedures_surgery_radiation__history_of_palliative_radiation_therapy",
+      "canonical_name": "history_of_palliative_radiation_therapy",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "procedures_surgery_radiation",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "History of radiation therapy administered for palliative purposes.",
+      "display_name": "History of palliative radiation therapy",
+      "parent_object": null,
+      "rationale": "Specific intent of radiation (palliative) is clinically distinct from general radiation history.",
+      "source_candidate_ids": [
+        "C122"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "procedures_surgery_radiation__history_of_stereotactic_radiosurgery",
+      "canonical_name": "history_of_stereotactic_radiosurgery",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "procedures_surgery_radiation",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "History of stereotactic radiosurgery (SRS), including for brain metastases.",
+      "display_name": "History of stereotactic radiosurgery",
+      "parent_object": null,
+      "rationale": "Merges SRS history and SRS specifically for brain metastases as they represent the same clinical procedure type.",
+      "source_candidate_ids": [
+        "C123",
+        "C124",
+        "C262"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "procedures_surgery_radiation__history_of_whole_brain_radiation_therapy",
+      "canonical_name": "history_of_whole_brain_radiation_therapy",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "procedures_surgery_radiation",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "History of whole-brain radiation therapy (WBRT).",
+      "display_name": "History of whole-brain radiation therapy",
+      "parent_object": null,
+      "rationale": "Distinct from SRS as it describes a different radiation modality/extent.",
+      "source_candidate_ids": [
+        "C125"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "procedures_surgery_radiation__lymph_node_dissection_status",
+      "canonical_name": "lymph_node_dissection_status",
+      "categories": [
+        "none",
+        "mediastinal",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "procedures_surgery_radiation",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "The extent or presence of lymph node dissection.",
+      "display_name": "Lymph node dissection status",
+      "parent_object": null,
+      "rationale": "Consolidates binary status and extent (mediastinal) into a single categorical variable describing the dissection.",
+      "source_candidate_ids": [
+        "C148",
+        "C149",
+        "C157",
+        "C158"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "procedures_surgery_radiation__postoperative_mediastinal_radiation",
+      "canonical_name": "postoperative_mediastinal_radiation",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "procedures_surgery_radiation",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "History of radiation to the mediastinum performed postoperatively.",
+      "display_name": "Postoperative mediastinal radiation",
+      "parent_object": null,
+      "rationale": "Specific clinical finding regarding postoperative radiation location.",
+      "source_candidate_ids": [
+        "C217"
+      ]
+    },
+    {
+      "action": "review",
+      "aliases": [],
+      "canonical_id": "procedures_surgery_radiation__pre_cycle_laboratory_status",
+      "canonical_name": "pre_cycle_laboratory_status",
+      "categories": null,
+      "clinical_domain": "procedures_surgery_radiation",
+      "data_type": "text",
+      "derivation": null,
+      "description": "Status of laboratory testing performed prior to a cycle.",
+      "display_name": "Pre-cycle laboratory status",
+      "parent_object": null,
+      "rationale": "Text-based status of lab testing requires review to determine clinical significance.",
+      "source_candidate_ids": [
+        "C219"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "procedures_surgery_radiation__radiation_dose_gy",
+      "canonical_name": "radiation_dose_gy",
+      "categories": null,
+      "clinical_domain": "procedures_surgery_radiation",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "The dose of radiation delivered in Gray (Gy).",
+      "display_name": "Radiation dose (Gy)",
+      "parent_object": null,
+      "rationale": "Consolidates all radiation dose measurements into a single continuous variable.",
+      "source_candidate_ids": [
+        "C237",
+        "C238",
+        "C273",
+        "C274"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "procedures_surgery_radiation__radiation_fractionation_count",
+      "canonical_name": "radiation_fractionation_count",
+      "categories": null,
+      "clinical_domain": "procedures_surgery_radiation",
+      "data_type": "count",
+      "derivation": null,
+      "description": "The number of radiation fractions (fx) delivered.",
+      "display_name": "Number of radiation fractions",
+      "parent_object": null,
+      "rationale": "Consolidates fractionation count and schedule into a count of fractions.",
+      "source_candidate_ids": [
+        "C194",
+        "C239"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "procedures_surgery_radiation__radiation_oncology_involvement",
+      "canonical_name": "radiation_oncology_involvement",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "procedures_surgery_radiation",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Indicates if radiation oncology was involved or referred.",
+      "display_name": "Radiation oncology involvement",
+      "parent_object": null,
+      "rationale": "Merges referral status and treatment involvement into a single indicator of oncology involvement.",
+      "source_candidate_ids": [
+        "C240",
+        "C241"
+      ]
+    },
+    {
+      "action": "drop",
+      "aliases": [
+        "Radiation Therapy History",
+        "Radiation therapy history"
+      ],
+      "canonical_id": "procedures_surgery_radiation__radiation_therapy_history",
+      "canonical_name": "radiation_therapy_history",
+      "categories": null,
+      "clinical_domain": "procedures_surgery_radiation",
+      "data_type": "text",
+      "derivation": null,
+      "description": "Schema-preserved drop decision for Radiation therapy history",
+      "display_name": "Radiation therapy history",
+      "parent_object": null,
+      "rationale": "Redundant with specific radiation history features.",
+      "source_candidate_ids": [
+        "C242"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "procedures_surgery_radiation__radiopharmaceutical_dose",
+      "canonical_name": "radiopharmaceutical_dose",
+      "categories": null,
+      "clinical_domain": "procedures_surgery_radiation",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "The dose of radiopharmaceutical administered (e.g., in MBq).",
+      "display_name": "Radiopharmaceutical dose",
+      "parent_object": null,
+      "rationale": "Direct extraction of tracer activity.",
+      "source_candidate_ids": [
+        "C243"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "procedures_surgery_radiation__surgical_status",
+      "canonical_name": "surgical_status",
+      "categories": [
+        "pre-operative",
+        "post-operative",
+        "adjuvant",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "procedures_surgery_radiation",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "The clinical status related to surgery (e.g., pre-operative, post-operative, adjuvant).",
+      "display_name": "Surgical status",
+      "parent_object": null,
+      "rationale": "Consolidates post-surgical changes and general surgical status into a categorical variable.",
+      "source_candidate_ids": [
+        "C215",
+        "C216",
+        "C263"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "anxiety severity",
+        "anxiety status"
+      ],
+      "canonical_id": "symptoms_patient_reported__anxiety_severity",
+      "canonical_name": "anxiety_severity",
+      "categories": [
+        "absent",
+        "mild",
+        "moderate",
+        "severe",
+        "unknown"
+      ],
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "ordinal",
+      "derivation": null,
+      "description": "The reported severity or presence of anxiety symptoms.",
+      "display_name": "Anxiety severity",
+      "parent_object": "psychiatric_symptoms",
+      "rationale": "Merged anxiety status and severity into a single ordinal scale to capture clinical nuance.",
+      "source_candidate_ids": [
+        "C015",
+        "C016"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "symptoms_patient_reported__appetite_loss",
+      "canonical_name": "appetite_loss",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of loss of appetite.",
+      "display_name": "Appetite loss",
+      "parent_object": "gastrointestinal_symptoms",
+      "rationale": "Standalone symptom.",
+      "source_candidate_ids": [
+        "C018"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "bone pain or symptomatic bone metastasis",
+        "bone pain presence"
+      ],
+      "canonical_id": "symptoms_patient_reported__bone_pain",
+      "canonical_name": "bone_pain",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of pain in the bones, potentially related to metastasis.",
+      "display_name": "Bone pain",
+      "parent_object": "pain",
+      "rationale": "Merged bone pain presence and symptomatic bone metastasis as they describe the same clinical finding.",
+      "source_candidate_ids": [
+        "C028",
+        "C029"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "symptoms_patient_reported__chest_pain",
+      "canonical_name": "chest_pain",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of pain in the chest area.",
+      "display_name": "Chest pain",
+      "parent_object": "pain",
+      "rationale": "Distinct from general pain.",
+      "source_candidate_ids": [
+        "C045"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "symptoms_patient_reported__chills",
+      "canonical_name": "chills",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of chills.",
+      "display_name": "Chills",
+      "parent_object": "systemic_symptoms",
+      "rationale": "Standalone symptom.",
+      "source_candidate_ids": [
+        "C046"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "constipation incidence"
+      ],
+      "canonical_id": "symptoms_patient_reported__constipation",
+      "canonical_name": "constipation",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence or incidence of constipation.",
+      "display_name": "Constipation",
+      "parent_object": "gastrointestinal_symptoms",
+      "rationale": "Merged incidence and presence into a binary feature.",
+      "source_candidate_ids": [
+        "C053",
+        "C054"
+      ]
+    },
+    {
+      "action": "review",
+      "aliases": [
+        "dry cough"
+      ],
+      "canonical_id": "symptoms_patient_reported__cough",
+      "canonical_name": "cough",
+      "categories": null,
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "text",
+      "derivation": null,
+      "description": "Presence, type, or frequency of cough.",
+      "display_name": "Cough",
+      "parent_object": "respiratory_symptoms",
+      "rationale": "Cough characteristics (dry, frequency, severity) are highly variable and best captured via review of text to avoid losing nuance.",
+      "source_candidate_ids": [
+        "C056",
+        "C057",
+        "C058",
+        "C059",
+        "C074"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "diarrhea incidence",
+        "presence of diarrhea"
+      ],
+      "canonical_id": "symptoms_patient_reported__diarrhea",
+      "canonical_name": "diarrhea",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence or incidence of diarrhea.",
+      "display_name": "Diarrhea",
+      "parent_object": "gastrointestinal_symptoms",
+      "rationale": "Merged diarrhea presence and incidence.",
+      "source_candidate_ids": [
+        "C066",
+        "C067",
+        "C221"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "symptoms_patient_reported__dizziness",
+      "canonical_name": "dizziness",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of dizziness or lightheadedness.",
+      "display_name": "Dizziness",
+      "parent_object": "neurological_symptoms",
+      "rationale": "Standalone symptom.",
+      "source_candidate_ids": [
+        "C070"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "dyspnea severity"
+      ],
+      "canonical_id": "symptoms_patient_reported__dyspnea",
+      "canonical_name": "dyspnea",
+      "categories": [
+        "absent",
+        "mild",
+        "moderate",
+        "severe",
+        "unknown"
+      ],
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "ordinal",
+      "derivation": null,
+      "description": "Presence or severity of shortness of breath.",
+      "display_name": "Dyspnea",
+      "parent_object": "respiratory_symptoms",
+      "rationale": "Merged dyspnea presence and severity into an ordinal scale.",
+      "source_candidate_ids": [
+        "C075",
+        "C076"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "fatigue"
+      ],
+      "canonical_id": "symptoms_patient_reported__fatigue_severity",
+      "canonical_name": "fatigue_severity",
+      "categories": [
+        "absent",
+        "mild",
+        "moderate",
+        "severe",
+        "unknown"
+      ],
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "ordinal",
+      "derivation": null,
+      "description": "The reported severity of fatigue, often graded by PRO-CTCAE.",
+      "display_name": "Fatigue severity",
+      "parent_object": "systemic_symptoms",
+      "rationale": "Merged fatigue and fatigue severity into an ordinal scale.",
+      "source_candidate_ids": [
+        "C089",
+        "C090"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "symptoms_patient_reported__fever",
+      "canonical_name": "fever",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of fever.",
+      "display_name": "Fever",
+      "parent_object": "systemic_symptoms",
+      "rationale": "Standalone symptom.",
+      "source_candidate_ids": [
+        "C093"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "gait deficit presence",
+        "neurological focal deficits"
+      ],
+      "canonical_id": "symptoms_patient_reported__focal_neurological_deficit",
+      "canonical_name": "focal_neurological_deficit",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of focal neurological deficits or gait deficits.",
+      "display_name": "Focal neurological deficit",
+      "parent_object": "neurological_symptoms",
+      "rationale": "Merged focal deficits and gait deficits as they are clinically related neurological findings.",
+      "source_candidate_ids": [
+        "C094",
+        "C099",
+        "C182"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "symptoms_patient_reported__headache",
+      "canonical_name": "headache",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of headache.",
+      "display_name": "Headache",
+      "parent_object": "neurological_symptoms",
+      "rationale": "Standalone symptom.",
+      "source_candidate_ids": [
+        "C106"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "symptoms_patient_reported__hemoptysis",
+      "canonical_name": "hemoptysis",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of coughing up blood.",
+      "display_name": "Hemoptysis",
+      "parent_object": "respiratory_symptoms",
+      "rationale": "Standalone symptom.",
+      "source_candidate_ids": [
+        "C110"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "nausea",
+        "nausea grade"
+      ],
+      "canonical_id": "symptoms_patient_reported__nausea_severity",
+      "canonical_name": "nausea_severity",
+      "categories": [
+        "absent",
+        "mild",
+        "moderate",
+        "severe",
+        "unknown"
+      ],
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "ordinal",
+      "derivation": null,
+      "description": "The reported severity or grade of nausea.",
+      "display_name": "Nausea severity",
+      "parent_object": "gastrointestinal_symptoms",
+      "rationale": "Merged nausea presence and severity into an ordinal scale.",
+      "source_candidate_ids": [
+        "C178",
+        "C179",
+        "C180"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "pain"
+      ],
+      "canonical_id": "symptoms_patient_reported__pain_severity",
+      "canonical_name": "pain_severity",
+      "categories": [
+        "absent",
+        "mild",
+        "moderate",
+        "severe",
+        "unknown"
+      ],
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "ordinal",
+      "derivation": null,
+      "description": "The reported severity of general pain.",
+      "display_name": "Pain severity",
+      "parent_object": "pain",
+      "rationale": "Merged general pain and pain severity.",
+      "source_candidate_ids": [
+        "C202",
+        "C203"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "symptoms_patient_reported__palpitations",
+      "canonical_name": "palpitations",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of heart palpitations.",
+      "display_name": "Palpitations",
+      "parent_object": "cardiovascular_symptoms",
+      "rationale": "Standalone symptom.",
+      "source_candidate_ids": [
+        "C205"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "presence of rash"
+      ],
+      "canonical_id": "symptoms_patient_reported__rash",
+      "canonical_name": "rash",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of skin rash.",
+      "display_name": "Rash",
+      "parent_object": "dermatological_symptoms",
+      "rationale": "Standalone symptom.",
+      "source_candidate_ids": [
+        "C231"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "sore throat presence"
+      ],
+      "canonical_id": "symptoms_patient_reported__sore_throat",
+      "canonical_name": "sore_throat",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of sore throat.",
+      "display_name": "Sore throat",
+      "parent_object": "heent_symptoms",
+      "rationale": "Standalone symptom.",
+      "source_candidate_ids": [
+        "C258"
+      ]
+    },
+    {
+      "action": "drop",
+      "aliases": [
+        "Systemic symptoms"
+      ],
+      "canonical_id": "symptoms_patient_reported__systemic_symptoms",
+      "canonical_name": "systemic_symptoms",
+      "categories": null,
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "text",
+      "derivation": null,
+      "description": "Schema-preserved drop decision for Systemic symptoms",
+      "display_name": "Systemic symptoms",
+      "parent_object": null,
+      "rationale": "Systemic symptoms is too vague and lacks specific evidence.",
+      "source_candidate_ids": [
+        "C266"
+      ]
+    },
+    {
+      "action": "drop",
+      "aliases": [
+        "Systemic symptoms presence"
+      ],
+      "canonical_id": "symptoms_patient_reported__systemic_symptoms_presence",
+      "canonical_name": "systemic_symptoms_presence",
+      "categories": null,
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "text",
+      "derivation": null,
+      "description": "Schema-preserved drop decision for Systemic symptoms presence",
+      "display_name": "Systemic symptoms presence",
+      "parent_object": null,
+      "rationale": "Systemic symptoms presence is too vague.",
+      "source_candidate_ids": [
+        "C267"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "symptoms_patient_reported__unexplained_weight_loss",
+      "canonical_name": "unexplained_weight_loss",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of unexplained weight loss.",
+      "display_name": "Unexplained weight loss",
+      "parent_object": "systemic_symptoms",
+      "rationale": "Standalone symptom.",
+      "source_candidate_ids": [
+        "C283"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "presence of vomiting"
+      ],
+      "canonical_id": "symptoms_patient_reported__vomiting",
+      "canonical_name": "vomiting",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of vomiting.",
+      "display_name": "Vomiting",
+      "parent_object": "gastrointestinal_symptoms",
+      "rationale": "Standalone symptom.",
+      "source_candidate_ids": [
+        "C235",
+        "C284"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "wheezing presence"
+      ],
+      "canonical_id": "symptoms_patient_reported__wheezing",
+      "canonical_name": "wheezing",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "symptoms_patient_reported",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of wheezing.",
+      "display_name": "Wheezing",
+      "parent_object": "respiratory_symptoms",
+      "rationale": "Standalone symptom.",
+      "source_candidate_ids": [
+        "C285",
+        "C286"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "systemic_treatments_medications__adjuvant_treatment_history",
+      "canonical_name": "adjuvant_treatment_history",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "systemic_treatments_medications",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Indicates whether the patient has a history of adjuvant therapy.",
+      "display_name": "Adjuvant treatment history",
+      "parent_object": null,
+      "rationale": "C002 and C003 both refer to the status/setting of adjuvant therapy; merged into a single binary history variable.",
+      "source_candidate_ids": [
+        "C002",
+        "C003"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "systemic_treatments_medications__care_intent",
+      "canonical_name": "care_intent",
+      "categories": [
+        "palliative",
+        "curative",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "systemic_treatments_medications",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "The primary goal of treatment (e.g., palliative).",
+      "display_name": "Care intent",
+      "parent_object": null,
+      "rationale": "Captures the clinical intent of the treatment provided.",
+      "source_candidate_ids": [
+        "C039"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "systemic_treatments_medications__chemotherapy_cycle_count",
+      "canonical_name": "chemotherapy_cycle_count",
+      "categories": null,
+      "clinical_domain": "systemic_treatments_medications",
+      "data_type": "count",
+      "derivation": null,
+      "description": "The total number of completed or planned chemotherapy cycles.",
+      "display_name": "Chemotherapy cycle count",
+      "parent_object": null,
+      "rationale": "Merges completed cycles and total number of cycles into a single count variable.",
+      "source_candidate_ids": [
+        "C052",
+        "C195"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [
+        "dosing cycle frequency",
+        "treatment cycle frequency"
+      ],
+      "canonical_id": "systemic_treatments_medications__chemotherapy_cycle_interval",
+      "canonical_name": "chemotherapy_cycle_interval",
+      "categories": null,
+      "clinical_domain": "systemic_treatments_medications",
+      "data_type": "continuous",
+      "derivation": null,
+      "description": "The frequency or interval between chemotherapy cycles.",
+      "display_name": "Chemotherapy cycle interval",
+      "parent_object": null,
+      "rationale": "Consolidates all mentions of cycle frequency/intervals (e.g., q21, q3 weeks) into one continuous measurement of time.",
+      "source_candidate_ids": [
+        "C043",
+        "C073",
+        "C276"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "systemic_treatments_medications__chemotherapy_regimen_type",
+      "canonical_name": "chemotherapy_regimen_type",
+      "categories": [
+        "carboplatin + pemetrexed",
+        "taxane-based",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "systemic_treatments_medications",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "The specific combination or type of chemotherapy regimen administered.",
+      "display_name": "Chemotherapy regimen type",
+      "parent_object": null,
+      "rationale": "Combines specific regimen descriptions and broad regimen types (taxane-based) into a single categorical field.",
+      "source_candidate_ids": [
+        "C044",
+        "C269"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "systemic_treatments_medications__current_chemotherapy_cycle_number",
+      "canonical_name": "current_chemotherapy_cycle_number",
+      "categories": null,
+      "clinical_domain": "systemic_treatments_medications",
+      "data_type": "count",
+      "derivation": null,
+      "description": "The ordinal number of the current chemotherapy cycle being administered.",
+      "display_name": "Current chemotherapy cycle number",
+      "parent_object": null,
+      "rationale": "Represents the specific cycle number in a sequence.",
+      "source_candidate_ids": [
+        "C063"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "systemic_treatments_medications__growth_factor_support",
+      "canonical_name": "growth_factor_support",
+      "categories": [
+        "outpatient",
+        "inpatient",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "systemic_treatments_medications",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "Details regarding the administration and setting of growth factor support.",
+      "display_name": "Growth factor support",
+      "parent_object": "growth_factor_therapy",
+      "rationale": "C104 (binary) and C105 (categorical) are merged into a single categorical variable describing the support context.",
+      "source_candidate_ids": [
+        "C104",
+        "C105"
+      ]
+    },
+    {
+      "action": "review",
+      "aliases": [],
+      "canonical_id": "systemic_treatments_medications__medication_administration_details",
+      "canonical_name": "medication_administration_details",
+      "categories": null,
+      "clinical_domain": "systemic_treatments_medications",
+      "data_type": "text",
+      "derivation": null,
+      "description": "Details regarding how a medication is administered, including route and frequency.",
+      "display_name": "Medication administration details",
+      "parent_object": "medication_administration",
+      "rationale": "Route and frequency are highly variable; a review of the text is safer than forced extraction into rigid categories for all medications.",
+      "source_candidate_ids": [
+        "C163",
+        "C164",
+        "C165"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "systemic_treatments_medications__medication_use",
+      "canonical_name": "medication_use",
+      "categories": [
+        "absent",
+        "present",
+        "unknown"
+      ],
+      "clinical_domain": "systemic_treatments_medications",
+      "data_type": "binary",
+      "derivation": null,
+      "description": "Presence of specific medications (e.g., Levetiracetam, Morphine, Ondansetron, Pembrolizumab, MET inhibitors).",
+      "display_name": "Medication use",
+      "parent_object": null,
+      "rationale": "These are distinct medications; while they share a 'use' concept, they are clinically distinct variables. They are grouped here as a template for medication extraction.",
+      "source_candidate_ids": [
+        "C143",
+        "C144",
+        "C168",
+        "C174",
+        "C199",
+        "C210"
+      ]
+    },
+    {
+      "action": "extract",
+      "aliases": [],
+      "canonical_id": "systemic_treatments_medications__treatment_response_status",
+      "canonical_name": "treatment_response_status",
+      "categories": [
+        "partial response",
+        "progressive disease",
+        "complete response",
+        "stable disease",
+        "other",
+        "unknown"
+      ],
+      "clinical_domain": "systemic_treatments_medications",
+      "data_type": "categorical",
+      "derivation": null,
+      "description": "The clinical assessment of how the patient responded to treatment.",
+      "display_name": "Treatment response status",
+      "parent_object": null,
+      "rationale": "Standard clinical assessment of response.",
+      "source_candidate_ids": [
+        "C277"
+      ]
+    }
+  ],
+  "metadata": {
+    "candidate_occurrences": 375,
+    "canonical_feature_count": 152,
+    "clinical_task": "Identify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.",
+    "elapsed_seconds": 0.46900177001953125,
+    "exact_unique_candidate_names": 287,
+    "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+    "server_url": "http://camus.dfci.harvard.edu:8002/v1",
+    "source_topic_responses": "one_off_tfidf_cohort_contrast/results_five_conf_five_mod_fold1_nmf/topic_label_batch/responses"
+  }
+}

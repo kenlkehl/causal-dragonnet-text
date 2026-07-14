@@ -1,0 +1,111 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 5.548574686050415,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Contains a leading hyphen and combines two distinct demographic variables into one string.",
+        "term": "- sex age"
+      },
+      {
+        "reason": "Contains a leading hyphen, likely a formatting artifact from a template or list.",
+        "term": "- sex"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "Demographics and Diagnosis",
+      "summary": "The topic contains terms related to the primary diagnosis of non-small cell lung cancer and basic demographic identifiers such as age and sex."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The terms clearly point to the primary diagnosis of non-small cell lung cancer.",
+        "feature_type": "diagnosis",
+        "name": "Non-small cell lung cancer diagnosis",
+        "represented_values_or_categories": [
+          "non-small cell"
+        ],
+        "supporting_terms": [
+          "diagnosis non-small cell",
+          "diagnosis non-small",
+          "primary diagnosis non-small"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The term 'sex' is explicitly mentioned as a demographic variable.",
+        "feature_type": "demographic",
+        "name": "Sex",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "- sex age",
+          "- sex"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The term 'age' is explicitly mentioned as a demographic variable.",
+        "feature_type": "demographic",
+        "name": "Age",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "- sex age"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Diagnosis type",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Non-small cell lung cancer diagnosis"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Sex",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Sex"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Age",
+        "suggested_representation": "continuous",
+        "supporting_specific_features": [
+          "Age"
+        ]
+      }
+    ],
+    "topic_index": 75,
+    "topic_rank": 16
+  },
+  "raw_content": "{\n  \"topic_rank\": 16,\n  \"topic_index\": 75,\n  \"general_topic\": {\n    \"label\": \"Demographics and Diagnosis\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic contains terms related to the primary diagnosis of non-small cell lung cancer and basic demographic identifiers such as age and sex.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Non-small cell lung cancer diagnosis\",\n      \"supporting_terms\": [\n        \"diagnosis non-small cell\",\n        \"diagnosis non-small\",\n        \"primary diagnosis non-small\"\n      ],\n      \"feature_type\": \"diagnosis\",\n      \"represented_values_or_categories\": [\n        \"non-small cell\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms clearly point to the primary diagnosis of non-small cell lung cancer.\"\n    },\n    {\n      \"name\": \"Sex\",\n      \"supporting_terms\": [\n        \"- sex age\",\n        \"- sex\"\n      ],\n      \"feature_type\": \"demographic\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The term 'sex' is explicitly mentioned as a demographic variable.\"\n    },\n    {\n      \"name\": \"Age\",\n      \"supporting_terms\": [\n        \"- sex age\"\n      ],\n      \"feature_type\": \"demographic\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The term 'age' is explicitly mentioned as a demographic variable.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"- sex age\",\n      \"reason\": \"Contains a leading hyphen and combines two distinct demographic variables into one string.\"\n    },\n    {\n      \"term\": \"- sex\",\n      \"reason\": \"Contains a leading hyphen, likely a formatting artifact from a template or list.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Diagnosis type\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Non-small cell lung cancer diagnosis\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Sex\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Sex\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Age\",\n      \"suggested_representation\": \"continuous\",\n      \"supporting_specific_features\": [\n        \"Age\"\n      ],\n      \"confidence\": \"high\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-96f81cc8b832d2e3",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "diagnosis non-small cell",
+    "diagnosis non-small",
+    "primary diagnosis non-small",
+    "- sex age",
+    "- sex"
+  ],
+  "topic_index": 75,
+  "topic_rank": 16,
+  "usage": {
+    "completion_tokens": 684,
+    "prompt_tokens": 768,
+    "prompt_tokens_details": null,
+    "total_tokens": 1452
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 16, internal index 75\n\nTerms in this topic, ordered from highest to lowest loading:\n1. diagnosis non-small cell\n2. diagnosis non-small\n3. primary diagnosis non-small\n4. - sex age\n5. - sex\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 16,\n  \"topic_index\": 75,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

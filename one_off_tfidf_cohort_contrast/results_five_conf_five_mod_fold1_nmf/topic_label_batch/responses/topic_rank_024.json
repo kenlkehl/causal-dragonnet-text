@@ -1,0 +1,184 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 9.023259162902832,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Generic placeholder/null value.",
+        "term": "unknown."
+      },
+      {
+        "reason": "Fragmentary anatomical or directional descriptor.",
+        "term": "and right"
+      },
+      {
+        "reason": "Verb phrase fragment.",
+        "term": "are identified"
+      },
+      {
+        "reason": "Likely a grade or part of a template, but ambiguous without context.",
+        "term": "nausea 5"
+      },
+      {
+        "reason": "Disease acronym with punctuation noise.",
+        "term": "nsclc . ---"
+      },
+      {
+        "reason": "Fragmentary clinical observation.",
+        "term": "neurologic grossly"
+      }
+    ],
+    "general_topic": {
+      "coherence": "mixed",
+      "confidence": "medium",
+      "label": "Neurological status and metastatic site assessment",
+      "summary": "The topic contains fragments related to intracranial/brain metastases, neurological deficits, and some toxicity symptoms like nausea and myelosuppression."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Terms indicate assessment of brain metastases or intracranial lesions.",
+        "feature_type": "categorical",
+        "name": "Intracranial disease status",
+        "represented_values_or_categories": [
+          "presence of intracranial disease",
+          "absence of brain lesions"
+        ],
+        "supporting_terms": [
+          "intracranial disease",
+          "no brain",
+          "lesions are"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Direct mention of neurological focal deficits.",
+        "feature_type": "categorical",
+        "name": "Neurological focal deficits",
+        "represented_values_or_categories": [
+          "presence of focal deficits"
+        ],
+        "supporting_terms": [
+          "focal deficits.",
+          "focal deficits. -"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "Nausea is identified, though 'nausea 5' may be a grade or artifact.",
+        "feature_type": "categorical",
+        "name": "Nausea",
+        "represented_values_or_categories": [
+          "nausea"
+        ],
+        "supporting_terms": [
+          "nausea 5",
+          "myelosuppression nausea"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "Mention of myelosuppression, likely as a treatment toxicity.",
+        "feature_type": "categorical",
+        "name": "Myelosuppression",
+        "represented_values_or_categories": [
+          "myelosuppression"
+        ],
+        "supporting_terms": [
+          "myelosuppression nausea"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "Refers to anatomical locations often involved in NSCLC progression.",
+        "feature_type": "categorical",
+        "name": "Mediastinal or hilar involvement",
+        "represented_values_or_categories": [
+          "mediastinal involvement",
+          "hilar involvement"
+        ],
+        "supporting_terms": [
+          "- mediastinum hilum"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Presence of intracranial metastases",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Intracranial disease status"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Neurological focal deficits",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Neurological focal deficits"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Nausea grade",
+        "suggested_representation": "ordinal",
+        "supporting_specific_features": [
+          "Nausea"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Myelosuppression",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Myelosuppression"
+        ]
+      },
+      {
+        "confidence": "low",
+        "name": "Mediastinal/Hilar lymphadenopathy",
+        "suggested_representation": "binary",
+        "supporting_specific_features": []
+      }
+    ],
+    "topic_index": 32,
+    "topic_rank": 24
+  },
+  "raw_content": "{\n  \"topic_rank\": 24,\n  \"topic_index\": 32,\n  \"general_topic\": {\n    \"label\": \"Neurological status and metastatic site assessment\",\n    \"coherence\": \"mixed\",\n    \"confidence\": \"medium\",\n    \"summary\": \"The topic contains fragments related to intracranial/brain metastases, neurological deficits, and some toxicity symptoms like nausea and myelosuppression.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Intracranial disease status\",\n      \"supporting_terms\": [\n        \"intracranial disease\",\n        \"no brain\",\n        \"lesions are\"\n      ],\n      \"feature_type\": \"categorical\",\n      \"represented_values_or_categories\": [\n        \"presence of intracranial disease\",\n        \"absence of brain lesions\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Terms indicate assessment of brain metastases or intracranial lesions.\"\n    },\n    {\n      \"name\": \"Neurological focal deficits\",\n      \"supporting_terms\": [\n        \"focal deficits.\",\n        \"focal deficits. -\"\n      ],\n      \"feature_type\": \"categorical\",\n      \"represented_values_or_categories\": [\n        \"presence of focal deficits\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Direct mention of neurological focal deficits.\"\n    },\n    {\n      \"name\": \"Nausea\",\n      \"supporting_terms\": [\n        \"nausea 5\",\n        \"myelosuppression nausea\"\n      ],\n      \"feature_type\": \"categorical\",\n      \"represented_values_or_categories\": [\n        \"nausea\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Nausea is identified, though 'nausea 5' may be a grade or artifact.\"\n    },\n    {\n      \"name\": \"Myelosuppression\",\n      \"supporting_terms\": [\n        \"myelosuppression nausea\"\n      ],\n      \"feature_type\": \"categorical\",\n      \"represented_values_or_categories\": [\n        \"myelosuppression\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Mention of myelosuppression, likely as a treatment toxicity.\"\n    },\n    {\n      \"name\": \"Mediastinal or hilar involvement\",\n      \"supporting_terms\": [\n        \"- mediastinum hilum\"\n      ],\n      \"feature_type\": \"categorical\",\n      \"represented_values_or_categories\": [\n        \"mediastinal involvement\",\n        \"hilar involvement\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Refers to anatomical locations often involved in NSCLC progression.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"unknown.\",\n      \"reason\": \"Generic placeholder/null value.\"\n    },\n    {\n      \"term\": \"and right\",\n      \"reason\": \"Fragmentary anatomical or directional descriptor.\"\n    },\n    {\n      \"term\": \"are identified\",\n      \"reason\": \"Verb phrase fragment.\"\n    },\n    {\n      \"term\": \"nausea 5\",\n      \"reason\": \"Likely a grade or part of a template, but ambiguous without context.\"\n    },\n    {\n      \"term\": \"nsclc . ---\",\n      \"reason\": \"Disease acronym with punctuation noise.\"\n    },\n    {\n      \"term\": \"neurologic grossly\",\n      \"reason\": \"Fragmentary clinical observation.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Presence of intracranial metastases\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Intracranial disease status\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Neurological focal deficits\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Neurological focal deficits\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Nausea grade\",\n      \"suggested_representation\": \"ordinal\",\n      \"supporting_specific_features\": [\n        \"Nausea\"\n      ],\n      \"confidence\": \"medium\"\n    },\n    {\n      \"name\": \"Myelosuppression\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Myelosuppression\"\n      ],\n      \"confidence\": \"medium\"\n    },\n    {\n      \"name\": \"Mediastinal/Hilar lymphadenopathy\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [],\n      \"confidence\": \"low\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-a4010ba2133b8d1b",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "unknown.",
+    "intracranial disease",
+    "no brain",
+    "and right",
+    "are identified",
+    "or focal deficits.",
+    "nausea 5",
+    "lesions are",
+    "focal deficits. -",
+    "myelosuppression nausea",
+    "nsclc . ---",
+    "- mediastinum hilum",
+    "extensive",
+    "neurologic grossly",
+    "- neurologic no"
+  ],
+  "topic_index": 32,
+  "topic_rank": 24,
+  "usage": {
+    "completion_tokens": 1161,
+    "prompt_tokens": 829,
+    "prompt_tokens_details": null,
+    "total_tokens": 1990
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 24, internal index 32\n\nTerms in this topic, ordered from highest to lowest loading:\n1. unknown.\n2. intracranial disease\n3. no brain\n4. and right\n5. are identified\n6. or focal deficits.\n7. nausea 5\n8. lesions are\n9. focal deficits. -\n10. myelosuppression nausea\n11. nsclc . ---\n12. - mediastinum hilum\n13. extensive\n14. neurologic grossly\n15. - neurologic no\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 24,\n  \"topic_index\": 32,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

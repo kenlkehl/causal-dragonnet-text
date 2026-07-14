@@ -1,0 +1,259 @@
+{
+  "attempts": 1,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "assignments": [
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C121",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "history_of_lower_lobectomy"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C122",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "history_of_palliative_radiation_therapy"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C123",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "history_of_stereotactic_radiosurgery"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C124",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "history_of_stereotactic_radiosurgery_for_brain_metastases"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C125",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "history_of_whole_brain_radiation_therapy"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C126",
+        "domain": "laboratory_vitals",
+        "preliminary_normalized_name": "hyperlipidemia_presence"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C127",
+        "domain": "laboratory_vitals",
+        "preliminary_normalized_name": "hypertension_control_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C128",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "imaging_modality_used"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C129",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "intracranial_metastasis"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C130",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "intracranial_metastasis_presence"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C131",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "intracranial_metastatic_enhancement"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C132",
+        "domain": "molecular_biomarkers",
+        "preliminary_normalized_name": "ki_67_index"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C133",
+        "domain": "molecular_biomarkers",
+        "preliminary_normalized_name": "kras_g12c_mutation_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C134",
+        "domain": "molecular_biomarkers",
+        "preliminary_normalized_name": "kras_mutation_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C135",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "largest_brain_lesion_diameter"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C136",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "largest_hepatic_lesion_diameter"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C137",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "laterality_of_brain_metastasis"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C138",
+        "domain": "laboratory_vitals",
+        "preliminary_normalized_name": "ldh_level"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C139",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "left_adrenal_metastasis"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C140",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "lesion_diameter"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C141",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "lesion_enhancement_pattern"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C142",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "lesion_enhancement_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C143",
+        "domain": "systemic_treatments_medications",
+        "preliminary_normalized_name": "levetiracetam_use"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C144",
+        "domain": "systemic_treatments_medications",
+        "preliminary_normalized_name": "lisinopril_dosage"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C145",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "liver_metastasis"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C146",
+        "domain": "demographics_social",
+        "preliminary_normalized_name": "living_arrangement"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C147",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "lobectomy_performed"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C148",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "lymph_node_dissection_extent"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C149",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "lymph_node_dissection_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C150",
+        "domain": "diagnosis_stage_histology",
+        "preliminary_normalized_name": "lymph_node_involvement"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C151",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "lymph_node_metastasis"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C152",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "lymph_node_short_axis_diameter"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C153",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "lymphadenopathy_presence"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C154",
+        "domain": "demographics_social",
+        "preliminary_normalized_name": "marital_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C155",
+        "domain": "other",
+        "preliminary_normalized_name": "maternal_history_of_breast_cancer"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C156",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "maximum_suv_max"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C157",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "mediastinal_lymph_node_dissection"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C158",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "mediastinal_lymph_node_dissection_performed"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C159",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "mediastinal_or_hilar_lymphadenopathy"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C160",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "mediastinal_or_hilar_lymphadenopathy_status"
+      }
+    ]
+  },
+  "raw_content": "{\n  \"assignments\": [\n    {\n      \"candidate_id\": \"C121\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"history_of_lower_lobectomy\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C122\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"history_of_palliative_radiation_therapy\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C123\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"history_of_stereotactic_radiosurgery\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C124\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"history_of_stereotactic_radiosurgery_for_brain_metastases\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C125\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"history_of_whole_brain_radiation_therapy\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C126\",\n      \"domain\": \"laboratory_vitals\",\n      \"preliminary_normalized_name\": \"hyperlipidemia_presence\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C127\",\n      \"domain\": \"laboratory_vitals\",\n      \"preliminary_normalized_name\": \"hypertension_control_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C128\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"imaging_modality_used\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C129\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"intracranial_metastasis\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C130\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"intracranial_metastasis_presence\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C131\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"intracranial_metastatic_enhancement\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C132\",\n      \"domain\": \"molecular_biomarkers\",\n      \"preliminary_normalized_name\": \"ki_67_index\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C133\",\n      \"domain\": \"molecular_biomarkers\",\n      \"preliminary_normalized_name\": \"kras_g12c_mutation_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C134\",\n      \"domain\": \"molecular_biomarkers\",\n      \"preliminary_normalized_name\": \"kras_mutation_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C135\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"largest_brain_lesion_diameter\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C136\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"largest_hepatic_lesion_diameter\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C137\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"laterality_of_brain_metastasis\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C138\",\n      \"domain\": \"laboratory_vitals\",\n      \"preliminary_normalized_name\": \"ldh_level\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C139\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"left_adrenal_metastasis\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C140\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"lesion_diameter\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C141\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"lesion_enhancement_pattern\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C142\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"lesion_enhancement_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C143\",\n      \"domain\": \"systemic_treatments_medications\",\n      \"preliminary_normalized_name\": \"levetiracetam_use\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C144\",\n      \"domain\": \"systemic_treatments_medications\",\n      \"preliminary_normalized_name\": \"lisinopril_dosage\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C145\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"liver_metastasis\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C146\",\n      \"domain\": \"demographics_social\",\n      \"preliminary_normalized_name\": \"living_arrangement\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C147\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"lobectomy_performed\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C148\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"lymph_node_dissection_extent\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C149\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"lymph_node_dissection_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C150\",\n      \"domain\": \"diagnosis_stage_histology\",\n      \"preliminary_normalized_name\": \"lymph_node_involvement\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C151\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"lymph_node_metastasis\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C152\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"lymph_node_short_axis_diameter\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C153\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"lymphadenopathy_presence\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C154\",\n      \"domain\": \"demographics_social\",\n      \"preliminary_normalized_name\": \"marital_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C155\",\n      \"domain\": \"other\",\n      \"preliminary_normalized_name\": \"maternal_history_of_breast_cancer\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C156\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"maximum_suv_max\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C157\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"mediastinal_lymph_node_dissection\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C158\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"mediastinal_lymph_node_dissection_performed\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C159\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"mediastinal_or_hilar_lymphadenopathy\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C160\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"mediastinal_or_hilar_lymphadenopathy_status\",\n      \"artifact_likelihood\": \"low\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-b3a22ac9e4084d66",
+  "status": "complete",
+  "system_prompt": "You organize proposed clinical feature names into broad domains before harmonization. Use only the supplied evidence. Every candidate ID must appear exactly once. Return valid JSON only.",
+  "usage": {
+    "completion_tokens": 2481,
+    "prompt_tokens": 5298,
+    "prompt_tokens_details": null,
+    "total_tokens": 7779
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nAssign every candidate to exactly one of these domains:\n[\"demographics_social\", \"diagnosis_stage_histology\", \"molecular_biomarkers\", \"imaging_disease_sites\", \"laboratory_vitals\", \"symptoms_patient_reported\", \"functional_performance\", \"systemic_treatments_medications\", \"procedures_surgery_radiation\", \"administrative_artifact\", \"other\"]\n\nUse `administrative_artifact` only for identifiers, note-template structure, or nonclinical administrative fragments. A clinically meaningful variable that may merely be unimportant should remain in its clinical domain.\n\nCandidates:\n[{\"candidate_id\": \"C121\", \"name\": \"History of lower lobectomy\", \"occurrence_count\": 1, \"topic_ranks\": [94], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Lower lobectomy\"], \"evidence_terms\": [\"lower lobectomy\", \"lower lobectomy with\", \"lower lobectomy and\", \"lobectomy\", \"lobectomy with\", \"lobectomy with mediastinal\"], \"feature_type_hints\": [\"procedure\"], \"represented_values_or_categories\": [\"lower lobectomy\"]}, {\"candidate_id\": \"C122\", \"name\": \"History of palliative radiation therapy\", \"occurrence_count\": 1, \"topic_ranks\": [36], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Prior palliative radiation therapy\"], \"evidence_terms\": [\"palliative external-beam radiation\", \"prior palliative radiation\", \"previously irradiated\", \"prior radiation\", \"palliative external-beam\"], \"feature_type_hints\": [\"history\"], \"represented_values_or_categories\": [\"prior\"]}, {\"candidate_id\": \"C123\", \"name\": \"History of stereotactic radiosurgery\", \"occurrence_count\": 4, \"topic_ranks\": [53, 55, 63, 100], \"representation_votes\": {\"binary\": 4}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Stereotactic Radiosurgery\", \"Stereotactic radiosurgery\", \"Stereotactic radiosurgery (SRS)\"], \"evidence_terms\": [\"stereotactic\", \"srs\", \"radiosurgery\", \"stereotactic radiosurgery\", \"stereotactic radiosurgery srs\", \"radiosurgery srs\"], \"feature_type_hints\": [\"procedure\"], \"represented_values_or_categories\": [\"stereotactic radiosurgery\"]}, {\"candidate_id\": \"C124\", \"name\": \"History of stereotactic radiosurgery for brain metastases\", \"occurrence_count\": 1, \"topic_ranks\": [74], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Stereotactic radiosurgery (SRS)\"], \"evidence_terms\": [\"stereotactic\", \"radiosurgery\", \"stereotactic radiosurgery\", \"with stereotactic radiosurgery\", \"with stereotactic\", \"srs\"], \"feature_type_hints\": [\"procedure\"], \"represented_values_or_categories\": [\"performed\"]}, {\"candidate_id\": \"C125\", \"name\": \"History of whole-brain radiation therapy\", \"occurrence_count\": 1, \"topic_ranks\": [27], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Whole-brain radiation therapy\"], \"evidence_terms\": [\"whole-brain\"], \"feature_type_hints\": [\"procedure\"], \"represented_values_or_categories\": [\"whole-brain\"]}, {\"candidate_id\": \"C126\", \"name\": \"Hyperlipidemia presence\", \"occurrence_count\": 1, \"topic_ranks\": [13], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"low\", \"supporting_specific_features\": [\"Hyperlipidemia\"], \"evidence_terms\": [\"daily. - hyperlipidemia\"], \"feature_type_hints\": [\"condition\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C127\", \"name\": \"Hypertension control status\", \"occurrence_count\": 1, \"topic_ranks\": [13], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Hypertension status\"], \"evidence_terms\": [\"hypertension. - no\", \"controlled on lisinopril\"], \"feature_type_hints\": [\"condition\"], \"represented_values_or_categories\": [\"no\", \"controlled\"]}, {\"candidate_id\": \"C128\", \"name\": \"Imaging modality used\", \"occurrence_count\": 1, \"topic_ranks\": [14], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Imaging modality (SWI)\"], \"evidence_terms\": [\"swi\", \"susceptibility-weighted imaging\", \"on swi.\", \"swi.\", \"imaging swi\", \"susceptibility-weighted imaging swi\", \"susceptibility-weighted\"], \"feature_type_hints\": [\"modality\"], \"represented_values_or_categories\": [\"susceptibility-weighted imaging\"]}, {\"candidate_id\": \"C129\", \"name\": \"Intracranial metastasis\", \"occurrence_count\": 1, \"topic_ranks\": [49], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Intracranial involvement\"], \"evidence_terms\": [\"evidence of intracranial\", \"or focal deficits.\", \"of intracranial\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C130\", \"name\": \"Intracranial metastasis presence\", \"occurrence_count\": 1, \"topic_ranks\": [9], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Intracranial involvement\"], \"evidence_terms\": [\"evidence of intracranial\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C131\", \"name\": \"Intracranial metastatic enhancement\", \"occurrence_count\": 1, \"topic_ranks\": [75], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Intracranial enhancement status\"], \"evidence_terms\": [\"no enhancing intracranial\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"no enhancing\"]}, {\"candidate_id\": \"C132\", \"name\": \"Ki-67 index\", \"occurrence_count\": 1, \"topic_ranks\": [75], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Ki-67 proliferation index\"], \"evidence_terms\": [\"ki-67\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C133\", \"name\": \"KRAS G12C mutation status\", \"occurrence_count\": 3, \"topic_ranks\": [21, 46, 68], \"representation_votes\": {\"binary\": 3}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Genetic Mutation: G12C and TP53\", \"KRAS G12C mutation\", \"KRAS G12C mutation status\"], \"evidence_terms\": [\"kras g12c driver\", \"g12c driver\", \"a kras g12c\", \"by a kras\", \"kras g12c driver with\", \"g12c mutation tp53\", \"demonstrated kras g12c\", \"demonstrated kras\"], \"feature_type_hints\": [\"genetic_mutation\", \"genomic_alteration\"], \"represented_values_or_categories\": [\"KRAS G12C\", \"TP53\", \"G12C\"]}, {\"candidate_id\": \"C134\", \"name\": \"KRAS mutation status\", \"occurrence_count\": 6, \"topic_ranks\": [11, 41, 50, 59, 68, 86], \"representation_votes\": {\"categorical\": 3, \"binary\": 3}, \"confidence\": \"high\", \"supporting_specific_features\": [\"KRAS G12C mutation\", \"KRAS mutation status\"], \"evidence_terms\": [\"demonstrated kras\", \"demonstrated kras g12c\", \"no kras\", \"no kras alk\", \"nsclc kras\", \"squamous nsclc kras\"], \"feature_type_hints\": [\"molecular_marker\", \"categorical\", \"genomic_alteration\"], \"represented_values_or_categories\": [\"KRAS G12C\", \"no kras\", \"g12c\", \"KRAS status\", \"G12C\", \"present\"]}, {\"candidate_id\": \"C135\", \"name\": \"Largest brain lesion diameter\", \"occurrence_count\": 1, \"topic_ranks\": [55], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Lesion size\"], \"evidence_terms\": [\"0.7 cm\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"0.7 cm\"]}, {\"candidate_id\": \"C136\", \"name\": \"Largest hepatic lesion diameter\", \"occurrence_count\": 1, \"topic_ranks\": [51], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Hepatic lesion size\"], \"evidence_terms\": [\"1.2 cm hypodense\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"1.2 cm\"]}, {\"candidate_id\": \"C137\", \"name\": \"Laterality of brain metastasis\", \"occurrence_count\": 1, \"topic_ranks\": [85], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Cerebellar metastasis\", \"Frontal lobe metastasis\"], \"evidence_terms\": [\"right cerebellar\", \"cerebellar\", \"hemisphere\", \"right cerebellar hemisphere\", \"cerebellar hemisphere\", \"cm right cerebellar\", \"frontal\", \"enhancing lesions left\", \"frontal lobe\", \"- left frontal\"], \"feature_type_hints\": [\"anatomical_location\"], \"represented_values_or_categories\": [\"right cerebellar hemisphere\", \"left frontal lobe\"]}, {\"candidate_id\": \"C138\", \"name\": \"LDH level\", \"occurrence_count\": 1, \"topic_ranks\": [54], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Lactate dehydrogenase (LDH)\"], \"evidence_terms\": [\"ldh in\"], \"feature_type_hints\": [\"laboratory_measurement\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C139\", \"name\": \"Left adrenal metastasis\", \"occurrence_count\": 1, \"topic_ranks\": [69], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Left adrenal metastasis\"], \"evidence_terms\": [\"left adrenal metastasis.\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"left\"]}, {\"candidate_id\": \"C140\", \"name\": \"Lesion diameter\", \"occurrence_count\": 1, \"topic_ranks\": [4], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Lesion size\"], \"evidence_terms\": [\"0.9 cm\", \"0.9 cm .\", \"0.9\", \"0.9 cm and\", \"lesions 1.2\", \"lesions 1.2 cm\", \"cm 0.9\", \"cm 0.9 cm\", \"and 0.9\", \"0.7 cm\", \"0.9 cm 0.8\"], \"feature_type_hints\": [\"continuous\"], \"represented_values_or_categories\": [\"0.7 cm\", \"0.8 cm\", \"0.9 cm\", \"1.2 cm\"]}, {\"candidate_id\": \"C141\", \"name\": \"Lesion enhancement pattern\", \"occurrence_count\": 1, \"topic_ranks\": [2], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Tumor enhancement pattern\"], \"evidence_terms\": [\"demonstrates heterogeneous enhancement\"], \"feature_type_hints\": [\"imaging_finding\"], \"represented_values_or_categories\": [\"heterogeneous enhancement\"]}, {\"candidate_id\": \"C142\", \"name\": \"Lesion enhancement status\", \"occurrence_count\": 1, \"topic_ranks\": [4], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Lesion enhancement pattern\"], \"evidence_terms\": [\"two enhancing\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"enhancing\"]}, {\"candidate_id\": \"C143\", \"name\": \"Levetiracetam use\", \"occurrence_count\": 1, \"topic_ranks\": [39], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Levetiracetam dosage\"], \"evidence_terms\": [\"levetiracetam\", \"levetiracetam 500 mg\", \"levetiracetam 500\", \"500 mg bid\"], \"feature_type_hints\": [\"medication_dosage\"], \"represented_values_or_categories\": [\"500 mg\", \"bid\"]}, {\"candidate_id\": \"C144\", \"name\": \"Lisinopril dosage\", \"occurrence_count\": 1, \"topic_ranks\": [13], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Lisinopril use\"], \"evidence_terms\": [\"on lisinopril 10\", \"controlled on lisinopril\"], \"feature_type_hints\": [\"medication\"], \"represented_values_or_categories\": [\"lisinopril\"]}, {\"candidate_id\": \"C145\", \"name\": \"Liver metastasis\", \"occurrence_count\": 1, \"topic_ranks\": [31], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Liver involvement\"], \"evidence_terms\": [\"liver adrenal\", \"liver adrenal glands\", \"liver spleen adrenal\"], \"feature_type_hints\": [\"anatomical_location\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C146\", \"name\": \"Living arrangement\", \"occurrence_count\": 3, \"topic_ranks\": [29, 88, 98], \"representation_votes\": {\"categorical\": 3}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Living situation\"], \"evidence_terms\": [\"a single-family\", \"in a single-family\", \"single-family\", \"home. -\", \"spouse\", \"with spouse\", \"lives with spouse\"], \"feature_type_hints\": [\"categorical\", \"social_determinant\"], \"represented_values_or_categories\": [\"single-family home\", \"lives with spouse\"]}, {\"candidate_id\": \"C147\", \"name\": \"Lobectomy performed\", \"occurrence_count\": 2, \"topic_ranks\": [32, 73], \"representation_votes\": {\"binary\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Lobectomy\"], \"evidence_terms\": [\"lobectomy with\", \"lobectomy with mediastinal\"], \"feature_type_hints\": [\"procedure\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C148\", \"name\": \"Lymph node dissection extent\", \"occurrence_count\": 1, \"topic_ranks\": [26], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Lymph node dissection status\", \"Mediastinal lymph node involvement\"], \"evidence_terms\": [\"dissection for\", \"node dissection for\", \"node dissection\", \"lymph node dissection\", \"dissection\", \"dissection for stage\", \"mediastinal lymph node\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"lymph node dissection\"]}, {\"candidate_id\": \"C149\", \"name\": \"Lymph node dissection status\", \"occurrence_count\": 3, \"topic_ranks\": [52, 73, 97], \"representation_votes\": {\"binary\": 3}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Lymph node dissection\", \"Node dissection\"], \"evidence_terms\": [\"node dissection\", \"lymph node dissection\", \"dissection\", \"node dissection performed\", \"dissection performed\"], \"feature_type_hints\": [\"surgical_procedure\", \"procedure\"], \"represented_values_or_categories\": [\"node dissection\", \"performed\"]}, {\"candidate_id\": \"C150\", \"name\": \"Lymph Node Involvement\", \"occurrence_count\": 1, \"topic_ranks\": [46], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"low\", \"supporting_specific_features\": [], \"evidence_terms\": [], \"feature_type_hints\": [], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C151\", \"name\": \"Lymph node metastasis\", \"occurrence_count\": 1, \"topic_ranks\": [31], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Lymph node involvement\"], \"evidence_terms\": [\"node\", \"lymph node\"], \"feature_type_hints\": [\"anatomical_location\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C152\", \"name\": \"Lymph node short axis diameter\", \"occurrence_count\": 1, \"topic_ranks\": [22], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Lymph node short axis diameter\"], \"evidence_terms\": [\"short axis <=\", \"axis <=\", \"lymph nodes short\", \"nodes short axis\", \"nodes short\", \"mm .\", \"8 mm .\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"<= 8 mm\"]}, {\"candidate_id\": \"C153\", \"name\": \"Lymphadenopathy presence\", \"occurrence_count\": 1, \"topic_ranks\": [76], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Lymphadenopathy status\"], \"evidence_terms\": [\"no lymphadenopathy. -\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"no lymphadenopathy\"]}, {\"candidate_id\": \"C154\", \"name\": \"Marital status\", \"occurrence_count\": 1, \"topic_ranks\": [29], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"low\", \"supporting_specific_features\": [], \"evidence_terms\": [], \"feature_type_hints\": [], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C155\", \"name\": \"Maternal history of breast cancer\", \"occurrence_count\": 1, \"topic_ranks\": [48], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Family history of breast cancer\"], \"evidence_terms\": [\"- mother died\", \"mother died of\", \"of breast cancer\", \"died of breast\", \"of breast\", \"breast\"], \"feature_type_hints\": [\"family_history\"], \"represented_values_or_categories\": [\"maternal\"]}, {\"candidate_id\": \"C156\", \"name\": \"Maximum SUV (SUVmax)\", \"occurrence_count\": 1, \"topic_ranks\": [12], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"SUVmax\"], \"evidence_terms\": [\"suvmax\", \"suvmax =\"], \"feature_type_hints\": [\"continuous\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C157\", \"name\": \"Mediastinal lymph node dissection\", \"occurrence_count\": 1, \"topic_ranks\": [94], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Lymph node dissection\"], \"evidence_terms\": [\"node dissection\", \"lymph node dissection\", \"with mediastinal lymph\", \"lobectomy with mediastinal\", \"dissection\", \"mediastinal lymph node\", \"node\"], \"feature_type_hints\": [\"procedure\"], \"represented_values_or_categories\": [\"mediastinal lymph node dissection\"]}, {\"candidate_id\": \"C158\", \"name\": \"Mediastinal lymph node dissection performed\", \"occurrence_count\": 2, \"topic_ranks\": [32, 99], \"representation_votes\": {\"binary\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Lymph node dissection\", \"Mediastinal lymph node dissection\"], \"evidence_terms\": [\"lymph node dissection\", \"node dissection\", \"dissection\", \"mediastinal lymph node\", \"with mediastinal lymph\", \"node dissection followed\", \"with mediastinal\", \"node dissection and\"], \"feature_type_hints\": [\"procedure\"], \"represented_values_or_categories\": [\"mediastinal\"]}, {\"candidate_id\": \"C159\", \"name\": \"Mediastinal or Hilar Lymphadenopathy\", \"occurrence_count\": 1, \"topic_ranks\": [82], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Lymph node location\"], \"evidence_terms\": [\"node\", \"mediastinal or hilar\", \"or hilar\"], \"feature_type_hints\": [\"anatomical_location\"], \"represented_values_or_categories\": [\"mediastinal\", \"hilar\"]}, {\"candidate_id\": \"C160\", \"name\": \"Mediastinal or hilar lymphadenopathy status\", \"occurrence_count\": 1, \"topic_ranks\": [22], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Mediastinal or hilar lymphadenopathy\"], \"evidence_terms\": [\"or hilar lymph\", \"enlarged mediastinal or\", \"mediastinal or hilar\", \"or hilar\", \"mediastinum hilum no\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"enlarged\", \"no\"]}]\n\nReturn:\n{\n  \"assignments\": [\n    {\n      \"candidate_id\": \"C001\",\n      \"domain\": \"one allowed domain\",\n      \"preliminary_normalized_name\": \"concise snake_case name\",\n      \"artifact_likelihood\": \"high | medium | low\"\n    }\n  ]\n}"
+}

@@ -1,0 +1,199 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 10.025749444961548,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Repetitive dosing fragments that do not specify the drug or context.",
+        "term": "a single dose"
+      },
+      {
+        "reason": "Incomplete phrase/template artifact.",
+        "term": "studies -"
+      },
+      {
+        "reason": "Fragmented laboratory units and name.",
+        "term": "mg dl ast"
+      },
+      {
+        "reason": "Grammatical fragment/template noise.",
+        "term": "patient to"
+      },
+      {
+        "reason": "Anatomical fragment without a noun.",
+        "term": "of right"
+      },
+      {
+        "reason": "Generic verb phrase/template noise.",
+        "term": "are identified"
+      }
+    ],
+    "general_topic": {
+      "coherence": "mixed",
+      "confidence": "medium",
+      "label": "Gastrointestinal symptoms and laboratory/imaging fragments",
+      "summary": "The topic contains fragments of patient-reported gastrointestinal side effects (nausea, vomiting, diarrhea), laboratory values (AST, platelets), and imaging descriptions (heterogeneous enhancement), mixed with administrative or template noise."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Patient reports regarding the presence or absence of nausea.",
+        "feature_type": "symptom",
+        "name": "Nausea",
+        "represented_values_or_categories": [
+          "denies"
+        ],
+        "supporting_terms": [
+          "denies nausea vomiting",
+          "denies nausea"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Patient reports regarding the presence or absence of vomiting.",
+        "feature_type": "symptom",
+        "name": "Vomiting",
+        "represented_values_or_categories": [
+          "denies"
+        ],
+        "supporting_terms": [
+          "denies nausea vomiting"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "Fragmented mention of diarrhea, likely part of a symptom checklist.",
+        "feature_type": "symptom",
+        "name": "Diarrhea",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "diarrhea or"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "Aspartate aminotransferase (AST) levels, though units and values are fragmented.",
+        "feature_type": "laboratory_measurement",
+        "name": "AST",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "mg dl ast",
+          "dl ast"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "Platelet count (plt) with a value of 260.",
+        "feature_type": "laboratory_measurement",
+        "name": "Platelet count",
+        "represented_values_or_categories": [
+          "260"
+        ],
+        "supporting_terms": [
+          "dl plt 260"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Radiological description of how a lesion enhances during imaging.",
+        "feature_type": "imaging_finding",
+        "name": "Tumor enhancement pattern",
+        "represented_values_or_categories": [
+          "heterogeneous enhancement"
+        ],
+        "supporting_terms": [
+          "demonstrates heterogeneous enhancement"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Nausea",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Nausea"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Vomiting",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Vomiting"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Diarrhea",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Diarrhea"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "AST level",
+        "suggested_representation": "continuous",
+        "supporting_specific_features": [
+          "AST"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Platelet count",
+        "suggested_representation": "continuous",
+        "supporting_specific_features": [
+          "Platelet count"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Lesion enhancement pattern",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Tumor enhancement pattern"
+        ]
+      }
+    ],
+    "topic_index": 59,
+    "topic_rank": 2
+  },
+  "raw_content": "{\n  \"topic_rank\": 2,\n  \"topic_index\": 59,\n  \"general_topic\": {\n    \"label\": \"Gastrointestinal symptoms and laboratory/imaging fragments\",\n    \"coherence\": \"mixed\",\n    \"confidence\": \"medium\",\n    \"summary\": \"The topic contains fragments of patient-reported gastrointestinal side effects (nausea, vomiting, diarrhea), laboratory values (AST, platelets), and imaging descriptions (heterogeneous enhancement), mixed with administrative or template noise.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Nausea\",\n      \"supporting_terms\": [\n        \"denies nausea vomiting\",\n        \"denies nausea\"\n      ],\n      \"feature_type\": \"symptom\",\n      \"represented_values_or_categories\": [\n        \"denies\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Patient reports regarding the presence or absence of nausea.\"\n    },\n    {\n      \"name\": \"Vomiting\",\n      \"supporting_terms\": [\n        \"denies nausea vomiting\"\n      ],\n      \"feature_type\": \"symptom\",\n      \"represented_values_or_categories\": [\n        \"denies\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Patient reports regarding the presence or absence of vomiting.\"\n    },\n    {\n      \"name\": \"Diarrhea\",\n      \"supporting_terms\": [\n        \"diarrhea or\"\n      ],\n      \"feature_type\": \"symptom\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Fragmented mention of diarrhea, likely part of a symptom checklist.\"\n    },\n    {\n      \"name\": \"AST\",\n      \"supporting_terms\": [\n        \"mg dl ast\",\n        \"dl ast\"\n      ],\n      \"feature_type\": \"laboratory_measurement\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Aspartate aminotransferase (AST) levels, though units and values are fragmented.\"\n    },\n    {\n      \"name\": \"Platelet count\",\n      \"supporting_terms\": [\n        \"dl plt 260\"\n      ],\n      \"feature_type\": \"laboratory_measurement\",\n      \"represented_values_or_categories\": [\n        \"260\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Platelet count (plt) with a value of 260.\"\n    },\n    {\n      \"name\": \"Tumor enhancement pattern\",\n      \"supporting_terms\": [\n        \"demonstrates heterogeneous enhancement\"\n      ],\n      \"feature_type\": \"imaging_finding\",\n      \"represented_values_or_categories\": [\n        \"heterogeneous enhancement\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Radiological description of how a lesion enhances during imaging.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"a single dose\",\n      \"reason\": \"Repetitive dosing fragments that do not specify the drug or context.\"\n    },\n    {\n      \"term\": \"studies -\",\n      \"reason\": \"Incomplete phrase/template artifact.\"\n    },\n    {\n      \"term\": \"mg dl ast\",\n      \"reason\": \"Fragmented laboratory units and name.\"\n    },\n    {\n      \"term\": \"patient to\",\n      \"reason\": \"Grammatical fragment/template noise.\"\n    },\n    {\n      \"term\": \"of right\",\n      \"reason\": \"Anatomical fragment without a noun.\"\n    },\n    {\n      \"term\": \"are identified\",\n      \"reason\": \"Generic verb phrase/template noise.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Nausea\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Nausea\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Vomiting\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Vomiting\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Diarrhea\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Diarrhea\"\n      ],\n      \"confidence\": \"medium\"\n    },\n    {\n      \"name\": \"AST level\",\n      \"suggested_representation\": \"continuous\",\n      \"supporting_specific_features\": [\n        \"AST\"\n      ],\n      \"confidence\": \"medium\"\n    },\n    {\n      \"name\": \"Platelet count\",\n      \"suggested_representation\": \"continuous\",\n      \"supporting_specific_features\": [\n        \"Platelet count\"\n      ],\n      \"confidence\": \"medium\"\n    },\n    {\n      \"name\": \"Lesion enhancement pattern\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Tumor enhancement pattern\"\n      ],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-abc2e246d0b468ca",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "denies nausea vomiting",
+    "denies nausea",
+    "a single dose",
+    "single dose of",
+    "single dose",
+    "studies -",
+    "mg dl ast",
+    "calcification.",
+    "demonstrates heterogeneous enhancement",
+    "dl ast",
+    "patient to",
+    "of right",
+    "are identified",
+    "dl plt 260",
+    "diarrhea or"
+  ],
+  "topic_index": 59,
+  "topic_rank": 2,
+  "usage": {
+    "completion_tokens": 1286,
+    "prompt_tokens": 823,
+    "prompt_tokens_details": null,
+    "total_tokens": 2109
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 2, internal index 59\n\nTerms in this topic, ordered from highest to lowest loading:\n1. denies nausea vomiting\n2. denies nausea\n3. a single dose\n4. single dose of\n5. single dose\n6. studies -\n7. mg dl ast\n8. calcification.\n9. demonstrates heterogeneous enhancement\n10. dl ast\n11. patient to\n12. of right\n13. are identified\n14. dl plt 260\n15. diarrhea or\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 2,\n  \"topic_index\": 59,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

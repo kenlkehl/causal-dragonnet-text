@@ -81,6 +81,24 @@ def test_causal_forest_head_warns_rebuilds_and_fits_when_tuning_fails(monkeypatc
     assert "CausalForestDML hyperparameter tuning failed" in caplog.text
 
 
+def test_causal_forest_head_can_use_fixed_configuration_without_tuning(monkeypatch):
+    _patch_econml_dependencies(monkeypatch)
+    X = np.array([[0.0], [1.0], [2.0], [3.0]])
+    W = np.array([[1.0], [1.0], [0.0], [0.0]])
+    T = np.array([0, 1, 0, 1])
+    Y = np.array([0, 1, 1, 0])
+
+    head = causal_forest_head.CausalForestHead(
+        n_estimators=8,
+        min_samples_leaf=2,
+        tune_model=False,
+    )
+    head.fit(X=X, W=W, T=T, Y=Y)
+
+    assert len(FakeCausalForestDML.instances) == 1
+    assert head.model.calls[0][0] == "fit"
+
+
 def test_tune_causal_forest_model_returns_false_on_failure(caplog):
     FakeCausalForestDML.instances = []
     FakeCausalForestDML.fail_tune = True

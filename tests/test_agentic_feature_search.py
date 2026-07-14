@@ -338,10 +338,22 @@ def test_extraction_cache_hash_includes_description_and_prompt_settings():
     desc_hash = _compute_config_hash({**base, "features": [spec_b]})
     prompt_hash = _compute_config_hash({**base, "prompt_template_version": "v2"})
     parser_hash = _compute_config_hash({**base, "vllm_reasoning_parser": "qwen3"})
+    endpoint_model_hash = _compute_config_hash(
+        {
+            **base,
+            "vllm_endpoint_model_inventory": {
+                "http://server-a/v1": "model-a",
+                "http://server-b/v1": "model-b",
+            },
+        }
+    )
+    model_length_hash = _compute_config_hash({**base, "vllm_max_model_len": 32768})
 
     assert _compute_config_hash(base) != desc_hash
     assert _compute_config_hash(base) != prompt_hash
     assert _compute_config_hash(base) != parser_hash
+    assert _compute_config_hash(base) != endpoint_model_hash
+    assert _compute_config_hash(base) != model_length_hash
 
 
 def test_parse_agent_response_strips_inline_reasoning_trace():
@@ -645,6 +657,70 @@ def test_agentic_extraction_provider_autodiscovers_server_model(monkeypatch, tmp
 
     assert calls[0]["kwargs"]["model_name"] == "served-extraction-model"
     assert extracted["explicit_feat_age"].tolist() == [72, 72]
+
+
+def test_agentic_extraction_provider_tracks_heterogeneous_endpoint_models(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            suffix = "a" if "server-a" in kwargs["base_url"] else "b"
+            self.models = FakeOpenAIModels([f"served-model-{suffix}"])
+
+        def close(self):
+            pass
+
+    class FakeVLLMFeatureExtractor:
+        def __init__(self, specs, **kwargs):
+            self.specs = specs
+            calls.append(kwargs)
+
+        def extract_to_dataframe(self, texts, batch_size=32):
+            return pd.DataFrame(
+                {
+                    "explicit_feat_age": [72] * len(texts),
+                    "explicit_feat_age_missing": [False] * len(texts),
+                }
+            )
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
+    monkeypatch.setattr(
+        "oci.inference.agentic_explicit_feature_forest.VLLMFeatureExtractor",
+        FakeVLLMFeatureExtractor,
+    )
+    config = _provider_config(tmp_path, cache_enabled=False)
+    config.explicit_features.vllm_server_url = (
+        "http://server-a/v1,http://server-b/v1"
+    )
+    config.explicit_features.vllm_model_name = "auto"
+    provider = VLLMExplicitFeatureExtractionProvider(config=config, output_dir=tmp_path)
+    specs = [
+        ExplicitFeatureSpec(
+            name="age",
+            type="continuous",
+            roles=["confounder"],
+            description="Age at baseline",
+        )
+    ]
+
+    provider.ensure_features(pd.DataFrame({"clinical_text": ["note"]}), specs)
+    cache_config = provider._cache_config(specs)
+
+    assert calls[0]["model_name"].startswith("heterogeneous_endpoint_model_pool:")
+    assert calls[0]["model_names_by_url"] == {
+        "http://server-a/v1": "served-model-a",
+        "http://server-b/v1": "served-model-b",
+    }
+    assert cache_config["vllm_endpoint_model_inventory"] == calls[0][
+        "model_names_by_url"
+    ]
 
 
 def test_agentic_extraction_provider_saves_grouped_results_as_per_spec_cache(
@@ -1165,6 +1241,69 @@ def test_openai_agent_autodiscovers_model_name():
     assert proposals == []
     assert client.models.calls == 1
     assert client.completions.calls[0]["model"] == "served-agent-model"
+
+
+def test_openai_agent_uses_endpoint_specific_autodiscovered_models(monkeypatch):
+    calls = []
+
+    class FakeCompletions:
+        def __init__(self, base_url):
+            self.base_url = base_url
+
+        def create(self, **kwargs):
+            calls.append((self.base_url, kwargs["model"]))
+            message = SimpleNamespace(content=json.dumps({"proposals": []}))
+            choice = SimpleNamespace(message=message, finish_reason="stop")
+            return SimpleNamespace(
+                choices=[choice],
+                model=kwargs["model"],
+                id="response-ok",
+                created=0,
+                usage=None,
+            )
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            suffix = "a" if "server-a" in kwargs["base_url"] else "b"
+            self.models = FakeOpenAIModels([f"served-agent-{suffix}"])
+            self.chat = SimpleNamespace(
+                completions=FakeCompletions(kwargs["base_url"])
+            )
+
+    monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
+    agent = OpenAICompatibleFeatureSearchAgent(
+        AgenticFeatureSearchConfig(
+            agent_server_url="http://server-a/v1,http://server-b/v1",
+            agent_model_name="auto",
+            agent_schema_repair_attempts=0,
+        )
+    )
+    agent._ensure_client()
+    agent._client_pool._next_index = 0
+
+    assert agent.propose({"current_features": [], "iteration_feedback": []}) == []
+
+    assert calls == [("http://server-a/v1", "served-agent-a")]
+    assert agent._resolve_agent_model_name().startswith(
+        "heterogeneous_endpoint_model_pool:"
+    )
+
+
+def test_openai_agent_can_disable_chat_template_thinking():
+    client = FakeOpenAIClient([json.dumps({"proposals": []})])
+    agent = OpenAICompatibleFeatureSearchAgent(
+        AgenticFeatureSearchConfig(
+            agent_model_name="served-agent-model",
+            agent_enable_thinking=False,
+            agent_schema_repair_attempts=0,
+        )
+    )
+    agent._client = client
+
+    assert agent.propose({"current_features": [], "iteration_feedback": []}) == []
+    assert client.completions.calls[0]["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": False}
+    }
 
 
 def test_openai_agent_requests_json_response_format_for_google_agent_platform():

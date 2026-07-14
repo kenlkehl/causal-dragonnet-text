@@ -65,7 +65,8 @@ class CausalForestHead:
         max_features: str = "sqrt",
         honest: bool = True,
         inference: bool = True,
-        random_state: int = 42
+        random_state: int = 42,
+        tune_model: bool = True,
     ):
         """
         Initialize Causal Forest head.
@@ -78,6 +79,9 @@ class CausalForestHead:
             honest: Use honest estimation (sample splitting within trees)
             inference: Enable inference for confidence intervals
             random_state: Random seed for reproducibility
+            tune_model: Run EconML's automatic tuning step before fitting. This
+                remains enabled by default for backward compatibility; callers
+                with a fixed, pre-evaluated configuration can disable it.
 
         Note: Nuisance functions (propensity, outcome) are estimated using sklearn
         random forests on the neural network's learned features.
@@ -95,6 +99,7 @@ class CausalForestHead:
         self.honest = honest
         self.inference = inference
         self.random_state = random_state
+        self.tune_model = bool(tune_model)
 
         # The CausalForestDML model (created during fit)
         self.model = None
@@ -167,9 +172,12 @@ class CausalForestHead:
         Y = np.asarray(Y).flatten()
 
         self.model = self._create_model()
-        if not tune_causal_forest_model(self.model, Y=Y, T=T, X=X, W=W):
-            logger.info("Rebuilding CausalForestDML after failed tuning attempt")
-            self.model = self._create_model()
+        if self.tune_model:
+            if not tune_causal_forest_model(self.model, Y=Y, T=T, X=X, W=W):
+                logger.info("Rebuilding CausalForestDML after failed tuning attempt")
+                self.model = self._create_model()
+        else:
+            logger.info("Skipping CausalForestDML tuning; using fixed configuration")
 
         # Fit the model
         # CausalForestDML expects T as 1D and Y as 1D

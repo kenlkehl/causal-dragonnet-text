@@ -1,0 +1,61 @@
+{
+  "attempts": 1,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "assignments": [
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C281",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "tumor_location"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C282",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "tumor_size"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C283",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "unexplained_weight_loss"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C284",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "vomiting"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C285",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "wheezing"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C286",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "wheezing_presence"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C287",
+        "domain": "laboratory_vitals",
+        "preliminary_normalized_name": "white_blood_cell_count"
+      }
+    ]
+  },
+  "raw_content": "{\n  \"assignments\": [\n    {\n      \"candidate_id\": \"C281\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"tumor_location\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C282\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"tumor_size\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C283\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"unexplained_weight_loss\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C284\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"vomiting\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C285\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"wheezing\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C286\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"wheezing_presence\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C287\",\n      \"domain\": \"laboratory_vitals\",\n      \"preliminary_normalized_name\": \"white_blood_cell_count\",\n      \"artifact_likelihood\": \"low\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-8033253677a41743",
+  "status": "complete",
+  "system_prompt": "You organize proposed clinical feature names into broad domains before harmonization. Use only the supplied evidence. Every candidate ID must appear exactly once. Return valid JSON only.",
+  "usage": {
+    "completion_tokens": 421,
+    "prompt_tokens": 1232,
+    "prompt_tokens_details": null,
+    "total_tokens": 1653
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nAssign every candidate to exactly one of these domains:\n[\"demographics_social\", \"diagnosis_stage_histology\", \"molecular_biomarkers\", \"imaging_disease_sites\", \"laboratory_vitals\", \"symptoms_patient_reported\", \"functional_performance\", \"systemic_treatments_medications\", \"procedures_surgery_radiation\", \"administrative_artifact\", \"other\"]\n\nUse `administrative_artifact` only for identifiers, note-template structure, or nonclinical administrative fragments. A clinically meaningful variable that may merely be unimportant should remain in its clinical domain.\n\nCandidates:\n[{\"candidate_id\": \"C281\", \"name\": \"Tumor location\", \"occurrence_count\": 1, \"topic_ranks\": [64], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Lung lobe location\"], \"evidence_terms\": [\"lower lobe\", \"lower\"], \"feature_type_hints\": [\"anatomical_location\"], \"represented_values_or_categories\": [\"lower lobe\"]}, {\"candidate_id\": \"C282\", \"name\": \"Tumor size\", \"occurrence_count\": 1, \"topic_ranks\": [77], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Tumor size\"], \"evidence_terms\": [\"0.7 cm\", \"0.9 cm\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"0.7 cm\", \"0.9 cm\"]}, {\"candidate_id\": \"C283\", \"name\": \"Unexplained weight loss\", \"occurrence_count\": 1, \"topic_ranks\": [66], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Unexplained weight loss\"], \"evidence_terms\": [\"hemoptysis unexplained weight\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C284\", \"name\": \"Vomiting\", \"occurrence_count\": 1, \"topic_ranks\": [2], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Vomiting\"], \"evidence_terms\": [\"denies nausea vomiting\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"denies\"]}, {\"candidate_id\": \"C285\", \"name\": \"Wheezing\", \"occurrence_count\": 1, \"topic_ranks\": [3], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Respiratory symptoms\"], \"evidence_terms\": [\"respiratory cough dyspnea\", \"exertion hemoptysis wheezing\", \"exertion hemoptysis\", \"on exertion hemoptysis\", \"wheezing cardiovascular none\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"cough\", \"dyspnea\", \"hemoptysis\", \"wheezing\", \"on exertion\"]}, {\"candidate_id\": \"C286\", \"name\": \"Wheezing presence\", \"occurrence_count\": 1, \"topic_ranks\": [10], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Wheezing\"], \"evidence_terms\": [\"no wheezing\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"absent\"]}, {\"candidate_id\": \"C287\", \"name\": \"White Blood Cell Count\", \"occurrence_count\": 4, \"topic_ranks\": [33, 49, 64, 96], \"representation_votes\": {\"continuous\": 4}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Laboratory Reference Range\", \"White Blood Cell Count\"], \"evidence_terms\": [\"wbc 7.5\", \"wbc 7.5 k\", \"cbc wbc 7.5\", \"7.5 k ul\", \"wbc 9.0 k\", \"cbc wbc 9.0\", \"wbc 9.0\", \"9.0 k\", \"wbc 6.2\", \"reference 150-400\", \"reference 1.5-8.0\", \"ul reference 150-400\", \"ul reference 1.5-8.0\"], \"feature_type_hints\": [\"measurement\", \"measurement_range\"], \"represented_values_or_categories\": [\"7.5 k/uL\", \"9.0 k/uL\", \"6.2\", \"150-400\", \"1.5-8.0\"]}]\n\nReturn:\n{\n  \"assignments\": [\n    {\n      \"candidate_id\": \"C001\",\n      \"domain\": \"one allowed domain\",\n      \"preliminary_normalized_name\": \"concise snake_case name\",\n      \"artifact_likelihood\": \"high | medium | low\"\n    }\n  ]\n}"
+}

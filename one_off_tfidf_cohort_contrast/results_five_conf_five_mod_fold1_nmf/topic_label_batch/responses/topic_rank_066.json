@@ -1,0 +1,153 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 7.543436050415039,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Medication instruction unrelated to cancer progression or treatment comparison.",
+        "term": "continue lisinopril"
+      },
+      {
+        "reason": "Fragmented temporal phrase, likely part of a follow-up instruction.",
+        "term": "3 months for"
+      },
+      {
+        "reason": "Fragmented temporal phrase.",
+        "term": "in 3 months"
+      },
+      {
+        "reason": "Grammatically fragmented term.",
+        "term": "of recurrence new"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "Disease recurrence and post-surgical status",
+      "summary": "The topic captures clinical indicators of cancer recurrence (cough, hemoptysis, weight loss) and surgical history (post-lobectomy, postoperative status)."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Presence of unexplained coughing up of blood.",
+        "feature_type": "symptom",
+        "name": "Hemoptysis",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "hemoptysis unexplained weight",
+          "hemoptysis unexplained",
+          "cough hemoptysis unexplained"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "The term 'unexplained weight' likely refers to unexplained weight loss, a common constitutional symptom in NSCLC.",
+        "feature_type": "symptom",
+        "name": "Unexplained weight loss",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "hemoptysis unexplained weight"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "General indicators or specific new symptoms suggesting the return of cancer.",
+        "feature_type": "clinical_finding",
+        "name": "Signs of disease recurrence",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "signs of recurrence",
+          "recurrence new cough",
+          "recurrence new",
+          "recurrence"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Indicates the patient has undergone a lobectomy procedure.",
+        "feature_type": "surgical_history",
+        "name": "Post-lobectomy status",
+        "represented_values_or_categories": [
+          "post-lobectomy"
+        ],
+        "supporting_terms": [
+          "post-lobectomy",
+          "postoperative changes",
+          "post-operative",
+          "- status post"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Hemoptysis",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Hemoptysis"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Unexplained weight loss",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Unexplained weight loss"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Disease recurrence status",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Signs of disease recurrence"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "History of lobectomy",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Post-lobectomy status"
+        ]
+      }
+    ],
+    "topic_index": 38,
+    "topic_rank": 66
+  },
+  "raw_content": "{\n  \"topic_rank\": 66,\n  \"topic_index\": 38,\n  \"general_topic\": {\n    \"label\": \"Disease recurrence and post-surgical status\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic captures clinical indicators of cancer recurrence (cough, hemoptysis, weight loss) and surgical history (post-lobectomy, postoperative status).\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Hemoptysis\",\n      \"supporting_terms\": [\n        \"hemoptysis unexplained weight\",\n        \"hemoptysis unexplained\",\n        \"cough hemoptysis unexplained\"\n      ],\n      \"feature_type\": \"symptom\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Presence of unexplained coughing up of blood.\"\n    },\n    {\n      \"name\": \"Unexplained weight loss\",\n      \"supporting_terms\": [\n        \"hemoptysis unexplained weight\"\n      ],\n      \"feature_type\": \"symptom\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The term 'unexplained weight' likely refers to unexplained weight loss, a common constitutional symptom in NSCLC.\"\n    },\n    {\n      \"name\": \"Signs of disease recurrence\",\n      \"supporting_terms\": [\n        \"signs of recurrence\",\n        \"recurrence new cough\",\n        \"recurrence new\",\n        \"recurrence\"\n      ],\n      \"feature_type\": \"clinical_finding\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"General indicators or specific new symptoms suggesting the return of cancer.\"\n    },\n    {\n      \"name\": \"Post-lobectomy status\",\n      \"supporting_terms\": [\n        \"post-lobectomy\",\n        \"postoperative changes\",\n        \"post-operative\",\n        \"- status post\"\n      ],\n      \"feature_type\": \"surgical_history\",\n      \"represented_values_or_categories\": [\n        \"post-lobectomy\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Indicates the patient has undergone a lobectomy procedure.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"continue lisinopril\",\n      \"reason\": \"Medication instruction unrelated to cancer progression or treatment comparison.\"\n    },\n    {\n      \"term\": \"3 months for\",\n      \"reason\": \"Fragmented temporal phrase, likely part of a follow-up instruction.\"\n    },\n    {\n      \"term\": \"in 3 months\",\n      \"reason\": \"Fragmented temporal phrase.\"\n    },\n    {\n      \"term\": \"of recurrence new\",\n      \"reason\": \"Grammatically fragmented term.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Hemoptysis\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Hemoptysis\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Unexplained weight loss\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Unexplained weight loss\"\n      ],\n      \"confidence\": \"medium\"\n    },\n    {\n      \"name\": \"Disease recurrence status\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Signs of disease recurrence\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"History of lobectomy\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Post-lobectomy status\"\n      ],\n      \"confidence\": \"high\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-ad922496016322a1",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "hemoptysis unexplained weight",
+    "hemoptysis unexplained",
+    "cough hemoptysis unexplained",
+    "signs of recurrence",
+    "recurrence new cough",
+    "of recurrence new",
+    "recurrence new",
+    "3 months for",
+    "recurrence",
+    "continue lisinopril",
+    "postoperative changes",
+    "post-lobectomy",
+    "in 3 months",
+    "- status post",
+    "post-operative"
+  ],
+  "topic_index": 38,
+  "topic_rank": 66,
+  "usage": {
+    "completion_tokens": 955,
+    "prompt_tokens": 836,
+    "prompt_tokens_details": null,
+    "total_tokens": 1791
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 66, internal index 38\n\nTerms in this topic, ordered from highest to lowest loading:\n1. hemoptysis unexplained weight\n2. hemoptysis unexplained\n3. cough hemoptysis unexplained\n4. signs of recurrence\n5. recurrence new cough\n6. of recurrence new\n7. recurrence new\n8. 3 months for\n9. recurrence\n10. continue lisinopril\n11. postoperative changes\n12. post-lobectomy\n13. in 3 months\n14. - status post\n15. post-operative\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 66,\n  \"topic_index\": 38,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

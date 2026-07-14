@@ -7384,11 +7384,18 @@ def _parsimony_tfidf_semantic_vectors(documents: Sequence[str]) -> np.ndarray:
     if n_items == 1:
         return np.ones((1, 1), dtype=float)
     try:
-        matrix = TfidfVectorizer(
+        word_matrix = TfidfVectorizer(
             ngram_range=(1, 2),
             min_df=1,
             sublinear_tf=True,
         ).fit_transform(documents)
+        char_matrix = TfidfVectorizer(
+            analyzer="char_wb",
+            ngram_range=(3, 5),
+            min_df=1,
+            sublinear_tf=True,
+        ).fit_transform(documents)
+        matrix = sparse.hstack([word_matrix, char_matrix], format="csr")
     except ValueError:
         return np.eye(n_items, dtype=float)
     if matrix.shape[0] > 1 and all(

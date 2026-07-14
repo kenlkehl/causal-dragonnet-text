@@ -3369,7 +3369,7 @@ def test_htr_sentence_model_snapshot_resolved_once(monkeypatch, tmp_path):
     assert resolve_htr_sentence_model_snapshot("hash") is None
 
 
-def test_multi_model_forest_expands_primary_handoff_for_consistency(tmp_path):
+def test_multi_model_forest_rejects_missing_exact_inner_handoff_path(tmp_path):
     dataset = pd.DataFrame(
         {
             "clinical_text": [f"note {idx}" for idx in range(12)],
@@ -3392,53 +3392,13 @@ def test_multi_model_forest_expands_primary_handoff_for_consistency(tmp_path):
             ),
         ),
     )
-    runner = MultiModelForestRunner(
-        dataset=dataset,
-        config=config,
-        output_path=tmp_path / "primary_predictions.parquet",
-        num_workers=2,
-    )
-    primary_rows = [
-        {
-            "schema_version": "multi_model_agentic_discovery_handoff_v1",
-            "fold_key": outer_fold,
-            "outer_fold": outer_fold,
-            "scope": "full_outer_train",
-            "n_rows": 6,
-            "metrics": {},
-            "importance": {},
-            "embedding_contrast_evidence": {},
-            "htr_evidence": {},
-            "context": {
-                "prompt_version": "multi_model_agentic_forest_v1",
-                "outer_fold": outer_fold,
-            },
-        }
-        for outer_fold in [1, 2]
-    ]
-
-    expanded = runner._expand_primary_handoff_rows(primary_rows)
-
-    assert len(expanded) == 8
-    assert sorted(int(row["fold_key"]) for row in expanded) == [
-        1,
-        2,
-        1001,
-        1002,
-        1003,
-        2001,
-        2002,
-        2003,
-    ]
-    inner_rows = [
-        row for row in expanded if row["scope"] == "candidate_consistency_inner_train"
-    ]
-    assert len(inner_rows) == 6
-    assert all(row["evidence_reused_from_fold_key"] in {1, 2} for row in inner_rows)
-    assert all(
-        row["context"]["handoff_provenance"]["stage2_raw_text_modeling_required"] is False
-        for row in inner_rows
-    )
+    with pytest.raises(ValueError, match="requires both deterministic BoW"):
+        MultiModelForestRunner(
+            dataset=dataset,
+            config=config,
+            output_path=tmp_path / "primary_predictions.parquet",
+            num_workers=2,
+        )
 
 
 def test_multi_model_agentic_proposal_bundle_cache_reuses_llm_result(tmp_path):
@@ -3646,11 +3606,16 @@ def test_oracle_multi_model_forest_script_builds_config():
         dataset_name="smoke",
         bow_view_grid="cli_single",
         bow_model="random_forest",
-        feature_discovery_methods=["bow", "embedding_contrast"],
+        feature_discovery_methods=["bow", "tfidf_topic_contrast"],
         cpus_total=10,
         gpu_ids=[0, 1],
         htr_gpu_ids=[0, 1],
         htr_jobs_per_gpu=2,
+        tfidf_topic_score_test_bootstrap_repeats=321,
+        tfidf_topic_score_test_bootstrap_top_topics=7,
+        tfidf_topic_score_test_fdr_level=0.15,
+        tfidf_topic_score_test_min_topics_per_bank=3,
+        tfidf_topic_score_test_max_topics_per_bank=11,
     )
     applied = script._make_applied_config(cfg, dataset_path)
     assert applied.architecture.model_type == "multi_model_forest"
@@ -3658,9 +3623,17 @@ def test_oracle_multi_model_forest_script_builds_config():
     assert isinstance(nn_cfg, MultiModelForestConfig)
     assert nn_cfg.cpus_total == 10
     assert nn_cfg.htr_jobs_per_gpu == 2
-    assert nn_cfg.feature_discovery_methods == ["bow", "embedding_contrast"]
+    assert nn_cfg.feature_discovery_methods == ["bow", "tfidf_topic_contrast"]
+    assert nn_cfg.htr_evidence_enabled is False
+    assert nn_cfg.embedding_contrast.enabled is False
     assert [view.name for view in nn_cfg.bow_views] == ["cli_view"]
     assert nn_cfg.bow_views[0].bow_model == "random_forest"
+    assert nn_cfg.tfidf_topic.score_test_enabled is True
+    assert nn_cfg.tfidf_topic.score_test_bootstrap_repeats == 321
+    assert nn_cfg.tfidf_topic.score_test_bootstrap_top_topics == 7
+    assert nn_cfg.tfidf_topic.score_test_fdr_level == pytest.approx(0.15)
+    assert nn_cfg.tfidf_topic.score_test_min_topics_per_bank == 3
+    assert nn_cfg.tfidf_topic.score_test_max_topics_per_bank == 11
     assert applied.architecture.multi_model_agentic_forest is nn_cfg
 
 
@@ -3782,6 +3755,14 @@ def test_oracle_multi_model_forest_splits_primary_and_agentic_hashes():
     assert google_auto.agentic_hash() == google_bare.agentic_hash()
     assert google_auto.agentic_hash() == google_publisher.agentic_hash()
     assert replace(cfg, n_folds=3).primary_hash() != base_primary
+    assert (
+        replace(cfg, tfidf_topic_score_test_fdr_level=0.10).primary_hash()
+        != base_primary
+    )
+    assert (
+        replace(cfg, tfidf_topic_score_test_bootstrap_repeats=1000).primary_hash()
+        != base_primary
+    )
 
 
 def test_embedding_contrast_prepare_uses_multi_gpu_precompute(tmp_path, monkeypatch):

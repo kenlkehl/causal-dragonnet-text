@@ -1,0 +1,8 @@
+{
+  "complete_topics": 100,
+  "elapsed_seconds": 56.94996428489685,
+  "failed_topics": 0,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "server_url": "http://camus.dfci.harvard.edu:8002/v1",
+  "total_topics": 100
+}

@@ -1,0 +1,501 @@
+feature,coefficient,direction
+appears,-0.49975523511307407,negative
+132,-0.4824465555182531,negative
+harold,-0.47166070469212806,negative
+spo2 94,-0.4653114332867054,negative
+132 78,-0.45946860605930095,negative
+bp 132,-0.4538111303063196,negative
+eleanor,-0.4388256691156275,negative
+94 on,-0.43821690419066606,negative
+oriented appears,-0.42030508441432113,negative
+patient harold,-0.4184729974355844,negative
+fatigued,-0.4150802043580976,negative
+mitchell,-0.40654677821131247,negative
+appears mildly,-0.3953771871887113,negative
+94,-0.3904240477211911,negative
+bp 128,-0.38643645769852797,negative
+eleanor mitchell,-0.3855231180036211,negative
+patient eleanor,-0.38294764084143984,negative
+128,-0.38224987261133586,negative
+given ecog,-0.3794957570762073,negative
+advance,-0.3682507010336137,negative
+nad appears,-0.3665921563951927,negative
+18 min,-0.3623107374013641,negative
+lytic lesions,-0.361879699527558,negative
+care planning,-0.3589448937759777,negative
+advance care,-0.35698348055421547,negative
+osteoarthritis,-0.3565099474412888,negative
+rr 18,-0.3510672676448934,negative
+74,-0.34819531073408166,negative
+whitaker,-0.3346006194288495,negative
+copd,-0.33416281811032444,negative
+plt 190,-0.3274628366221799,negative
+mitchell age,-0.32363039804341676,negative
+fatigue 70,-0.3128589148258269,negative
+age 73,-0.31204062374616404,negative
+daughter,-0.3116118736101664,negative
+assistance,-0.30860518601086867,negative
+dyspnea and,-0.3042515345794946,negative
+appears fatigued,-0.3001308502620237,negative
+ambulation,-0.300027396431984,negative
+84,-0.2989545196136786,negative
+age 84,-0.2965475426278589,negative
+palliative care,-0.2951026639586333,negative
+function 45,-0.29356509592765795,negative
+obstructive pulmonary,-0.2934813316111644,negative
+unable,-0.2926587172905561,negative
+unable to,-0.2926587172905561,negative
+requires assistance,-0.292050713533885,negative
+carboplatin pemetrexed,-0.2897272932466094,negative
+kg weight,-0.28873842409331024,negative
+pemetrexed,-0.28845211007115434,negative
+mildly fatigued,-0.2859205231314821,negative
+82,-0.28550968913974434,negative
+decreased appetite,-0.28474651580403515,negative
+goals of,-0.2845816773086152,negative
+care but,-0.28384938331789844,negative
+age 82,-0.28270961787547394,negative
+age 70,-0.2813929601052386,negative
+chronic obstructive,-0.28077489265702893,negative
+inhaler,-0.28032444441668175,negative
+76,-0.2795264996721021,negative
+field mild,-0.27937071200768304,negative
+oxygen,-0.2786552984731255,negative
+71,-0.2782263663299924,negative
+status limited,-0.2779218114118577,negative
+albuterol,-0.2768429234155744,negative
+due to,-0.27642429833676513,negative
+retired,-0.27591877433149625,negative
+third line,-0.2725143325433634,negative
+cane,-0.27197351994587604,negative
+respiratory dyspnea,-0.2717627276441234,negative
+but unable,-0.2717312003631719,negative
+t7,-0.26812001979631894,negative
+ecog limited,-0.2679171475778208,negative
+128 72,-0.2669749044285211,negative
+limited self,-0.2669067813486116,negative
+died,-0.26487949552033463,negative
+due,-0.26318392001163116,negative
+to palliative,-0.26256072603256475,negative
+history retired,-0.2614275764758529,negative
+died of,-0.26099793690421386,negative
+of waking,-0.2583003943541743,negative
+190,-0.25763354113919656,negative
+and advance,-0.2565963375774656,negative
+dyspnea on,-0.2548888576626151,negative
+fatigued in,-0.25461465260433086,negative
+age 78,-0.25444174998089897,negative
+illness harold,-0.2541657500259141,negative
+waking,-0.254010774803381,negative
+waking hours,-0.254010774803381,negative
+albuterol inhaler,-0.253824349540084,negative
+assistance with,-0.2530280305834641,negative
+illness eleanor,-0.252808875109133,negative
+for dyspnea,-0.252450644743892,negative
+wheezes abdomen,-0.2503391325141624,negative
+dyspnea 60,-0.24900939684233664,negative
+l3,-0.24855519210630206,negative
+spo2 92,-0.24701993965354913,negative
+no alcohol,-0.24590038957543264,negative
+osteopenia,-0.24496172776215014,negative
+james whitaker,-0.24445512961249172,negative
+cisplatin,-0.24405530789478952,negative
+work activities,-0.24390335748080808,negative
+84 bpm,-0.2427857655326947,negative
+t9,-0.24278267216886618,negative
+nightly albuterol,-0.24248277457723177,negative
+differentiated adenocarcinoma,-0.24184549238998537,negative
+multiple lytic,-0.24173588776697721,negative
+systems constitutional,-0.2411361923089993,negative
+harold thompson,-0.24046252073739016,negative
+50 of,-0.24012359221059557,negative
+past month,-0.2399703588842577,negative
+exertion,-0.23894477604945039,negative
+symptom control,-0.23843721581000454,negative
+on exertion,-0.2375592774319235,negative
+gastrointestinal appetite,-0.2374416337673846,negative
+limited functional,-0.2372312569813793,negative
+hr 84,-0.2370672128115994,negative
+goals,-0.23574316622641708,negative
+alcohol or,-0.23494748275586835,negative
+30 pack,-0.23479594364159503,negative
+for symptom,-0.2344214941971573,negative
+chest discomfort,-0.23154646498078663,negative
+of knees,-0.23149699527498646,negative
+respiratory decreased,-0.23133574864215167,negative
+knees,-0.23097493052142076,negative
+36 heent,-0.23075297281482832,negative
+limited by,-0.2301500210931231,negative
+function 40,-0.2301039433732744,negative
+stated,-0.22989872781590728,negative
+alimta,-0.2295706303976811,negative
+for ambulation,-0.22932468763687708,negative
+single agent,-0.22759325950778161,negative
+out work,-0.22756112057760491,negative
+air temp,-0.22713287870203858,negative
+pulmonary disease,-0.22542299734572094,negative
+palliative,-0.22533164055944271,negative
+lumbar,-0.22528354098851092,negative
+stage iiia,-0.22493634362551712,negative
+age 71,-0.22445866992799823,negative
+decline,-0.2242238297622401,negative
+puffs prn,-0.22328292899068727,negative
+tolerance,-0.22283085820253615,negative
+requires,-0.22280539743250558,negative
+self care,-0.22269811033276962,negative
+sounds over,-0.2223704191335816,negative
+or illicit,-0.22236484046413157,negative
+stated age,-0.22225688486600634,negative
+iiia,-0.22124384800975436,negative
+osteoarthritis of,-0.2207577712012174,negative
+128 78,-0.2200609163624796,negative
+improve,-0.21929650637902307,negative
+fatigued ecog,-0.21895866510818696,negative
+to improve,-0.2173250689456255,negative
+78 year,-0.2156405599925256,negative
+home oxygen,-0.2155045228773047,negative
+smoker 30,-0.21486081289209946,negative
+has declined,-0.21465050171458314,negative
+left upper,-0.21403587948459074,negative
+intensive,-0.21396734267002931,negative
+loss over,-0.2137986985644896,negative
+45 100,-0.21287395213967958,negative
+mother died,-0.21256502645944156,negative
+care confined,-0.21232096324345862,negative
+lisinopril 20,-0.21208280676871952,negative
+190 μl,-0.21169632098562058,negative
+neutrophils 103,-0.2115326400176989,negative
+nutritional,-0.21153251022367262,negative
+age 72,-0.21116820162978686,negative
+ago lives,-0.21066059613558655,negative
+age 86,-0.21045230880723922,negative
+supplemental oxygen,-0.2102308628283583,negative
+pneumonia,-0.2097917220776351,negative
+73 year,-0.20941290327810028,negative
+age 61,-0.20841949697125484,negative
+190 ul,-0.2083172352449537,negative
+age 74,-0.2079113886084136,negative
+about,-0.20787734604411273,negative
+control and,-0.20757382121399814,negative
+confined to,-0.20744509068692962,negative
+age 76,-0.20730037806904783,negative
+inhaler puffs,-0.20721206030967348,negative
+electrician,-0.20721066236843552,negative
+assistance for,-0.2066250331919594,negative
+optimize,-0.2064740307174081,negative
+retired electrician,-0.20589944521524012,negative
+dyspnea worsens,-0.2056423726420656,negative
+of breast,-0.2054980737543645,negative
+self,-0.2050913135538232,negative
+calcium,-0.20494591198176862,negative
+pemetrexed cycles,-0.2047640696308457,negative
+neutrophils,-0.2041869002355049,negative
+whitaker age,-0.20398289687724275,negative
+harold is,-0.2034894429691623,negative
+eleanor is,-0.2032331422556957,negative
+symptom management,-0.20300168149510167,negative
+disease moderate,-0.20185517523431667,negative
+of myocardial,-0.2016706374885143,negative
+50 100,-0.20115402277974342,negative
+81,-0.20104353876644152,negative
+confined,-0.20098517145970646,negative
+stable occasional,-0.20093098971763176,negative
+agent chemotherapy,-0.20017352660407686,negative
+home health,-0.2001188958690389,negative
+loss 35,-0.19977938932299064,negative
+planning,-0.1996441641957744,negative
+and goals,-0.19936109415081926,negative
+to bed,-0.19908053734989256,negative
+persistent fatigue,-0.19902917681570184,negative
+oxycodone,-0.1988586787920389,negative
+84 year,-0.1987536981745836,negative
+vinorelbine cycles,-0.19841240480606065,negative
+mildly,-0.19835455171834293,negative
+t3n2m1,-0.1980519615807483,negative
+puffs,-0.19769773687183076,negative
+of care,-0.19736284251544126,negative
+min spo2,-0.19715849197682936,negative
+in activities,-0.19642363252792483,negative
+cough hemoptysis,-0.19614954017391234,negative
+initiate low,-0.1959490231366648,negative
+control,-0.19574822120520707,negative
+pleuritic,-0.195574466429023,negative
+care for,-0.19555940439566183,negative
+met copy,-0.19554237897072066,negative
+decreased breath,-0.19549794143106422,negative
+lines of,-0.19522159870034933,negative
+use family,-0.1950238543122292,negative
+dyspnea 55,-0.19496601872333166,negative
+age 75,-0.1942021868077915,negative
+occasional anxiety,-0.1940560531164413,negative
+supplemental,-0.19404959638457317,negative
+76 mmhg,-0.19361881329995884,negative
+and family,-0.1931055573514125,negative
+insomnia 45,-0.1930000503420138,negative
+generalized,-0.1927661560527761,negative
+kidney disease,-0.1924811801688909,negative
+chronic kidney,-0.1924811801688909,negative
+acting,-0.192239334036907,negative
+normocephalic mucous,-0.19171885533387606,negative
+declined,-0.19138139347525585,negative
+jensen,-0.19135654050582696,negative
+inhaler prn,-0.19097872766158644,negative
+nightly,-0.19060271114369243,negative
+line carboplatin,-0.19051977517290722,negative
+atorvastatin 40,-0.19039758883297794,negative
+40 mg,-0.18998376419307303,negative
+kidney,-0.189965645354977,negative
+progressive dyspnea,-0.1895752622849325,negative
+with some,-0.18934816353670716,negative
+father died,-0.18893839028035417,negative
+lives alone,-0.18873424279404002,negative
+122 78,0.5508136733481936,positive
+122,0.5493719266809046,positive
+bp 122,0.5324023858273088,positive
+patient michael,0.46764804177350194,positive
+well appearing,0.46724344900187437,positive
+appearing,0.4435210382738849,positive
+fully active,0.4342644530464809,positive
+fully,0.42427916608952543,positive
+general well,0.4184413722050601,positive
+age 55,0.41061725418390116,positive
+michael,0.39438209643843525,positive
+age 56,0.3935253285414013,positive
+works,0.3660847683470792,positive
+bp 118,0.34276091513101137,positive
+age 57,0.3382316238585509,positive
+full time,0.33407070217530127,positive
+118 72,0.33167375656295195,positive
+nad ecog,0.32946144910066555,positive
+bilateral pulmonary,0.3137626771972504,positive
+appearing nad,0.30851218261457325,positive
+ortiz,0.30836852207761195,positive
+daniel,0.3080610472818847,positive
+spo2 98,0.30712510693936484,positive
+14 min,0.3059409464168647,positive
+ecog fully,0.3038427097695274,positive
+118,0.30379348784157184,positive
+patient daniel,0.30194354604523005,positive
+55 year,0.3008401841667971,positive
+platinum doublet,0.29662849559042365,positive
+michael thompson,0.29414070885774113,positive
+function 80,0.2939945780274222,positive
+72 bpm,0.2910466262154647,positive
+clear to,0.2873308677557365,positive
+to auscultation,0.2873308677557365,positive
+graphic designer,0.28640182110409673,positive
+designer,0.28640182110409673,positive
+graphic,0.28640182110409673,positive
+rr 14,0.28635172433043066,positive
+non platinum,0.28494100166998454,positive
+hr 72,0.2847290655222632,positive
+auscultation,0.2837817571606143,positive
+57,0.28324878558846406,positive
+109,0.2828958114903469,positive
+auscultation bilaterally,0.2825009195471907,positive
+daniel ortiz,0.2811777603865892,positive
+function 75,0.2790928126872302,positive
+partner,0.2761841812248673,positive
+function 78,0.2746783086409047,positive
+98 on,0.2741448652677287,positive
+as graphic,0.2694804263070485,positive
+time as,0.2687577099420652,positive
+software,0.266709576711229,positive
+respiratory clear,0.2642546408220869,positive
+software engineer,0.26401545359123063,positive
+85 100,0.26014386813433843,positive
+engineer,0.26002686068922226,positive
+denies dyspnea,0.2571792573149957,positive
+80 100,0.2567669255517814,positive
+function 85,0.25354454295134,positive
+56,0.24850834698255753,positive
+age 40,0.24750005761743332,positive
+as software,0.24644127131146318,positive
+with partner,0.2458484019914793,positive
+chronic medical,0.2449185445635016,positive
+chemotherapy or,0.24419093371398545,positive
+78 100,0.24067311470464095,positive
+54,0.23893054085119889,positive
+daily no,0.23828495111944478,positive
+doublet,0.23826954317335372,positive
+conditions,0.23710011394616,positive
+illness michael,0.23706616768490862,positive
+radiosurgery,0.23351391566006663,positive
+employed,0.23286520986554707,positive
+medical conditions,0.2328262506698234,positive
+left frontal,0.2326270530495414,positive
+48,0.23050138430753997,positive
+michael alvarez,0.230375003186945,positive
+multiple bilateral,0.22769426789729363,positive
+or rales,0.2258771003327679,positive
+mediastinal station,0.22556923489991798,positive
+t2an3m1c,0.22435110715937565,positive
+min ast,0.22364963922828096,positive
+spouse works,0.22234658901197293,positive
+toes,0.2218900570550379,positive
+works as,0.22042150233994565,positive
+michael is,0.2199591896349893,positive
+stereotactic radiosurgery,0.2198764908431415,positive
+alc,0.21918943109157313,positive
+active ecog,0.21779166453492776,positive
+iv t2an3m1c,0.2174446108946512,positive
+rhonchi abdomen,0.2162870297936766,positive
+rales,0.21620104442247126,positive
+85,0.21447519101607368,positive
+brain metastases,0.21326912336164075,positive
+part time,0.21326674450424576,positive
+scapular,0.21269521424883997,positive
+hypertension father,0.21044558174458222,positive
+56 year,0.20818471895353274,positive
+m1c,0.2078246321625776,positive
+85 mg,0.20778346194212616,positive
+l1 tps,0.20744892356621822,positive
+age 48,0.2070366894280991,positive
+or bruising,0.2065670410444432,positive
+remains fully,0.20608346778593709,positive
+excellent,0.20564270065919585,positive
+general no,0.20446299455413722,positive
+iv kras,0.2034041552624486,positive
+treated lesions,0.2018685027286716,positive
+post srs,0.20176704303376258,positive
+drinks,0.20150923572212526,positive
+260,0.20131089765599822,positive
+ecog heent,0.20011286348183785,positive
+rib pain,0.19980872388911913,positive
+right cerebellar,0.1995711224144367,positive
+drinks week,0.19952928197991296,positive
+week illicit,0.19946792771102514,positive
+10 pack,0.1993064655967487,positive
+no chronic,0.19750238904541872,positive
+encourage adequate,0.19557806131139457,positive
+chills weight,0.1944273067516335,positive
+definitive intracranial,0.19419109170149212,positive
+situation lives,0.19393860272656388,positive
+the biopsy,0.19370798896270952,positive
+function 70,0.19316470666850266,positive
+appearing in,0.19304065303339094,positive
+alc μl,0.19236461774362304,positive
+poorly differentiated,0.19179885077897796,positive
+poorly,0.19053403988018797,positive
+alt 18,0.1904866055785075,positive
+platinum free,0.19018196684972039,positive
+living situation,0.1885134512189433,positive
+enhanced chest,0.18755596062139035,positive
+occupation,0.18683921066571707,positive
+srs,0.18671375926879794,positive
+alvarez,0.18626386821981739,positive
+age 38,0.186259560779631,positive
+clear,0.18551359822214947,positive
+after first,0.18517877178231984,positive
+plt 260,0.18505237412830064,positive
+58,0.18441500736285013,positive
+encourage continued,0.18383643887693313,positive
+hgb 14,0.1837329179799835,positive
+prescription,0.1836879529944447,positive
+bronchoscopic,0.1835034417337981,positive
+situation,0.18330145201648415,positive
+adrenal nodules,0.18270976409762085,positive
+ca 19,0.18206518198441754,positive
+75 100,0.1818723952765662,positive
+mr ortiz,0.1815037174532217,positive
+feeling well,0.18117742359627967,positive
+patient laura,0.1807947353299397,positive
+loss 20,0.18004601063256181,positive
+drugs denies,0.1800420541319445,positive
+stereotactic,0.17933879057262192,positive
+loss pd,0.1793240182871619,positive
+rash or,0.17895298299748263,positive
+health 70,0.17875880293801158,positive
+polydipsia hematologic,0.17871631075676525,positive
+dissection negative,0.17772934528378007,positive
+hydration,0.17771513644677106,positive
+nodules stable,0.17719671903311718,positive
+alcohol social,0.17621071259691923,positive
+56 encounter,0.17617629964131787,positive
+alive,0.17609095831061916,positive
+98,0.17601438105345105,positive
+seizure,0.17586259137405322,positive
+age 54,0.17578247054516463,positive
+doublet chemotherapy,0.1751667286176012,positive
+serum,0.1747191538908957,positive
+age 49,0.17403816713655407,positive
+adequate hydration,0.17322187812272044,positive
+diarrhea 100,0.17285599111142672,positive
+large cell,0.1726932918892867,positive
+active,0.17252919323730437,positive
+metastases treated,0.17226142041024045,positive
+loss egfr,0.1718348884005899,positive
+male,0.17175001419634375,positive
+frontal,0.17126453596087715,positive
+age 66,0.1708470047900754,positive
+μl alc,0.16955532154686356,positive
+pain dyspnea,0.169147515945733,positive
+stage iiib,0.16904199646988194,positive
+markers cea,0.16898332549791825,positive
+who was,0.16894747150374156,positive
+spouse employed,0.16880796440243814,positive
+nad well,0.16810482571709032,positive
+bulky,0.1679693074786161,positive
+dyspnea hemoptysis,0.16774438170863692,positive
+fatigue 55,0.16757035044428314,positive
+free doublet,0.16747967364505506,positive
+use lives,0.16747222405157924,positive
+baseline staging,0.1673643537462446,positive
+negative no,0.1673320406839914,positive
+age 45,0.16724343349425022,positive
+to report,0.16717052931128445,positive
+fully functional,0.1658367990486978,positive
+toes grade,0.16538178228124945,positive
+lobe squamous,0.1652062436239084,positive
+90 100,0.165016770272573,positive
+two brain,0.16488454960740823,positive
+cr 92,0.16473668838428102,positive
+smoker no,0.16461558352124223,positive
+naive,0.164454188975967,positive
+12 ml,0.16434952859983867,positive
+additional fdg,0.16417310478773559,positive
+robert miller,0.16383967393423207,positive
+initiate systemic,0.16370367246923484,positive
+230,0.16325711959020006,positive
+loss tp53,0.16315352771595837,positive
+pain diarrhea,0.1629438056326183,positive
+38 year,0.1626199904839998,positive
+or rhonchi,0.16259638520716302,positive
+88 mg,0.16250176803878547,positive
+240,0.16238283267928413,positive
+radiosurgery to,0.16222092366013535,positive
+never smoker,0.1621770604522568,positive
+all activities,0.16211679366258228,positive
+55 encounter,0.1620393383736388,positive
+laura,0.16202937509806187,positive
+vaf stk11,0.16189621327364104,positive
+nodules cm,0.16182358967044697,positive
+redacted sex,0.1612845250639988,positive
+hydration and,0.16122563226911404,positive
+anc 109,0.16118563682475032,positive
+14 dl,0.161159004313993,positive
+no neuroendocrine,0.1608106091097448,positive
+loss 25,0.1606187902532887,positive
+initiating systemic,0.16034930818264556,positive
+egfr negative,0.16002614159398376,positive
+to two,0.15934932309880592,positive
+days after,0.15928410858579392,positive
+is 56,0.15885839999160253,positive
+and balanced,0.1586828855709127,positive
+260 μl,0.15825005789072635,positive
+dyspnea 15,0.15795907512588273,positive
+out all,0.15792047811167506,positive
+oriented cranial,0.1576751288391451,positive
+he remains,0.1575397162487571,positive
+constipation 10,0.15727351601578962,positive
+cell carcinoma,0.15724050056692168,positive
+cisplatin docetaxel,0.15722982745992856,positive
+smoker 10,0.15722755264540084,positive
+10 egfr,0.15722619229070842,positive
+appearing ecog,0.1571759585116757,positive
+cancers,0.157012776234791,positive
+55 years,0.15663107784539188,positive
+dyspnea chest,0.156359564384443,positive
+sinus symptoms,0.1562664777524386,positive
+surrounding,0.15605116198168797,positive
+vinorelbine based,0.1558035300902947,positive

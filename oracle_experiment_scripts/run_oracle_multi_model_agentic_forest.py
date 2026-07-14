@@ -275,6 +275,7 @@ class MultiModelAgenticOracleConfig:
     agent_api_key: str = "EMPTY"
     agent_temperature: float = 0.0
     agent_max_tokens: int = 25000
+    agent_enable_thinking: Optional[bool] = None
     agent_request_max_retries: int = 3
     agent_retry_initial_delay: float = 1.0
     agent_retry_max_delay: float = 30.0
@@ -291,6 +292,7 @@ class MultiModelAgenticOracleConfig:
     extraction_api_key: str = "EMPTY"
     extraction_mode: str = "server"
     extraction_reasoning_parser: Optional[str] = "auto"
+    extraction_enable_thinking: Optional[bool] = None
     extraction_batch_size: int = 100
     extraction_max_retries: int = 3
     extraction_retry_initial_delay: float = 1.0
@@ -373,6 +375,7 @@ def _make_applied_config(
                 agent_api_key=agent_api_key,
                 agent_temperature=config.agent_temperature,
                 agent_max_tokens=config.agent_max_tokens,
+                agent_enable_thinking=config.agent_enable_thinking,
                 agent_request_max_retries=config.agent_request_max_retries,
                 agent_retry_initial_delay=config.agent_retry_initial_delay,
                 agent_retry_max_delay=config.agent_retry_max_delay,
@@ -476,6 +479,11 @@ def _make_applied_config(
             vllm_model_name=extraction_model_name,
             vllm_api_key=extraction_api_key,
             vllm_reasoning_parser=config.extraction_reasoning_parser,
+            vllm_enable_thinking=(
+                config.extraction_enable_thinking
+                if extraction_provider == "openai"
+                else None
+            ),
             extraction_batch_size=config.extraction_batch_size,
             extraction_max_retries=config.extraction_max_retries,
             extraction_retry_initial_delay=config.extraction_retry_initial_delay,

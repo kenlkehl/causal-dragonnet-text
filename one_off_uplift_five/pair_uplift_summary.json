@@ -1,0 +1,60 @@
+{
+  "folds": 5,
+  "seed": 137,
+  "n_pairs": 364,
+  "treated_outcome_rate": 0.4725274725274725,
+  "baseline_control_prob": {
+    "auroc": 0.7284399224806202,
+    "brier": 0.22834492292518505,
+    "log_loss": 0.6485875593062461
+  },
+  "ridge_delta_probability_model": {
+    "auroc": 0.7300750968992248,
+    "brier": 0.22283380646420772,
+    "log_loss": 0.6374608957189735
+  },
+  "offset_logit_delta_model": {
+    "auroc": 0.7272589631782945,
+    "brier": 0.2266957697229453,
+    "log_loss": 0.6457152143812712
+  },
+  "offset_logit_fold_intercepts": [
+    0.1494420277416613,
+    0.14803743199944533,
+    0.15073323973237332,
+    0.17261851411082818,
+    0.14912469096231237
+  ],
+  "ridge_delta_prob_vs_true_pair_delta_prob": {
+    "pearson": 0.16787007460934597,
+    "spearman": 0.20789770627877724
+  },
+  "offset_implied_delta_prob_vs_true_pair_delta_prob": {
+    "pearson": 0.054204961767857586,
+    "spearman": 0.08783495458464326
+  },
+  "ridge_delta_prob_vs_true_treated_ite_prob": {
+    "pearson": 0.17810039788950988,
+    "spearman": 0.20715473816345548
+  },
+  "offset_implied_delta_prob_vs_true_treated_ite_prob": {
+    "pearson": 0.07364088346876649,
+    "spearman": 0.11684977538028596
+  },
+  "ngram_range": [
+    1,
+    2
+  ],
+  "min_df": 2,
+  "max_df": 0.95,
+  "max_features": 100000,
+  "ridge_alpha": 10.0,
+  "logit_l2_alpha": 1.0,
+  "outputs": {
+    "pair_predictions": "one_off_uplift_five/pair_uplift_honest_predictions.parquet",
+    "modifier_summary": "one_off_uplift_five/pair_uplift_by_modifier.csv",
+    "ridge_top_features": "one_off_uplift_five/pair_uplift_ridge_top_features.csv",
+    "offset_logit_top_features": "one_off_uplift_five/pair_uplift_offset_logit_top_features.csv",
+    "summary": "one_off_uplift_five/pair_uplift_summary.json"
+  }
+}

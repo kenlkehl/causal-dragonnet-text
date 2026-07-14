@@ -1,0 +1,259 @@
+{
+  "attempts": 1,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "assignments": [
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C201",
+        "domain": "molecular_biomarkers",
+        "preliminary_normalized_name": "p40_immunohistochemistry_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C202",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "pain"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C203",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "pain_severity"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C204",
+        "domain": "other",
+        "preliminary_normalized_name": "palliative_care_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C205",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "palpitations"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C206",
+        "domain": "demographics_social",
+        "preliminary_normalized_name": "patient_age"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C207",
+        "domain": "molecular_biomarkers",
+        "preliminary_normalized_name": "pd_l1_amplification_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C208",
+        "domain": "molecular_biomarkers",
+        "preliminary_normalized_name": "pd_l1_expression"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C209",
+        "domain": "molecular_biomarkers",
+        "preliminary_normalized_name": "pd_l1_expression_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C210",
+        "domain": "systemic_treatments_medications",
+        "preliminary_normalized_name": "pembrolizumab_use"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C211",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "perilesional_edema_presence"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C212",
+        "domain": "functional_performance",
+        "preliminary_normalized_name": "physical_function_score"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C213",
+        "domain": "laboratory_vitals",
+        "preliminary_normalized_name": "platelet_count"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C214",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "pleural_effusion"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C215",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "post_operative_surgical_changes"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C216",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "post_surgical_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C217",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "postoperative_mediastinal_radiation"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C218",
+        "domain": "laboratory_vitals",
+        "preliminary_normalized_name": "potassium"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C219",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "pre_cycle_laboratory_status"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C220",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "presence_of_brain_metastases"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C221",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "presence_of_diarrhea"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C222",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "presence_of_enhancing_brain_lesions"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C223",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "presence_of_fdg_avid_lesions"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C224",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "presence_of_hepatic_metastasis"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C225",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "presence_of_intracranial_metastases"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C226",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "presence_of_mass_effect"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C227",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "presence_of_mediastinal_thickening_or_effusion"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C228",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "presence_of_mri_sequences"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C229",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "presence_of_new_solid_pulmonary_nodule"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C230",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "presence_of_peritumoral_edema"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C231",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "presence_of_rash"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C232",
+        "domain": "diagnosis_stage_histology",
+        "preliminary_normalized_name": "presence_of_residual_or_recurrent_disease"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C233",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "presence_of_splenic_lesion"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C234",
+        "domain": "imaging_disease_sites",
+        "preliminary_normalized_name": "presence_of_surrounding_edema"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C235",
+        "domain": "symptoms_patient_reported",
+        "preliminary_normalized_name": "presence_of_vomiting"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C236",
+        "domain": "diagnosis_stage_histology",
+        "preliminary_normalized_name": "primary_tumor_anatomical_location"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C237",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "radiation_dose_gy"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C238",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "radiation_dose_for_brain_metastases"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C239",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "radiation_fractionation_schedule"
+      },
+      {
+        "artifact_likelihood": "low",
+        "candidate_id": "C240",
+        "domain": "procedures_surgery_radiation",
+        "preliminary_normalized_name": "radiation_oncology_referral_status"
+      }
+    ]
+  },
+  "raw_content": "{\n  \"assignments\": [\n    {\n      \"candidate_id\": \"C201\",\n      \"domain\": \"molecular_biomarkers\",\n      \"preliminary_normalized_name\": \"p40_immunohistochemistry_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C202\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"pain\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C203\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"pain_severity\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C204\",\n      \"domain\": \"other\",\n      \"preliminary_normalized_name\": \"palliative_care_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C205\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"palpitations\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C206\",\n      \"domain\": \"demographics_social\",\n      \"preliminary_normalized_name\": \"patient_age\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C207\",\n      \"domain\": \"molecular_biomarkers\",\n      \"preliminary_normalized_name\": \"pd_l1_amplification_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C208\",\n      \"domain\": \"molecular_biomarkers\",\n      \"preliminary_normalized_name\": \"pd_l1_expression\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C209\",\n      \"domain\": \"molecular_biomarkers\",\n      \"preliminary_normalized_name\": \"pd_l1_expression_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C210\",\n      \"domain\": \"systemic_treatments_medications\",\n      \"preliminary_normalized_name\": \"pembrolizumab_use\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C211\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"perilesional_edema_presence\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C212\",\n      \"domain\": \"functional_performance\",\n      \"preliminary_normalized_name\": \"physical_function_score\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C213\",\n      \"domain\": \"laboratory_vitals\",\n      \"preliminary_normalized_name\": \"platelet_count\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C214\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"pleural_effusion\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C215\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"post_operative_surgical_changes\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C216\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"post_surgical_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C217\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"postoperative_mediastinal_radiation\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C218\",\n      \"domain\": \"laboratory_vitals\",\n      \"preliminary_normalized_name\": \"potassium\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C219\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"pre_cycle_laboratory_status\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C220\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"presence_of_brain_metastases\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C221\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"presence_of_diarrhea\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C222\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"presence_of_enhancing_brain_lesions\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C223\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"presence_of_fdg_avid_lesions\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C224\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"presence_of_hepatic_metastasis\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C225\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"presence_of_intracranial_metastases\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C226\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"presence_of_mass_effect\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C227\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"presence_of_mediastinal_thickening_or_effusion\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C228\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"presence_of_mri_sequences\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C229\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"presence_of_new_solid_pulmonary_nodule\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C230\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"presence_of_peritumoral_edema\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C231\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"presence_of_rash\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C232\",\n      \"domain\": \"diagnosis_stage_histology\",\n      \"preliminary_normalized_name\": \"presence_of_residual_or_recurrent_disease\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C233\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"presence_of_splenic_lesion\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C234\",\n      \"domain\": \"imaging_disease_sites\",\n      \"preliminary_normalized_name\": \"presence_of_surrounding_edema\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C235\",\n      \"domain\": \"symptoms_patient_reported\",\n      \"preliminary_normalized_name\": \"presence_of_vomiting\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C236\",\n      \"domain\": \"diagnosis_stage_histology\",\n      \"preliminary_normalized_name\": \"primary_tumor_anatomical_location\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C237\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"radiation_dose_gy\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C238\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"radiation_dose_for_brain_metastases\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C239\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"radiation_fractionation_schedule\",\n      \"artifact_likelihood\": \"low\"\n    },\n    {\n      \"candidate_id\": \"C240\",\n      \"domain\": \"procedures_surgery_radiation\",\n      \"preliminary_normalized_name\": \"radiation_oncology_referral_status\",\n      \"artifact_likelihood\": \"low\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-8e6a3c81e987463a",
+  "status": "complete",
+  "system_prompt": "You organize proposed clinical feature names into broad domains before harmonization. Use only the supplied evidence. Every candidate ID must appear exactly once. Return valid JSON only.",
+  "usage": {
+    "completion_tokens": 2470,
+    "prompt_tokens": 4984,
+    "prompt_tokens_details": null,
+    "total_tokens": 7454
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nAssign every candidate to exactly one of these domains:\n[\"demographics_social\", \"diagnosis_stage_histology\", \"molecular_biomarkers\", \"imaging_disease_sites\", \"laboratory_vitals\", \"symptoms_patient_reported\", \"functional_performance\", \"systemic_treatments_medications\", \"procedures_surgery_radiation\", \"administrative_artifact\", \"other\"]\n\nUse `administrative_artifact` only for identifiers, note-template structure, or nonclinical administrative fragments. A clinically meaningful variable that may merely be unimportant should remain in its clinical domain.\n\nCandidates:\n[{\"candidate_id\": \"C201\", \"name\": \"p40 immunohistochemistry status\", \"occurrence_count\": 1, \"topic_ranks\": [28], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"p40 expression\"], \"evidence_terms\": [\"p40 strong\", \"---------------- p40 strong\", \"p40 strong nuclear\", \"positivity supports squamous\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"strong\", \"nuclear\"]}, {\"candidate_id\": \"C202\", \"name\": \"Pain\", \"occurrence_count\": 1, \"topic_ranks\": [40], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Pain\"], \"evidence_terms\": [\"pain 20\", \"pain 20 100\", \"100 pain 20\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C203\", \"name\": \"Pain severity\", \"occurrence_count\": 1, \"topic_ranks\": [6], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Pain\"], \"evidence_terms\": [\"pain 45\", \"100 pain 45\", \"pain 45 100\", \"4 mild pain\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"mild\"]}, {\"candidate_id\": \"C204\", \"name\": \"Palliative Care Status\", \"occurrence_count\": 2, \"topic_ranks\": [5, 84], \"representation_votes\": {\"binary\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Palliative care involvement\", \"Palliative Care Involvement\"], \"evidence_terms\": [\"- palliative care\", \"- palliative\", \"palliative\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"palliative care\"]}, {\"candidate_id\": \"C205\", \"name\": \"Palpitations\", \"occurrence_count\": 1, \"topic_ranks\": [3], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Palpitations\"], \"evidence_terms\": [\"palpitations gastrointestinal\", \"pain palpitations gastrointestinal\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C206\", \"name\": \"Patient age\", \"occurrence_count\": 1, \"topic_ranks\": [20], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Patient age\"], \"evidence_terms\": [\"at age 80\"], \"feature_type_hints\": [\"demographic\"], \"represented_values_or_categories\": [\"80\"]}, {\"candidate_id\": \"C207\", \"name\": \"PD-L1 amplification status\", \"occurrence_count\": 1, \"topic_ranks\": [10], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"PD-L1 amplification\"], \"evidence_terms\": [\"met amplification pd-l1\", \"amplification pd-l1\"], \"feature_type_hints\": [\"molecular_biomarker\"], \"represented_values_or_categories\": [\"amplification\"]}, {\"candidate_id\": \"C208\", \"name\": \"PD-L1 expression\", \"occurrence_count\": 1, \"topic_ranks\": [20], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"PD-L1 expression level\"], \"evidence_terms\": [\"pd-l1 10%\"], \"feature_type_hints\": [\"biomarker\"], \"represented_values_or_categories\": [\"10%\"]}, {\"candidate_id\": \"C209\", \"name\": \"PD-L1 expression status\", \"occurrence_count\": 2, \"topic_ranks\": [42, 68], \"representation_votes\": {\"categorical\": 2}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"PD-L1 expression\"], \"evidence_terms\": [\"met amplification pd-l1\", \"amplification pd-l1\"], \"feature_type_hints\": [\"biomarker\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C210\", \"name\": \"Pembrolizumab use\", \"occurrence_count\": 1, \"topic_ranks\": [35], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Pembrolizumab administration\"], \"evidence_terms\": [\"pembro\"], \"feature_type_hints\": [\"medication\"], \"represented_values_or_categories\": [\"pembrolizumab\"]}, {\"candidate_id\": \"C211\", \"name\": \"Perilesional edema presence\", \"occurrence_count\": 1, \"topic_ranks\": [53], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Perilesional edema\"], \"evidence_terms\": [\"perilesional edema\", \"perilesional edema.\", \"perilesional\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C212\", \"name\": \"Physical function score\", \"occurrence_count\": 1, \"topic_ranks\": [8], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Physical function\"], \"evidence_terms\": [\"physical function 55\"], \"feature_type_hints\": [\"functional_status\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C213\", \"name\": \"Platelet count\", \"occurrence_count\": 4, \"topic_ranks\": [2, 44, 75, 88], \"representation_votes\": {\"continuous\": 4}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Platelet count\"], \"evidence_terms\": [\"dl plt 260\", \"12.0-16.0 platelets\", \"dl 12.0-16.0 platelets\", \"plt 230 k\", \"plt 240 k\", \"240 k\", \"plt 240\", \"dl plt 240\", \"240 k l\", \"240 k ul\", \"plt 260 k\", \"260 k ul\"], \"feature_type_hints\": [\"laboratory_measurement\", \"measurement\"], \"represented_values_or_categories\": [\"260\", \"12.0-16.0\", \"230 k/uL\", \"240 k/uL\", \"260 k/uL\"]}, {\"candidate_id\": \"C214\", \"name\": \"Pleural effusion\", \"occurrence_count\": 1, \"topic_ranks\": [31], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Pleural effusion or thickening\"], \"evidence_terms\": [\"thickening or effusion.\", \"or effusion.\"], \"feature_type_hints\": [\"clinical_finding\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C215\", \"name\": \"Post-operative surgical changes\", \"occurrence_count\": 1, \"topic_ranks\": [87], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Post-surgical status\"], \"evidence_terms\": [\"post-operative changes\", \"post-surgical\", \"post-operative\", \"post-surgical changes\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"post-operative changes\", \"post-surgical changes\"]}, {\"candidate_id\": \"C216\", \"name\": \"Post-surgical status\", \"occurrence_count\": 1, \"topic_ranks\": [99], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Post-surgical status\"], \"evidence_terms\": [\"post-surgical\", \"post-surgical changes\"], \"feature_type_hints\": [\"clinical_status\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C217\", \"name\": \"Postoperative mediastinal radiation\", \"occurrence_count\": 1, \"topic_ranks\": [73], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Mediastinal radiation\"], \"evidence_terms\": [\"mediastinal radiation\", \"postoperative mediastinal radiation\", \"mediastinal radiation 60\", \"radiation\"], \"feature_type_hints\": [\"procedure\"], \"represented_values_or_categories\": [\"postoperative\"]}, {\"candidate_id\": \"C218\", \"name\": \"Potassium\", \"occurrence_count\": 1, \"topic_ranks\": [61], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"low\", \"supporting_specific_features\": [], \"evidence_terms\": [], \"feature_type_hints\": [], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C219\", \"name\": \"Pre-cycle laboratory status\", \"occurrence_count\": 1, \"topic_ranks\": [15], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Pre-cycle laboratory testing\"], \"evidence_terms\": [\"pre-cycle labs\", \"pre-cycle labs and\", \"for pre-cycle labs\"], \"feature_type_hints\": [\"procedure\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C220\", \"name\": \"Presence of brain metastases\", \"occurrence_count\": 6, \"topic_ranks\": [27, 53, 55, 63, 74, 85], \"representation_votes\": {\"binary\": 6}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Brain metastases\"], \"evidence_terms\": [\"with brain metastases\", \"brain metastases.\", \"brain metastases\", \"with brain metastases.\", \"known brain\", \"three enhancing lesions\", \"brain metastases treated\", \"- brain metastases\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"presence\", \"three enhancing lesions\", \"present\"]}, {\"candidate_id\": \"C221\", \"name\": \"Presence of diarrhea\", \"occurrence_count\": 1, \"topic_ranks\": [64], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Gastrointestinal symptoms\"], \"evidence_terms\": [\"vomiting diarrhea or\", \"vomiting diarrhea\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"vomiting\", \"diarrhea\"]}, {\"candidate_id\": \"C222\", \"name\": \"Presence of enhancing brain lesions\", \"occurrence_count\": 1, \"topic_ranks\": [14], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Enhancing lesion location\"], \"evidence_terms\": [\"enhancing lesions left\"], \"feature_type_hints\": [\"location\"], \"represented_values_or_categories\": [\"left\"]}, {\"candidate_id\": \"C223\", \"name\": \"Presence of FDG-avid lesions\", \"occurrence_count\": 1, \"topic_ranks\": [75], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"FDG-avid lesions\"], \"evidence_terms\": [\"fdg-avid lesions in\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C224\", \"name\": \"Presence of hepatic metastasis\", \"occurrence_count\": 1, \"topic_ranks\": [51], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Hepatic metastasis\"], \"evidence_terms\": [\"hepatic metastasis.\", \"hepatic lesion in\", \"lesion in hepatic\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"metastasis\"]}, {\"candidate_id\": \"C225\", \"name\": \"Presence of intracranial metastases\", \"occurrence_count\": 1, \"topic_ranks\": [24], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Intracranial disease status\"], \"evidence_terms\": [\"intracranial disease\", \"no brain\", \"lesions are\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"presence of intracranial disease\", \"absence of brain lesions\"]}, {\"candidate_id\": \"C226\", \"name\": \"Presence of mass effect\", \"occurrence_count\": 1, \"topic_ranks\": [53], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Mass effect\"], \"evidence_terms\": [\"mass effect\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C227\", \"name\": \"Presence of mediastinal thickening or effusion\", \"occurrence_count\": 1, \"topic_ranks\": [22], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Mediastinal thickening or effusion\"], \"evidence_terms\": [\"thickening or effusion.\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"thickening\", \"effusion\"]}, {\"candidate_id\": \"C228\", \"name\": \"Presence of MRI sequences (T1, T2, FLAIR, DWI)\", \"occurrence_count\": 1, \"topic_ranks\": [89], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Diffusion-Weighted Imaging (DWI)\", \"FLAIR imaging\", \"T1-weighted imaging\", \"T2-weighted imaging\"], \"evidence_terms\": [\"t1-weighted\", \"t1-weighted t2-weighted\", \"t1-weighted images\", \"t2-weighted\", \"t2-weighted flair\", \"t1-weighted t2-weighted flair\", \"flair diffusion-weighted\", \"flair diffusion-weighted imaging\", \"diffusion-weighted\", \"diffusion-weighted imaging dwi\", \"imaging dwi\"], \"feature_type_hints\": [\"imaging_modality\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C229\", \"name\": \"Presence of new solid pulmonary nodule\", \"occurrence_count\": 1, \"topic_ranks\": [60], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Presence of new solid pulmonary nodule\"], \"evidence_terms\": [\"ct identified a\", \"ct identified\", \"solid nodule in\", \"nodule in the\", \"nodule in\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"solid nodule\"]}, {\"candidate_id\": \"C230\", \"name\": \"Presence of peritumoral edema\", \"occurrence_count\": 1, \"topic_ranks\": [27], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Peritumoral edema\"], \"evidence_terms\": [\"surrounding edema.\", \"surrounding edema. -\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"presence\"]}, {\"candidate_id\": \"C231\", \"name\": \"Presence of rash\", \"occurrence_count\": 1, \"topic_ranks\": [1], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Rash\"], \"evidence_terms\": [\"none rashes psychiatric\", \"rashes psychiatric\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"none\"]}, {\"candidate_id\": \"C232\", \"name\": \"Presence of residual or recurrent disease\", \"occurrence_count\": 1, \"topic_ranks\": [87], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Residual or recurrent disease status\"], \"evidence_terms\": [\"residual or\", \"no residual or\", \"no residual\", \"or recurrent\", \"residual or recurrent\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"residual\", \"no residual\", \"recurrent\"]}, {\"candidate_id\": \"C233\", \"name\": \"Presence of splenic lesion\", \"occurrence_count\": 1, \"topic_ranks\": [51], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Splenic lesion\"], \"evidence_terms\": [\"- spleen\", \"identified. - spleen\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C234\", \"name\": \"Presence of surrounding edema\", \"occurrence_count\": 1, \"topic_ranks\": [100], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Surrounding Edema\"], \"evidence_terms\": [\"surrounding edema.\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C235\", \"name\": \"Presence of vomiting\", \"occurrence_count\": 1, \"topic_ranks\": [64], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Gastrointestinal symptoms\"], \"evidence_terms\": [\"vomiting diarrhea or\", \"vomiting diarrhea\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"vomiting\", \"diarrhea\"]}, {\"candidate_id\": \"C236\", \"name\": \"Primary tumor anatomical location\", \"occurrence_count\": 1, \"topic_ranks\": [11], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Tumor location\"], \"evidence_terms\": [\"lower lobe\", \"the right lower\", \"lower lobe. -\"], \"feature_type_hints\": [\"anatomical_site\"], \"represented_values_or_categories\": [\"lower lobe\", \"right lower lobe\"]}, {\"candidate_id\": \"C237\", \"name\": \"Radiation dose (Gy)\", \"occurrence_count\": 2, \"topic_ranks\": [73, 100], \"representation_votes\": {\"continuous\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Radiation dose\", \"Radiation Dose\"], \"evidence_terms\": [\"gy\", \"gy in\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"Gray (Gy)\"]}, {\"candidate_id\": \"C238\", \"name\": \"Radiation dose for brain metastases\", \"occurrence_count\": 1, \"topic_ranks\": [74], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Radiation dose\"], \"evidence_terms\": [\"gy\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": [\"Gray (Gy)\"]}, {\"candidate_id\": \"C239\", \"name\": \"Radiation fractionation schedule\", \"occurrence_count\": 1, \"topic_ranks\": [91], \"representation_votes\": {\"continuous\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Radiation fractionation\"], \"evidence_terms\": [\"fractions\", \"fx\"], \"feature_type_hints\": [\"measurement\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C240\", \"name\": \"Radiation oncology referral status\", \"occurrence_count\": 1, \"topic_ranks\": [34], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Radiation oncology referral\"], \"evidence_terms\": [\"to radiation oncology\", \"to radiation\", \"oncology for\", \"radiation oncology for\", \"refer to radiation\", \"referral to radiation\", \"radiation oncology\", \"radiation\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"referral status\"]}]\n\nReturn:\n{\n  \"assignments\": [\n    {\n      \"candidate_id\": \"C001\",\n      \"domain\": \"one allowed domain\",\n      \"preliminary_normalized_name\": \"concise snake_case name\",\n      \"artifact_likelihood\": \"high | medium | low\"\n    }\n  ]\n}"
+}

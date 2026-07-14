@@ -1,0 +1,140 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 6.5845983028411865,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Fragmentary temporal expression without clear clinical context.",
+        "term": "3 months for"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "Postoperative status and lymph node involvement",
+      "summary": "The topic focuses on surgical outcomes, specifically the presence of residual disease, disease recurrence, and the extent of lymph node dissection (e.g., mediastinal nodes)."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Terms describe the presence or absence of disease remaining after treatment or the return of the disease.",
+        "feature_type": "categorical",
+        "name": "Residual or recurrent disease status",
+        "represented_values_or_categories": [
+          "residual",
+          "recurrent",
+          "no residual"
+        ],
+        "supporting_terms": [
+          "residual or",
+          "or recurrent",
+          "residual or recurrent",
+          "no residual or",
+          "no residual",
+          "recurrence"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Terms refer to the surgical procedure of removing lymph nodes, likely used to determine stage or assess nodal involvement.",
+        "feature_type": "categorical",
+        "name": "Lymph node dissection status",
+        "represented_values_or_categories": [
+          "lymph node dissection"
+        ],
+        "supporting_terms": [
+          "dissection for",
+          "node dissection for",
+          "node dissection",
+          "lymph node dissection",
+          "dissection",
+          "dissection for stage"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Specifically identifies the anatomical location of lymph nodes relevant to lung cancer staging.",
+        "feature_type": "categorical",
+        "name": "Mediastinal lymph node involvement",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "mediastinal lymph node"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "Refers to physiological or radiological changes following a surgical procedure.",
+        "feature_type": "text-derived",
+        "name": "Postoperative changes",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "postoperative changes"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Residual disease presence",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Residual or recurrent disease status"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Disease recurrence status",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Residual or recurrent disease status"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Lymph node dissection extent",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Lymph node dissection status",
+          "Mediastinal lymph node involvement"
+        ]
+      }
+    ],
+    "topic_index": 2,
+    "topic_rank": 26
+  },
+  "raw_content": "{\n  \"topic_rank\": 26,\n  \"topic_index\": 2,\n  \"general_topic\": {\n    \"label\": \"Postoperative status and lymph node involvement\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic focuses on surgical outcomes, specifically the presence of residual disease, disease recurrence, and the extent of lymph node dissection (e.g., mediastinal nodes).\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Residual or recurrent disease status\",\n      \"supporting_terms\": [\n        \"residual or\",\n        \"or recurrent\",\n        \"residual or recurrent\",\n        \"no residual or\",\n        \"no residual\",\n        \"recurrence\"\n      ],\n      \"feature_type\": \"categorical\",\n      \"represented_values_or_categories\": [\n        \"residual\",\n        \"recurrent\",\n        \"no residual\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Terms describe the presence or absence of disease remaining after treatment or the return of the disease.\"\n    },\n    {\n      \"name\": \"Lymph node dissection status\",\n      \"supporting_terms\": [\n        \"dissection for\",\n        \"node dissection for\",\n        \"node dissection\",\n        \"lymph node dissection\",\n        \"dissection\",\n        \"dissection for stage\"\n      ],\n      \"feature_type\": \"categorical\",\n      \"represented_values_or_categories\": [\n        \"lymph node dissection\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Terms refer to the surgical procedure of removing lymph nodes, likely used to determine stage or assess nodal involvement.\"\n    },\n    {\n      \"name\": \"Mediastinal lymph node involvement\",\n      \"supporting_terms\": [\n        \"mediastinal lymph node\"\n      ],\n      \"feature_type\": \"categorical\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Specifically identifies the anatomical location of lymph nodes relevant to lung cancer staging.\"\n    },\n    {\n      \"name\": \"Postoperative changes\",\n      \"supporting_terms\": [\n        \"postoperative changes\"\n      ],\n      \"feature_type\": \"text-derived\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Refers to physiological or radiological changes following a surgical procedure.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"3 months for\",\n      \"reason\": \"Fragmentary temporal expression without clear clinical context.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Residual disease presence\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Residual or recurrent disease status\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Disease recurrence status\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Residual or recurrent disease status\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Lymph node dissection extent\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Lymph node dissection status\",\n        \"Mediastinal lymph node involvement\"\n      ],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-ba83faf411ef5b6c",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "residual or",
+    "or recurrent",
+    "residual or recurrent",
+    "no residual or",
+    "dissection for",
+    "node dissection for",
+    "node dissection",
+    "lymph node dissection",
+    "no residual",
+    "postoperative changes",
+    "recurrence",
+    "dissection",
+    "mediastinal lymph node",
+    "3 months for",
+    "dissection for stage"
+  ],
+  "topic_index": 2,
+  "topic_rank": 26,
+  "usage": {
+    "completion_tokens": 848,
+    "prompt_tokens": 820,
+    "prompt_tokens_details": null,
+    "total_tokens": 1668
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 26, internal index 2\n\nTerms in this topic, ordered from highest to lowest loading:\n1. residual or\n2. or recurrent\n3. residual or recurrent\n4. no residual or\n5. dissection for\n6. node dissection for\n7. node dissection\n8. lymph node dissection\n9. no residual\n10. postoperative changes\n11. recurrence\n12. dissection\n13. mediastinal lymph node\n14. 3 months for\n15. dissection for stage\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 26,\n  \"topic_index\": 2,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

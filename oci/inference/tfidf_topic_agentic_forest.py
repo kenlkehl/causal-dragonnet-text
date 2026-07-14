@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -9,7 +10,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -47,16 +48,18 @@ from .tfidf_topic_discovery import (
     row_set_fingerprint,
     stable_hash,
 )
+from .tfidf_topic_score_selection import TOPIC_SCORE_TEST_SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
 
 TOPIC_LABEL_PROMPT_VERSION = "tfidf_topic_label_v2"
 TOPIC_RECOVERY_PROMPT_VERSION = "tfidf_topic_recovery_v2"
+ORPHAN_NGRAM_LABEL_PROMPT_VERSION = "tfidf_orphan_ngram_label_v1"
 TOPIC_NAME_HARMONIZATION_PROMPT_VERSION = "tfidf_topic_name_harmonization_v2"
 TOPIC_GLOBAL_DEDUP_PROMPT_VERSION = "tfidf_topic_global_dedup_v2"
 TOPIC_VALUE_HARMONIZATION_PROMPT_VERSION = "tfidf_topic_value_harmonization_v2"
 TOPIC_VALUE_REPAIR_PROMPT_VERSION = "tfidf_topic_value_repair_v2"
-CANONICAL_REGISTRY_SCHEMA_VERSION = "tfidf_topic_canonical_registry_v3"
+CANONICAL_REGISTRY_SCHEMA_VERSION = "tfidf_topic_canonical_registry_v4"
 PARSIMONY_SCHEMA_VERSION = "tfidf_topic_parsimony_v2"
 
 _NAME_HARMONIZATION_ACTIONS = {"extract", "derive", "alias/drop", "drop"}
@@ -75,6 +78,21 @@ _VALUE_HARMONIZATION_BATCH_SIZE = 8
 _GLOBAL_DEDUP_BLOCK_SIZE = 8
 _GLOBAL_DEDUP_MIN_SIMILARITY = 0.22
 _GLOBAL_DEDUP_MAX_NEIGHBORS = 4
+_RECOVERY_NGRAM_STOPWORDS = {
+    "and",
+    "are",
+    "for",
+    "from",
+    "has",
+    "have",
+    "not",
+    "of",
+    "the",
+    "to",
+    "was",
+    "were",
+    "with",
+}
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -99,6 +117,100 @@ def _write_jsonl_atomic(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
     temporary.replace(path)
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _safe_rank_correlation(
+    first: Sequence[float], second: Sequence[float], *, rank: bool
+) -> Optional[float]:
+    left = np.asarray(first, dtype=float)
+    right = np.asarray(second, dtype=float)
+    mask = np.isfinite(left) & np.isfinite(right)
+    if int(mask.sum()) < 2:
+        return None
+    left = left[mask]
+    right = right[mask]
+    if rank:
+        left = pd.Series(left).rank(method="average").to_numpy(dtype=float)
+        right = pd.Series(right).rank(method="average").to_numpy(dtype=float)
+    if float(np.std(left)) <= 0.0 or float(np.std(right)) <= 0.0:
+        return None
+    return float(np.corrcoef(left, right)[0, 1])
+
+
+def evaluate_frozen_structured_predictions(
+    *,
+    prediction_path: Path,
+    oracle_frame: pd.DataFrame,
+    output_dir: Path,
+    oracle_ite_column: str = "true_ite_prob",
+) -> Dict[str, Any]:
+    """Join synthetic oracle ITEs only after every outer prediction is frozen."""
+    prediction_path = Path(prediction_path)
+    frozen_hash = _sha256_file(prediction_path)
+    predictions = pd.read_parquet(prediction_path)
+    if any(str(column).startswith("true_") for column in predictions.columns):
+        raise RuntimeError("Frozen structured predictions contain an oracle column")
+    oracle = oracle_frame[["_oci_row_id", oracle_ite_column]].copy()
+    if oracle["_oci_row_id"].duplicated().any():
+        raise ValueError("Oracle frame contains duplicate _oci_row_id values")
+    evaluated = predictions.merge(
+        oracle,
+        on="_oci_row_id",
+        how="left",
+        validate="one_to_one",
+    )
+    if evaluated[oracle_ite_column].isna().any():
+        raise ValueError("Oracle ITE is missing for one or more frozen predictions")
+
+    def metrics_for(frame: pd.DataFrame) -> Dict[str, Any]:
+        truth = frame[oracle_ite_column].to_numpy(dtype=float)
+        estimate = frame["pred_ite_prob"].to_numpy(dtype=float)
+        error = estimate - truth
+        return {
+            "n": int(len(frame)),
+            "pearson_correlation": _safe_rank_correlation(
+                truth, estimate, rank=False
+            ),
+            "spearman_correlation": _safe_rank_correlation(
+                truth, estimate, rank=True
+            ),
+            "mae": float(np.mean(np.abs(error))),
+            "rmse": float(np.sqrt(np.mean(np.square(error)))),
+            "mean_error": float(np.mean(error)),
+            "estimated_ate": float(np.mean(estimate)),
+            "oracle_ate": float(np.mean(truth)),
+            "ate_bias": float(np.mean(estimate) - np.mean(truth)),
+            "estimated_ite_standard_deviation": float(np.std(estimate)),
+            "oracle_ite_standard_deviation": float(np.std(truth)),
+        }
+
+    payload = {
+        "schema_version": "tfidf_topic_agentic_forest_v7",
+        "evaluation_is_post_hoc": True,
+        "all_outer_predictions_frozen_before_oracle_join": True,
+        "frozen_prediction_path": str(prediction_path),
+        "frozen_prediction_sha256": frozen_hash,
+        "oracle_ite_column": oracle_ite_column,
+        "overall": metrics_for(evaluated),
+        "per_fold": [
+            {"outer_fold": int(fold), **metrics_for(frame)}
+            for fold, frame in evaluated.groupby("outer_fold", sort=True)
+        ],
+    }
+    output_dir = Path(output_dir)
+    evaluated.to_parquet(
+        output_dir / "posthoc_predictions_with_oracle.parquet", index=False
+    )
+    _write_json(output_dir / "posthoc_oracle_metrics.json", payload)
+    return payload
+
+
 def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     with Path(path).open(encoding="utf-8") as handle:
@@ -119,6 +231,398 @@ def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
+def validate_tfidf_topic_stage2_handoff(
+    *,
+    dataset: pd.DataFrame,
+    config: AppliedInferenceConfig,
+    handoff_path: Path,
+) -> Dict[str, Any]:
+    """Audit exact-scope Stage 1 artifacts without constructing an LLM client."""
+    from .tfidf_topic_stage1 import tfidf_topic_stage1_config_hash
+
+    data = dataset.reset_index(drop=True)
+    n_rows = int(len(data))
+    valid_row_ids = set(range(n_rows))
+    handoff_path = Path(handoff_path)
+    rows = _read_jsonl(handoff_path)
+    expected_hash = tfidf_topic_stage1_config_hash(config)
+    required_inner = int(
+        config.architecture.multi_model_forest.candidate_consistency_inner_folds
+    )
+    max_variables = int(config.explicit_features.max_variables_per_extraction_request)
+    if not 1 <= max_variables <= 10:
+        raise RuntimeError(
+            "Stage 2 extraction preflight requires "
+            "max_variables_per_extraction_request in [1, 10]"
+        )
+
+    def artifact_path(value: Any) -> Path:
+        requested = Path(str(value or "")).expanduser()
+        candidates = [requested, handoff_path.parent / requested]
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate.resolve()
+        raise RuntimeError(f"Missing exact-scope Stage 1 artifact: {value!r}")
+
+    selected_counts: Dict[str, List[int]] = {
+        "treatment": [],
+        "outcome": [],
+        "effect": [],
+    }
+    topic_counts: Dict[str, List[int]] = {
+        "treatment": [],
+        "outcome": [],
+        "effect": [],
+    }
+    selected_ngram_counts: Dict[str, List[int]] = {
+        "treatment": [],
+        "outcome": [],
+        "effect": [],
+    }
+    orphan_cluster_counts: List[int] = []
+    selected_orphan_cluster_counts: List[int] = []
+    honest_nuisance_rows = 0
+    inner_score_contexts = 0
+    outer_contexts = 0
+    referenced_paths: List[str] = []
+    rows_by_outer: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+
+    for row in rows:
+        outer_fold = int(row["outer_fold"])
+        rows_by_outer[outer_fold].append(row)
+        if str(row.get("stage1_config_hash")) != expected_hash:
+            raise RuntimeError(
+                f"Stage 1 hash mismatch in outer fold {outer_fold}: "
+                f"{row.get('stage1_config_hash')!r} != {expected_hash!r}"
+            )
+        fit_ids = [int(value) for value in row.get("fit_row_ids", [])]
+        heldout_ids = [int(value) for value in row.get("heldout_row_ids", [])]
+        if len(fit_ids) != len(set(fit_ids)) or len(heldout_ids) != len(
+            set(heldout_ids)
+        ):
+            raise RuntimeError(f"Duplicate row ids in fold {row.get('fold_key')}")
+        if not (set(fit_ids) | set(heldout_ids)) <= valid_row_ids:
+            raise RuntimeError(f"Out-of-range row id in fold {row.get('fold_key')}")
+        if set(fit_ids) & set(heldout_ids):
+            raise RuntimeError(f"Fit/held-out overlap in fold {row.get('fold_key')}")
+        discovery = row.get("discovery") or {}
+        for key, values in (
+            ("fit", fit_ids),
+            ("heldout", heldout_ids),
+        ):
+            expected_fingerprint = row_set_fingerprint(values)
+            if row.get(f"{key}_row_fingerprint") != expected_fingerprint:
+                raise RuntimeError(
+                    f"Handoff {key} fingerprint mismatch in fold {row.get('fold_key')}"
+                )
+            if discovery.get(f"{key}_row_fingerprint") != expected_fingerprint:
+                raise RuntimeError(
+                    f"Discovery {key} fingerprint mismatch in fold {row.get('fold_key')}"
+                )
+        vocabulary = list(discovery.get("common_vocabulary") or [])
+        if int(discovery.get("common_vocabulary_size") or 0) != len(vocabulary):
+            raise RuntimeError(f"Vocabulary size mismatch in fold {row.get('fold_key')}")
+        if any(str(term).startswith("true_") for term in vocabulary):
+            raise RuntimeError("An oracle-prefixed token entered a Stage 1 vocabulary")
+
+        artifacts = discovery.get("artifacts") or {}
+        fitted_path = artifact_path(artifacts.get("fitted_context"))
+        fit_topics_path = artifact_path(artifacts.get("fit_topic_values"))
+        heldout_topics_path = artifact_path(artifacts.get("heldout_topic_values"))
+        nuisance_path = artifact_path(artifacts.get("nuisance_predictions"))
+        referenced_paths.extend(
+            map(
+                str,
+                [fitted_path, fit_topics_path, heldout_topics_path, nuisance_path],
+            )
+        )
+        ngram_paths = artifacts.get("ngram_scores") or {}
+        if set(ngram_paths) != {"treatment", "outcome", "effect"}:
+            raise RuntimeError(f"Incomplete n-gram banks in fold {row.get('fold_key')}")
+        referenced_paths.extend(
+            str(artifact_path(ngram_paths[bank]))
+            for bank in ("treatment", "outcome", "effect")
+        )
+
+        bank_metadata = discovery.get("topic_banks") or {}
+        with np.load(fit_topics_path) as fit_archive, np.load(
+            heldout_topics_path
+        ) as heldout_archive:
+            for bank in ("treatment", "outcome", "effect"):
+                if bank not in bank_metadata:
+                    raise RuntimeError(
+                        f"Missing {bank} topic bank in fold {row.get('fold_key')}"
+                    )
+                topics = list((bank_metadata.get(bank) or {}).get("topics") or [])
+                topic_counts[bank].append(len(topics))
+                if any(len(topic.get("terms") or []) != 15 for topic in topics):
+                    raise RuntimeError(
+                        f"A {bank} topic does not contain exactly 15 terms"
+                    )
+                fit_values = (
+                    np.asarray(fit_archive[bank])
+                    if bank in fit_archive.files
+                    else np.zeros((len(fit_ids), 0))
+                )
+                heldout_values = (
+                    np.asarray(heldout_archive[bank])
+                    if bank in heldout_archive.files
+                    else np.zeros((len(heldout_ids), 0))
+                )
+                if fit_values.shape != (len(fit_ids), len(topics)):
+                    raise RuntimeError(
+                        f"Misaligned fit {bank} topic values in fold {row.get('fold_key')}"
+                    )
+                if heldout_values.shape != (len(heldout_ids), len(topics)):
+                    raise RuntimeError(
+                        f"Misaligned held-out {bank} topic values in fold "
+                        f"{row.get('fold_key')}"
+                    )
+
+        nuisance = pd.read_parquet(nuisance_path)
+        fit_nuisance = nuisance.loc[
+            nuisance["prediction_scope"] == "fit_oof"
+        ].copy()
+        external_nuisance = nuisance.loc[
+            nuisance["prediction_scope"] == "external_heldout"
+        ].copy()
+        if set(map(int, fit_nuisance["_oci_row_id"])) != set(fit_ids):
+            raise RuntimeError(f"Misaligned OOF nuisance rows in fold {row.get('fold_key')}")
+        if set(map(int, external_nuisance["_oci_row_id"])) != set(heldout_ids):
+            raise RuntimeError(
+                f"Misaligned external nuisance rows in fold {row.get('fold_key')}"
+            )
+        required_prediction_columns = {"treatment_stacked", "outcome_stacked"}
+        if not required_prediction_columns <= set(nuisance.columns):
+            raise RuntimeError(f"Missing stacked nuisances in fold {row.get('fold_key')}")
+        if not np.isfinite(
+            nuisance[list(required_prediction_columns)].to_numpy(dtype=float)
+        ).all():
+            raise RuntimeError(f"Non-finite nuisance prediction in fold {row.get('fold_key')}")
+        fit_set = set(fit_ids)
+        for record in fit_nuisance[["_oci_row_id", "fit_row_ids"]].to_dict(
+            orient="records"
+        ):
+            training_ids = set(map(int, record["fit_row_ids"]))
+            if int(record["_oci_row_id"]) in training_ids or not training_ids <= fit_set:
+                raise RuntimeError(
+                    f"A fit OOF nuisance prediction includes its own label in fold "
+                    f"{row.get('fold_key')}"
+                )
+        for record in external_nuisance[["_oci_row_id", "fit_row_ids"]].to_dict(
+            orient="records"
+        ):
+            training_ids = set(map(int, record["fit_row_ids"]))
+            if int(record["_oci_row_id"]) in training_ids or training_ids != fit_set:
+                raise RuntimeError(
+                    f"An external nuisance prediction has invalid fit provenance in "
+                    f"fold {row.get('fold_key')}"
+                )
+        honest_nuisance_rows += int(len(nuisance))
+
+        score_artifact = artifacts.get("topic_score_tests")
+        if row.get("scope") == "candidate_selection_inner_fit":
+            inner_score_contexts += 1
+            score_path = artifact_path(score_artifact)
+            referenced_paths.append(str(score_path))
+            score_tests = json.loads(score_path.read_text(encoding="utf-8"))
+            if (
+                score_tests.get("schema_version")
+                != TOPIC_SCORE_TEST_SCHEMA_VERSION
+                or score_tests.get("status") != "completed"
+                or not bool(score_tests.get("uses_heldout_treatment_and_outcome"))
+                or bool(score_tests.get("fits_patient_level_cate_model"))
+                or bool(score_tests.get("constructs_divided_pseudo_target"))
+            ):
+                raise RuntimeError(f"Invalid inner score-test artifact: {score_path}")
+            for bank in ("treatment", "outcome", "effect"):
+                bank_score = (score_tests.get("banks") or {}).get(bank) or {}
+                tests = list(bank_score.get("topic_tests") or [])
+                topics = list((bank_metadata.get(bank) or {}).get("topics") or [])
+                if len(tests) != len(topics):
+                    raise RuntimeError(
+                        f"{bank} score/topic mismatch in fold {row.get('fold_key')}"
+                    )
+                topic_ids = {str(topic["topic_id"]) for topic in topics}
+                selected_ids = set(map(str, bank_score.get("selected_topic_ids") or []))
+                if not selected_ids <= topic_ids:
+                    raise RuntimeError(
+                        f"Unknown selected {bank} topic in fold {row.get('fold_key')}"
+                    )
+                calibration = bank_score.get("bootstrap_calibration") or {}
+                if not all(
+                    bool(calibration.get(field))
+                    for field in (
+                        "complete_topic_family",
+                        "complete_term_group_family",
+                        "complete_ngram_family",
+                    )
+                ):
+                    raise RuntimeError(
+                        f"Incomplete {bank} multiplier family in fold {row.get('fold_key')}"
+                    )
+                if any(
+                    len(test.get("term_scores") or []) != 15
+                    or "topic_standardized_score" not in test
+                    or "term_group_primary_p" not in test
+                    or "_topic_bootstrap_rows" in test
+                    for test in tests
+                ):
+                    raise RuntimeError(
+                        f"Incomplete {bank} topic evidence in fold {row.get('fold_key')}"
+                    )
+                selected_counts[bank].append(len(selected_ids))
+                selected_ngram_counts[bank].append(
+                    int(bank_score.get("ngram_selection_count") or 0)
+                )
+            if bool(config.architecture.multi_model_forest.tfidf_topic.orphan_ngram_enabled):
+                orphan = score_tests.get("effect_orphan_ngram_branch") or {}
+                clusters = list(orphan.get("clusters") or [])
+                selected_clusters = list(orphan.get("selected_clusters") or [])
+                selected_ids = set(map(str, orphan.get("selected_cluster_ids") or []))
+                all_ids = {str(cluster.get("cluster_id")) for cluster in clusters}
+                effect_topic_terms = {
+                    str(term.get("term"))
+                    for topic in (bank_metadata.get("effect") or {}).get("topics", [])
+                    for term in topic.get("terms", [])
+                }
+                calibration = orphan.get("bootstrap_calibration") or {}
+                if (
+                    orphan.get("status") != "completed"
+                    or not bool(orphan.get("uses_heldout_treatment_and_outcome"))
+                    or bool(orphan.get("fits_patient_level_cate_model"))
+                    or not bool(orphan.get("topic_term_exclusion_is_fit_side"))
+                    or bool(orphan.get("cluster_construction_uses_heldout_rows_or_labels"))
+                    or selected_ids != {
+                        str(cluster.get("cluster_id"))
+                        for cluster in selected_clusters
+                    }
+                    or not selected_ids <= all_ids
+                    or (
+                        bool(clusters)
+                        and not bool(
+                            calibration.get("complete_term_group_family", False)
+                        )
+                    )
+                ):
+                    raise RuntimeError(
+                        f"Invalid inner orphan n-gram branch: {score_path}"
+                    )
+                for cluster in clusters:
+                    terms = list(cluster.get("term_scores") or [])
+                    if not 1 <= len(terms) <= 15:
+                        raise RuntimeError(
+                            "An orphan n-gram cluster does not contain 1-15 terms"
+                        )
+                    if effect_topic_terms & {
+                        str(term.get("term")) for term in terms
+                    }:
+                        raise RuntimeError(
+                            "An orphan n-gram cluster overlaps a fitted topic summary"
+                        )
+                orphan_cluster_counts.append(len(clusters))
+                selected_orphan_cluster_counts.append(len(selected_clusters))
+        elif row.get("scope") == "full_outer_train":
+            outer_contexts += 1
+            compact_score = discovery.get("topic_score_tests") or {}
+            if (
+                score_artifact is not None
+                or compact_score.get("status") != "not_run"
+                or bool(compact_score.get("uses_heldout_treatment_and_outcome"))
+            ):
+                raise RuntimeError(
+                    f"A full-outer context exposes score-test labels in fold {outer_fold}"
+                )
+        else:
+            raise RuntimeError(f"Unknown handoff scope: {row.get('scope')!r}")
+
+    outer_test_occurrences: Counter = Counter()
+    for outer_fold, fold_rows in sorted(rows_by_outer.items()):
+        full = [row for row in fold_rows if row.get("scope") == "full_outer_train"]
+        inner = [
+            row
+            for row in fold_rows
+            if row.get("scope") == "candidate_selection_inner_fit"
+        ]
+        if len(full) != 1 or len(inner) != required_inner:
+            raise RuntimeError(
+                f"Incomplete exact contexts for outer fold {outer_fold}: "
+                f"full={len(full)}/1 inner={len(inner)}/{required_inner}"
+            )
+        outer_fit = set(map(int, full[0]["fit_row_ids"]))
+        outer_heldout = set(map(int, full[0]["heldout_row_ids"]))
+        if outer_fit | outer_heldout != valid_row_ids:
+            raise RuntimeError(f"Outer fold {outer_fold} does not partition the dataset")
+        outer_test_occurrences.update(outer_heldout)
+        for inner_row in inner:
+            inner_fit = set(map(int, inner_row["fit_row_ids"]))
+            inner_heldout = set(map(int, inner_row["heldout_row_ids"]))
+            if inner_fit | inner_heldout != outer_fit:
+                raise RuntimeError(
+                    f"Inner fold {outer_fold}/{inner_row.get('inner_fold')} does not "
+                    "partition its outer-training rows"
+                )
+    if set(outer_test_occurrences) != valid_row_ids or set(
+        outer_test_occurrences.values()
+    ) != {1}:
+        raise RuntimeError("Outer held-out folds do not form a once-only row partition")
+
+    forbidden_reference_tokens = (
+        "htr",
+        "sentence_transform",
+        "pseudo_target",
+        "matched_pair",
+        "uplift",
+        "raw_text_forest",
+    )
+    forbidden_references = sorted(
+        path
+        for path in referenced_paths
+        if any(token in Path(path).name.lower() for token in forbidden_reference_tokens)
+    )
+    if forbidden_references:
+        raise RuntimeError(
+            f"Forbidden Stage 1 artifact references are present: {forbidden_references[:3]}"
+        )
+
+    def value_range(values: Sequence[int]) -> List[int]:
+        return [min(values), max(values)] if values else [0, 0]
+
+    return {
+        "schema_version": "tfidf_topic_stage2_preflight_v1",
+        "status": "passed",
+        "handoff_schema_version": HANDOFF_SCHEMA_VERSION,
+        "topic_score_test_schema_version": TOPIC_SCORE_TEST_SCHEMA_VERSION,
+        "stage1_config_hash": expected_hash,
+        "dataset_row_count": n_rows,
+        "outer_fold_count": len(rows_by_outer),
+        "exact_context_count": len(rows),
+        "inner_score_context_count": inner_score_contexts,
+        "full_outer_context_count": outer_contexts,
+        "topic_count_ranges": {
+            bank: value_range(values) for bank, values in topic_counts.items()
+        },
+        "selected_topic_count_ranges": {
+            bank: value_range(values) for bank, values in selected_counts.items()
+        },
+        "selected_ngram_count_ranges": {
+            bank: value_range(values)
+            for bank, values in selected_ngram_counts.items()
+        },
+        "orphan_cluster_count_range": value_range(orphan_cluster_counts),
+        "selected_orphan_cluster_count_range": value_range(
+            selected_orphan_cluster_counts
+        ),
+        "honest_nuisance_prediction_rows_checked": honest_nuisance_rows,
+        "outer_test_rows_predicted_once": True,
+        "outer_test_score_artifact_count": 0,
+        "forbidden_artifact_reference_count": 0,
+        "oracle_columns_consumed": False,
+        "llm_or_extraction_client_constructed": False,
+        "max_variables_per_extraction_request": max_variables,
+    }
+
+
 def build_topic_label_context(
     *,
     outer_fold: int,
@@ -130,9 +634,13 @@ def build_topic_label_context(
     uncovered_raw_ngrams: Optional[Sequence[str]] = None,
     current_definitions: Optional[Sequence[Dict[str, Any]]] = None,
     extraction_failures: Optional[Sequence[Dict[str, Any]]] = None,
+    score_test_evidence: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     terms = list(topic.get("terms") or [])
-    if len(terms) != 15:
+    if prompt_version == ORPHAN_NGRAM_LABEL_PROMPT_VERSION:
+        if not 1 <= len(terms) <= 15:
+            raise ValueError("Every orphan n-gram prompt must receive 1-15 terms")
+    elif len(terms) != 15:
         raise ValueError("Every topic-label prompt must receive exactly 15 supplied terms")
     role = "effect_modifier" if bank == "effect" else "confounder"
     return {
@@ -143,10 +651,19 @@ def build_topic_label_context(
         "bank": str(bank),
         "mechanical_role": role,
         "topic_id": str(topic["topic_id"]),
+        "evidence_kind": str(
+            topic.get("evidence_kind")
+            or (
+                "orphan_raw_ngram_cluster"
+                if prompt_version == ORPHAN_NGRAM_LABEL_PROMPT_VERSION
+                else "nmf_topic"
+            )
+        ),
         "topic_terms": terms,
         "uncovered_raw_ngrams": list(uncovered_raw_ngrams or []),
         "current_canonical_definitions": list(current_definitions or []),
         "extraction_failures": list(extraction_failures or []),
+        "heldout_relevance_evidence": dict(score_test_evidence or {}),
         "max_features": 20 if prompt_version == TOPIC_RECOVERY_PROMPT_VERSION else 12,
         "response_contract": {
             "general_topic": "short neutral label, including mixed/weak/artifact when appropriate",
@@ -168,18 +685,101 @@ def build_topic_label_context(
     }
 
 
+def select_topic_recovery_raw_ngrams(
+    raw_scores: pd.DataFrame,
+    topic: Dict[str, Any],
+    *,
+    excluded_terms: Sequence[str] = (),
+    limit: int = 20,
+) -> List[str]:
+    """Return bounded, fit-ranked raw evidence tied to one uncovered topic.
+
+    The score table is already ordered using fit-side contrast evidence.  We
+    reserve half the request for unrepresented n-grams sharing a meaningful
+    token with the topic and half for the global fit-side ranking.  Reserving a
+    global share prevents a broad/noisy topic vocabulary from consuming all 20
+    slots before the highest-ranked uncovered raw evidence is revisited.
+    Held-out labels are never consulted here.
+    """
+    if int(limit) < 1 or raw_scores.empty:
+        return []
+    frame = raw_scores
+    if "eligible" in frame.columns:
+        frame = frame[frame["eligible"].astype(bool)]
+    excluded = {str(term) for term in excluded_terms}
+
+    def tokens(value: Any) -> set:
+        return {
+            token
+            for token in re.findall(r"[a-z0-9]+", str(value or "").lower())
+            if len(token) >= 3
+            and token not in _RECOVERY_NGRAM_STOPWORDS
+            and not token.isdigit()
+        }
+
+    topic_terms = {
+        str(term.get("term") or "") for term in topic.get("terms", [])
+    }
+    topic_tokens = set().union(*(tokens(term) for term in topic_terms))
+    candidates: List[Tuple[int, int, str]] = []
+    for fit_rank, feature in enumerate(frame["feature"].astype(str), start=1):
+        if feature in excluded or feature in topic_terms:
+            continue
+        overlap = len(tokens(feature) & topic_tokens)
+        candidates.append((-overlap, fit_rank, feature))
+    focused = [row for row in candidates if row[0] < 0]
+    focused.sort()
+    global_fill = sorted(candidates, key=lambda row: (row[1], row[2]))
+    global_slots = max(1, int(limit) // 2)
+    focused_slots = max(0, int(limit) - global_slots)
+    selected: List[str] = []
+    seen: set = set()
+    for _negative_overlap, _fit_rank, feature in focused:
+        if feature in seen:
+            continue
+        seen.add(feature)
+        selected.append(feature)
+        if len(selected) >= focused_slots:
+            break
+    for _negative_overlap, _fit_rank, feature in global_fill:
+        if feature in seen:
+            continue
+        seen.add(feature)
+        selected.append(feature)
+        if len(selected) >= int(limit):
+            break
+    return selected
+
+
 def render_topic_label_prompt(context: Dict[str, Any]) -> str:
     """Render the one-topic prompt; intentionally contains no forbidden jargon."""
     terms = list(context.get("topic_terms") or [])
-    if len(terms) != 15:
+    is_orphan = (
+        context.get("prompt_version") == ORPHAN_NGRAM_LABEL_PROMPT_VERSION
+    )
+    if is_orphan:
+        if not 1 <= len(terms) <= 15:
+            raise ValueError("Orphan n-gram prompt rendering requires 1-15 terms")
+    elif len(terms) != 15:
         raise ValueError("Topic prompt rendering requires exactly 15 supplied terms")
     payload = json.dumps(context, indent=2, default=str)
+    evidence_description = (
+        "These raw text phrases formed a stable, held-out-supported evidence "
+        "group that was not represented in the fitted topic summaries. Review "
+        f"this one group and its {len(terms)} supplied phrases."
+        if is_orphan
+        else "Topic modeling was used only to organize candidate text signals. "
+        "Review this one topic and its 15 highest-loading supplied terms."
+    )
     prompt = f"""You are organizing candidate pre-treatment clinical information for a study of treatment choice, baseline outcome risk, and variation in outcomes after treatment.
 
-Topic modeling was used only to organize candidate text signals. Review this one topic and its 15 highest-loading supplied terms. First identify the general topic. Then list the specific, operational clinical features actually represented by the supplied terms.
+{evidence_description} First identify the general clinical concept. Then list the specific, operational clinical features actually represented by the supplied terms.
 
 Rules:
 - Cite one or more exact supplied terms for every proposed feature.
+- Automated held-out relevance evidence may be supplied; use it to focus on
+  represented terms with reproducible signal, while keeping every definition
+  grounded in the exact supplied terms.
 - A topic may be mixed, weak, administrative, or artifactual; say so and return no features when appropriate.
 - Do not decide the analytic role of a feature. The role is assigned mechanically from the topic bank.
 - Do not exclude response, survival, toxicity, or outcome-related concepts merely because of their content.
@@ -603,18 +1203,32 @@ def _candidate_from_response(
                 "scope": context["scope"],
                 "bank": context["bank"],
                 "topic_id": context["topic_id"],
+                "evidence_kind": context.get("evidence_kind", "nmf_topic"),
                 "supporting_terms": [
                     {
                         "term": term,
                         "loading": float(term_rows.get(term, {}).get("loading", 0.0)),
-                        "rank": int(term_rows.get(term, {}).get("screen_rank", 0)),
+                        "rank": int(
+                            term_rows.get(term, {}).get(
+                                "screen_rank",
+                                term_rows.get(term, {}).get("fit_rank", 0),
+                            )
+                        ),
                         "signed_score": float(
-                            term_rows.get(term, {}).get("signed_score", 0.0)
+                            term_rows.get(term, {}).get(
+                                "signed_score",
+                                term_rows.get(term, {}).get(
+                                    "fit_signed_score", 0.0
+                                ),
+                            )
                         ),
                     }
                     for term in supporting
                 ],
                 "objective": context["bank"],
+                "heldout_relevance_evidence": dict(
+                    context.get("heldout_relevance_evidence") or {}
+                ),
             }
         ],
     }
@@ -858,6 +1472,32 @@ def _refresh_registry_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
         }
     )
     return result
+
+
+def _registry_entry_state_hash(entry: Dict[str, Any]) -> str:
+    """Hash both the extraction contract and its modeling/evidence state.
+
+    ``contract_hash`` deliberately excludes provenance and roles because those
+    fields do not change the extraction prompt.  Recovery, however, must still
+    recognize a newly supported topic or role as a registry change: it affects
+    coverage diagnostics and whether the extracted column enters W, X, or both.
+    """
+    refreshed = _refresh_registry_entry(entry)
+    provenance_hashes = sorted(
+        stable_hash(provenance)
+        for provenance in refreshed.get("provenance", [])
+    )
+    return stable_hash(
+        {
+            "name": refreshed["name"],
+            "contract_hash": refreshed["contract_hash"],
+            "roles": sorted(refreshed.get("roles", [])),
+            "provenance_hashes": provenance_hashes,
+            "required_or_prespecified": bool(
+                refreshed.get("required_or_prespecified")
+            ),
+        }
+    )
 
 
 def _merge_executable_registry_entries(
@@ -1893,6 +2533,21 @@ def select_initial_topic_evidence_registry(
             "topics", []
         ):
             masses[(bank, str(topic["topic_id"]))] = _topic_evidence_mass(topic)
+    orphan_branch = (
+        (metadata.get("topic_score_tests") or {}).get(
+            "effect_orphan_ngram_branch"
+        )
+        or {}
+    )
+    for cluster in orphan_branch.get("selected_clusters") or []:
+        cluster_id = str(cluster.get("cluster_id") or "").strip()
+        if not cluster_id:
+            continue
+        masses[("effect", cluster_id)] = max(
+            float(cluster.get("quadratic_statistic_per_rank") or 0.0),
+            float(cluster.get("maximum_absolute_standardized_score") or 0.0),
+            1e-12,
+        )
 
     topic_sets = [
         {key for key in _registry_topic_keys(entry) if key in masses}
@@ -1914,7 +2569,12 @@ def select_initial_topic_evidence_registry(
         metadata.get("artifacts", {}).get("ngram_scores", {}).get("effect")
     )
     highest_ranked: List[str] = []
-    if raw_path and Path(raw_path).exists() and int(highest_ranked_effect_count) > 0:
+    if (
+        orphan_branch.get("status") != "completed"
+        and raw_path
+        and Path(raw_path).exists()
+        and int(highest_ranked_effect_count) > 0
+    ):
         raw_scores = pd.read_parquet(raw_path)
         if "eligible" in raw_scores.columns:
             raw_scores = raw_scores[raw_scores["eligible"].astype(bool)]
@@ -2054,7 +2714,11 @@ def select_initial_topic_evidence_registry(
         }
     audit = {
         "schema_version": "tfidf_topic_initial_review_registry_v1",
-        "selection_rule": "greedy_unsigned_topic_and_mappable_effect_ngram_mass_cover",
+        "selection_rule": (
+            "greedy_unsigned_topic_and_selected_orphan_cluster_mass_cover"
+            if orphan_branch.get("status") == "completed"
+            else "greedy_unsigned_topic_and_mappable_effect_ngram_mass_cover"
+        ),
         "coverage_target": target,
         "has_global_feature_count_cap": False,
         "n_canonical_candidate_contracts": len(entries),
@@ -2121,13 +2785,30 @@ def select_deferred_review_additions(
             "topics", []
         ):
             masses[(bank, str(topic["topic_id"]))] = _topic_evidence_mass(topic)
+    orphan_branch = (
+        (metadata.get("topic_score_tests") or {}).get(
+            "effect_orphan_ngram_branch"
+        )
+        or {}
+    )
+    for cluster in orphan_branch.get("selected_clusters") or []:
+        cluster_id = str(cluster.get("cluster_id") or "").strip()
+        if cluster_id:
+            masses[("effect", cluster_id)] = max(
+                float(cluster.get("quadratic_statistic_per_rank") or 0.0),
+                float(cluster.get("maximum_absolute_standardized_score") or 0.0),
+                1e-12,
+            )
     covered_topics = set().union(
         *(_registry_topic_keys(entry) for entry in active_registry)
     ) if active_registry else set()
     coverage = diagnostic.get("effect_coverage", {})
-    missing_effect_terms = set(
-        coverage.get("mappable_highest_ranked_raw_ngrams", [])
-    ) - set(coverage.get("preserved_highest_ranked_raw_ngrams", []))
+    missing_effect_terms = (
+        set()
+        if orphan_branch.get("status") == "completed"
+        else set(coverage.get("mappable_highest_ranked_raw_ngrams", []))
+        - set(coverage.get("preserved_highest_ranked_raw_ngrams", []))
+    )
 
     remaining = [
         _refresh_registry_entry(entry)
@@ -2260,11 +2941,29 @@ def _effect_evidence_coverage(
             if provenance.get("bank") == "effect"
             for term in provenance.get("supporting_terms", [])
         }
-    denominator_topics = (
-        set(masses)
-        if operational_topic_ids is None
-        else set(masses) & operational_topic_ids
+    score_selected_topic_ids = set(
+        map(
+            str,
+            (
+                (metadata.get("topic_score_tests") or {})
+                .get("banks", {})
+                .get("effect", {})
+                .get("selected_topic_ids", [])
+            ),
+        )
     )
+    if operational_topic_ids is None:
+        denominator_topics = set(masses)
+    elif score_selected_topic_ids:
+        # The score-test shortlist is the evidence universe handed to the
+        # agent.  A topic cannot disappear from the coverage denominator just
+        # because the agent failed to produce an executable candidate for it.
+        # Additive recovery topics join that universe once operationalized.
+        denominator_topics = set(masses) & (
+            score_selected_topic_ids | operational_topic_ids
+        )
+    else:
+        denominator_topics = set(masses) & operational_topic_ids
     total = float(sum(masses[topic_id] for topic_id in denominator_topics))
     covered = float(
         sum(
@@ -2285,13 +2984,51 @@ def _effect_evidence_coverage(
         if operational_terms is None
         else [term for term in highest_ranked if term in operational_terms]
     )
-    preserved_highest = [term for term in mappable_highest if term in supported_terms]
+    # Preservation is assessed against the complete stable top-ranked raw
+    # evidence, not only terms an initial agent happened to operationalize.
+    # Otherwise an omitted but strong n-gram vanishes from the denominator and
+    # the recovery gate can pass without ever revisiting it.
+    preserved_highest = [term for term in highest_ranked if term in supported_terms]
+    orphan_branch = (
+        (metadata.get("topic_score_tests") or {}).get(
+            "effect_orphan_ngram_branch"
+        )
+        or {}
+    )
+    selected_orphan_clusters = list(orphan_branch.get("selected_clusters") or [])
+    orphan_masses = {
+        str(cluster.get("cluster_id")): max(
+            float(cluster.get("quadratic_statistic_per_rank") or 0.0),
+            float(cluster.get("maximum_absolute_standardized_score") or 0.0),
+            1e-12,
+        )
+        for cluster in selected_orphan_clusters
+        if str(cluster.get("cluster_id") or "").strip()
+    }
+    orphan_total = float(sum(orphan_masses.values()))
+    orphan_covered = float(
+        sum(
+            mass
+            for cluster_id, mass in orphan_masses.items()
+            if cluster_id in supported_topics
+        )
+    )
+    uncovered_orphan_ids = sorted(set(orphan_masses) - supported_topics)
     return {
         "covered_mass": covered,
         "total_mass": total,
         "coverage_fraction": 1.0 if total <= 0.0 else covered / total,
         "covered_topic_ids": sorted(supported_topics & denominator_topics),
-        "uncovered_topic_ids": sorted(denominator_topics - supported_topics),
+        "uncovered_topic_ids": sorted(
+            (denominator_topics - supported_topics) | set(uncovered_orphan_ids)
+        ),
+        "score_test_shortlist_topic_ids": sorted(score_selected_topic_ids),
+        "all_fitted_topic_mass": float(sum(masses.values())),
+        "shortlist_to_all_fitted_mass_fraction": (
+            1.0
+            if not masses or float(sum(masses.values())) <= 0.0
+            else total / float(sum(masses.values()))
+        ),
         "excluded_topic_ids_without_operational_candidate": sorted(
             set(masses) - denominator_topics
         ),
@@ -2303,11 +3040,23 @@ def _effect_evidence_coverage(
         "preserved_highest_ranked_raw_ngrams": preserved_highest,
         "highest_ranked_raw_ngram_preservation": (
             1.0
-            if not mappable_highest
-            else len(preserved_highest) / len(mappable_highest)
+            if not highest_ranked
+            else len(preserved_highest) / len(highest_ranked)
+        ),
+        "orphan_ngram_branch_status": orphan_branch.get("status"),
+        "selected_orphan_cluster_ids": sorted(orphan_masses),
+        "covered_orphan_cluster_ids": sorted(
+            set(orphan_masses) & supported_topics
+        ),
+        "uncovered_orphan_cluster_ids": uncovered_orphan_ids,
+        "orphan_cluster_covered_mass": orphan_covered,
+        "orphan_cluster_total_mass": orphan_total,
+        "orphan_cluster_coverage_fraction": (
+            1.0 if orphan_total <= 0.0 else orphan_covered / orphan_total
         ),
         "raw_effect_evidence_weak": bool(
-            bank.get("weak_or_unstable_raw_evidence", False) or total <= 0.0
+            bank.get("weak_or_unstable_raw_evidence", False)
+            or (total <= 0.0 and orphan_total <= 0.0)
         ),
     }
 
@@ -2381,7 +3130,50 @@ def structured_heldout_diagnostic(
     if "effect" in fit_topics.files and x_fit.shape[1] > 0:
         fit_values = np.asarray(fit_topics["effect"], dtype=float)
         heldout_values = np.asarray(heldout_topics["effect"], dtype=float)
-        predicted = Ridge(alpha=10.0).fit(x_fit, fit_values).predict(x_heldout)
+        effect_topics = list(
+            (metadata.get("topic_banks", {}).get("effect") or {}).get(
+                "topics", []
+            )
+        )
+        selected_effect_ids = set(
+            map(
+                str,
+                (
+                    (metadata.get("topic_score_tests", {}).get("banks", {}))
+                    .get("effect", {})
+                    .get("selected_topic_ids", [])
+                ),
+            )
+        )
+        if candidate_evidence_universe is not None:
+            # Recovery rounds can introduce a score-ranked topic that was not
+            # in the initial shortlist.  Once it has an operational candidate,
+            # its held-out reconstruction belongs in the same diagnostic gate
+            # as the initially selected topics.
+            selected_effect_ids.update(
+                str(provenance.get("topic_id"))
+                for entry in candidate_evidence_universe
+                for provenance in entry.get("provenance", [])
+                if provenance.get("bank") == "effect"
+                and provenance.get("topic_id") is not None
+            )
+        if selected_effect_ids:
+            selected_indices = [
+                index
+                for index, topic in enumerate(effect_topics)
+                if str(topic.get("topic_id")) in selected_effect_ids
+            ]
+            if selected_indices:
+                fit_values = fit_values[:, selected_indices]
+                heldout_values = heldout_values[:, selected_indices]
+        predicted = np.asarray(
+            Ridge(alpha=10.0).fit(x_fit, fit_values).predict(x_heldout),
+            dtype=float,
+        )
+        if predicted.ndim == 1:
+            predicted = predicted[:, None]
+        if heldout_values.ndim == 1:
+            heldout_values = heldout_values[:, None]
         correlations: List[Optional[float]] = []
         for index in range(fit_values.shape[1]):
             if np.std(predicted[:, index]) > 0.0 and np.std(heldout_values[:, index]) > 0.0:
@@ -2395,6 +3187,14 @@ def structured_heldout_diagnostic(
             "mean_correlation": None if not finite else float(np.mean(finite)),
             "topic_correlations": correlations,
             "n_topics": int(fit_values.shape[1]),
+            "selected_topic_ids": [
+                str(effect_topics[index].get("topic_id"))
+                for index in (
+                    selected_indices
+                    if selected_effect_ids and selected_indices
+                    else range(len(effect_topics))
+                )
+            ],
             "rmse": float(np.sqrt(mean_squared_error(heldout_values, predicted))),
         }
 
@@ -2531,18 +3331,37 @@ def structured_review_gate(
                 "patient_level_effect_learner_used": False,
             }
         )
-        criteria.append(
-            {
-                "family": "effect",
-                "metric": "highest_ranked_raw_ngram_preservation",
-                "observed": coverage["highest_ranked_raw_ngram_preservation"],
-                "target": nn_config.tfidf_topic.initial_effect_coverage_target,
-                "passed": bool(
-                    coverage["highest_ranked_raw_ngram_preservation"]
-                    >= nn_config.tfidf_topic.initial_effect_coverage_target
-                ),
-            }
-        )
+        if coverage.get("orphan_ngram_branch_status") == "completed":
+            criteria.append(
+                {
+                    "family": "effect",
+                    "metric": "selected_orphan_ngram_cluster_coverage",
+                    "observed": coverage[
+                        "orphan_cluster_coverage_fraction"
+                    ],
+                    "target": nn_config.tfidf_topic.initial_effect_coverage_target,
+                    "passed": bool(
+                        coverage["orphan_cluster_coverage_fraction"]
+                        >= nn_config.tfidf_topic.initial_effect_coverage_target
+                    ),
+                    "raw_top20_preservation_reported_but_not_used_as_gate": True,
+                }
+            )
+        else:
+            criteria.append(
+                {
+                    "family": "effect",
+                    "metric": "highest_ranked_raw_ngram_preservation",
+                    "observed": coverage[
+                        "highest_ranked_raw_ngram_preservation"
+                    ],
+                    "target": nn_config.tfidf_topic.initial_effect_coverage_target,
+                    "passed": bool(
+                        coverage["highest_ranked_raw_ngram_preservation"]
+                        >= nn_config.tfidf_topic.initial_effect_coverage_target
+                    ),
+                }
+            )
     failed = [criterion for criterion in criteria if not criterion["passed"]]
     return {
         "passed": not failed,
@@ -2650,6 +3469,14 @@ class TfidfTopicAgenticForestRunner:
             current.roles = list(dict.fromkeys([*current.roles, *spec.roles]))
         self.prespecified_specs = list(by_name.values())
 
+    @staticmethod
+    def _without_oracle_columns(frame: pd.DataFrame) -> pd.DataFrame:
+        """Return the exact modeling frame with every synthetic oracle removed."""
+        oracle_columns = [
+            column for column in frame.columns if str(column).startswith("true_")
+        ]
+        return frame.drop(columns=oracle_columns, errors="ignore")
+
     def _prespecified_candidates(self) -> List[Dict[str, Any]]:
         return [
             {
@@ -2693,20 +3520,747 @@ class TfidfTopicAgenticForestRunner:
             )
         return full[0], inner
 
-    def _topic_jobs(self, row: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
-        jobs: List[Tuple[str, Dict[str, Any]]] = []
+    def _load_topic_score_tests(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        artifact = row["discovery"].get("artifacts", {}).get("topic_score_tests")
+        if not artifact:
+            raise RuntimeError(
+                "Score-test filtering is enabled but this exact inner context has "
+                "no topic_score_tests artifact; rerun Stage 1."
+            )
+        path = Path(str(artifact))
+        if not path.exists():
+            raise RuntimeError(f"Missing exact-context topic score tests: {path}")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("schema_version") != TOPIC_SCORE_TEST_SCHEMA_VERSION:
+            raise RuntimeError(
+                "Exact-context topic/n-gram score tests use an incompatible "
+                f"schema {payload.get('schema_version')!r}; expected "
+                f"{TOPIC_SCORE_TEST_SCHEMA_VERSION!r}. Rerun Stage 1."
+            )
+        if payload.get("status") != "completed":
+            raise RuntimeError(
+                f"Exact-context topic score tests are incomplete: {path}"
+            )
+        return payload
+
+    def _topic_score_selection_snapshot(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        if not bool(self.nn_config.tfidf_topic.score_test_enabled):
+            return {"enabled": False, "banks": {}}
+        payload = self._load_topic_score_tests(row)
+        snapshot: Dict[str, Any] = {
+            "enabled": True,
+            "schema_version": payload.get("schema_version"),
+            "scope_id": payload.get("scope_id"),
+            "banks": {},
+        }
         for bank in ("treatment", "outcome", "effect"):
-            for topic in row["discovery"]["topic_banks"].get(bank, {}).get("topics", []):
-                jobs.append((bank, topic))
+            bank_payload = (payload.get("banks") or {}).get(bank) or {}
+            selected_ids = set(
+                map(str, bank_payload.get("selected_topic_ids") or [])
+            )
+            selected_topics = []
+            for test in bank_payload.get("topic_tests", []):
+                if str(test.get("topic_id")) not in selected_ids:
+                    continue
+                selected_topics.append(
+                    {
+                        key: test.get(key)
+                        for key in (
+                            "topic_id",
+                            "evidence_rank",
+                            "selection_reason",
+                            "primary_p",
+                            "primary_p_source",
+                            "fdr_q",
+                            "familywise_p",
+                            "topic_score_testable",
+                            "topic_score_moment",
+                            "topic_standardized_score",
+                            "topic_unadjusted_two_sided_p",
+                            "topic_familywise_p",
+                            "term_group_primary_p",
+                            "term_group_primary_p_source",
+                            "term_group_fdr_q",
+                            "term_group_familywise_p",
+                            "candidate_familywise_energy_p",
+                            "quadratic_statistic",
+                            "quadratic_covariance_rank",
+                            "quadratic_statistic_per_rank",
+                            "maximum_absolute_standardized_score",
+                            "term_scores",
+                            "selected_ngram_count",
+                            "selected_ngram_terms",
+                        )
+                    }
+                )
+            snapshot["banks"][bank] = {
+                "selected_topic_ids": sorted(selected_ids),
+                "selected_topics": selected_topics,
+                "selection_count": int(bank_payload.get("selection_count") or 0),
+                "selection_rule": bank_payload.get("selection_rule"),
+                "bootstrap_calibration": bank_payload.get(
+                    "bootstrap_calibration"
+                ) or {},
+                "selected_ngrams": list(
+                    bank_payload.get("selected_ngrams") or []
+                ),
+                "selected_ngram_terms": list(
+                    bank_payload.get("selected_ngram_terms") or []
+                ),
+                "ngram_selection_count": int(
+                    bank_payload.get("ngram_selection_count") or 0
+                ),
+                "ngram_selection_rule": bank_payload.get(
+                    "ngram_selection_rule"
+                ),
+            }
+        orphan = payload.get("effect_orphan_ngram_branch") or {}
+        snapshot["effect_orphan_ngram_branch"] = {
+            "status": orphan.get("status"),
+            "candidate_definition": orphan.get("candidate_definition"),
+            "selected_cluster_ids": list(
+                orphan.get("selected_cluster_ids") or []
+            ),
+            "selected_clusters": list(orphan.get("selected_clusters") or []),
+            "selection_count": int(orphan.get("selection_count") or 0),
+            "selection_rule": orphan.get("selection_rule"),
+            "bootstrap_calibration": orphan.get("bootstrap_calibration") or {},
+            "cluster_count": int(orphan.get("cluster_count") or 0),
+        }
+        return snapshot
+
+    @staticmethod
+    def _topic_document(topic: Dict[str, Any]) -> str:
+        return " ; ".join(
+            str(term.get("term") or "")
+            for term in topic.get("terms", [])
+            if str(term.get("term") or "").strip()
+        )
+
+    def _full_orphan_jobs_from_policy(
+        self,
+        row: Dict[str, Any],
+        policy: Dict[str, Any],
+    ) -> Tuple[List[Tuple[str, Dict[str, Any]]], Dict[str, Any]]:
+        """Map fixed inner orphan signatures onto full-training raw evidence."""
+        orphan_policy = (
+            (policy.get("topic_score_selection") or {}).get(
+                "effect_orphan_ngram_branch"
+            )
+            or {}
+        )
+        signatures = [
+            dict(signature)
+            for signature in orphan_policy.get("signatures") or []
+            if signature.get("terms")
+        ]
+        audit: Dict[str, Any] = {
+            "source": "fixed_inner_orphan_ngram_policy_mapping",
+            "uses_outer_heldout_labels": False,
+            "input_signature_count": len(signatures),
+            "jobs": [],
+        }
+        if not bool(self.nn_config.tfidf_topic.orphan_ngram_enabled):
+            audit["status"] = "disabled"
+            return [], audit
+        if not signatures:
+            audit["status"] = "no_selected_inner_orphan_clusters"
+            return [], audit
+
+        documents = [" ; ".join(map(str, signature["terms"])) for signature in signatures]
+        signature_vectors = _parsimony_tfidf_semantic_vectors(documents)
+        signature_similarity = signature_vectors @ signature_vectors.T
+        ungrouped = set(range(len(signatures)))
+        signature_groups: List[List[int]] = []
+        threshold = float(
+            self.nn_config.tfidf_topic.orphan_ngram_cluster_similarity_threshold
+        )
+        for seed in range(len(signatures)):
+            if seed not in ungrouped:
+                continue
+            members = [
+                index
+                for index in sorted(ungrouped)
+                if index == seed
+                or float(signature_similarity[seed, index]) >= threshold
+                or bool(
+                    set(map(str, signatures[seed]["terms"]))
+                    & set(map(str, signatures[index]["terms"]))
+                )
+            ]
+            for index in members:
+                ungrouped.discard(index)
+            signature_groups.append(members)
+        signature_groups.sort(
+            key=lambda members: (
+                -len({int(signatures[index]["inner_fold"]) for index in members}),
+                min(
+                    float(signatures[index].get("primary_p") or 1.0)
+                    for index in members
+                ),
+                min(str(signatures[index].get("cluster_id")) for index in members),
+            )
+        )
+
+        score_path = Path(
+            str(row["discovery"]["artifacts"]["ngram_scores"]["effect"])
+        )
+        raw = pd.read_parquet(score_path).copy()
+        raw["feature"] = raw["feature"].astype(str)
+        raw["fit_rank"] = np.arange(1, len(raw) + 1, dtype=int)
+        if "eligible" in raw.columns:
+            raw = raw.loc[raw["eligible"].astype(bool)].copy()
+        raw = raw.loc[
+            raw["signed_score"].astype(float).abs()
+            >= float(self.nn_config.tfidf_topic.orphan_ngram_min_abs_fit_score)
+        ].copy()
+        represented = {
+            str(term.get("term"))
+            for topic in (
+                row["discovery"]["topic_banks"].get("effect", {}).get(
+                    "topics", []
+                )
+            )
+            for term in topic.get("terms", [])
+        }
+        raw = raw.loc[~raw["feature"].isin(represented)].copy()
+        raw = raw.sort_values(
+            ["fit_rank", "unsigned_score", "feature"],
+            ascending=[True, False, True],
+            kind="stable",
+        )
+        candidate_records = raw.to_dict(orient="records")
+        candidate_terms = [str(record["feature"]) for record in candidate_records]
+        signature_terms = sorted(
+            {
+                str(term)
+                for signature in signatures
+                for term in signature.get("terms") or []
+                if str(term).strip()
+            }
+        )
+        if not candidate_terms or not signature_terms:
+            audit["status"] = "no_full_context_fit_side_candidates"
+            return [], audit
+        semantic_vectors = _parsimony_tfidf_semantic_vectors(
+            [*signature_terms, *candidate_terms]
+        )
+        signature_term_vectors = semantic_vectors[: len(signature_terms)]
+        candidate_vectors = semantic_vectors[len(signature_terms) :]
+        term_similarity = candidate_vectors @ signature_term_vectors.T
+        signature_term_index = {
+            term: index for index, term in enumerate(signature_terms)
+        }
+        required_folds = min(
+            int(self.nn_config.tfidf_topic.orphan_ngram_full_min_inner_folds),
+            int(policy.get("inner_fold_count") or 1),
+        )
+        maximum_terms = int(
+            self.nn_config.tfidf_topic.orphan_ngram_cluster_max_terms
+        )
+        assigned_terms: set[str] = set()
+        jobs: List[Tuple[str, Dict[str, Any]]] = []
+        for group_index, members in enumerate(signature_groups, start=1):
+            inner_folds = sorted(
+                {int(signatures[index]["inner_fold"]) for index in members}
+            )
+            if len(inner_folds) < required_folds:
+                continue
+            group_terms = sorted(
+                {
+                    str(term)
+                    for index in members
+                    for term in signatures[index].get("terms") or []
+                }
+            )
+            group_columns = [signature_term_index[term] for term in group_terms]
+            ranked_candidates: List[Tuple[int, float, int, str, Dict[str, Any]]] = []
+            for candidate_index, record in enumerate(candidate_records):
+                term = str(record["feature"])
+                if term in assigned_terms:
+                    continue
+                exact = term in group_terms
+                similarity = float(
+                    np.max(term_similarity[candidate_index, group_columns])
+                )
+                if not exact and similarity < threshold:
+                    continue
+                ranked_candidates.append(
+                    (
+                        0 if exact else 1,
+                        -similarity,
+                        int(record["fit_rank"]),
+                        term,
+                        record,
+                    )
+                )
+            ranked_candidates.sort(key=lambda item: item[:4])
+            chosen = ranked_candidates[:maximum_terms]
+            if not chosen:
+                continue
+            term_rows: List[Dict[str, Any]] = []
+            for exact_rank, negative_similarity, _rank, term, record in chosen:
+                assigned_terms.add(term)
+                term_rows.append(
+                    {
+                        "term": term,
+                        "loading": 0.0,
+                        "screen_rank": int(record["fit_rank"]),
+                        "signed_score": float(record["signed_score"]),
+                        "fit_rank": int(record["fit_rank"]),
+                        "fit_signed_score": float(record["signed_score"]),
+                        "fit_unsigned_score": float(
+                            abs(float(record["signed_score"]))
+                        ),
+                        "combined_importance": float(
+                            record.get("combined_importance", 0.0)
+                        ),
+                        "mapped_exactly": exact_rank == 0,
+                        "mapping_similarity": float(-negative_similarity),
+                    }
+                )
+            cluster_id = f"effect_orphan_cluster_full_{len(jobs) + 1:03d}"
+            mapped_evidence = {
+                "source": "fixed_inner_orphan_ngram_policy_mapping",
+                "uses_outer_heldout_labels": False,
+                "cluster_id": cluster_id,
+                "matched_inner_folds": inner_folds,
+                "matched_inner_cluster_ids": [
+                    str(signatures[index].get("cluster_id")) for index in members
+                ],
+                "inner_signatures": [signatures[index] for index in members],
+                "full_context_terms": [row["term"] for row in term_rows],
+            }
+            job = (
+                "effect",
+                {
+                    "topic_id": cluster_id,
+                    "bank": "effect",
+                    "evidence_kind": "orphan_raw_ngram_cluster",
+                    "terms": term_rows,
+                    "_prompt_version": ORPHAN_NGRAM_LABEL_PROMPT_VERSION,
+                    "_selection_evidence": mapped_evidence,
+                },
+            )
+            jobs.append(job)
+            audit["jobs"].append(mapped_evidence)
+        audit.update(
+            {
+                "status": "completed",
+                "signature_group_count": len(signature_groups),
+                "required_inner_fold_recurrence": required_folds,
+                "full_fit_candidate_count": len(candidate_records),
+                "mapped_job_count": len(jobs),
+                "mapped_term_count": len(assigned_terms),
+            }
+        )
+        return jobs, audit
+
+    def _full_topic_jobs_from_policy(
+        self,
+        row: Dict[str, Any],
+        policy: Dict[str, Any],
+    ) -> Tuple[List[Tuple[str, Dict[str, Any]]], Dict[str, Any]]:
+        score_policy = policy.get("topic_score_selection") or {}
+        policy_banks = score_policy.get("banks") or {}
+        jobs: List[Tuple[str, Dict[str, Any]]] = []
+        audit: Dict[str, Any] = {
+            "source": "fixed_inner_score_test_policy",
+            "outer_fold": int(row["outer_fold"]),
+            "uses_outer_heldout_labels": False,
+            "banks": {},
+        }
+        for bank in ("treatment", "outcome", "effect"):
+            topics = list(
+                row["discovery"]["topic_banks"].get(bank, {}).get("topics", [])
+            )
+            signatures = list((policy_banks.get(bank) or {}).get("signatures") or [])
+            if not topics:
+                audit["banks"][bank] = {
+                    "selected_topic_ids": [],
+                    "reason": "no_full_context_topics",
+                }
+                continue
+            if not signatures:
+                audit["banks"][bank] = {
+                    "selected_topic_ids": [],
+                    "reason": "no_testable_or_selected_inner_topics",
+                    "uses_outer_heldout_labels": False,
+                }
+                continue
+            documents = [
+                " ; ".join(map(str, signature.get("terms") or []))
+                for signature in signatures
+            ] + [self._topic_document(topic) for topic in topics]
+            vectors = _parsimony_tfidf_semantic_vectors(documents)
+            signature_vectors = vectors[: len(signatures)]
+            topic_vectors = vectors[len(signatures):]
+            similarities = topic_vectors @ signature_vectors.T
+            term_fold_recurrence = {
+                str(term): int(count)
+                for term, count in (
+                    (policy_banks.get(bank) or {}).get(
+                        "selected_ngram_fold_recurrence",
+                        (policy_banks.get(bank) or {}).get(
+                            "selected_term_fold_recurrence", {}
+                        ),
+                    )
+                ).items()
+            }
+            scored: List[Dict[str, Any]] = []
+            for topic_index, topic in enumerate(topics):
+                topic_terms = {
+                    str(term.get("term"))
+                    for term in topic.get("terms", [])
+                    if str(term.get("term") or "").strip()
+                }
+                exact_folds = {
+                    int(signature["inner_fold"])
+                    for signature in signatures
+                    if topic_terms & set(map(str, signature.get("terms") or []))
+                }
+                semantic_folds = {
+                    int(signatures[index]["inner_fold"])
+                    for index, value in enumerate(similarities[topic_index])
+                    if float(value) >= 0.35
+                }
+                matched_folds = exact_folds | semantic_folds
+                matched_evidence: List[Dict[str, Any]] = []
+                for signature_index, signature in enumerate(signatures):
+                    signature_terms = set(map(str, signature.get("terms") or []))
+                    exact_overlap = sorted(topic_terms & signature_terms)
+                    similarity = float(similarities[topic_index, signature_index])
+                    if not exact_overlap and similarity < 0.35:
+                        continue
+                    strongest_terms = sorted(
+                        list(signature.get("term_scores") or []),
+                        key=lambda term: -abs(
+                            float(term.get("heldout_standardized_score") or 0.0)
+                        ),
+                    )[:5]
+                    matched_evidence.append(
+                        {
+                            "inner_fold": int(signature["inner_fold"]),
+                            "inner_topic_id": str(signature.get("topic_id")),
+                            "exact_term_overlap": exact_overlap,
+                            "semantic_similarity": similarity,
+                            "primary_p": signature.get("primary_p"),
+                            "primary_p_source": signature.get("primary_p_source"),
+                            "fdr_q": signature.get("fdr_q"),
+                            "familywise_p": signature.get("familywise_p"),
+                            "topic_standardized_score": signature.get(
+                                "topic_standardized_score"
+                            ),
+                            "topic_score_moment": signature.get(
+                                "topic_score_moment"
+                            ),
+                            "term_group_primary_p": signature.get(
+                                "term_group_primary_p"
+                            ),
+                            "term_group_fdr_q": signature.get(
+                                "term_group_fdr_q"
+                            ),
+                            "evidence_rank": signature.get("evidence_rank"),
+                            "quadratic_statistic_per_rank": signature.get(
+                                "quadratic_statistic_per_rank"
+                            ),
+                            "strongest_term_scores": strongest_terms,
+                        }
+                    )
+                matched_evidence.sort(
+                    key=lambda evidence: (
+                        -len(evidence["exact_term_overlap"]),
+                        -float(evidence["semantic_similarity"]),
+                        float(
+                            evidence["primary_p"]
+                            if evidence["primary_p"] is not None
+                            else 1.0
+                        ),
+                        int(evidence["inner_fold"]),
+                    )
+                )
+                exact_weight = int(
+                    sum(term_fold_recurrence.get(term, 0) for term in topic_terms)
+                )
+                best_similarity = float(np.max(similarities[topic_index]))
+                scored.append(
+                    {
+                        "topic_index": topic_index,
+                        "topic_id": str(topic["topic_id"]),
+                        "matched_inner_folds": sorted(matched_folds),
+                        "matched_inner_fold_count": len(matched_folds),
+                        "exact_selected_term_weight": exact_weight,
+                        "exact_selected_ngram_weight": exact_weight,
+                        "best_signature_similarity": best_similarity,
+                        "matched_inner_evidence": matched_evidence[:6],
+                        "mapping_score": float(
+                            len(matched_folds)
+                            + exact_weight
+                            / max(1, 15 * int(policy.get("inner_fold_count") or 1))
+                            + best_similarity
+                        ),
+                    }
+                )
+            scored.sort(
+                key=lambda item: (
+                    -int(item["matched_inner_fold_count"]),
+                    -int(item["exact_selected_term_weight"]),
+                    -float(item["best_signature_similarity"]),
+                    str(item["topic_id"]),
+                )
+            )
+            maximum = min(
+                int(self.nn_config.tfidf_topic.score_test_max_topics_per_bank),
+                len(scored),
+            )
+            minimum = min(
+                int(self.nn_config.tfidf_topic.score_test_min_topics_per_bank),
+                maximum,
+            )
+            required_folds = min(
+                int(
+                    self.nn_config.tfidf_topic.score_test_full_topic_min_inner_folds
+                ),
+                int(policy.get("inner_fold_count") or 1),
+            )
+            selected = [
+                item
+                for item in scored
+                if int(item["matched_inner_fold_count"]) >= required_folds
+            ][:maximum]
+            selected_ids = {item["topic_id"] for item in selected}
+            for item in scored:
+                if len(selected) >= minimum:
+                    break
+                if item["topic_id"] not in selected_ids:
+                    selected.append(item)
+                    selected_ids.add(item["topic_id"])
+            selected_by_id = {item["topic_id"]: item for item in selected}
+            for topic in topics:
+                topic_id = str(topic["topic_id"])
+                if topic_id not in selected_by_id:
+                    continue
+                evidence = {
+                    "source": "fixed_inner_score_test_policy_mapping",
+                    "uses_outer_heldout_labels": False,
+                    **selected_by_id[topic_id],
+                }
+                jobs.append((bank, {**topic, "_selection_evidence": evidence}))
+            audit["banks"][bank] = {
+                "selected_topic_ids": [
+                    str(item["topic_id"]) for item in selected
+                ],
+                "required_inner_fold_recurrence": required_folds,
+                "minimum_topics": minimum,
+                "maximum_topics": maximum,
+                "topic_mapping": scored,
+            }
+        orphan_jobs, orphan_audit = self._full_orphan_jobs_from_policy(
+            row, policy
+        )
+        jobs.extend(orphan_jobs)
+        audit["effect_orphan_ngram_branch"] = orphan_audit
+        return jobs, audit
+
+    def _topic_jobs(
+        self,
+        row: Dict[str, Any],
+        selection_policy: Optional[Dict[str, Any]] = None,
+    ) -> List[Tuple[str, Dict[str, Any]]]:
+        if not bool(self.nn_config.tfidf_topic.score_test_enabled):
+            return [
+                (bank, topic)
+                for bank in ("treatment", "outcome", "effect")
+                for topic in row["discovery"]["topic_banks"].get(bank, {}).get(
+                    "topics", []
+                )
+            ]
+        if row.get("scope") == "full_outer_train":
+            if selection_policy is None:
+                raise RuntimeError(
+                    "Full-outer topic labeling requires the fixed inner "
+                    "score-test policy; labeling all topics is not allowed."
+                )
+            jobs, _audit = self._full_topic_jobs_from_policy(row, selection_policy)
+            return jobs
+
+        topic_jobs = [
+            (bank, topic)
+            for bank, topic in self._inner_ranked_topic_jobs(row)
+            if bool(
+                (topic.get("_selection_evidence") or {}).get(
+                    "selected_for_agent", False
+                )
+            )
+        ]
+        return [*topic_jobs, *self._inner_orphan_jobs(row)]
+
+    def _inner_orphan_jobs(
+        self, row: Dict[str, Any]
+    ) -> List[Tuple[str, Dict[str, Any]]]:
+        """Return held-out-selected groups from the predeclared fit-side universe."""
+        if row.get("scope") == "full_outer_train":
+            raise ValueError("Inner orphan score evidence is unavailable for full contexts")
+        if not bool(self.nn_config.tfidf_topic.orphan_ngram_enabled):
+            return []
+        score_tests = self._load_topic_score_tests(row)
+        branch = score_tests.get("effect_orphan_ngram_branch") or {}
+        if branch.get("status") != "completed":
+            raise RuntimeError(
+                "The orphan n-gram branch is enabled but its exact inner "
+                "score-test artifact is incomplete; rerun Stage 1."
+            )
+        jobs: List[Tuple[str, Dict[str, Any]]] = []
+        for cluster in sorted(
+            branch.get("selected_clusters") or [],
+            key=lambda item: (
+                int(item.get("evidence_rank") or 10**9),
+                str(item.get("cluster_id")),
+            ),
+        ):
+            term_rows = []
+            for term in cluster.get("term_scores") or []:
+                term_rows.append(
+                    {
+                        **dict(term),
+                        "loading": 0.0,
+                        "screen_rank": int(term.get("fit_rank") or 0),
+                        "signed_score": float(
+                            term.get("fit_signed_score") or 0.0
+                        ),
+                    }
+                )
+            if not 1 <= len(term_rows) <= 15:
+                raise RuntimeError(
+                    f"Selected orphan cluster {cluster.get('cluster_id')} has "
+                    f"{len(term_rows)} terms; expected 1-15"
+                )
+            evidence = {
+                "source": "exact_inner_heldout_orphan_ngram_group_score_test",
+                "uses_heldout_treatment_and_outcome": True,
+                **dict(cluster),
+            }
+            jobs.append(
+                (
+                    "effect",
+                    {
+                        "topic_id": str(cluster["cluster_id"]),
+                        "bank": "effect",
+                        "evidence_kind": "orphan_raw_ngram_cluster",
+                        "terms": term_rows,
+                        "_prompt_version": ORPHAN_NGRAM_LABEL_PROMPT_VERSION,
+                        "_selection_evidence": evidence,
+                    },
+                )
+            )
         return jobs
 
-    def _label_context_topics(self, row: Dict[str, Any], context_dir: Path) -> List[Dict[str, Any]]:
+    def _inner_ranked_topic_jobs(
+        self, row: Dict[str, Any]
+    ) -> List[Tuple[str, Dict[str, Any]]]:
+        """Return every inner topic in held-out evidence order.
+
+        The initial labeling pass consumes only ``selected_for_agent`` topics.
+        Additive review can ask for the next relevant topic when structured
+        diagnostics fail, without recomputing or peeking at any new rows.
+        """
+        if row.get("scope") == "full_outer_train":
+            raise ValueError("Ranked held-out topic evidence exists only for inner contexts")
+        if not bool(self.nn_config.tfidf_topic.score_test_enabled):
+            return [
+                (bank, topic)
+                for bank in ("treatment", "outcome", "effect")
+                for topic in row["discovery"]["topic_banks"].get(bank, {}).get(
+                    "topics", []
+                )
+            ]
+        score_tests = self._load_topic_score_tests(row)
+        jobs: List[Tuple[str, Dict[str, Any]]] = []
+        for bank in ("treatment", "outcome", "effect"):
+            bank_tests = (score_tests.get("banks") or {}).get(bank) or {}
+            topics_by_id = {
+                str(topic["topic_id"]): topic
+                for topic in row["discovery"]["topic_banks"].get(bank, {}).get(
+                    "topics", []
+                )
+            }
+            ranked_tests = sorted(
+                bank_tests.get("topic_tests", []),
+                key=lambda test: (
+                    int(test.get("evidence_rank") or 10**9),
+                    str(test.get("topic_id")),
+                ),
+            )
+            for test in ranked_tests:
+                topic_id = str(test["topic_id"])
+                topic = topics_by_id.get(topic_id)
+                if topic is None:
+                    continue
+                evidence = {
+                    "source": "exact_inner_heldout_topic_and_ngram_score_test",
+                    "uses_heldout_treatment_and_outcome": True,
+                    **test,
+                }
+                jobs.append((bank, {**topic, "_selection_evidence": evidence}))
+        return jobs
+
+    def _label_context_topics(
+        self,
+        row: Dict[str, Any],
+        context_dir: Path,
+        selection_policy: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
         checkpoint = context_dir / "topic_labels.jsonl"
+        model_identity = self._harmonization_agent_model_identity()
+        request_settings_hash = stable_hash(
+            {
+                "agent_provider": getattr(
+                    self.search_config, "agent_provider", "openai"
+                ),
+                "agent_server_url": getattr(
+                    self.search_config, "agent_server_url", None
+                ),
+                "configured_model_name": getattr(
+                    self.search_config, "agent_model_name", None
+                ),
+                "resolved_model_identity": model_identity,
+                "agent_temperature": self.search_config.agent_temperature,
+                "agent_max_tokens": self.search_config.agent_max_tokens,
+                "agent_enable_thinking": getattr(
+                    self.search_config, "agent_enable_thinking", None
+                ),
+                "agent_schema_repair_attempts": getattr(
+                    self.search_config, "agent_schema_repair_attempts", 1
+                ),
+            }
+        )
         completed: Dict[str, Dict[str, Any]] = {}
         if self.resume and checkpoint.exists():
             for item in _read_unversioned_jsonl(checkpoint):
                 completed[str(item["topic_id"])] = item
-        jobs = self._topic_jobs(row)
+        jobs = self._topic_jobs(row, selection_policy=selection_policy)
+        selection_audit: Dict[str, Any]
+        if row.get("scope") == "full_outer_train" and selection_policy is not None:
+            _jobs, selection_audit = self._full_topic_jobs_from_policy(
+                row, selection_policy
+            )
+        else:
+            selection_audit = {
+                "source": (
+                    "exact_inner_heldout_topic_and_ngram_score_test"
+                    if self.nn_config.tfidf_topic.score_test_enabled
+                    else "score_test_filter_disabled"
+                ),
+                "selected_topic_ids_by_bank": {
+                    bank: [
+                        str(topic["topic_id"])
+                        for job_bank, topic in jobs
+                        if job_bank == bank
+                    ]
+                    for bank in ("treatment", "outcome", "effect")
+                },
+            }
+        _write_json(context_dir / "topic_filter_selection.json", selection_audit)
 
         def run_one(bank: str, topic: Dict[str, Any]) -> Dict[str, Any]:
             context = build_topic_label_context(
@@ -2715,6 +4269,10 @@ class TfidfTopicAgenticForestRunner:
                 inner_fold=row.get("inner_fold"),
                 bank=bank,
                 topic=topic,
+                prompt_version=str(
+                    topic.get("_prompt_version") or TOPIC_LABEL_PROMPT_VERSION
+                ),
+                score_test_evidence=topic.get("_selection_evidence"),
             )
             try:
                 response = self.proposal_agent.propose(context)
@@ -2730,6 +4288,8 @@ class TfidfTopicAgenticForestRunner:
                     "topic_id": topic["topic_id"],
                     "bank": bank,
                     "context_hash": stable_hash(context),
+                    "model_identity": model_identity,
+                    "request_settings_hash": request_settings_hash,
                     "response": response,
                     "response_trace": trace if self.search_config.save_agent_raw_output else None,
                     "candidates": candidates,
@@ -2740,13 +4300,36 @@ class TfidfTopicAgenticForestRunner:
                     "topic_id": topic["topic_id"],
                     "bank": bank,
                     "context_hash": stable_hash(context),
+                    "model_identity": model_identity,
+                    "request_settings_hash": request_settings_hash,
                     "candidates": [],
                     "status": "dropped",
                     "drop_reason": repr(exc),
                     "error": repr(exc),
                 }
 
-        pending = [(bank, topic) for bank, topic in jobs if topic["topic_id"] not in completed]
+        pending = []
+        for bank, topic in jobs:
+            expected_context = build_topic_label_context(
+                outer_fold=int(row["outer_fold"]),
+                scope=str(row["scope"]),
+                inner_fold=row.get("inner_fold"),
+                bank=bank,
+                topic=topic,
+                prompt_version=str(
+                    topic.get("_prompt_version") or TOPIC_LABEL_PROMPT_VERSION
+                ),
+                score_test_evidence=topic.get("_selection_evidence"),
+            )
+            existing = completed.get(str(topic["topic_id"]))
+            if (
+                existing is None
+                or existing.get("context_hash") != stable_hash(expected_context)
+                or existing.get("model_identity") != model_identity
+                or existing.get("request_settings_hash")
+                != request_settings_hash
+            ):
+                pending.append((bank, topic))
         if pending:
             # Resolve one shared client/model before concurrent topic requests so
             # lazy endpoint discovery cannot race across worker threads.
@@ -3362,6 +4945,12 @@ class TfidfTopicAgenticForestRunner:
         inner_fold = int(row["inner_fold"])
         context_dir = outer_dir / f"inner_{inner_fold:03d}"
         labels = self._label_context_topics(row, context_dir)
+        initially_labeled_topic_ids = {
+            str(label["topic_id"]) for label in labels
+        }
+        recovery_topic_attempts: Counter = Counter()
+        attempted_recovery_raw_terms: set[str] = set()
+        recovery_topic_evidence: List[Dict[str, Any]] = []
         candidates = [
             {
                 **candidate,
@@ -3450,16 +5039,13 @@ class TfidfTopicAgenticForestRunner:
             newly_dropped: List[Dict[str, Any]] = []
             recovery_source = "deferred_canonical_contracts"
             recovery_prompt_context: Optional[Dict[str, Any]] = None
+            recovery_topic_summary: Optional[Dict[str, Any]] = None
             if not addition_registry:
                 # Only when the fold-local valid pool has no relevant contract
                 # do we revisit one uncovered source topic with a bounded prompt.
                 uncovered = diagnostic["effect_coverage"].get(
                     "uncovered_topic_ids", []
                 )
-                topic_lookup = {
-                    topic["topic_id"]: (bank, topic)
-                    for bank, topic in self._topic_jobs(row)
-                }
                 failed_targets = [
                     str(criterion.get("target"))
                     for criterion in gate.get("criteria", [])
@@ -3467,15 +5053,75 @@ class TfidfTopicAgenticForestRunner:
                     and criterion.get("family") == "nuisance"
                     and criterion.get("target") in {"treatment", "outcome"}
                 ]
-                topic_id = uncovered[0] if uncovered else next(
+                relevant_banks = set(failed_targets)
+                if any(
+                    not criterion.get("passed", False)
+                    and criterion.get("family") == "effect"
+                    for criterion in gate.get("criteria", [])
+                ):
+                    relevant_banks.add("effect")
+                ranked_jobs = [
+                    *self._inner_ranked_topic_jobs(row),
+                    *self._inner_orphan_jobs(row),
+                ]
+                if not relevant_banks:
+                    relevant_banks = {bank for bank, _topic in ranked_jobs}
+                by_id = {
+                    str(topic["topic_id"]): (bank, topic)
+                    for bank, topic in ranked_jobs
+                }
+                topic_choice: Optional[Tuple[str, Dict[str, Any]]] = next(
                     (
-                        topic["topic_id"]
-                        for bank, topic in self._topic_jobs(row)
-                        if bank in failed_targets
+                        by_id[str(topic_id)]
+                        for topic_id in uncovered
+                        if str(topic_id) in by_id
+                        and recovery_topic_attempts[str(topic_id)] == 0
                     ),
-                    next(iter(topic_lookup), None),
+                    None,
                 )
-                if topic_id is None:
+                if topic_choice is None:
+                    # Expand beyond the initial shortlist in fixed held-out
+                    # evidence order when the structured model still misses a
+                    # diagnostic family. This is bounded by the global recovery
+                    # round limit and never consults a new row set.
+                    topic_choice = next(
+                        (
+                            (bank, topic)
+                            for bank, topic in ranked_jobs
+                            if bank in relevant_banks
+                            and (
+                                bank != "effect"
+                                or not bool(
+                                    self.nn_config.tfidf_topic.orphan_ngram_enabled
+                                )
+                                or str(topic["topic_id"])
+                                in initially_labeled_topic_ids
+                            )
+                            and str(topic["topic_id"])
+                            not in initially_labeled_topic_ids
+                            and recovery_topic_attempts[str(topic["topic_id"])] == 0
+                        ),
+                        None,
+                    )
+                if topic_choice is None:
+                    topic_choice = next(
+                        (
+                            (bank, topic)
+                            for bank, topic in ranked_jobs
+                            if bank in relevant_banks
+                            and (
+                                bank != "effect"
+                                or not bool(
+                                    self.nn_config.tfidf_topic.orphan_ngram_enabled
+                                )
+                                or str(topic["topic_id"])
+                                in initially_labeled_topic_ids
+                            )
+                            and recovery_topic_attempts[str(topic["topic_id"])] == 0
+                        ),
+                        None,
+                    )
+                if topic_choice is None:
                     rounds.append(
                         {
                             "round": round_index,
@@ -3483,26 +5129,54 @@ class TfidfTopicAgenticForestRunner:
                         }
                     )
                     break
-                bank, topic = topic_lookup[topic_id]
+                bank, topic = topic_choice
+                topic_id = str(topic["topic_id"])
+                recovery_topic_attempts[topic_id] += 1
                 score_path = row["discovery"]["artifacts"]["ngram_scores"][bank]
                 raw_scores = pd.read_parquet(score_path)
-                if "eligible" in raw_scores.columns:
-                    raw_scores = raw_scores[raw_scores["eligible"].astype(bool)]
-                raw_terms = raw_scores.head(20)["feature"].astype(str).tolist()
+                covered_raw_terms = {
+                    str(
+                        term.get("term")
+                        if isinstance(term, dict)
+                        else term
+                    )
+                    for entry in registry
+                    for provenance in entry.get("provenance", [])
+                    for term in provenance.get("supporting_terms", [])
+                }
+                covered_raw_terms.update(attempted_recovery_raw_terms)
                 if bank == "effect":
                     preserved = set(
                         diagnostic["effect_coverage"].get(
                             "preserved_highest_ranked_raw_ngrams", []
                         )
                     )
-                    raw_terms = [term for term in raw_terms if term not in preserved]
+                    covered_raw_terms.update(map(str, preserved))
+                is_orphan_cluster = (
+                    topic.get("evidence_kind") == "orphan_raw_ngram_cluster"
+                )
+                raw_terms = (
+                    []
+                    if is_orphan_cluster
+                    else select_topic_recovery_raw_ngrams(
+                        raw_scores,
+                        topic,
+                        excluded_terms=covered_raw_terms,
+                        limit=20,
+                    )
+                )
+                attempted_recovery_raw_terms.update(raw_terms)
                 recovery_prompt_context = build_topic_label_context(
                     outer_fold=int(row["outer_fold"]),
                     scope=str(row["scope"]),
                     inner_fold=inner_fold,
                     bank=bank,
                     topic=topic,
-                    prompt_version=TOPIC_RECOVERY_PROMPT_VERSION,
+                    prompt_version=(
+                        ORPHAN_NGRAM_LABEL_PROMPT_VERSION
+                        if is_orphan_cluster
+                        else TOPIC_RECOVERY_PROMPT_VERSION
+                    ),
                     uncovered_raw_ngrams=raw_terms,
                     current_definitions=[
                         {
@@ -3528,7 +5202,21 @@ class TfidfTopicAgenticForestRunner:
                         if float(summary.get("coverage", 0.0))
                         < float(self.search_config.min_feature_coverage)
                     ],
+                    score_test_evidence=topic.get("_selection_evidence"),
                 )
+                recovery_topic_summary = {
+                    "round": round_index,
+                    "bank": bank,
+                    "topic_id": topic_id,
+                    "was_initially_selected": topic_id in initially_labeled_topic_ids,
+                    "terms": [
+                        str(term.get("term")) for term in topic.get("terms", [])
+                    ],
+                    "score_test_evidence": dict(
+                        topic.get("_selection_evidence") or {}
+                    ),
+                }
+                recovery_topic_evidence.append(recovery_topic_summary)
                 response = self.proposal_agent.propose(recovery_prompt_context)
                 additions = [
                     candidate
@@ -3544,13 +5232,23 @@ class TfidfTopicAgenticForestRunner:
                     include_prespecified=False,
                 )
                 recovery_source = "targeted_source_topic_prompt"
+            old_registry_state = {
+                entry["name"]: _registry_entry_state_hash(entry)
+                for entry in registry
+            }
+            old_contract_hashes = {
+                entry["name"]: entry["contract_hash"] for entry in registry
+            }
             updated, merge_drops = _merge_executable_registry_entries(
                 [*registry, *addition_registry]
             )
             newly_dropped.extend(merge_drops)
-            changed = [entry for entry in updated if entry["contract_hash"] not in {
-                old["contract_hash"] for old in registry
-            }]
+            changed = [
+                entry
+                for entry in updated
+                if old_registry_state.get(entry["name"])
+                != _registry_entry_state_hash(entry)
+            ]
             if not changed:
                 rounds.append(
                     {
@@ -3558,6 +5256,7 @@ class TfidfTopicAgenticForestRunner:
                         "stop": "no_registry_specification_change",
                         "recovery_source": recovery_source,
                         "deferred_addition_audit": deferred_addition_audit,
+                        "recovery_topic": recovery_topic_summary,
                     }
                 )
                 break
@@ -3602,7 +5301,15 @@ class TfidfTopicAgenticForestRunner:
                     "round": round_index,
                     "gate": gate,
                     "diagnostic": diagnostic,
-                    "added_contracts": [entry["name"] for entry in changed],
+                    "changed_registry_entries": [
+                        entry["name"] for entry in changed
+                    ],
+                    "materially_changed_extraction_contracts": [
+                        entry["name"]
+                        for entry in changed
+                        if old_contract_hashes.get(entry["name"])
+                        != entry["contract_hash"]
+                    ],
                     "registry_size": len(registry),
                     "deferred_valid_contracts": len(deferred_registry),
                     "recovery_source": recovery_source,
@@ -3612,6 +5319,7 @@ class TfidfTopicAgenticForestRunner:
                         if recovery_prompt_context is not None
                         else None
                     ),
+                    "recovery_topic": recovery_topic_summary,
                 }
             )
             if consecutive_non_improving >= 2:
@@ -3646,8 +5354,8 @@ class TfidfTopicAgenticForestRunner:
         audit: Dict[str, Any]
         try:
             evaluation: SplitEvaluation = self.evaluator.evaluate_split(
-                train_df=fit_df,
-                test_df=heldout_df,
+                train_df=self._without_oracle_columns(fit_df),
+                test_df=self._without_oracle_columns(heldout_df),
                 specs=registry_specs(registry),
                 fold_id=1000 * int(row["outer_fold"]) + inner_fold,
             )
@@ -3687,6 +5395,8 @@ class TfidfTopicAgenticForestRunner:
                 entry["name"] for entry in pre_parsimony_registry
             ],
             "inner_forest_audit": audit,
+            "topic_score_selection": self._topic_score_selection_snapshot(row),
+            "recovery_topic_evidence": recovery_topic_evidence,
         }
         _write_json(context_dir / "canonical_registry.json", {
             "schema_version": CANONICAL_REGISTRY_SCHEMA_VERSION,
@@ -3790,8 +5500,201 @@ class TfidfTopicAgenticForestRunner:
                     "entry": template,
                 }
             )
+        score_policy_banks: Dict[str, Any] = {}
+        for bank in ("treatment", "outcome", "effect"):
+            signatures: List[Dict[str, Any]] = []
+            selected_term_folds: Dict[str, set] = defaultdict(set)
+            selected_ngram_folds: Dict[str, set] = defaultdict(set)
+            for result in inner_results:
+                inner_fold = int(result["inner_fold"])
+                seen_inner_topics: set = set()
+                bank_selection = (
+                    (result.get("topic_score_selection") or {})
+                    .get("banks", {})
+                    .get(bank, {})
+                )
+                for ngram in bank_selection.get("selected_ngrams", []):
+                    term = str(ngram.get("term") or "")
+                    if term:
+                        selected_ngram_folds[term].add(inner_fold)
+                for topic in bank_selection.get("selected_topics", []):
+                    seen_inner_topics.add(str(topic.get("topic_id")))
+                    term_scores = list(topic.get("term_scores") or [])
+                    terms = [
+                        str(term.get("term"))
+                        for term in term_scores
+                        if str(term.get("term") or "").strip()
+                    ]
+                    for term in terms:
+                        selected_term_folds[term].add(inner_fold)
+                    signatures.append(
+                        {
+                            "inner_fold": inner_fold,
+                            "topic_id": str(topic.get("topic_id")),
+                            "terms": terms,
+                            "primary_p": topic.get("primary_p"),
+                            "primary_p_source": topic.get("primary_p_source"),
+                            "fdr_q": topic.get("fdr_q"),
+                            "familywise_p": topic.get("familywise_p"),
+                            "topic_standardized_score": topic.get(
+                                "topic_standardized_score"
+                            ),
+                            "topic_score_moment": topic.get("topic_score_moment"),
+                            "topic_familywise_p": topic.get(
+                                "topic_familywise_p"
+                            ),
+                            "term_group_primary_p": topic.get(
+                                "term_group_primary_p"
+                            ),
+                            "term_group_fdr_q": topic.get(
+                                "term_group_fdr_q"
+                            ),
+                            "selection_reason": topic.get("selection_reason"),
+                            "evidence_rank": topic.get("evidence_rank"),
+                            "quadratic_statistic_per_rank": topic.get(
+                                "quadratic_statistic_per_rank"
+                            ),
+                            "term_scores": term_scores,
+                            "selected_ngram_terms": [
+                                str(term.get("term"))
+                                for term in term_scores
+                                if bool(term.get("selected_for_agent_evidence"))
+                            ],
+                            "policy_source": "initial_score_test_shortlist",
+                        }
+                    )
+                for recovered in result.get("recovery_topic_evidence", []):
+                    if str(recovered.get("bank")) != bank:
+                        continue
+                    topic_id = str(recovered.get("topic_id"))
+                    if topic_id in seen_inner_topics:
+                        continue
+                    evidence = dict(recovered.get("score_test_evidence") or {})
+                    term_scores = list(evidence.get("term_scores") or [])
+                    terms = [
+                        str(term)
+                        for term in (recovered.get("terms") or [])
+                        if str(term).strip()
+                    ]
+                    if not terms:
+                        terms = [
+                            str(term.get("term"))
+                            for term in term_scores
+                            if str(term.get("term") or "").strip()
+                        ]
+                    for term in terms:
+                        selected_term_folds[term].add(inner_fold)
+                    signatures.append(
+                        {
+                            "inner_fold": inner_fold,
+                            "topic_id": topic_id,
+                            "terms": terms,
+                            "primary_p": evidence.get("primary_p"),
+                            "primary_p_source": evidence.get("primary_p_source"),
+                            "fdr_q": evidence.get("fdr_q"),
+                            "familywise_p": evidence.get("familywise_p"),
+                            "topic_standardized_score": evidence.get(
+                                "topic_standardized_score"
+                            ),
+                            "topic_score_moment": evidence.get(
+                                "topic_score_moment"
+                            ),
+                            "topic_familywise_p": evidence.get(
+                                "topic_familywise_p"
+                            ),
+                            "term_group_primary_p": evidence.get(
+                                "term_group_primary_p"
+                            ),
+                            "term_group_fdr_q": evidence.get(
+                                "term_group_fdr_q"
+                            ),
+                            "selection_reason": "additive_review_expansion",
+                            "evidence_rank": evidence.get("evidence_rank"),
+                            "quadratic_statistic_per_rank": evidence.get(
+                                "quadratic_statistic_per_rank"
+                            ),
+                            "term_scores": term_scores,
+                            "selected_ngram_terms": [
+                                str(term.get("term"))
+                                for term in term_scores
+                                if bool(term.get("selected_for_agent_evidence"))
+                            ],
+                            "policy_source": "additive_review_expansion",
+                            "recovery_round": recovered.get("round"),
+                        }
+                    )
+                    seen_inner_topics.add(topic_id)
+            score_policy_banks[bank] = {
+                "signatures": signatures,
+                "selected_topic_count": len(signatures),
+                "selected_term_fold_recurrence": {
+                    term: len(folds)
+                    for term, folds in sorted(selected_term_folds.items())
+                },
+                "selected_ngram_fold_recurrence": {
+                    term: len(folds)
+                    for term, folds in sorted(selected_ngram_folds.items())
+                },
+                "selected_ngram_count": len(selected_ngram_folds),
+                "inner_folds_with_selected_topics": sorted(
+                    {int(signature["inner_fold"]) for signature in signatures}
+                ),
+            }
+        orphan_signatures: List[Dict[str, Any]] = []
+        orphan_term_folds: Dict[str, set] = defaultdict(set)
+        for result in inner_results:
+            inner_fold = int(result["inner_fold"])
+            orphan_selection = (
+                (result.get("topic_score_selection") or {}).get(
+                    "effect_orphan_ngram_branch"
+                )
+                or {}
+            )
+            for cluster in orphan_selection.get("selected_clusters") or []:
+                term_scores = list(cluster.get("term_scores") or [])
+                terms = [
+                    str(term.get("term"))
+                    for term in term_scores
+                    if str(term.get("term") or "").strip()
+                ]
+                for term in terms:
+                    orphan_term_folds[term].add(inner_fold)
+                orphan_signatures.append(
+                    {
+                        "inner_fold": inner_fold,
+                        "cluster_id": str(cluster.get("cluster_id")),
+                        "terms": terms,
+                        "primary_p": cluster.get("primary_p"),
+                        "primary_p_source": cluster.get("primary_p_source"),
+                        "fdr_q": cluster.get("fdr_q"),
+                        "familywise_p": cluster.get("familywise_p"),
+                        "quadratic_statistic_per_rank": cluster.get(
+                            "quadratic_statistic_per_rank"
+                        ),
+                        "maximum_absolute_standardized_score": cluster.get(
+                            "maximum_absolute_standardized_score"
+                        ),
+                        "evidence_rank": cluster.get("evidence_rank"),
+                        "term_scores": term_scores,
+                    }
+                )
+        orphan_policy = {
+            "enabled": bool(self.nn_config.tfidf_topic.orphan_ngram_enabled),
+            "signatures": orphan_signatures,
+            "selected_cluster_count": len(orphan_signatures),
+            "selected_term_fold_recurrence": {
+                term: len(folds)
+                for term, folds in sorted(orphan_term_folds.items())
+            },
+            "inner_folds_with_selected_clusters": sorted(
+                {int(signature["inner_fold"]) for signature in orphan_signatures}
+            ),
+            "full_context_min_inner_folds": int(
+                self.nn_config.tfidf_topic.orphan_ngram_full_min_inner_folds
+            ),
+        }
         return {
-            "policy_version": "tfidf_topic_inner_policy_v2",
+            "policy_version": "tfidf_topic_inner_policy_v6",
             "inner_fold_count": len(inner_results),
             "exact_name_recurrence": dict(name_counts),
             "domain_parent_recurrence": dict(domain_parent_counts),
@@ -3813,6 +5716,12 @@ class TfidfTopicAgenticForestRunner:
             "inner_accepted_parsimony_replacements": replacements,
             "strong_full_outer_evidence_not_vetoed_by_name_recurrence": True,
             "agent_selector_can_veto_stable_evidence": False,
+            "topic_score_selection": {
+                "schema_version": "tfidf_topic_inner_score_policy_v5",
+                "uses_outer_heldout_labels": False,
+                "banks": score_policy_banks,
+                "effect_orphan_ngram_branch": orphan_policy,
+            },
         }
 
     def _recover_from_inner_policy(
@@ -4420,7 +6329,11 @@ class TfidfTopicAgenticForestRunner:
         _write_json(outer_dir / "inner_policy.json", policy)
 
         full_context_dir = outer_dir / "full_outer_train"
-        labels = self._label_context_topics(full_row, full_context_dir)
+        labels = self._label_context_topics(
+            full_row,
+            full_context_dir,
+            selection_policy=policy,
+        )
         candidates = [
             {
                 **candidate,
@@ -4510,8 +6423,8 @@ class TfidfTopicAgenticForestRunner:
         # parsimony decision are frozen. No test labels are sent to extraction.
         test_df = self._extract_scope(full_row["heldout_row_ids"], registry)
         evaluation: SplitEvaluation = self.evaluator.evaluate_split(
-            train_df=train_df,
-            test_df=test_df,
+            train_df=self._without_oracle_columns(train_df),
+            test_df=self._without_oracle_columns(test_df),
             specs=specs,
             fold_id=outer_fold,
         )
@@ -4592,17 +6505,39 @@ class TfidfTopicAgenticForestRunner:
             predictions.append(prediction)
             metrics.append(metric)
         combined = pd.concat(predictions, ignore_index=True).sort_values("_oci_row_id")
+        if any(str(column).startswith("true_") for column in combined.columns):
+            raise RuntimeError("An oracle column entered structured forest predictions")
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         combined.to_parquet(self.output_path, index=False)
+        frozen_prediction_sha256 = _sha256_file(self.output_path)
+        posthoc_oracle_metrics: Optional[Dict[str, Any]] = None
+        if "true_ite_prob" in self.dataset.columns:
+            posthoc_oracle_metrics = evaluate_frozen_structured_predictions(
+                prediction_path=self.output_path,
+                oracle_frame=self.dataset[["_oci_row_id", "true_ite_prob"]],
+                output_dir=self.artifact_dir,
+                oracle_ite_column="true_ite_prob",
+            )
         _write_jsonl(self.artifact_dir / "outer_metrics.jsonl", metrics)
         _write_json(
             self.artifact_dir / "manifest.json",
             {
-                "schema_version": "tfidf_topic_agentic_forest_v2",
+                "schema_version": "tfidf_topic_agentic_forest_v7",
                 "handoff_schema_version": HANDOFF_SCHEMA_VERSION,
+                "topic_score_test_schema_version": (
+                    TOPIC_SCORE_TEST_SCHEMA_VERSION
+                ),
                 "n_outer_folds": len(outer_folds),
                 "final_ite_source": "structured_causal_forest_only",
                 "forbidden_artifacts_present": False,
+                "oracle_columns_consumed_by_modeling": False,
+                "all_outer_predictions_frozen_before_oracle_join": True,
+                "prediction_sha256_before_oracle_join": frozen_prediction_sha256,
+                "posthoc_oracle_metrics_path": (
+                    str(self.artifact_dir / "posthoc_oracle_metrics.json")
+                    if posthoc_oracle_metrics is not None
+                    else None
+                ),
             },
         )
 

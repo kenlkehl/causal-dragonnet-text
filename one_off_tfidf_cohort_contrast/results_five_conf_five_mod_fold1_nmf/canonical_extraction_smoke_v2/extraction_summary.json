@@ -1,0 +1,8 @@
+{
+  "elapsed_seconds": 32.979525327682495,
+  "extract_feature_count": 139,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "output_column_count": 279,
+  "request_group_count": 18,
+  "row_count": 2
+}

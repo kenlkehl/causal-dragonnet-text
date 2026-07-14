@@ -1,0 +1,6 @@
+variable,hit,n_hits,best_feature,best_direction,best_coefficient,best_abs_rank_within_direction,all_hit_features
+age,True,32,age 55,positive,0.4106172541839011,10,mitchell age; age 73; age 84; age 82; age 70; age 78; age 71; stated age; 78 year; age 72; age 86; 73 year; age 61; age 74; age 76; whitaker age; 84 year; age 75; age 55; age 56; age 57; 55 year; age 40; 56 year; age 48
+sex,True,2,male,positive,0.1717500141963437,177,male; redacted sex
+ecog_performance_status,True,19,fatigued,negative,-0.4150802043580976,11,fatigued; given ecog; assistance; appears fatigued; ambulation; requires assistance; mildly fatigued; ecog limited; limited self; fatigued in; assistance with; for ambulation; fatigued ecog; assistance for; nad ecog; ecog fully; active ecog; ecog heent; appearing ecog
+creatinine_clearance,True,3,kidney disease,negative,-0.1924811801688909,235,kidney disease; chronic kidney; kidney
+prior_platinum_therapy,True,7,platinum doublet,positive,0.2966284955904236,29,carboplatin pemetrexed; cisplatin; line carboplatin; platinum doublet; non platinum; platinum free; cisplatin docetaxel

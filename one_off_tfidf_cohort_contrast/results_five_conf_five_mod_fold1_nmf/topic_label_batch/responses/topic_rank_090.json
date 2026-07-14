@@ -1,0 +1,129 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 5.507323265075684,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Gendered pronoun, linguistic noise",
+        "term": "she"
+      },
+      {
+        "reason": "Contains administrative identifier (MRN)",
+        "term": "female mrn"
+      },
+      {
+        "reason": "Contains administrative/redaction artifact",
+        "term": "female mrn redacted"
+      },
+      {
+        "reason": "Gendered pronoun, linguistic noise",
+        "term": "her"
+      },
+      {
+        "reason": "Incomplete phrase; stage value is missing",
+        "term": "woman with stage"
+      },
+      {
+        "reason": "Narrative transition phrase",
+        "term": "she reports"
+      },
+      {
+        "reason": "Social history/relationship term, lacks clinical context here",
+        "term": "husband"
+      }
+    ],
+    "general_topic": {
+      "coherence": "mixed",
+      "confidence": "high",
+      "label": "Patient demographics and gender-related pronouns",
+      "summary": "The topic is dominated by gendered pronouns and demographic identifiers (female, woman) and contains fragments of clinical history, but is heavily diluted by linguistic noise and administrative artifacts."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The terms explicitly identify the biological sex of the patient.",
+        "feature_type": "categorical",
+        "name": "Biological Sex",
+        "represented_values_or_categories": [
+          "female"
+        ],
+        "supporting_terms": [
+          "female",
+          "sex female"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "Terms indicate the presence or timing of a cancer diagnosis.",
+        "feature_type": "categorical",
+        "name": "Cancer Diagnosis Status",
+        "represented_values_or_categories": [
+          "diagnosed"
+        ],
+        "supporting_terms": [
+          "cancer diagnosed",
+          "cancer diagnosed at"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "Sex",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Biological Sex"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Cancer Diagnosis Date",
+        "suggested_representation": "continuous",
+        "supporting_specific_features": [
+          "Cancer Diagnosis Status"
+        ]
+      },
+      {
+        "confidence": "low",
+        "name": "Cancer Stage",
+        "suggested_representation": "ordinal",
+        "supporting_specific_features": []
+      }
+    ],
+    "topic_index": 84,
+    "topic_rank": 90
+  },
+  "raw_content": "{\n  \"topic_rank\": 90,\n  \"topic_index\": 84,\n  \"general_topic\": {\n    \"label\": \"Patient demographics and gender-related pronouns\",\n    \"coherence\": \"mixed\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic is dominated by gendered pronouns and demographic identifiers (female, woman) and contains fragments of clinical history, but is heavily diluted by linguistic noise and administrative artifacts.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Biological Sex\",\n      \"supporting_terms\": [\n        \"female\",\n        \"sex female\"\n      ],\n      \"feature_type\": \"categorical\",\n      \"represented_values_or_categories\": [\n        \"female\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms explicitly identify the biological sex of the patient.\"\n    },\n    {\n      \"name\": \"Cancer Diagnosis Status\",\n      \"supporting_terms\": [\n        \"cancer diagnosed\",\n        \"cancer diagnosed at\"\n      ],\n      \"feature_type\": \"categorical\",\n      \"represented_values_or_categories\": [\n        \"diagnosed\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Terms indicate the presence or timing of a cancer diagnosis.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"she\",\n      \"reason\": \"Gendered pronoun, linguistic noise\"\n    },\n    {\n      \"term\": \"female mrn\",\n      \"reason\": \"Contains administrative identifier (MRN)\"\n    },\n    {\n      \"term\": \"female mrn redacted\",\n      \"reason\": \"Contains administrative/redaction artifact\"\n    },\n    {\n      \"term\": \"her\",\n      \"reason\": \"Gendered pronoun, linguistic noise\"\n    },\n    {\n      \"term\": \"woman with stage\",\n      \"reason\": \"Incomplete phrase; stage value is missing\"\n    },\n    {\n      \"term\": \"she reports\",\n      \"reason\": \"Narrative transition phrase\"\n    },\n    {\n      \"term\": \"husband\",\n      \"reason\": \"Social history/relationship term, lacks clinical context here\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"Sex\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Biological Sex\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Cancer Diagnosis Date\",\n      \"suggested_representation\": \"continuous\",\n      \"supporting_specific_features\": [\n        \"Cancer Diagnosis Status\"\n      ],\n      \"confidence\": \"medium\"\n    },\n    {\n      \"name\": \"Cancer Stage\",\n      \"suggested_representation\": \"ordinal\",\n      \"supporting_specific_features\": [],\n      \"confidence\": \"low\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-b5eadc3809f4a751",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "she",
+    "female",
+    "female mrn",
+    "woman with stage",
+    "she reports",
+    "woman",
+    "her",
+    "sex female",
+    "woman with",
+    "female mrn redacted",
+    "history - mother",
+    "husband",
+    "cancer diagnosed",
+    "she has not",
+    "cancer diagnosed at"
+  ],
+  "topic_index": 84,
+  "topic_rank": 90,
+  "usage": {
+    "completion_tokens": 708,
+    "prompt_tokens": 817,
+    "prompt_tokens_details": null,
+    "total_tokens": 1525
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 90, internal index 84\n\nTerms in this topic, ordered from highest to lowest loading:\n1. she\n2. female\n3. female mrn\n4. woman with stage\n5. she reports\n6. woman\n7. her\n8. sex female\n9. woman with\n10. female mrn redacted\n11. history - mother\n12. husband\n13. cancer diagnosed\n14. she has not\n15. cancer diagnosed at\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 90,\n  \"topic_index\": 84,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

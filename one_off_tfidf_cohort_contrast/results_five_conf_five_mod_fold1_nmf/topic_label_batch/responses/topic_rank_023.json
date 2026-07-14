@@ -1,0 +1,154 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 7.233643531799316,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Anatomical fragment with no clear clinical context in this topic.",
+        "term": "toes"
+      },
+      {
+        "reason": "Clinical recommendation/instruction rather than a patient feature.",
+        "term": "encourage low-impact exercise"
+      },
+      {
+        "reason": "Incomplete phrase; psychological state is ambiguous without further context.",
+        "term": "anxiety about"
+      },
+      {
+        "reason": "Fragment of a clinical observation template.",
+        "term": "reports persistent"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "Patient Performance Status and Functional Capacity",
+      "summary": "The topic focuses on assessing a patient's functional status, specifically referencing ECOG performance status and limitations in activity/ambulation."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "The terms explicitly mention ECOG performance status and a specific score of 2.",
+        "feature_type": "ordinal",
+        "name": "ECOG Performance Status",
+        "represented_values_or_categories": [
+          "2"
+        ],
+        "supporting_terms": [
+          "performance status 2",
+          "status 2",
+          "status 2 -",
+          "4. ecog performance"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Terms describe the patient's functional capacity and its limitations.",
+        "feature_type": "categorical",
+        "name": "Functional Status",
+        "represented_values_or_categories": [
+          "limited"
+        ],
+        "supporting_terms": [
+          "2 - functional",
+          "- functional",
+          "functional but limited"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "Refers to the patient's ability to walk or move independently.",
+        "feature_type": "categorical",
+        "name": "Ambulation Status",
+        "represented_values_or_categories": [
+          "ambulatory"
+        ],
+        "supporting_terms": [
+          "2 ambulatory"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "Fatigue is mentioned as a factor, likely impacting functional status.",
+        "feature_type": "text-derived",
+        "name": "Fatigue",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "by fatigue and"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "ECOG Performance Status",
+        "suggested_representation": "ordinal",
+        "supporting_specific_features": [
+          "ECOG Performance Status"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Functional Limitation Status",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Functional Status"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Ambulation Ability",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Ambulation Status"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Fatigue Severity",
+        "suggested_representation": "ordinal",
+        "supporting_specific_features": [
+          "Fatigue"
+        ]
+      }
+    ],
+    "topic_index": 48,
+    "topic_rank": 23
+  },
+  "raw_content": "{\n  \"topic_rank\": 23,\n  \"topic_index\": 48,\n  \"general_topic\": {\n    \"label\": \"Patient Performance Status and Functional Capacity\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic focuses on assessing a patient's functional status, specifically referencing ECOG performance status and limitations in activity/ambulation.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"ECOG Performance Status\",\n      \"supporting_terms\": [\n        \"performance status 2\",\n        \"status 2\",\n        \"status 2 -\",\n        \"4. ecog performance\"\n      ],\n      \"feature_type\": \"ordinal\",\n      \"represented_values_or_categories\": [\n        \"2\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms explicitly mention ECOG performance status and a specific score of 2.\"\n    },\n    {\n      \"name\": \"Functional Status\",\n      \"supporting_terms\": [\n        \"2 - functional\",\n        \"- functional\",\n        \"functional but limited\"\n      ],\n      \"feature_type\": \"categorical\",\n      \"represented_values_or_categories\": [\n        \"limited\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Terms describe the patient's functional capacity and its limitations.\"\n    },\n    {\n      \"name\": \"Ambulation Status\",\n      \"supporting_terms\": [\n        \"2 ambulatory\"\n      ],\n      \"feature_type\": \"categorical\",\n      \"represented_values_or_categories\": [\n        \"ambulatory\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Refers to the patient's ability to walk or move independently.\"\n    },\n    {\n      \"name\": \"Fatigue\",\n      \"supporting_terms\": [\n        \"by fatigue and\"\n      ],\n      \"feature_type\": \"text-derived\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Fatigue is mentioned as a factor, likely impacting functional status.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"toes\",\n      \"reason\": \"Anatomical fragment with no clear clinical context in this topic.\"\n    },\n    {\n      \"term\": \"encourage low-impact exercise\",\n      \"reason\": \"Clinical recommendation/instruction rather than a patient feature.\"\n    },\n    {\n      \"term\": \"anxiety about\",\n      \"reason\": \"Incomplete phrase; psychological state is ambiguous without further context.\"\n    },\n    {\n      \"term\": \"reports persistent\",\n      \"reason\": \"Fragment of a clinical observation template.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"ECOG Performance Status\",\n      \"suggested_representation\": \"ordinal\",\n      \"supporting_specific_features\": [\n        \"ECOG Performance Status\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Functional Limitation Status\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Functional Status\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Ambulation Ability\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Ambulation Status\"\n      ],\n      \"confidence\": \"medium\"\n    },\n    {\n      \"name\": \"Fatigue Severity\",\n      \"suggested_representation\": \"ordinal\",\n      \"supporting_specific_features\": [\n        \"Fatigue\"\n      ],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-92d6b83bfa70e9d9",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "performance status 2",
+    "status 2",
+    "status 2 -",
+    "2 - functional",
+    "- functional",
+    "- limited",
+    "but limited",
+    "functional but limited",
+    "encourage low-impact exercise",
+    "reports persistent",
+    "2 ambulatory",
+    "toes",
+    "by fatigue and",
+    "4. ecog performance",
+    "anxiety about"
+  ],
+  "topic_index": 48,
+  "topic_rank": 23,
+  "usage": {
+    "completion_tokens": 927,
+    "prompt_tokens": 831,
+    "prompt_tokens_details": null,
+    "total_tokens": 1758
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 23, internal index 48\n\nTerms in this topic, ordered from highest to lowest loading:\n1. performance status 2\n2. status 2\n3. status 2 -\n4. 2 - functional\n5. - functional\n6. - limited\n7. but limited\n8. functional but limited\n9. encourage low-impact exercise\n10. reports persistent\n11. 2 ambulatory\n12. toes\n13. by fatigue and\n14. 4. ecog performance\n15. anxiety about\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 23,\n  \"topic_index\": 48,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

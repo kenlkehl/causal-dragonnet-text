@@ -1,0 +1,158 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 7.608534574508667,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Incomplete phrase; likely refers to anatomical location but lacks a noun (e.g., lobe or node).",
+        "term": "the right lower"
+      },
+      {
+        "reason": "Fragmentary term; lacks specificity without the preceding context.",
+        "term": "dissection"
+      },
+      {
+        "reason": "Highly non-specific fragment.",
+        "term": "node"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "Surgical history and pathology of lung resection",
+      "summary": "The topic focuses on surgical procedures (lobectomy and lymph node dissection) and associated pathology (adenocarcinoma) related to lung cancer treatment."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Represents the surgical removal of the lower lobe of the lung.",
+        "feature_type": "procedure",
+        "name": "Lower lobectomy",
+        "represented_values_or_categories": [
+          "lower lobectomy"
+        ],
+        "supporting_terms": [
+          "lower lobectomy",
+          "lower lobectomy with",
+          "lower lobectomy and",
+          "lobectomy",
+          "lobectomy with",
+          "lobectomy with mediastinal"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Refers to the surgical removal of lymph nodes, specifically in the mediastinal region.",
+        "feature_type": "procedure",
+        "name": "Lymph node dissection",
+        "represented_values_or_categories": [
+          "mediastinal lymph node dissection"
+        ],
+        "supporting_terms": [
+          "node dissection",
+          "lymph node dissection",
+          "with mediastinal lymph",
+          "lobectomy with mediastinal",
+          "dissection",
+          "mediastinal lymph node",
+          "node"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Specifies a histological diagnosis of adenocarcinoma located in the lower lobe.",
+        "feature_type": "diagnosis",
+        "name": "Lower-lobe adenocarcinoma",
+        "represented_values_or_categories": [
+          "adenocarcinoma"
+        ],
+        "supporting_terms": [
+          "lower-lobe adenocarcinoma"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "Indicates whether the patient received adjuvant treatment following surgery.",
+        "feature_type": "treatment_context",
+        "name": "Adjuvant therapy status",
+        "represented_values_or_categories": [
+          "adjuvant"
+        ],
+        "supporting_terms": [
+          "adjuvant"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "high",
+        "name": "History of lower lobectomy",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Lower lobectomy"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Mediastinal lymph node dissection",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Lymph node dissection"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Histological subtype: Adenocarcinoma",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Lower-lobe adenocarcinoma"
+        ]
+      },
+      {
+        "confidence": "medium",
+        "name": "Adjuvant treatment history",
+        "suggested_representation": "binary",
+        "supporting_specific_features": [
+          "Adjuvant therapy status"
+        ]
+      }
+    ],
+    "topic_index": 62,
+    "topic_rank": 94
+  },
+  "raw_content": "{\n  \"topic_rank\": 94,\n  \"topic_index\": 62,\n  \"general_topic\": {\n    \"label\": \"Surgical history and pathology of lung resection\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic focuses on surgical procedures (lobectomy and lymph node dissection) and associated pathology (adenocarcinoma) related to lung cancer treatment.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"Lower lobectomy\",\n      \"supporting_terms\": [\n        \"lower lobectomy\",\n        \"lower lobectomy with\",\n        \"lower lobectomy and\",\n        \"lobectomy\",\n        \"lobectomy with\",\n        \"lobectomy with mediastinal\"\n      ],\n      \"feature_type\": \"procedure\",\n      \"represented_values_or_categories\": [\n        \"lower lobectomy\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Represents the surgical removal of the lower lobe of the lung.\"\n    },\n    {\n      \"name\": \"Lymph node dissection\",\n      \"supporting_terms\": [\n        \"node dissection\",\n        \"lymph node dissection\",\n        \"with mediastinal lymph\",\n        \"lobectomy with mediastinal\",\n        \"dissection\",\n        \"mediastinal lymph node\",\n        \"node\"\n      ],\n      \"feature_type\": \"procedure\",\n      \"represented_values_or_categories\": [\n        \"mediastinal lymph node dissection\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Refers to the surgical removal of lymph nodes, specifically in the mediastinal region.\"\n    },\n    {\n      \"name\": \"Lower-lobe adenocarcinoma\",\n      \"supporting_terms\": [\n        \"lower-lobe adenocarcinoma\"\n      ],\n      \"feature_type\": \"diagnosis\",\n      \"represented_values_or_categories\": [\n        \"adenocarcinoma\"\n      ],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Specifies a histological diagnosis of adenocarcinoma located in the lower lobe.\"\n    },\n    {\n      \"name\": \"Adjuvant therapy status\",\n      \"supporting_terms\": [\n        \"adjuvant\"\n      ],\n      \"feature_type\": \"treatment_context\",\n      \"represented_values_or_categories\": [\n        \"adjuvant\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Indicates whether the patient received adjuvant treatment following surgery.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"the right lower\",\n      \"reason\": \"Incomplete phrase; likely refers to anatomical location but lacks a noun (e.g., lobe or node).\"\n    },\n    {\n      \"term\": \"dissection\",\n      \"reason\": \"Fragmentary term; lacks specificity without the preceding context.\"\n    },\n    {\n      \"term\": \"node\",\n      \"reason\": \"Highly non-specific fragment.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"History of lower lobectomy\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Lower lobectomy\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Mediastinal lymph node dissection\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Lymph node dissection\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Histological subtype: Adenocarcinoma\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Lower-lobe adenocarcinoma\"\n      ],\n      \"confidence\": \"high\"\n    },\n    {\n      \"name\": \"Adjuvant treatment history\",\n      \"suggested_representation\": \"binary\",\n      \"supporting_specific_features\": [\n        \"Adjuvant therapy status\"\n      ],\n      \"confidence\": \"medium\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-a47d5814a5706b50",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "lower lobectomy",
+    "lower lobectomy with",
+    "lower lobectomy and",
+    "node dissection",
+    "lymph node dissection",
+    "the right lower",
+    "lower-lobe adenocarcinoma",
+    "adjuvant",
+    "lobectomy with",
+    "with mediastinal lymph",
+    "lobectomy with mediastinal",
+    "dissection",
+    "lobectomy",
+    "mediastinal lymph node",
+    "node"
+  ],
+  "topic_index": 62,
+  "topic_rank": 94,
+  "usage": {
+    "completion_tokens": 975,
+    "prompt_tokens": 829,
+    "prompt_tokens_details": null,
+    "total_tokens": 1804
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 94, internal index 62\n\nTerms in this topic, ordered from highest to lowest loading:\n1. lower lobectomy\n2. lower lobectomy with\n3. lower lobectomy and\n4. node dissection\n5. lymph node dissection\n6. the right lower\n7. lower-lobe adenocarcinoma\n8. adjuvant\n9. lobectomy with\n10. with mediastinal lymph\n11. lobectomy with mediastinal\n12. dissection\n13. lobectomy\n14. mediastinal lymph node\n15. node\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 94,\n  \"topic_index\": 62,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

@@ -1,0 +1,54 @@
+{
+  "nuisance_propensity_confounder_hits": {
+    "n_variables_with_hits": 5,
+    "n_variables_total": 5,
+    "misses": [],
+    "best_features": {
+      "age": "age 71",
+      "sex": "female",
+      "ecog_performance_status": "ambulation",
+      "creatinine_clearance": "kidney",
+      "prior_platinum_therapy": "cisplatin pemetrexed"
+    }
+  },
+  "nuisance_outcome_confounder_hits": {
+    "n_variables_with_hits": 5,
+    "n_variables_total": 5,
+    "misses": [],
+    "best_features": {
+      "age": "age 55",
+      "sex": "male",
+      "ecog_performance_status": "fatigued",
+      "creatinine_clearance": "kidney disease",
+      "prior_platinum_therapy": "platinum doublet"
+    }
+  },
+  "uplift_ridge_modifier_hits": {
+    "n_variables_with_hits": 4,
+    "n_variables_total": 5,
+    "misses": [
+      "baseline_hemoglobin"
+    ],
+    "best_features": {
+      "histology_type": "treated::large cell",
+      "egfr_mutation_status": "treated::deletion egfr",
+      "baseline_nlr": "treated::neutrophils",
+      "brain_metastases_status": "treated::right cerebellar",
+      "baseline_hemoglobin": ""
+    }
+  },
+  "uplift_offset_logit_modifier_hits": {
+    "n_variables_with_hits": 4,
+    "n_variables_total": 5,
+    "misses": [
+      "baseline_hemoglobin"
+    ],
+    "best_features": {
+      "histology_type": "treated::large cell",
+      "egfr_mutation_status": "treated::deletion egfr",
+      "baseline_nlr": "treated::neutrophils",
+      "brain_metastases_status": "treated::right cerebellar",
+      "baseline_hemoglobin": ""
+    }
+  }
+}

@@ -1,0 +1,103 @@
+{
+  "attempts": 1,
+  "elapsed_seconds": 5.362017393112183,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "artifact_or_ambiguous_terms": [
+      {
+        "reason": "Likely a fragment of a larger expression pattern or a scoring value (e.g., 'CK5 6 diffuse').",
+        "term": "6 diffuse"
+      },
+      {
+        "reason": "Fragmented term combining a numeric value with a staining pattern.",
+        "term": "6 diffuse cytoplasmic"
+      }
+    ],
+    "general_topic": {
+      "coherence": "coherent",
+      "confidence": "high",
+      "label": "Histopathology and Cytokeratin Expression",
+      "summary": "The topic relates to histological classification and immunohistochemical staining patterns (specifically CK5) in carcinoma cells."
+    },
+    "specific_features": [
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "The terms suggest Cytokeratin 5 (CK5) staining that is diffuse and located in the cytoplasm. The '6' may be a fragment of a larger term or a specific scoring value.",
+        "feature_type": "immunohistochemical finding",
+        "name": "CK5 expression pattern",
+        "represented_values_or_categories": [
+          "diffuse",
+          "cytoplasmic"
+        ],
+        "supporting_terms": [
+          "ck5 6 diffuse",
+          "6 diffuse",
+          "6 diffuse cytoplasmic"
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "high",
+        "explanation": "Refers to the general histological classification of the tumor.",
+        "feature_type": "clinical finding",
+        "name": "Histology",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "histology."
+        ]
+      },
+      {
+        "artifact_likelihood": "low",
+        "confidence": "medium",
+        "explanation": "Indicates a carcinoma-type malignancy, though the specific cell type is partially truncated.",
+        "feature_type": "diagnosis",
+        "name": "Cell carcinoma",
+        "represented_values_or_categories": [],
+        "supporting_terms": [
+          "cell carcinoma"
+        ]
+      }
+    ],
+    "structured_feature_candidates": [
+      {
+        "confidence": "medium",
+        "name": "CK5 immunohistochemistry pattern",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "CK5 expression pattern"
+        ]
+      },
+      {
+        "confidence": "high",
+        "name": "Tumor histology",
+        "suggested_representation": "categorical",
+        "supporting_specific_features": [
+          "Histology"
+        ]
+      }
+    ],
+    "topic_index": 83,
+    "topic_rank": 28
+  },
+  "raw_content": "{\n  \"topic_rank\": 28,\n  \"topic_index\": 83,\n  \"general_topic\": {\n    \"label\": \"Histopathology and Cytokeratin Expression\",\n    \"coherence\": \"coherent\",\n    \"confidence\": \"high\",\n    \"summary\": \"The topic relates to histological classification and immunohistochemical staining patterns (specifically CK5) in carcinoma cells.\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"CK5 expression pattern\",\n      \"supporting_terms\": [\n        \"ck5 6 diffuse\",\n        \"6 diffuse\",\n        \"6 diffuse cytoplasmic\"\n      ],\n      \"feature_type\": \"immunohistochemical finding\",\n      \"represented_values_or_categories\": [\n        \"diffuse\",\n        \"cytoplasmic\"\n      ],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"The terms suggest Cytokeratin 5 (CK5) staining that is diffuse and located in the cytoplasm. The '6' may be a fragment of a larger term or a specific scoring value.\"\n    },\n    {\n      \"name\": \"Histology\",\n      \"supporting_terms\": [\n        \"histology.\"\n      ],\n      \"feature_type\": \"clinical finding\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"high\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Refers to the general histological classification of the tumor.\"\n    },\n    {\n      \"name\": \"Cell carcinoma\",\n      \"supporting_terms\": [\n        \"cell carcinoma\"\n      ],\n      \"feature_type\": \"diagnosis\",\n      \"represented_values_or_categories\": [],\n      \"confidence\": \"medium\",\n      \"artifact_likelihood\": \"low\",\n      \"explanation\": \"Indicates a carcinoma-type malignancy, though the specific cell type is partially truncated.\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\n      \"term\": \"6 diffuse\",\n      \"reason\": \"Likely a fragment of a larger expression pattern or a scoring value (e.g., 'CK5 6 diffuse').\"\n    },\n    {\n      \"term\": \"6 diffuse cytoplasmic\",\n      \"reason\": \"Fragmented term combining a numeric value with a staining pattern.\"\n    }\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"CK5 immunohistochemistry pattern\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"CK5 expression pattern\"\n      ],\n      \"confidence\": \"medium\"\n    },\n    {\n      \"name\": \"Tumor histology\",\n      \"suggested_representation\": \"categorical\",\n      \"supporting_specific_features\": [\n        \"Histology\"\n      ],\n      \"confidence\": \"high\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-8ac0df111d36e33a",
+  "status": "complete",
+  "system_prompt": "You are a clinical feature ontology analyst.\n\nWe are trying to identify a useful list of patient-level features for a clinical task. As one dimensionality-reduction step, we performed topic modeling over text terms that appeared potentially relevant. You will receive the terms from exactly one topic, ordered by their loading within that topic.\n\nInterpret only the evidence in the supplied terms and the stated clinical task. Do not assume that every topic is coherent or clinically meaningful. Terms can include incomplete phrases, numeric fragments, documentation templates, identifiers, or accidental co-occurrences. Do not assign a clinical role or importance to a feature merely because it appears in the topic.\n\nReturn only a valid JSON object matching the requested schema. Do not include markdown or analysis outside the JSON.",
+  "terms": [
+    "ck5 6 diffuse",
+    "histology.",
+    "6 diffuse",
+    "6 diffuse cytoplasmic",
+    "cell carcinoma"
+  ],
+  "topic_index": 83,
+  "topic_rank": 28,
+  "usage": {
+    "completion_tokens": 666,
+    "prompt_tokens": 765,
+    "prompt_tokens_details": null,
+    "total_tokens": 1431
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nTopic identifier: rank 28, internal index 83\n\nTerms in this topic, ordered from highest to lowest loading:\n1. ck5 6 diffuse\n2. histology.\n3. 6 diffuse\n4. 6 diffuse cytoplasmic\n5. cell carcinoma\n\nAnalyze the topic at two distinct levels:\n\n1. General topic: Give a concise label for the broad subject represented by the terms. State whether the topic is coherent, mixed, or mostly artifact/noise.\n2. Specific features: Identify the distinct, normalized clinical features or concepts actually represented within the topic. Preserve distinct entities, measurements, findings, categories, values, or thresholds instead of collapsing them merely because they share a broad subject. Do not invent a specific feature unless at least one supplied term supports it.\n\nFor each specific feature, provide its normalized name, the exact supporting terms copied from the list, its feature type, any values/categories/thresholds explicitly represented, confidence, artifact likelihood, and a short explanation. A topic may contain no usable specific features or several. Include at most 12.\n\nAlso identify ambiguous or artifactual terms and provide a conservative list of structured feature candidates worth carrying forward for later review. A candidate should name the feature to measure, not claim what role it has in the clinical task.\n\nReturn this JSON schema:\n{\n  \"topic_rank\": 28,\n  \"topic_index\": 83,\n  \"general_topic\": {\n    \"label\": \"string\",\n    \"coherence\": \"coherent | mixed | mostly_artifact\",\n    \"confidence\": \"high | medium | low\",\n    \"summary\": \"string\"\n  },\n  \"specific_features\": [\n    {\n      \"name\": \"string\",\n      \"supporting_terms\": [\"exact term\"],\n      \"feature_type\": \"string\",\n      \"represented_values_or_categories\": [\"string\"],\n      \"confidence\": \"high | medium | low\",\n      \"artifact_likelihood\": \"high | medium | low\",\n      \"explanation\": \"string\"\n    }\n  ],\n  \"artifact_or_ambiguous_terms\": [\n    {\"term\": \"exact term\", \"reason\": \"string\"}\n  ],\n  \"structured_feature_candidates\": [\n    {\n      \"name\": \"string\",\n      \"suggested_representation\": \"binary | categorical | ordinal | continuous | count | text-derived\",\n      \"supporting_specific_features\": [\"specific feature name\"],\n      \"confidence\": \"high | medium | low\"\n    }\n  ]\n}"
+}

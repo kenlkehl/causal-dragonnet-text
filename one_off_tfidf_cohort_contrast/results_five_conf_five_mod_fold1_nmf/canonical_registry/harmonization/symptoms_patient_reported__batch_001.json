@@ -1,0 +1,789 @@
+{
+  "attempts": 1,
+  "model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "parsed_response": {
+    "candidate_mappings": [
+      {
+        "candidate_id": "C015",
+        "local_id": "F01",
+        "rationale": "Anxiety severity is a more specific version of anxiety status.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C016",
+        "local_id": "F01",
+        "rationale": "Anxiety status is the base concept.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C018",
+        "local_id": "F02",
+        "rationale": "Direct symptom.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C028",
+        "local_id": "F03",
+        "rationale": "Describes the same clinical finding of bone pain/metastasis.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C029",
+        "local_id": "F03",
+        "rationale": "Describes the same clinical finding of bone pain.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C045",
+        "local_id": "F04",
+        "rationale": "Direct symptom.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C046",
+        "local_id": "F05",
+        "rationale": "Direct symptom.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C053",
+        "local_id": "F06",
+        "rationale": "Direct symptom.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C054",
+        "local_id": "F06",
+        "rationale": "Constipation incidence is a variation of constipation presence.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C056",
+        "local_id": "F07",
+        "rationale": "Base cough symptom.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C057",
+        "local_id": "F07",
+        "rationale": "Cough frequency is a characteristic of cough.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C058",
+        "local_id": "F07",
+        "rationale": "Cough severity is a characteristic of cough.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C059",
+        "local_id": "F07",
+        "rationale": "Cough type is a characteristic of cough.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C074",
+        "local_id": "F07",
+        "rationale": "Dry cough is a type of cough.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C066",
+        "local_id": "F08",
+        "rationale": "Direct symptom.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C067",
+        "local_id": "F08",
+        "rationale": "Diarrhea incidence is a variation of diarrhea presence.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C070",
+        "local_id": "F09",
+        "rationale": "Direct symptom.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C075",
+        "local_id": "F10",
+        "rationale": "Base dyspnea symptom.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C076",
+        "local_id": "F10",
+        "rationale": "Dyspnea severity is a characteristic of dyspnea.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C089",
+        "local_id": "F11",
+        "rationale": "Fatigue is the base concept for fatigue severity.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C090",
+        "local_id": "F11",
+        "rationale": "Fatigue severity is the specific variable.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C093",
+        "local_id": "F12",
+        "rationale": "Direct symptom.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C094",
+        "local_id": "F13",
+        "rationale": "Direct symptom.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C099",
+        "local_id": "F13",
+        "rationale": "Gait deficit is a type of focal neurological deficit.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C106",
+        "local_id": "F14",
+        "rationale": "Direct symptom.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C110",
+        "local_id": "F15",
+        "rationale": "Direct symptom.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C178",
+        "local_id": "F16",
+        "rationale": "Nausea presence is part of nausea severity.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C179",
+        "local_id": "F16",
+        "rationale": "Nausea grade is a synonym for nausea severity.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C180",
+        "local_id": "F16",
+        "rationale": "Nausea severity is the specific variable.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C182",
+        "local_id": "F13",
+        "rationale": "Neurological focal deficits is a synonym for focal neurological deficit.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C202",
+        "local_id": "F17",
+        "rationale": "Pain is the base concept for pain severity.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C203",
+        "local_id": "F17",
+        "rationale": "Pain severity is the specific variable.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C205",
+        "local_id": "F18",
+        "rationale": "Direct symptom.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C221",
+        "local_id": "F08",
+        "rationale": "Presence of diarrhea is a variation of diarrhea.",
+        "relation": "alias_of"
+      },
+      {
+        "candidate_id": "C231",
+        "local_id": "F19",
+        "rationale": "Direct symptom.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C235",
+        "local_id": "F21",
+        "rationale": "Presence of vomiting is a variation of vomiting.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C258",
+        "local_id": "F20",
+        "rationale": "Direct symptom.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C266",
+        "local_id": "drop",
+        "rationale": "Systemic symptoms is too vague and lacks specific evidence."
+      },
+      {
+        "candidate_id": "C267",
+        "local_id": "drop",
+        "rationale": "Systemic symptoms presence is too vague."
+      },
+      {
+        "candidate_id": "C283",
+        "local_id": "F23",
+        "rationale": "Direct symptom.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C284",
+        "local_id": "F21",
+        "rationale": "Direct symptom.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C285",
+        "local_id": "F22",
+        "rationale": "Direct symptom.",
+        "relation": "base_variable"
+      },
+      {
+        "candidate_id": "C286",
+        "local_id": "F22",
+        "rationale": "Wheezing presence is a variation of wheezing.",
+        "relation": "alias_of"
+      }
+    ],
+    "canonical_features": [
+      {
+        "action": "extract",
+        "aliases": [
+          "anxiety status",
+          "anxiety severity"
+        ],
+        "canonical_name": "anxiety_severity",
+        "categories": [
+          "mild",
+          "moderate",
+          "severe",
+          "unknown"
+        ],
+        "data_type": "ordinal",
+        "derivation": null,
+        "description": "The reported severity or presence of anxiety symptoms.",
+        "display_name": "Anxiety severity",
+        "local_id": "F01",
+        "parent_object": "psychiatric_symptoms",
+        "rationale": "Merged anxiety status and severity into a single ordinal scale to capture clinical nuance.",
+        "source_candidate_ids": [
+          "C015",
+          "C016"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "appetite_loss",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of loss of appetite.",
+        "display_name": "Appetite loss",
+        "local_id": "F02",
+        "parent_object": "gastrointestinal_symptoms",
+        "rationale": "Standalone symptom.",
+        "source_candidate_ids": [
+          "C018"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "bone pain or symptomatic bone metastasis",
+          "bone pain presence"
+        ],
+        "canonical_name": "bone_pain",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of pain in the bones, potentially related to metastasis.",
+        "display_name": "Bone pain",
+        "local_id": "F03",
+        "parent_object": "pain",
+        "rationale": "Merged bone pain presence and symptomatic bone metastasis as they describe the same clinical finding.",
+        "source_candidate_ids": [
+          "C028",
+          "C029"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "chest_pain",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of pain in the chest area.",
+        "display_name": "Chest pain",
+        "local_id": "F04",
+        "parent_object": "pain",
+        "rationale": "Distinct from general pain.",
+        "source_candidate_ids": [
+          "C045"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "chills",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of chills.",
+        "display_name": "Chills",
+        "local_id": "F05",
+        "parent_object": "systemic_symptoms",
+        "rationale": "Standalone symptom.",
+        "source_candidate_ids": [
+          "C046"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "constipation incidence"
+        ],
+        "canonical_name": "constipation",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence or incidence of constipation.",
+        "display_name": "Constipation",
+        "local_id": "F06",
+        "parent_object": "gastrointestinal_symptoms",
+        "rationale": "Merged incidence and presence into a binary feature.",
+        "source_candidate_ids": [
+          "C053",
+          "C054"
+        ]
+      },
+      {
+        "action": "review",
+        "aliases": [
+          "dry cough"
+        ],
+        "canonical_name": "cough",
+        "data_type": "text",
+        "derivation": null,
+        "description": "Presence, type, or frequency of cough.",
+        "display_name": "Cough",
+        "local_id": "F07",
+        "parent_object": "respiratory_symptoms",
+        "rationale": "Cough characteristics (dry, frequency, severity) are highly variable and best captured via review of text to avoid losing nuance.",
+        "source_candidate_ids": [
+          "C056",
+          "C057",
+          "C058",
+          "C059",
+          "C074"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "presence of diarrhea",
+          "diarrhea incidence"
+        ],
+        "canonical_name": "diarrhea",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence or incidence of diarrhea.",
+        "display_name": "Diarrhea",
+        "local_id": "F08",
+        "parent_object": "gastrointestinal_symptoms",
+        "rationale": "Merged diarrhea presence and incidence.",
+        "source_candidate_ids": [
+          "C066",
+          "C067",
+          "C221"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "dizziness",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of dizziness or lightheadedness.",
+        "display_name": "Dizziness",
+        "local_id": "F09",
+        "parent_object": "neurological_symptoms",
+        "rationale": "Standalone symptom.",
+        "source_candidate_ids": [
+          "C070"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "dyspnea severity"
+        ],
+        "canonical_name": "dyspnea",
+        "categories": [
+          "absent",
+          "mild",
+          "moderate",
+          "severe",
+          "unknown"
+        ],
+        "data_type": "ordinal",
+        "derivation": null,
+        "description": "Presence or severity of shortness of breath.",
+        "display_name": "Dyspnea",
+        "local_id": "F10",
+        "parent_object": "respiratory_symptoms",
+        "rationale": "Merged dyspnea presence and severity into an ordinal scale.",
+        "source_candidate_ids": [
+          "C075",
+          "C076"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "fatigue"
+        ],
+        "canonical_name": "fatigue_severity",
+        "categories": [
+          "mild",
+          "moderate",
+          "severe",
+          "unknown"
+        ],
+        "data_type": "ordinal",
+        "derivation": null,
+        "description": "The reported severity of fatigue, often graded by PRO-CTCAE.",
+        "display_name": "Fatigue severity",
+        "local_id": "F11",
+        "parent_object": "systemic_symptoms",
+        "rationale": "Merged fatigue and fatigue severity into an ordinal scale.",
+        "source_candidate_ids": [
+          "C089",
+          "C090"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "fever",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of fever.",
+        "display_name": "Fever",
+        "local_id": "F12",
+        "parent_object": "systemic_symptoms",
+        "rationale": "Standalone symptom.",
+        "source_candidate_ids": [
+          "C093"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "neurological focal deficits",
+          "gait deficit presence"
+        ],
+        "canonical_name": "focal_neurological_deficit",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of focal neurological deficits or gait deficits.",
+        "display_name": "Focal neurological deficit",
+        "local_id": "F13",
+        "parent_object": "neurological_symptoms",
+        "rationale": "Merged focal deficits and gait deficits as they are clinically related neurological findings.",
+        "source_candidate_ids": [
+          "C094",
+          "C099",
+          "C182"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "headache",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of headache.",
+        "display_name": "Headache",
+        "local_id": "F14",
+        "parent_object": "neurological_symptoms",
+        "rationale": "Standalone symptom.",
+        "source_candidate_ids": [
+          "C106"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "hemoptysis",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of coughing up blood.",
+        "display_name": "Hemoptysis",
+        "local_id": "F15",
+        "parent_object": "respiratory_symptoms",
+        "rationale": "Standalone symptom.",
+        "source_candidate_ids": [
+          "C110"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "nausea",
+          "nausea grade"
+        ],
+        "canonical_name": "nausea_severity",
+        "categories": [
+          "mild",
+          "moderate",
+          "severe",
+          "unknown"
+        ],
+        "data_type": "ordinal",
+        "derivation": null,
+        "description": "The reported severity or grade of nausea.",
+        "display_name": "Nausea severity",
+        "local_id": "F16",
+        "parent_object": "gastrointestinal_symptoms",
+        "rationale": "Merged nausea presence and severity into an ordinal scale.",
+        "source_candidate_ids": [
+          "C178",
+          "C179",
+          "C180"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "pain"
+        ],
+        "canonical_name": "pain_severity",
+        "categories": [
+          "mild",
+          "moderate",
+          "severe",
+          "unknown"
+        ],
+        "data_type": "ordinal",
+        "derivation": null,
+        "description": "The reported severity of general pain.",
+        "display_name": "Pain severity",
+        "local_id": "F17",
+        "parent_object": "pain",
+        "rationale": "Merged general pain and pain severity.",
+        "source_candidate_ids": [
+          "C202",
+          "C203"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "palpitations",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of heart palpitations.",
+        "display_name": "Palpitations",
+        "local_id": "F18",
+        "parent_object": "cardiovascular_symptoms",
+        "rationale": "Standalone symptom.",
+        "source_candidate_ids": [
+          "C205"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "presence of rash"
+        ],
+        "canonical_name": "rash",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of skin rash.",
+        "display_name": "Rash",
+        "local_id": "F19",
+        "parent_object": "dermatological_symptoms",
+        "rationale": "Standalone symptom.",
+        "source_candidate_ids": [
+          "C231"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "sore throat presence"
+        ],
+        "canonical_name": "sore_throat",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of sore throat.",
+        "display_name": "Sore throat",
+        "local_id": "F20",
+        "parent_object": "heent_symptoms",
+        "rationale": "Standalone symptom.",
+        "source_candidate_ids": [
+          "C258"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "presence of vomiting"
+        ],
+        "canonical_name": "vomiting",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of vomiting.",
+        "display_name": "Vomiting",
+        "local_id": "F21",
+        "parent_object": "gastrointestinal_symptoms",
+        "rationale": "Standalone symptom.",
+        "source_candidate_ids": [
+          "C235",
+          "C284"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [
+          "wheezing presence"
+        ],
+        "canonical_name": "wheezing",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of wheezing.",
+        "display_name": "Wheezing",
+        "local_id": "F22",
+        "parent_object": "respiratory_symptoms",
+        "rationale": "Standalone symptom.",
+        "source_candidate_ids": [
+          "C285",
+          "C286"
+        ]
+      },
+      {
+        "action": "extract",
+        "aliases": [],
+        "canonical_name": "unexplained_weight_loss",
+        "categories": [
+          "absent",
+          "present",
+          "unknown"
+        ],
+        "data_type": "binary",
+        "derivation": null,
+        "description": "Presence of unexplained weight loss.",
+        "display_name": "Unexplained weight loss",
+        "local_id": "F23",
+        "parent_object": "systemic_symptoms",
+        "rationale": "Standalone symptom.",
+        "source_candidate_ids": [
+          "C283"
+        ]
+      }
+    ]
+  },
+  "raw_content": "{\n  \"canonical_features\": [\n    {\n      \"local_id\": \"F01\",\n      \"canonical_name\": \"anxiety_severity\",\n      \"display_name\": \"Anxiety severity\",\n      \"description\": \"The reported severity or presence of anxiety symptoms.\",\n      \"data_type\": \"ordinal\",\n      \"categories\": [\n        \"mild\",\n        \"moderate\",\n        \"severe\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"psychiatric_symptoms\",\n      \"aliases\": [\n        \"anxiety status\",\n        \"anxiety severity\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C015\",\n        \"C016\"\n      ],\n      \"rationale\": \"Merged anxiety status and severity into a single ordinal scale to capture clinical nuance.\"\n    },\n    {\n      \"local_id\": \"F02\",\n      \"canonical_name\": \"appetite_loss\",\n      \"display_name\": \"Appetite loss\",\n      \"description\": \"Presence of loss of appetite.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"gastrointestinal_symptoms\",\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C018\"\n      ],\n      \"rationale\": \"Standalone symptom.\"\n    },\n    {\n      \"local_id\": \"F03\",\n      \"canonical_name\": \"bone_pain\",\n      \"display_name\": \"Bone pain\",\n      \"description\": \"Presence of pain in the bones, potentially related to metastasis.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"pain\",\n      \"aliases\": [\n        \"bone pain or symptomatic bone metastasis\",\n        \"bone pain presence\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C028\",\n        \"C029\"\n      ],\n      \"rationale\": \"Merged bone pain presence and symptomatic bone metastasis as they describe the same clinical finding.\"\n    },\n    {\n      \"local_id\": \"F04\",\n      \"canonical_name\": \"chest_pain\",\n      \"display_name\": \"Chest pain\",\n      \"description\": \"Presence of pain in the chest area.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"pain\",\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C045\"\n      ],\n      \"rationale\": \"Distinct from general pain.\"\n    },\n    {\n      \"local_id\": \"F05\",\n      \"canonical_name\": \"chills\",\n      \"display_name\": \"Chills\",\n      \"description\": \"Presence of chills.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"systemic_symptoms\",\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C046\"\n      ],\n      \"rationale\": \"Standalone symptom.\"\n    },\n    {\n      \"local_id\": \"F06\",\n      \"canonical_name\": \"constipation\",\n      \"display_name\": \"Constipation\",\n      \"description\": \"Presence or incidence of constipation.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"gastrointestinal_symptoms\",\n      \"aliases\": [\n        \"constipation incidence\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C053\",\n        \"C054\"\n      ],\n      \"rationale\": \"Merged incidence and presence into a binary feature.\"\n    },\n    {\n      \"local_id\": \"F07\",\n      \"canonical_name\": \"cough\",\n      \"display_name\": \"Cough\",\n      \"description\": \"Presence, type, or frequency of cough.\",\n      \"data_type\": \"text\",\n      \"action\": \"review\",\n      \"parent_object\": \"respiratory_symptoms\",\n      \"aliases\": [\n        \"dry cough\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C056\",\n        \"C057\",\n        \"C058\",\n        \"C059\",\n        \"C074\"\n      ],\n      \"rationale\": \"Cough characteristics (dry, frequency, severity) are highly variable and best captured via review of text to avoid losing nuance.\"\n    },\n    {\n      \"local_id\": \"F08\",\n      \"canonical_name\": \"diarrhea\",\n      \"display_name\": \"Diarrhea\",\n      \"description\": \"Presence or incidence of diarrhea.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"gastrointestinal_symptoms\",\n      \"aliases\": [\n        \"presence of diarrhea\",\n        \"diarrhea incidence\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C066\",\n        \"C067\",\n        \"C221\"\n      ],\n      \"rationale\": \"Merged diarrhea presence and incidence.\"\n    },\n    {\n      \"local_id\": \"F09\",\n      \"canonical_name\": \"dizziness\",\n      \"display_name\": \"Dizziness\",\n      \"description\": \"Presence of dizziness or lightheadedness.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"neurological_symptoms\",\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C070\"\n      ],\n      \"rationale\": \"Standalone symptom.\"\n    },\n    {\n      \"local_id\": \"F10\",\n      \"canonical_name\": \"dyspnea\",\n      \"display_name\": \"Dyspnea\",\n      \"description\": \"Presence or severity of shortness of breath.\",\n      \"data_type\": \"ordinal\",\n      \"categories\": [\n        \"absent\",\n        \"mild\",\n        \"moderate\",\n        \"severe\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"respiratory_symptoms\",\n      \"aliases\": [\n        \"dyspnea severity\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C075\",\n        \"C076\"\n      ],\n      \"rationale\": \"Merged dyspnea presence and severity into an ordinal scale.\"\n    },\n    {\n      \"local_id\": \"F11\",\n      \"canonical_name\": \"fatigue_severity\",\n      \"display_name\": \"Fatigue severity\",\n      \"description\": \"The reported severity of fatigue, often graded by PRO-CTCAE.\",\n      \"data_type\": \"ordinal\",\n      \"categories\": [\n        \"mild\",\n        \"moderate\",\n        \"severe\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"systemic_symptoms\",\n      \"aliases\": [\n        \"fatigue\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C089\",\n        \"C090\"\n      ],\n      \"rationale\": \"Merged fatigue and fatigue severity into an ordinal scale.\"\n    },\n    {\n      \"local_id\": \"F12\",\n      \"canonical_name\": \"fever\",\n      \"display_name\": \"Fever\",\n      \"description\": \"Presence of fever.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"systemic_symptoms\",\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C093\"\n      ],\n      \"rationale\": \"Standalone symptom.\"\n    },\n    {\n      \"local_id\": \"F13\",\n      \"canonical_name\": \"focal_neurological_deficit\",\n      \"display_name\": \"Focal neurological deficit\",\n      \"description\": \"Presence of focal neurological deficits or gait deficits.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"neurological_symptoms\",\n      \"aliases\": [\n        \"neurological focal deficits\",\n        \"gait deficit presence\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C094\",\n        \"C099\",\n        \"C182\"\n      ],\n      \"rationale\": \"Merged focal deficits and gait deficits as they are clinically related neurological findings.\"\n    },\n    {\n      \"local_id\": \"F14\",\n      \"canonical_name\": \"headache\",\n      \"display_name\": \"Headache\",\n      \"description\": \"Presence of headache.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"neurological_symptoms\",\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C106\"\n      ],\n      \"rationale\": \"Standalone symptom.\"\n    },\n    {\n      \"local_id\": \"F15\",\n      \"canonical_name\": \"hemoptysis\",\n      \"display_name\": \"Hemoptysis\",\n      \"description\": \"Presence of coughing up blood.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"respiratory_symptoms\",\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C110\"\n      ],\n      \"rationale\": \"Standalone symptom.\"\n    },\n    {\n      \"local_id\": \"F16\",\n      \"canonical_name\": \"nausea_severity\",\n      \"display_name\": \"Nausea severity\",\n      \"description\": \"The reported severity or grade of nausea.\",\n      \"data_type\": \"ordinal\",\n      \"categories\": [\n        \"mild\",\n        \"moderate\",\n        \"severe\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"gastrointestinal_symptoms\",\n      \"aliases\": [\n        \"nausea\",\n        \"nausea grade\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C178\",\n        \"C179\",\n        \"C180\"\n      ],\n      \"rationale\": \"Merged nausea presence and severity into an ordinal scale.\"\n    },\n    {\n      \"local_id\": \"F17\",\n      \"canonical_name\": \"pain_severity\",\n      \"display_name\": \"Pain severity\",\n      \"description\": \"The reported severity of general pain.\",\n      \"data_type\": \"ordinal\",\n      \"categories\": [\n        \"mild\",\n        \"moderate\",\n        \"severe\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"pain\",\n      \"aliases\": [\n        \"pain\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C202\",\n        \"C203\"\n      ],\n      \"rationale\": \"Merged general pain and pain severity.\"\n    },\n    {\n      \"local_id\": \"F18\",\n      \"canonical_name\": \"palpitations\",\n      \"display_name\": \"Palpitations\",\n      \"description\": \"Presence of heart palpitations.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"cardiovascular_symptoms\",\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C205\"\n      ],\n      \"rationale\": \"Standalone symptom.\"\n    },\n    {\n      \"local_id\": \"F19\",\n      \"canonical_name\": \"rash\",\n      \"display_name\": \"Rash\",\n      \"description\": \"Presence of skin rash.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"dermatological_symptoms\",\n      \"aliases\": [\n        \"presence of rash\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C231\"\n      ],\n      \"rationale\": \"Standalone symptom.\"\n    },\n    {\n      \"local_id\": \"F20\",\n      \"canonical_name\": \"sore_throat\",\n      \"display_name\": \"Sore throat\",\n      \"description\": \"Presence of sore throat.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"heent_symptoms\",\n      \"aliases\": [\n        \"sore throat presence\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C258\"\n      ],\n      \"rationale\": \"Standalone symptom.\"\n    },\n    {\n      \"local_id\": \"F21\",\n      \"canonical_name\": \"vomiting\",\n      \"display_name\": \"Vomiting\",\n      \"description\": \"Presence of vomiting.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"gastrointestinal_symptoms\",\n      \"aliases\": [\n        \"presence of vomiting\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C235\",\n        \"C284\"\n      ],\n      \"rationale\": \"Standalone symptom.\"\n    },\n    {\n      \"local_id\": \"F22\",\n      \"canonical_name\": \"wheezing\",\n      \"display_name\": \"Wheezing\",\n      \"description\": \"Presence of wheezing.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"respiratory_symptoms\",\n      \"aliases\": [\n        \"wheezing presence\"\n      ],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C285\",\n        \"C286\"\n      ],\n      \"rationale\": \"Standalone symptom.\"\n    },\n    {\n      \"local_id\": \"F23\",\n      \"canonical_name\": \"unexplained_weight_loss\",\n      \"display_name\": \"Unexplained weight loss\",\n      \"description\": \"Presence of unexplained weight loss.\",\n      \"data_type\": \"binary\",\n      \"categories\": [\n        \"absent\",\n        \"present\",\n        \"unknown\"\n      ],\n      \"action\": \"extract\",\n      \"parent_object\": \"systemic_symptoms\",\n      \"aliases\": [],\n      \"derivation\": null,\n      \"source_candidate_ids\": [\n        \"C283\"\n      ],\n      \"rationale\": \"Standalone symptom.\"\n    }\n  ],\n  \"candidate_mappings\": [\n    {\n      \"candidate_id\": \"C015\",\n      \"local_id\": \"F01\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Anxiety severity is a more specific version of anxiety status.\"\n    },\n    {\n      \"candidate_id\": \"C016\",\n      \"local_id\": \"F01\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Anxiety status is the base concept.\"\n    },\n    {\n      \"candidate_id\": \"C018\",\n      \"local_id\": \"F02\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct symptom.\"\n    },\n    {\n      \"candidate_id\": \"C028\",\n      \"local_id\": \"F03\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Describes the same clinical finding of bone pain/metastasis.\"\n    },\n    {\n      \"candidate_id\": \"C029\",\n      \"local_id\": \"F03\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Describes the same clinical finding of bone pain.\"\n    },\n    {\n      \"candidate_id\": \"C045\",\n      \"local_id\": \"F04\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct symptom.\"\n    },\n    {\n      \"candidate_id\": \"C046\",\n      \"local_id\": \"F05\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct symptom.\"\n    },\n    {\n      \"candidate_id\": \"C053\",\n      \"local_id\": \"F06\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct symptom.\"\n    },\n    {\n      \"candidate_id\": \"C054\",\n      \"local_id\": \"F06\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Constipation incidence is a variation of constipation presence.\"\n    },\n    {\n      \"candidate_id\": \"C056\",\n      \"local_id\": \"F07\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Base cough symptom.\"\n    },\n    {\n      \"candidate_id\": \"C057\",\n      \"local_id\": \"F07\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Cough frequency is a characteristic of cough.\"\n    },\n    {\n      \"candidate_id\": \"C058\",\n      \"local_id\": \"F07\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Cough severity is a characteristic of cough.\"\n    },\n    {\n      \"candidate_id\": \"C059\",\n      \"local_id\": \"F07\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Cough type is a characteristic of cough.\"\n    },\n    {\n      \"candidate_id\": \"C074\",\n      \"local_id\": \"F07\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Dry cough is a type of cough.\"\n    },\n    {\n      \"candidate_id\": \"C066\",\n      \"local_id\": \"F08\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct symptom.\"\n    },\n    {\n      \"candidate_id\": \"C067\",\n      \"local_id\": \"F08\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Diarrhea incidence is a variation of diarrhea presence.\"\n    },\n    {\n      \"candidate_id\": \"C070\",\n      \"local_id\": \"F09\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct symptom.\"\n    },\n    {\n      \"candidate_id\": \"C075\",\n      \"local_id\": \"F10\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Base dyspnea symptom.\"\n    },\n    {\n      \"candidate_id\": \"C076\",\n      \"local_id\": \"F10\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Dyspnea severity is a characteristic of dyspnea.\"\n    },\n    {\n      \"candidate_id\": \"C089\",\n      \"local_id\": \"F11\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Fatigue is the base concept for fatigue severity.\"\n    },\n    {\n      \"candidate_id\": \"C090\",\n      \"local_id\": \"F11\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Fatigue severity is the specific variable.\"\n    },\n    {\n      \"candidate_id\": \"C093\",\n      \"local_id\": \"F12\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct symptom.\"\n    },\n    {\n      \"candidate_id\": \"C094\",\n      \"local_id\": \"F13\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct symptom.\"\n    },\n    {\n      \"candidate_id\": \"C099\",\n      \"local_id\": \"F13\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Gait deficit is a type of focal neurological deficit.\"\n    },\n    {\n      \"candidate_id\": \"C106\",\n      \"local_id\": \"F14\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct symptom.\"\n    },\n    {\n      \"candidate_id\": \"C110\",\n      \"local_id\": \"F15\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct symptom.\"\n    },\n    {\n      \"candidate_id\": \"C178\",\n      \"local_id\": \"F16\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Nausea presence is part of nausea severity.\"\n    },\n    {\n      \"candidate_id\": \"C179\",\n      \"local_id\": \"F16\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Nausea grade is a synonym for nausea severity.\"\n    },\n    {\n      \"candidate_id\": \"C180\",\n      \"local_id\": \"F16\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Nausea severity is the specific variable.\"\n    },\n    {\n      \"candidate_id\": \"C182\",\n      \"local_id\": \"F13\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Neurological focal deficits is a synonym for focal neurological deficit.\"\n    },\n    {\n      \"candidate_id\": \"C202\",\n      \"local_id\": \"F17\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Pain is the base concept for pain severity.\"\n    },\n    {\n      \"candidate_id\": \"C203\",\n      \"local_id\": \"F17\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Pain severity is the specific variable.\"\n    },\n    {\n      \"candidate_id\": \"C205\",\n      \"local_id\": \"F18\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct symptom.\"\n    },\n    {\n      \"candidate_id\": \"C221\",\n      \"local_id\": \"F08\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Presence of diarrhea is a variation of diarrhea.\"\n    },\n    {\n      \"candidate_id\": \"C231\",\n      \"local_id\": \"F19\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct symptom.\"\n    },\n    {\n      \"candidate_id\": \"C235\",\n      \"local_id\": \"F21\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Presence of vomiting is a variation of vomiting.\"\n    },\n    {\n      \"candidate_id\": \"C258\",\n      \"local_id\": \"F20\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct symptom.\"\n    },\n    {\n      \"candidate_id\": \"C266\",\n      \"local_id\": \"drop\",\n      \"rationale\": \"Systemic symptoms is too vague and lacks specific evidence.\"\n    },\n    {\n      \"candidate_id\": \"C267\",\n      \"local_id\": \"drop\",\n      \"rationale\": \"Systemic symptoms presence is too vague.\"\n    },\n    {\n      \"candidate_id\": \"C283\",\n      \"local_id\": \"F23\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct symptom.\"\n    },\n    {\n      \"candidate_id\": \"C284\",\n      \"local_id\": \"F21\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct symptom.\"\n    },\n    {\n      \"candidate_id\": \"C285\",\n      \"local_id\": \"F22\",\n      \"relation\": \"base_variable\",\n      \"rationale\": \"Direct symptom.\"\n    },\n    {\n      \"candidate_id\": \"C286\",\n      \"local_id\": \"F22\",\n      \"relation\": \"alias_of\",\n      \"rationale\": \"Wheezing presence is a variation of wheezing.\"\n    }\n  ]\n}",
+  "request_id": "chatcmpl-b7a2c3823d199c05",
+  "status": "complete",
+  "system_prompt": "You design conservative canonical clinical feature registries. The goal is to reduce redundant extraction while preserving clinically distinct variables. Use only supplied evidence. Return valid JSON only.",
+  "usage": {
+    "completion_tokens": 6379,
+    "prompt_tokens": 5788,
+    "prompt_tokens_details": null,
+    "total_tokens": 12167
+  },
+  "user_prompt": "Clinical task:\nIdentify clinically meaningful patient features relevant to the study of advanced or metastatic non-small cell lung cancer in a comparison of vinorelbine and gemcitabine.\n\nDomain: symptoms_patient_reported\n\nHarmonize the following candidate feature names. Apply these distinctions carefully:\n\n- Merge true aliases that ask for the same patient-level variable.\n- Represent categories or values of one variable under one canonical feature when appropriate.\n- Mark a feature `derive` only when it can be calculated from other canonical base variables without reading the clinical text again.\n- Keep clinically related but non-equivalent measurements or findings separate.\n- Use `subfield_of` to connect distinct fields that belong to one reusable clinical object.\n- Drop only clear artifacts or redundant aliases. Use `review` when a safe extraction contract cannot be specified.\n- Preserve provenance: every candidate ID must map exactly once.\n- Do not assign a role in the clinical task.\n\nAllowed data types: [\"binary\", \"categorical\", \"continuous\", \"count\", \"ordinal\", \"text\"]\nAllowed actions: [\"derive\", \"drop\", \"extract\", \"review\"]\nAllowed mapping relations: [\"alias_of\", \"base_variable\", \"derived_from\", \"drop\", \"related_but_distinct\", \"review\", \"subfield_of\"]\n\nFor binary features, categories must be [\"absent\", \"present\", \"unknown\"]. For categorical or ordinal features, provide a conservative explicit category list including \"unknown\". Continuous and count features have no categories. Text features should normally be marked `review`, not `extract`.\n\nFor derivations, use this schema when executable; otherwise use operation `not_automated`:\n{\"operation\": \"ratio | threshold | category_map | not_automated\", \"inputs\": [\"canonical_name\"], \"parameters\": {}}\n\nCandidates:\n[{\"candidate_id\": \"C015\", \"name\": \"Anxiety severity\", \"occurrence_count\": 1, \"topic_ranks\": [3], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Anxiety\"], \"evidence_terms\": [\"psychiatric mild anxiety\", \"anxiety about diagnosis\", \"mild anxiety\"], \"feature_type_hints\": [\"psychiatric symptom\"], \"represented_values_or_categories\": [\"mild\", \"about diagnosis\"]}, {\"candidate_id\": \"C016\", \"name\": \"Anxiety status\", \"occurrence_count\": 2, \"topic_ranks\": [1, 9], \"representation_votes\": {\"ordinal\": 1, \"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Anxiety\"], \"evidence_terms\": [\"psychiatric mild anxiety\", \"anxiety about diagnosis\", \"mild anxiety\", \"mild anxiety about\", \"psychiatric mild\", \"occasional anxiety\", \"anxiety about\"], \"feature_type_hints\": [\"finding\", \"symptom\"], \"represented_values_or_categories\": [\"mild\", \"occasional\"]}, {\"candidate_id\": \"C018\", \"name\": \"Appetite loss\", \"occurrence_count\": 1, \"topic_ranks\": [25], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Appetite loss\"], \"evidence_terms\": [\"appetite loss 20\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C028\", \"name\": \"Bone pain or symptomatic bone metastasis\", \"occurrence_count\": 1, \"topic_ranks\": [34], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Symptomatic bone involvement\"], \"evidence_terms\": [\"symptomatic bone\", \"prn for bone\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"symptomatic\"]}, {\"candidate_id\": \"C029\", \"name\": \"Bone pain presence\", \"occurrence_count\": 1, \"topic_ranks\": [9], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Symptomatic bone pain\"], \"evidence_terms\": [\"symptomatic bone\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C045\", \"name\": \"Chest pain\", \"occurrence_count\": 1, \"topic_ranks\": [17], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Chest pain\"], \"evidence_terms\": [\"chills chest pain\", \"chills chest\", \"fever chills chest\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C046\", \"name\": \"Chills\", \"occurrence_count\": 1, \"topic_ranks\": [17], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Chills\"], \"evidence_terms\": [\"chills chest pain\", \"chills chest\", \"fever chills chest\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C053\", \"name\": \"Constipation\", \"occurrence_count\": 1, \"topic_ranks\": [25], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Constipation\"], \"evidence_terms\": [\"20 100 constipation\", \"100 constipation 10\", \"constipation 10 100\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C054\", \"name\": \"Constipation incidence\", \"occurrence_count\": 1, \"topic_ranks\": [8], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Constipation\"], \"evidence_terms\": [\"100 constipation 20\", \"constipation 20 100\", \"constipation 20\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C056\", \"name\": \"Cough\", \"occurrence_count\": 3, \"topic_ranks\": [3, 54, 79], \"representation_votes\": {\"binary\": 3}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Cough\", \"Respiratory symptoms\"], \"evidence_terms\": [\"respiratory cough dyspnea\", \"exertion hemoptysis wheezing\", \"exertion hemoptysis\", \"on exertion hemoptysis\", \"wheezing cardiovascular none\", \"cough or\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"cough\", \"dyspnea\", \"hemoptysis\", \"wheezing\", \"on exertion\"]}, {\"candidate_id\": \"C057\", \"name\": \"Cough frequency\", \"occurrence_count\": 1, \"topic_ranks\": [17], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Dry cough\"], \"evidence_terms\": [\"dry cough\", \"occasional dry cough\", \"occasional dry\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"occasional\"]}, {\"candidate_id\": \"C058\", \"name\": \"Cough severity\", \"occurrence_count\": 1, \"topic_ranks\": [20], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Cough severity\"], \"evidence_terms\": [\"mild cough\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"mild\"]}, {\"candidate_id\": \"C059\", \"name\": \"Cough severity/type\", \"occurrence_count\": 1, \"topic_ranks\": [10], \"representation_votes\": {\"categorical\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Cough\"], \"evidence_terms\": [\"occasional dry cough\", \"dry cough\", \"occasional dry\", \"dry\", \"dry cough no\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"dry\", \"occasional\"]}, {\"candidate_id\": \"C066\", \"name\": \"Diarrhea\", \"occurrence_count\": 2, \"topic_ranks\": [2, 25], \"representation_votes\": {\"binary\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Diarrhea\"], \"evidence_terms\": [\"diarrhea or\", \"10 100 diarrhea\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C067\", \"name\": \"Diarrhea incidence\", \"occurrence_count\": 1, \"topic_ranks\": [8], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Diarrhea\"], \"evidence_terms\": [\"20 100 diarrhea\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C070\", \"name\": \"Dizziness\", \"occurrence_count\": 1, \"topic_ranks\": [47], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Dizziness\"], \"evidence_terms\": [\"dizziness or\", \"dizziness or focal\", \"dizziness\", \"headaches dizziness\", \"no headaches dizziness\", \"headaches dizziness or\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"present\", \"absent\"]}, {\"candidate_id\": \"C074\", \"name\": \"Dry cough\", \"occurrence_count\": 1, \"topic_ranks\": [88], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Dry cough\"], \"evidence_terms\": [\"dry cough\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"present\"]}, {\"candidate_id\": \"C075\", \"name\": \"Dyspnea\", \"occurrence_count\": 3, \"topic_ranks\": [3, 40, 54], \"representation_votes\": {\"binary\": 2, \"ordinal\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Dyspnea\", \"Respiratory symptoms\"], \"evidence_terms\": [\"respiratory cough dyspnea\", \"exertion hemoptysis wheezing\", \"exertion hemoptysis\", \"on exertion hemoptysis\", \"wheezing cardiovascular none\", \"20 100 dyspnea\", \"20 dyspnea\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"cough\", \"dyspnea\", \"hemoptysis\", \"wheezing\", \"on exertion\"]}, {\"candidate_id\": \"C076\", \"name\": \"Dyspnea severity\", \"occurrence_count\": 1, \"topic_ranks\": [38], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Exertional dyspnea\"], \"evidence_terms\": [\"exertional\", \"mild exertional\", \"exertional dyspnea\", \"mild exertional dyspnea\", \"rest mild\", \"at rest mild\", \"rest mild exertional\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"mild\", \"at rest\"]}, {\"candidate_id\": \"C089\", \"name\": \"Fatigue\", \"occurrence_count\": 1, \"topic_ranks\": [40], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Fatigue\"], \"evidence_terms\": [\"pro-ctcae fatigue\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"pro-ctcae\"]}, {\"candidate_id\": \"C090\", \"name\": \"Fatigue severity\", \"occurrence_count\": 3, \"topic_ranks\": [6, 23, 35], \"representation_votes\": {\"ordinal\": 3}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Fatigue\", \"Fatigue grade\"], \"evidence_terms\": [\"pro-ctcae fatigue\", \"pro-ctcae fatigue -\", \"instrument pro-ctcae fatigue\", \"by fatigue and\", \"mild fatigue grade\"], \"feature_type_hints\": [\"symptom\", \"text-derived\", \"adverse_event\"], \"represented_values_or_categories\": [\"mild\"]}, {\"candidate_id\": \"C093\", \"name\": \"Fever\", \"occurrence_count\": 1, \"topic_ranks\": [17], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Fever\"], \"evidence_terms\": [\"fever chills chest\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C094\", \"name\": \"Focal neurological deficit\", \"occurrence_count\": 1, \"topic_ranks\": [47], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Focal neurological deficit\"], \"evidence_terms\": [\"dizziness or focal\", \"or focal deficits.\", \"focal deficits. -\", \"focal deficits.\", \"neurologic no\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"present\", \"absent\"]}, {\"candidate_id\": \"C099\", \"name\": \"Gait deficit presence\", \"occurrence_count\": 1, \"topic_ranks\": [39], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Focal neurological deficits\"], \"evidence_terms\": [\"focal deficits gait\", \"deficits gait\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"gait deficits\"]}, {\"candidate_id\": \"C106\", \"name\": \"Headache\", \"occurrence_count\": 1, \"topic_ranks\": [47], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Headache\"], \"evidence_terms\": [\"headaches dizziness\", \"no headaches dizziness\", \"headaches dizziness or\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"present\", \"absent\"]}, {\"candidate_id\": \"C110\", \"name\": \"Hemoptysis\", \"occurrence_count\": 3, \"topic_ranks\": [3, 38, 66], \"representation_votes\": {\"binary\": 3}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Hemoptysis\", \"Respiratory symptoms\", \"Sputum hemoptysis\"], \"evidence_terms\": [\"respiratory cough dyspnea\", \"exertion hemoptysis wheezing\", \"exertion hemoptysis\", \"on exertion hemoptysis\", \"wheezing cardiovascular none\", \"sputum hemoptysis\", \"cough sputum hemoptysis\", \"hemoptysis unexplained weight\", \"hemoptysis unexplained\", \"cough hemoptysis unexplained\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"cough\", \"dyspnea\", \"hemoptysis\", \"wheezing\", \"on exertion\"]}, {\"candidate_id\": \"C178\", \"name\": \"Nausea\", \"occurrence_count\": 2, \"topic_ranks\": [2, 40], \"representation_votes\": {\"binary\": 1, \"ordinal\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Nausea\"], \"evidence_terms\": [\"denies nausea vomiting\", \"denies nausea\", \"nausea 10\", \"nausea 10 100\", \"100 nausea 10\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"denies\"]}, {\"candidate_id\": \"C179\", \"name\": \"Nausea grade\", \"occurrence_count\": 1, \"topic_ranks\": [24], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Nausea\"], \"evidence_terms\": [\"nausea 5\", \"myelosuppression nausea\"], \"feature_type_hints\": [\"categorical\"], \"represented_values_or_categories\": [\"nausea\"]}, {\"candidate_id\": \"C180\", \"name\": \"Nausea severity\", \"occurrence_count\": 1, \"topic_ranks\": [6], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Nausea\"], \"evidence_terms\": [\"moderate nausea\", \"moderate nausea -\", \"4 moderate nausea\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"moderate\"]}, {\"candidate_id\": \"C182\", \"name\": \"Neurological focal deficits\", \"occurrence_count\": 2, \"topic_ranks\": [24, 49], \"representation_votes\": {\"binary\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Intracranial involvement\", \"Neurological focal deficits\"], \"evidence_terms\": [\"focal deficits.\", \"focal deficits. -\", \"evidence of intracranial\", \"or focal deficits.\", \"of intracranial\"], \"feature_type_hints\": [\"categorical\", \"finding\"], \"represented_values_or_categories\": [\"presence of focal deficits\"]}, {\"candidate_id\": \"C202\", \"name\": \"Pain\", \"occurrence_count\": 1, \"topic_ranks\": [40], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Pain\"], \"evidence_terms\": [\"pain 20\", \"pain 20 100\", \"100 pain 20\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C203\", \"name\": \"Pain severity\", \"occurrence_count\": 1, \"topic_ranks\": [6], \"representation_votes\": {\"ordinal\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Pain\"], \"evidence_terms\": [\"pain 45\", \"100 pain 45\", \"pain 45 100\", \"4 mild pain\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"mild\"]}, {\"candidate_id\": \"C205\", \"name\": \"Palpitations\", \"occurrence_count\": 1, \"topic_ranks\": [3], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Palpitations\"], \"evidence_terms\": [\"palpitations gastrointestinal\", \"pain palpitations gastrointestinal\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C221\", \"name\": \"Presence of diarrhea\", \"occurrence_count\": 1, \"topic_ranks\": [64], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Gastrointestinal symptoms\"], \"evidence_terms\": [\"vomiting diarrhea or\", \"vomiting diarrhea\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"vomiting\", \"diarrhea\"]}, {\"candidate_id\": \"C231\", \"name\": \"Presence of rash\", \"occurrence_count\": 1, \"topic_ranks\": [1], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Rash\"], \"evidence_terms\": [\"none rashes psychiatric\", \"rashes psychiatric\"], \"feature_type_hints\": [\"finding\"], \"represented_values_or_categories\": [\"none\"]}, {\"candidate_id\": \"C235\", \"name\": \"Presence of vomiting\", \"occurrence_count\": 1, \"topic_ranks\": [64], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Gastrointestinal symptoms\"], \"evidence_terms\": [\"vomiting diarrhea or\", \"vomiting diarrhea\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"vomiting\", \"diarrhea\"]}, {\"candidate_id\": \"C258\", \"name\": \"Sore throat presence\", \"occurrence_count\": 2, \"topic_ranks\": [18, 92], \"representation_votes\": {\"binary\": 2}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Sore throat\"], \"evidence_terms\": [\"sore throat sinus\", \"throat sinus\", \"no sore throat\", \"no sore\", \"heent no sore\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"present\", \"absent\"]}, {\"candidate_id\": \"C266\", \"name\": \"Systemic symptoms\", \"occurrence_count\": 1, \"topic_ranks\": [17], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"low\", \"supporting_specific_features\": [], \"evidence_terms\": [], \"feature_type_hints\": [], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C267\", \"name\": \"Systemic symptoms presence\", \"occurrence_count\": 1, \"topic_ranks\": [57], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"low\", \"supporting_specific_features\": [], \"evidence_terms\": [], \"feature_type_hints\": [], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C283\", \"name\": \"Unexplained weight loss\", \"occurrence_count\": 1, \"topic_ranks\": [66], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"medium\", \"supporting_specific_features\": [\"Unexplained weight loss\"], \"evidence_terms\": [\"hemoptysis unexplained weight\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": []}, {\"candidate_id\": \"C284\", \"name\": \"Vomiting\", \"occurrence_count\": 1, \"topic_ranks\": [2], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Vomiting\"], \"evidence_terms\": [\"denies nausea vomiting\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"denies\"]}, {\"candidate_id\": \"C285\", \"name\": \"Wheezing\", \"occurrence_count\": 1, \"topic_ranks\": [3], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Respiratory symptoms\"], \"evidence_terms\": [\"respiratory cough dyspnea\", \"exertion hemoptysis wheezing\", \"exertion hemoptysis\", \"on exertion hemoptysis\", \"wheezing cardiovascular none\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"cough\", \"dyspnea\", \"hemoptysis\", \"wheezing\", \"on exertion\"]}, {\"candidate_id\": \"C286\", \"name\": \"Wheezing presence\", \"occurrence_count\": 1, \"topic_ranks\": [10], \"representation_votes\": {\"binary\": 1}, \"confidence\": \"high\", \"supporting_specific_features\": [\"Wheezing\"], \"evidence_terms\": [\"no wheezing\"], \"feature_type_hints\": [\"symptom\"], \"represented_values_or_categories\": [\"absent\"]}]\n\nReturn:\n{\n  \"canonical_features\": [\n    {\n      \"local_id\": \"F01\",\n      \"canonical_name\": \"snake_case_name\",\n      \"display_name\": \"Readable name\",\n      \"description\": \"Precise extraction definition with aliases where useful\",\n      \"data_type\": \"binary | categorical | ordinal | continuous | count | text\",\n      \"categories\": [\"value\"] or null,\n      \"action\": \"extract | derive | drop | review\",\n      \"parent_object\": \"optional snake_case object name\" or null,\n      \"aliases\": [\"source wording\"],\n      \"derivation\": object or null,\n      \"source_candidate_ids\": [\"C001\"],\n      \"rationale\": \"short explanation\"\n    }\n  ],\n  \"candidate_mappings\": [\n    {\n      \"candidate_id\": \"C001\",\n      \"local_id\": \"F01\",\n      \"relation\": \"alias_of | base_variable | derived_from | subfield_of | related_but_distinct | drop | review\",\n      \"rationale\": \"short explanation\"\n    }\n  ]\n}"
+}
