@@ -185,6 +185,27 @@ def test_extraction_prompt_distinguishes_unknown_from_not_documented():
     assert "For continuous fields" in prompt
 
 
+def test_neural_query_rag_prompt_treats_prior_outcomes_as_valid_history():
+    specs = [
+        ExplicitFeatureSpec(
+            name="prior_platinum_response",
+            type="categorical",
+            categories=["response", "no_response", "not_documented"],
+            roles=["confounder"],
+        )
+    ]
+    document = (
+        "[neural_query_rag_v1]\n"
+        "<retrieved_excerpt>Prior platinum produced a partial response.</retrieved_excerpt>"
+    )
+
+    prompt = build_extraction_prompt(document, specs)
+
+    assert "Read every retrieved baseline-history excerpt" in prompt
+    assert "prior therapies, responses, or outcomes" in prompt
+    assert "complete clinical note" not in prompt
+
+
 def test_parse_extraction_response_accepts_quoted_null_as_missing():
     specs = [
         ExplicitFeatureSpec(name="age", type="continuous", roles=["confounder"]),

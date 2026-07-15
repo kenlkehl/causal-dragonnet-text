@@ -1512,6 +1512,11 @@ class OpenAICompatibleFeatureSearchAgent:
             "tfidf_topic_value_harmonization_v2",
             "tfidf_topic_value_repair_v2",
         }
+        is_neural_query_prompt = context.get("prompt_version") in {
+            "neural_query_feature_v1",
+            "neural_query_registry_v1",
+            "neural_query_review_v1",
+        }
 
         for attempt_idx in range(max_repair_attempts + 1):
             response_kwargs = {
@@ -1566,6 +1571,7 @@ class OpenAICompatibleFeatureSearchAgent:
                     or is_parsimony_factor
                     or is_tfidf_topic_label
                     or is_tfidf_topic_harmonization
+                    or is_neural_query_prompt
                 ):
                     parsed = parse_agent_json_object(content)
                     if is_value_harmonization:
@@ -1584,6 +1590,22 @@ class OpenAICompatibleFeatureSearchAgent:
                         )
 
                         issues = topic_harmonization_response_issues(parsed, context)
+                    elif is_neural_query_prompt:
+                        from .neural_query_agentic_forest import (
+                            QUERY_FEATURE_PROMPT_VERSION,
+                            QUERY_REVIEW_PROMPT_VERSION,
+                            query_feature_response_issues,
+                            query_registry_response_issues,
+                            query_review_response_issues,
+                        )
+
+                        neural_prompt_version = context.get("prompt_version")
+                        if neural_prompt_version == QUERY_FEATURE_PROMPT_VERSION:
+                            issues = query_feature_response_issues(parsed, context)
+                        elif neural_prompt_version == QUERY_REVIEW_PROMPT_VERSION:
+                            issues = query_review_response_issues(parsed, context)
+                        else:
+                            issues = query_registry_response_issues(parsed, context)
                     else:
                         issues = consensus_disambiguation_response_issues(parsed)
                     if issues:
@@ -1622,6 +1644,15 @@ class OpenAICompatibleFeatureSearchAgent:
                             "following the original response contract. Cover every required "
                             "candidate exactly once, use only supplied ids/names, and never "
                             "return a review state. Problems: " + "; ".join(issues)
+                        )
+                    elif is_neural_query_prompt:
+                        repair_prompt = (
+                            "Repair the neural-query response as exactly one JSON "
+                            "object following the original response contract. Use "
+                            "only supplied evidence/candidate ids, obey all count "
+                            "limits, and cover required candidates exactly once. "
+                            "Problems: "
+                            + "; ".join(issues)
                         )
                     elif is_consensus_disambiguation:
                         repair_prompt = build_consensus_disambiguation_repair_prompt(issues)
@@ -1942,6 +1973,11 @@ class CodexCLIFeatureSearchAgent:
             "tfidf_topic_value_harmonization_v2",
             "tfidf_topic_value_repair_v2",
         }
+        is_neural_query_prompt = prompt_version in {
+            "neural_query_feature_v1",
+            "neural_query_registry_v1",
+            "neural_query_review_v1",
+        }
 
         for attempt_idx in range(max_repair_attempts + 1):
             response = self._run(prompt)
@@ -1962,6 +1998,7 @@ class CodexCLIFeatureSearchAgent:
                     or is_parsimony_factor
                     or is_tfidf_topic_label
                     or is_tfidf_topic_harmonization
+                    or is_neural_query_prompt
                 ):
                     parsed = parse_agent_json_object(content)
                     if is_value_harmonization:
@@ -1980,6 +2017,21 @@ class CodexCLIFeatureSearchAgent:
                         )
 
                         issues = topic_harmonization_response_issues(parsed, context)
+                    elif is_neural_query_prompt:
+                        from .neural_query_agentic_forest import (
+                            QUERY_FEATURE_PROMPT_VERSION,
+                            QUERY_REVIEW_PROMPT_VERSION,
+                            query_feature_response_issues,
+                            query_registry_response_issues,
+                            query_review_response_issues,
+                        )
+
+                        if prompt_version == QUERY_FEATURE_PROMPT_VERSION:
+                            issues = query_feature_response_issues(parsed, context)
+                        elif prompt_version == QUERY_REVIEW_PROMPT_VERSION:
+                            issues = query_review_response_issues(parsed, context)
+                        else:
+                            issues = query_registry_response_issues(parsed, context)
                     else:
                         issues = consensus_disambiguation_response_issues(parsed)
                     if issues:
@@ -2014,6 +2066,15 @@ class CodexCLIFeatureSearchAgent:
                             "following the original response contract. Cover every required "
                             "candidate exactly once, use only supplied ids/names, and never "
                             "return a review state. Problems: " + "; ".join(issues)
+                        )
+                    elif is_neural_query_prompt:
+                        repair_prompt = (
+                            "Repair the neural-query response as exactly one JSON "
+                            "object following the original response contract. Use "
+                            "only supplied evidence/candidate ids, obey all count "
+                            "limits, and cover required candidates exactly once. "
+                            "Problems: "
+                            + "; ".join(issues)
                         )
                     elif is_consensus_disambiguation:
                         repair_prompt = build_consensus_disambiguation_repair_prompt(issues)
@@ -2962,6 +3023,18 @@ def build_agent_prompt(
     search_config: AgenticFeatureSearchConfig,
 ) -> str:
     """Construct the proposal prompt sent to the LLM agent."""
+    if context.get("prompt_version") == "neural_query_feature_v1":
+        from .neural_query_agentic_forest import render_query_feature_prompt
+
+        return render_query_feature_prompt(context)
+    if context.get("prompt_version") == "neural_query_registry_v1":
+        from .neural_query_agentic_forest import render_query_registry_prompt
+
+        return render_query_registry_prompt(context)
+    if context.get("prompt_version") == "neural_query_review_v1":
+        from .neural_query_agentic_forest import render_query_review_prompt
+
+        return render_query_review_prompt(context)
     if context.get("prompt_version") in {
         "tfidf_topic_label_v2",
         "tfidf_topic_recovery_v2",

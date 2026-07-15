@@ -229,12 +229,27 @@ def build_extraction_prompt(
     if max_text_length is not None and len(text) > int(max_text_length):
         text = text[-int(max_text_length) :]
 
-    prompt = f"""Read this complete clinical note and extract the following patient characteristics.
-Use only information available before or at treatment initiation. Do not guess. For categorical fields, follow each field's unknown/not_documented policy. For continuous fields that are not explicitly stated or cannot be deterministically converted, return null.
+    if "[neural_query_rag_v1]" in text:
+        document_instruction = (
+            "Read every retrieved baseline-history excerpt below and extract the "
+            "following patient characteristics. The excerpts may mention prior "
+            "therapies, responses, or outcomes; those are valid history before the "
+            "current treatment decision."
+        )
+        document_label = "Query-retrieved baseline excerpts"
+    else:
+        document_instruction = (
+            "Read this complete clinical note and extract the following patient "
+            "characteristics."
+        )
+        document_label = "Clinical Note"
+
+    prompt = f"""{document_instruction}
+Use only information available before or at the current treatment initiation. Do not guess. For categorical fields, follow each field's unknown/not_documented policy. For continuous fields that are not explicitly stated or cannot be deterministically converted, return null.
 
 {instructions_text}
 
-Clinical Note:
+{document_label}:
 {text}
 
 Respond with JSON only, no other text:
