@@ -49,6 +49,7 @@ from .agentic_explicit_feature_forest import (
     AgenticFeatureProposal,
     CausalForestExplicitEvaluator,
     SplitEvaluation,
+    StructuredInteractionExplicitEvaluator,
     VLLMExplicitFeatureExtractionProvider,
     _clinical_text_examples,
     _get_agent_response_trace,
@@ -105,6 +106,50 @@ _CONCEPT_CLUSTER_SNIPPET_CHARS = 320
 _CONCEPT_CLUSTER_TOP_PHRASES = 12
 _PARSIMONY_SCHEMA_VERSION = "multi_model_agentic_cluster_factor_parsimony_v2"
 _PARSIMONY_FACTOR_PROMPT_VERSION = "multi_model_agentic_parsimony_factor_v1"
+
+
+def _make_configured_explicit_evaluator(
+    *,
+    config: AppliedInferenceConfig,
+    cf_config: ExplicitFeatureForestConfig,
+) -> Any:
+    """Select the integrated structured head without changing legacy defaults.
+
+    Older/standalone configurations do not necessarily contain the integrated
+    ``multi_model_forest`` block.  Those continue to use the causal forest.
+    When the block is present, its validated estimator selector is authoritative
+    for both the ordinary and precomputed-discovery runners.
+    """
+    architecture = getattr(config, "architecture", None)
+    integrated_config = getattr(architecture, "multi_model_forest", None)
+    if integrated_config is None:
+        return CausalForestExplicitEvaluator(config=config, cf_config=cf_config)
+
+    estimator = getattr(integrated_config, "structured_effect_estimator", None)
+    if estimator is None:
+        return CausalForestExplicitEvaluator(config=config, cf_config=cf_config)
+    estimator = str(estimator).strip().lower().replace("-", "_")
+    if estimator in {"interaction", "s_learner", "interaction_s_learner"}:
+        return StructuredInteractionExplicitEvaluator(
+            config=config,
+            cf_config=cf_config,
+        )
+    if estimator in {"causal_forest", "forest"}:
+        return CausalForestExplicitEvaluator(config=config, cf_config=cf_config)
+    raise ValueError(
+        "multi_model_forest.structured_effect_estimator must be "
+        "'interaction_s_learner' or 'causal_forest'"
+    )
+
+
+def _without_oracle_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return the modeling frame with synthetic-oracle columns removed."""
+    oracle_columns = [
+        column
+        for column in frame.columns
+        if str(column).lower().startswith(("true_", "oracle_"))
+    ]
+    return frame.drop(columns=oracle_columns, errors="ignore")
 
 
 def run_multi_model_agentic_forest(
@@ -319,9 +364,13 @@ class MultiModelAgenticForestRunner:
                 output_dir=self.artifact_dir,
             )
         )
-        self.evaluator = evaluator or CausalForestExplicitEvaluator(
-            config=config,
-            cf_config=self.cf_config,
+        self.evaluator = (
+            evaluator
+            if evaluator is not None
+            else _make_configured_explicit_evaluator(
+                config=config,
+                cf_config=self.cf_config,
+            )
         )
         self.embedding_provider = embedding_provider
         self.htr_evidence_provider = htr_evidence_provider
@@ -947,8 +996,8 @@ class MultiModelAgenticForestRunner:
         )
 
         final_eval: SplitEvaluation = self.evaluator.evaluate_split(
-            train_df=train_df,
-            test_df=test_df,
+            train_df=_without_oracle_columns(train_df),
+            test_df=_without_oracle_columns(test_df),
             specs=selected_specs,
             fold_id=outer_fold,
         )
@@ -9328,6 +9377,12 @@ def _bow_evidence_digest_groups(
                 {
                     "source": f"{source_prefix}{view_name}.{key}",
                     "view_name": view.get("view_name"),
+                    "bow_model": (
+                        (view.get("view_config") or {}).get("bow_model")
+                        if isinstance(view.get("view_config"), dict)
+                        else None
+                    )
+                    or view.get("bow_model"),
                     "evidence_type": key,
                     "meaning": _bow_digest_key_description(key, role),
                     "rows": rows,

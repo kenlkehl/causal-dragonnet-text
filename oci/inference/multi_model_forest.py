@@ -38,7 +38,10 @@ from .tfidf_topic_agentic_forest import (
     run_tfidf_topic_agentic_forest,
     validate_tfidf_topic_stage2_handoff,
 )
-from .tfidf_topic_stage1 import run_tfidf_topic_stage1
+from .tfidf_topic_stage1 import (
+    run_tfidf_topic_stage1,
+    tfidf_topic_stage1_cache_is_valid,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -298,7 +301,12 @@ class MultiModelForestRunner:
             )
 
     def _stage1_complete(self) -> bool:
-        return self.output_path.exists() and self.handoff_path.exists()
+        return tfidf_topic_stage1_cache_is_valid(
+            dataset=self.dataset.drop(columns=["_oci_row_id"], errors="ignore"),
+            config=self.config,
+            output_path=self.output_path,
+            handoff_path=self.handoff_path,
+        )
 
     def _write_stage_config(self, path: Path) -> None:
         payload = {

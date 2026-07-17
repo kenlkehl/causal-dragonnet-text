@@ -30,6 +30,15 @@ QUERY_REGISTRY_PROMPT_VERSION = "neural_query_registry_v1"
 QUERY_REVIEW_PROMPT_VERSION = "neural_query_review_v1"
 QUERY_RAG_TEXT_VERSION = "neural_query_rag_v1"
 
+_FIELD_CUE_CLAUSE_SPLIT = re.compile(r"[\n\r,;|]+")
+_FIELD_CUE_NUMBER = re.compile(
+    r"(?<![A-Za-z0-9_])(?:[<>]=?|[~≈])?\s*[-+]?(?:\d+(?:\.\d+)?|\.\d+)"
+)
+_FIELD_CUE_WORD = re.compile(r"[A-Za-z][A-Za-z0-9+/%().-]*")
+_FIELD_CUE_TRAILING_CONNECTORS = frozenset(
+    {"at", "are", "is", "of", "was", "were"}
+)
+
 
 class FrozenChunkEmbeddingCache:
     """Read-only, row-addressed access to a previously computed embedding cache.
@@ -257,6 +266,123 @@ def _contrastive_ngrams(
     ]
 
 
+def _literal_field_labels(text: str) -> List[str]:
+    """Return short labels next to values without using a domain vocabulary."""
+
+    labels: List[str] = []
+    for clause in _FIELD_CUE_CLAUSE_SPLIT.split(str(text)):
+        delimiter = re.search(r"[:=]", clause)
+        if delimiter is not None:
+            words = list(_FIELD_CUE_WORD.finditer(clause[: delimiter.start()]))
+            if words:
+                words = words[-4:]
+                labels.append(clause[words[0].start() : words[-1].end()])
+
+        cursor = 0
+        for value_match in _FIELD_CUE_NUMBER.finditer(clause):
+            prefix = clause[cursor : value_match.start()]
+            words = list(_FIELD_CUE_WORD.finditer(prefix))
+            while (
+                words
+                and words[-1].group(0).lower() in _FIELD_CUE_TRAILING_CONNECTORS
+            ):
+                words.pop()
+            if words:
+                words = words[-4:]
+                label = prefix[words[0].start() : words[-1].end()].strip()
+                if 1 < len(label) <= 80:
+                    labels.append(label)
+            cursor = value_match.end()
+    return labels
+
+
+def _literal_ngram_match(term: str, text: str) -> bool:
+    tokens = re.findall(r"[A-Za-z0-9]+", str(term))
+    if not tokens:
+        return False
+    pattern = r"(?<![A-Za-z0-9])" + r"\W+".join(
+        re.escape(token) for token in tokens
+    ) + r"(?![A-Za-z0-9])"
+    return re.search(pattern, str(text), flags=re.IGNORECASE) is not None
+
+
+def derive_evidence_field_cues(
+    retrieved_training_chunks: Sequence[Mapping[str, Any]],
+    contrastive_ngrams: Sequence[Mapping[str, Any]],
+    *,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Derive bounded navigation cues only from supplied training evidence.
+
+    Literal labels adjacent to values help expose multi-field records.  Ranked
+    n-grams retain the broader semantic retrieval signal.  Both sources must be
+    grounded in a supplied excerpt, and no clinical term inventory is used.
+    """
+
+    if int(limit) < 1:
+        return []
+    chunks = [dict(item) for item in retrieved_training_chunks]
+    records: Dict[str, Dict[str, Any]] = {}
+    first_seen = 0
+
+    def add(cue: str, *, source: str, evidence_ids: Sequence[str]) -> None:
+        nonlocal first_seen
+        literal = re.sub(r"\s+", " ", str(cue)).strip(" \t:=-")
+        if not literal or len(literal) > 80:
+            return
+        key = literal.casefold()
+        if key not in records:
+            records[key] = {
+                "cue": literal,
+                "source_kinds": [],
+                "supporting_evidence_ids": [],
+                "_first_seen": first_seen,
+            }
+            first_seen += 1
+        record = records[key]
+        if source not in record["source_kinds"]:
+            record["source_kinds"].append(source)
+        for evidence_id in evidence_ids:
+            if evidence_id and evidence_id not in record["supporting_evidence_ids"]:
+                record["supporting_evidence_ids"].append(evidence_id)
+
+    for chunk in chunks:
+        evidence_id = str(chunk.get("evidence_id") or "")
+        for label in _literal_field_labels(str(chunk.get("text") or "")):
+            add(
+                label,
+                source="literal_value_label",
+                evidence_ids=[evidence_id],
+            )
+
+    for item in contrastive_ngrams:
+        term = str(item.get("term") or "").strip()
+        supporting_ids = [
+            str(chunk.get("evidence_id") or "")
+            for chunk in chunks
+            if _literal_ngram_match(term, str(chunk.get("text") or ""))
+        ]
+        if supporting_ids:
+            add(
+                term,
+                source="contrastive_ngram",
+                evidence_ids=supporting_ids,
+            )
+
+    ranked = sorted(
+        records.values(),
+        key=lambda item: (
+            "literal_value_label" not in item["source_kinds"],
+            -len(item["supporting_evidence_ids"]),
+            int(item["_first_seen"]),
+        ),
+    )[: int(limit)]
+    return [
+        {key: value for key, value in item.items() if not key.startswith("_")}
+        for item in ranked
+    ]
+
+
 def build_query_evidence(
     *,
     bank: str,
@@ -274,6 +400,10 @@ def build_query_evidence(
     config.validate()
     if len(queries) != len(query_records):
         raise ValueError("one query record is required per query")
+    if len(row_ids) != len(chunk_matrices):
+        raise ValueError("row_ids and chunk_matrices must have equal lengths")
+    if any(not 0 <= int(row_id) < len(all_chunk_texts) for row_id in row_ids):
+        raise IndexError("an evidence row id is outside the chunk-text corpus")
     scores, indices = query_patient_top_chunks(
         chunk_matrices, queries, top_k=1, device=device
     )
@@ -401,6 +531,32 @@ def build_query_feature_context(
     config: NeuralQueryAgenticForestConfig,
 ) -> Dict[str, Any]:
     role = mechanical_role_for_bank(str(evidence["bank"]))
+    retrieved_training_chunks = [
+        {
+            key: value
+            for key, value in {
+                "evidence_id": str(item.get("evidence_id") or ""),
+                "chunk_index": item.get("chunk_index"),
+                "similarity": item.get("similarity"),
+                "text": str(item.get("text") or ""),
+            }.items()
+            if value is not None
+        }
+        for item in evidence.get("top_chunks") or []
+        if isinstance(item, Mapping)
+    ]
+    top_contrastive_ngrams = [
+        {
+            key: value
+            for key, value in {
+                "term": str(item.get("term") or ""),
+                "tfidf_contrast": item.get("tfidf_contrast"),
+            }.items()
+            if value is not None
+        }
+        for item in evidence.get("top_contrastive_ngrams") or []
+        if isinstance(item, Mapping)
+    ]
     return {
         "prompt_version": QUERY_FEATURE_PROMPT_VERSION,
         "query_id": str(evidence["query_id"]),
@@ -413,8 +569,21 @@ def build_query_feature_context(
             "member_subfolds": evidence.get("member_subfolds"),
             "statistical_gate_applied": False,
         },
-        "top_contrastive_ngrams": list(evidence.get("top_contrastive_ngrams") or []),
-        "retrieved_training_chunks": list(evidence.get("top_chunks") or []),
+        "evidence_field_cues": derive_evidence_field_cues(
+            retrieved_training_chunks,
+            top_contrastive_ngrams,
+            limit=int(config.evidence_top_ngrams),
+        ),
+        "field_cue_policy": {
+            "source_fields": [
+                "retrieved_training_chunks.text",
+                "top_contrastive_ngrams.term",
+            ],
+            "uses_fixed_clinical_vocabulary": False,
+            "forwards_unlisted_evidence_metadata": False,
+        },
+        "top_contrastive_ngrams": top_contrastive_ngrams,
+        "retrieved_training_chunks": retrieved_training_chunks,
     }
 
 
@@ -427,7 +596,7 @@ def render_query_feature_prompt(context: Mapping[str, Any]) -> str:
 The direction was learned from the {context['bank']} prediction objective. It was not selected or rejected by a statistical gate. Review all supplied retrieved chunks and contrastive phrases, identify the general semantic theme, and propose zero or more distinct patient-level variables actually represented by this evidence.
 
 Important rules:
-- You may propose multiple variables from one query when a retrieved object contains separable fields, such as ANC, ALC, NLR, and hemoglobin in a CBC section.
+- You may propose multiple variables when a retrieved object contains separable fields. To avoid overlooking them, inspect evidence_field_cues, which were mechanically derived only from literal labels and n-grams in the supplied training excerpts. Treat cues as navigation aids, not as a seed vocabulary, and require direct excerpt support for every proposal.
 - Return no variables when the query is administrative, incoherent, post-decision, or not operationally extractable.
 - Every feature must cite one or more supplied evidence_id values and short supporting phrases copied from those excerpts.
 - Use only information documented before the current treatment decision. Prior treatments,
@@ -450,7 +619,7 @@ Return exactly one JSON object:
     "categories": ["canonical categories for categorical variables"],
     "description": "precise pre-treatment extraction contract, including units/timing",
     "clinical_domain": "short domain",
-    "parent_object": "reusable parent object such as baseline CBC",
+    "parent_object": "reusable source object or report section",
     "supporting_evidence_ids": ["supplied evidence_id"],
     "supporting_phrases": ["short exact phrase from supplied excerpt"],
     "rationale": "why the evidence represents this variable"

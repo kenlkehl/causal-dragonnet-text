@@ -59,6 +59,17 @@ def _compute_config_hash(config: Dict[str, Any]) -> str:
             'extraction_max_text_length',
             config.get('max_text_length', 400000),
         ),
+        'extraction_grouping_strategy': config.get(
+            'extraction_grouping_strategy', 'clinical_domain'
+        ),
+        'extraction_grouping_version': config.get('extraction_grouping_version', ''),
+        'extraction_request_group_sha256': config.get(
+            'extraction_request_group_sha256', ''
+        ),
+        'extraction_context_strategy': config.get('extraction_context_strategy', 'tail'),
+        'extraction_context_compactor_version': config.get(
+            'extraction_context_compactor_version', ''
+        ),
         'patient_text_hash': config.get('patient_text_hash', ''),
         'temporal_cutoff': config.get('temporal_cutoff', ''),
         'max_variables_per_extraction_request': config.get(

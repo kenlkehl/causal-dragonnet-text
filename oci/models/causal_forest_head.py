@@ -8,6 +8,7 @@ import numpy as np
 try:
     from econml.dml import CausalForestDML
     from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+
     ECONML_AVAILABLE = True
 except ImportError:
     ECONML_AVAILABLE = False
@@ -88,8 +89,7 @@ class CausalForestHead:
         """
         if not ECONML_AVAILABLE:
             raise ImportError(
-                "econml is required for CausalForestHead. "
-                "Install with: pip install econml"
+                "econml is required for CausalForestHead. " "Install with: pip install econml"
             )
 
         self.n_estimators = n_estimators
@@ -104,6 +104,45 @@ class CausalForestHead:
         # The CausalForestDML model (created during fit)
         self.model = None
         self._fitted = False
+        self.tuning_attempted_ = False
+        self.tuning_succeeded_ = None
+        self.effective_forest_parameters_ = None
+
+    def _configured_forest_parameters(self) -> Dict[str, Any]:
+        return {
+            "n_estimators": int(self.n_estimators),
+            "max_depth": self.max_depth,
+            "min_samples_leaf": int(self.min_samples_leaf),
+            "max_features": self.max_features,
+            "honest": bool(self.honest),
+            "inference": bool(self.inference),
+            "random_state": int(self.random_state),
+        }
+
+    def _effective_forest_parameters(self) -> Dict[str, Any]:
+        """Return the post-tuning forest parameters that affect final fitting."""
+
+        if self.model is None:
+            raise RuntimeError("causal forest model has not been created")
+        raw: Dict[str, Any] = {}
+        get_params = getattr(self.model, "get_params", None)
+        if callable(get_params):
+            candidate = get_params(deep=False)
+            if isinstance(candidate, dict):
+                raw = candidate
+        elif isinstance(getattr(self.model, "kwargs", None), dict):
+            # Deterministic test doubles expose their constructor parameters
+            # this way; the production EconML estimator uses get_params().
+            raw = self.model.kwargs
+        effective: Dict[str, Any] = {}
+        for name, fallback in self._configured_forest_parameters().items():
+            value = raw.get(name, fallback)
+            if isinstance(value, np.generic):
+                value = value.item()
+            if value is not None and not isinstance(value, (bool, int, float, str)):
+                raise TypeError(f"effective causal-forest parameter {name} is not scalar")
+            effective[name] = value
+        return effective
 
     def _create_model(self):
         """Create an unfitted CausalForestDML with configured nuisance models."""
@@ -112,7 +151,7 @@ class CausalForestHead:
             max_depth=self.max_depth,
             min_samples_leaf=self.min_samples_leaf,
             random_state=self.random_state,
-            n_jobs=-1
+            n_jobs=-1,
         )
         logger.info("Using random forest for propensity estimation (on neural features)")
 
@@ -121,7 +160,7 @@ class CausalForestHead:
             max_depth=self.max_depth,
             min_samples_leaf=self.min_samples_leaf,
             random_state=self.random_state,
-            n_jobs=-1
+            n_jobs=-1,
         )
         logger.info("Using random forest for outcome estimation (on neural features)")
 
@@ -136,7 +175,7 @@ class CausalForestHead:
             honest=self.honest,
             inference=self.inference,
             random_state=self.random_state,
-            n_jobs=-1
+            n_jobs=-1,
         )
 
     def fit(
@@ -146,8 +185,8 @@ class CausalForestHead:
         Y: np.ndarray,
         W: Optional[np.ndarray] = None,
         propensity: Optional[np.ndarray] = None,
-        outcome_pred: Optional[np.ndarray] = None
-    ) -> 'CausalForestHead':
+        outcome_pred: Optional[np.ndarray] = None,
+    ) -> "CausalForestHead":
         """
         Fit causal forest on extracted features.
 
@@ -165,15 +204,26 @@ class CausalForestHead:
         n_samples = X.shape[0] if X is not None else len(Y)
         x_dim = X.shape[1] if X is not None else 0
         w_msg = f", W={W.shape[1]} controls" if W is not None else ""
-        logger.info(f"Fitting CausalForestDML on {n_samples} samples with X={x_dim} features{w_msg}")
+        logger.info(
+            f"Fitting CausalForestDML on {n_samples} samples with X={x_dim} features{w_msg}"
+        )
 
         # Ensure arrays are the right shape
         T = np.asarray(T).flatten()
         Y = np.asarray(Y).flatten()
 
         self.model = self._create_model()
+        self.tuning_attempted_ = bool(self.tune_model)
+        self.tuning_succeeded_ = None
         if self.tune_model:
-            if not tune_causal_forest_model(self.model, Y=Y, T=T, X=X, W=W):
+            self.tuning_succeeded_ = tune_causal_forest_model(
+                self.model,
+                Y=Y,
+                T=T,
+                X=X,
+                W=W,
+            )
+            if not self.tuning_succeeded_:
                 logger.info("Rebuilding CausalForestDML after failed tuning attempt")
                 self.model = self._create_model()
         else:
@@ -182,16 +232,31 @@ class CausalForestHead:
         # Fit the model
         # CausalForestDML expects T as 1D and Y as 1D
         self.model.fit(Y=Y, T=T, X=X, W=W)
+        self.effective_forest_parameters_ = self._effective_forest_parameters()
         self._fitted = True
 
         logger.info("CausalForestDML fitting complete")
         return self
 
+    def fit_audit(self) -> Dict[str, Any]:
+        """Return actual tuning status and effective post-tuning parameters."""
+
+        if not self._fitted or self.effective_forest_parameters_ is None:
+            raise RuntimeError("CausalForestHead must be fit before requesting its audit")
+        return {
+            "configured_parameters": self._configured_forest_parameters(),
+            "tuning_configured": bool(self.tune_model),
+            "tuning_attempted": bool(self.tuning_attempted_),
+            "tuning_succeeded": self.tuning_succeeded_,
+            "tuning_failure_fell_back_to_configured_parameters": bool(
+                self.tuning_attempted_ and self.tuning_succeeded_ is False
+            ),
+            "tuning_params": "auto" if self.tune_model else None,
+            "effective_parameters": dict(self.effective_forest_parameters_),
+        }
+
     def predict(
-        self,
-        X: Optional[np.ndarray],
-        return_ci: bool = True,
-        alpha: float = 0.05
+        self, X: Optional[np.ndarray], return_ci: bool = True, alpha: float = 0.05
     ) -> Dict[str, np.ndarray]:
         """
         Predict ITE with optional confidence intervals.
@@ -213,9 +278,7 @@ class CausalForestHead:
         # Point estimates
         tau_pred = self.model.effect(X).flatten()
 
-        result = {
-            'tau_pred': tau_pred
-        }
+        result = {"tau_pred": tau_pred}
 
         # Confidence intervals (if available)
         if return_ci and self.inference:
@@ -223,19 +286,19 @@ class CausalForestHead:
                 # Get inference object
                 inference_result = self.model.effect_inference(X)
                 ci = inference_result.conf_int(alpha=alpha)
-                result['tau_lower'] = ci[0].flatten()
-                result['tau_upper'] = ci[1].flatten()
-                result['tau_std'] = inference_result.std_point.flatten() if hasattr(inference_result, 'std_point') else None
+                result["tau_lower"] = ci[0].flatten()
+                result["tau_upper"] = ci[1].flatten()
+                result["tau_std"] = (
+                    inference_result.std_point.flatten()
+                    if hasattr(inference_result, "std_point")
+                    else None
+                )
             except Exception as e:
                 logger.warning(f"Could not compute confidence intervals: {e}")
 
         return result
 
-    def effect_summary(
-        self,
-        X: Optional[np.ndarray],
-        alpha: float = 0.05
-    ) -> Dict[str, Any]:
+    def effect_summary(self, X: Optional[np.ndarray], alpha: float = 0.05) -> Dict[str, Any]:
         """
         Get summary statistics of treatment effects.
 
@@ -247,38 +310,38 @@ class CausalForestHead:
             Dictionary with summary statistics
         """
         preds = self.predict(X, return_ci=True, alpha=alpha)
-        tau = preds['tau_pred']
+        tau = preds["tau_pred"]
 
         summary = {
-            'ate': np.mean(tau),
-            'ate_std': np.std(tau),
-            'tau_min': np.min(tau),
-            'tau_max': np.max(tau),
-            'tau_median': np.median(tau),
-            'n_samples': len(tau),
-            'n_positive_effect': np.sum(tau > 0),
-            'n_negative_effect': np.sum(tau < 0),
+            "ate": np.mean(tau),
+            "ate_std": np.std(tau),
+            "tau_min": np.min(tau),
+            "tau_max": np.max(tau),
+            "tau_median": np.median(tau),
+            "n_samples": len(tau),
+            "n_positive_effect": np.sum(tau > 0),
+            "n_negative_effect": np.sum(tau < 0),
         }
 
-        if 'tau_lower' in preds and preds['tau_lower'] is not None:
+        if "tau_lower" in preds and preds["tau_lower"] is not None:
             # Proportion of significant effects (CI doesn't include 0)
-            significant = (preds['tau_lower'] > 0) | (preds['tau_upper'] < 0)
-            summary['n_significant'] = np.sum(significant)
-            summary['pct_significant'] = np.mean(significant) * 100
+            significant = (preds["tau_lower"] > 0) | (preds["tau_upper"] < 0)
+            summary["n_significant"] = np.sum(significant)
+            summary["pct_significant"] = np.mean(significant) * 100
 
         return summary
 
     def get_state(self) -> Dict[str, Any]:
         """Get serializable state for checkpointing."""
         return {
-            'n_estimators': self.n_estimators,
-            'max_depth': self.max_depth,
-            'min_samples_leaf': self.min_samples_leaf,
-            'max_features': self.max_features,
-            'honest': self.honest,
-            'inference': self.inference,
-            'random_state': self.random_state,
-            'fitted': self._fitted
+            "n_estimators": self.n_estimators,
+            "max_depth": self.max_depth,
+            "min_samples_leaf": self.min_samples_leaf,
+            "max_features": self.max_features,
+            "honest": self.honest,
+            "inference": self.inference,
+            "random_state": self.random_state,
+            "fitted": self._fitted,
         }
 
 
@@ -301,7 +364,7 @@ class _FixedPropensityModel:
         """Return propensity as probability."""
         n = X.shape[0]
         # Return as 2-column array [P(T=0), P(T=1)]
-        p = self.propensity_scores[self._idx:self._idx + n]
+        p = self.propensity_scores[self._idx : self._idx + n]
         self._idx += n
         return np.column_stack([1 - p, p])
 
@@ -329,6 +392,6 @@ class _FixedOutcomeModel:
     def predict(self, X):
         """Return outcome predictions."""
         n = X.shape[0]
-        preds = self.outcome_preds[self._idx:self._idx + n]
+        preds = self.outcome_preds[self._idx : self._idx + n]
         self._idx += n
         return preds

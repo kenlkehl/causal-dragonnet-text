@@ -35,8 +35,12 @@ def _patch_econml_dependencies(monkeypatch):
     FakeCausalForestDML.fail_tune = False
     monkeypatch.setattr(causal_forest_head, "ECONML_AVAILABLE", True)
     monkeypatch.setattr(causal_forest_head, "CausalForestDML", FakeCausalForestDML)
-    monkeypatch.setattr(causal_forest_head, "RandomForestClassifier", FakeNuisanceModel, raising=False)
-    monkeypatch.setattr(causal_forest_head, "RandomForestRegressor", FakeNuisanceModel, raising=False)
+    monkeypatch.setattr(
+        causal_forest_head, "RandomForestClassifier", FakeNuisanceModel, raising=False
+    )
+    monkeypatch.setattr(
+        causal_forest_head, "RandomForestRegressor", FakeNuisanceModel, raising=False
+    )
 
 
 def test_causal_forest_head_tunes_before_fit(monkeypatch):
@@ -58,6 +62,11 @@ def test_causal_forest_head_tunes_before_fit(monkeypatch):
     np.testing.assert_array_equal(model.calls[0][1]["X"], X)
     np.testing.assert_array_equal(model.calls[0][1]["W"], W)
     np.testing.assert_array_equal(model.calls[1][1]["W"], W)
+    audit = head.fit_audit()
+    assert audit["tuning_attempted"] is True
+    assert audit["tuning_succeeded"] is True
+    assert audit["tuning_failure_fell_back_to_configured_parameters"] is False
+    assert audit["effective_parameters"]["n_estimators"] == 8
 
 
 def test_causal_forest_head_warns_rebuilds_and_fits_when_tuning_fails(monkeypatch, caplog):
@@ -79,6 +88,11 @@ def test_causal_forest_head_warns_rebuilds_and_fits_when_tuning_fails(monkeypatc
     assert second_model.calls[0][0] == "fit"
     np.testing.assert_array_equal(second_model.calls[0][1]["W"], W)
     assert "CausalForestDML hyperparameter tuning failed" in caplog.text
+    audit = head.fit_audit()
+    assert audit["tuning_attempted"] is True
+    assert audit["tuning_succeeded"] is False
+    assert audit["tuning_failure_fell_back_to_configured_parameters"] is True
+    assert audit["effective_parameters"] == audit["configured_parameters"]
 
 
 def test_causal_forest_head_can_use_fixed_configuration_without_tuning(monkeypatch):
@@ -97,6 +111,10 @@ def test_causal_forest_head_can_use_fixed_configuration_without_tuning(monkeypat
 
     assert len(FakeCausalForestDML.instances) == 1
     assert head.model.calls[0][0] == "fit"
+    audit = head.fit_audit()
+    assert audit["tuning_attempted"] is False
+    assert audit["tuning_succeeded"] is None
+    assert audit["tuning_failure_fell_back_to_configured_parameters"] is False
 
 
 def test_tune_causal_forest_model_returns_false_on_failure(caplog):

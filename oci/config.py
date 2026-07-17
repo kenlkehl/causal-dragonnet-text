@@ -110,6 +110,7 @@ def normalize_tfidf_topic_feature_discovery_methods(
         )
     return normalized
 
+
 _MULTI_MODEL_FEATURE_DISCOVERY_METHOD_ALIASES = {
     "bow": {
         "bow",
@@ -305,8 +306,16 @@ class ExplicitFeatureExtractionConfig:
     extraction_request_timeout: Optional[float] = 900.0
     extraction_temperature: float = 0.0  # LLM temperature (0 for deterministic)
     extraction_max_tokens: int = 25000  # Max tokens for LLM response
-    extraction_max_text_length: int = 400000  # Max clinical text chars in extraction prompt
+    extraction_max_text_length: Optional[int] = 400000  # Max text chars in extraction prompt
+    # Request packing and document-context selection. Defaults preserve the
+    # historical domain grouping and note-tail prompt behavior.
+    extraction_grouping_strategy: str = "clinical_domain"
+    extraction_context_strategy: str = "tail"
     extraction_provider: str = "openai"
+    # Opt-in for datasets whose text has already been made temporally valid by
+    # construction. The legacy default preserves treatment-time extraction
+    # eligibility instructions for every existing caller.
+    source_text_temporally_valid_by_design: bool = False
     codex_cli_executable: str = "codex"
     codex_cli_model_name: Optional[str] = "gpt-5.4-mini"
     codex_cli_reasoning_effort: Optional[str] = "medium"
@@ -323,13 +332,40 @@ class ExplicitFeatureExtractionConfig:
     featurizer_dropout: float = 0.1
 
     def __post_init__(self):
+        if not isinstance(self.source_text_temporally_valid_by_design, bool):
+            raise ValueError(
+                "explicit_features.source_text_temporally_valid_by_design must be boolean"
+            )
         if not 1 <= int(self.max_variables_per_extraction_request) <= 10:
             raise ValueError(
                 "explicit_features.max_variables_per_extraction_request must be in [1, 10]"
             )
-        self.max_variables_per_extraction_request = int(
-            self.max_variables_per_extraction_request
-        )
+        self.max_variables_per_extraction_request = int(self.max_variables_per_extraction_request)
+        grouping = str(self.extraction_grouping_strategy).strip().lower().replace("-", "_")
+        if grouping not in {"clinical_domain", "packed"}:
+            raise ValueError(
+                "explicit_features.extraction_grouping_strategy must be "
+                "'clinical_domain' or 'packed'"
+            )
+        self.extraction_grouping_strategy = grouping
+        context = str(self.extraction_context_strategy).strip().lower().replace("-", "_")
+        if context not in {"tail", "contract_lexical_rag"}:
+            raise ValueError(
+                "explicit_features.extraction_context_strategy must be "
+                "'tail' or 'contract_lexical_rag'"
+            )
+        self.extraction_context_strategy = context
+        if self.extraction_max_text_length is not None:
+            self.extraction_max_text_length = int(self.extraction_max_text_length)
+            if self.extraction_max_text_length < 1:
+                raise ValueError("explicit_features.extraction_max_text_length must be positive")
+        if context == "contract_lexical_rag" and (
+            self.extraction_max_text_length is None or self.extraction_max_text_length < 256
+        ):
+            raise ValueError(
+                "explicit_features.extraction_max_text_length must be at least 256 "
+                "for contract_lexical_rag"
+            )
 
 
 def parse_explicit_feature_spec_entries(
@@ -674,6 +710,15 @@ class ExplicitFeatureForestConfig:
     max_features: str = "sqrt"
     honest: bool = True
     inference: bool = True
+    # Outcome-regression interaction head used by the integrated evidence
+    # pathway.  The regularization value is selected by fit-sample inner CV on
+    # observed outcome loss; no ITE labels are available to this selection.
+    interaction_regularization_grid: List[float] = field(
+        default_factory=lambda: [0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0]
+    )
+    interaction_inner_folds: int = 3
+    interaction_interact_all_features: bool = True
+    interaction_max_iter: int = 3000
 
 
 ConfounderForestConfig = ExplicitFeatureForestConfig
@@ -727,6 +772,10 @@ class AgenticFeatureSearchConfig:
     agent_max_tokens: int = 25000
     # None leaves the endpoint's chat-template reasoning behavior unchanged.
     agent_enable_thinking: Optional[bool] = None
+    # Optional server-side reasoning budget.  This is sent only when thinking
+    # is explicitly enabled, so a configured budget cannot silently turn
+    # reasoning on for endpoints or workflows that leave it disabled.
+    agent_thinking_token_budget: Optional[int] = None
     agent_schema_repair_attempts: int = 1
     agent_request_max_retries: int = 3
     agent_retry_initial_delay: float = 1.0
@@ -764,6 +813,33 @@ class AgenticFeatureSearchConfig:
             raise ValueError("agentic_feature_search.max_removals_per_iter must be >= 0")
         if self.agent_request_timeout is not None and self.agent_request_timeout <= 0:
             raise ValueError("agentic_feature_search.agent_request_timeout must be > 0 or None")
+        if self.agent_enable_thinking is not None and not isinstance(
+            self.agent_enable_thinking, bool
+        ):
+            raise ValueError(
+                "agentic_feature_search.agent_enable_thinking must be a boolean or None"
+            )
+        if (
+            isinstance(self.agent_max_tokens, bool)
+            or not isinstance(self.agent_max_tokens, int)
+            or self.agent_max_tokens <= 0
+        ):
+            raise ValueError("agentic_feature_search.agent_max_tokens must be a positive integer")
+        if self.agent_thinking_token_budget is not None:
+            if (
+                isinstance(self.agent_thinking_token_budget, bool)
+                or not isinstance(self.agent_thinking_token_budget, int)
+                or self.agent_thinking_token_budget <= 0
+            ):
+                raise ValueError(
+                    "agentic_feature_search.agent_thinking_token_budget must be a "
+                    "positive integer or None"
+                )
+            if self.agent_thinking_token_budget >= self.agent_max_tokens:
+                raise ValueError(
+                    "agentic_feature_search.agent_thinking_token_budget must be "
+                    "strictly less than agent_max_tokens"
+                )
         if not 0.0 <= self.min_feature_coverage <= 1.0:
             raise ValueError("agentic_feature_search.min_feature_coverage must be in [0, 1]")
         if self.search_mode not in {"iterative", "broad_screen"}:
@@ -1113,40 +1189,28 @@ class TfidfTopicDiscoveryConfig:
                 "score_test_min_topics_per_bank"
             )
         if self.score_test_full_topic_min_inner_folds < 1:
-            raise ValueError(
-                "tfidf_topic.score_test_full_topic_min_inner_folds must be >= 1"
-            )
+            raise ValueError("tfidf_topic.score_test_full_topic_min_inner_folds must be >= 1")
         if float(self.orphan_ngram_min_abs_fit_score) < 0.0:
-            raise ValueError(
-                "tfidf_topic.orphan_ngram_min_abs_fit_score must be >= 0"
-            )
+            raise ValueError("tfidf_topic.orphan_ngram_min_abs_fit_score must be >= 0")
         if not 1 <= int(self.orphan_ngram_cluster_max_terms) <= 15:
-            raise ValueError(
-                "tfidf_topic.orphan_ngram_cluster_max_terms must be in [1, 15]"
-            )
+            raise ValueError("tfidf_topic.orphan_ngram_cluster_max_terms must be in [1, 15]")
         if int(self.orphan_ngram_cluster_neighbors) < 1:
-            raise ValueError(
-                "tfidf_topic.orphan_ngram_cluster_neighbors must be >= 1"
-            )
+            raise ValueError("tfidf_topic.orphan_ngram_cluster_neighbors must be >= 1")
         if int(self.orphan_ngram_max_selected_clusters) < 0:
-            raise ValueError(
-                "tfidf_topic.orphan_ngram_max_selected_clusters must be >= 0"
-            )
-        if not 0 <= int(self.orphan_ngram_min_selected_clusters) <= int(
-            self.orphan_ngram_max_selected_clusters
+            raise ValueError("tfidf_topic.orphan_ngram_max_selected_clusters must be >= 0")
+        if (
+            not 0
+            <= int(self.orphan_ngram_min_selected_clusters)
+            <= int(self.orphan_ngram_max_selected_clusters)
         ):
             raise ValueError(
                 "tfidf_topic.orphan_ngram_min_selected_clusters must be in "
                 "[0, orphan_ngram_max_selected_clusters]"
             )
         if int(self.orphan_ngram_full_min_inner_folds) < 1:
-            raise ValueError(
-                "tfidf_topic.orphan_ngram_full_min_inner_folds must be >= 1"
-            )
+            raise ValueError("tfidf_topic.orphan_ngram_full_min_inner_folds must be >= 1")
         if self.orphan_ngram_enabled and not self.score_test_enabled:
-            raise ValueError(
-                "tfidf_topic.orphan_ngram_enabled requires score_test_enabled"
-            )
+            raise ValueError("tfidf_topic.orphan_ngram_enabled requires score_test_enabled")
         for field_name in (
             "minimum_nuisance_source_agreement",
             "minimum_subsample_selection_fraction",
@@ -1339,7 +1403,9 @@ class MultiModelAgenticForestConfig:
             )
         self.agent_context_mode = agent_context_mode
         if self.concept_inventory_max_concepts < 1:
-            raise ValueError("multi_model_agentic_forest.concept_inventory_max_concepts must be >= 1")
+            raise ValueError(
+                "multi_model_agentic_forest.concept_inventory_max_concepts must be >= 1"
+            )
         if self.candidate_consistency_inner_folds < 2:
             raise ValueError(
                 "multi_model_agentic_forest.candidate_consistency_inner_folds must be >= 2"
@@ -1396,13 +1462,10 @@ class MultiModelAgenticForestConfig:
             )
         if not 0.0 <= self.parsimony_cluster_semantic_weight <= 1.0:
             raise ValueError(
-                "multi_model_agentic_forest.parsimony_cluster_semantic_weight "
-                "must be in [0, 1]"
+                "multi_model_agentic_forest.parsimony_cluster_semantic_weight " "must be in [0, 1]"
             )
         if self.parsimony_cluster_neighbors < 1:
-            raise ValueError(
-                "multi_model_agentic_forest.parsimony_cluster_neighbors must be >= 1"
-            )
+            raise ValueError("multi_model_agentic_forest.parsimony_cluster_neighbors must be >= 1")
         for field_name in [
             "parsimony_cluster_combined_threshold",
             "parsimony_cluster_empirical_min_similarity",
@@ -1412,31 +1475,22 @@ class MultiModelAgenticForestConfig:
         ]:
             value = float(getattr(self, field_name))
             if not 0.0 <= value <= 1.0:
-                raise ValueError(
-                    f"multi_model_agentic_forest.{field_name} must be in [0, 1]"
-                )
+                raise ValueError(f"multi_model_agentic_forest.{field_name} must be in [0, 1]")
         if self.parsimony_cluster_min_size < 2:
-            raise ValueError(
-                "multi_model_agentic_forest.parsimony_cluster_min_size must be >= 2"
-            )
+            raise ValueError("multi_model_agentic_forest.parsimony_cluster_min_size must be >= 2")
         if self.parsimony_cluster_max_size < self.parsimony_cluster_min_size:
             raise ValueError(
                 "multi_model_agentic_forest.parsimony_cluster_max_size must be >= "
                 "parsimony_cluster_min_size"
             )
         if self.parsimony_cluster_sketch_dim < 1:
-            raise ValueError(
-                "multi_model_agentic_forest.parsimony_cluster_sketch_dim must be >= 1"
-            )
+            raise ValueError("multi_model_agentic_forest.parsimony_cluster_sketch_dim must be >= 1")
         if not 1 <= self.parsimony_max_factors_per_cluster <= 2:
             raise ValueError(
-                "multi_model_agentic_forest.parsimony_max_factors_per_cluster "
-                "must be 1 or 2"
+                "multi_model_agentic_forest.parsimony_max_factors_per_cluster " "must be 1 or 2"
             )
         if self.parsimony_metric_epsilon < 0.0:
-            raise ValueError(
-                "multi_model_agentic_forest.parsimony_metric_epsilon must be >= 0"
-            )
+            raise ValueError("multi_model_agentic_forest.parsimony_metric_epsilon must be >= 0")
         _validate_parallelism_setting(
             self.candidate_consistency_parallelism,
             "multi_model_agentic_forest.candidate_consistency_parallelism",
@@ -1522,6 +1576,10 @@ class MultiModelForestConfig(MultiModelAgenticForestConfig):
     """Configuration for the integrated two-stage multi-model forest path."""
 
     tfidf_topic: TfidfTopicDiscoveryConfig = field(default_factory=TfidfTopicDiscoveryConfig)
+    # Optional audited outer/inner fold registry for exact-context Stage 1/2
+    # artifact reproduction.  The registry content, rather than its path, is
+    # incorporated into the Stage 1 cache identity.
+    split_registry_path: Optional[str] = None
     # Outer-fold execution backend for CPU-only TF-IDF/NMF contexts.
     outer_parallel_backend: str = "threads"
     # Optional overrides for the two nested fold families. When unset, the legacy
@@ -1548,6 +1606,10 @@ class MultiModelForestConfig(MultiModelAgenticForestConfig):
     matched_pair_bow_l2_alpha: float = 1.0
     matched_pair_bow_max_iter: int = 100
     matched_pair_htr_attention_pairs_per_fold: int = 16
+    # Final structured CATE head.  Keep the honest causal-forest path as the
+    # production default; the interaction S-learner remains an explicit
+    # diagnostic/ablation option.
+    structured_effect_estimator: str = "causal_forest"
 
     def __post_init__(self):
         raw_methods = self.feature_discovery_methods
@@ -1589,13 +1651,20 @@ class MultiModelForestConfig(MultiModelAgenticForestConfig):
             super().__post_init__()
         if isinstance(self.tfidf_topic, dict):
             self.tfidf_topic = TfidfTopicDiscoveryConfig(**self.tfidf_topic)
+        if self.split_registry_path is not None:
+            registry_path = str(self.split_registry_path).strip()
+            self.split_registry_path = registry_path or None
         backend = str(self.outer_parallel_backend).strip().lower()
-        if backend not in {"threads", "processes", "loky"}:
+        if backend not in {"threads", "processes", "loky", "multiprocessing", "fork"}:
             raise ValueError(
                 "multi_model_forest.outer_parallel_backend must be "
-                "'threads', 'processes', or 'loky'"
+                "'threads', 'processes', 'loky', 'multiprocessing', or 'fork'"
             )
-        self.outer_parallel_backend = "processes" if backend == "loky" else backend
+        backend_aliases = {
+            "loky": "processes",
+            "fork": "multiprocessing",
+        }
+        self.outer_parallel_backend = backend_aliases.get(backend, backend)
         for field_name in ("bow_fold_parallelism", "htr_fold_parallelism"):
             value = getattr(self, field_name)
             if value is None:
@@ -1616,13 +1685,9 @@ class MultiModelForestConfig(MultiModelAgenticForestConfig):
         self.cpus_total = None if self.cpus_total is None else int(self.cpus_total)
         self.htr_jobs_per_gpu = int(self.htr_jobs_per_gpu)
         if not 0.0 < float(self.matched_pair_propensity_caliper) <= 1.0:
-            raise ValueError(
-                "multi_model_forest.matched_pair_propensity_caliper must be in (0, 1]"
-            )
+            raise ValueError("multi_model_forest.matched_pair_propensity_caliper must be in (0, 1]")
         if not 0.0 < float(self.matched_pair_outcome_caliper) <= 1.0:
-            raise ValueError(
-                "multi_model_forest.matched_pair_outcome_caliper must be in (0, 1]"
-            )
+            raise ValueError("multi_model_forest.matched_pair_outcome_caliper must be in (0, 1]")
         if int(self.matched_pair_max_controls_per_candidate) < 1:
             raise ValueError(
                 "multi_model_forest.matched_pair_max_controls_per_candidate must be >= 1"
@@ -1652,6 +1717,20 @@ class MultiModelForestConfig(MultiModelAgenticForestConfig):
         self.matched_pair_htr_attention_pairs_per_fold = int(
             self.matched_pair_htr_attention_pairs_per_fold
         )
+        estimator = str(self.structured_effect_estimator).strip().lower().replace("-", "_")
+        estimator_aliases = {
+            "interaction": "interaction_s_learner",
+            "s_learner": "interaction_s_learner",
+            "interaction_s_learner": "interaction_s_learner",
+            "causal_forest": "causal_forest",
+            "forest": "causal_forest",
+        }
+        if estimator not in estimator_aliases:
+            raise ValueError(
+                "multi_model_forest.structured_effect_estimator must be "
+                "'interaction_s_learner' or 'causal_forest'"
+            )
+        self.structured_effect_estimator = estimator_aliases[estimator]
 
 
 @dataclass
@@ -2092,6 +2171,10 @@ class ModelArchitectureConfig:
     htr_sentence_pooling: str = "auto"
     htr_normalize_sentence_embeddings: bool = True
     htr_trainable_sentence_encoder_layers: int = 0
+    # Historical all-evidence Stage-1 sets this runtime-only safety policy to
+    # True after loading its immutable source config.  Generic hash-backed HTR
+    # tests leave it False because they intentionally have no live encoder.
+    htr_require_live_unfrozen_encoder_attestation: bool = False
     htr_role_attention: bool = False
     htr_w_attention_heads: int = 1
     htr_x_attention_heads: int = 1
@@ -2568,33 +2651,14 @@ class ExperimentConfig:
                 )
         if self.applied_inference.architecture.model_type == "multi_model_forest":
             mm_config = self.applied_inference.architecture.multi_model_forest
-            methods = normalize_multi_model_feature_discovery_methods(
+            methods = normalize_tfidf_topic_feature_discovery_methods(
                 getattr(mm_config, "feature_discovery_methods", None),
                 source="multi_model_forest.feature_discovery_methods",
             )
-            if methods is None:
-                methods = mm_config._feature_discovery_methods_from_flags()
             if not methods:
                 raise ValueError(
-                    "multi_model_forest must enable at least one feature "
-                    "discovery method: bow, htr, or embedding_contrast"
-                )
-            embedding_config = mm_config.embedding_contrast
-            if (
-                not bool(getattr(embedding_config, "enabled", False))
-                and not str(getattr(embedding_config, "disable_reason", "") or "").strip()
-            ):
-                raise ValueError(
-                    "multi_model_forest.embedding_contrast.enabled=False "
-                    "requires embedding_contrast.disable_reason"
-                )
-            if (
-                not bool(getattr(mm_config, "htr_evidence_enabled", True))
-                and not str(getattr(mm_config, "htr_evidence_disable_reason", "") or "").strip()
-            ):
-                raise ValueError(
-                    "multi_model_forest.htr_evidence_enabled=False "
-                    "requires htr_evidence_disable_reason"
+                    "multi_model_forest v2 must enable BoW nuisance modeling "
+                    "and TF-IDF topic contrast discovery"
                 )
         if self.applied_inference.architecture.model_type == "causal_forest":
             cf_config = self.applied_inference.architecture.causal_forest

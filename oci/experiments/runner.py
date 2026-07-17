@@ -88,6 +88,11 @@ class ExperimentRunner:
         from ..inference.applied import run_applied_inference
 
         applied_config = self.config.applied_inference
+        # Applied inference owns its nested splitters, so propagate the
+        # experiment seed explicitly instead of relying on process-global RNG
+        # state. AppliedInferenceConfig remains backward-compatible for direct
+        # callers that do not attach a seed.
+        applied_config.seed = int(self.config.seed)
 
         logger.info(f"Loading dataset: {applied_config.dataset_path}")
         df = load_dataset(applied_config.dataset_path)

@@ -48,6 +48,10 @@ from ..config import (
 )
 from ..models.causal_forest_head import CausalForestHead
 from ..models.extractor_factory import create_feature_extractor
+from ..models.hierarchical_transformer_extractor import (
+    HTR_SENTENCE_ENCODER_TRAINING_AUDIT_SCHEMA,
+    HierarchicalTransformerExtractor,
+)
 from .agentic_explicit_feature_forest import (
     AgenticFeatureProposal,
     OpenAICompatibleFeatureSearchAgent,
@@ -1224,6 +1228,114 @@ class AgenticAttentionVariableForestRunner:
                 0,
             ),
         )
+
+    def _assert_htr_sentence_encoder_training_state(
+        self,
+        extractor: nn.Module,
+    ) -> Dict[str, Any]:
+        """Fail before optimization if the live HTR encoder state is inexact."""
+
+        configured_type = (
+            str(
+                getattr(
+                    self.config.architecture,
+                    "feature_extractor_type",
+                    "hierarchical_transformer",
+                )
+            )
+            .strip()
+            .lower()
+        )
+        htr_requested = configured_type in {
+            "hierarchical_transformer",
+            "htr",
+            "frozen_llm_pooler",
+        }
+        production_attestation_required = bool(
+            getattr(
+                self.config.architecture,
+                "htr_require_live_unfrozen_encoder_attestation",
+                False,
+            )
+        )
+        if not htr_requested:
+            return {
+                "schema_version": HTR_SENTENCE_ENCODER_TRAINING_AUDIT_SCHEMA,
+                "htr_requested": False,
+            }
+        if type(extractor) is not HierarchicalTransformerExtractor:
+            if not production_attestation_required:
+                return {
+                    "schema_version": HTR_SENTENCE_ENCODER_TRAINING_AUDIT_SCHEMA,
+                    "htr_requested": True,
+                    "test_double_without_production_attestation": True,
+                }
+            raise TypeError("HTR training requires the exact HierarchicalTransformerExtractor")
+        audit = extractor.sentence_encoder_training_audit()
+        if audit.get("schema_version") != HTR_SENTENCE_ENCODER_TRAINING_AUDIT_SCHEMA:
+            raise RuntimeError("HTR sentence-encoder training audit schema changed")
+        requested_freeze = getattr(
+            self.config.architecture,
+            "htr_freeze_sentence_encoder",
+            None,
+        )
+        if audit.get("requested_freeze_sentence_encoder") is not requested_freeze:
+            raise RuntimeError("live HTR extractor freeze state differs from its effective config")
+        if requested_freeze is False:
+            if audit.get("hash_backend_without_sentence_encoder") is True:
+                # Deterministic hash extractors are retained for lightweight
+                # tests; the historical production backend authenticates a
+                # concrete private transformer model tree instead.
+                if production_attestation_required:
+                    raise RuntimeError(
+                        "production HTR requires a live trainable transformer "
+                        "sentence encoder; hash fallback is forbidden"
+                    )
+                return audit
+            if (
+                audit.get("effective_backend") != "transformers"
+                or audit.get("encoder_initialized") is not True
+                or audit.get("sentence_encoder_present") is not True
+                or int(audit.get("sentence_encoder_parameter_tensors", 0)) <= 0
+                or int(audit.get("sentence_encoder_parameters", 0)) <= 0
+                or audit.get("all_sentence_encoder_parameters_trainable") is not True
+            ):
+                raise RuntimeError(
+                    "unfrozen HTR policy is not reflected in the initialized "
+                    "sentence-encoder parameters"
+                )
+        return audit
+
+    def _assert_htr_sentence_encoder_optimizer_coverage(
+        self,
+        extractor: nn.Module,
+        optimizer: torch.optim.Optimizer,
+    ) -> None:
+        """Prove the live unfrozen encoder tensors are optimizer members."""
+
+        audit = self._assert_htr_sentence_encoder_training_state(extractor)
+        if (
+            audit.get("htr_requested") is False
+            or audit.get("hash_backend_without_sentence_encoder") is True
+            or audit.get("test_double_without_production_attestation") is True
+        ):
+            return
+        if audit.get("requested_freeze_sentence_encoder") is not False:
+            return
+        assert type(extractor) is HierarchicalTransformerExtractor
+        encoder = extractor._sentence_encoder
+        if encoder is None:
+            raise RuntimeError("initialized unfrozen HTR sentence encoder is missing")
+        expected = {id(parameter) for parameter in encoder.parameters()}
+        observed = {
+            id(parameter)
+            for group in optimizer.param_groups
+            for parameter in group.get("params", ())
+        }
+        if not expected or not expected.issubset(observed):
+            raise RuntimeError(
+                "HTR nuisance optimizer omits one or more unfrozen sentence-encoder " "parameters"
+            )
 
     def _make_text_loader(
         self,
@@ -3099,6 +3211,7 @@ class AgenticAttentionVariableForestRunner:
         model.extractor.fit_tokenizer(
             df.iloc[positions][self.config.text_column].astype(str).tolist()
         )
+        self._assert_htr_sentence_encoder_training_state(model.extractor)
         train_loader = self._make_text_loader(
             model,
             df,
@@ -3114,6 +3227,10 @@ class AgenticAttentionVariableForestRunner:
             [p for p in model.parameters() if p.requires_grad],
             lr=train_config.learning_rate,
             weight_decay=nuisance_weight_decay,
+        )
+        self._assert_htr_sentence_encoder_optimizer_coverage(
+            model.extractor,
+            optimizer,
         )
         num_batches = max(1, len(train_loader))
         scheduler = _make_linear_lr_scheduler(

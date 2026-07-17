@@ -6,3 +6,4 @@ __pycache__/
 *.oci_cache*
 synthetic_output*
 applied_experiments/
+artifacts/

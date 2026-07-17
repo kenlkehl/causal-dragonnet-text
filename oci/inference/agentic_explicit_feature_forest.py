@@ -33,6 +33,8 @@ from ..config import (
     ExplicitFeatureSpec,
 )
 from ..extraction import (
+    CONTRACT_LEXICAL_CONTEXT_VERSION,
+    EXTRACTION_GROUPING_VERSION,
     ExtractionCache,
     VLLMFeatureExtractor,
     resolve_vllm_reasoning_parser,
@@ -52,13 +54,14 @@ from ..extraction.llm_routing import (
 )
 from ..extraction.llm_routing import parse_server_urls
 from ..models.causal_forest_head import CausalForestHead
+from ..models.structured_interaction_head import StructuredInteractionHead
 from .applied_explicit_feature_forest import _build_features, _hstack_present
 
 logger = logging.getLogger(__name__)
 
 AGENT_PROMPT_VERSION = "agentic_explicit_feature_search_v1"
 BROAD_AGENT_PROMPT_VERSION = "agentic_explicit_feature_broad_screen_v2"
-EXTRACTION_PROMPT_VERSION = "explicit_features_v3"
+EXTRACTION_PROMPT_VERSION = "explicit_features_v5"
 VALID_ACTIONS = {"add", "remove", "update_role", "none"}
 VALID_ROLES = {"confounder", "effect_modifier"}
 VALID_TYPES = {"categorical", "continuous"}
@@ -261,15 +264,10 @@ class AgenticFeatureSearchRunner:
         if not self.initial_specs:
             logger.info("Agentic explicit-feature search is starting from an empty feature set")
 
-        self.proposal_agent = proposal_agent or make_feature_search_agent(
-            self.search_config
-        )
-        self.extraction_provider = (
-            extraction_provider
-            or make_explicit_feature_extraction_provider(
-                config=config,
-                output_dir=self.artifact_dir,
-            )
+        self.proposal_agent = proposal_agent or make_feature_search_agent(self.search_config)
+        self.extraction_provider = extraction_provider or make_explicit_feature_extraction_provider(
+            config=config,
+            output_dir=self.artifact_dir,
         )
         self.evaluator = evaluator or CausalForestExplicitEvaluator(
             config=config,
@@ -1376,9 +1374,7 @@ class OpenAICompatibleFeatureSearchAgent:
         configured = self.search_config.agent_model_name
         self._ensure_client()
         if self._client is not None:
-            server_url = str(
-                self.search_config.agent_server_url or "configured_direct_client"
-            )
+            server_url = str(self.search_config.agent_server_url or "configured_direct_client")
             if server_url not in self._resolved_agent_models_by_url:
                 model_name = (
                     _discover_openai_compatible_model_name(
@@ -1422,9 +1418,7 @@ class OpenAICompatibleFeatureSearchAgent:
             return inventory[server_url]
         if len(inventory) == 1:
             return next(iter(inventory.values()))
-        raise RuntimeError(
-            f"No resolved agent model identity for endpoint {server_url!r}"
-        )
+        raise RuntimeError(f"No resolved agent model identity for endpoint {server_url!r}")
 
     def _create_completion(self, **kwargs: Any) -> Any:
         self._ensure_client()
@@ -1498,9 +1492,7 @@ class OpenAICompatibleFeatureSearchAgent:
             context.get("prompt_version") == "multi_model_agentic_value_harmonization_v1"
         )
         is_concept_inventory = context.get("prompt_version") in _CONCEPT_INVENTORY_PROMPT_VERSIONS
-        is_parsimony_factor = (
-            context.get("prompt_version") == _PARSIMONY_FACTOR_PROMPT_VERSION
-        )
+        is_parsimony_factor = context.get("prompt_version") == _PARSIMONY_FACTOR_PROMPT_VERSION
         is_tfidf_topic_label = context.get("prompt_version") in {
             "tfidf_topic_label_v2",
             "tfidf_topic_recovery_v2",
@@ -1517,6 +1509,16 @@ class OpenAICompatibleFeatureSearchAgent:
             "neural_query_registry_v1",
             "neural_query_review_v1",
         }
+        from .all_evidence_post_extraction_review import (
+            POST_EXTRACTION_REVIEW_PROMPT_VERSION,
+        )
+
+        is_post_extraction_review = (
+            context.get("prompt_version") == POST_EXTRACTION_REVIEW_PROMPT_VERSION
+        )
+        from .all_evidence_fusion import FUSION_PROMPT_VERSION
+
+        is_all_evidence_fusion = context.get("prompt_version") == FUSION_PROMPT_VERSION
 
         for attempt_idx in range(max_repair_attempts + 1):
             response_kwargs = {
@@ -1525,21 +1527,26 @@ class OpenAICompatibleFeatureSearchAgent:
                 "temperature": self.search_config.agent_temperature,
                 "max_tokens": self.search_config.agent_max_tokens,
             }
-            enable_thinking = getattr(
-                self.search_config, "agent_enable_thinking", None
-            )
+            if is_all_evidence_fusion or is_post_extraction_review:
+                # OpenAI-compatible servers, including current vLLM releases,
+                # can constrain generation to one syntactically valid JSON
+                # object. Semantic validation and repair still run below.
+                response_kwargs["response_format"] = {"type": "json_object"}
+            enable_thinking = getattr(self.search_config, "agent_enable_thinking", None)
             if (
                 enable_thinking is not None
-                and str(getattr(self.search_config, "agent_provider", "openai"))
-                .strip()
-                .lower()
+                and str(getattr(self.search_config, "agent_provider", "openai")).strip().lower()
                 == "openai"
             ):
-                response_kwargs["extra_body"] = {
-                    "chat_template_kwargs": {
-                        "enable_thinking": bool(enable_thinking)
-                    }
-                }
+                extra_body = {"chat_template_kwargs": {"enable_thinking": bool(enable_thinking)}}
+                thinking_token_budget = getattr(
+                    self.search_config,
+                    "agent_thinking_token_budget",
+                    None,
+                )
+                if bool(enable_thinking) and thinking_token_budget is not None:
+                    extra_body["thinking_token_budget"] = int(thinking_token_budget)
+                response_kwargs["extra_body"] = extra_body
             response_kwargs.update(
                 google_json_response_format_kwargs(
                     api_key=self.search_config.agent_api_key,
@@ -1563,6 +1570,8 @@ class OpenAICompatibleFeatureSearchAgent:
             attempts.append(trace)
             self.last_response_trace = _trace_with_repair_attempts(trace, attempts)
 
+            parsed_json_object = False
+            parsed: Any = None
             try:
                 if (
                     is_consensus_disambiguation
@@ -1572,8 +1581,11 @@ class OpenAICompatibleFeatureSearchAgent:
                     or is_tfidf_topic_label
                     or is_tfidf_topic_harmonization
                     or is_neural_query_prompt
+                    or is_post_extraction_review
+                    or is_all_evidence_fusion
                 ):
                     parsed = parse_agent_json_object(content)
+                    parsed_json_object = True
                     if is_value_harmonization:
                         issues = value_harmonization_response_issues(parsed, context)
                     elif is_concept_inventory:
@@ -1606,6 +1618,46 @@ class OpenAICompatibleFeatureSearchAgent:
                             issues = query_review_response_issues(parsed, context)
                         else:
                             issues = query_registry_response_issues(parsed, context)
+                    elif is_post_extraction_review:
+                        from .all_evidence_post_extraction_review import (
+                            _normalize_fresh_post_extraction_review_response,
+                            post_extraction_review_response_issues,
+                        )
+
+                        parsed, normalization_audit = (
+                            _normalize_fresh_post_extraction_review_response(
+                                parsed,
+                                context,
+                            )
+                        )
+                        trace["fresh_response_normalization"] = normalization_audit
+                        attempts[-1] = trace
+                        self.last_response_trace = _trace_with_repair_attempts(
+                            trace,
+                            attempts,
+                        )
+                        issues = post_extraction_review_response_issues(parsed, context)
+                    elif is_all_evidence_fusion:
+                        from .all_evidence_fusion import (
+                            _normalize_agent_response_citation_families,
+                            all_evidence_fusion_response_issues,
+                        )
+
+                        parsed, normalization_audit = _normalize_agent_response_citation_families(
+                            parsed, context
+                        )
+                        trace["fresh_response_normalization"] = normalization_audit
+                        # Retain the original trace field for consumers that
+                        # inspect citation-family correction specifically.
+                        trace["citation_family_normalization"] = normalization_audit[
+                            "citation_family_normalization"
+                        ]
+                        attempts[-1] = trace
+                        self.last_response_trace = _trace_with_repair_attempts(
+                            trace,
+                            attempts,
+                        )
+                        issues = all_evidence_fusion_response_issues(parsed, context)
                     else:
                         issues = consensus_disambiguation_response_issues(parsed)
                     if issues:
@@ -1613,12 +1665,14 @@ class OpenAICompatibleFeatureSearchAgent:
                     return parsed
                 proposals = parse_agent_response(content)
             except Exception as exc:
-                issues = [f"malformed JSON: {exc}"]
+                failure_kind = "semantic validation" if parsed_json_object else "malformed JSON"
+                issues = [f"{failure_kind}: {exc}"]
                 if attempt_idx < max_repair_attempts:
                     logger.warning(
-                        "Agent response had malformed JSON on attempt %s/%s: "
+                        "Agent response failed %s on attempt %s/%s: "
                         "finish_reason=%s content_chars=%s max_tokens=%s. "
                         "Asking model to repair JSON.",
+                        failure_kind,
                         attempt_idx + 1,
                         max_repair_attempts + 1,
                         getattr(choice, "finish_reason", None),
@@ -1651,8 +1705,26 @@ class OpenAICompatibleFeatureSearchAgent:
                             "object following the original response contract. Use "
                             "only supplied evidence/candidate ids, obey all count "
                             "limits, and cover required candidates exactly once. "
-                            "Problems: "
-                            + "; ".join(issues)
+                            "Problems: " + "; ".join(issues)
+                        )
+                    elif is_post_extraction_review:
+                        from .all_evidence_post_extraction_review import (
+                            build_post_extraction_review_repair_prompt,
+                        )
+
+                        repair_prompt = build_post_extraction_review_repair_prompt(
+                            issues,
+                            context=context,
+                            failed_response=parsed if parsed_json_object else None,
+                        )
+                    elif is_all_evidence_fusion:
+                        from .all_evidence_fusion import (
+                            build_all_evidence_fusion_repair_prompt,
+                        )
+
+                        repair_prompt = build_all_evidence_fusion_repair_prompt(
+                            issues,
+                            context,
                         )
                     elif is_consensus_disambiguation:
                         repair_prompt = build_consensus_disambiguation_repair_prompt(issues)
@@ -1665,6 +1737,14 @@ class OpenAICompatibleFeatureSearchAgent:
                         ]
                     )
                     continue
+                if is_post_extraction_review:
+                    from .all_evidence_post_extraction_review import (
+                        PostExtractionReviewResponseExhausted,
+                    )
+
+                    raise PostExtractionReviewResponseExhausted(
+                        "remote post-extraction reviewer exhausted bounded response repair"
+                    ) from exc
                 raise ValueError(
                     "Agent response could not be parsed after "
                     f"{attempt_idx + 1} attempt(s): {issues[0]}"
@@ -1841,16 +1921,34 @@ Do not include markdown fences, comments, prose, or reasoning in the final answe
 def _codex_extraction_prompt(
     clinical_text: str,
     specs: List[ExplicitFeatureSpec],
+    *,
+    max_text_length: Optional[int] = None,
+    context_strategy: str = "tail",
+    source_text_temporally_valid_by_design: bool = False,
 ) -> str:
     task_prompt = build_extraction_prompt(
         clinical_text,
         specs,
-        max_text_length=None,
+        max_text_length=max_text_length,
+        context_strategy=context_strategy,
+        source_text_temporally_valid_by_design=source_text_temporally_valid_by_design,
+    )
+    complete_document = (
+        str(context_strategy).strip().lower().replace("-", "_") == "tail"
+        and max_text_length is None
+    )
+    reading_instruction = (
+        "Read the whole clinical note in the extraction prompt below from beginning " "to end."
+        if complete_document
+        else "Read every labeled verbatim excerpt in the extraction prompt below."
+    )
+    extraction_source = (
+        "the full note text" if complete_document else "the provided contract-guided excerpts"
     )
     return _codex_backend_prompt(
-        "Read the whole clinical note in the extraction prompt below from beginning "
-        "to end. Do not use regex-only, keyword-only, or hand-coded rule shortcuts; "
-        "perform the clinical extraction directly from the full note text. If the "
+        f"{reading_instruction} Do not use regex-only, keyword-only, or hand-coded "
+        f"rule shortcuts; perform the clinical extraction directly from "
+        f"{extraction_source}. If the "
         "note does not support a value, return null for that field.\n\n"
         f"{task_prompt}",
         task_kind="clinical explicit-feature extraction",
@@ -1957,9 +2055,7 @@ class CodexCLIFeatureSearchAgent:
             "agentic_attention_consensus_disambiguation_v1",
             "multi_model_agentic_alias_resolution_v1",
         }
-        is_value_harmonization = (
-            prompt_version == "multi_model_agentic_value_harmonization_v1"
-        )
+        is_value_harmonization = prompt_version == "multi_model_agentic_value_harmonization_v1"
         is_concept_inventory = prompt_version in _CONCEPT_INVENTORY_PROMPT_VERSIONS
         is_parsimony_factor = prompt_version == _PARSIMONY_FACTOR_PROMPT_VERSION
         is_tfidf_topic_label = prompt_version in {
@@ -1978,6 +2074,11 @@ class CodexCLIFeatureSearchAgent:
             "neural_query_registry_v1",
             "neural_query_review_v1",
         }
+        from .all_evidence_post_extraction_review import (
+            POST_EXTRACTION_REVIEW_PROMPT_VERSION,
+        )
+
+        is_post_extraction_review = prompt_version == POST_EXTRACTION_REVIEW_PROMPT_VERSION
 
         for attempt_idx in range(max_repair_attempts + 1):
             response = self._run(prompt)
@@ -1990,6 +2091,8 @@ class CodexCLIFeatureSearchAgent:
             attempts.append(trace)
             self.last_response_trace = _trace_with_repair_attempts(trace, attempts)
 
+            parsed_json_object = False
+            parsed: Any = None
             try:
                 if (
                     is_consensus_disambiguation
@@ -1999,8 +2102,10 @@ class CodexCLIFeatureSearchAgent:
                     or is_tfidf_topic_label
                     or is_tfidf_topic_harmonization
                     or is_neural_query_prompt
+                    or is_post_extraction_review
                 ):
                     parsed = parse_agent_json_object(content)
+                    parsed_json_object = True
                     if is_value_harmonization:
                         issues = value_harmonization_response_issues(parsed, context)
                     elif is_concept_inventory:
@@ -2032,6 +2137,25 @@ class CodexCLIFeatureSearchAgent:
                             issues = query_review_response_issues(parsed, context)
                         else:
                             issues = query_registry_response_issues(parsed, context)
+                    elif is_post_extraction_review:
+                        from .all_evidence_post_extraction_review import (
+                            _normalize_fresh_post_extraction_review_response,
+                            post_extraction_review_response_issues,
+                        )
+
+                        parsed, normalization_audit = (
+                            _normalize_fresh_post_extraction_review_response(
+                                parsed,
+                                context,
+                            )
+                        )
+                        trace["fresh_response_normalization"] = normalization_audit
+                        attempts[-1] = trace
+                        self.last_response_trace = _trace_with_repair_attempts(
+                            trace,
+                            attempts,
+                        )
+                        issues = post_extraction_review_response_issues(parsed, context)
                     else:
                         issues = consensus_disambiguation_response_issues(parsed)
                     if issues:
@@ -2039,7 +2163,8 @@ class CodexCLIFeatureSearchAgent:
                     return parsed
                 proposals = parse_agent_response(content)
             except Exception as exc:
-                issues = [f"malformed JSON: {exc}"]
+                failure_kind = "semantic validation" if parsed_json_object else "malformed JSON"
+                issues = [f"{failure_kind}: {exc}"]
                 if attempt_idx < max_repair_attempts:
                     logger.warning(
                         "Codex CLI agent response had malformed JSON on attempt %s/%s; "
@@ -2073,8 +2198,17 @@ class CodexCLIFeatureSearchAgent:
                             "object following the original response contract. Use "
                             "only supplied evidence/candidate ids, obey all count "
                             "limits, and cover required candidates exactly once. "
-                            "Problems: "
-                            + "; ".join(issues)
+                            "Problems: " + "; ".join(issues)
+                        )
+                    elif is_post_extraction_review:
+                        from .all_evidence_post_extraction_review import (
+                            build_post_extraction_review_repair_prompt,
+                        )
+
+                        repair_prompt = build_post_extraction_review_repair_prompt(
+                            issues,
+                            context=context,
+                            failed_response=parsed if parsed_json_object else None,
                         )
                     elif is_consensus_disambiguation:
                         repair_prompt = build_consensus_disambiguation_repair_prompt(issues)
@@ -2085,6 +2219,14 @@ class CodexCLIFeatureSearchAgent:
                         f"{repair_prompt}\nReturn repaired JSON only."
                     )
                     continue
+                if is_post_extraction_review:
+                    from .all_evidence_post_extraction_review import (
+                        PostExtractionReviewResponseExhausted,
+                    )
+
+                    raise PostExtractionReviewResponseExhausted(
+                        "Codex post-extraction reviewer exhausted bounded response repair"
+                    ) from exc
                 raise ValueError(
                     "Codex CLI agent response could not be parsed after "
                     f"{attempt_idx + 1} attempt(s): {issues[0]}"
@@ -2141,6 +2283,8 @@ def _proposal_agent_supports_alias_resolution(agent: Any) -> bool:
 class VLLMExplicitFeatureExtractionProvider:
     """Ensure requested explicit feature columns exist, using grouped extraction."""
 
+    extraction_request_group_dependent = True
+
     def __init__(self, config: AppliedInferenceConfig, output_dir: Path):
         self.config = config
         self.feature_config = config.explicit_features
@@ -2153,6 +2297,12 @@ class VLLMExplicitFeatureExtractionProvider:
         self._resolved_vllm_models_by_url: Dict[str, str] = {}
         self._active_text_hash: Optional[str] = None
         self._active_patient_text_hashes: List[str] = []
+        self._active_request_group_contracts_by_spec: Dict[str, List[Dict[str, Any]]] = {}
+
+    def adaptive_review_contract_local_extraction(self) -> bool:
+        """Whether one target has identical request semantics in every registry."""
+
+        return int(getattr(self.feature_config, "max_variables_per_extraction_request", 10)) == 1
 
     def ensure_features(
         self,
@@ -2160,12 +2310,9 @@ class VLLMExplicitFeatureExtractionProvider:
         specs: List[ExplicitFeatureSpec],
     ) -> pd.DataFrame:
         dataset = dataset.copy()
-        active_texts = [
-            str(value or "") for value in dataset[self.config.text_column].tolist()
-        ]
+        active_texts = [str(value or "") for value in dataset[self.config.text_column].tolist()]
         self._active_patient_text_hashes = [
-            hashlib.sha256(value.encode("utf-8")).hexdigest()
-            for value in active_texts
+            hashlib.sha256(value.encode("utf-8")).hexdigest() for value in active_texts
         ]
         self._active_text_hash = hashlib.sha256(
             json.dumps(
@@ -2174,9 +2321,31 @@ class VLLMExplicitFeatureExtractionProvider:
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
+        # A target's extracted value depends on every companion contract in its
+        # request: companions alter both the JSON schema and contract-RAG query.
+        # Plan groups before cache lookup so per-spec entries are bound to the
+        # exact ordered request group that produced them. Existing unowned
+        # columns are intentionally excluded from provider request planning.
+        provider_owned_or_missing = []
+        for spec in specs:
+            value_col = f"explicit_feat_{spec.name}"
+            missing_col = f"{value_col}_missing"
+            if (
+                spec.name in self._column_fingerprints
+                or value_col not in dataset.columns
+                or missing_col not in dataset.columns
+            ):
+                provider_owned_or_missing.append(spec)
+        planned_groups = self._extraction_spec_groups(provider_owned_or_missing)
+        self._active_request_group_contracts_by_spec = {}
+        for group in planned_groups:
+            contracts = [_spec_extraction_contract_dict(spec) for spec in group]
+            for spec in group:
+                self._active_request_group_contracts_by_spec[spec.name] = contracts
+
         missing_specs: List[ExplicitFeatureSpec] = []
         row_caches: Dict[str, pd.DataFrame] = {}
-        for spec in specs:
+        for spec in provider_owned_or_missing:
             if self._columns_available(dataset, spec):
                 continue
 
@@ -2204,7 +2373,10 @@ class VLLMExplicitFeatureExtractionProvider:
             missing_specs.append(spec)
 
         if missing_specs:
-            for group in self._extraction_spec_groups(missing_specs):
+            missing_names = {spec.name for spec in missing_specs}
+            for group in planned_groups:
+                if not any(spec.name in missing_names for spec in group):
+                    continue
                 if self.feature_config.cache_enabled:
                     extracted_df = self._extract_spec_group_resumable(
                         dataset,
@@ -2222,17 +2394,26 @@ class VLLMExplicitFeatureExtractionProvider:
         specs: List[ExplicitFeatureSpec],
     ) -> List[List[ExplicitFeatureSpec]]:
         """Group related contracts while enforcing the hard ten-variable cap."""
-        maximum = int(
-            getattr(self.feature_config, "max_variables_per_extraction_request", 10)
-        )
+        maximum = int(getattr(self.feature_config, "max_variables_per_extraction_request", 10))
         if not 1 <= maximum <= 10:
             raise ValueError("max_variables_per_extraction_request must be in [1, 10]")
+        grouping_strategy = (
+            str(getattr(self.feature_config, "extraction_grouping_strategy", "clinical_domain"))
+            .strip()
+            .lower()
+            .replace("-", "_")
+        )
+        if grouping_strategy == "packed":
+            groups = [specs[start : start + maximum] for start in range(0, len(specs), maximum)]
+            if any(len(group) > 10 for group in groups):  # pragma: no cover
+                raise RuntimeError("Extraction grouping exceeded the hard ten-variable cap")
+            return groups
+        if grouping_strategy != "clinical_domain":
+            raise ValueError("extraction_grouping_strategy must be 'clinical_domain' or 'packed'")
         domains: Dict[str, List[ExplicitFeatureSpec]] = {}
         domain_order: List[str] = []
 
-        def broad_domain_family(
-            domain: str, parent_object: str, feature_name: str
-        ) -> str:
+        def broad_domain_family(domain: str, parent_object: str, feature_name: str) -> str:
             """Normalize agent vocabulary into stable prompt-sized domains.
 
             Name harmonization deliberately retains specific clinical domains in
@@ -2349,9 +2530,7 @@ class VLLMExplicitFeatureExtractionProvider:
                 # mostly singleton patient requests; the hard cap still applies.
                 source_domain = structured.group(1).strip()
                 parent_object = structured.group(2).strip()
-                domain = broad_domain_family(
-                    source_domain, parent_object, spec.name
-                )
+                domain = broad_domain_family(source_domain, parent_object, spec.name)
             elif ":" in text:
                 domain = text.split(":", 1)[0]
             else:
@@ -2366,7 +2545,9 @@ class VLLMExplicitFeatureExtractionProvider:
         groups: List[List[ExplicitFeatureSpec]] = []
         for domain in domain_order:
             values = domains[domain]
-            groups.extend(values[start : start + maximum] for start in range(0, len(values), maximum))
+            groups.extend(
+                values[start : start + maximum] for start in range(0, len(values), maximum)
+            )
         if any(len(group) > 10 for group in groups):
             raise RuntimeError("Extraction grouping exceeded the hard ten-variable cap")
         return groups
@@ -2480,9 +2661,7 @@ class VLLMExplicitFeatureExtractionProvider:
             download_dir=self.feature_config.vllm_download_dir,
             max_model_len=self.feature_config.vllm_max_model_len,
             vllm_reasoning_parser=self.feature_config.vllm_reasoning_parser,
-            vllm_enable_thinking=getattr(
-                self.feature_config, "vllm_enable_thinking", None
-            ),
+            vllm_enable_thinking=getattr(self.feature_config, "vllm_enable_thinking", None),
             api_key=getattr(self.feature_config, "vllm_api_key", "EMPTY"),
             max_retries=self.feature_config.extraction_max_retries,
             retry_initial_delay=getattr(
@@ -2508,6 +2687,18 @@ class VLLMExplicitFeatureExtractionProvider:
             temperature=self.feature_config.extraction_temperature,
             max_tokens=self.feature_config.extraction_max_tokens,
             max_text_length=self.feature_config.extraction_max_text_length,
+            context_strategy=getattr(
+                self.feature_config,
+                "extraction_context_strategy",
+                "tail",
+            ),
+            source_text_temporally_valid_by_design=bool(
+                getattr(
+                    self.feature_config,
+                    "source_text_temporally_valid_by_design",
+                    False,
+                )
+            ),
         )
         try:
             return extractor.extract_to_dataframe(
@@ -2641,6 +2832,21 @@ class VLLMExplicitFeatureExtractionProvider:
     def _cache_config(self, specs: List[ExplicitFeatureSpec]) -> Dict[str, Any]:
         model_name = self._resolve_vllm_model_name()
         model_inventory = self._resolve_vllm_model_inventory()
+        if len(specs) == 1:
+            request_group_contracts = self._active_request_group_contracts_by_spec.get(
+                specs[0].name,
+                [_spec_extraction_contract_dict(specs[0])],
+            )
+        else:
+            request_group_contracts = [_spec_extraction_contract_dict(spec) for spec in specs]
+        request_group_sha256 = hashlib.sha256(
+            json.dumps(
+                request_group_contracts,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=_json_default,
+            ).encode("utf-8")
+        ).hexdigest()
         cache_config = {
             "features": [_spec_extraction_contract_dict(spec) for spec in specs],
             "prompt_template_version": EXTRACTION_PROMPT_VERSION,
@@ -2658,14 +2864,38 @@ class VLLMExplicitFeatureExtractionProvider:
                 )
                 for url, endpoint_model in model_inventory.items()
             },
-            "vllm_enable_thinking": getattr(
-                self.feature_config, "vllm_enable_thinking", None
-            ),
+            "vllm_enable_thinking": getattr(self.feature_config, "vllm_enable_thinking", None),
             "extraction_temperature": self.feature_config.extraction_temperature,
             "extraction_max_tokens": self.feature_config.extraction_max_tokens,
             "extraction_max_text_length": self.feature_config.extraction_max_text_length,
+            "extraction_grouping_strategy": getattr(
+                self.feature_config,
+                "extraction_grouping_strategy",
+                "clinical_domain",
+            ),
+            "extraction_context_strategy": getattr(
+                self.feature_config,
+                "extraction_context_strategy",
+                "tail",
+            ),
+            "extraction_context_compactor_version": CONTRACT_LEXICAL_CONTEXT_VERSION,
+            "extraction_grouping_version": EXTRACTION_GROUPING_VERSION,
+            "extraction_request_group_sha256": request_group_sha256,
             "patient_text_hash": self._active_text_hash,
-            "temporal_cutoff": "information documented before the treatment decision",
+            "source_text_temporally_valid_by_design": bool(
+                getattr(
+                    self.feature_config,
+                    "source_text_temporally_valid_by_design",
+                    False,
+                )
+            ),
+            "temporal_boundary_enforced": not bool(
+                getattr(
+                    self.feature_config,
+                    "source_text_temporally_valid_by_design",
+                    False,
+                )
+            ),
             "max_variables_per_extraction_request": int(
                 getattr(self.feature_config, "max_variables_per_extraction_request", 10)
             ),
@@ -2719,6 +2949,12 @@ class CodexCLIExplicitFeatureExtractionProvider(VLLMExplicitFeatureExtractionPro
     reads_complete_documents = True
 
     def _cache_config(self, specs: List[ExplicitFeatureSpec]) -> Dict[str, Any]:
+        context_strategy = (
+            str(getattr(self.feature_config, "extraction_context_strategy", "tail"))
+            .strip()
+            .lower()
+            .replace("-", "_")
+        )
         return {
             "features": [_spec_extraction_contract_dict(spec) for spec in specs],
             "prompt_template_version": EXTRACTION_PROMPT_VERSION,
@@ -2737,9 +2973,31 @@ class CodexCLIExplicitFeatureExtractionProvider(VLLMExplicitFeatureExtractionPro
             "codex_cli_extra_args": _codex_extra_args(
                 getattr(self.feature_config, "codex_cli_extra_args", [])
             ),
-            "complete_document": True,
+            "complete_document": context_strategy == "tail",
+            "extraction_max_text_length": self.feature_config.extraction_max_text_length,
+            "extraction_grouping_strategy": getattr(
+                self.feature_config,
+                "extraction_grouping_strategy",
+                "clinical_domain",
+            ),
+            "extraction_context_strategy": context_strategy,
+            "extraction_context_compactor_version": CONTRACT_LEXICAL_CONTEXT_VERSION,
+            "extraction_grouping_version": EXTRACTION_GROUPING_VERSION,
             "patient_text_hash": self._active_text_hash,
-            "temporal_cutoff": "information documented before the treatment decision",
+            "source_text_temporally_valid_by_design": bool(
+                getattr(
+                    self.feature_config,
+                    "source_text_temporally_valid_by_design",
+                    False,
+                )
+            ),
+            "temporal_boundary_enforced": not bool(
+                getattr(
+                    self.feature_config,
+                    "source_text_temporally_valid_by_design",
+                    False,
+                )
+            ),
             "max_variables_per_extraction_request": int(
                 getattr(self.feature_config, "max_variables_per_extraction_request", 10)
             ),
@@ -2786,7 +3044,30 @@ class CodexCLIExplicitFeatureExtractionProvider(VLLMExplicitFeatureExtractionPro
         text: str,
         specs: List[ExplicitFeatureSpec],
     ) -> Dict[str, Any]:
-        base_prompt = _codex_extraction_prompt(text, specs)
+        context_strategy = (
+            str(getattr(self.feature_config, "extraction_context_strategy", "tail"))
+            .strip()
+            .lower()
+            .replace("-", "_")
+        )
+        trusted_temporal_source = bool(
+            getattr(
+                self.feature_config,
+                "source_text_temporally_valid_by_design",
+                False,
+            )
+        )
+        base_prompt = _codex_extraction_prompt(
+            text,
+            specs,
+            max_text_length=(
+                self.feature_config.extraction_max_text_length
+                if context_strategy == "contract_lexical_rag"
+                else None
+            ),
+            context_strategy=context_strategy,
+            source_text_temporally_valid_by_design=trusted_temporal_source,
+        )
         prompt = base_prompt
         best_result = None
         max_attempts = max(1, int(self.feature_config.extraction_max_retries))
@@ -2833,7 +3114,7 @@ class CodexCLIExplicitFeatureExtractionProvider(VLLMExplicitFeatureExtractionPro
                     )
                     prompt = (
                         f"{base_prompt}\n\nPrevious Codex response:\n{response.content}\n\n"
-                        f"{build_extraction_repair_prompt(parsed.issues, specs)}"
+                        f"{build_extraction_repair_prompt(parsed.issues, specs, source_text_temporally_valid_by_design=trusted_temporal_source)}"
                     )
                     continue
             except Exception as exc:
@@ -3018,11 +3299,165 @@ class CausalForestExplicitEvaluator:
         return SplitEvaluation(predictions=predictions, metrics=metrics)
 
 
+class StructuredInteractionExplicitEvaluator:
+    """Nested-CV structured S-learner with treatment interactions.
+
+    The outer fit/test boundary is supplied by the calling runner.  Within the
+    fit frame, :class:`StructuredInteractionHead` selects regularization using
+    observed outcome loss only.  The held-out frame is scored once after that
+    choice and final fit are frozen.
+    """
+
+    def __init__(
+        self,
+        config: AppliedInferenceConfig,
+        cf_config: ExplicitFeatureForestConfig,
+    ) -> None:
+        self.config = config
+        self.cf_config = cf_config
+
+    def evaluate_split(
+        self,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        specs: List[ExplicitFeatureSpec],
+        fold_id: int,
+    ) -> SplitEvaluation:
+        train_t = np.asarray(
+            train_df[self.config.treatment_column].values,
+            dtype=float,
+        ).reshape(-1)
+        train_y = np.asarray(
+            train_df[self.config.outcome_column].values,
+            dtype=float,
+        ).reshape(-1)
+        test_t = np.asarray(
+            test_df[self.config.treatment_column].values,
+            dtype=float,
+        ).reshape(-1)
+        test_y = np.asarray(
+            test_df[self.config.outcome_column].values,
+            dtype=float,
+        ).reshape(-1)
+
+        x_train, w_train, x_names, w_names, means, stds = _build_features(
+            train_df,
+            specs,
+        )
+        x_test, w_test, _, _, _, _ = _build_features(
+            test_df,
+            specs,
+            means,
+            stds,
+        )
+        actual_x_dim = 0 if x_train is None else int(x_train.shape[1])
+        if x_train is None:
+            # Keep an explicit zero column so a confounder-only registry is a
+            # valid main-effect model with a constant treatment effect.
+            x_train = np.zeros((len(train_df), 1), dtype=np.float32)
+            x_test = np.zeros((len(test_df), 1), dtype=np.float32)
+            x_names = ["intercept_effect"]
+
+        features_train = _hstack_present(x_train, w_train)
+        features_test = _hstack_present(x_test, w_test)
+        if features_train is None or features_test is None:
+            raise ValueError("Unable to build explicit-feature interaction matrices")
+
+        interact_all = bool(getattr(self.cf_config, "interaction_interact_all_features", True))
+        head = StructuredInteractionHead(
+            outcome_type=self.config.outcome_type,
+            regularization_grid=getattr(
+                self.cf_config,
+                "interaction_regularization_grid",
+                (0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0),
+            ),
+            inner_folds=int(getattr(self.cf_config, "interaction_inner_folds", 3)),
+            interact_all_features=interact_all,
+            random_state=42 + int(fold_id),
+            max_iter=int(getattr(self.cf_config, "interaction_max_iter", 3000)),
+        )
+        modifier_indices = None if interact_all else np.arange(x_train.shape[1])
+        head.fit(
+            features_train,
+            train_t,
+            train_y,
+            modifier_indices=modifier_indices,
+        )
+        y0, y1 = head.predict_potential_outcomes(features_test)
+        tau = y1 - y0
+        outcome_prediction = head.predict_observed_outcome(features_test, test_t)
+
+        propensity = _fit_predict_propensity(
+            features_train,
+            train_t,
+            features_test,
+            self.cf_config,
+            random_state=142 + int(fold_id),
+        )
+        # Prediction artifacts are fail-closed against accidental synthetic
+        # oracle propagation even when a lower-level caller forgets to strip it.
+        prediction_input = test_df.drop(
+            columns=[column for column in test_df.columns if str(column).startswith("true_")],
+            errors="ignore",
+        )
+        predictions = prediction_input.copy()
+        predictions["pred_ite_prob"] = tau
+        predictions["pred_y0_prob"] = y0
+        predictions["pred_y1_prob"] = y1
+        predictions["pred_propensity_prob"] = propensity
+        predictions["pred_outcome_prob"] = outcome_prediction
+        predictions["cv_fold"] = int(fold_id)
+
+        tuning = head.tuning_result_
+        assert tuning is not None
+        metrics = {
+            "fold": int(fold_id),
+            "n_train": int(len(train_df)),
+            "n_test": int(len(test_df)),
+            "n_explicit_features": int(len(specs)),
+            "n_x_features": int(actual_x_dim),
+            "n_w_features": 0 if w_train is None else int(w_train.shape[1]),
+            "n_interaction_features": int(len(head.modifier_indices_)),
+            "interact_all_features": interact_all,
+            "ate_estimate": float(np.mean(tau)),
+            "r_loss": float(_r_loss(test_y, test_t, outcome_prediction, propensity, tau)),
+            "treatment_auroc": _safe_roc_auc(test_t, propensity),
+            "outcome_auroc": (
+                _safe_roc_auc(test_y, outcome_prediction)
+                if self.config.outcome_type == "binary"
+                else None
+            ),
+            "x_feature_names": x_names,
+            "w_feature_names": w_names,
+            "effect_estimator": "interaction_s_learner",
+            "interaction_selected_regularization": float(tuning.selected_regularization),
+            "interaction_selection_metric": tuning.selection_metric,
+            "interaction_inner_folds": int(tuning.n_splits),
+            "interaction_mean_validation_loss": {
+                str(key): float(value) for key, value in tuning.mean_validation_loss.items()
+            },
+        }
+        return SplitEvaluation(predictions=predictions, metrics=metrics)
+
+
 def build_agent_prompt(
     context: Dict[str, Any],
     search_config: AgenticFeatureSearchConfig,
 ) -> str:
     """Construct the proposal prompt sent to the LLM agent."""
+    from .all_evidence_fusion import FUSION_PROMPT_VERSION
+
+    if context.get("prompt_version") == FUSION_PROMPT_VERSION:
+        from .all_evidence_fusion import render_all_evidence_fusion_context_prompt
+
+        return render_all_evidence_fusion_context_prompt(context)
+    from .all_evidence_post_extraction_review import (
+        POST_EXTRACTION_REVIEW_PROMPT_VERSION,
+        render_post_extraction_review_prompt,
+    )
+
+    if context.get("prompt_version") == POST_EXTRACTION_REVIEW_PROMPT_VERSION:
+        return render_post_extraction_review_prompt(context)
     if context.get("prompt_version") == "neural_query_feature_v1":
         from .neural_query_agentic_forest import render_query_feature_prompt
 
@@ -3209,11 +3644,7 @@ def build_multi_model_evidence_digest_role_prompt(
     """Render flattened evidence blurbs as a simple concept proposal prompt."""
     del search_config
     max_proposals = int(context.get("max_proposals") or 30)
-    blurbs = [
-        str(item).strip()
-        for item in (context.get("text_blurbs") or [])
-        if str(item).strip()
-    ]
+    blurbs = [str(item).strip() for item in (context.get("text_blurbs") or []) if str(item).strip()]
     blurbs_text = (
         "\n\n".join(f"{idx}. {blurb}" for idx, blurb in enumerate(blurbs, start=1))
         if blurbs
@@ -4260,9 +4691,7 @@ def concept_inventory_response_issues(
             for cluster_id in cluster_ids:
                 cluster_id_text = str(cluster_id)
                 if known_cluster_ids and cluster_id_text not in known_cluster_ids:
-                    issues.append(
-                        f"concept {idx} ({name}): unknown cluster_id {cluster_id_text!r}"
-                    )
+                    issues.append(f"concept {idx} ({name}): unknown cluster_id {cluster_id_text!r}")
         if is_cluster_labeling and not cluster_ids:
             issues.append(f"concept {idx} ({name}): cluster_ids required for cluster labeling")
 
@@ -4306,9 +4735,7 @@ def parsimony_factor_response_issues(
     if not cluster_id:
         issues.append("missing cluster_id")
     elif expected_cluster_id and cluster_id != expected_cluster_id:
-        issues.append(
-            f"cluster_id {cluster_id!r} does not match supplied {expected_cluster_id!r}"
-        )
+        issues.append(f"cluster_id {cluster_id!r} does not match supplied {expected_cluster_id!r}")
 
     decision = str(response.get("decision") or "").strip().lower()
     if decision not in {"replace_cluster", "retain_cluster"}:
@@ -4385,9 +4812,7 @@ def parsimony_factor_response_issues(
         categories = factor.get("categories")
         if feature_type == "categorical":
             if not isinstance(categories, list) or not 2 <= len(categories) <= 8:
-                issues.append(
-                    f"factor {idx} ({name}): categorical factor needs 2-8 categories"
-                )
+                issues.append(f"factor {idx} ({name}): categorical factor needs 2-8 categories")
         elif categories not in (None, []):
             issues.append(f"factor {idx} ({name}): continuous factor cannot have categories")
         if feature_type == "continuous" and _missing_or_empty(factor.get("unit")):
@@ -4401,9 +4826,7 @@ def parsimony_factor_response_issues(
         else:
             invalid_roles = {str(role) for role in roles} - VALID_ROLES
             if invalid_roles:
-                issues.append(
-                    f"factor {idx} ({name}): invalid roles {sorted(invalid_roles)}"
-                )
+                issues.append(f"factor {idx} ({name}): invalid roles {sorted(invalid_roles)}")
             factor_roles.update(str(role) for role in roles if str(role) in VALID_ROLES)
 
         for field_name in [

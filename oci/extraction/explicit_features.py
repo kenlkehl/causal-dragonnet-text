@@ -55,6 +55,10 @@ import pandas as pd
 from tqdm import tqdm
 
 from ..config import ExplicitFeatureSpec
+from .contract_lexical_context import (
+    CONTRACT_LEXICAL_CONTEXT_VERSION,
+    compact_contract_lexical_context,
+)
 from .llm_routing import (
     OpenAIClientPool,
     google_json_response_format_kwargs,
@@ -118,6 +122,11 @@ def _category_match_key(value: Any) -> str:
     return text
 
 
+_UNDECLARED_CATEGORICAL_MISSING_SENTINEL_KEYS = frozenset(
+    _category_match_key(value) for value in ("unknown", "not_documented")
+)
+
+
 def _is_null_like(value: Any) -> bool:
     """Accept common quoted JSON-null spellings as conservative missing values."""
     if value is None:
@@ -173,14 +182,22 @@ class _ExtractionParseResult:
 
 
 def build_extraction_prompt(
-    clinical_text: str, specs: List[ExplicitFeatureSpec], max_text_length: int = 400000
+    clinical_text: str,
+    specs: List[ExplicitFeatureSpec],
+    max_text_length: Optional[int] = 400000,
+    context_strategy: str = "tail",
+    source_text_temporally_valid_by_design: bool = False,
 ) -> str:
     """Build prompt for feature extraction.
 
     Args:
         clinical_text: Clinical text to extract from
         specs: List of feature specifications
-        max_text_length: Maximum tail characters of text to include
+        max_text_length: Maximum context characters to include
+        context_strategy: Historical ``tail`` truncation or deterministic
+            ``contract_lexical_rag`` retrieval
+        source_text_temporally_valid_by_design: Trust source-text timing and do
+            not impose a treatment-time eligibility boundary
 
     Returns:
         Formatted prompt string for the LLM
@@ -200,10 +217,15 @@ def build_extraction_prompt(
             alias_instruction = (
                 f"\n   Value aliases to canonicalize: {alias_text}" if alias_text else ""
             )
+            missing_scope = (
+                "does not state this value in the supplied source text."
+                if source_text_temporally_valid_by_design
+                else "does not state this value before treatment."
+            )
             missing_instruction = (
-                "\n   Use \"unknown\" only when the note explicitly says the value is "
-                "unknown or indeterminate. Use \"not_documented\" when the note "
-                "does not state this value before treatment."
+                '\n   Use "unknown" only when the note explicitly says the value is '
+                'unknown or indeterminate. Use "not_documented" when the note '
+                f"{missing_scope}"
                 if {"unknown", "not_documented"}.issubset(set(categories))
                 else ""
             )
@@ -223,29 +245,62 @@ def build_extraction_prompt(
     instructions_text = "\n".join(instructions)
     json_example = "{" + ", ".join(json_fields) + "}"
 
-    # Keep the end of long notes where addenda, latest staging, and recent labs
-    # are often documented.
     text = str(clinical_text)
-    if max_text_length is not None and len(text) > int(max_text_length):
-        text = text[-int(max_text_length) :]
+    strategy = str(context_strategy).strip().lower().replace("-", "_")
+    if strategy == "tail":
+        # Preserve the historical behavior exactly for backward compatibility.
+        if max_text_length is not None and len(text) > int(max_text_length):
+            text = text[-int(max_text_length) :]
+    elif strategy == "contract_lexical_rag":
+        if max_text_length is None:
+            raise ValueError("contract_lexical_rag requires a finite max_text_length")
+        text = compact_contract_lexical_context(
+            text,
+            specs,
+            max_chars=int(max_text_length),
+        ).text
+    else:
+        raise ValueError("context_strategy must be 'tail' or 'contract_lexical_rag'")
 
-    if "[neural_query_rag_v1]" in text:
+    if strategy == "contract_lexical_rag":
         document_instruction = (
-            "Read every retrieved baseline-history excerpt below and extract the "
-            "following patient characteristics. The excerpts may mention prior "
-            "therapies, responses, or outcomes; those are valid history before the "
-            "current treatment decision."
+            "Read every contract-guided verbatim excerpt below and extract the "
+            "following characteristics. Excerpts retain their original source order."
         )
-        document_label = "Query-retrieved baseline excerpts"
+        document_label = "Contract-guided retrieved excerpts"
+    elif "[neural_query_rag_v1]" in text:
+        if source_text_temporally_valid_by_design:
+            document_instruction = (
+                "Read every retrieved excerpt below and extract the following patient "
+                "characteristics according to each contract."
+            )
+            document_label = "Query-retrieved excerpts"
+        else:
+            document_instruction = (
+                "Read every retrieved baseline-history excerpt below and extract the "
+                "following patient characteristics. The excerpts may mention prior "
+                "therapies, responses, or outcomes; those are valid history before the "
+                "current treatment decision."
+            )
+            document_label = "Query-retrieved baseline excerpts"
     else:
         document_instruction = (
-            "Read this complete clinical note and extract the following patient "
-            "characteristics."
+            "Read this complete clinical note and extract the following patient " "characteristics."
         )
         document_label = "Clinical Note"
 
+    temporal_instruction = (
+        "The supplied source text is temporally valid by design. Do not infer or enforce "
+        "a treatment-time boundary, and do not reject a documented value because of "
+        "temporal wording. Follow the extraction contract exactly. Do not guess."
+        if source_text_temporally_valid_by_design
+        else "Use only information available before or at the current treatment "
+        "initiation. Do not guess."
+    )
     prompt = f"""{document_instruction}
-Use only information available before or at the current treatment initiation. Do not guess. For categorical fields, follow each field's unknown/not_documented policy. For continuous fields that are not explicitly stated or cannot be deterministically converted, return null.
+{temporal_instruction}
+For categorical fields, use a listed category when supported and follow each field's unknown/not_documented policy. Every categorical field may be JSON null when its value is not documented.
+For continuous fields that are not explicitly stated or cannot be deterministically converted, return null.
 
 {instructions_text}
 
@@ -261,6 +316,8 @@ Respond with JSON only, no other text:
 def build_extraction_repair_prompt(
     issues: List[str],
     specs: List[ExplicitFeatureSpec],
+    *,
+    source_text_temporally_valid_by_design: bool = False,
 ) -> str:
     """Build a follow-up prompt for malformed extraction JSON."""
     issue_text = "\n".join(f"- {issue}" for issue in issues[:10])
@@ -276,6 +333,15 @@ def build_extraction_repair_prompt(
             instructions.append(f'- "{spec.name}" must be a number or null.')
     shape = "{" + ", ".join(fields) + "}"
     instruction_text = "\n".join(instructions)
+    missing_rule = (
+        "The supplied source text is temporally valid by design. Do not infer or enforce a "
+        "treatment-time boundary, and do not reject a documented value because of temporal "
+        "wording. Use null when a value is unknown, not stated, or cannot be inferred from "
+        "the supplied source text."
+        if source_text_temporally_valid_by_design
+        else "Use null when a value is unknown, not stated, or cannot be inferred from "
+        "information documented before treatment."
+    )
     return f"""The previous extraction response could not be used.
 
 Problems:
@@ -288,7 +354,7 @@ Return exactly one JSON object with exactly these keys:
 
 Field rules:
 {instruction_text}
-Use null when a value is unknown, not stated, or cannot be inferred from pre-treatment information."""
+{missing_rule}"""
 
 
 def parse_extraction_response(
@@ -347,16 +413,30 @@ def _parse_extraction_response_with_issues(
 
         if conf_type == "categorical":
             categories = spec.categories or []
-            if _is_null_like(value):
+            if value is None:
                 result[name] = ExplicitFeatureValue(
                     name=name, type=conf_type, value=None, is_missing=True
                 )
             else:
                 value_map = _categorical_value_map(spec)
-                matched_cat = value_map.get(_category_match_key(value))
+                match_key = _category_match_key(value)
+                matched_cat = value_map.get(match_key)
                 if matched_cat:
                     result[name] = ExplicitFeatureValue(
                         name=name, type=conf_type, value=matched_cat, is_missing=False
+                    )
+                elif (
+                    _is_null_like(value)
+                    or match_key in _UNDECLARED_CATEGORICAL_MISSING_SENTINEL_KEYS
+                ):
+                    # Fresh models sometimes emit a conventional missing label
+                    # even when that label is not part of the contract.  Exact
+                    # declared categories and aliases win above; only the two
+                    # generic undeclared sentinels fall back to JSON-null
+                    # semantics.  Using the category match key intentionally
+                    # accepts deterministic whitespace/underscore/hyphen forms.
+                    result[name] = ExplicitFeatureValue(
+                        name=name, type=conf_type, value=None, is_missing=True
                     )
                 else:
                     logger.debug(f"Invalid category '{value}' for {name}, valid: {categories}")
@@ -476,7 +556,9 @@ class VLLMFeatureExtractor:
         request_timeout: Optional[float] = 900.0,
         temperature: float = 0.0,
         max_tokens: int = 1024,
-        max_text_length: int = 400000,
+        max_text_length: Optional[int] = 400000,
+        context_strategy: str = "tail",
+        source_text_temporally_valid_by_design: bool = False,
     ):
         """Initialize extractor.
 
@@ -501,6 +583,9 @@ class VLLMFeatureExtractor:
             temperature: LLM temperature (0 for deterministic)
             max_tokens: Maximum tokens in response
             max_text_length: Maximum clinical text characters included in prompt
+            context_strategy: ``tail`` or ``contract_lexical_rag``
+            source_text_temporally_valid_by_design: Trust source-text timing
+                instead of imposing a treatment-time eligibility boundary
         """
         if mode not in ("server", "start_server", "python_api"):
             raise ValueError(
@@ -517,17 +602,14 @@ class VLLMFeatureExtractor:
             for url, endpoint_model in (model_names_by_url or {}).items()
         }
         missing_inventory = [
-            url for url in self.server_urls
-            if supplied_inventory and url not in supplied_inventory
+            url for url in self.server_urls if supplied_inventory and url not in supplied_inventory
         ]
         if missing_inventory:
             raise ValueError(
-                "model_names_by_url is missing configured endpoint(s): "
-                f"{missing_inventory}"
+                "model_names_by_url is missing configured endpoint(s): " f"{missing_inventory}"
             )
         self.model_names_by_url = {
-            url: supplied_inventory.get(url, str(model_name))
-            for url in self.server_urls
+            url: supplied_inventory.get(url, str(model_name)) for url in self.server_urls
         }
         self.tensor_parallel_size = tensor_parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
@@ -547,6 +629,8 @@ class VLLMFeatureExtractor:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.max_text_length = max_text_length
+        self.context_strategy = str(context_strategy)
+        self.source_text_temporally_valid_by_design = bool(source_text_temporally_valid_by_design)
 
         # These are set lazily
         self._client = None
@@ -656,7 +740,13 @@ class VLLMFeatureExtractor:
 
     def _extract_single_server(self, text: str) -> Dict[str, ExplicitFeatureValue]:
         """Extract features from single text using server API."""
-        prompt = build_extraction_prompt(text, self.specs, max_text_length=self.max_text_length)
+        prompt = build_extraction_prompt(
+            text,
+            self.specs,
+            max_text_length=self.max_text_length,
+            context_strategy=self.context_strategy,
+            source_text_temporally_valid_by_design=(self.source_text_temporally_valid_by_design),
+        )
         messages = [{"role": "user", "content": prompt}]
         best_result = None
         max_attempts = max(1, int(self.max_retries))
@@ -687,9 +777,7 @@ class VLLMFeatureExtractor:
                 }
                 if self.vllm_enable_thinking is not None:
                     response_kwargs["extra_body"] = {
-                        "chat_template_kwargs": {
-                            "enable_thinking": bool(self.vllm_enable_thinking)
-                        }
+                        "chat_template_kwargs": {"enable_thinking": bool(self.vllm_enable_thinking)}
                     }
                 response_kwargs.update(
                     google_json_response_format_kwargs(
@@ -732,6 +820,9 @@ class VLLMFeatureExtractor:
                                     "content": build_extraction_repair_prompt(
                                         parsed.issues,
                                         self.specs,
+                                        source_text_temporally_valid_by_design=(
+                                            self.source_text_temporally_valid_by_design
+                                        ),
                                     ),
                                 },
                             ]
@@ -785,6 +876,10 @@ class VLLMFeatureExtractor:
                 text,
                 self.specs,
                 max_text_length=self.max_text_length,
+                context_strategy=self.context_strategy,
+                source_text_temporally_valid_by_design=(
+                    self.source_text_temporally_valid_by_design
+                ),
             )
             tokenizer = self._llm.get_tokenizer()
 
@@ -947,7 +1042,8 @@ def extract_explicit_features(
     request_timeout: Optional[float] = 900.0,
     temperature: float = 0.0,
     max_tokens: int = 1024,
-    max_text_length: int = 400000,
+    max_text_length: Optional[int] = 400000,
+    context_strategy: str = "tail",
     batch_size: int = 32,
 ) -> pd.DataFrame:
     """Convenience function to extract features from texts.
@@ -972,6 +1068,7 @@ def extract_explicit_features(
         temperature: LLM temperature
         max_tokens: Max response tokens
         max_text_length: Maximum clinical text characters included in prompt
+        context_strategy: ``tail`` or ``contract_lexical_rag``
         batch_size: Batch size for processing
 
     Returns:
@@ -996,6 +1093,7 @@ def extract_explicit_features(
         temperature=temperature,
         max_tokens=max_tokens,
         max_text_length=max_text_length,
+        context_strategy=context_strategy,
     )
 
     try:

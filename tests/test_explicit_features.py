@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from oci.config import ExperimentConfig, ExplicitFeatureSpec
@@ -9,6 +11,10 @@ from oci.extraction import (
     parse_extraction_response,
     parse_server_urls,
     resolve_vllm_reasoning_parser,
+)
+from oci.extraction.explicit_features import (
+    _parse_extraction_response_with_issues,
+    build_extraction_repair_prompt,
 )
 from oci.models.explicit_feature_featurizer import (
     filter_specs_by_role,
@@ -182,6 +188,7 @@ def test_extraction_prompt_distinguishes_unknown_from_not_documented():
 
     assert 'Use "unknown" only when the note explicitly says' in prompt
     assert 'Use "not_documented" when the note does not state' in prompt
+    assert "Every categorical field may be JSON null when its value is not documented" in prompt
     assert "For continuous fields" in prompt
 
 
@@ -206,6 +213,43 @@ def test_neural_query_rag_prompt_treats_prior_outcomes_as_valid_history():
     assert "complete clinical note" not in prompt
 
 
+def test_temporally_valid_source_opt_in_removes_extraction_boundary_from_main_and_repair():
+    specs = [
+        ExplicitFeatureSpec(
+            name="response_status",
+            type="categorical",
+            categories=["absent", "present", "unknown", "not_documented"],
+            roles=["effect_modifier"],
+        )
+    ]
+    prompt = build_extraction_prompt(
+        "After therapy, response status was present.",
+        specs,
+        source_text_temporally_valid_by_design=True,
+    )
+    repair = build_extraction_repair_prompt(
+        ["malformed JSON"],
+        specs,
+        source_text_temporally_valid_by_design=True,
+    )
+
+    for text in (prompt, repair):
+        assert "temporally valid by design" in text
+        assert "Do not infer or enforce a treatment-time boundary" in text
+    assert "Use only information available before" not in prompt
+    assert "does not state this value before treatment" not in prompt
+    assert "information documented before treatment" not in repair
+
+
+def test_legacy_extraction_prompt_default_keeps_treatment_time_boundary():
+    specs = [ExplicitFeatureSpec(name="age", type="continuous", roles=["confounder"])]
+    prompt = build_extraction_prompt("Age 70.", specs)
+    repair = build_extraction_repair_prompt(["malformed JSON"], specs)
+
+    assert "Use only information available before or at" in prompt
+    assert "information documented before treatment" in repair
+
+
 def test_parse_extraction_response_accepts_quoted_null_as_missing():
     specs = [
         ExplicitFeatureSpec(name="age", type="continuous", roles=["confounder"]),
@@ -217,9 +261,7 @@ def test_parse_extraction_response_accepts_quoted_null_as_missing():
         ),
     ]
 
-    parsed = parse_extraction_response(
-        '{"age": "null", "marker_status": "null"}', specs
-    )
+    parsed = parse_extraction_response('{"age": "null", "marker_status": "null"}', specs)
 
     assert parsed["age"].value is None and parsed["age"].is_missing
     assert parsed["marker_status"].value is None and parsed["marker_status"].is_missing
@@ -240,6 +282,84 @@ def test_parse_extraction_response_maps_categorical_value_aliases():
 
     assert parsed["pd_l1_expression"].value == ">=50%"
     assert parsed["pd_l1_expression"].is_missing is False
+
+
+@pytest.mark.parametrize(
+    "sentinel",
+    [
+        "unknown",
+        " UNKNOWN ",
+        "not_documented",
+        "not documented",
+        "not-documented",
+    ],
+)
+def test_undeclared_categorical_missing_sentinel_is_null_without_schema_issue(
+    sentinel,
+):
+    specs = [
+        ExplicitFeatureSpec(
+            name="surface_state",
+            type="categorical",
+            categories=["matte", "gloss"],
+            roles=["confounder"],
+        )
+    ]
+
+    parsed = _parse_extraction_response_with_issues(
+        json.dumps({"surface_state": sentinel}),
+        specs,
+    )
+
+    assert parsed.issues == []
+    assert parsed.values["surface_state"].value is None
+    assert parsed.values["surface_state"].is_missing is True
+
+
+def test_declared_categorical_missing_labels_and_aliases_win_before_null_fallback():
+    specs = [
+        ExplicitFeatureSpec(
+            name="declared_state",
+            type="categorical",
+            categories=["matte", "unknown"],
+            roles=["confounder"],
+        ),
+        ExplicitFeatureSpec(
+            name="aliased_state",
+            type="categorical",
+            categories=["matte", "gloss"],
+            value_aliases={"gloss": ["not documented"]},
+            roles=["confounder"],
+        ),
+    ]
+
+    parsed = _parse_extraction_response_with_issues(
+        '{"declared_state": "unknown", "aliased_state": "not_documented"}',
+        specs,
+    )
+
+    assert parsed.issues == []
+    assert parsed.values["declared_state"].value == "unknown"
+    assert parsed.values["declared_state"].is_missing is False
+    assert parsed.values["aliased_state"].value == "gloss"
+    assert parsed.values["aliased_state"].is_missing is False
+
+
+def test_nonexact_undeclared_missing_label_remains_a_schema_issue():
+    spec = ExplicitFeatureSpec(
+        name="surface_state",
+        type="categorical",
+        categories=["matte", "gloss"],
+        roles=["confounder"],
+    )
+
+    parsed = _parse_extraction_response_with_issues(
+        '{"surface_state": "unknown_value"}',
+        [spec],
+    )
+
+    assert len(parsed.issues) == 1
+    assert "invalid category" in parsed.issues[0]
 
 
 def test_raw_explicit_features_maps_categorical_value_aliases():
@@ -397,9 +517,7 @@ def test_vllm_feature_extractor_can_disable_chat_template_thinking():
 
     result = extractor._extract_single_server("Age: 41")
 
-    assert calls["extra_body"] == {
-        "chat_template_kwargs": {"enable_thinking": False}
-    }
+    assert calls["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
     assert result["age"].value == 41.0
 
 
@@ -433,8 +551,7 @@ def test_vllm_feature_extractor_requests_json_response_format_for_google_agent_p
         ],
         mode="server",
         server_url=(
-            "https://aiplatform.googleapis.com/v1/projects/p/"
-            "locations/global/endpoints/openapi"
+            "https://aiplatform.googleapis.com/v1/projects/p/" "locations/global/endpoints/openapi"
         ),
         model_name="google/gemma-4-26b-a4b-it-maas",
         api_key="GOOGLE_ADC",
@@ -537,6 +654,51 @@ def test_vllm_feature_extractor_accepts_schema_complete_null_without_retry():
     assert len(calls) == 1
     assert result["age"].value is None
     assert result["age"].is_missing is True
+
+
+def test_vllm_feature_extractor_accepts_undeclared_missing_sentinel_without_retry():
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+
+            class Message:
+                content = '{"surface_state": "not_documented"}'
+
+            class Choice:
+                message = Message()
+
+            class Response:
+                choices = [Choice()]
+
+            return Response()
+
+    class FakeClient:
+        class Chat:
+            completions = FakeCompletions()
+
+        chat = Chat()
+
+    extractor = VLLMFeatureExtractor(
+        specs=[
+            ExplicitFeatureSpec(
+                name="surface_state",
+                type="categorical",
+                categories=["matte", "gloss"],
+                roles=["confounder"],
+            ),
+        ],
+        mode="server",
+        max_retries=3,
+    )
+    extractor._client = FakeClient()
+
+    result = extractor._extract_single_server("No surface state is documented.")
+
+    assert len(calls) == 1
+    assert result["surface_state"].value is None
+    assert result["surface_state"].is_missing is True
 
 
 def test_vllm_feature_extractor_retries_next_server(monkeypatch):

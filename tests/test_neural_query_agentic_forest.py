@@ -1,8 +1,14 @@
+import inspect
+import json
+import re
+
 import numpy as np
 
+import oci.inference.neural_query_agentic_forest as neural_query_module
 from oci.inference.neural_query_agentic_forest import (
     NeuralQueryAgenticForestConfig,
     apply_review_candidates_to_registry,
+    build_query_evidence,
     build_query_feature_context,
     build_query_rag_documents,
     build_query_registry_context,
@@ -46,11 +52,14 @@ def test_one_query_prompt_allows_multiple_traceable_features_without_gate():
         "member_count": 5,
         "member_subfolds": [1, 2, 3, 4, 5],
         "fit_standardized_score": 2.1,
-        "top_contrastive_ngrams": [{"term": "baseline cbc"}],
+        "top_contrastive_ngrams": [
+            {"term": "marker alpha"},
+            {"term": "marker beta"},
+        ],
         "top_chunks": [
             {
                 "evidence_id": "effect_query_001__row_00001__chunk_000",
-                "text": "Baseline ANC 6.0, ALC 1.0, NLR 6.0, Hgb 11.2 g/dL.",
+                "text": "Baseline panel: marker alpha 6.0, marker beta 11.2 units.",
             }
         ],
     }
@@ -60,36 +69,37 @@ def test_one_query_prompt_allows_multiple_traceable_features_without_gate():
     assert "statistical gate" in prompt
     assert "Prior treatments" in prompt
     assert "responses, toxicities, and outcomes are valid baseline history" in prompt
+    assert "evidence_field_cues" in prompt
+    assert {row["cue"].lower() for row in context["evidence_field_cues"]} >= {
+        "marker alpha",
+        "marker beta",
+    }
     response = {
-        "general_topic": "baseline CBC",
+        "general_topic": "baseline panel",
         "query_quality": "coherent",
         "proposals": [
             {
                 "action": "add",
-                "name": "baseline_nlr",
+                "name": "baseline_marker_alpha",
                 "type": "continuous",
                 "categories": None,
-                "description": "Baseline neutrophil-to-lymphocyte ratio.",
-                "clinical_domain": "hematology",
-                "parent_object": "baseline CBC",
-                "supporting_evidence_ids": [
-                    "effect_query_001__row_00001__chunk_000"
-                ],
-                "supporting_phrases": ["NLR 6.0"],
+                "description": "Baseline marker alpha in the documented units.",
+                "clinical_domain": "measurement panel",
+                "parent_object": "baseline panel",
+                "supporting_evidence_ids": ["effect_query_001__row_00001__chunk_000"],
+                "supporting_phrases": ["marker alpha 6.0"],
                 "rationale": "Explicitly present.",
             },
             {
                 "action": "add",
-                "name": "baseline_hemoglobin",
+                "name": "baseline_marker_beta",
                 "type": "continuous",
                 "categories": None,
-                "description": "Baseline hemoglobin in g/dL.",
-                "clinical_domain": "hematology",
-                "parent_object": "baseline CBC",
-                "supporting_evidence_ids": [
-                    "effect_query_001__row_00001__chunk_000"
-                ],
-                "supporting_phrases": ["Hgb 11.2 g/dL"],
+                "description": "Baseline marker beta in the documented units.",
+                "clinical_domain": "measurement panel",
+                "parent_object": "baseline panel",
+                "supporting_evidence_ids": ["effect_query_001__row_00001__chunk_000"],
+                "supporting_phrases": ["marker beta 11.2 units"],
                 "rationale": "Explicitly present.",
             },
         ],
@@ -97,10 +107,90 @@ def test_one_query_prompt_allows_multiple_traceable_features_without_gate():
     assert query_feature_response_issues(response, context) == []
     candidates = query_candidates_from_response(response, context)
     assert [candidate["name"] for candidate in candidates] == [
-        "baseline_nlr",
-        "baseline_hemoglobin",
+        "baseline_marker_alpha",
+        "baseline_marker_beta",
     ]
     assert all(candidate["roles"] == ["effect_modifier"] for candidate in candidates)
+
+
+def test_feature_prompt_has_no_fixed_hidden_variable_seed_vocabulary():
+    source = inspect.getsource(neural_query_module)
+    prompt = render_query_feature_prompt(
+        build_query_feature_context(
+            {
+                "query_id": "effect_query_001",
+                "bank": "effect",
+                "top_contrastive_ngrams": [{"term": "marker zeta"}],
+                "top_chunks": [
+                    {
+                        "evidence_id": "training_evidence_001",
+                        "text": "Marker zeta: 4.2 units.",
+                    }
+                ],
+            },
+            config=NeuralQueryAgenticForestConfig(),
+        )
+    )
+    for fixed_term in ("QX7", "RZ8", "VT9", "widgetonium", "Wdg", "QAZ"):
+        pattern = rf"\b{re.escape(fixed_term)}\b"
+        assert re.search(pattern, source, flags=re.IGNORECASE) is None
+        assert re.search(pattern, prompt, flags=re.IGNORECASE) is None
+    assert "marker zeta" in prompt.lower()
+    assert 'uses_fixed_clinical_vocabulary": false' in prompt
+
+
+def test_query_evidence_and_prompt_context_isolate_heldout_and_oracle_payloads():
+    class GuardedChunkTexts:
+        def __len__(self):
+            return 3
+
+        def __getitem__(self, row_id):
+            if int(row_id) == 1:
+                raise AssertionError("outer-held-out text was accessed during discovery")
+            return [
+                ["training marker alpha 2.0"],
+                [],
+                ["training marker beta 3.0"],
+            ][int(row_id)]
+
+    config = NeuralQueryAgenticForestConfig(
+        evidence_top_patients=1,
+        evidence_background_patients=1,
+    )
+    evidence = build_query_evidence(
+        bank="effect",
+        queries=np.array([[1.0, 0.0]], dtype=np.float32),
+        query_records=[
+            {
+                "query_id": "effect_query_001",
+                "member_count": 2,
+                "true_ite_prob": "ORACLE_RECORD_SENTINEL",
+            }
+        ],
+        row_ids=[0, 2],
+        chunk_matrices=[
+            np.array([[1.0, 0.0]], dtype=np.float32),
+            np.array([[0.8, 0.2]], dtype=np.float32),
+        ],
+        all_chunk_texts=GuardedChunkTexts(),
+        config=config,
+        device="cpu",
+        seed=7,
+    )[0]
+    assert "ORACLE_RECORD_SENTINEL" not in json.dumps(evidence)
+
+    evidence["outer_heldout_payload"] = "HELDOUT_METADATA_SENTINEL"
+    evidence["top_chunks"][0]["true_ite_prob"] = "ORACLE_CHUNK_SENTINEL"
+    evidence["top_contrastive_ngrams"][0]["oracle_score"] = "ORACLE_NGRAM_SENTINEL"
+    context = build_query_feature_context(evidence, config=config)
+    serialized = json.dumps(context)
+    for sentinel in (
+        "HELDOUT_METADATA_SENTINEL",
+        "ORACLE_CHUNK_SENTINEL",
+        "ORACLE_NGRAM_SENTINEL",
+    ):
+        assert sentinel not in serialized
+    assert context["field_cue_policy"]["forwards_unlisted_evidence_metadata"] is False
 
 
 def test_registry_role_union_and_extraction_group_cap():

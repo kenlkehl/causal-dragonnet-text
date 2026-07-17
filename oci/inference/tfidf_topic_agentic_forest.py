@@ -28,6 +28,7 @@ from ..models.explicit_feature_featurizer import get_raw_explicit_features
 from .agentic_explicit_feature_forest import (
     CausalForestExplicitEvaluator,
     SplitEvaluation,
+    StructuredInteractionExplicitEvaluator,
     _get_agent_response_trace,
     _normalize_feature_name,
     _spec_to_dict,
@@ -49,6 +50,10 @@ from .tfidf_topic_discovery import (
     stable_hash,
 )
 from .tfidf_topic_score_selection import TOPIC_SCORE_TEST_SCHEMA_VERSION
+from .tfidf_topic_split_registry import (
+    load_tfidf_topic_split_registry,
+    validate_handoff_rows_against_split_registry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -238,17 +243,35 @@ def validate_tfidf_topic_stage2_handoff(
     handoff_path: Path,
 ) -> Dict[str, Any]:
     """Audit exact-scope Stage 1 artifacts without constructing an LLM client."""
-    from .tfidf_topic_stage1 import tfidf_topic_stage1_config_hash
+    from .tfidf_topic_stage1 import (
+        tfidf_topic_stage1_config_hash,
+        tfidf_topic_stage1_identity,
+    )
 
     data = dataset.reset_index(drop=True)
     n_rows = int(len(data))
     valid_row_ids = set(range(n_rows))
     handoff_path = Path(handoff_path)
     rows = _read_jsonl(handoff_path)
-    expected_hash = tfidf_topic_stage1_config_hash(config)
+    expected_hash = tfidf_topic_stage1_config_hash(config, data)
+    expected_identity = tfidf_topic_stage1_identity(config, data)
     required_inner = int(
         config.architecture.multi_model_forest.candidate_consistency_inner_folds
     )
+    registry_path = getattr(
+        config.architecture.multi_model_forest,
+        "split_registry_path",
+        None,
+    )
+    split_registry = None
+    if registry_path:
+        split_registry = load_tfidf_topic_split_registry(
+            registry_path,
+            dataset_row_count=n_rows,
+            outer_fold_count=int(config.cv_folds),
+            inner_fold_count=required_inner,
+        )
+        validate_handoff_rows_against_split_registry(rows, split_registry)
     max_variables = int(config.explicit_features.max_variables_per_extraction_request)
     if not 1 <= max_variables <= 10:
         raise RuntimeError(
@@ -295,6 +318,29 @@ def validate_tfidf_topic_stage2_handoff(
                 f"Stage 1 hash mismatch in outer fold {outer_fold}: "
                 f"{row.get('stage1_config_hash')!r} != {expected_hash!r}"
             )
+        if split_registry is not None:
+            expected_fields = {
+                "dataset_content_fingerprint": expected_identity["dataset"][
+                    "content_fingerprint"
+                ],
+                "dataset_ordered_row_fingerprint": expected_identity["dataset"][
+                    "ordered_row_fingerprint"
+                ],
+                "split_semantics_hash": expected_identity["split_semantics_hash"],
+                "split_registry_content_hash": split_registry["content_hash"],
+            }
+            discovery = row.get("discovery") or {}
+            for key, expected_value in expected_fields.items():
+                if row.get(key) != expected_value:
+                    raise RuntimeError(
+                        f"Registry-sealed handoff {key} mismatch in outer fold "
+                        f"{outer_fold}"
+                    )
+                if key != "split_registry_content_hash" and discovery.get(key) != expected_value:
+                    raise RuntimeError(
+                        f"Registry-sealed discovery {key} mismatch in outer fold "
+                        f"{outer_fold}"
+                    )
         fit_ids = [int(value) for value in row.get("fit_row_ids", [])]
         heldout_ids = [int(value) for value in row.get("heldout_row_ids", [])]
         if len(fit_ids) != len(set(fit_ids)) or len(heldout_ids) != len(
@@ -3444,12 +3490,23 @@ class TfidfTopicAgenticForestRunner:
         self.extraction_provider = extraction_provider or make_explicit_feature_extraction_provider(
             config=config, output_dir=self.artifact_dir
         )
-        self.evaluator = evaluator or CausalForestExplicitEvaluator(
-            config=config,
-            cf_config=getattr(
-                config.architecture, "explicit_feature_forest", ExplicitFeatureForestConfig()
-            ),
-        )
+        if evaluator is not None:
+            self.evaluator = evaluator
+        else:
+            evaluator_class = (
+                StructuredInteractionExplicitEvaluator
+                if self.nn_config.structured_effect_estimator
+                == "interaction_s_learner"
+                else CausalForestExplicitEvaluator
+            )
+            self.evaluator = evaluator_class(
+                config=config,
+                cf_config=getattr(
+                    config.architecture,
+                    "explicit_feature_forest",
+                    ExplicitFeatureForestConfig(),
+                ),
+            )
         self.resume = bool(resume)
         prespecified = [
             *list(self.nn_config.prespecified_features),
@@ -4229,6 +4286,9 @@ class TfidfTopicAgenticForestRunner:
                 "agent_enable_thinking": getattr(
                     self.search_config, "agent_enable_thinking", None
                 ),
+                "agent_thinking_token_budget": getattr(
+                    self.search_config, "agent_thinking_token_budget", None
+                ),
                 "agent_schema_repair_attempts": getattr(
                     self.search_config, "agent_schema_repair_attempts", 1
                 ),
@@ -4387,6 +4447,9 @@ class TfidfTopicAgenticForestRunner:
                 "agent_max_tokens": self.search_config.agent_max_tokens,
                 "agent_enable_thinking": getattr(
                     self.search_config, "agent_enable_thinking", None
+                ),
+                "agent_thinking_token_budget": getattr(
+                    self.search_config, "agent_thinking_token_budget", None
                 ),
             }
         )

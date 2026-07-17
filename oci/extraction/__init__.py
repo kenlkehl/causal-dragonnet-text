@@ -16,6 +16,13 @@ from .explicit_features import (
     extract_explicit_features,
 )
 from .cache import ExtractionCache
+from .contract_lexical_context import (
+    CONTRACT_LEXICAL_CONTEXT_VERSION,
+    EXTRACTION_GROUPING_VERSION,
+    ContractLexicalContext,
+    RetrievedContractExcerpt,
+    compact_contract_lexical_context,
+)
 from .numeric_inventory import (
     AgenticNumericInventoryExtractor,
     CompletionResult,
@@ -52,6 +59,11 @@ __all__ = [
     "strip_reasoning_trace",
     "extract_explicit_features",
     "ExtractionCache",
+    "CONTRACT_LEXICAL_CONTEXT_VERSION",
+    "EXTRACTION_GROUPING_VERSION",
+    "ContractLexicalContext",
+    "RetrievedContractExcerpt",
+    "compact_contract_lexical_context",
     "AgenticNumericInventoryExtractor",
     "CompletionResult",
     "NumericInventoryConfig",

@@ -696,10 +696,9 @@ def test_agentic_extraction_provider_tracks_heterogeneous_endpoint_models(
         FakeVLLMFeatureExtractor,
     )
     config = _provider_config(tmp_path, cache_enabled=False)
-    config.explicit_features.vllm_server_url = (
-        "http://server-a/v1,http://server-b/v1"
-    )
+    config.explicit_features.vllm_server_url = "http://server-a/v1,http://server-b/v1"
     config.explicit_features.vllm_model_name = "auto"
+    config.explicit_features.source_text_temporally_valid_by_design = True
     provider = VLLMExplicitFeatureExtractionProvider(config=config, output_dir=tmp_path)
     specs = [
         ExplicitFeatureSpec(
@@ -718,9 +717,10 @@ def test_agentic_extraction_provider_tracks_heterogeneous_endpoint_models(
         "http://server-a/v1": "served-model-a",
         "http://server-b/v1": "served-model-b",
     }
-    assert cache_config["vllm_endpoint_model_inventory"] == calls[0][
-        "model_names_by_url"
-    ]
+    assert cache_config["vllm_endpoint_model_inventory"] == calls[0]["model_names_by_url"]
+    assert calls[0]["source_text_temporally_valid_by_design"] is True
+    assert cache_config["source_text_temporally_valid_by_design"] is True
+    assert cache_config["temporal_boundary_enforced"] is False
 
 
 def test_agentic_extraction_provider_saves_grouped_results_as_per_spec_cache(
@@ -1266,9 +1266,7 @@ def test_openai_agent_uses_endpoint_specific_autodiscovered_models(monkeypatch):
         def __init__(self, **kwargs):
             suffix = "a" if "server-a" in kwargs["base_url"] else "b"
             self.models = FakeOpenAIModels([f"served-agent-{suffix}"])
-            self.chat = SimpleNamespace(
-                completions=FakeCompletions(kwargs["base_url"])
-            )
+            self.chat = SimpleNamespace(completions=FakeCompletions(kwargs["base_url"]))
 
     monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
     agent = OpenAICompatibleFeatureSearchAgent(
@@ -1284,17 +1282,62 @@ def test_openai_agent_uses_endpoint_specific_autodiscovered_models(monkeypatch):
     assert agent.propose({"current_features": [], "iteration_feedback": []}) == []
 
     assert calls == [("http://server-a/v1", "served-agent-a")]
-    assert agent._resolve_agent_model_name().startswith(
-        "heterogeneous_endpoint_model_pool:"
+    assert agent._resolve_agent_model_name().startswith("heterogeneous_endpoint_model_pool:")
+
+
+@pytest.mark.parametrize("invalid_budget", [0, -1, True, 1.5, "4096"])
+def test_agentic_config_rejects_invalid_thinking_token_budget(invalid_budget):
+    with pytest.raises(ValueError, match="agent_thinking_token_budget"):
+        AgenticFeatureSearchConfig(agent_thinking_token_budget=invalid_budget)
+
+
+@pytest.mark.parametrize("invalid_enable", [0, 1, "false", [], object()])
+def test_agentic_config_rejects_non_boolean_thinking_switch(invalid_enable):
+    with pytest.raises(ValueError, match="agent_enable_thinking"):
+        AgenticFeatureSearchConfig(agent_enable_thinking=invalid_enable)
+
+
+@pytest.mark.parametrize("invalid_max_tokens", [0, -1, True, 1.5, "25000", None])
+def test_agentic_config_rejects_invalid_agent_max_tokens(invalid_max_tokens):
+    with pytest.raises(ValueError, match="agent_max_tokens"):
+        AgenticFeatureSearchConfig(agent_max_tokens=invalid_max_tokens)
+
+
+@pytest.mark.parametrize("budget", [4096, 4097])
+def test_agentic_config_reserves_final_answer_tokens_from_thinking_budget(budget):
+    with pytest.raises(ValueError, match="strictly less than agent_max_tokens"):
+        AgenticFeatureSearchConfig(
+            agent_max_tokens=4096,
+            agent_thinking_token_budget=budget,
+        )
+
+
+def test_openai_agent_sends_enabled_thinking_budget_at_request_root():
+    client = FakeOpenAIClient([json.dumps({"proposals": []})])
+    agent = OpenAICompatibleFeatureSearchAgent(
+        AgenticFeatureSearchConfig(
+            agent_model_name="served-agent-model",
+            agent_enable_thinking=True,
+            agent_thinking_token_budget=4096,
+            agent_schema_repair_attempts=0,
+        )
     )
+    agent._client = client
+
+    assert agent.propose({"current_features": [], "iteration_feedback": []}) == []
+    assert client.completions.calls[0]["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": True},
+        "thinking_token_budget": 4096,
+    }
 
 
-def test_openai_agent_can_disable_chat_template_thinking():
+def test_openai_agent_can_disable_chat_template_thinking_without_sending_budget():
     client = FakeOpenAIClient([json.dumps({"proposals": []})])
     agent = OpenAICompatibleFeatureSearchAgent(
         AgenticFeatureSearchConfig(
             agent_model_name="served-agent-model",
             agent_enable_thinking=False,
+            agent_thinking_token_budget=4096,
             agent_schema_repair_attempts=0,
         )
     )
@@ -1304,6 +1347,22 @@ def test_openai_agent_can_disable_chat_template_thinking():
     assert client.completions.calls[0]["extra_body"] == {
         "chat_template_kwargs": {"enable_thinking": False}
     }
+
+
+def test_openai_agent_does_not_send_budget_when_thinking_is_unset():
+    client = FakeOpenAIClient([json.dumps({"proposals": []})])
+    agent = OpenAICompatibleFeatureSearchAgent(
+        AgenticFeatureSearchConfig(
+            agent_model_name="served-agent-model",
+            agent_enable_thinking=None,
+            agent_thinking_token_budget=4096,
+            agent_schema_repair_attempts=0,
+        )
+    )
+    agent._client = client
+
+    assert agent.propose({"current_features": [], "iteration_feedback": []}) == []
+    assert "extra_body" not in client.completions.calls[0]
 
 
 def test_openai_agent_requests_json_response_format_for_google_agent_platform():
