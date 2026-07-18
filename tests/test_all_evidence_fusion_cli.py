@@ -13,12 +13,37 @@ from oci.inference import all_evidence_fusion_cli as cli
 from oci.inference.neural_query_signal_artifact import query_signal_columns
 
 
-def _args(tmp_path: Path, *extra: str):
+def _args(
+    tmp_path: Path,
+    *extra: str,
+    include_review_dependencies: bool = True,
+):
     paths = {}
     for name in ("dataset", "legacy", "tfidf", "primary"):
         path = tmp_path / f"{name}.artifact"
         path.write_bytes(b"placeholder")
         paths[name] = path
+    review_values: list[str] = []
+    if include_review_dependencies:
+        stage1_config = tmp_path / "historical_stage1.json"
+        stage1_config.write_text(
+            json.dumps({"config": asdict(cli.AppliedInferenceConfig())}),
+            encoding="utf-8",
+        )
+        embedding_cache = tmp_path / "frozen_embeddings"
+        embedding_cache.mkdir(exist_ok=True)
+        (embedding_cache / "metadata.json").write_text(
+            json.dumps({"num_samples": 4}),
+            encoding="utf-8",
+        )
+        for filename in ("chunk_embeddings.npy", "offsets.npy", "chunk_texts.jsonl"):
+            (embedding_cache / filename).write_bytes(b"placeholder")
+        review_values = [
+            "--review-stage1-config",
+            str(stage1_config),
+            "--review-embedding-cache-dir",
+            str(embedding_cache),
+        ]
     values = [
         "--benchmark-name",
         "synthetic-five-by-five",
@@ -38,6 +63,7 @@ def _args(tmp_path: Path, *extra: str):
         "remote/model",
         "--expected-outer-folds",
         "2",
+        *review_values,
         *extra,
     ]
     return cli.build_parser().parse_args(values)
@@ -208,7 +234,7 @@ def test_fusion_reasoning_is_on_while_extraction_reasoning_is_off(tmp_path):
 
     assert fusion.agent_enable_thinking is True
     assert fusion.agent_max_tokens == 25000
-    assert fusion.agent_thinking_token_budget == 4096
+    assert fusion.agent_thinking_token_budget == 5000
     assert extraction.explicit_features.vllm_enable_thinking is False
 
 
@@ -320,13 +346,22 @@ def test_precomputed_recursive_review_feature_bank_options_are_removed(tmp_path)
         _args(tmp_path, "--require-review-feature-banks")
 
 
-def test_cli_fails_closed_when_adaptive_review_lacks_context_fit_inputs(tmp_path):
+def test_v24_runtime_defaults_to_two_review_rounds_and_rejects_disabling_them(
+    tmp_path,
+):
+    assert _args(tmp_path).post_extraction_review_rounds == 2
+
+    disabled = _args(tmp_path, "--post-extraction-review-rounds", "0")
+    with pytest.raises(ValueError, match=r"must be in \[1, 8\]"):
+        cli.build_agent_config(disabled)
+
+
+def test_cli_fails_closed_when_default_adaptive_review_lacks_context_fit_inputs(tmp_path):
     args = _args(
         tmp_path,
-        "--post-extraction-review-rounds",
-        "1",
         "--max-variables-per-extraction-request",
         "1",
+        include_review_dependencies=False,
     )
     with pytest.raises(ValueError, match="--review-stage1-config is required"):
         cli.validate_benchmark_inputs(args)
@@ -396,6 +431,7 @@ def _review_dependency_args(
     *,
     rows: int = 4,
     modifier_only: bool = True,
+    include_rounds: bool = True,
 ) -> list[str]:
     stage1_config = tmp_path / "historical_stage1.json"
     stage1_config.write_text(
@@ -403,32 +439,122 @@ def _review_dependency_args(
         encoding="utf-8",
     )
     embedding_cache = tmp_path / "frozen_embeddings"
-    embedding_cache.mkdir()
+    embedding_cache.mkdir(exist_ok=True)
     (embedding_cache / "metadata.json").write_text(
         json.dumps({"num_samples": rows}),
         encoding="utf-8",
     )
     for filename in ("chunk_embeddings.npy", "offsets.npy", "chunk_texts.jsonl"):
         (embedding_cache / filename).write_bytes(b"placeholder")
-    values = [
-        "--post-extraction-review-rounds",
-        "2",
-        "--max-variables-per-extraction-request",
-        "1",
-        "--review-stage1-config",
-        str(stage1_config),
-        "--review-embedding-cache-dir",
-        str(embedding_cache),
-        "--review-stage1-device",
-        "cuda:0",
-        "--review-neural-query-device",
-        "cuda:0",
-        "--review-neural-query-device",
-        "cuda:1",
-    ]
-    if modifier_only:
-        values.append("--modifier-interactions-only")
+    values = []
+    if include_rounds:
+        values.extend(("--post-extraction-review-rounds", "2"))
+    values.extend(
+        [
+            "--max-variables-per-extraction-request",
+            "1",
+            "--review-stage1-config",
+            str(stage1_config),
+            "--review-embedding-cache-dir",
+            str(embedding_cache),
+            "--review-stage1-device",
+            "cuda:0",
+            "--review-neural-query-device",
+            "cuda:0",
+            "--review-neural-query-device",
+            "cuda:1",
+        ]
+    )
+    values.append(
+        "--modifier-interactions-only"
+        if modifier_only
+        else "--no-modifier-interactions-only"
+    )
     return values
+
+
+def _install_required_v24_runtime_stubs(monkeypatch, *, row_count: int):
+    """Install inert constructors for tests concerned with post-run behavior."""
+
+    spent_provider = object()
+    gate_provider = object()
+    final_upstream_producer = object()
+    monkeypatch.setattr(
+        cli,
+        "SpentOnlyFrozenChunkEmbeddingCache",
+        lambda _path: SimpleNamespace(row_count=row_count),
+    )
+    monkeypatch.setattr(cli, "_resolve_htr_model_path", lambda _config: Path("htr"))
+    monkeypatch.setattr(cli, "PrivateHTRModelTreeSnapshot", lambda _path: object())
+    monkeypatch.setattr(cli, "ContextFitNeuralQueryService", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        cli,
+        "TfidfTopicOrphanSpentDiscoveryBackend",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "TfidfTopicOrphanContextBackend",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_shared_tfidf_context_fit_backends",
+        lambda **_kwargs: SimpleNamespace(
+            spent_discovery_backend=object(),
+            context_backend=object(),
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "HistoricalStage1SpentDiscoveryBackend",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "NeuralQuerySpentDiscoveryBackend",
+        lambda _service: object(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "ContextFitReviewSpentEvidenceProvider",
+        lambda **_kwargs: spent_provider,
+    )
+    monkeypatch.setattr(
+        cli,
+        "HistoricalStage1ContextBackend",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "NeuralQueryContextBackend",
+        lambda _service: object(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "CompositeContextFitUpstreamBackend",
+        lambda _backends: object(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "CrossFitStableUpstreamBackend",
+        lambda _backend, *, config: object(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "ContextFitUpstreamGateProvider",
+        lambda _cache_dir, *, backend: gate_provider,
+    )
+    monkeypatch.setattr(
+        cli,
+        "FinalContextFitUpstreamProducer",
+        lambda _cache_dir, *, backend: final_upstream_producer,
+    )
+    return SimpleNamespace(
+        spent_provider=spent_provider,
+        gate_provider=gate_provider,
+        final_upstream_producer=final_upstream_producer,
+    )
 
 
 def test_adaptive_review_dry_run_rejects_group_dependent_extraction_requests(tmp_path):
@@ -581,27 +707,33 @@ def test_dry_run_validates_without_constructing_remote_dependencies(tmp_path, mo
     assert result["source_text_temporal_policy"]["temporal_boundary_enforced"] is False
     assert result["clients_constructed"] is False
     assert result["oracle_columns_read"] is False
-    assert result["query_moment_fallback_enabled"] is True
-    assert result["sparse_query_moment_fallback_enabled"] is True
+    assert result["query_moment_fallback_enabled"] is False
+    assert result["sparse_query_moment_fallback_enabled"] is False
     assert result["authenticated_neural_query_moment_folds"] == []
-    assert result["neural_query_moments_required"] is False
+    assert result["neural_query_moments_required"] is True
+    assert result["neural_query_moment_requirement_mode"] == "adaptive_context_fit"
     assert result["tfidf_orphan_adapter_enabled"] is True
     assert result["fusion_enable_thinking"] is True
     assert result["fusion_max_tokens"] == 25000
-    assert result["fusion_thinking_token_budget"] == 4096
+    assert result["fusion_thinking_token_budget"] == 5000
     assert result["extraction_enable_thinking"] is False
     assert result["extraction_source_text_temporally_valid_by_design"] is True
-    assert result["post_extraction_review_rounds"] == 0
+    assert result["post_extraction_review_rounds"] == 2
     assert result["post_extraction_review_max_quality_retries"] == 2
-    assert result["post_extraction_review_agent_is_base_reasoning_agent"] is False
-    assert result["post_extraction_review_source_signals_required"] is False
-    assert result["post_extraction_review_feature_banks_required"] is False
+    assert result["post_extraction_review_agent_is_base_reasoning_agent"] is True
+    assert result["post_extraction_review_source_signals_required"] is True
+    assert result["post_extraction_review_feature_banks_required"] is True
     assert result["precomputed_recursive_review_feature_banks_enabled"] is False
-    assert result["post_extraction_review_spent_discovery_families"] == []
+    assert result["post_extraction_review_spent_discovery_families"] == sorted(
+        cli._REQUIRED_REVIEW_DISCOVERY_FAMILIES
+    )
     assert result["read_only_review_spent_cache_source_count"] == 0
     assert result["read_only_review_spent_cache_sources"] == []
     assert result["read_only_context_fit_cache_source_count"] == 0
     assert result["read_only_context_fit_cache_sources"] == []
+    assert result["final_causal_forest_required"] is True
+    assert result["final_causal_forest_active"] is True
+    assert result["nonforest_final_model_fallback_allowed"] is False
 
 
 def test_review_spent_cache_cli_registration_is_repeatable(tmp_path):
@@ -754,7 +886,11 @@ def test_adaptive_review_dry_run_validates_context_fit_dependencies_only(
     tmp_path,
     monkeypatch,
 ):
-    args = _args(tmp_path, "--dry-run", *_review_dependency_args(tmp_path))
+    args = _args(
+        tmp_path,
+        "--dry-run",
+        *_review_dependency_args(tmp_path, include_rounds=False),
+    )
     _mock_valid_input_loaders(monkeypatch)
 
     def forbidden(*args, **kwargs):
@@ -806,6 +942,7 @@ def test_adaptive_review_dry_run_validates_context_fit_dependencies_only(
     assert result["final_upstream_producer_constructed"] is False
     assert result["final_causal_forest_required"] is True
     assert result["final_causal_forest_active"] is True
+    assert result["nonforest_final_model_fallback_allowed"] is False
     assert result["final_ite_estimator"] == (cli.FINAL_CONTEXT_FIT_CAUSAL_FOREST_ADAPTER_ID)
     forest_backend = dict(result["final_causal_forest_backend"])
     runtime = forest_backend.pop("repository_runtime")
@@ -845,15 +982,18 @@ def test_adaptive_review_dry_run_validates_context_fit_dependencies_only(
     assert result["clients_constructed"] is False
 
 
-def test_require_neural_query_moments_fails_when_any_fold_is_unregistered(
+def test_require_neural_query_moments_uses_context_fit_without_static_registrations(
     tmp_path,
     monkeypatch,
 ):
     args = _args(tmp_path, "--dry-run", "--require-neural-query-moments")
     _mock_valid_input_loaders(monkeypatch)
 
-    with pytest.raises(ValueError, match=r"outer folds \[1, 2\]"):
-        cli.run_benchmark(args)
+    result = cli.run_benchmark(args)
+
+    assert result["authenticated_neural_query_moment_folds"] == []
+    assert result["neural_query_moment_requirement_mode"] == "adaptive_context_fit"
+    assert result["neural_query_moments_required"] is True
 
 
 def test_adaptive_require_neural_query_uses_context_fit_and_static_artifact_is_audit_only(
@@ -1394,8 +1534,12 @@ def test_oracle_projection_occurs_only_after_runner_freezes_predictions(tmp_path
         orphan_ngram_artifacts_by_fold=orphan_overrides,
         row_count=4,
         outer_folds=(1, 2),
+        review_stage1_config_path=Path(args.review_stage1_config).resolve(),
+        review_embedding_cache_dir=Path(args.review_embedding_cache_dir).resolve(),
+        review_neural_query_cache_dir=tmp_path / "query_context_cache",
     )
     monkeypatch.setattr(cli, "validate_benchmark_inputs", lambda ignored: validated)
+    upstream = _install_required_v24_runtime_stubs(monkeypatch, row_count=validated.row_count)
     events = []
 
     class BaseAgent:
@@ -1417,30 +1561,31 @@ def test_oracle_projection_occurs_only_after_runner_freezes_predictions(tmp_path
     class Runner:
         def __init__(self, **kwargs):
             assert kwargs["review_agent"] is kwargs["fusion_agent"].base
-            assert kwargs["final_upstream_producer"] is None
-            assert kwargs["raw_final_upstream_producer"] is None
-            assert kwargs["review_gate_source_provider"] is None
+            assert kwargs["final_upstream_producer"] is upstream.final_upstream_producer
+            assert kwargs["raw_final_upstream_producer"] is upstream.final_upstream_producer
+            assert kwargs["review_gate_source_provider"] is upstream.gate_provider
             assert kwargs["review_partition_provider"] is None
-            assert kwargs["review_gate_feature_bank_provider"] is None
+            assert kwargs["review_gate_feature_bank_provider"] is upstream.gate_provider
+            assert kwargs["review_spent_evidence_provider"] is upstream.spent_provider
             assert kwargs["legacy_primary_predictions_path"] == validated.primary_splits_path
             assert kwargs["tfidf_orphan_artifacts_by_fold"] is orphan_overrides
             assert kwargs["config"].include_tfidf_orphan_ngrams is True
-            assert kwargs["config"].derive_sparse_query_moments_when_missing is True
+            assert kwargs["config"].derive_sparse_query_moments_when_missing is False
             assert kwargs["config"].fusion_model_identity == "remote/model"
             assert kwargs["config"].extraction_model_identity == "remote/model"
             assert kwargs["config"].remote_endpoint_pool_identity == ("http://camus:8010/v1")
             assert kwargs["config"].fusion_enable_thinking is True
             assert kwargs["config"].fusion_max_tokens == 25000
-            assert kwargs["config"].fusion_thinking_token_budget == 4096
+            assert kwargs["config"].fusion_thinking_token_budget == 5000
             assert kwargs["config"].extraction_enable_thinking is False
-            assert kwargs["config"].post_extraction_review_rounds == 0
+            assert kwargs["config"].post_extraction_review_rounds == 2
             assert kwargs["config"].post_extraction_review_max_operations == 4
             assert kwargs["config"].post_extraction_review_max_quality_retries == 2
-            assert kwargs["config"].require_review_source_signals is False
-            assert kwargs["config"].require_review_feature_banks is False
-            assert kwargs["config"].require_final_upstream_inputs is False
-            assert kwargs["config"].require_final_upstream_neural_query_inputs is False
-            assert kwargs["config"].require_final_causal_forest is False
+            assert kwargs["config"].require_review_source_signals is True
+            assert kwargs["config"].require_review_feature_banks is True
+            assert kwargs["config"].require_final_upstream_inputs is True
+            assert kwargs["config"].require_final_upstream_neural_query_inputs is True
+            assert kwargs["config"].require_final_causal_forest is True
             assert kwargs["config"].final_upstream_meta_inner_folds == 3
             assert kwargs["config"].final_upstream_head_regularization == 1.0
 
@@ -1491,10 +1636,14 @@ def test_prediction_hash_mismatch_blocks_oracle_projection(tmp_path, monkeypatch
         orphan_ngram_artifacts_by_fold={},
         row_count=4,
         outer_folds=(1, 2),
+        review_stage1_config_path=Path(args.review_stage1_config).resolve(),
+        review_embedding_cache_dir=Path(args.review_embedding_cache_dir).resolve(),
+        review_neural_query_cache_dir=tmp_path / "query_context_cache",
     )
     prediction_path = tmp_path / "mutated_predictions.parquet"
     prediction_path.write_bytes(b"bytes that do not match the declared runner hash")
     monkeypatch.setattr(cli, "validate_benchmark_inputs", lambda ignored: validated)
+    _install_required_v24_runtime_stubs(monkeypatch, row_count=validated.row_count)
     monkeypatch.setattr(
         cli,
         "validate_remote_endpoint_pool",
@@ -1545,8 +1694,12 @@ def test_no_posthoc_flag_never_reads_oracle(tmp_path, monkeypatch):
         orphan_ngram_artifacts_by_fold={},
         row_count=4,
         outer_folds=(1, 2),
+        review_stage1_config_path=Path(args.review_stage1_config).resolve(),
+        review_embedding_cache_dir=Path(args.review_embedding_cache_dir).resolve(),
+        review_neural_query_cache_dir=tmp_path / "query_context_cache",
     )
     monkeypatch.setattr(cli, "validate_benchmark_inputs", lambda ignored: validated)
+    _install_required_v24_runtime_stubs(monkeypatch, row_count=validated.row_count)
     monkeypatch.setattr(cli, "OpenAICompatibleFeatureSearchAgent", lambda config: object())
     monkeypatch.setattr(
         cli,

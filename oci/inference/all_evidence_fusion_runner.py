@@ -168,6 +168,7 @@ FINAL_ITE_ESTIMATOR_AUDIT_SCHEMA_VERSION = "all_evidence_final_ite_estimator_v1"
 FINAL_FOREST_POTENTIAL_OUTCOME_POLICY_VERSION = (
     "exact_nuisance_mean_feasible_potential_outcome_projection_v2"
 )
+DEFAULT_POST_EXTRACTION_REVIEW_ROUNDS = 2
 _MAX_EXACT_INNER_RECURRENCE_TERMS_PER_GROUP = 24
 
 _FORBIDDEN_NAME = re.compile(r"(?:^|_)(?:true|oracle|ground_truth)(?:_|$)", flags=re.IGNORECASE)
@@ -3084,7 +3085,7 @@ class AllEvidenceFusionRunnerConfig:
     extraction_max_text_length: int = 400000
     extraction_batch_size: int = 32
     max_variables_per_extraction_request: int = 10
-    post_extraction_review_rounds: int = 0
+    post_extraction_review_rounds: int = DEFAULT_POST_EXTRACTION_REVIEW_ROUNDS
     post_extraction_review_max_operations: int = 4
     post_extraction_review_max_quality_retries: int = 2
     post_extraction_review_min_partition_rows: int = 8
@@ -3181,6 +3182,21 @@ class AllEvidenceFusionRunnerConfig:
         ):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be a boolean")
+        # Positive adaptive review is strict by default.  The only supported
+        # non-strict path is the existing explicit degraded research/test mode;
+        # the v24 benchmark CLI never enables it.
+        if (
+            self.post_extraction_review_rounds > 0
+            and not self.allow_degraded_review_without_all_upstream
+        ):
+            for name in (
+                "require_review_source_signals",
+                "require_review_feature_banks",
+                "require_final_upstream_inputs",
+                "require_final_upstream_neural_query_inputs",
+                "require_final_causal_forest",
+            ):
+                object.__setattr__(self, name, True)
         if self.post_extraction_review_rounds == 0 and (
             self.require_review_source_signals or self.require_review_feature_banks
         ):

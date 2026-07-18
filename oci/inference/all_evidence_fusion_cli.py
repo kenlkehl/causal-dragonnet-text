@@ -4,7 +4,7 @@ This module deliberately keeps benchmark execution behind a narrow boundary:
 
 * proposal/selection and extraction use the same explicitly configured remote
   OpenAI-compatible endpoint pool;
-* proposal/selection reasoning is enabled with a fixed 4096-token budget while
+* proposal/selection reasoning is enabled with a fixed 5000-token budget while
   extraction reasoning is fixed off, and both execution semantics are
   immutable-manifest-bound;
 * extraction is fixed to ``vllm_mode='server'`` and cannot start or import a
@@ -55,6 +55,7 @@ from .all_evidence_fusion_runner import (
     AllEvidenceFusionRunResult,
     AllEvidenceFusionRunner,
     AllEvidenceFusionRunnerConfig,
+    DEFAULT_POST_EXTRACTION_REVIEW_ROUNDS,
     QueryEvidenceArtifact,
     TfidfOrphanNgramArtifact,
     evaluate_frozen_all_evidence_predictions,
@@ -133,7 +134,7 @@ from .tfidf_topic_discovery import row_set_fingerprint
 _BENCHMARK_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _SERVER_MODE = "server"
 _FUSION_ENABLE_THINKING = True
-_FUSION_THINKING_TOKEN_BUDGET = 4096
+_FUSION_THINKING_TOKEN_BUDGET = 5000
 _EXTRACTION_ENABLE_THINKING = False
 _ORACLE_ITE_COLUMN = "true_ite_prob"
 _REVIEW_EMBEDDING_CACHE_FILES = (
@@ -300,8 +301,8 @@ def _validate_numeric_configuration(args: argparse.Namespace) -> None:
         raise ValueError("--max-variables-per-extraction-request must be in [1, 10]")
     if int(args.extraction_max_text_length) < 1:
         raise ValueError("--extraction-max-text-length must be positive")
-    if not 0 <= int(args.post_extraction_review_rounds) <= 8:
-        raise ValueError("--post-extraction-review-rounds must be in [0, 8]")
+    if not 1 <= int(args.post_extraction_review_rounds) <= 8:
+        raise ValueError("--post-extraction-review-rounds must be in [1, 8]")
     if (
         int(args.post_extraction_review_rounds) > 0
         and int(args.max_variables_per_extraction_request) != 1
@@ -1138,6 +1139,11 @@ def _dry_run_summary(
     validated: ValidatedBenchmarkInputs,
 ) -> dict[str, Any]:
     review_enabled = int(args.post_extraction_review_rounds) > 0
+    if not review_enabled:
+        raise ValueError(
+            "the v24 benchmark requires adaptive post-extraction review and the "
+            "honest final causal forest"
+        )
     review_query_config = build_review_neural_query_config(args) if review_enabled else None
     final_schema = (
         build_final_upstream_schema_config(
@@ -1147,9 +1153,7 @@ def _dry_run_summary(
         if review_enabled and validated.review_stage1_config_path is not None
         else None
     )
-    sparse_query_fallback_enabled = not review_enabled and not bool(
-        args.require_neural_query_moments
-    )
+    sparse_query_fallback_enabled = False
     tfidf_graph, tfidf_graph_selection = _select_tfidf_context_backend_graph(
         validated.authenticated_context_fit_cache_sources
     )
@@ -1238,18 +1242,13 @@ def _dry_run_summary(
         "final_upstream_inputs_required": review_enabled,
         "final_upstream_neural_query_inputs_required": review_enabled,
         "final_upstream_producer_constructed": False,
-        "final_causal_forest_required": review_enabled,
-        "final_causal_forest_active": review_enabled,
-        "final_ite_estimator": (
-            FINAL_CONTEXT_FIT_CAUSAL_FOREST_ADAPTER_ID
-            if review_enabled
-            else "structured_interaction_head_degraded_fallback"
-        ),
-        "final_causal_forest_backend": (
-            FixedCausalForestHeadBackend(random_state=int(args.seed)).identity()
-            if review_enabled
-            else None
-        ),
+        "final_causal_forest_required": True,
+        "final_causal_forest_active": True,
+        "final_ite_estimator": FINAL_CONTEXT_FIT_CAUSAL_FOREST_ADAPTER_ID,
+        "final_causal_forest_backend": FixedCausalForestHeadBackend(
+            random_state=int(args.seed)
+        ).identity(),
+        "nonforest_final_model_fallback_allowed": False,
         "final_causal_forest_backend_injected": False,
         "raw_final_upstream_runtime_constructed": False,
         "raw_final_upstream_runtime_retained_separately_from_cache_overlay": (review_enabled),
@@ -1354,6 +1353,11 @@ def run_benchmark(args: argparse.Namespace) -> Mapping[str, Any]:
         validated.output_dir / "remote_extraction",
     )
     review_rounds = int(args.post_extraction_review_rounds)
+    if review_rounds < 1:
+        raise RuntimeError(
+            "the v24 benchmark requires adaptive post-extraction review and the "
+            "honest final causal forest"
+        )
     review_spent_evidence_provider = None
     review_gate_provider = None
     final_upstream_producer = None
@@ -1488,6 +1492,16 @@ def run_benchmark(args: argparse.Namespace) -> Mapping[str, Any]:
                 sources=context_fit_sources,
                 output_root=validated.output_dir,
             )
+    if (
+        review_spent_evidence_provider is None
+        or review_gate_provider is None
+        or final_upstream_producer is None
+        or raw_final_upstream_producer is None
+    ):
+        raise RuntimeError(
+            "the v24 benchmark cannot construct its required adaptive-review and "
+            "honest causal-forest runtime"
+        )
     overlay = None
     if validated.cache_index_paths:
         overlay = FrozenExtractionCacheOverlay(
@@ -1546,19 +1560,17 @@ def run_benchmark(args: argparse.Namespace) -> Mapping[str, Any]:
             post_extraction_review_min_partition_rows=int(
                 args.post_extraction_review_min_partition_rows
             ),
-            require_review_source_signals=review_rounds > 0,
-            require_review_feature_banks=review_rounds > 0,
-            require_final_upstream_inputs=review_rounds > 0,
-            require_final_upstream_neural_query_inputs=review_rounds > 0,
-            require_final_causal_forest=review_rounds > 0,
+            require_review_source_signals=True,
+            require_review_feature_banks=True,
+            require_final_upstream_inputs=True,
+            require_final_upstream_neural_query_inputs=True,
+            require_final_causal_forest=True,
             final_upstream_meta_inner_folds=int(args.final_upstream_meta_inner_folds),
             final_upstream_head_regularization=float(args.final_upstream_head_regularization),
             require_registry_seal=True,
             include_tfidf_orphan_ngrams=True,
             require_tfidf_orphan_ngrams=bool(args.require_orphan_ngrams),
-            derive_sparse_query_moments_when_missing=(
-                review_rounds == 0 and not bool(args.require_neural_query_moments)
-            ),
+            derive_sparse_query_moments_when_missing=False,
             require_neural_query_moments=bool(args.require_neural_query_moments),
             neural_query_moment_artifacts_by_fold=(validated.neural_query_moment_artifacts_by_fold),
         ),
@@ -1574,20 +1586,13 @@ def run_benchmark(args: argparse.Namespace) -> Mapping[str, Any]:
         "prediction_path": str(result.prediction_path),
         "prediction_sha256": result.prediction_sha256,
         "run_manifest_path": str(result.run_manifest_path),
-        "final_ite_estimator": (
-            FINAL_CONTEXT_FIT_CAUSAL_FOREST_ADAPTER_ID
-            if raw_final_upstream_producer is not None
-            else "structured_interaction_head_degraded_fallback"
-        ),
-        "final_causal_forest_active": raw_final_upstream_producer is not None,
-        "final_causal_forest_backend": (
-            FixedCausalForestHeadBackend(random_state=int(args.seed)).identity()
-            if raw_final_upstream_producer is not None
-            else None
-        ),
-        "raw_final_upstream_runtime_retained_separately_from_cache_overlay": (
-            raw_final_upstream_producer is not None
-        ),
+        "final_ite_estimator": FINAL_CONTEXT_FIT_CAUSAL_FOREST_ADAPTER_ID,
+        "final_causal_forest_active": True,
+        "final_causal_forest_backend": FixedCausalForestHeadBackend(
+            random_state=int(args.seed)
+        ).identity(),
+        "nonforest_final_model_fallback_allowed": False,
+        "raw_final_upstream_runtime_retained_separately_from_cache_overlay": True,
         **_shared_tfidf_runtime_audit(
             review_enabled=review_rounds > 0,
             graph=tfidf_graph,
@@ -1646,10 +1651,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--post-extraction-review-rounds",
         type=int,
-        default=0,
+        default=DEFAULT_POST_EXTRACTION_REVIEW_ROUNDS,
         help=(
-            "Bounded sequential outer-train review proposals. Positive values require "
-            "the context-fit Stage-1 and frozen-embedding arguments below."
+            "Bounded sequential outer-train review proposals. The v24 benchmark "
+            "requires at least one round and defaults to two; the context-fit Stage-1 "
+            "and frozen-embedding arguments below are required."
         ),
     )
     parser.add_argument("--post-extraction-review-max-operations", type=int, default=4)
@@ -1751,7 +1757,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--request-max-retries", type=int, default=3)
     parser.add_argument("--request-timeout", type=float, default=1800.0)
     parser.add_argument("--extraction-batch-size", type=int, default=32)
-    parser.add_argument("--max-variables-per-extraction-request", type=int, default=10)
+    parser.add_argument("--max-variables-per-extraction-request", type=int, default=1)
     parser.add_argument(
         "--extraction-grouping-strategy",
         choices=("clinical_domain", "packed"),
@@ -1836,8 +1842,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--modifier-interactions-only",
-        action="store_true",
-        help="Interact only contracts assigned the effect-modifier role.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Interact only contracts assigned the effect-modifier role. This is on by "
+            "default and required by the v24 causal-forest runtime."
+        ),
     )
     parser.add_argument(
         "--evaluate-oracle-posthoc",

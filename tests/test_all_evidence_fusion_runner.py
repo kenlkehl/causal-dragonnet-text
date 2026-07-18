@@ -84,6 +84,41 @@ def test_runner_default_grid_explores_stronger_logistic_regularization():
     )
 
 
+def test_runner_defaults_to_strict_two_round_review_and_manifest_identity():
+    config = AllEvidenceFusionRunnerConfig()
+
+    assert config.post_extraction_review_rounds == 2
+    assert config.require_review_source_signals is True
+    assert config.require_review_feature_banks is True
+    assert config.require_final_upstream_inputs is True
+    assert config.require_final_upstream_neural_query_inputs is True
+    assert config.require_final_causal_forest is True
+    assert config.allow_degraded_review_without_all_upstream is False
+
+    strict_manifest_identity = fusion_runner_module._content_sha256(
+        fusion_runner_module.asdict(config)
+    )
+    explicitly_nonadaptive = AllEvidenceFusionRunnerConfig(
+        post_extraction_review_rounds=0
+    )
+    nonadaptive_manifest_identity = fusion_runner_module._content_sha256(
+        fusion_runner_module.asdict(explicitly_nonadaptive)
+    )
+    assert strict_manifest_identity != nonadaptive_manifest_identity
+
+
+def test_runner_default_fails_closed_without_exact_causal_forest_runtime(tmp_path):
+    with pytest.raises(ValueError, match="required final causal forest.*exact raw"):
+        AllEvidenceFusionRunner(
+            dataset_path=tmp_path / "dataset.parquet",
+            legacy_handoff_path=tmp_path / "legacy.jsonl",
+            tfidf_handoff_path=tmp_path / "tfidf.jsonl",
+            output_dir=tmp_path / "output",
+            fusion_agent=_FusionAgent(),
+            extraction_provider=_Extractor(),
+        )
+
+
 def test_required_neural_query_moments_cannot_enable_sparse_fallback():
     with pytest.raises(ValueError, match="cannot enable the sparse query fallback"):
         AllEvidenceFusionRunnerConfig(
@@ -114,7 +149,10 @@ def test_runner_fails_closed_when_required_final_upstream_producer_is_missing(
             output_dir=tmp_path / "output",
             fusion_agent=_FusionAgent(),
             extraction_provider=_Extractor(),
-            config=AllEvidenceFusionRunnerConfig(**{required_flag: True}),
+            config=AllEvidenceFusionRunnerConfig(
+                post_extraction_review_rounds=0,
+                **{required_flag: True},
+            ),
         )
 
 
@@ -129,7 +167,10 @@ def test_required_final_forest_needs_exact_raw_runtime_and_defaults_to_fixed_bac
             output_dir=tmp_path / "missing_raw",
             fusion_agent=_FusionAgent(),
             extraction_provider=_Extractor(),
-            config=AllEvidenceFusionRunnerConfig(require_final_causal_forest=True),
+            config=AllEvidenceFusionRunnerConfig(
+                post_extraction_review_rounds=0,
+                require_final_causal_forest=True,
+            ),
         )
 
     raw = FinalContextFitUpstreamProducer(
@@ -145,7 +186,10 @@ def test_required_final_forest_needs_exact_raw_runtime_and_defaults_to_fixed_bac
         extraction_provider=_Extractor(),
         final_upstream_producer=raw,
         raw_final_upstream_producer=raw,
-        config=AllEvidenceFusionRunnerConfig(require_final_causal_forest=True),
+        config=AllEvidenceFusionRunnerConfig(
+            post_extraction_review_rounds=0,
+            require_final_causal_forest=True,
+        ),
     )
 
     assert type(runner.final_causal_forest_backend) is FixedCausalForestHeadBackend
@@ -378,6 +422,7 @@ def test_adaptive_required_neural_queries_reject_spent_provider_without_selector
                 require_final_upstream_inputs=True,
                 require_final_upstream_neural_query_inputs=True,
                 require_neural_query_moments=True,
+                allow_degraded_review_without_all_upstream=True,
             ),
         )
 
@@ -487,6 +532,7 @@ def test_runner_gate_bind_boundary_exposes_only_exact_ids_text_and_spent_labels(
         extraction_provider=_Extractor(),
         review_gate_source_provider=provider,
         review_gate_feature_bank_provider=provider,
+        config=AllEvidenceFusionRunnerConfig(post_extraction_review_rounds=0),
     )
     source = runner._gate_source_view(
         outer_fold=1,
@@ -977,7 +1023,10 @@ def test_runner_rejects_declared_and_effective_fusion_reasoning_mismatch(
             output_dir=tmp_path / "output",
             fusion_agent=fusion_agent,
             extraction_provider=_Extractor(),
-            config=AllEvidenceFusionRunnerConfig(fusion_enable_thinking=True),
+            config=AllEvidenceFusionRunnerConfig(
+                post_extraction_review_rounds=0,
+                fusion_enable_thinking=True,
+            ),
         )
 
 
@@ -996,6 +1045,7 @@ def test_runner_accepts_matching_staged_fusion_reasoning_configuration(tmp_path)
         fusion_agent=fusion_agent,
         extraction_provider=_Extractor(),
         config=AllEvidenceFusionRunnerConfig(
+            post_extraction_review_rounds=0,
             fusion_enable_thinking=True,
             fusion_max_tokens=25000,
             fusion_thinking_token_budget=4096,
@@ -1031,6 +1081,7 @@ def test_runner_rejects_declared_and_effective_fusion_thinking_budget_mismatch(
             fusion_agent=fusion_agent,
             extraction_provider=_Extractor(),
             config=AllEvidenceFusionRunnerConfig(
+                post_extraction_review_rounds=0,
                 fusion_enable_thinking=True,
                 fusion_thinking_token_budget=4096,
             ),
@@ -1090,6 +1141,7 @@ def test_runner_rejects_declared_and_effective_fusion_max_token_mismatch(
             fusion_agent=fusion_agent,
             extraction_provider=_Extractor(),
             config=AllEvidenceFusionRunnerConfig(
+                post_extraction_review_rounds=0,
                 fusion_enable_thinking=True,
                 fusion_max_tokens=25000,
                 fusion_thinking_token_budget=4096,
@@ -4939,6 +4991,7 @@ def test_direct_runner_required_neural_queries_rejects_bare_artifact(tmp_path):
         fusion_agent=agent,
         extraction_provider=_Extractor(),
         config=AllEvidenceFusionRunnerConfig(
+            post_extraction_review_rounds=0,
             interaction_inner_folds=2,
             regularization_grid=(0.1, 1.0),
             require_neural_query_moments=True,
@@ -5287,6 +5340,7 @@ def test_runner_freezes_oracle_free_predictions_and_train_only_encoder_state(tmp
         candidate_pool_paths=pools,
         cache_overlay=cache_overlay,
         config=AllEvidenceFusionRunnerConfig(
+            post_extraction_review_rounds=0,
             interaction_inner_folds=2,
             regularization_grid=(0.1, 1.0),
             derive_sparse_query_moments_when_missing=True,
@@ -5470,6 +5524,7 @@ def test_runner_freezes_oracle_free_predictions_and_train_only_encoder_state(tmp
             expected_row_count=len(source),
         ),
         config=AllEvidenceFusionRunnerConfig(
+            post_extraction_review_rounds=0,
             interaction_inner_folds=2,
             regularization_grid=(0.1, 1.0),
             derive_sparse_query_moments_when_missing=True,
@@ -5492,6 +5547,7 @@ def test_runner_freezes_oracle_free_predictions_and_train_only_encoder_state(tmp
         extraction_provider=_Extractor(),
         candidate_pool_paths=pools,
         config=AllEvidenceFusionRunnerConfig(
+            post_extraction_review_rounds=0,
             interaction_inner_folds=2,
             regularization_grid=(0.1, 1.0),
             derive_sparse_query_moments_when_missing=True,
@@ -5512,6 +5568,7 @@ def test_runner_freezes_oracle_free_predictions_and_train_only_encoder_state(tmp
         extraction_provider=_Extractor(),
         candidate_pool_paths=pools,
         config=AllEvidenceFusionRunnerConfig(
+            post_extraction_review_rounds=0,
             interaction_inner_folds=2,
             regularization_grid=(0.1, 1.0),
             derive_sparse_query_moments_when_missing=True,
@@ -5537,6 +5594,7 @@ def test_runner_persists_request_bound_staged_agent_audit(tmp_path):
         fusion_agent=staged_agent,
         extraction_provider=_Extractor(),
         config=AllEvidenceFusionRunnerConfig(
+            post_extraction_review_rounds=0,
             max_candidates=1,
             interaction_inner_folds=2,
             regularization_grid=(0.1, 1.0),
@@ -5620,6 +5678,7 @@ def test_runner_rejects_unknown_raw_reasoning_from_fresh_staged_audit(tmp_path):
         fusion_agent=agent,
         extraction_provider=_Extractor(),
         config=AllEvidenceFusionRunnerConfig(
+            post_extraction_review_rounds=0,
             max_candidates=1,
             interaction_inner_folds=2,
             regularization_grid=(0.1, 1.0),
@@ -5664,6 +5723,7 @@ def test_runner_adds_default_full_outer_orphan_source_and_manifest_audit(tmp_pat
         extraction_provider=_Extractor(),
         candidate_pool_paths=pools,
         config=AllEvidenceFusionRunnerConfig(
+            post_extraction_review_rounds=0,
             interaction_inner_folds=2,
             regularization_grid=(0.1, 1.0),
         ),
@@ -5723,6 +5783,7 @@ def test_runner_registry_repairs_nonportable_per_fold_orphan_paths(tmp_path):
         candidate_pool_paths=pools,
         tfidf_orphan_artifacts_by_fold=registry,
         config=AllEvidenceFusionRunnerConfig(
+            post_extraction_review_rounds=0,
             interaction_inner_folds=2,
             regularization_grid=(0.1, 1.0),
             require_tfidf_orphan_ngrams=True,
@@ -5794,7 +5855,10 @@ def test_oracle_content_in_legacy_evidence_is_rejected_before_agent_call(tmp_pat
         fusion_agent=_FusionAgent(),
         extraction_provider=_Extractor(),
         candidate_pool_paths=pools,
-        config=AllEvidenceFusionRunnerConfig(interaction_inner_folds=2),
+        config=AllEvidenceFusionRunnerConfig(
+            post_extraction_review_rounds=0,
+            interaction_inner_folds=2,
+        ),
     )
     with pytest.raises(ValueError, match="forbidden oracle/true"):
         runner.run()
@@ -5958,6 +6022,7 @@ def _run_with_final_upstream_mode(tmp_path, *, mode):
         final_upstream_producer=producer,
         candidate_pool_paths=pools,
         config=AllEvidenceFusionRunnerConfig(
+            post_extraction_review_rounds=0,
             interaction_inner_folds=2,
             interact_all_features=False,
             regularization_grid=(0.003, 10.0),
@@ -6145,6 +6210,7 @@ def _run_with_exact_runtime_forest(tmp_path, monkeypatch, *, mode):
         final_causal_forest_backend=backend,
         candidate_pool_paths=pools,
         config=AllEvidenceFusionRunnerConfig(
+            post_extraction_review_rounds=0,
             interaction_inner_folds=2,
             require_final_upstream_inputs=True,
             require_final_upstream_neural_query_inputs=True,
