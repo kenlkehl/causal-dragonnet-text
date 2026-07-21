@@ -9,8 +9,9 @@ import multiprocessing as mp
 from dataclasses import asdict
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+import joblib
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed, parallel_config
@@ -20,6 +21,7 @@ from threadpoolctl import threadpool_limits
 from ..config import AppliedInferenceConfig, MultiModelForestConfig
 from .tfidf_topic_discovery import (
     HANDOFF_SCHEMA_VERSION,
+    compact_topic_score_tests,
     fit_tfidf_topic_context,
     row_set_fingerprint,
     stable_hash,
@@ -38,6 +40,14 @@ logger = logging.getLogger(__name__)
 TFIDF_TOPIC_SPLIT_SCHEMA_VERSION = "tfidf_topic_joint_treatment_outcome_v1"
 TFIDF_TOPIC_DATASET_FINGERPRINT_VERSION = "tfidf_topic_model_inputs_v1"
 _DEFAULT_STAGE1_SEED = 42
+TFIDF_NESTED_CALIBRATION_SCHEMA_VERSION = "tfidf_nested_fit_calibration_v1"
+
+
+def _float_hex_sha256(values: Sequence[float]) -> str:
+    vector = np.asarray(values, dtype=float)
+    if vector.ndim != 1 or not np.isfinite(vector).all():
+        raise ValueError("TF-IDF label vectors must be finite and one-dimensional")
+    return stable_hash([float(value).hex() for value in vector])
 
 
 def _resolve_tfidf_topic_stage1_parallel_backend(value: Any) -> Tuple[str, str]:
@@ -473,6 +483,287 @@ def tfidf_topic_stage1_cache_is_valid(
     )
 
 
+def _nested_calibration_plan(
+    fit_df: pd.DataFrame,
+    *,
+    config: AppliedInferenceConfig,
+    outer_fold: int,
+    inner_fold: Optional[int],
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    """Split only registered fit rows for production score selection.
+
+    The registered held-out frame is deliberately not an argument.  A caller
+    therefore cannot accidentally use its labels while choosing the nested
+    split, topic count, terms, orphan clusters, or score-test shortlist.
+    """
+
+    if len(fit_df) < 6:
+        raise ValueError("nested TF-IDF calibration requires at least six registered fit rows")
+    nn_config: MultiModelForestConfig = config.architecture.multi_model_forest
+    requested = max(2, int(nn_config.tfidf_nested_calibration_folds))
+    # Each calibration fold needs at least two rows for covariance estimates,
+    # while the model-training side needs at least four for nuisance OOF fits.
+    maximum = max(2, len(fit_df) // 2)
+    fold_count = min(requested, maximum)
+    if len(fit_df) - int(np.ceil(len(fit_df) / fold_count)) < 4:
+        raise ValueError("registered TF-IDF fit partition is too small for nested model training")
+    nested_seed = _configured_seed(config) + 71_000 + 1_009 * int(outer_fold) + int(inner_fold or 0)
+    splits, split_metadata = make_joint_treatment_outcome_splits(
+        fit_df,
+        treatment_column=config.treatment_column,
+        outcome_column=config.outcome_column,
+        outcome_type=config.outcome_type,
+        n_splits=fold_count,
+        seed=nested_seed,
+    )
+    # The selected fold is a fixed function of public fold coordinates and not
+    # of any registered-heldout value.
+    selected_index = (int(outer_fold) + int(inner_fold or 0) - 1) % len(splits)
+    model_positions, calibration_positions = splits[selected_index]
+    model_fit = fit_df.iloc[np.asarray(model_positions, dtype=int)].copy()
+    calibration = fit_df.iloc[np.asarray(calibration_positions, dtype=int)].copy()
+    if len(model_fit) < 4 or len(calibration) < 2:
+        raise ValueError("nested TF-IDF model/calibration partition is infeasible")
+    model_ids = model_fit["_oci_row_id"].astype(int).tolist()
+    calibration_ids = calibration["_oci_row_id"].astype(int).tolist()
+    registered_ids = fit_df["_oci_row_id"].astype(int).tolist()
+    if set(model_ids) & set(calibration_ids) or set(model_ids) | set(calibration_ids) != set(
+        registered_ids
+    ):
+        raise RuntimeError("nested TF-IDF calibration did not partition registered fit rows")
+    return (
+        model_fit,
+        calibration,
+        {
+            "schema_version": TFIDF_NESTED_CALIBRATION_SCHEMA_VERSION,
+            "policy": "nested_fit_calibration",
+            "seed": nested_seed,
+            "fold_count": fold_count,
+            "configured_fold_count": requested,
+            "fold_parameter": "tfidf_nested_calibration_folds",
+            "canonical_hierarchy_partition_count_used": False,
+            "interaction_inner_folds_used": False,
+            "selected_fold": selected_index + 1,
+            "split_method": split_metadata,
+            "model_fit_row_ids": model_ids,
+            "calibration_row_ids": calibration_ids,
+            "model_fit_row_fingerprint": row_set_fingerprint(model_ids),
+            "calibration_row_fingerprint": row_set_fingerprint(calibration_ids),
+            "registered_heldout_labels_accessed": False,
+            "nested_calibration_labels_accessed": True,
+            "selection_frozen_before_registered_heldout_transform": True,
+        },
+    )
+
+
+def _rewrite_score_scope_as_nested_calibration(
+    score_tests: Mapping[str, Any],
+    *,
+    scope_id: str,
+    nesting: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Make the label boundary unambiguous in the persisted score artifact."""
+
+    value = json.loads(json.dumps(score_tests, default=str))
+    value.update(
+        {
+            "scope_id": scope_id,
+            "score_selection_label_policy": "nested_fit_calibration",
+            "uses_heldout_treatment_and_outcome": False,
+            "uses_registered_heldout_treatment_and_outcome": False,
+            "uses_nested_fit_calibration_treatment_and_outcome": True,
+            "nested_calibration_schema_version": TFIDF_NESTED_CALIBRATION_SCHEMA_VERSION,
+            "nested_model_fit_row_fingerprint": nesting["model_fit_row_fingerprint"],
+            "nested_calibration_row_fingerprint": nesting["calibration_row_fingerprint"],
+        }
+    )
+    orphan = value.get("effect_orphan_ngram_branch")
+    if isinstance(orphan, dict):
+        orphan.update(
+            {
+                "uses_heldout_treatment_and_outcome": False,
+                "uses_registered_heldout_treatment_and_outcome": False,
+                "uses_nested_fit_calibration_treatment_and_outcome": True,
+            }
+        )
+    frozen_body = {
+        "scope_id": scope_id,
+        "score_selection_label_policy": value["score_selection_label_policy"],
+        "banks": value.get("banks") or {},
+        "effect_orphan_ngram_branch": value.get("effect_orphan_ngram_branch") or {},
+        "nested_model_fit_row_fingerprint": value["nested_model_fit_row_fingerprint"],
+        "nested_calibration_row_fingerprint": value["nested_calibration_row_fingerprint"],
+    }
+    value["selection_frozen_sha256"] = stable_hash(frozen_body)
+    return value
+
+
+def _fit_tfidf_topic_context_nested_calibration(
+    *,
+    spec: Dict[str, Any],
+    config: AppliedInferenceConfig,
+    artifact_dir: Path,
+) -> Dict[str, Any]:
+    """Reuse the native TF-IDF fitter with fit-only nested calibration.
+
+    The native model is trained on the nested model partition and scored on the
+    nested calibration partition.  Only after the selected score artifact is
+    written and hashed are the registered held-out texts transformed.  Their
+    treatment and outcome columns are never selected or passed downstream.
+    """
+
+    nn_config: MultiModelForestConfig = config.architecture.multi_model_forest
+    topic_config = nn_config.tfidf_topic
+    registered_fit = spec["fit_df"].copy()
+    registered_heldout = spec["heldout_df"].loc[:, ["_oci_row_id", config.text_column]].copy()
+    model_fit, calibration, nesting = _nested_calibration_plan(
+        registered_fit,
+        config=config,
+        outer_fold=int(spec["outer_fold"]),
+        inner_fold=spec.get("inner_fold"),
+    )
+    metadata = fit_tfidf_topic_context(
+        fit_df=model_fit,
+        heldout_df=calibration,
+        text_column=config.text_column,
+        treatment_column=config.treatment_column,
+        outcome_column=config.outcome_column,
+        outcome_type=config.outcome_type,
+        views=nn_config.bow_views,
+        nuisance_folds=int(nn_config.nuisance_folds),
+        config=topic_config,
+        artifact_dir=artifact_dir,
+        scope_id=f"{spec['scope_id']}__nested_calibration",
+        enable_heldout_score_tests=True,
+    )
+    artifacts = metadata.get("artifacts") or {}
+    score_path = Path(str(artifacts.get("topic_score_tests") or ""))
+    if not score_path.is_file():
+        raise RuntimeError("nested TF-IDF fit did not produce a score-selection artifact")
+    raw_scores = json.loads(score_path.read_text(encoding="utf-8"))
+    if raw_scores.get("status") != "completed":
+        raise RuntimeError("nested TF-IDF score selection did not complete")
+    score_tests = _rewrite_score_scope_as_nested_calibration(
+        raw_scores,
+        scope_id=str(spec["scope_id"]),
+        nesting=nesting,
+    )
+    score_path.write_text(json.dumps(score_tests, indent=2, default=str), encoding="utf-8")
+
+    # The frozen model is now allowed to transform the registered heldout text.
+    model_path = Path(str(artifacts.get("fitted_context") or ""))
+    if not model_path.is_file():
+        raise RuntimeError("nested TF-IDF fit did not persist its fitted context")
+    fitted = joblib.load(model_path)
+    heldout_texts = registered_heldout[config.text_column].fillna("").tolist()
+    registered_heldout_topics = fitted.transform_topics(heldout_texts)
+
+    fit_topics_path = Path(str(artifacts.get("fit_topic_values") or ""))
+    calibration_topics_path = Path(str(artifacts.get("heldout_topic_values") or ""))
+    with np.load(fit_topics_path) as archive:
+        model_topic_values = {name: np.asarray(archive[name]) for name in archive.files}
+    with np.load(calibration_topics_path) as archive:
+        calibration_topic_values = {name: np.asarray(archive[name]) for name in archive.files}
+    registered_fit_ids = registered_fit["_oci_row_id"].astype(int).tolist()
+    model_ids = nesting["model_fit_row_ids"]
+    calibration_ids = nesting["calibration_row_ids"]
+    combined_topics: Dict[str, np.ndarray] = {}
+    heldout_topics: Dict[str, np.ndarray] = {}
+    for bank in ("treatment", "outcome", "effect"):
+        topic_count = len((metadata.get("topic_banks") or {}).get(bank, {}).get("topics") or [])
+        model_values = model_topic_values.get(bank, np.zeros((len(model_ids), 0)))
+        calibration_values = calibration_topic_values.get(bank, np.zeros((len(calibration_ids), 0)))
+        if model_values.shape != (len(model_ids), topic_count) or calibration_values.shape != (
+            len(calibration_ids),
+            topic_count,
+        ):
+            raise RuntimeError("nested TF-IDF topic values are misaligned")
+        by_row = {
+            **{row_id: model_values[index] for index, row_id in enumerate(model_ids)},
+            **{row_id: calibration_values[index] for index, row_id in enumerate(calibration_ids)},
+        }
+        combined_topics[bank] = np.asarray(
+            [by_row[row_id] for row_id in registered_fit_ids], dtype=float
+        ).reshape(len(registered_fit_ids), topic_count)
+        heldout_topics[bank] = np.asarray(
+            registered_heldout_topics.get(
+                bank,
+                np.zeros((len(registered_heldout), topic_count)),
+            ),
+            dtype=float,
+        ).reshape(len(registered_heldout), topic_count)
+    np.savez_compressed(fit_topics_path, **combined_topics)
+    np.savez_compressed(calibration_topics_path, **heldout_topics)
+
+    nuisance_path = Path(str(artifacts.get("nuisance_predictions") or ""))
+    nested_nuisance = pd.read_parquet(nuisance_path)
+    if set(map(int, nested_nuisance["_oci_row_id"])) != set(registered_fit_ids):
+        raise RuntimeError("nested TF-IDF nuisance rows do not cover registered fit rows")
+    nested_nuisance["prediction_scope"] = "fit_oof"
+    e_heldout, e_views = fitted.treatment_stack.predict(heldout_texts)
+    m_heldout, m_views = fitted.outcome_stack.predict(heldout_texts)
+    external_rows: List[Dict[str, Any]] = []
+    for position, row_id in enumerate(registered_heldout["_oci_row_id"].astype(int).tolist()):
+        row: Dict[str, Any] = {
+            "_oci_row_id": row_id,
+            "prediction_scope": "external_heldout",
+            "treatment_stacked": float(e_heldout[position]),
+            "outcome_stacked": float(m_heldout[position]),
+            "fit_row_ids": list(model_ids),
+        }
+        for view in nn_config.bow_views:
+            row[f"treatment_view__{view.name}"] = float(e_views[view.name][position])
+            row[f"outcome_view__{view.name}"] = float(m_views[view.name][position])
+        external_rows.append(row)
+    fit_order = {row_id: index for index, row_id in enumerate(registered_fit_ids)}
+    nested_nuisance["_fit_order"] = nested_nuisance["_oci_row_id"].map(fit_order)
+    nested_nuisance = nested_nuisance.sort_values("_fit_order").drop(columns="_fit_order")
+    pd.concat(
+        [nested_nuisance, pd.DataFrame(external_rows)],
+        ignore_index=True,
+        sort=False,
+    ).to_parquet(nuisance_path, index=False)
+
+    registered_heldout_ids = registered_heldout["_oci_row_id"].astype(int).tolist()
+    registered_fit_treatment = registered_fit[config.treatment_column].to_numpy(dtype=float)
+    registered_fit_outcome = registered_fit[config.outcome_column].to_numpy(dtype=float)
+    model_fit_treatment = model_fit[config.treatment_column].to_numpy(dtype=float)
+    model_fit_outcome = model_fit[config.outcome_column].to_numpy(dtype=float)
+    calibration_treatment = calibration[config.treatment_column].to_numpy(dtype=float)
+    calibration_outcome = calibration[config.outcome_column].to_numpy(dtype=float)
+    metadata.update(
+        {
+            "scope_id": str(spec["scope_id"]),
+            "fit_row_ids": registered_fit_ids,
+            "heldout_row_ids": registered_heldout_ids,
+            "fit_row_fingerprint": row_set_fingerprint(registered_fit_ids),
+            "heldout_row_fingerprint": row_set_fingerprint(registered_heldout_ids),
+            "model_fit_row_ids": list(model_ids),
+            "model_fit_row_fingerprint": nesting["model_fit_row_fingerprint"],
+            "registered_fit_treatment_sha256": _float_hex_sha256(
+                registered_fit_treatment
+            ),
+            "registered_fit_outcome_sha256": _float_hex_sha256(registered_fit_outcome),
+            "nested_model_fit_treatment_sha256": _float_hex_sha256(model_fit_treatment),
+            "nested_model_fit_outcome_sha256": _float_hex_sha256(model_fit_outcome),
+            "nested_calibration_treatment_sha256": _float_hex_sha256(
+                calibration_treatment
+            ),
+            "nested_calibration_outcome_sha256": _float_hex_sha256(calibration_outcome),
+            "score_selection_label_policy": "nested_fit_calibration",
+            "selection_nesting": nesting,
+            "selection_frozen_sha256": score_tests["selection_frozen_sha256"],
+            "registered_heldout_columns_read": ["_oci_row_id", config.text_column],
+            "registered_heldout_labels_accessed": False,
+            "heldout_score_tests_enabled": True,
+            "topic_score_tests": compact_topic_score_tests(score_tests),
+        }
+    )
+    metadata_path = artifact_dir / "context_metadata.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
+    return metadata
+
+
 def _fit_tfidf_topic_stage1_spec_impl(
     spec: Dict[str, Any],
     *,
@@ -492,8 +783,10 @@ def _fit_tfidf_topic_stage1_spec_impl(
             cached = json.loads(metadata_path.read_text(encoding="utf-8"))
             expected_fit = row_set_fingerprint(spec["fit_df"]["_oci_row_id"])
             expected_heldout = row_set_fingerprint(spec["heldout_df"]["_oci_row_id"])
-            expected_score_tests = spec["scope"] == "candidate_selection_inner_fit" and bool(
-                topic_config.score_test_enabled
+            label_policy = str(topic_config.score_selection_label_policy)
+            expected_score_tests = bool(topic_config.score_test_enabled) and (
+                label_policy == "nested_fit_calibration"
+                or spec["scope"] == "candidate_selection_inner_fit"
             )
             artifact_paths = [
                 cached.get("artifacts", {}).get("fitted_context"),
@@ -515,6 +808,31 @@ def _fit_tfidf_topic_stage1_spec_impl(
                 == dataset_identity["ordered_row_fingerprint"]
                 and cached.get("split_semantics_hash") == split_semantics_hash
                 and bool(cached.get("heldout_score_tests_enabled", False)) == expected_score_tests
+                and cached.get("score_selection_label_policy", label_policy) == label_policy
+                and (
+                    label_policy != "nested_fit_calibration"
+                    or (
+                        cached.get("registered_fit_treatment_sha256")
+                        == _float_hex_sha256(
+                            spec["fit_df"][config.treatment_column].to_numpy(dtype=float)
+                        )
+                        and cached.get("registered_fit_outcome_sha256")
+                        == _float_hex_sha256(
+                            spec["fit_df"][config.outcome_column].to_numpy(dtype=float)
+                        )
+                    )
+                )
+                and (
+                    label_policy != "nested_fit_calibration"
+                    or (
+                        cached.get("registered_heldout_labels_accessed") is False
+                        and cached.get("selection_frozen_sha256")
+                        and (cached.get("selection_nesting") or {}).get(
+                            "selection_frozen_before_registered_heldout_transform"
+                        )
+                        is True
+                    )
+                )
                 and (
                     not expected_score_tests
                     or (
@@ -540,23 +858,33 @@ def _fit_tfidf_topic_stage1_spec_impl(
         len(spec["fit_df"]),
         len(spec["heldout_df"]),
     )
-    metadata = fit_tfidf_topic_context(
-        fit_df=spec["fit_df"],
-        heldout_df=spec["heldout_df"],
-        text_column=config.text_column,
-        treatment_column=config.treatment_column,
-        outcome_column=config.outcome_column,
-        outcome_type=config.outcome_type,
-        views=nn_config.bow_views,
-        nuisance_folds=int(nn_config.nuisance_folds),
-        config=topic_config,
-        artifact_dir=contexts_dir / spec["scope_id"],
-        scope_id=spec["scope_id"],
-        enable_heldout_score_tests=(
-            spec["scope"] == "candidate_selection_inner_fit"
-            and bool(topic_config.score_test_enabled)
-        ),
-    )
+    context_dir = contexts_dir / spec["scope_id"]
+    if str(topic_config.score_selection_label_policy) == "nested_fit_calibration":
+        if not bool(topic_config.score_test_enabled):
+            raise ValueError("nested TF-IDF calibration requires score testing")
+        metadata = _fit_tfidf_topic_context_nested_calibration(
+            spec=spec,
+            config=config,
+            artifact_dir=context_dir,
+        )
+    else:
+        metadata = fit_tfidf_topic_context(
+            fit_df=spec["fit_df"],
+            heldout_df=spec["heldout_df"],
+            text_column=config.text_column,
+            treatment_column=config.treatment_column,
+            outcome_column=config.outcome_column,
+            outcome_type=config.outcome_type,
+            views=nn_config.bow_views,
+            nuisance_folds=int(nn_config.nuisance_folds),
+            config=topic_config,
+            artifact_dir=context_dir,
+            scope_id=spec["scope_id"],
+            enable_heldout_score_tests=(
+                spec["scope"] == "candidate_selection_inner_fit"
+                and bool(topic_config.score_test_enabled)
+            ),
+        )
     metadata.update(
         {
             "stage1_config_hash": stage1_hash,

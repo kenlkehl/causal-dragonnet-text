@@ -3,6 +3,57 @@
 Date: 2026-07-18
 
 
+## 2026-07-19 continuation checkpoint
+
+The replacement discovery path now uses the required hierarchy instead of one
+all-evidence prompt: each of the ten active Stage 1 architectures is interpreted,
+consolidated, and coverage-audited separately; cross-architecture planning sees
+ten compact dossiers; and raw evidence can return only through a bounded,
+ID-addressed lookback. A second exact-spent hierarchy for review rounds after the
+first gate is being integrated so newly visible evidence can add or revise
+features without dumping the complete catalog into one prompt.
+
+The historical projection omission for
+`tfidf_semantic_retrieval_contrasts` is closed by an authenticated compatibility
+view. It authenticates the exact provider or cache overlay object, exact request
+rows/text/treatment/outcome, immutable cache bytes, provider/backend/helper code,
+and a per-object before/after migration ledger. The provider and legacy grouping
+helper remain byte-identical at SHA-256
+`de11740a862c13d59d340e1dba26fb1202820dec4a0055c49819b7e01eccc1f1`
+and `a46b801fc7a6f7dc66c42dc91a1bda9ddd93a79d871b9649aa89e25877ef633c`.
+
+Both preserved real fold-1 caches were reauthenticated through the exact current
+overlay with zero backend fits and the exact 480-spent/320-sealed schedule:
+
+- one-confounder/one-modifier cache key
+  `6d2123501feb4181fe2f72083b203e277d598bd3ef2408a0159e818c1a9a605a`,
+  catalog SHA-256
+  `24562e2b83fc3d9defbcaf4e3edbdf5f5748907d898ce5580b58b008befd86e4`,
+  migration-ledger SHA-256
+  `56f9a6f668081e01976ca92f46a87437cc90187d4c2441aa08f2d31af49f1e76`;
+- five-confounder/five-modifier cache key
+  `eaa08c3584581f4ce3bafac7e449ac3cb41e0ef8315c2006b93ad5dc1a0570b5`,
+  catalog SHA-256
+  `35b9fcb4ec32ac6fba11bf9592aa2c3a1fd004e3d27e19d8fcb16e7762f83aee`,
+  migration-ledger SHA-256
+  `10f50ede4514da1903c1fc7fa3e3be5b8a0dfbd0af223faba52e05c76970c227`.
+
+Each cache reconstructed all ten active families, including exactly 19 semantic
+retrieval contrasts. These fold-1 fits must be reused, not recomputed.
+
+First-gate direct numerical materialization is now deferred. Zero-call
+preparation freezes an authenticated `FirstGateMaterializationIntent` containing
+the exact stable coordinate contract but performs no Stage 1 context fit, matrix
+read, or gate-cache write. Only after exact batch approval and an immutable review
+proposal freeze may the gate bank be realized; the resulting manifest, matrix
+hashes, values, provider, and lineage must match the intent before gate evaluation.
+
+Before restarting expensive preparation, finish the phased review-policy update:
+round 1 may reuse the approved initial accepted-support evidence; rounds 2 and
+later must require a refreshed exact accumulated-spent all-ten hierarchy, bounded
+lookback, and pre-gate proposal freeze. Then run the consolidated regression suite.
+
+
 ## 1. The overall goal
 
 The project is trying to develop an AI pipeline to learn and predict heterogeneous treatment effects (individual treatment effects, ITEs, aka conditional average treatment effects, CATEs) in oncology when most of the useful patient information is contained in clinical notes.
@@ -1476,3 +1527,475 @@ The main scientific question is not whether an agent can rank a dense JSON objec
 It is whether the combined statistical evidence can be translated into the actual
 patient characteristics encoded in the notes, extracted reliably, and used in an
 honest causal treatment-effect model.
+
+## 13. Resumed implementation checkpoint (2026-07-18)
+
+The architecture-at-a-time implementation is now the authenticated production
+path for both initial discovery and later adaptive reconsideration.  It covers all
+ten active Stage 1 concept families in their exact declared order.  Each family is
+interpreted, consolidated, and coverage-criticized independently.  Only ten compact
+family dossiers reach cross-architecture planning.  Raw evidence can be revisited
+only by exact requested evidence ID under the fixed 24-ID / 96,000-byte global
+lookback bound.  The proposal and extraction definitions are frozen before any
+untouched review gate is materialized or consumed.
+
+The adaptive prompt contract authenticates the exact six-stage system text,
+settings, top-level payload schema, static literals, dynamic paths and shapes, and
+nested output schemas.  Selector reasoning is exactly 5,000 tokens.  Definition
+extraction reasoning is disabled.  The definition-stage vocabulary grounding
+policy is an exact static literal and is mutation-tested.  The current semantic
+validator and the seven-file implementation bundle are revalidated for every cache
+hit.  An outer adaptive artifact is comparison-only and cannot bypass current
+execution authentication.
+
+The runner bridge now supplies fresh accumulated-spent evidence to the adaptive
+builder on later rounds, never to the legacy reviewer.  It compiles add, drop,
+split, rename, revise-definition, merge, and role changes into a frozen executable
+registry, with exact current-family citation coverage for merge/revision operations.
+Rejected gates restore the baseline registry; accepted gates commit the exact
+candidate registry.  Final audit fields describe observed adaptive executions and
+their exact proposal/executable hashes.
+
+Regression checkpoint after the final static-literal synchronization:
+
+- 28 adaptive hierarchy and authenticated executor tests passed;
+- 19 adaptive runner-bridge tests passed;
+- 46 approved-batch and offline-packet tests passed;
+- 86 core hierarchy/compiler/cache/catalog tests passed, with 4 intentional skips;
+- 230 evidence provenance, deferred-gate, upstream, review, integration, and CLI
+  tests passed;
+- 31 OpenAI-compatible JSON runner identity tests passed;
+- 55 adjacent discovery/review/upstream tests passed.
+
+Total: 495 passed, 4 skipped.  Black single-worker checks and pyflakes checks for
+the directly changed adaptive and packet modules/tests are clean.
+
+Prepare-only must bind the exact future execution endpoint
+`http://camus:8010/v1`, model
+`RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic`.  The endpoint is part of the approved
+runner identity, so the older TEST-NET placeholder must not be used.  This does not
+contact Camus: prepare-only fails if a client pool is constructed, if runner
+execution metadata changes, or if any JSON job is submitted.  It reports zero
+remote calls.  The next action is local preparation for both synthetic datasets,
+followed by publication of the exact offline packet and a hard stop for user
+approval before any Camus request.
+
+## 14. Active prepare-only checkpoint (2026-07-19 02:42 EDT)
+
+The first sandboxed prepare attempt authenticated both 623 MiB handoffs, replayed
+both exact fold-1 caches, and produced valid fold-1 preparation artifacts, but
+failed closed when PyTorch first initialized HTR with `No CUDA GPUs are available`.
+This was sandbox device isolation: an approved out-of-sandbox PyTorch probe returned
+`True 2`.  The incomplete directories were preserved, not deleted, as:
+
+- `hierarchical_all_arch_one_20260719_v1_{scratch,preparation}_sandbox_cuda_unavailable_20260719_0229`;
+- `hierarchical_all_arch_five_20260719_v1_{scratch,preparation}_sandbox_cuda_unavailable_20260719_0229`.
+
+The authoritative prepare-only jobs were relaunched with GPU access using the same
+arguments and exact Camus runner identity, with one-by-one on `cuda:1` and
+five-by-five on `cuda:0`.  Prepare-only still constructs no remote client and makes
+zero JSON/model calls.  Both authoritative target paths were fresh at relaunch.
+Both jobs replayed fold 1 and entered uncached fold 2 at 02:42:33 EDT.  Both passed
+the prior CUDA failure boundary and loaded/train the unfrozen HTR sentence encoder.
+
+No exact replay exists for folds 2--5.  Required cache keys are:
+
+- one-by-one: fold 2 `5a35682310e8491630f750c4b58af384d68fe777ef087f7cbb218353e506ab69`,
+  fold 3 `6ae859b093967dcf52bb612960d6a67c17de6e745425a7d6db2b3e6755e510aa`,
+  fold 4 `e3dd9f03e4b2f2329c5fd6a726f6f84e2a739bc20dd46a70e7eebcca6a51f830`,
+  fold 5 `80833c064a49462feb68fd23eacaefd424ad6eecfe1ee522ee9ed6e9a57bcbb1`;
+- five-by-five: fold 2 `379bca2b911ef3cc22a2607434623360d0c33d4c06e774c140e2382151bec20c`,
+  fold 3 `2a0922ccbc8483715d035d26e3212a34cca7c1b602df37dbf1ebc30c6762b710`,
+  fold 4 `94d5d860cd761ba02393451afb59729806b3e2378cf99dcfb986a7483316b407`,
+  fold 5 `385490e1f24feb6b2b4ed5a986a5fe5390b42baa9d4910b31ed835b119067216`.
+
+The exact-current historical runtime was 121.9 minutes for one-by-one and 125.7
+minutes for five-by-five per uncached initial-spent fold.  Four sequential misses
+therefore imply about 8--8.5 hours wall time with both datasets running concurrently
+on separate GPUs.  This is consistent with five nuisance folds and 1,000 bootstrap
+replicates in the frozen Stage 1 configuration.  Do not interrupt a healthy fold:
+the provider commits its complete cache JSON atomically only after all three
+spent-evidence backends finish.
+
+Fold-2 milestone:
+
+- one-by-one cache key
+  `5a35682310e8491630f750c4b58af384d68fe777ef087f7cbb218353e506ab69`
+  committed at 04:45:36 EDT; file SHA-256
+  `7e1f45048b5317f245b63728ec617d3c0f4023d5693356c490ac63a57667ede5`;
+  `outer_fold_002/immutable_fold_preparation.json` completed at 04:46:29 EDT;
+- five-by-five cache key
+  `379bca2b911ef3cc22a2607434623360d0c33d4c06e774c140e2382151bec20c`
+  committed at 04:50:44 EDT; file SHA-256
+  `6938061e8ebedc742fb5dcf55b6086b8ded306e2e67eed90c918ec877884251b`;
+  `outer_fold_002/immutable_fold_preparation.json` completed at 04:51:52 EDT.
+
+Both jobs then continued to fold 3 without interruption.
+
+Fold-3 milestone (one-by-one):
+
+- cache key
+  `6ae859b093967dcf52bb612960d6a67c17de6e745425a7d6db2b3e6755e510aa`
+  committed atomically at 06:49:04 EDT; file SHA-256
+  `da3de77e90cdbec64f6a70252c9b10a8999db458618633ada86dc8d114dafe83`;
+- `outer_fold_003/immutable_fold_preparation.json` completed at 06:49:55 EDT;
+- fold 4 entered its uncached spent-evidence build at 06:50:50 EDT.
+
+Fold-3 milestone (five-by-five):
+
+- cache key
+  `2a0922ccbc8483715d035d26e3212a34cca7c1b602df37dbf1ebc30c6762b710`
+  committed atomically at 07:01:00 EDT; file SHA-256
+  `f3da27a8f0733c0d470b4a4acf5cf4c877901c559bdac7e630c6d04e191bd2b3`;
+- `outer_fold_003/immutable_fold_preparation.json` completed at 07:02:07 EDT
+  with file SHA-256
+  `216fade98c5e37ced5f6ba0d28aee12d88da4ff933d1508dc3935ad9bb0a25d4`;
+- fold 4 entered its uncached spent-evidence build at 07:03:03 EDT.
+
+Fold-4 milestone (one-by-one):
+
+- cache key
+  `e3dd9f03e4b2f2329c5fd6a726f6f84e2a739bc20dd46a70e7eebcca6a51f830`
+  committed atomically at 08:55:28 EDT; file SHA-256
+  `558e44608a32f15583530f9101ae022b28ae36189aa1da40b86843a875cb20a0`;
+- `outer_fold_004/immutable_fold_preparation.json` completed at 08:56:24 EDT
+  with file SHA-256
+  `c4be7e918aba0a0ab386b63766d2dae6077d1854edf96e5f6224fe90ad014aef`;
+- fold 5 entered its uncached spent-evidence build at 08:57:18 EDT.
+
+Fold-4 milestone (five-by-five):
+
+- cache key
+  `94d5d860cd761ba02393451afb59729806b3e2378cf99dcfb986a7483316b407`
+  committed atomically at 09:12:04 EDT; file SHA-256
+  `fc3f30970f0973e8602e2aeb32928aac6f6cb71f01fd46006d1d2b4d63b0504b`;
+- `outer_fold_004/immutable_fold_preparation.json` completed at 09:13:12 EDT
+  with file SHA-256
+  `c508668bfb67671fa16f9e1c0feef1e781721d617d9728a9c23419bf7c50f0ef`;
+- fold 5 entered its uncached spent-evidence build at 09:14:08 EDT.
+
+Both datasets are therefore in their final preparation fold with exact fold 1--4
+cache coverage.
+
+Fold-5 and prepare-only completion milestone (one-by-one):
+
+- cache key
+  `80833c064a49462feb68fd23eacaefd424ad6eecfe1ee522ee9ed6e9a57bcbb1`
+  committed atomically at 11:00:24 EDT; file SHA-256
+  `da3f3aad38b5f905d4bb394cf610ce429ddbec2b595c6f631c6852909cac6358`;
+- `outer_fold_005/immutable_fold_preparation.json` completed at 11:01:20 EDT
+  with file SHA-256
+  `cfea826a0f6f805c0cd19dbbd7a0cad1642aa7b0f679c6830378015b7823ef6a`;
+- the authoritative process exited `0` with status
+  `hierarchical_discovery_prepared_awaiting_approval`, approval SHA-256
+  `750dbb3e072bac8ec41afb1123c0f3b0eb3dfc561e1d58273d58f437ed66763f`,
+  and offline review packet SHA-256
+  `d62746b13d2eaa141cc78433a497c094bf0610e470dd233cd645e37d5a38c206`;
+- its terminal record says `hierarchical_json_jobs_executed: 0`,
+  `remote_clients_constructed: false`, `remote_calls_made: false`,
+  `oracle_columns_read: false`, `predictions_written: false`, and
+  `final_run_manifest_written: false`.
+
+The one-by-one packet is undergoing local cross-hash authentication.  Do not use
+its approval digest until that audit passes and the exact packet is shown to the
+user.  Five-by-five remains in fold 5.
+
+Fold-5 and prepare-only completion milestone (five-by-five):
+
+- cache key
+  `385490e1f24feb6b2b4ed5a986a5fe5390b42baa9d4910b31ed835b119067216`
+  committed atomically at 11:19:39 EDT; file SHA-256
+  `a23b3489db1af0e4f059e27878504ac78df6103411ce7eeece27e362398a1cfa`;
+- `outer_fold_005/immutable_fold_preparation.json` completed at 11:20:48 EDT
+  with file SHA-256
+  `d3c87aa86fd96b611e16ac795f151a5bb3c79f2e4a12c1926cef7ede5a26df1`;
+- the authoritative process exited `0` with status
+  `hierarchical_discovery_prepared_awaiting_approval`, approval SHA-256
+  `79a8dbc1693b13501c89562e5599d18c6ee026058673d2c845ec969f731d48f4`,
+  and offline review packet SHA-256
+  `035223f539103e30fff1065522af747770bea204285e315b7a82daf91bc6c5d9`;
+- its terminal record says `hierarchical_json_jobs_executed: 0`,
+  `remote_clients_constructed: false`, `remote_calls_made: false`,
+  `oracle_columns_read: false`, `predictions_written: false`, and
+  `final_run_manifest_written: false`.
+
+The one-by-one packet passed full local replay and cross-hash authentication.  The
+five-by-five packet is undergoing the same audit.  Neither approval digest is
+authorized until both exact packets are shown to the user and explicitly approved.
+
+Final offline-packet authentication checkpoint:
+
+- both packets pass current production-validator replay, envelope/cross-hash,
+  current-source identity, comparison-byte, exact three-file manifest, file-mode,
+  and post-audit side-effect checks;
+- every fold contains nonzero evidence from all ten active architectures, delivered
+  exactly once through family-pure chunks before ten-dossier integration; complete
+  raw multi-architecture dumps, global top-k truncation, and sparse fallback are
+  absent;
+- the exact six-stage adaptive contract is current: architecture interpretation,
+  consolidation, coverage audit, ten-dossier planning, bounded integration, and
+  extraction definition; the first five stages use exactly 5,000 reasoning tokens,
+  extraction reasoning is off, raw lookback is bounded to 24 IDs/96,000 bytes and
+  8 IDs per target, and proposal freeze precedes the next gate;
+- all first-gate intents validate against current code; labels/views were not
+  exposed, materialization remains deferred until exact approval and proposal
+  freeze, and all declared hierarchical job-cache roots remain absent;
+- exact Camus identity is `http://camus:8010/v1` with model
+  `RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic`; local identity reconstruction had no
+  client pool or execution records;
+- one-by-one approval SHA-256 is
+  `750dbb3e072bac8ec41afb1123c0f3b0eb3dfc561e1d58273d58f437ed66763f`;
+- five-by-five approval SHA-256 is
+  `79a8dbc1693b13501c89562e5599d18c6ee026058673d2c845ec969f731d48f4`.
+
+The required next action is to show the exact immutable packets to the user and wait
+for explicit approval of these two batch approval digests.  Do not substitute the
+offline packet SHA values for the approval SHA values.  Do not contact Camus before
+that approval.
+
+## 15. Exact user approval received (2026-07-19 16:49 EDT)
+
+After the two authenticated execution digests were presented together and the goal
+was stopped at the mandatory approval boundary, the user replied `approved`.  This
+explicitly authorizes remote Camus execution of exactly these two immutable batches:
+
+- one-by-one:
+  `750dbb3e072bac8ec41afb1123c0f3b0eb3dfc561e1d58273d58f437ed66763f`;
+- five-by-five:
+  `79a8dbc1693b13501c89562e5599d18c6ee026058673d2c845ec969f731d48f4`.
+
+This approval does not authorize a different digest, changed implementation,
+different endpoint/model identity, nonfresh final output, premature oracle access,
+or any relaxation of the proposal/prediction freeze.  Reconstruct each execution
+from the authenticated preparation directory and exact replay-cache registrations,
+use a fresh final output directory and fresh output-local neural-query cache, and
+let the code reject any byte-identity mismatch before the first remote call.
+
+## 16. Approved v1 packets retired after pre-network replay defect
+
+The approved v1 batches above must not be executed.  A mandatory fresh-output
+reconstruction exposed two preparation/replay defects before any Camus client was
+constructed or any oracle data were read:
+
+- the prepare CLI advertised newly copied output-local caches even though the
+  immutable input manifest binds the exact historical read-only sources; and
+- each immutable fold preparation embedded the prepare scratch absolute cache path
+  in its semantic-compatibility migration ledger.  Replaying into a required fresh
+  output root therefore made `_write_immutable_json` reject a mutation of the
+  preparation manifest before the approval gate.
+
+The path-bound compatibility packet, including the intermediate five-by-five v2
+digest `8f42b0922e2c3558c68ba342a3567e7f28379552e1a0bcc2447bad7f73adb32a`,
+is non-executable and was never presented for approval.  The user's section-15
+approval covers only the retired v1 digests; it cannot authorize the corrected v3
+packets below.
+
+The correction is fail-closed and source-bound:
+
+- compatibility ledger schema v3 replaces the output-local absolute cache path
+  with an authenticated relative filename and records
+  `absolute_location_recorded: false`; exact historical v1 source identities,
+  runtime bytes, cache keys, provider identity, and source hashes remain bound;
+- input/fold preparation schemas v2 bind the complete current compatibility
+  identity, which is captured once and rechecked after all folds;
+- prefix salvage validates that exact identity;
+- the CLI now distinguishes exact approval-preserving historical registrations
+  from output-local copies usable only for a new preparation and deduplicates
+  context-fit registrations; and
+- targeted compatibility, packet, hierarchy, CLI, and salvage tests pass, with
+  the broad final targeted run at 85 passed and no failures (expected skips only).
+
+Do not edit source before approved execution: the corrected packets bind its exact
+hashes.
+
+## 17. Corrected v3 packets and fresh-root replay proof
+
+Both corrected prepare-only runs exited `0` with zero clients, calls, or jobs;
+oracle visibility and prediction/final-output writes remained false.  Independent
+read-only audits replayed the current production packet composers and validators
+and passed every source, envelope, manifest, architecture-coverage, routing, and
+offline-boundary check.
+
+Corrected one-by-one identities:
+
+- approval SHA-256:
+  `4b0dcc810600ec963b688f0683eb98cf98bb47bf2596ecf34c0c9405dd386cd8`;
+- input-manifest content SHA-256:
+  `65f66fadb4d60a4eb956e752d078304282823a7b816d735749a95520b6611d15`;
+- offline-packet logical SHA-256:
+  `55e2ec15911e2c96ba4f1a06604a2d6e7271cd277941746fa532d0eb9da9e122`;
+- preparation directory:
+  `artifacts/all_evidence_fusion/hierarchical_all_arch_one_20260719_v3_preparation`.
+
+Corrected five-by-five identities:
+
+- approval SHA-256:
+  `6e046fa5048d97f0a3c6b52a9518471270ca1cdde144e35fa9b1ac38fbcf1e7d`;
+- input-manifest content SHA-256:
+  `8c7a29ed19671bcf99f7112284817aa532fe410a5cb0d89dcd4741fb897767a4`;
+- offline-packet logical SHA-256:
+  `2e0474c7154a3a93918d2119d51f9786c59786b3a3fb953cf4e674495ed1baf8`;
+- preparation directory:
+  `artifacts/all_evidence_fusion/hierarchical_all_arch_five_20260719_v3_preparation`.
+
+Each packet contains nonzero evidence from all ten required Stage-1 architectures
+and preserves the architecture-local dossier -> coverage audit -> bounded raw-ID
+lookback -> cross-architecture integration -> proposal-freeze workflow.  Direct
+numerical evidence remains non-grounding, selector thinking is exactly 5,000,
+extraction thinking is off, sparse fallback is forbidden, and the estimator is
+strict `CausalForestDML`.
+
+Before requesting approval, each preparation was reconstructed with the exact five
+historical cache registrations into a different fresh output root while supplying
+an all-zero approval digest.  Both probes reproduced all five cache files with the
+ten exact approval-bound file hashes and then exited only at
+`approved batch SHA-256 does not match the offline packet`.  Each probe tree
+contains exactly those five spent-cache files; neither preparation nor probe tree
+contains a hierarchy job-cache, remote result, prediction, final-output, or oracle
+artifact.  This proves output-root portability through the last pre-network gate.
+
+Mandatory next boundary: show both corrected approval digests to the user and
+obtain fresh explicit approval naming or unambiguously covering both.  Do not treat
+the section-15 `approved` reply as authorization for either v3 digest.  After that
+approval, run one-by-one first and five-by-five second; never overlap the two full
+runs because extraction concurrency can otherwise exceed the intended 128 calls.
+
+## 18. V3 approval, live failures, and required bounded-response repair
+
+The user explicitly approved both v3 packets and directed execution.  One-by-one
+was started first; five-by-five never started.  The first command misspelled the
+CLI approval option and exited in `argparse` before creating the fresh output root
+or making a remote call.  The corrected option is
+`--hierarchical-approved-batch-sha256`.
+
+Two correct live invocations then each reproduced all five output-local spent
+caches with the exact approval-bound hashes, passed immutable preparation and
+batch validation, and reached the first fold's first architecture-local Camus job.
+Both failed closed before any hierarchy result was cached:
+
+1. the first response contained a duplicate JSON key, `feature_names`, and was
+   rejected by `parse_strict_json_object`;
+2. the recovery invocation used a new fresh execution directory, the same v3
+   packet/digest/endpoint/model/source/arguments, and an unchanged empty hierarchy
+   cache, but its regenerated first response cited an unsupplied evidence ID and
+   was rejected by `validate_interpret_evidence_chunk_response`.
+
+The failed execution roots are preserved as:
+
+- `artifacts/all_evidence_fusion/hierarchical_all_arch_one_20260719_v3_execution`;
+- `artifacts/all_evidence_fusion/hierarchical_all_arch_one_20260719_v3_execution_retry01`.
+
+Neither contains predictions, a final run manifest, or oracle output.  The v3
+preparation's hierarchy job-cache root remains absent because invalid responses
+are never stored.
+
+Do not continue whole-run v3 retries.  The hierarchy currently makes one remote
+call per logical job: parse failures are classified as non-retryable inside the
+JSON runner, and semantic-validator failures escape the orchestrator.  This
+contradicts the interface specification's promised one bounded, authenticated
+repair attempt and is not viable across roughly 468 initial hierarchy calls plus
+dynamic work.
+
+The active correction must add one fail-closed repair request for both strict-JSON
+and semantic-validation failures, use only static/sanitized diagnostics, bind the
+exact initial/repair message policy and implementation into the precommit/offline
+packet/cache identities, retain the original selector/extraction thinking policy,
+cache only validated results, and test duplicate-key repair, unsupplied-evidence
+repair, and exhausted repair.  Do not modify Stage 1 model modules while building
+the corrected packets: the expensive registered spent caches must remain exactly
+reusable.  After the repair passes independent review, prepare and authenticate
+new immutable packets from the same historical cache registrations; v3 approval
+cannot authorize their changed identities.
+
+## 19. V4 authentication, live failure, and retirement
+
+The bounded one-repair implementation was prepared as v4 and independently
+authenticated for both cohorts.  The machine approval identities were:
+
+- one-by-one:
+  `78c4cc8d0d62a555f3609c14b9e7a8f5566aaf04a29fcaca1260a03addab8459`;
+- five-by-five:
+  `98afe7f95c04dd1a0383ade201b0ce5a142a61c9a3e769a82d1a449a5b8bc6c8`.
+
+The first sandboxed one-by-one execution reconstructed all five spent-evidence
+caches and then failed DNS resolution before any remote request.  A fresh
+network-enabled retry reconstructed the same caches, reached Camus, and exercised
+the initial response plus its one authenticated privacy-preserving repair.  Both
+responses failed semantic validation because they cited an unsupplied identifier.
+No invalid response was cached.  No prediction, final manifest, or oracle output
+was written.  The failed roots are preserved as:
+
+- `artifacts/all_evidence_fusion/hierarchical_all_arch_one_20260719_v4_execution`;
+- `artifacts/all_evidence_fusion/hierarchical_all_arch_one_20260719_v4_execution_retry01`.
+
+The five-by-five v4 execution never started.  Both v4 packets are retired.
+
+The root cause was not the hierarchical architecture-at-a-time design.  Static
+model-facing output examples contained regex-valid placeholder strings such as
+`supplied_member_id` and `candidate_id`.  The repair prompt instructed the model
+to use only identifiers visible in the request, so copying those placeholders was
+consistent with the prose but inconsistent with the supplied evidence domains.
+The defect affected base and adaptive jobs, not only the first interpretation job.
+
+## 20. Dynamic response contracts, source binding, and output-aware chunks
+
+The post-v4 correction derives a strict JSON Schema and identifier-ownership map
+from designated request fields for every base and adaptive job.  The exact schema,
+canonical bytes, hashes, ownership map, rendered request, job ID, cache identity,
+repair job, and offline packet are authenticated together.  Runtime transport uses
+vLLM strict `json_schema`; semantic validators remain authoritative.  Identifier-
+looking examples were removed from static and runtime prompt contracts.
+
+An independent audit then found that the new response-contract helper was imported
+by the base hierarchy but was not included in its implementation hash.  The base
+hierarchy now binds a complete implementation bundle into inner precommit, every
+initial and repair job, runtime drift checks, and the cache validator identity.
+A helper-only change therefore rekeys preparation or fails closed rather than
+silently changing a previously approved schema.
+
+Live probing found a second independent limit.  Historical architecture chunks
+contained roughly 163 semantic member IDs at the median, 175 at p90, and up to
+191.  A production-equivalent 61-member probe using the first dynamic contract
+still allowed every evidence disposition to repeat the chunk-wide member-ID
+domain.  Camus exhausted all 25,000 completion tokens with
+`finish_reason: length` and returned 83,353 bytes of incomplete JSON.
+
+The corrected interpretation contract uses one `anyOf` branch per evidence atom:
+
+- `evidence_id` is an exact `const`;
+- member IDs are restricted to that evidence atom's owned enum;
+- the member-disposition array has the exact owned length;
+- generated names, prose, arrays, and per-member name fanout have finite bounds;
+- semantic validation still enforces uniqueness, exact coverage, and name unions.
+
+Rejection review uses the analogous candidate-owned evidence branches.  Camus was
+also probed directly and accepts the required `maxLength` keyword; `uniqueItems`
+remains forbidden because the deployed grammar does not implement it.
+
+Architecture chunk plans now add a third authenticated packing dimension,
+`max_semantic_member_ids_per_chunk`, fixed by default at 64.  It is bound through
+the plan identity, audit, hierarchy config, approved fold/batch packet, CLI, base
+runner, and adaptive policy.  Every evidence atom and every semantic member is
+still delivered exactly once; an atom that individually exceeds the bound fails
+closed and must be losslessly batched by its native adapter.
+
+The corrected production-equivalent 61-member probe passed on Camus:
+
+- `finish_reason: stop`;
+- 24,928 prompt tokens and 14,200 completion tokens;
+- 10 concepts, seven complete evidence dispositions, and all 61 members;
+- strict JSON and semantic validation passed;
+- response content SHA-256:
+  `b01daddce57327d7ee76102cb6a841c92464928ed218c81b2afa1839def41248`;
+- validated response SHA-256:
+  `52fb5465781aabbf831a83c00070a4e335081a712173440cbe6f325d70169612`.
+
+Only hashes, counts, and transport metadata from this diagnostic were retained;
+raw model content was not persisted.  Fresh v5 packets must not be prepared until
+the complete base/adaptive/cache/packet regression and independent source audit
+pass on the final bytes.
+
+The user's run authorization covers this benchmark workflow.  Packet digests are
+machine integrity and resume controls, not an interactive approval ceremony.  The
+operator-facing production wrapper must compute, authenticate, carry, and record
+them internally; it must not require end users to approve digests manually.

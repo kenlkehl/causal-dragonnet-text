@@ -83,7 +83,7 @@ from .tfidf_topic_discovery import fit_tfidf_topic_context
 from .tfidf_upstream_gate_backend import TfidfTopicOrphanContextBackend
 
 REVIEW_SPENT_EVIDENCE_PROVIDER_ID = "context_fit_review_spent_evidence_provider_v3"
-REVIEW_SPENT_EVIDENCE_CACHE_VERSION = "context_fit_review_spent_evidence_cache_v3"
+REVIEW_SPENT_EVIDENCE_CACHE_VERSION = "context_fit_review_spent_evidence_cache_v4"
 STAGE1_SPENT_DISCOVERY_BACKEND_ID = "historical_stage1_spent_discovery_v5"
 TFIDF_SPENT_DISCOVERY_BACKEND_ID = "tfidf_topic_orphan_spent_discovery_v2"
 
@@ -143,7 +143,6 @@ _HTR_CONCEPT_STOP_WORDS = frozenset(ENGLISH_STOP_WORDS) | {
     "signature",
     "timepoint",
 }
-_HTR_CONCEPT_LIMIT = 6
 _EMAIL_URL_LONG_ID = re.compile(
     r"(?:\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b|https?://|www\.|"
     r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b|"
@@ -724,12 +723,18 @@ class SpentOnlyFrozenChunkEmbeddingCache:
     )
 
     def __init__(self, cache_dir: Path | str) -> None:
-        self.cache_dir = Path(cache_dir).resolve()
-        if not self.cache_dir.is_dir():
-            raise FileNotFoundError(f"frozen embedding cache does not exist: {self.cache_dir}")
-        missing = [name for name in self._FILES if not (self.cache_dir / name).is_file()]
+        supplied_root = Path(cache_dir)
+        if supplied_root.is_symlink():
+            raise ValueError("frozen embedding cache root cannot be a symlink")
+        if not supplied_root.is_dir():
+            raise FileNotFoundError(f"frozen embedding cache does not exist: {supplied_root}")
+        linked = [name for name in self._FILES if (supplied_root / name).is_symlink()]
+        if linked:
+            raise ValueError(f"frozen embedding cache files cannot be symlinks: {linked}")
+        missing = [name for name in self._FILES if not (supplied_root / name).is_file()]
         if missing:
             raise FileNotFoundError(f"frozen embedding cache is incomplete: {missing}")
+        self.cache_dir = supplied_root.resolve(strict=True)
         snapshots: dict[str, BinaryIO] = {}
         snapshot_digests: dict[str, str] = {}
         snapshot_sizes: dict[str, int] = {}
@@ -1035,8 +1040,10 @@ def _signed_contrastive_terms(
     positive: Sequence[str],
     negative: Sequence[str],
     *,
-    limit: int = 12,
+    limit: int | None = None,
 ) -> list[dict[str, Any]]:
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+        raise ValueError("contrastive term limit must be a positive integer or None")
     positive_documents = [str(value) for value in positive if str(value).strip()]
     negative_documents = [str(value) for value in negative if str(value).strip()]
     documents = [*positive_documents, *negative_documents]
@@ -1048,7 +1055,6 @@ def _signed_contrastive_terms(
             strip_accents="unicode",
             ngram_range=(1, 3),
             min_df=1,
-            max_features=4096,
             sublinear_tf=True,
         )
         matrix = vectorizer.fit_transform(documents)
@@ -1067,12 +1073,16 @@ def _signed_contrastive_terms(
             continue
         seen.add(phrase)
         output.append({"concept": phrase, "score": score})
-        if len(output) >= int(limit):
+        if limit is not None and len(output) >= limit:
             break
     return output
 
 
-def _embedding_concepts_only(evidence: Mapping[str, Any]) -> dict[str, Any]:
+def _embedding_concepts_only(
+    evidence: Mapping[str, Any],
+    *,
+    contrastive_term_limit: int | None = None,
+) -> dict[str, Any]:
     output: list[dict[str, Any]] = []
     for raw in evidence.get("contrasts") or ():
         if not isinstance(raw, Mapping):
@@ -1089,7 +1099,11 @@ def _embedding_concepts_only(evidence: Mapping[str, Any]) -> dict[str, Any]:
             for row in raw.get(key) or ()
             if isinstance(row, Mapping)
         ]
-        scores = _signed_contrastive_terms(positive, negative)
+        scores = _signed_contrastive_terms(
+            positive,
+            negative,
+            limit=contrastive_term_limit,
+        )
         if not scores:
             continue
         item = {
@@ -1214,7 +1228,7 @@ def _htr_phrase_has_unsafe_numeric_fragment(phrase: str) -> bool:
 def _htr_attention_contrastive_terms(
     attention_rows: Sequence[Mapping[str, Any]],
     *,
-    limit: int = _HTR_CONCEPT_LIMIT,
+    limit: int | None = None,
 ) -> list[dict[str, Any]]:
     """Derive recurrent concepts from patient-local high/low HTR attention.
 
@@ -1225,6 +1239,8 @@ def _htr_attention_contrastive_terms(
     two rows survive; source chunks and row identities remain transient.
     """
 
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+        raise ValueError("HTR contrastive term limit must be a positive integer or None")
     grouped: dict[tuple[str, ...], list[tuple[float, int, str, str]]] = {}
     sources: dict[tuple[str, ...], tuple[str, str]] = {}
     for raw in attention_rows:
@@ -1271,7 +1287,6 @@ def _htr_attention_contrastive_terms(
             strip_accents="unicode",
             ngram_range=(1, 3),
             min_df=2,
-            max_features=4096,
             stop_words=sorted(_HTR_CONCEPT_STOP_WORDS),
             sublinear_tf=True,
         )
@@ -1323,12 +1338,17 @@ def _htr_attention_contrastive_terms(
         seen.add(phrase)
         used_tokens.update(phrase_tokens)
         output.append({"concept": phrase, "score": score})
-        if len(output) >= int(limit):
+        if limit is not None and len(output) >= limit:
             break
     return output
 
 
-def _htr_concepts_only(evidence: Mapping[str, Any]) -> dict[str, Any]:
+def _htr_concepts_only(
+    evidence: Mapping[str, Any],
+    *,
+    phrases_per_attention_row: int | None = None,
+    fallback_contrastive_term_limit: int | None = None,
+) -> dict[str, Any]:
     output: dict[str, Any] = {}
     for stage in ("nuisance", "effect", "pair_uplift"):
         raw_stage = evidence.get(stage)
@@ -1358,7 +1378,9 @@ def _htr_concepts_only(evidence: Mapping[str, Any]) -> dict[str, Any]:
                 phrase = _safe_concept_phrase(candidate)
                 if phrase and phrase not in phrases:
                     phrases.append(phrase)
-                if len(phrases) >= 12:
+                if phrases_per_attention_row is not None and len(phrases) >= int(
+                    phrases_per_attention_row
+                ):
                     break
             if phrases:
                 # The historical compactor recognizes this field directly.
@@ -1371,7 +1393,10 @@ def _htr_concepts_only(evidence: Mapping[str, Any]) -> dict[str, Any]:
                     "attended_token_summary": str(item["concept"]),
                     "attention_score": float(item["score"]),
                 }
-                for item in _htr_attention_contrastive_terms(attention_rows)
+                for item in _htr_attention_contrastive_terms(
+                    attention_rows,
+                    limit=fallback_contrastive_term_limit,
+                )
             ]
         if rows:
             output[stage] = {"attention": rows}

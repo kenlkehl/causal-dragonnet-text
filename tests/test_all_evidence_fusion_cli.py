@@ -13,6 +13,22 @@ from oci.inference import all_evidence_fusion_cli as cli
 from oci.inference.neural_query_signal_artifact import query_signal_columns
 
 
+def _all_architecture_applied_config_payload():
+    payload = asdict(cli.AppliedInferenceConfig())
+    architecture = payload["architecture"]
+    forest = architecture["multi_model_forest"]
+    forest["feature_discovery_methods"] = ["bow", "htr", "embedding_contrast"]
+    forest["bow_discovery_enabled"] = True
+    forest["htr_evidence_enabled"] = True
+    forest["embedding_contrast"]["enabled"] = True
+    forest["embedding_contrast"]["include_cluster_contrast_vectors"] = True
+    forest["matched_pair_uplift_enabled"] = True
+    forest["matched_pair_bow_enabled"] = True
+    forest["matched_pair_htr_enabled"] = True
+    architecture["htr_freeze_sentence_encoder"] = False
+    return payload
+
+
 def _args(
     tmp_path: Path,
     *extra: str,
@@ -27,7 +43,7 @@ def _args(
     if include_review_dependencies:
         stage1_config = tmp_path / "historical_stage1.json"
         stage1_config.write_text(
-            json.dumps({"config": asdict(cli.AppliedInferenceConfig())}),
+            json.dumps({"config": _all_architecture_applied_config_payload()}),
             encoding="utf-8",
         )
         embedding_cache = tmp_path / "frozen_embeddings"
@@ -47,6 +63,8 @@ def _args(
     values = [
         "--benchmark-name",
         "synthetic-five-by-five",
+        "--discovery-mode",
+        cli._LEGACY_STAGED_DISCOVERY_MODE,
         "--dataset",
         str(paths["dataset"]),
         "--legacy-handoff",
@@ -67,6 +85,39 @@ def _args(
         *extra,
     ]
     return cli.build_parser().parse_args(values)
+
+
+def _hierarchical_args(tmp_path: Path, *extra: str):
+    return _args(
+        tmp_path,
+        "--discovery-mode",
+        cli._HIERARCHICAL_DISCOVERY_MODE,
+        "--hierarchical-preparation-dir",
+        str(tmp_path / "hierarchical_preparation"),
+        *extra,
+    )
+
+
+def test_benchmark_parser_defaults_to_hierarchical_initial_discovery():
+    assert cli.build_parser().get_default("discovery_mode") == cli._HIERARCHICAL_DISCOVERY_MODE
+    assert cli.build_parser().get_default("hierarchical_max_atoms_per_chunk") == 2
+    assert cli.build_parser().get_default("hierarchical_max_semantic_member_ids_per_chunk") == 3
+
+
+def test_hierarchical_semantic_member_cap_is_bound_into_adaptive_review_policy(tmp_path):
+    args = _hierarchical_args(
+        tmp_path,
+        "--hierarchical-max-semantic-member-ids-per-chunk",
+        "3",
+    )
+    policy = cli.build_frozen_review_evidence_policy(args)
+    hierarchy_config = cli.build_hierarchical_discovery_config(args)
+    assert policy.adaptive_config().max_semantic_member_ids_per_chunk == 3
+    assert hierarchy_config.max_semantic_member_ids_per_chunk == 3
+
+    args.hierarchical_max_semantic_member_ids_per_chunk = 0
+    with pytest.raises(ValueError, match="max_semantic_member_ids_per_chunk"):
+        cli.build_frozen_review_evidence_policy(args)
 
 
 @pytest.mark.parametrize(
@@ -435,7 +486,7 @@ def _review_dependency_args(
 ) -> list[str]:
     stage1_config = tmp_path / "historical_stage1.json"
     stage1_config.write_text(
-        json.dumps({"config": asdict(cli.AppliedInferenceConfig())}),
+        json.dumps({"config": _all_architecture_applied_config_payload()}),
         encoding="utf-8",
     )
     embedding_cache = tmp_path / "frozen_embeddings"
@@ -466,9 +517,7 @@ def _review_dependency_args(
         ]
     )
     values.append(
-        "--modifier-interactions-only"
-        if modifier_only
-        else "--no-modifier-interactions-only"
+        "--modifier-interactions-only" if modifier_only else "--no-modifier-interactions-only"
     )
     return values
 
@@ -537,7 +586,7 @@ def _install_required_v24_runtime_stubs(monkeypatch, *, row_count: int):
     )
     monkeypatch.setattr(
         cli,
-        "CrossFitStableUpstreamBackend",
+        "CoordinatePreservingContextFitUpstreamBackend",
         lambda _backend, *, config: object(),
     )
     monkeypatch.setattr(
@@ -555,6 +604,325 @@ def _install_required_v24_runtime_stubs(monkeypatch, *, row_count: int):
         gate_provider=gate_provider,
         final_upstream_producer=final_upstream_producer,
     )
+
+
+def test_hierarchical_prepare_only_uses_strict_json_runner_without_remote_call(
+    tmp_path,
+    monkeypatch,
+):
+    historical_prompt = tmp_path / "historical_prompt.txt"
+    old_prompt = tmp_path / "old_hierarchy_prompt.txt"
+    historical_prompt.write_bytes(b"historical prompt bytes\n")
+    old_prompt.write_bytes(b"old hierarchy prompt bytes\n")
+    args = _hierarchical_args(
+        tmp_path,
+        "--prepare-hierarchical-discovery",
+        "--historical-discovery-prompt",
+        f"{historical_prompt}::{hashlib.sha256(historical_prompt.read_bytes()).hexdigest()}",
+        "--old-hierarchy-prompt",
+        f"{old_prompt}::{hashlib.sha256(old_prompt.read_bytes()).hexdigest()}",
+    )
+    preparation_dir = Path(args.hierarchical_preparation_dir).resolve()
+    job_cache_root = preparation_dir / "hierarchical_job_cache"
+    validated = cli.ValidatedBenchmarkInputs(
+        dataset_path=Path(args.dataset),
+        legacy_handoff_path=Path(args.legacy_handoff),
+        tfidf_handoff_path=Path(args.resealed_tfidf_handoff),
+        primary_splits_path=Path(args.primary_splits),
+        output_dir=Path(args.output_dir),
+        cache_index_paths=(),
+        orphan_ngram_artifacts_by_fold={},
+        row_count=4,
+        outer_folds=(1, 2),
+        review_stage1_config_path=Path(args.review_stage1_config).resolve(),
+        review_embedding_cache_dir=Path(args.review_embedding_cache_dir).resolve(),
+        review_neural_query_cache_dir=Path(args.output_dir)
+        / "post_extraction_review_neural_query_cache",
+        hierarchical_preparation_dir=preparation_dir,
+        hierarchical_job_cache_root=job_cache_root,
+        hierarchical_offline_review_packet_dir=preparation_dir / "offline_review_packet",
+    )
+    monkeypatch.setattr(cli, "validate_benchmark_inputs", lambda _args: validated)
+    runtime = _install_required_v24_runtime_stubs(monkeypatch, row_count=validated.row_count)
+    calls = {}
+
+    class JsonRunner:
+        def __init__(self, **kwargs):
+            calls["json_runner_kwargs"] = kwargs
+            self.execution_metadata = ()
+            self._pool = None
+
+        def run_json(self, **_kwargs):
+            raise AssertionError("prepare-only invoked a remote JSON job")
+
+    class BaseAgent:
+        def __init__(self, config):
+            self.config = config
+            self._client = None
+            self._client_pool = None
+
+    class Extractor:
+        def __init__(self, config, output_dir):
+            calls["extractor"] = (config, Path(output_dir))
+
+    approval = "a" * 64
+
+    class Runner:
+        def __init__(self, **kwargs):
+            calls["runner_kwargs"] = kwargs
+            assert kwargs["fusion_agent"] is None
+            assert isinstance(kwargs["review_agent"], BaseAgent)
+            assert isinstance(kwargs["hierarchical_discovery_runner"], JsonRunner)
+            assert kwargs["hierarchical_discovery_approved_batch_sha256"] is None
+            assert kwargs["hierarchical_preparation_dir"] == preparation_dir
+            assert kwargs["hierarchical_discovery_job_cache_root"] == job_cache_root
+            assert (
+                kwargs["hierarchical_discovery_config"].max_integrated_features
+                == args.max_candidates
+            )
+            assert kwargs["hierarchical_review_evidence_policy"].accepted_support_only is True
+
+        def prepare_hierarchical_discovery_batch(self):
+            calls["prepared"] = True
+            return SimpleNamespace(
+                approval_sha256=approval,
+                batch_packet_path=preparation_dir / "batch.json",
+                input_manifest_path=preparation_dir / "inputs.json",
+                input_manifest_sha256="b" * 64,
+                dataset_sha256="c" * 64,
+                context_fit_overlay_companion_path=preparation_dir / "companion.json",
+                context_fit_overlay_companion_sha256="d" * 64,
+                first_gate_materialization_intent_index_path=(
+                    preparation_dir / "first_gate_materialization_intents.json"
+                ),
+                first_gate_materialization_intent_index_sha256="e" * 64,
+                folds=(
+                    SimpleNamespace(outer_fold=1),
+                    SimpleNamespace(outer_fold=2),
+                ),
+            )
+
+        def run(self):
+            raise AssertionError("prepare-only invoked final execution")
+
+    monkeypatch.setattr(cli, "OpenAICompatibleJsonDiscoveryJobRunner", JsonRunner)
+    monkeypatch.setattr(cli, "OpenAICompatibleFeatureSearchAgent", BaseAgent)
+    monkeypatch.setattr(
+        cli,
+        "StagedAllEvidenceFusionAgent",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("hierarchical mode constructed the staged initial agent")
+        ),
+    )
+    monkeypatch.setattr(cli, "VLLMExplicitFeatureExtractionProvider", Extractor)
+    monkeypatch.setattr(cli, "AllEvidenceFusionRunner", Runner)
+    review_packet = SimpleNamespace(approval_ready=True, packet_sha256="f" * 64)
+    persisted_review = SimpleNamespace(
+        packet_json_path=preparation_dir / "offline_review_packet" / "packet.json",
+        packet_json_sha256="1" * 64,
+        packet_markdown_path=preparation_dir / "offline_review_packet" / "packet.md",
+        packet_markdown_sha256="2" * 64,
+        manifest_path=preparation_dir / "offline_review_packet" / "manifest.json",
+        manifest_sha256="3" * 64,
+    )
+
+    def persist_review_packet(**kwargs):
+        assert kwargs["prepared"].approval_sha256 == approval
+        assert kwargs["validated"] is validated
+        calls["offline_review_packet"] = True
+        return review_packet, persisted_review
+
+    monkeypatch.setattr(
+        cli,
+        "_persist_hierarchical_offline_review_packet",
+        persist_review_packet,
+    )
+    spent_registrations = (
+        f"{validated.output_dir / 'spent_fold_1.json'}::" + "4" * 64,
+        f"{validated.output_dir / 'spent_fold_2.json'}::" + "5" * 64,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_prepared_review_spent_cache_registrations",
+        lambda **_kwargs: spent_registrations,
+    )
+
+    result = cli.run_benchmark(args)
+
+    assert calls["prepared"] is True
+    assert calls["json_runner_kwargs"] == {
+        "server_urls": "http://camus:8010/v1",
+        "model_name": "remote/model",
+        "api_key": "EMPTY",
+        "request_timeout": 1800.0,
+        "max_retries": 3,
+        "max_tokens": 25000,
+    }
+    assert result["status"] == "hierarchical_discovery_prepared_awaiting_approval"
+    assert result["approval_sha256"] == approval
+    assert result["next_execution_argument"] == ("--hierarchical-approved-batch-sha256=" + approval)
+    assert result["first_gate_context_fit_cache_registration"] is None
+    assert result["first_gate_numerical_materialization_deferred"] is True
+    assert result["first_gate_materialization_intent_index_path"] == str(
+        preparation_dir / "first_gate_materialization_intents.json"
+    )
+    assert result["first_gate_materialization_intent_index_sha256"] == "e" * 64
+    assert result["remote_clients_constructed"] is False
+    assert result["remote_calls_made"] is False
+    assert result["hierarchical_json_jobs_executed"] == 0
+    assert calls["offline_review_packet"] is True
+    assert result["offline_review_packet_approval_ready"] is True
+    assert result["offline_review_packet_sha256"] == "f" * 64
+    assert result["remote_execution_authorized_by_review_packet"] is False
+    assert result["review_spent_evidence_cache_registrations"] == list(spent_registrations)
+    assert result["new_preparation_review_spent_registrations"] == list(spent_registrations)
+    assert result["hierarchical_preparation_cache_replay_exported"] is False
+    assert result["hierarchical_preparation_cache_replay_registration"] is None
+    assert result["authoritative_replay_review_spent_registrations"] == []
+    assert result["authoritative_replay_context_fit_index_registration"] is None
+    assert result["authoritative_execution_review_spent_registrations"] == []
+    assert result["authoritative_execution_context_fit_index_registrations"] == []
+    assert result["authoritative_execution_replay_arguments"] == []
+    assert result["next_authenticated_provider_replay_arguments"] == [
+        *(
+            "--read-only-review-spent-evidence-cache=" + registration
+            for registration in spent_registrations
+        ),
+    ]
+    assert result["new_preparation_replay_arguments"] == [
+        *(
+            "--read-only-review-spent-evidence-cache=" + registration
+            for registration in spent_registrations
+        ),
+    ]
+    assert result["predictions_written"] is False
+    assert result["final_run_manifest_written"] is False
+    assert result["execution_requires_fresh_output_dir"] is True
+    assert result["hierarchical_per_fold_job_cache_roots"] == {
+        "1": str(job_cache_root / "outer_fold_001"),
+        "2": str(job_cache_root / "outer_fold_002"),
+    }
+
+
+def test_approval_preserving_replay_arguments_keep_exact_input_registrations(
+    tmp_path,
+):
+    spent = SimpleNamespace(
+        source_path=tmp_path / "historical_spent.json",
+        registered_sha256="a" * 64,
+    )
+    context = SimpleNamespace(
+        index_path=tmp_path / "historical_context_index.json",
+        index_sha256="b" * 64,
+    )
+    validated = SimpleNamespace(
+        authenticated_review_spent_cache_sources=(spent,),
+        authenticated_context_fit_cache_sources=(context, context),
+    )
+
+    assert cli._approval_preserving_review_spent_cache_registrations(validated) == (
+        f"{spent.source_path}::{spent.registered_sha256}",
+    )
+    assert cli._approval_preserving_context_fit_cache_registrations(validated) == (
+        f"{context.index_path}::{context.index_sha256}",
+    )
+
+
+def test_hierarchical_wrong_batch_approval_reaches_runner_barrier_before_remote(
+    tmp_path,
+    monkeypatch,
+):
+    supplied_approval = "a" * 64
+    args = _hierarchical_args(
+        tmp_path,
+        "--hierarchical-approved-batch-sha256",
+        supplied_approval,
+    )
+    preparation_dir = Path(args.hierarchical_preparation_dir).resolve()
+    context_source = SimpleNamespace(kind="review_gate")
+    validated = cli.ValidatedBenchmarkInputs(
+        dataset_path=Path(args.dataset),
+        legacy_handoff_path=Path(args.legacy_handoff),
+        tfidf_handoff_path=Path(args.resealed_tfidf_handoff),
+        primary_splits_path=Path(args.primary_splits),
+        output_dir=Path(args.output_dir),
+        cache_index_paths=(),
+        orphan_ngram_artifacts_by_fold={},
+        row_count=4,
+        outer_folds=(1, 2),
+        review_stage1_config_path=Path(args.review_stage1_config).resolve(),
+        review_embedding_cache_dir=Path(args.review_embedding_cache_dir).resolve(),
+        review_neural_query_cache_dir=Path(args.output_dir)
+        / "post_extraction_review_neural_query_cache",
+        authenticated_context_fit_cache_sources=(context_source,),
+        hierarchical_preparation_dir=preparation_dir,
+        hierarchical_job_cache_root=preparation_dir / "hierarchical_job_cache",
+    )
+    monkeypatch.setattr(cli, "validate_benchmark_inputs", lambda _args: validated)
+    monkeypatch.setattr(
+        cli,
+        "_select_tfidf_context_backend_graph",
+        lambda _sources: (
+            cli.SHARED_TFIDF_RUNTIME_GRAPH_ID,
+            cli._SHARED_TFIDF_GRAPH_ATTESTED_SELECTION,
+        ),
+    )
+    _install_required_v24_runtime_stubs(monkeypatch, row_count=validated.row_count)
+    calls = {"remote": 0}
+
+    class JsonRunner:
+        execution_metadata = ()
+        _pool = None
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def run_json(self, **_kwargs):
+            calls["remote"] += 1
+            raise AssertionError("wrong approval reached a remote JSON job")
+
+    class BaseAgent:
+        def __init__(self, config):
+            self.config = config
+            self._client = None
+            self._client_pool = None
+
+    monkeypatch.setattr(cli, "OpenAICompatibleJsonDiscoveryJobRunner", JsonRunner)
+    monkeypatch.setattr(cli, "OpenAICompatibleFeatureSearchAgent", BaseAgent)
+    monkeypatch.setattr(
+        cli,
+        "VLLMExplicitFeatureExtractionProvider",
+        lambda _config, _output: object(),
+    )
+
+    def gate_overlay(**kwargs):
+        assert kwargs["hierarchical_first_gate_preparation"] is True
+        calls["gate_overlay"] = kwargs
+        return object()
+
+    monkeypatch.setattr(cli, "AuthenticatedContextFitGateCacheOverlay", gate_overlay)
+
+    class Runner:
+        def __init__(self, **kwargs):
+            assert kwargs["fusion_agent"] is None
+            assert kwargs["hierarchical_discovery_approved_batch_sha256"] == supplied_approval
+            self.discovery_runner = kwargs["hierarchical_discovery_runner"]
+
+        def run(self):
+            # This mirrors the real runner's authenticated batch coordinator
+            # boundary; its own focused tests exercise the byte-exact packet
+            # comparison.  The CLI must pass the digest without pre-calling the
+            # JSON runner.
+            assert calls["remote"] == 0
+            raise ValueError("batch approval SHA-256 does not match prepared packet")
+
+    monkeypatch.setattr(cli, "AllEvidenceFusionRunner", Runner)
+
+    with pytest.raises(ValueError, match="approval SHA-256 does not match"):
+        cli.run_benchmark(args)
+
+    assert calls["remote"] == 0
+    assert "gate_overlay" in calls
 
 
 def test_adaptive_review_dry_run_rejects_group_dependent_extraction_requests(tmp_path):
@@ -736,6 +1104,99 @@ def test_dry_run_validates_without_constructing_remote_dependencies(tmp_path, mo
     assert result["nonforest_final_model_fallback_allowed"] is False
 
 
+def test_hierarchical_dry_run_shows_closed_settings_without_constructing_clients(
+    tmp_path,
+    monkeypatch,
+):
+    args = _hierarchical_args(tmp_path, "--dry-run")
+    _mock_valid_input_loaders(monkeypatch)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("hierarchical dry-run constructed a live dependency")
+
+    monkeypatch.setattr(cli, "OpenAICompatibleJsonDiscoveryJobRunner", forbidden)
+    monkeypatch.setattr(cli, "OpenAICompatibleFeatureSearchAgent", forbidden)
+    monkeypatch.setattr(cli, "StagedAllEvidenceFusionAgent", forbidden)
+    monkeypatch.setattr(cli, "VLLMExplicitFeatureExtractionProvider", forbidden)
+    monkeypatch.setattr(cli, "AllEvidenceFusionRunner", forbidden)
+
+    result = cli.run_benchmark(args)
+
+    assert result["discovery_mode"] == cli._HIERARCHICAL_DISCOVERY_MODE
+    assert result["initial_discovery_agent"] == ("OpenAICompatibleJsonDiscoveryJobRunner")
+    assert result["legacy_staged_initial_discovery_active"] is False
+    assert result["hierarchical_architecture_at_a_time"] is True
+    assert result["hierarchical_all_active_stage1_architectures_required"] is True
+    assert result["hierarchical_selector_thinking_enabled"] is True
+    assert result["hierarchical_selector_thinking_token_budget"] == 5000
+    assert result["hierarchical_extraction_definition_thinking_enabled"] is False
+    assert result["hierarchical_extraction_definition_thinking_token_budget_field"] == "omitted"
+    assert result["hierarchical_runner_explicit_model_no_autodiscovery"] is True
+    assert result["hierarchical_runner_response_format"] == (
+        "strict_json_schema_from_authenticated_discovery_job_v1"
+    )
+    assert result["hierarchical_runner_max_tokens"] == 25000
+    assert result["hierarchical_max_rendered_prompt_bytes"] == 220000
+    assert result["hierarchical_architecture_chunk_limits"] == {
+        "max_atoms_per_chunk": 2,
+        "max_bytes_per_chunk": 48_000,
+        "max_semantic_member_ids_per_chunk": 3,
+    }
+    assert result["hierarchical_json_runner_constructed"] is False
+    assert result["clients_constructed"] is False
+    assert result["remote_calls_made"] is False
+    assert result["extraction_enable_thinking"] is False
+    assert result["sparse_query_moment_fallback_enabled"] is False
+    assert result["final_causal_forest_required"] is True
+    assert result["nonforest_final_model_fallback_allowed"] is False
+    assert result["hierarchical_review_evidence_policy"]["accepted_support_only"] is True
+    assert (
+        result["hierarchical_review_evidence_policy"]["adaptive_reconsideration_identity"][
+            "config"
+        ]["max_semantic_member_ids_per_chunk"]
+        == 3
+    )
+    assert result["hierarchical_per_fold_job_cache_roots"] == {
+        "1": str(
+            Path(args.hierarchical_preparation_dir).resolve()
+            / "hierarchical_job_cache"
+            / "outer_fold_001"
+        ),
+        "2": str(
+            Path(args.hierarchical_preparation_dir).resolve()
+            / "hierarchical_job_cache"
+            / "outer_fold_002"
+        ),
+    }
+
+
+def test_hierarchical_execution_without_approval_fails_before_live_dependencies(
+    tmp_path,
+    monkeypatch,
+):
+    args = _hierarchical_args(tmp_path)
+    _mock_valid_input_loaders(monkeypatch)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("missing approval constructed a live dependency")
+
+    monkeypatch.setattr(cli, "OpenAICompatibleJsonDiscoveryJobRunner", forbidden)
+    monkeypatch.setattr(cli, "OpenAICompatibleFeatureSearchAgent", forbidden)
+    monkeypatch.setattr(cli, "VLLMExplicitFeatureExtractionProvider", forbidden)
+
+    with pytest.raises(ValueError, match="exact --hierarchical-approved-batch-sha256"):
+        cli.run_benchmark(args)
+
+
+def test_hierarchical_prepare_only_requires_both_authenticated_prompt_controls(
+    tmp_path,
+):
+    args = _hierarchical_args(tmp_path, "--prepare-hierarchical-discovery")
+
+    with pytest.raises(ValueError, match="requires both --historical-discovery-prompt"):
+        cli.validate_benchmark_inputs(args)
+
+
 def test_review_spent_cache_cli_registration_is_repeatable(tmp_path):
     first = f"{tmp_path / 'first.json'}::{'a' * 64}"
     second = f"{tmp_path / 'second.json'}::{'b' * 64}"
@@ -908,7 +1369,7 @@ def test_adaptive_review_dry_run_validates_context_fit_dependencies_only(
         "NeuralQueryContextBackend",
         "CompositeContextFitUpstreamBackend",
         "ContextFitUpstreamGateProvider",
-        "CrossFitStableUpstreamBackend",
+        "CoordinatePreservingContextFitUpstreamBackend",
         "FinalContextFitUpstreamProducer",
     ):
         monkeypatch.setattr(cli, name, forbidden)
@@ -966,14 +1427,24 @@ def test_adaptive_review_dry_run_validates_context_fit_dependencies_only(
     assert result["final_upstream_meta_inner_folds"] == 3
     assert result["final_upstream_head_regularization"] == 1.0
     assert result["final_upstream_schema_namespace"] == "all_evidence_upstream"
-    assert result["final_upstream_signed_order_width"] == 16
+    assert result["final_upstream_signed_order_width"] is None
+    assert result["final_upstream_volatile_signed_order_widths"] == {
+        f"embedding_clustered::{cli.PROPENSITY_NUISANCE_FEATURE_ROLE}": 10,
+        f"embedding_clustered::{cli.UNCALIBRATED_EFFECT_MODIFIER_ROLE}": 10,
+        f"tfidf_topics::{cli.PROPENSITY_NUISANCE_FEATURE_ROLE}": 100,
+        f"tfidf_topics::{cli.OUTCOME_NUISANCE_FEATURE_ROLE}": 100,
+        f"tfidf_topic_contrast::{cli.UNCALIBRATED_EFFECT_MODIFIER_ROLE}": 100,
+        f"tfidf_orphan_ngrams::{cli.UNCALIBRATED_EFFECT_MODIFIER_ROLE}": 32,
+    }
     assert result["final_upstream_neural_query_signed_order_widths"] == {
         "treatment": 5,
         "outcome": 5,
         "effect": 5,
     }
-    assert result["final_upstream_raw_family_role_count"] == 19
-    assert result["final_upstream_raw_column_count"] == 309
+    assert result["final_upstream_raw_family_role_count"] == 6
+    assert result["final_upstream_named_raw_coordinate_count"] == 72
+    assert result["final_upstream_raw_column_count"] == 464
+    assert result["final_upstream_coordinate_registry"]["maximum_child_raw_coordinate_count"] == 424
     assert result["neural_query_moments_required"] is True
     assert result["neural_query_moment_requirement_flag_set"] is False
     assert result["neural_query_moment_requirement_mode"] == "adaptive_context_fit"
@@ -1361,7 +1832,11 @@ def test_adaptive_review_wires_shared_query_service_and_gate_provider(
     monkeypatch.setattr(cli, "NeuralQueryContextBackend", query_gate_ctor)
     monkeypatch.setattr(cli, "CompositeContextFitUpstreamBackend", composite_ctor)
     monkeypatch.setattr(cli, "ContextFitUpstreamGateProvider", gate_provider_ctor)
-    monkeypatch.setattr(cli, "CrossFitStableUpstreamBackend", stable_backend_ctor)
+    monkeypatch.setattr(
+        cli,
+        "CoordinatePreservingContextFitUpstreamBackend",
+        stable_backend_ctor,
+    )
     monkeypatch.setattr(cli, "FinalContextFitUpstreamProducer", final_producer_ctor)
     monkeypatch.setattr(
         cli,
@@ -1430,8 +1905,9 @@ def test_adaptive_review_wires_shared_query_service_and_gate_provider(
     assert calls.get("gate_cache_overlay", False) is with_context_fit_cache_overlay
     assert calls.get("final_cache_overlay", False) is with_context_fit_cache_overlay
     assert calls["stable_schema"].namespace == "all_evidence_upstream"
-    assert len(calls["stable_schema"].raw_families) == 19
-    assert len(calls["stable_schema"].raw_output_schema()) == 309
+    assert len(calls["stable_schema"].named_raw_coordinates) == 72
+    assert len(calls["stable_schema"].volatile_raw_families) == 6
+    assert len(calls["stable_schema"].raw_output_schema()) == 464
     assert result["shared_tfidf_context_fit_service_enabled"] is (
         not preserve_authenticated_identity
     )
@@ -1451,13 +1927,13 @@ def test_adaptive_review_wires_shared_query_service_and_gate_provider(
         else cli._SHARED_TFIDF_GRAPH_DEFAULT_SELECTION
     )
     assert {
-        family.source_kind: family.signed_order_width
-        for family in calls["stable_schema"].raw_families
-        if family.source_kind.startswith("neural_query_")
+        coordinate.source_kind
+        for coordinate in calls["stable_schema"].named_raw_coordinates
+        if coordinate.source_kind.startswith("neural_query_")
     } == {
-        "neural_query_treatment_moments": 5,
-        "neural_query_outcome_moments": 5,
-        "neural_query_effect_moments": 5,
+        "neural_query_treatment_moments",
+        "neural_query_outcome_moments",
+        "neural_query_effect_moments",
     }
     assert calls["stage1_spent"]["device"] == "cuda:0"
     assert calls["stage1_gate"]["device"] == "cuda:0"

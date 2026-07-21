@@ -193,6 +193,7 @@ def test_concept_embedding_cache_roundtrip(tmp_path, monkeypatch):
         chunk_size_words=2,
         chunk_overlap_words=1,
         max_chunks=4,
+        chunk_selection="last",
     )
     texts = ["alpha beta gamma", "delta epsilon"]
     cache.precompute(texts, device=None, batch_size=2)
@@ -202,6 +203,7 @@ def test_concept_embedding_cache_roundtrip(tmp_path, monkeypatch):
     assert cache.hidden_states_array[0].shape == (3, 5)
     assert cache.attention_mask_array[1].shape == (2,)
     assert encoder.batch_lengths == [2, 2, 1]
+    assert cache._metadata["chunk_selection"] == "last"
 
 
 def test_concept_embedding_cache_token_bounds_persisted_chunks(tmp_path, monkeypatch):
@@ -298,6 +300,7 @@ def test_concept_embedding_cache_multi_gpu_shards_chunks(tmp_path, monkeypatch):
     assert cache.hidden_states_array[2].shape == (1, 5)
     assert cache.chunk_counts == [2, 2, 1]
     assert cache._metadata["num_gpus_used"] == 2
+    assert cache._metadata["chunk_selection"] == "first"
 
 
 def test_load_sentence_transformer_forces_float32(monkeypatch):

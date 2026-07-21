@@ -20,6 +20,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 import tempfile
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -74,6 +75,8 @@ NEURAL_QUERY_CONTEXT_BACKEND_ID = "neural_query_context_gate_backend_v3"
 NEURAL_QUERY_SPENT_EVIDENCE_PROVIDER_ID = "neural_query_spent_evidence_provider_v2"
 NEURAL_QUERY_SPENT_DISCOVERY_BACKEND_ID = "neural_query_spent_discovery_backend_v2"
 NEURAL_QUERY_SPENT_EVIDENCE_SCHEMA = "context_fit_neural_query_evidence_v2"
+NEURAL_QUERY_OWNED_SNAPSHOT_SCHEMA = "context_fit_neural_query_owned_snapshot_v1"
+NEURAL_QUERY_NUISANCE_OUTPUT_BINDING_SCHEMA = "context_fit_neural_query_nuisance_output_binding_v1"
 
 _BANKS = ("treatment", "outcome", "effect")
 _ROLE_BY_BANK = {
@@ -116,6 +119,95 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _array_content_sha256(value: np.ndarray) -> str:
+    """Hash one closed numerical array including its dtype and exact shape."""
+
+    array = np.ascontiguousarray(np.asarray(value))
+    if array.dtype.hasobject:
+        raise ValueError("neural-query snapshot arrays cannot contain Python objects")
+    header = _canonical_json(
+        {
+            "dtype": array.dtype.str,
+            "shape": [int(dimension) for dimension in array.shape],
+        }
+    ).encode("utf-8")
+    digest = hashlib.sha256()
+    digest.update(header)
+    digest.update(b"\0")
+    digest.update(memoryview(array).cast("B"))
+    return digest.hexdigest()
+
+
+def _stable_json_file(path: Path) -> tuple[dict[str, Any], str]:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("neural-query snapshot metadata must be one regular file")
+    before = path.stat()
+    payload = path.read_bytes()
+    after = path.stat()
+    before_identity = (
+        int(before.st_dev),
+        int(before.st_ino),
+        int(before.st_size),
+        int(before.st_mtime_ns),
+        int(before.st_ctime_ns),
+    )
+    after_identity = (
+        int(after.st_dev),
+        int(after.st_ino),
+        int(after.st_size),
+        int(after.st_mtime_ns),
+        int(after.st_ctime_ns),
+    )
+    if before_identity != after_identity:
+        raise RuntimeError("neural-query snapshot metadata changed while reading")
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("neural-query snapshot metadata is not valid JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError("neural-query snapshot metadata must be one JSON object")
+    return value, hashlib.sha256(payload).hexdigest()
+
+
+def _atomic_write_new_bytes(path: Path, payload: bytes) -> None:
+    if path.exists() or path.is_symlink():
+        raise FileExistsError(f"refusing to replace neural-query snapshot file: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_write_new_npz(path: Path, arrays: Mapping[str, np.ndarray]) -> None:
+    if path.exists() or path.is_symlink():
+        raise FileExistsError(f"refusing to replace neural-query snapshot file: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".npz",
+        delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+        np.savez_compressed(handle, **arrays)
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _validated_fresh_executable_cache_root(path: Path | str) -> Path:
     """Accept only a new/empty real directory as an executable cache root."""
 
@@ -143,6 +235,8 @@ def _json_state(value: Any) -> Any:
         return {str(key): _json_state(child) for key, child in value.items()}
     if isinstance(value, (list, tuple)):
         return [_json_state(child) for child in value]
+    if isinstance(value, np.ndarray):
+        return _json_state(value.tolist())
     if isinstance(value, np.generic):
         return _json_state(value.item())
     if isinstance(value, Path):
@@ -272,6 +366,303 @@ def _safe_query_ngram_rows(values: Any) -> list[dict[str, Any]]:
     return output
 
 
+def _require_sha256(value: Any, *, name: str) -> str:
+    text = str(value or "")
+    if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
+        raise ValueError(f"{name} must be a lowercase SHA-256")
+    return text
+
+
+def _owned_discovery_memory_sha256(discovery: Mapping[str, Any]) -> str:
+    if not isinstance(discovery, Mapping):
+        raise TypeError("owned neural-query discovery must be a mapping")
+    return _sha256_json(_json_state(discovery))
+
+
+def _owned_discovery_snapshot_parts(
+    discovery: Mapping[str, Any],
+) -> tuple[dict[str, np.ndarray], dict[str, Any], dict[str, Any]]:
+    """Project trusted fitted state into numerical arrays and closed JSON metadata."""
+
+    if not isinstance(discovery, Mapping):
+        raise TypeError("owned neural-query discovery must be a mapping")
+    banks = discovery.get("banks")
+    if not isinstance(banks, Mapping) or set(banks) != set(_BANKS):
+        raise ValueError("owned neural-query discovery must contain exactly three banks")
+    if discovery.get("runtime") != NEURAL_QUERY_DISCOVERY_RUNTIME_ID:
+        raise ValueError("owned neural-query discovery has the wrong fit runtime")
+    if (
+        discovery.get("all_queries_retained") is not True
+        or discovery.get("validation_audits_used_for_selection") is not False
+        or discovery.get("executable_checkpoint_io") is not False
+    ):
+        raise ValueError("owned neural-query discovery lacks its ungated in-memory attestations")
+    _require_sha256(
+        discovery.get("fit_input_binding_sha256"),
+        name="neural-query fit input binding",
+    )
+    nuisance = discovery.get("fit_nuisance_output_binding")
+    if not isinstance(nuisance, Mapping) or (
+        nuisance.get("schema_version") != NEURAL_QUERY_NUISANCE_OUTPUT_BINDING_SCHEMA
+        or nuisance.get("heldout_labels_accessed") is not False
+    ):
+        raise ValueError("owned neural-query discovery has no fitted nuisance-output binding")
+    nuisance_rows = _integer_rows(
+        nuisance.get("fit_row_ids") or (),
+        name="fit_nuisance_output_binding.fit_row_ids",
+    )
+    _require_sha256(nuisance.get("fit_e_sha256"), name="fit_e_sha256")
+    _require_sha256(nuisance.get("fit_m_sha256"), name="fit_m_sha256")
+
+    arrays: dict[str, np.ndarray] = {}
+    bank_metadata: dict[str, Any] = {}
+    inventory: dict[str, Any] = {}
+    query_count_by_bank: dict[str, int] = {}
+    fit_row_count: int | None = None
+    for bank in _BANKS:
+        raw = banks[bank]
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"owned neural-query {bank} bank is malformed")
+        queries = np.asarray(raw.get("queries"), dtype=np.float32)
+        train_activations = np.asarray(raw.get("train_activations"), dtype=np.float32)
+        records = raw.get("records")
+        if (
+            queries.ndim != 2
+            or queries.shape[0] < 1
+            or queries.shape[1] < 1
+            or not np.isfinite(queries).all()
+            or train_activations.ndim != 2
+            or train_activations.shape[0] < 1
+            or train_activations.shape[1] != queries.shape[0]
+            or not np.isfinite(train_activations).all()
+            or not isinstance(records, list)
+            or len(records) != queries.shape[0]
+            or not isinstance(raw.get("consensus"), Mapping)
+            or not isinstance(raw.get("objective"), str)
+            or not str(raw.get("objective")).strip()
+            or raw.get("all_queries_retained") is not True
+            or raw.get("statistical_gate_applied") is not False
+        ):
+            raise ValueError(f"owned neural-query {bank} fit state is incomplete")
+        if fit_row_count is None:
+            fit_row_count = int(train_activations.shape[0])
+        elif fit_row_count != int(train_activations.shape[0]):
+            raise ValueError("owned neural-query bank activations have different fit row counts")
+        query_count_by_bank[bank] = int(queries.shape[0])
+        for suffix, array in (
+            ("queries", queries),
+            ("train_activations", train_activations),
+        ):
+            key = f"{bank}_{suffix}"
+            arrays[key] = np.ascontiguousarray(array)
+            inventory[key] = {
+                "dtype": arrays[key].dtype.str,
+                "shape": [int(dimension) for dimension in arrays[key].shape],
+                "content_sha256": _array_content_sha256(arrays[key]),
+            }
+        bank_metadata[bank] = {
+            str(key): _json_state(value)
+            for key, value in raw.items()
+            if str(key) not in {"queries", "train_activations"}
+        }
+    if fit_row_count != len(nuisance_rows):
+        raise ValueError("fitted nuisance rows do not align with neural-query train activations")
+
+    discovery_metadata = {
+        str(key): _json_state(value) for key, value in discovery.items() if str(key) != "banks"
+    }
+    discovery_metadata["banks"] = bank_metadata
+    details = {
+        "array_inventory": inventory,
+        "query_count_by_bank": query_count_by_bank,
+        "fit_row_count": int(fit_row_count),
+        "owned_discovery_content_sha256": _sha256_json(
+            {
+                "array_inventory": inventory,
+                "discovery_metadata": discovery_metadata,
+            }
+        ),
+    }
+    return arrays, discovery_metadata, details
+
+
+def validate_owned_discovery_snapshot(
+    snapshot_dir: Path | str,
+    *,
+    expected_cache_key: str | None = None,
+    expected_binding: Mapping[str, Any] | None = None,
+    expected_service_identity_sha256: str | None = None,
+) -> Mapping[str, Any]:
+    """Read and validate the non-executable NPZ/JSON snapshot only.
+
+    This validator never reads the service's joblib audit checkpoint and calls
+    ``numpy.load`` with object deserialization disabled.
+    """
+
+    root = Path(snapshot_dir)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("neural-query owned snapshot must be one real directory")
+    candidates = sorted(root.iterdir(), key=lambda path: path.name)
+    if any(path.is_symlink() for path in candidates) or {path.name for path in candidates} != {
+        "arrays.npz",
+        "metadata.json",
+    }:
+        raise ValueError(
+            "neural-query owned snapshot must contain only NPZ arrays and JSON metadata"
+        )
+    arrays_path = root / "arrays.npz"
+    metadata_path = root / "metadata.json"
+    metadata, _metadata_sha256 = _stable_json_file(metadata_path)
+    expected_fields = {
+        "schema_version",
+        "cache_key",
+        "binding",
+        "service_identity_sha256",
+        "arrays_file",
+        "arrays_sha256",
+        "array_inventory",
+        "query_count_by_bank",
+        "fit_row_count",
+        "owned_discovery_content_sha256",
+        "discovery_metadata",
+        "snapshot_source",
+        "executable_serialization_present",
+        "joblib_checkpoint_loaded",
+        "content_sha256",
+    }
+    if set(metadata) != expected_fields:
+        raise ValueError("neural-query owned snapshot metadata has an open or incomplete schema")
+    body = {key: value for key, value in metadata.items() if key != "content_sha256"}
+    if (
+        metadata.get("schema_version") != NEURAL_QUERY_OWNED_SNAPSHOT_SCHEMA
+        or metadata.get("content_sha256") != _sha256_json(body)
+        or metadata.get("arrays_file") != "arrays.npz"
+        or metadata.get("snapshot_source") != "trusted_current_service_memory"
+        or metadata.get("executable_serialization_present") is not False
+        or metadata.get("joblib_checkpoint_loaded") is not False
+    ):
+        raise ValueError("neural-query owned snapshot metadata is not self-authenticating")
+    cache_key = _require_sha256(metadata.get("cache_key"), name="snapshot cache_key")
+    service_sha256 = _require_sha256(
+        metadata.get("service_identity_sha256"),
+        name="snapshot service identity",
+    )
+    if expected_cache_key is not None and cache_key != _require_sha256(
+        expected_cache_key,
+        name="expected snapshot cache_key",
+    ):
+        raise ValueError("neural-query owned snapshot has another cache key")
+    if expected_service_identity_sha256 is not None and service_sha256 != _require_sha256(
+        expected_service_identity_sha256,
+        name="expected service identity",
+    ):
+        raise ValueError("neural-query owned snapshot has another service identity")
+    binding = metadata.get("binding")
+    if not isinstance(binding, Mapping):
+        raise ValueError("neural-query owned snapshot has no fit binding")
+    if expected_binding is not None and dict(binding) != copy.deepcopy(dict(expected_binding)):
+        raise ValueError("neural-query owned snapshot has another exact fit binding")
+    if _sha256_json(binding) != cache_key:
+        raise ValueError("neural-query owned snapshot cache key does not bind its fit inputs")
+    binding_rows = _integer_rows(
+        binding.get("row_ids") or (),
+        name="snapshot binding.row_ids",
+    )
+    if int(binding.get("row_count", 0)) != len(binding_rows):
+        raise ValueError("neural-query owned snapshot fit row count is invalid")
+    for field in (
+        "service_identity_sha256",
+        "text_sha256",
+        "treatment_sha256",
+        "outcome_sha256",
+        "embedding_row_binding_sha256",
+    ):
+        _require_sha256(binding.get(field), name=f"snapshot binding.{field}")
+    if binding.get("service_identity_sha256") != service_sha256:
+        raise ValueError("neural-query snapshot service binding is inconsistent")
+
+    arrays_sha256 = _sha256_file(arrays_path)
+    if arrays_sha256 != _require_sha256(
+        metadata.get("arrays_sha256"),
+        name="snapshot arrays_sha256",
+    ):
+        raise RuntimeError("neural-query owned snapshot NPZ changed after emission")
+    inventory = metadata.get("array_inventory")
+    counts = metadata.get("query_count_by_bank")
+    discovery_metadata = metadata.get("discovery_metadata")
+    if (
+        not isinstance(inventory, Mapping)
+        or not isinstance(counts, Mapping)
+        or set(counts) != set(_BANKS)
+        or not isinstance(discovery_metadata, Mapping)
+    ):
+        raise ValueError("neural-query owned snapshot has malformed array metadata")
+    expected_array_keys = {
+        f"{bank}_{suffix}" for bank in _BANKS for suffix in ("queries", "train_activations")
+    }
+    if set(inventory) != expected_array_keys:
+        raise ValueError("neural-query owned snapshot array inventory is incomplete")
+    observed_inventory: dict[str, Any] = {}
+    before_npz_sha256 = arrays_sha256
+    with np.load(arrays_path, allow_pickle=False) as archive:
+        if set(archive.files) != expected_array_keys:
+            raise ValueError("neural-query owned snapshot NPZ has unexpected arrays")
+        for key in sorted(expected_array_keys):
+            array = np.asarray(archive[key])
+            if array.dtype.hasobject or array.ndim != 2 or not np.isfinite(array).all():
+                raise ValueError("neural-query owned snapshot contains an invalid numerical array")
+            observed_inventory[key] = {
+                "dtype": array.dtype.str,
+                "shape": [int(dimension) for dimension in array.shape],
+                "content_sha256": _array_content_sha256(array),
+            }
+    if _sha256_file(arrays_path) != before_npz_sha256:
+        raise RuntimeError("neural-query owned snapshot NPZ changed while validating")
+    if observed_inventory != dict(inventory):
+        raise RuntimeError("neural-query owned snapshot array inventory does not match its NPZ")
+    fit_row_count = int(metadata.get("fit_row_count", 0))
+    if fit_row_count != len(binding_rows):
+        raise ValueError("neural-query owned snapshot activations are bound to another row count")
+    for bank in _BANKS:
+        query_count = int(counts[bank])
+        query_shape = observed_inventory[f"{bank}_queries"]["shape"]
+        activation_shape = observed_inventory[f"{bank}_train_activations"]["shape"]
+        if (
+            query_count < 1
+            or query_shape[0] != query_count
+            or activation_shape != [fit_row_count, query_count]
+        ):
+            raise ValueError(f"neural-query owned snapshot {bank} shapes are not scope-bound")
+    nuisance = discovery_metadata.get("fit_nuisance_output_binding")
+    if (
+        discovery_metadata.get("runtime") != NEURAL_QUERY_DISCOVERY_RUNTIME_ID
+        or discovery_metadata.get("executable_checkpoint_io") is not False
+        or discovery_metadata.get("all_queries_retained") is not True
+        or discovery_metadata.get("validation_audits_used_for_selection") is not False
+        or not isinstance(nuisance, Mapping)
+        or nuisance.get("schema_version") != NEURAL_QUERY_NUISANCE_OUTPUT_BINDING_SCHEMA
+        or tuple(map(int, nuisance.get("fit_row_ids") or ())) != binding_rows
+        or nuisance.get("heldout_labels_accessed") is not False
+    ):
+        raise ValueError("neural-query owned snapshot discovery metadata is not fit-scope closed")
+    for field in ("fit_input_binding_sha256",):
+        _require_sha256(discovery_metadata.get(field), name=f"snapshot discovery.{field}")
+    for field in ("fit_e_sha256", "fit_m_sha256"):
+        _require_sha256(nuisance.get(field), name=f"snapshot nuisance.{field}")
+    observed_owned_sha256 = _sha256_json(
+        {
+            "array_inventory": observed_inventory,
+            "discovery_metadata": copy.deepcopy(dict(discovery_metadata)),
+        }
+    )
+    if observed_owned_sha256 != _require_sha256(
+        metadata.get("owned_discovery_content_sha256"),
+        name="snapshot owned discovery content",
+    ):
+        raise RuntimeError("neural-query owned snapshot discovery content is inconsistent")
+    return copy.deepcopy(metadata)
+
+
 def _fit_context_query_discovery(
     *,
     row_ids: tuple[int, ...],
@@ -342,6 +733,8 @@ class ContextFitNeuralQueryService:
         # audit artifacts only: a live service keeps its trusted discoveries in
         # memory and never executes mutable bytes from the cache directory.
         self._owned_discoveries: dict[str, Mapping[str, Any]] = {}
+        self._owned_discovery_bindings: dict[str, Mapping[str, Any]] = {}
+        self._owned_discovery_content_sha256s: dict[str, str] = {}
         self.dataset_path = Path(dataset_path).resolve()
         if not self.dataset_path.is_file():
             raise FileNotFoundError("neural-query context dataset must exist")
@@ -518,6 +911,10 @@ class ContextFitNeuralQueryService:
         checkpoint_path = root / "query_discovery.joblib"
         trusted = self._owned_discoveries.get(cache_key)
         if trusted is not None:
+            owned_binding = self._owned_discovery_bindings.get(cache_key)
+            owned_sha256 = self._owned_discovery_content_sha256s.get(cache_key)
+            if owned_binding != binding or owned_sha256 != _owned_discovery_memory_sha256(trusted):
+                raise RuntimeError("trusted neural-query discovery changed after ownership binding")
             discovery = copy.deepcopy(trusted)
             self._validate_discovery(discovery)
             self.identity()
@@ -573,7 +970,10 @@ class ContextFitNeuralQueryService:
             temporary_manifest.replace(manifest_path)
         finally:
             temporary_manifest.unlink(missing_ok=True)
-        self._owned_discoveries[cache_key] = copy.deepcopy(discovery)
+        owned = copy.deepcopy(discovery)
+        self._owned_discoveries[cache_key] = owned
+        self._owned_discovery_bindings[cache_key] = copy.deepcopy(binding)
+        self._owned_discovery_content_sha256s[cache_key] = _owned_discovery_memory_sha256(owned)
         return copy.deepcopy(discovery), cache_key
 
     def _validate_discovery(self, discovery: Any) -> None:
@@ -648,6 +1048,71 @@ class ContextFitNeuralQueryService:
             outcome=outcome,
             embedding_provider=embedding_provider,
         )
+
+    def write_owned_discovery_snapshot(
+        self,
+        *,
+        cache_key: str,
+        output_dir: Path | str,
+    ) -> Mapping[str, Any]:
+        """Persist one trusted fit as non-executable NPZ arrays plus closed JSON.
+
+        The executable audit checkpoint is neither read nor copied.  Only state
+        retained in this service instance after the genuine fit is eligible.
+        """
+
+        self.identity()
+        key = _require_sha256(cache_key, name="owned neural-query cache_key")
+        try:
+            discovery = self._owned_discoveries[key]
+            binding = self._owned_discovery_bindings[key]
+            owned_sha256 = self._owned_discovery_content_sha256s[key]
+        except (AttributeError, KeyError) as exc:
+            raise ValueError("neural-query snapshot key is not owned by this service") from exc
+        if _sha256_json(binding) != key:
+            raise RuntimeError("owned neural-query binding no longer matches its cache key")
+        if _owned_discovery_memory_sha256(discovery) != owned_sha256:
+            raise RuntimeError("owned neural-query discovery changed after fit")
+        arrays, discovery_metadata, details = _owned_discovery_snapshot_parts(discovery)
+        root = Path(output_dir)
+        if root.exists() or root.is_symlink():
+            raise FileExistsError("neural-query owned snapshot target must not already exist")
+        root.parent.mkdir(parents=True, exist_ok=True)
+        if root.parent.is_symlink():
+            raise ValueError("neural-query owned snapshot parent cannot be a symlink")
+        root.mkdir(exist_ok=False)
+        arrays_path = root / "arrays.npz"
+        _atomic_write_new_npz(arrays_path, arrays)
+        service_identity_sha256 = _sha256_json(self._identity)
+        body = {
+            "schema_version": NEURAL_QUERY_OWNED_SNAPSHOT_SCHEMA,
+            "cache_key": key,
+            "binding": copy.deepcopy(dict(binding)),
+            "service_identity_sha256": service_identity_sha256,
+            "arrays_file": arrays_path.name,
+            "arrays_sha256": _sha256_file(arrays_path),
+            "array_inventory": details["array_inventory"],
+            "query_count_by_bank": details["query_count_by_bank"],
+            "fit_row_count": details["fit_row_count"],
+            "owned_discovery_content_sha256": details["owned_discovery_content_sha256"],
+            "discovery_metadata": discovery_metadata,
+            "snapshot_source": "trusted_current_service_memory",
+            "executable_serialization_present": False,
+            "joblib_checkpoint_loaded": False,
+        }
+        metadata = {**body, "content_sha256": _sha256_json(body)}
+        _atomic_write_new_bytes(
+            root / "metadata.json",
+            (_canonical_json(metadata) + "\n").encode("utf-8"),
+        )
+        validated = validate_owned_discovery_snapshot(
+            root,
+            expected_cache_key=key,
+            expected_binding=binding,
+            expected_service_identity_sha256=service_identity_sha256,
+        )
+        self.identity()
+        return validated
 
     def safe_evidence(
         self,
@@ -1015,10 +1480,13 @@ class NeuralQuerySpentDiscoveryBackend:
 __all__ = [
     "NEURAL_QUERY_CONTEXT_BACKEND_ID",
     "NEURAL_QUERY_CONTEXT_SERVICE_ID",
+    "NEURAL_QUERY_NUISANCE_OUTPUT_BINDING_SCHEMA",
+    "NEURAL_QUERY_OWNED_SNAPSHOT_SCHEMA",
     "NEURAL_QUERY_SPENT_EVIDENCE_PROVIDER_ID",
     "NEURAL_QUERY_SPENT_DISCOVERY_BACKEND_ID",
     "ContextFitNeuralQueryService",
     "NeuralQueryContextBackend",
     "NeuralQuerySpentEvidenceProvider",
     "NeuralQuerySpentDiscoveryBackend",
+    "validate_owned_discovery_snapshot",
 ]

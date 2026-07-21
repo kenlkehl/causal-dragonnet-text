@@ -85,7 +85,7 @@ _VALID_ACTIONS = frozenset({"drop", "merge", "re_role", "replace", "revise", "st
 _VALID_ROLES = frozenset({"confounder", "effect_modifier"})
 _SNAKE_CASE = re.compile(r"^[a-z][a-z0-9_]*$")
 _OPAQUE_DIAGNOSTIC_ID = re.compile(r"^diagnostic_[0-9]{4}$")
-_OPAQUE_EVIDENCE_ID = re.compile(r"^evidence_[0-9]+$")
+_OPAQUE_EVIDENCE_ID = re.compile(r"^evidence_(?:[0-9]+|[0-9a-f]{64})$")
 
 
 class PostExtractionReviewResponseExhausted(ValueError):
@@ -115,6 +115,81 @@ def _content_sha256(value: Any) -> str:
 
 def _detached(value: Any) -> Any:
     return json.loads(_canonical_json(value))
+
+
+_MODEL_FACING_MACHINE_ONLY_EXACT_KEYS = frozenset(
+    {
+        "prompt_version",
+        "schema_version",
+        "source_text_temporal_policy",
+    }
+)
+_MODEL_FACING_MACHINE_ONLY_KEY_SUFFIXES = (
+    "_policy_version",
+    "_sha256",
+    "_diagnostic_version",
+)
+_MODEL_FACING_TEMPORAL_POLICY_MARKERS = frozenset(
+    {
+        "source_text_temporal_policy",
+        "source_text_temporally_valid_by_design_v1",
+        "source_text_temporally_valid_by_design",
+        "temporal_boundary_enforced",
+        "post_treatment_semantic_filtering_enabled",
+        "temporal_eligibility_affects_selection_or_acceptance",
+        "semantic_timepoint_fields_allowed_as_extraction_meaning",
+    }
+)
+
+
+def _is_machine_only_review_prompt_key(value: Any) -> bool:
+    normalized = str(value).casefold()
+    return normalized in _MODEL_FACING_MACHINE_ONLY_EXACT_KEYS or normalized.endswith(
+        _MODEL_FACING_MACHINE_ONLY_KEY_SUFFIXES
+    )
+
+
+def _without_machine_only_review_metadata(value: Any) -> Any:
+    """Copy prompt data while removing internal machine metadata at any depth."""
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _without_machine_only_review_metadata(child)
+            for key, child in value.items()
+            if not _is_machine_only_review_prompt_key(key)
+        }
+    if isinstance(value, list):
+        return [_without_machine_only_review_metadata(child) for child in value]
+    return value
+
+
+def _assert_no_model_facing_machine_metadata(value: Any) -> None:
+    """Fail closed if machine-only keys or timing-policy values escaped projection."""
+
+    def visit(item: Any, *, path: str) -> None:
+        if isinstance(item, Mapping):
+            for key, child in item.items():
+                if _is_machine_only_review_prompt_key(key):
+                    raise ValueError(
+                        "post-extraction review prompt contains internal machine metadata "
+                        f"key: {path}.{key}"
+                    )
+                visit(child, path=f"{path}.{key}")
+        elif isinstance(item, list):
+            for index, child in enumerate(item):
+                visit(child, path=f"{path}[{index}]")
+
+    visit(value, path="context")
+
+    serialized = _canonical_json(value).casefold()
+    leaked = sorted(
+        marker for marker in _MODEL_FACING_TEMPORAL_POLICY_MARKERS if marker in serialized
+    )
+    if leaked:
+        raise ValueError(
+            "post-extraction review prompt contains internal temporal-policy audit markers: "
+            f"{leaked}"
+        )
 
 
 def _finite_or_none(value: Any) -> float | None:
@@ -275,12 +350,12 @@ def collect_post_extraction_diagnostic_targets(
 
     def direct_targets(item: Mapping[str, Any]) -> tuple[str, ...]:
         names: list[str] = []
-        for field in ("feature_name", "contract_name"):
-            raw = item.get(field)
+        for target_field in ("feature_name", "contract_name"):
+            raw = item.get(target_field)
             if isinstance(raw, str) and raw.strip():
                 names.append(raw.strip())
-        for field in ("feature_names", "failed_contract_names"):
-            raw = item.get(field)
+        for target_field in ("feature_names", "failed_contract_names"):
+            raw = item.get(target_field)
             if isinstance(raw, (list, tuple)):
                 names.extend(str(name).strip() for name in raw if str(name).strip())
         if str(item.get("kind") or "") == "prior_gate_feedback":
@@ -582,8 +657,12 @@ def render_post_extraction_review_prompt(context: Mapping[str, Any]) -> str:
     # Validate the supplied contracts before embedding them in a remote prompt.
     for spec in current:
         CandidateContract(spec)
+    # Machine provenance remains available in the internal context/audit, but
+    # is recursively removed from this detached copy before any remote request.
+    prompt_context = _without_machine_only_review_metadata(_detached(context))
+    _assert_no_model_facing_machine_metadata(prompt_context)
     context_json = json.dumps(
-        _detached(context),
+        prompt_context,
         separators=(",", ":"),
         ensure_ascii=False,
     )
@@ -608,9 +687,7 @@ models, while raw effect features and calibrated effect signals enter the
 effect regression. Family ablations delete a family and refit; a raw feature is
 never interpreted directly as a treatment effect.
 Text-grounding diagnostics are aggregate lexical audits over already-spent
-notes. The source text is temporally valid by design: do not infer a treatment
-boundary, filter temporal wording, or use timing as an eligibility or safety
-criterion. Treat repeated locally grounded support for a different declared
+notes. Treat repeated locally grounded support for a different declared
 category as an unsafe ontology mismatch. Use missing-value opportunities,
 category conflicts, weak grounding, alias, or unit warnings as reasons to
 clarify the ontology/contract rather than as proof that a row-level value is wrong.
@@ -639,7 +716,6 @@ You may:
 
 Return exactly one JSON object with this schema:
 {{
-  "schema_version": "{POST_EXTRACTION_REVIEW_RESPONSE_SCHEMA_VERSION}",
   "operations": [
     {{
       "action": "drop|merge|re_role|replace|revise|stop",
@@ -692,8 +768,6 @@ Rules:
   normalized alias to only one category. Aliases must be genuine variants: never
   repeat a canonical category as its own alias, and never repeat a normalized
   alias. Omit aliases for continuous contracts.
-- Preserve a semantic timepoint when it is part of the supported construct, but
-  do not use timepoint wording as an eligibility or safety criterion.
 - Do not invent a concept from general medical knowledge; ground replacements
   and revisions in the supplied evidence and diagnostics.
 - Complexity is penalized by the deterministic acceptance evaluator. Prefer a
@@ -1029,8 +1103,8 @@ def build_post_extraction_review_repair_prompt(
             "operation budget. While required safety remediation remains, do not stop."
         )
     return (
-        "Repair the post-extraction review response as exactly one JSON object "
-        f"matching {POST_EXTRACTION_REVIEW_RESPONSE_SCHEMA_VERSION}. Every operation "
+        "Repair the post-extraction review response as exactly one JSON object with "
+        "an operations array. Every operation "
         "must contain exactly these six keys: action, target_names, contract, "
         "supporting_diagnostic_ids, supporting_evidence_ids, reason. For drop, use "
         "contract:null and supporting_evidence_ids:[] when no source evidence is cited. "

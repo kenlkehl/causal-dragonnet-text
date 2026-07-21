@@ -123,6 +123,8 @@ def _service(
     service = object.__new__(ContextFitNeuralQueryService)
     service.cache_dir = tmp_path / "query-cache"
     service._owned_discoveries = {}
+    service._owned_discovery_bindings = {}
+    service._owned_discovery_content_sha256s = {}
     service.dataset_path = tmp_path / "dataset.parquet"
     service.stage1_config_path = tmp_path / "stage1.json"
     service.stage1_config_path.write_text("{}", encoding="utf-8")
@@ -148,6 +150,10 @@ def _discovery():
         "banks": {
             bank: {
                 "queries": np.asarray([[1.0, 0.0]], dtype=np.float32),
+                "train_activations": np.asarray(
+                    [[0.1], [0.2], [0.3], [0.4]],
+                    dtype=np.float32,
+                ),
                 "records": [
                     {
                         "query_id": f"{bank}_context_query_001",
@@ -156,10 +162,26 @@ def _discovery():
                         "fit_standardized_score": 0.4,
                     }
                 ],
+                "consensus": {"method": "test_ungated_consensus"},
+                "objective": f"test_{bank}_objective",
+                "all_queries_retained": True,
+                "statistical_gate_applied": False,
             }
             for bank in ("treatment", "outcome", "effect")
         },
+        "runtime": query_context_module.NEURAL_QUERY_DISCOVERY_RUNTIME_ID,
+        "fit_input_binding_sha256": "a" * 64,
+        "fit_nuisance_output_binding": {
+            "schema_version": query_context_module.NEURAL_QUERY_NUISANCE_OUTPUT_BINDING_SCHEMA,
+            "fit_row_ids": [0, 1, 2, 3],
+            "fit_e_sha256": "b" * 64,
+            "fit_m_sha256": "c" * 64,
+            "heldout_labels_accessed": False,
+        },
         "subfold_audit": [],
+        "all_queries_retained": True,
+        "validation_audits_used_for_selection": False,
+        "executable_checkpoint_io": False,
     }
 
 
@@ -1224,6 +1246,148 @@ def test_context_cache_return_value_cannot_mutate_trusted_in_memory_discovery(
     assert calls == [rows]
     assert reused["banks"]["treatment"]["queries"].tolist() == [[1.0, 0.0]]
     assert reused["banks"]["treatment"]["records"][0]["fit_standardized_score"] == 0.4
+
+
+def test_owned_snapshot_persists_exact_trusted_arrays_without_loading_joblib(
+    tmp_path,
+    monkeypatch,
+):
+    calls: list[tuple[int, ...]] = []
+    _patch_discovery(monkeypatch, calls)
+    service = _service(tmp_path)
+    rows = (0, 1, 2, 3)
+    discovery, cache_key = service.discovery_for_context(
+        outer_fold=1,
+        context_row_ids=rows,
+        context_texts=_TEST_TEXTS[:4],
+        context_treatment=np.asarray([0.0, 1.0, 0.0, 1.0]),
+        context_outcome=np.asarray([0.0, 1.0, 1.0, 0.0]),
+    )
+
+    def forbidden_load(*_args, **_kwargs):
+        raise AssertionError("owned snapshot attempted executable joblib deserialization")
+
+    monkeypatch.setattr(query_context_module.joblib, "load", forbidden_load)
+    snapshot_dir = tmp_path / "sealed" / "owned_snapshot"
+    metadata = service.write_owned_discovery_snapshot(
+        cache_key=cache_key,
+        output_dir=snapshot_dir,
+    )
+    validated = query_context_module.validate_owned_discovery_snapshot(
+        snapshot_dir,
+        expected_cache_key=cache_key,
+    )
+
+    assert validated == metadata
+    assert metadata["snapshot_source"] == "trusted_current_service_memory"
+    assert metadata["executable_serialization_present"] is False
+    assert metadata["joblib_checkpoint_loaded"] is False
+    assert not list(snapshot_dir.rglob("*.joblib"))
+    with np.load(snapshot_dir / "arrays.npz", allow_pickle=False) as arrays:
+        for bank in ("treatment", "outcome", "effect"):
+            np.testing.assert_array_equal(
+                arrays[f"{bank}_queries"],
+                discovery["banks"][bank]["queries"],
+            )
+            np.testing.assert_array_equal(
+                arrays[f"{bank}_train_activations"],
+                discovery["banks"][bank]["train_activations"],
+            )
+
+
+def test_owned_snapshot_rejects_unknown_existing_mutated_and_tampered_state(
+    tmp_path,
+    monkeypatch,
+):
+    calls: list[tuple[int, ...]] = []
+    _patch_discovery(monkeypatch, calls)
+    service = _service(tmp_path)
+    rows = (0, 1, 2, 3)
+    _discovery_result, cache_key = service.discovery_for_context(
+        outer_fold=1,
+        context_row_ids=rows,
+        context_texts=_TEST_TEXTS[:4],
+        context_treatment=np.asarray([0.0, 1.0, 0.0, 1.0]),
+        context_outcome=np.asarray([0.0, 1.0, 1.0, 0.0]),
+    )
+    with pytest.raises(ValueError, match="not owned"):
+        service.write_owned_discovery_snapshot(
+            cache_key="f" * 64,
+            output_dir=tmp_path / "unknown",
+        )
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    with pytest.raises(FileExistsError, match="must not already exist"):
+        service.write_owned_discovery_snapshot(
+            cache_key=cache_key,
+            output_dir=existing,
+        )
+
+    snapshot_dir = tmp_path / "snapshot"
+    service.write_owned_discovery_snapshot(cache_key=cache_key, output_dir=snapshot_dir)
+    arrays_path = snapshot_dir / "arrays.npz"
+    arrays_path.write_bytes(arrays_path.read_bytes() + b"tamper")
+    with pytest.raises(RuntimeError, match="NPZ changed"):
+        query_context_module.validate_owned_discovery_snapshot(snapshot_dir)
+
+    service._owned_discoveries[cache_key]["banks"]["effect"]["queries"][0, 0] = -17.0
+    with pytest.raises(RuntimeError, match="changed after fit"):
+        service.write_owned_discovery_snapshot(
+            cache_key=cache_key,
+            output_dir=tmp_path / "mutated",
+        )
+
+
+def test_owned_queries_and_exact_gate_moments_ignore_external_heldout_labels(
+    tmp_path,
+    monkeypatch,
+):
+    calls: list[tuple[int, ...]] = []
+    _patch_discovery(monkeypatch, calls)
+    service = _service(tmp_path)
+    backend = NeuralQueryContextBackend(service)
+    fit_kwargs = {
+        "outer_fold": 1,
+        "context_row_ids": (0, 1, 2, 3),
+        "context_texts": _TEST_TEXTS[:4],
+        "context_treatment": np.asarray([0.0, 1.0, 0.0, 1.0]),
+        "context_outcome": np.asarray([0.0, 1.0, 1.0, 0.0]),
+        "gate_row_ids": (4,),
+        "gate_texts": (_TEST_TEXTS[4],),
+        "work_dir": tmp_path,
+    }
+    heldout_treatment = np.asarray([0.0])
+    heldout_outcome = np.asarray([1.0])
+    first = backend.fit_predict(**fit_kwargs)
+    _discovery_value, cache_key = service.discovery_for_context(
+        outer_fold=1,
+        context_row_ids=(0, 1, 2, 3),
+        context_texts=_TEST_TEXTS[:4],
+        context_treatment=fit_kwargs["context_treatment"],
+        context_outcome=fit_kwargs["context_outcome"],
+    )
+    service.write_owned_discovery_snapshot(
+        cache_key=cache_key,
+        output_dir=tmp_path / "snapshot_before",
+    )
+
+    heldout_treatment[:] = 1.0
+    heldout_outcome[:] = 0.0
+    second = backend.fit_predict(**fit_kwargs)
+    service.write_owned_discovery_snapshot(
+        cache_key=cache_key,
+        output_dir=tmp_path / "snapshot_after",
+    )
+
+    np.testing.assert_array_equal(first.feature_values, second.feature_values)
+    assert first.feature_names == second.feature_names
+    for bank in ("treatment", "outcome", "effect"):
+        with np.load(tmp_path / "snapshot_before" / "arrays.npz", allow_pickle=False) as before:
+            before_queries = before[f"{bank}_queries"].copy()
+        with np.load(tmp_path / "snapshot_after" / "arrays.npz", allow_pickle=False) as after:
+            np.testing.assert_array_equal(before_queries, after[f"{bank}_queries"])
+    assert heldout_treatment.tolist() == [1.0]
+    assert heldout_outcome.tolist() == [0.0]
 
 
 def test_context_cache_never_loads_entry_created_by_another_service_instance(

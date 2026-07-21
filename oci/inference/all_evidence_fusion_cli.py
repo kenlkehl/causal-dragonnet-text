@@ -2,19 +2,26 @@
 
 This module deliberately keeps benchmark execution behind a narrow boundary:
 
-* proposal/selection and extraction use the same explicitly configured remote
-  OpenAI-compatible endpoint pool;
-* proposal/selection reasoning is enabled with a fixed 5000-token budget while
-  extraction reasoning is fixed off, and both execution semantics are
-  immutable-manifest-bound;
+* production initial discovery is hierarchical and architecture-at-a-time,
+  using strict JSON jobs against one explicit endpoint/model (never the legacy
+  staged prompt agent);
+* selector reasoning is enabled with exactly 5000 tokens while hierarchy
+  extraction-definition reasoning and patient extraction reasoning are off;
+* every outer fold is prepared into one inspectable batch before the exact
+  batch SHA-256 can authorize cache lookup or remote hierarchy jobs;
+* the legacy staged discovery mode remains only for tests and historical
+  ablations;
 * extraction is fixed to ``vllm_mode='server'`` and cannot start or import a
   local model through a CLI option;
 * the causal runner sees only text, treatment, and observed outcome columns;
 * synthetic oracle effects are loaded only after frozen predictions exist and
   only when post-hoc evaluation was explicitly requested.
 
-``--dry-run`` authenticates the input structure and configuration without
-constructing any proposal agent, extraction provider, or network client.
+``--dry-run`` authenticates the input structure and reports the complete
+configuration without constructing any agent, extraction provider, runner, or
+network client. ``--prepare-hierarchical-discovery`` may materialize local
+Stage-1/cache artifacts in a fresh scratch output, but makes no remote call and
+writes no prediction or final run manifest.
 """
 
 from __future__ import annotations
@@ -64,6 +71,13 @@ from .all_evidence_fusion_runner import (
     load_resealed_tfidf_handoff,
     load_sanitized_dataset,
 )
+from .approved_hierarchical_discovery_batch import (
+    FrozenReviewEvidencePolicyBinding,
+)
+from .adaptive_hierarchical_stage1_reconsideration import (
+    AdaptiveReconsiderationConfig,
+    adaptive_hierarchical_stage1_reconsideration_identity,
+)
 from .all_evidence_post_extraction_review import (
     OUTCOME_NUISANCE_FEATURE_ROLE,
     PROPENSITY_NUISANCE_FEATURE_ROLE,
@@ -87,6 +101,10 @@ from .neural_query_context_backend import (
     NeuralQuerySpentDiscoveryBackend,
 )
 from .final_context_fit_upstream_bank import FinalContextFitUpstreamProducer
+from .coordinate_preserving_context_fit_upstream_backend import (
+    CoordinatePreservingContextFitUpstreamBackend,
+    CoordinatePreservingUpstreamSchemaConfig,
+)
 from .final_context_fit_causal_forest_adapter import (
     FINAL_CONTEXT_FIT_CAUSAL_FOREST_ADAPTER_ID,
     FixedCausalForestHeadBackend,
@@ -104,10 +122,13 @@ from .review_spent_evidence_cache_overlay import (
     authenticate_review_spent_cache_registrations,
 )
 from .stable_context_fit_upstream_backend import (
-    CrossFitStableUpstreamBackend,
     CrossFitStableUpstreamSchemaConfig,
     PrecommittedCalibratedSource,
     PrecommittedRawFeatureFamily,
+)
+from .production_coordinate_preserving_upstream_schema import (
+    build_production_coordinate_preserving_schema,
+    production_coordinate_preserving_registry_audit,
 )
 from .stage1_upstream_gate_backend import (
     HistoricalStage1ConfigSnapshot,
@@ -128,6 +149,30 @@ from .tfidf_upstream_gate_backend import (
     TfidfTopicOrphanContextBackend,
 )
 from .query_moment_evidence_adapter import load_query_moment_evidence_artifact
+from .frozen_hierarchical_review_evidence import (
+    frozen_hierarchical_review_evidence_identity,
+)
+from .hierarchical_all_architecture_discovery import (
+    MAX_RENDERED_DISCOVERY_PROMPT_BYTES,
+    HierarchicalDiscoveryConfig,
+)
+from .hierarchical_discovery_response_contract import (
+    HIERARCHICAL_DISCOVERY_MAX_ATOMS_PER_INTERPRET_JOB,
+    HIERARCHICAL_DISCOVERY_MAX_MEMBERS_PER_INTERPRET_JOB,
+)
+from .lossless_stage1_evidence_catalog import (
+    DEFAULT_MAX_BYTES_PER_ARCHITECTURE_CHUNK,
+)
+from .openai_compatible_json_discovery_job_runner import (
+    MINIMUM_DISCOVERY_MAX_TOKENS,
+    OPENAI_JSON_DISCOVERY_RUNNER_VERSION,
+    OpenAICompatibleJsonDiscoveryJobRunner,
+)
+from .offline_hierarchical_discovery_review_packet import (
+    AuthenticatedPromptFile,
+    build_offline_extraction_definition_prompt_preview,
+    compose_offline_hierarchical_discovery_review_packet,
+)
 from .staged_all_evidence_fusion_agent import StagedAllEvidenceFusionAgent
 from .tfidf_topic_discovery import row_set_fingerprint
 
@@ -136,6 +181,11 @@ _SERVER_MODE = "server"
 _FUSION_ENABLE_THINKING = True
 _FUSION_THINKING_TOKEN_BUDGET = 5000
 _EXTRACTION_ENABLE_THINKING = False
+_HIERARCHICAL_DISCOVERY_MODE = "hierarchical"
+_LEGACY_STAGED_DISCOVERY_MODE = "legacy-staged-test-only"
+_HIERARCHICAL_JOB_CACHE_DIRNAME = "hierarchical_job_cache"
+_DEFAULT_FROZEN_REVIEW_MAX_EVIDENCE_IDS = 512
+_DEFAULT_FROZEN_REVIEW_MAX_EVIDENCE_BYTES = 2_000_000
 _ORACLE_ITE_COLUMN = "true_ite_prob"
 _REVIEW_EMBEDDING_CACHE_FILES = (
     "metadata.json",
@@ -149,6 +199,7 @@ _REQUIRED_REVIEW_DISCOVERY_FAMILIES = frozenset(
 )
 _FINAL_UPSTREAM_NAMESPACE = "all_evidence_upstream"
 _FINAL_UPSTREAM_SIGNED_ORDER_WIDTH = 16
+_FINAL_UPSTREAM_MAX_ORPHAN_FEATURES = 32
 _FINAL_UPSTREAM_RAW_FAMILY_ROLE_KEYS = (
     ("bow_nuisance", PROPENSITY_NUISANCE_FEATURE_ROLE),
     ("bow_nuisance", OUTCOME_NUISANCE_FEATURE_ROLE),
@@ -206,6 +257,11 @@ class ValidatedBenchmarkInputs:
     review_neural_query_cache_dir: Path | None = None
     authenticated_review_spent_cache_sources: tuple[AuthenticatedReviewSpentCacheSource, ...] = ()
     authenticated_context_fit_cache_sources: tuple[AuthenticatedContextFitCacheSource, ...] = ()
+    hierarchical_preparation_dir: Path | None = None
+    hierarchical_job_cache_root: Path | None = None
+    hierarchical_offline_review_packet_dir: Path | None = None
+    historical_discovery_prompt: AuthenticatedPromptFile | None = None
+    old_hierarchy_prompt: AuthenticatedPromptFile | None = None
 
 
 _SHARED_TFIDF_GRAPH_DEFAULT_SELECTION = "default_wrapped_no_context_fit_source_v1"
@@ -295,6 +351,17 @@ def _validate_numeric_configuration(args: argparse.Namespace) -> None:
         raise ValueError("--max-candidates must be in [1, 64]")
     if int(args.proposal_max_tokens) < 1 or int(args.extraction_max_tokens) < 1:
         raise ValueError("proposal/extraction token limits must be positive")
+    if (
+        str(args.discovery_mode) == _HIERARCHICAL_DISCOVERY_MODE
+        and int(args.proposal_max_tokens) < MINIMUM_DISCOVERY_MAX_TOKENS
+    ):
+        raise ValueError(
+            "hierarchical --proposal-max-tokens must cover the authenticated "
+            "visible response plus reasoning reserve: at least "
+            f"{MINIMUM_DISCOVERY_MAX_TOKENS}"
+        )
+    if not 0 <= int(args.request_max_retries) <= 8:
+        raise ValueError("--request-max-retries must be in [0, 8]")
     if int(args.extraction_batch_size) < 1:
         raise ValueError("--extraction-batch-size must be positive")
     if not 1 <= int(args.max_variables_per_extraction_request) <= 10:
@@ -326,9 +393,7 @@ def _validate_numeric_configuration(args: argparse.Namespace) -> None:
         or not isinstance(bow_workers, (int, np.integer))
         or int(bow_workers) < 1
     ):
-        raise ValueError(
-            "--review-stage1-bow-fold-parallelism must be a positive integer"
-        )
+        raise ValueError("--review-stage1-bow-fold-parallelism must be a positive integer")
     meta_folds = args.final_upstream_meta_inner_folds
     if (
         isinstance(meta_folds, (bool, np.bool_))
@@ -377,6 +442,64 @@ def _validate_numeric_configuration(args: argparse.Namespace) -> None:
             "--extraction-prompt-version must match the provider's actual prompt version "
             f"{EXTRACTION_PROMPT_VERSION!r}"
         )
+
+    if str(args.discovery_mode) == _HIERARCHICAL_DISCOVERY_MODE:
+        # Construction performs the complete closed-bound validation.  Keeping
+        # this here makes dry-run and live execution share one exact policy.
+        build_hierarchical_discovery_config(args)
+        build_frozen_review_evidence_policy(args)
+
+
+def build_hierarchical_discovery_config(
+    args: argparse.Namespace,
+) -> HierarchicalDiscoveryConfig:
+    """Build the closed architecture-at-a-time discovery policy."""
+
+    return HierarchicalDiscoveryConfig(
+        max_rendered_prompt_bytes=MAX_RENDERED_DISCOVERY_PROMPT_BYTES,
+        max_semantic_member_ids_per_chunk=int(args.hierarchical_max_semantic_member_ids_per_chunk),
+        max_cross_architecture_lookback_ids_per_group=int(
+            args.hierarchical_max_cross_architecture_lookback_ids
+        ),
+        max_cross_architecture_lookback_bytes_per_group=int(
+            args.hierarchical_max_cross_architecture_lookback_bytes
+        ),
+        max_extraction_lookback_ids_per_feature=int(
+            args.hierarchical_max_extraction_lookback_ids_per_feature
+        ),
+        max_extraction_lookback_bytes_per_feature=int(
+            args.hierarchical_max_extraction_lookback_bytes_per_feature
+        ),
+        max_rejection_lookback_ids_per_candidate=int(
+            args.hierarchical_max_rejection_lookback_ids_per_candidate
+        ),
+        max_rejection_lookback_bytes_per_candidate=int(
+            args.hierarchical_max_rejection_lookback_bytes_per_candidate
+        ),
+        max_integrated_features=int(args.max_candidates),
+    )
+
+
+def build_frozen_review_evidence_policy(
+    args: argparse.Namespace,
+) -> FrozenReviewEvidencePolicyBinding:
+    """Bind review to exact support of hierarchy-accepted features only."""
+
+    adaptive_config = AdaptiveReconsiderationConfig(
+        max_atoms_per_chunk=int(args.hierarchical_max_atoms_per_chunk),
+        max_bytes_per_chunk=int(args.hierarchical_max_bytes_per_chunk),
+        max_semantic_member_ids_per_chunk=int(args.hierarchical_max_semantic_member_ids_per_chunk),
+        max_operations=int(args.post_extraction_review_max_operations),
+    )
+    return FrozenReviewEvidencePolicyBinding(
+        max_evidence_ids=int(args.hierarchical_review_max_evidence_ids),
+        max_evidence_bytes=int(args.hierarchical_review_max_evidence_bytes),
+        review_materializer_identity=frozen_hierarchical_review_evidence_identity(),
+        adaptive_reconsideration_identity=(
+            adaptive_hierarchical_stage1_reconsideration_identity(adaptive_config)
+        ),
+        accepted_support_only=True,
+    )
 
 
 def extraction_prompt_cache_identity(args: argparse.Namespace) -> str:
@@ -620,6 +743,53 @@ def build_applied_inference_config(
     return config
 
 
+def _validate_discovery_cli_mode(args: argparse.Namespace) -> None:
+    mode = str(args.discovery_mode)
+    hierarchical = mode == _HIERARCHICAL_DISCOVERY_MODE
+    if mode not in {_HIERARCHICAL_DISCOVERY_MODE, _LEGACY_STAGED_DISCOVERY_MODE}:
+        raise ValueError(f"unsupported discovery mode: {mode!r}")
+    if bool(args.prepare_hierarchical_discovery) and not hierarchical:
+        raise ValueError("--prepare-hierarchical-discovery requires hierarchical mode")
+    approved = args.hierarchical_approved_batch_sha256
+    if approved is not None:
+        raw_approved = str(approved).strip()
+        if re.fullmatch(r"[0-9a-f]{64}", raw_approved) is None:
+            raise ValueError("--hierarchical-approved-batch-sha256 must be one lowercase SHA-256")
+        args.hierarchical_approved_batch_sha256 = raw_approved
+    if bool(args.prepare_hierarchical_discovery) and approved is not None:
+        raise ValueError(
+            "prepare-only mode cannot also provide --hierarchical-approved-batch-sha256"
+        )
+    if bool(args.prepare_hierarchical_discovery) and (
+        args.historical_discovery_prompt is None or args.old_hierarchy_prompt is None
+    ):
+        raise ValueError(
+            "prepare-only mode requires both --historical-discovery-prompt "
+            "PATH::SHA256 and --old-hierarchy-prompt PATH::SHA256"
+        )
+    if bool(args.dry_run) and approved is not None:
+        raise ValueError("--dry-run cannot approve a hierarchical batch")
+    if bool(args.dry_run) and bool(args.prepare_hierarchical_discovery):
+        raise ValueError("--dry-run and --prepare-hierarchical-discovery are mutually exclusive")
+    if not hierarchical:
+        unexpected = {
+            "--hierarchical-preparation-dir": args.hierarchical_preparation_dir,
+            "--hierarchical-job-cache-root": args.hierarchical_job_cache_root,
+            "--hierarchical-approved-batch-sha256": approved,
+            "--historical-discovery-prompt": args.historical_discovery_prompt,
+            "--old-hierarchy-prompt": args.old_hierarchy_prompt,
+            "--hierarchical-offline-review-packet-dir": (
+                args.hierarchical_offline_review_packet_dir
+            ),
+        }
+        present = sorted(name for name, value in unexpected.items() if value is not None)
+        if present:
+            raise ValueError(
+                "legacy staged discovery does not accept hierarchical runtime options: "
+                + ", ".join(present)
+            )
+
+
 def _required_file(path: Path | str, *, label: str) -> Path:
     resolved = Path(path).expanduser().resolve()
     if not resolved.is_file():
@@ -632,6 +802,32 @@ def _required_directory(path: Path | str, *, label: str) -> Path:
     if not resolved.is_dir():
         raise FileNotFoundError(f"{label} does not exist or is not a directory: {resolved}")
     return resolved
+
+
+def _authenticated_prompt_registration(
+    value: str | None,
+    *,
+    label: str,
+) -> AuthenticatedPromptFile | None:
+    """Parse and immediately authenticate one exact ``PATH::SHA256`` prompt."""
+
+    if value is None:
+        return None
+    raw_path, separator, raw_sha256 = str(value).rpartition("::")
+    if not separator or not raw_path:
+        raise ValueError(f"{label} must use PATH::SHA256")
+    sha256 = raw_sha256.strip()
+    if re.fullmatch(r"[0-9a-f]{64}", sha256) is None:
+        raise ValueError(f"{label} must declare one lowercase SHA-256")
+    path = _required_file(raw_path, label=label)
+    registration = AuthenticatedPromptFile(
+        path=path,
+        expected_sha256=sha256,
+        display_name=path.name,
+    )
+    # Re-read during packet composition so mutation after validation fails too.
+    registration.snapshot(artifact_kind="cli_prevalidation_only")
+    return registration
 
 
 def build_review_neural_query_config(
@@ -735,6 +931,61 @@ def build_final_upstream_schema_config(
     )
 
 
+def build_coordinate_preserving_final_upstream_schema_config(
+    stage1_config_path: Path | str,
+    *,
+    stage1_config_snapshot: HistoricalStage1ConfigSnapshot | None = None,
+    neural_query_config: NeuralQueryAgenticForestConfig | None = None,
+    max_orphan_features: int = _FINAL_UPSTREAM_MAX_ORPHAN_FEATURES,
+) -> CoordinatePreservingUpstreamSchemaConfig:
+    """Precommit the production v3 schema without fitting or reading patient rows."""
+
+    path = _required_file(stage1_config_path, label="historical Stage-1 review config")
+    snapshot = stage1_config_snapshot or HistoricalStage1ConfigSnapshot.from_path(path)
+    if snapshot.source_path != path:
+        raise ValueError("final upstream schema config path does not match exact snapshot")
+    snapshot.verify_source()
+    applied = snapshot.applied_config()
+    forest = applied.architecture.multi_model_forest
+    required_flags = {
+        "bow_discovery_enabled": bool(forest.bow_discovery_enabled),
+        "htr_evidence_enabled": bool(forest.htr_evidence_enabled),
+        "embedding_contrast.enabled": bool(forest.embedding_contrast.enabled),
+        "embedding_contrast.include_cluster_contrast_vectors": bool(
+            forest.embedding_contrast.include_cluster_contrast_vectors
+        ),
+        "matched_pair_uplift_enabled": bool(forest.matched_pair_uplift_enabled),
+        "matched_pair_bow_enabled": bool(forest.matched_pair_bow_enabled),
+        "matched_pair_htr_enabled": bool(forest.matched_pair_htr_enabled),
+    }
+    disabled = sorted(name for name, enabled in required_flags.items() if not enabled)
+    if disabled:
+        raise ValueError(
+            "all-architecture coordinate registry requires enabled Stage-1 paths: "
+            + ", ".join(disabled)
+        )
+    if bool(applied.architecture.htr_freeze_sentence_encoder):
+        raise ValueError(
+            "the all-architecture benchmark requires the HTR sentence encoder to be trainable"
+        )
+    views = tuple(str(view.name).strip() for view in forest.bow_views)
+    query_config = neural_query_config or NeuralQueryAgenticForestConfig()
+    if not isinstance(query_config, NeuralQueryAgenticForestConfig):
+        raise TypeError("neural_query_config must be NeuralQueryAgenticForestConfig")
+    query_config.validate()
+    return build_production_coordinate_preserving_schema(
+        namespace=_FINAL_UPSTREAM_NAMESPACE,
+        bow_view_names=views,
+        source_config_sha256=snapshot.sha256,
+        cluster_max_components=int(forest.embedding_contrast.cluster_contrast_max_components),
+        tfidf_topic_count=int(forest.tfidf_topic.topic_count),
+        max_orphan_features=int(max_orphan_features),
+        neural_query_counts={
+            bank: query_config.query_count(bank) for bank in ("treatment", "outcome", "effect")
+        },
+    )
+
+
 def _validate_review_embedding_cache(
     cache_dir: Path | str,
     *,
@@ -771,36 +1022,87 @@ def _validated_output_path(path: Path | str) -> Path:
     return output
 
 
+def _validated_hierarchical_layout(
+    args: argparse.Namespace,
+    *,
+    output_dir: Path,
+) -> tuple[Path, Path, Path]:
+    """Resolve the separate resumable preparation and stable job-cache roots."""
+
+    if args.hierarchical_preparation_dir is None:
+        raise ValueError("hierarchical discovery requires --hierarchical-preparation-dir")
+    preparation = _validated_output_path(args.hierarchical_preparation_dir)
+    output = output_dir.resolve()
+    if (
+        preparation == output
+        or preparation.is_relative_to(output)
+        or output.is_relative_to(preparation)
+    ):
+        raise ValueError(
+            "--hierarchical-preparation-dir and --output-dir must be separate "
+            "non-nested directories"
+        )
+    requested_cache = args.hierarchical_job_cache_root
+    job_cache_root = _validated_output_path(
+        requested_cache
+        if requested_cache is not None
+        else preparation / _HIERARCHICAL_JOB_CACHE_DIRNAME
+    )
+    if job_cache_root == preparation or not job_cache_root.is_relative_to(preparation):
+        raise ValueError(
+            "--hierarchical-job-cache-root must be a child of " "--hierarchical-preparation-dir"
+        )
+    review_packet_dir = _validated_output_path(
+        args.hierarchical_offline_review_packet_dir
+        if args.hierarchical_offline_review_packet_dir is not None
+        else preparation / "offline_review_packet"
+    )
+    if review_packet_dir.parent != preparation:
+        raise ValueError(
+            "--hierarchical-offline-review-packet-dir must be a direct child of "
+            "--hierarchical-preparation-dir"
+        )
+    if bool(args.prepare_hierarchical_discovery) and review_packet_dir.exists():
+        raise ValueError(
+            "--hierarchical-offline-review-packet-dir must be absent before "
+            "prepare-only immutable persistence"
+        )
+    return preparation, job_cache_root, review_packet_dir
+
+
 def _validate_fresh_review_neural_query_cache(
     path: Path | str,
     *,
-    output_dir: Path,
+    cache_parent: Path,
+    require_empty: bool = True,
+    parent_option: str = "--output-dir",
 ) -> Path:
-    """Bind the executable query cache to one fresh output-local directory.
+    """Bind the executable query cache to one explicit local cache directory.
 
     Unlike the frozen embedding input, this cache contains executable joblib
     checkpoints produced while the adaptive review is running.  It is
-    therefore an output, never an input: an override cannot point at an
-    ancestor, sibling, nested symlink, or previously populated cache tree.
-    Keeping it as a direct child also makes the one permitted pre-created
-    empty directory easy to distinguish from every other pre-existing output.
+    therefore never accepted outside its explicitly selected parent.  Every
+    live invocation uses a fresh output-local directory.  Cross-process
+    hierarchical replay uses separately authenticated read-only overlays,
+    never a previously populated executable neural-query cache.
     """
 
-    output = _validated_output_path(output_dir)
+    parent = _validated_output_path(cache_parent)
     raw = Path(path).expanduser()
     cursor = raw if raw.is_absolute() else Path.cwd() / raw
     while True:
         if cursor.is_symlink():
             raise ValueError("--review-neural-query-cache-dir cannot contain a symlink component")
-        if cursor.resolve() == output or cursor.parent == cursor:
+        if cursor.resolve() == parent or cursor.parent == cursor:
             break
         cursor = cursor.parent
     cache = _validated_output_path(raw)
-    if cache.parent != output:
+    if cache.parent != parent:
         raise ValueError(
-            "--review-neural-query-cache-dir must be a direct child of the fresh " "--output-dir"
+            "--review-neural-query-cache-dir must be a direct child of "
+            f"{'the fresh ' if parent_option == '--output-dir' else ''}{parent_option}"
         )
-    if cache.exists() and any(cache.iterdir()):
+    if require_empty and cache.exists() and any(cache.iterdir()):
         raise ValueError(
             "--review-neural-query-cache-dir must be nonexistent or empty; "
             "pre-populated executable checkpoints are forbidden"
@@ -952,6 +1254,7 @@ def parse_neural_query_moment_artifact_registrations(
 def validate_benchmark_inputs(args: argparse.Namespace) -> ValidatedBenchmarkInputs:
     """Authenticate input structure without constructing remote dependencies."""
 
+    _validate_discovery_cli_mode(args)
     benchmark = str(args.benchmark_name or "").strip()
     if not _BENCHMARK_NAME.fullmatch(benchmark):
         raise ValueError("--benchmark-name must use only letters, numbers, '.', '_' or '-'")
@@ -988,6 +1291,24 @@ def validate_benchmark_inputs(args: argparse.Namespace) -> ValidatedBenchmarkInp
         raise ValueError("--read-only-context-fit-cache-index requires post-extraction review")
     orphan_artifacts = parse_orphan_ngram_artifact_registrations(args.orphan_ngram_artifact)
     output_dir = _validated_output_path(args.output_dir)
+    hierarchical = str(args.discovery_mode) == _HIERARCHICAL_DISCOVERY_MODE
+    hierarchical_preparation_dir: Path | None = None
+    hierarchical_job_cache_root: Path | None = None
+    hierarchical_offline_review_packet_dir: Path | None = None
+    if hierarchical:
+        (
+            hierarchical_preparation_dir,
+            hierarchical_job_cache_root,
+            hierarchical_offline_review_packet_dir,
+        ) = _validated_hierarchical_layout(args, output_dir=output_dir)
+    historical_discovery_prompt = _authenticated_prompt_registration(
+        args.historical_discovery_prompt,
+        label="historical discovery prompt",
+    )
+    old_hierarchy_prompt = _authenticated_prompt_registration(
+        args.old_hierarchy_prompt,
+        label="old hierarchy prompt",
+    )
     review_stage1_config_path = None
     review_embedding_cache_dir = None
     review_neural_query_cache_dir = None
@@ -999,7 +1320,9 @@ def validate_benchmark_inputs(args: argparse.Namespace) -> ValidatedBenchmarkInp
         )
         review_neural_query_cache_dir = _validate_fresh_review_neural_query_cache(
             requested_query_cache,
-            output_dir=output_dir,
+            cache_parent=output_dir,
+            require_empty=True,
+            parent_option="--output-dir",
         )
         _validate_fresh_benchmark_output(
             output_dir,
@@ -1012,7 +1335,7 @@ def validate_benchmark_inputs(args: argparse.Namespace) -> ValidatedBenchmarkInp
         # Parse and validate any closed query override during dry-run, before
         # a service or model-bearing backend can be constructed.
         review_query_config = build_review_neural_query_config(args)
-        build_final_upstream_schema_config(
+        build_coordinate_preserving_final_upstream_schema_config(
             review_stage1_config_path,
             neural_query_config=review_query_config,
         )
@@ -1109,6 +1432,11 @@ def validate_benchmark_inputs(args: argparse.Namespace) -> ValidatedBenchmarkInp
         review_neural_query_cache_dir=review_neural_query_cache_dir,
         authenticated_review_spent_cache_sources=review_spent_cache_sources,
         authenticated_context_fit_cache_sources=context_fit_cache_sources,
+        hierarchical_preparation_dir=hierarchical_preparation_dir,
+        hierarchical_job_cache_root=hierarchical_job_cache_root,
+        hierarchical_offline_review_packet_dir=hierarchical_offline_review_packet_dir,
+        historical_discovery_prompt=historical_discovery_prompt,
+        old_hierarchy_prompt=old_hierarchy_prompt,
     )
 
 
@@ -1139,6 +1467,7 @@ def _dry_run_summary(
     validated: ValidatedBenchmarkInputs,
 ) -> dict[str, Any]:
     review_enabled = int(args.post_extraction_review_rounds) > 0
+    hierarchical = str(args.discovery_mode) == _HIERARCHICAL_DISCOVERY_MODE
     if not review_enabled:
         raise ValueError(
             "the v24 benchmark requires adaptive post-extraction review and the "
@@ -1146,11 +1475,16 @@ def _dry_run_summary(
         )
     review_query_config = build_review_neural_query_config(args) if review_enabled else None
     final_schema = (
-        build_final_upstream_schema_config(
+        build_coordinate_preserving_final_upstream_schema_config(
             validated.review_stage1_config_path,
             neural_query_config=review_query_config,
         )
         if review_enabled and validated.review_stage1_config_path is not None
+        else None
+    )
+    final_registry_audit = (
+        production_coordinate_preserving_registry_audit(final_schema)
+        if final_schema is not None
         else None
     )
     sparse_query_fallback_enabled = False
@@ -1162,6 +1496,16 @@ def _dry_run_summary(
         graph=tfidf_graph,
         selection=tfidf_graph_selection,
     )
+    hierarchical_config = build_hierarchical_discovery_config(args) if hierarchical else None
+    review_policy = build_frozen_review_evidence_policy(args) if hierarchical else None
+    per_fold_job_cache_roots = (
+        {
+            str(fold): str(validated.hierarchical_job_cache_root / f"outer_fold_{fold:03d}")
+            for fold in validated.outer_folds
+        }
+        if hierarchical and validated.hierarchical_job_cache_root is not None
+        else {}
+    )
     return {
         "status": "validated_dry_run",
         "source_text_temporal_policy": source_text_temporal_policy_audit(),
@@ -1171,7 +1515,101 @@ def _dry_run_summary(
         "outer_folds": list(validated.outer_folds),
         "remote_endpoint_pool": validate_remote_endpoint_pool(args.endpoint),
         "remote_model": str(args.model),
-        "proposal_provider": "openai_compatible_remote",
+        "discovery_mode": str(args.discovery_mode),
+        "benchmark_default_discovery_mode": _HIERARCHICAL_DISCOVERY_MODE,
+        "initial_discovery_agent": (
+            "OpenAICompatibleJsonDiscoveryJobRunner"
+            if hierarchical
+            else "StagedAllEvidenceFusionAgent_legacy_test_only"
+        ),
+        "legacy_staged_initial_discovery_active": not hierarchical,
+        "hierarchical_architecture_at_a_time": hierarchical,
+        "hierarchical_all_active_stage1_architectures_required": hierarchical,
+        "hierarchical_prepare_only_requested": bool(args.prepare_hierarchical_discovery),
+        "hierarchical_approved_batch_sha256_supplied": bool(
+            args.hierarchical_approved_batch_sha256
+        ),
+        "hierarchical_preparation_dir": (
+            str(validated.hierarchical_preparation_dir) if hierarchical else None
+        ),
+        "hierarchical_job_cache_root": (
+            str(validated.hierarchical_job_cache_root) if hierarchical else None
+        ),
+        "hierarchical_offline_review_packet_dir": (
+            str(validated.hierarchical_offline_review_packet_dir) if hierarchical else None
+        ),
+        "historical_discovery_prompt_registration": (
+            {
+                "path": str(validated.historical_discovery_prompt.path),
+                "sha256": validated.historical_discovery_prompt.expected_sha256,
+            }
+            if validated.historical_discovery_prompt is not None
+            else None
+        ),
+        "old_hierarchy_prompt_registration": (
+            {
+                "path": str(validated.old_hierarchy_prompt.path),
+                "sha256": validated.old_hierarchy_prompt.expected_sha256,
+            }
+            if validated.old_hierarchy_prompt is not None
+            else None
+        ),
+        "hierarchical_per_fold_job_cache_roots": per_fold_job_cache_roots,
+        "hierarchical_preparation_scratch_output_dir": (
+            str(validated.output_dir) if hierarchical else None
+        ),
+        "hierarchical_provider_writable_caches_output_local": hierarchical,
+        "hierarchical_cross_process_provider_replay_requires_authenticated_overlays": (
+            hierarchical
+        ),
+        "hierarchical_fresh_executable_neural_query_cache_required": hierarchical,
+        "hierarchical_discovery_config": (
+            hierarchical_config.as_dict() if hierarchical_config is not None else None
+        ),
+        "hierarchical_architecture_chunk_limits": (
+            {
+                "max_atoms_per_chunk": int(args.hierarchical_max_atoms_per_chunk),
+                "max_bytes_per_chunk": int(args.hierarchical_max_bytes_per_chunk),
+                "max_semantic_member_ids_per_chunk": int(
+                    args.hierarchical_max_semantic_member_ids_per_chunk
+                ),
+            }
+            if hierarchical
+            else None
+        ),
+        "hierarchical_review_evidence_policy": (
+            review_policy.as_dict() if review_policy is not None else None
+        ),
+        "hierarchical_runner_schema_version": (
+            OPENAI_JSON_DISCOVERY_RUNNER_VERSION if hierarchical else None
+        ),
+        "hierarchical_runner_temperature": 0 if hierarchical else None,
+        "hierarchical_runner_response_format": (
+            "strict_json_schema_from_authenticated_discovery_job_v1" if hierarchical else None
+        ),
+        "hierarchical_runner_explicit_model_no_autodiscovery": hierarchical,
+        "hierarchical_runner_max_tokens": (int(args.proposal_max_tokens) if hierarchical else None),
+        "hierarchical_runner_request_timeout": (
+            float(args.request_timeout) if hierarchical else None
+        ),
+        "hierarchical_runner_max_retries": (
+            int(args.request_max_retries) if hierarchical else None
+        ),
+        "hierarchical_selector_thinking_enabled": hierarchical,
+        "hierarchical_selector_thinking_token_budget": (
+            _FUSION_THINKING_TOKEN_BUDGET if hierarchical else None
+        ),
+        "hierarchical_extraction_definition_thinking_enabled": False,
+        "hierarchical_extraction_definition_thinking_token_budget_field": "omitted",
+        "hierarchical_max_rendered_prompt_bytes": (
+            MAX_RENDERED_DISCOVERY_PROMPT_BYTES if hierarchical else None
+        ),
+        "hierarchical_json_runner_constructed": False,
+        "proposal_provider": (
+            "openai_compatible_strict_json_hierarchy"
+            if hierarchical
+            else "openai_compatible_remote_legacy_staged"
+        ),
         "fusion_enable_thinking": _FUSION_ENABLE_THINKING,
         "fusion_max_tokens": int(args.proposal_max_tokens),
         "fusion_thinking_token_budget": _FUSION_THINKING_TOKEN_BUDGET,
@@ -1257,8 +1695,14 @@ def _dry_run_summary(
         "final_upstream_schema_namespace": (
             final_schema.namespace if final_schema is not None else None
         ),
-        "final_upstream_signed_order_width": (
-            _FINAL_UPSTREAM_SIGNED_ORDER_WIDTH if final_schema is not None else None
+        "final_upstream_signed_order_width": (None),
+        "final_upstream_volatile_signed_order_widths": (
+            {
+                f"{item.source_kind}::{item.consumer_role}": item.signed_order_width
+                for item in final_schema.volatile_raw_families
+            }
+            if final_schema is not None
+            else {}
         ),
         "final_upstream_neural_query_signed_order_widths": (
             {
@@ -1274,16 +1718,25 @@ def _dry_run_summary(
             else []
         ),
         "final_upstream_raw_family_roles": (
-            [item.identity() for item in final_schema.raw_families]
+            [item.identity() for item in final_schema.volatile_raw_families]
             if final_schema is not None
             else []
         ),
         "final_upstream_raw_family_role_count": (
-            len(final_schema.raw_families) if final_schema is not None else 0
+            len(final_schema.volatile_raw_families) if final_schema is not None else 0
+        ),
+        "final_upstream_named_raw_coordinates": (
+            [item.identity() for item in final_schema.named_raw_coordinates]
+            if final_schema is not None
+            else []
+        ),
+        "final_upstream_named_raw_coordinate_count": (
+            len(final_schema.named_raw_coordinates) if final_schema is not None else 0
         ),
         "final_upstream_raw_column_count": (
             len(final_schema.raw_output_schema()) if final_schema is not None else 0
         ),
+        "final_upstream_coordinate_registry": final_registry_audit,
         "modifier_interactions_only_required_for_final_upstream": review_enabled,
         "modifier_interactions_only": bool(args.modifier_interactions_only),
         "neural_query_moments_required": (
@@ -1324,8 +1777,112 @@ def _dry_run_summary(
         "read_only_cache_index_count": len(validated.cache_index_paths),
         "explicit_orphan_artifact_folds": sorted(validated.orphan_ngram_artifacts_by_fold),
         "clients_constructed": False,
+        "remote_calls_made": False,
         "oracle_columns_read": False,
     }
+
+
+def _persist_hierarchical_offline_review_packet(
+    *,
+    prepared: Any,
+    validated: ValidatedBenchmarkInputs,
+) -> tuple[Any, Any]:
+    """Compose the mandatory human-review packet from one real prepared fold."""
+
+    if (
+        validated.historical_discovery_prompt is None
+        or validated.old_hierarchy_prompt is None
+        or validated.hierarchical_offline_review_packet_dir is None
+    ):
+        raise RuntimeError("validated prepare-only comparison artifacts are incomplete")
+    folds = tuple(prepared.folds)
+    if not folds:
+        raise RuntimeError("prepared hierarchy contains no outer fold for offline review")
+    representative = folds[0]
+    atoms = tuple(representative.catalog.atoms)
+    if not atoms:
+        raise RuntimeError("representative prepared fold has no evidence atoms")
+    atom = atoms[0]
+    evidence = atom.as_discovery_item()
+    extraction_preview = build_offline_extraction_definition_prompt_preview(
+        canonical_name=f"preview_{atom.source_family}_supported_concept",
+        evidence=(evidence,),
+        supporting_evidence_ids=(evidence.evidence_id,),
+        value_shape_hypothesis="ambiguous",
+    )
+    packet = compose_offline_hierarchical_discovery_review_packet(
+        batch_precommit=prepared.coordinator.precommit,
+        representative_outer_fold=representative.outer_fold,
+        representative_family=atom.source_family,
+        extraction_definition_preview=extraction_preview,
+        extraction_preview_outer_fold=representative.outer_fold,
+        historical_prompt=validated.historical_discovery_prompt,
+        old_hierarchy_prompt=validated.old_hierarchy_prompt,
+    )
+    if packet.approval_ready is not True:
+        raise RuntimeError("offline hierarchical review packet is not approval-ready")
+    persisted = packet.persist(
+        preparation_directory=validated.hierarchical_offline_review_packet_dir
+    )
+    persisted.validate_authentication()
+    return packet, persisted
+
+
+def _prepared_review_spent_cache_registrations(
+    *,
+    validated: ValidatedBenchmarkInputs,
+    expected_fold_count: int,
+) -> tuple[str, ...]:
+    """Authenticate the fold-local spent caches exported by preparation."""
+
+    root = validated.output_dir / "post_extraction_review_spent_evidence_cache"
+    if not root.is_dir():
+        raise RuntimeError("prepare-only did not materialize the spent-evidence cache root")
+    paths = tuple(
+        sorted(
+            (
+                path
+                for path in root.iterdir()
+                if path.is_file() and not path.is_symlink() and path.suffix == ".json"
+            ),
+            key=lambda path: path.name,
+        )
+    )
+    registrations = tuple(f"{path}::{sha256_file(path)}" for path in paths)
+    authenticated = authenticate_review_spent_cache_registrations(registrations)
+    if len(authenticated) != expected_fold_count:
+        raise RuntimeError(
+            "prepare-only must export exactly one authenticated initial-spent cache "
+            "per outer fold"
+        )
+    return registrations
+
+
+def _approval_preserving_review_spent_cache_registrations(
+    validated: ValidatedBenchmarkInputs,
+) -> tuple[str, ...]:
+    """Render the exact spent-cache sources already bound into preparation."""
+
+    return tuple(
+        f"{source.source_path}::{source.registered_sha256}"
+        for source in validated.authenticated_review_spent_cache_sources
+    )
+
+
+def _approval_preserving_context_fit_cache_registrations(
+    validated: ValidatedBenchmarkInputs,
+) -> tuple[str, ...]:
+    """Render the exact context-cache indexes already bound into preparation."""
+
+    registrations: list[str] = []
+    seen: set[tuple[Path, str]] = set()
+    for source in validated.authenticated_context_fit_cache_sources:
+        key = (Path(source.index_path), str(source.index_sha256))
+        if key in seen:
+            continue
+        seen.add(key)
+        registrations.append(f"{key[0]}::{key[1]}")
+    return tuple(registrations)
 
 
 def run_benchmark(args: argparse.Namespace) -> Mapping[str, Any]:
@@ -1334,16 +1891,38 @@ def run_benchmark(args: argparse.Namespace) -> Mapping[str, Any]:
     validated = validate_benchmark_inputs(args)
     if bool(args.dry_run):
         return _dry_run_summary(args, validated)
+    hierarchical = str(args.discovery_mode) == _HIERARCHICAL_DISCOVERY_MODE
+    if (
+        hierarchical
+        and not bool(args.prepare_hierarchical_discovery)
+        and args.hierarchical_approved_batch_sha256 is None
+    ):
+        raise ValueError(
+            "hierarchical execution requires the exact "
+            "--hierarchical-approved-batch-sha256 printed by prepare-only mode"
+        )
     tfidf_graph, tfidf_graph_selection = _select_tfidf_context_backend_graph(
         validated.authenticated_context_fit_cache_sources
     )
 
     agent_config = build_agent_config(args)
     base_agent = OpenAICompatibleFeatureSearchAgent(agent_config)
-    fusion_agent = StagedAllEvidenceFusionAgent(
-        base_agent,
-        final_max_candidates=int(args.max_candidates),
-    )
+    hierarchical_runner = None
+    if hierarchical:
+        hierarchical_runner = OpenAICompatibleJsonDiscoveryJobRunner(
+            server_urls=validate_remote_endpoint_pool(args.endpoint),
+            model_name=str(args.model),
+            api_key=str(args.api_key),
+            request_timeout=float(args.request_timeout),
+            max_retries=int(args.request_max_retries),
+            max_tokens=int(args.proposal_max_tokens),
+        )
+        fusion_agent = None
+    else:
+        fusion_agent = StagedAllEvidenceFusionAgent(
+            base_agent,
+            final_max_candidates=int(args.max_candidates),
+        )
 
     applied_config = build_applied_inference_config(args, vllm_mode=_SERVER_MODE)
     if applied_config.explicit_features.vllm_mode != _SERVER_MODE:
@@ -1359,9 +1938,12 @@ def run_benchmark(args: argparse.Namespace) -> Mapping[str, Any]:
             "honest final causal forest"
         )
     review_spent_evidence_provider = None
+    raw_review_spent_evidence_provider = None
     review_gate_provider = None
+    raw_review_gate_provider = None
     final_upstream_producer = None
     raw_final_upstream_producer = None
+    coordinate_preserving_nuisance_view_names: tuple[str, ...] | None = None
     if review_rounds > 0:
         if (
             validated.review_stage1_config_path is None
@@ -1373,6 +1955,9 @@ def run_benchmark(args: argparse.Namespace) -> Mapping[str, Any]:
             validated.review_stage1_config_path
         )
         htr_config = stage1_config_snapshot.applied_config()
+        coordinate_preserving_nuisance_view_names = tuple(
+            str(view.name).strip() for view in htr_config.architecture.multi_model_forest.bow_views
+        )
         htr_model_snapshot = PrivateHTRModelTreeSnapshot(_resolve_htr_model_path(htr_config))
         shared_embedding_cache = SpentOnlyFrozenChunkEmbeddingCache(
             validated.review_embedding_cache_dir
@@ -1405,6 +1990,7 @@ def run_benchmark(args: argparse.Namespace) -> Mapping[str, Any]:
             stage1_config_path=validated.review_stage1_config_path,
             stage1_config_snapshot=stage1_config_snapshot,
             outcome_type=applied_config.outcome_type,
+            max_orphan_features=_FINAL_UPSTREAM_MAX_ORPHAN_FEATURES,
         )
         # Context-fit run attestations select their exact historical graph.
         # With no such source, prefer the current wrapped graph; a spent-only
@@ -1418,7 +2004,7 @@ def run_benchmark(args: argparse.Namespace) -> Mapping[str, Any]:
             tfidf_context_backend = shared_tfidf.context_backend
         elif tfidf_graph != UNWRAPPED_TFIDF_RUNTIME_GRAPH_ID:
             raise RuntimeError("selected an unsupported TF-IDF context backend graph")
-        review_spent_evidence_provider = ContextFitReviewSpentEvidenceProvider(
+        raw_review_spent_evidence_provider = ContextFitReviewSpentEvidenceProvider(
             backends=(
                 HistoricalStage1SpentDiscoveryBackend(
                     dataset_path=validated.dataset_path,
@@ -1437,6 +2023,7 @@ def run_benchmark(args: argparse.Namespace) -> Mapping[str, Any]:
             cache_dir=validated.output_dir / "post_extraction_review_spent_evidence_cache",
             required_source_families=tuple(sorted(_REQUIRED_REVIEW_DISCOVERY_FAMILIES)),
         )
+        review_spent_evidence_provider = raw_review_spent_evidence_provider
         if validated.authenticated_review_spent_cache_sources:
             review_spent_evidence_provider = AuthenticatedReviewSpentEvidenceCacheOverlay(
                 provider=review_spent_evidence_provider,
@@ -1460,12 +2047,13 @@ def run_benchmark(args: argparse.Namespace) -> Mapping[str, Any]:
                 NeuralQueryContextBackend(query_service),
             )
         )
-        stable_review_backend = CrossFitStableUpstreamBackend(
+        stable_review_backend = CoordinatePreservingContextFitUpstreamBackend(
             review_backend,
-            config=build_final_upstream_schema_config(
+            config=build_coordinate_preserving_final_upstream_schema_config(
                 validated.review_stage1_config_path,
                 stage1_config_snapshot=stage1_config_snapshot,
                 neural_query_config=review_query_config,
+                max_orphan_features=_FINAL_UPSTREAM_MAX_ORPHAN_FEATURES,
             ),
         )
         raw_review_gate_provider = ContextFitUpstreamGateProvider(
@@ -1480,12 +2068,15 @@ def run_benchmark(args: argparse.Namespace) -> Mapping[str, Any]:
         final_upstream_producer = raw_final_upstream_producer
         context_fit_sources = validated.authenticated_context_fit_cache_sources
         if any(source.kind == "review_gate" for source in context_fit_sources):
-            review_gate_provider = AuthenticatedContextFitGateCacheOverlay(
-                provider=raw_review_gate_provider,
-                runtime_producer=raw_final_upstream_producer,
-                sources=context_fit_sources,
-                output_root=validated.output_dir,
-            )
+            overlay_kwargs = {
+                "provider": raw_review_gate_provider,
+                "runtime_producer": raw_final_upstream_producer,
+                "sources": context_fit_sources,
+                "output_root": validated.output_dir,
+            }
+            if hierarchical:
+                overlay_kwargs["hierarchical_first_gate_preparation"] = True
+            review_gate_provider = AuthenticatedContextFitGateCacheOverlay(**overlay_kwargs)
         if any(source.kind == "final_upstream" for source in context_fit_sources):
             final_upstream_producer = AuthenticatedFinalContextFitCacheOverlay(
                 producer=raw_final_upstream_producer,
@@ -1525,9 +2116,31 @@ def run_benchmark(args: argparse.Namespace) -> Mapping[str, Any]:
         review_gate_feature_bank_provider=review_gate_provider,
         final_upstream_producer=final_upstream_producer,
         raw_final_upstream_producer=raw_final_upstream_producer,
+        coordinate_preserving_nuisance_view_names=(coordinate_preserving_nuisance_view_names),
         legacy_primary_predictions_path=validated.primary_splits_path,
         tfidf_orphan_artifacts_by_fold=validated.orphan_ngram_artifacts_by_fold,
         cache_overlay=overlay,
+        hierarchical_discovery_runner=hierarchical_runner,
+        hierarchical_discovery_config=(
+            build_hierarchical_discovery_config(args) if hierarchical else None
+        ),
+        hierarchical_discovery_job_cache_root=(
+            validated.hierarchical_job_cache_root if hierarchical else None
+        ),
+        hierarchical_discovery_approved_batch_sha256=(
+            args.hierarchical_approved_batch_sha256 if hierarchical else None
+        ),
+        hierarchical_review_evidence_policy=(
+            build_frozen_review_evidence_policy(args) if hierarchical else None
+        ),
+        hierarchical_preparation_dir=(
+            validated.hierarchical_preparation_dir if hierarchical else None
+        ),
+        hierarchical_max_atoms_per_chunk=int(args.hierarchical_max_atoms_per_chunk),
+        hierarchical_max_bytes_per_chunk=int(args.hierarchical_max_bytes_per_chunk),
+        hierarchical_max_semantic_member_ids_per_chunk=int(
+            args.hierarchical_max_semantic_member_ids_per_chunk
+        ),
         config=AllEvidenceFusionRunnerConfig(
             text_column=applied_config.text_column,
             treatment_column=applied_config.treatment_column,
@@ -1576,11 +2189,138 @@ def run_benchmark(args: argparse.Namespace) -> Mapping[str, Any]:
         ),
     )
 
+    if bool(args.prepare_hierarchical_discovery):
+        if not hierarchical or hierarchical_runner is None:  # pragma: no cover - mode guard
+            raise RuntimeError("prepare-only mode escaped the hierarchical boundary")
+        prepared = runner.prepare_hierarchical_discovery_batch()
+        if hierarchical_runner.execution_metadata:
+            raise RuntimeError("prepare-only mode executed a hierarchical JSON job")
+        if getattr(hierarchical_runner, "_pool", None) is not None:
+            raise RuntimeError("prepare-only mode constructed an OpenAI client pool")
+        if (
+            getattr(base_agent, "_client", None) is not None
+            or getattr(base_agent, "_client_pool", None) is not None
+        ):
+            raise RuntimeError("prepare-only mode constructed a review-agent client")
+        review_packet, persisted_review = _persist_hierarchical_offline_review_packet(
+            prepared=prepared,
+            validated=validated,
+        )
+        spent_cache_registrations = _prepared_review_spent_cache_registrations(
+            validated=validated,
+            expected_fold_count=len(prepared.folds),
+        )
+        if len(spent_cache_registrations) != len(prepared.folds):
+            raise RuntimeError("preparation must retain exactly one spent cache per fold")
+        # Approval binds the exact authenticated input overlays, including
+        # their source paths and source count.  Newly copied output-local cache
+        # files are useful inputs to a *new* preparation, but substituting them
+        # into execution changes the provider identity and invalidates the
+        # approved batch before any remote call.
+        authoritative_spent_registrations = _approval_preserving_review_spent_cache_registrations(
+            validated
+        )
+        authoritative_context_registrations = _approval_preserving_context_fit_cache_registrations(
+            validated
+        )
+        return {
+            "status": "hierarchical_discovery_prepared_awaiting_approval",
+            "benchmark_name": str(args.benchmark_name),
+            "approval_sha256": prepared.approval_sha256,
+            "batch_packet_path": str(prepared.batch_packet_path),
+            "input_manifest_path": str(prepared.input_manifest_path),
+            "input_manifest_sha256": prepared.input_manifest_sha256,
+            "dataset_sha256": prepared.dataset_sha256,
+            "context_fit_overlay_companion_path": str(prepared.context_fit_overlay_companion_path),
+            "context_fit_overlay_companion_sha256": (prepared.context_fit_overlay_companion_sha256),
+            "first_gate_materialization_intent_index_path": str(
+                prepared.first_gate_materialization_intent_index_path
+            ),
+            "first_gate_materialization_intent_index_sha256": (
+                prepared.first_gate_materialization_intent_index_sha256
+            ),
+            "first_gate_context_fit_cache_registration": None,
+            "first_gate_numerical_materialization_deferred": True,
+            "review_spent_evidence_cache_registrations": list(spent_cache_registrations),
+            "new_preparation_review_spent_registrations": list(spent_cache_registrations),
+            "hierarchical_preparation_cache_replay_exported": False,
+            "hierarchical_preparation_cache_replay_registration": None,
+            "authoritative_replay_review_spent_registrations": list(
+                authoritative_spent_registrations
+            ),
+            "authoritative_replay_context_fit_index_registration": None,
+            "authoritative_execution_review_spent_registrations": list(
+                authoritative_spent_registrations
+            ),
+            "authoritative_execution_context_fit_index_registrations": list(
+                authoritative_context_registrations
+            ),
+            "authoritative_execution_replay_arguments": [
+                *(
+                    "--read-only-review-spent-evidence-cache=" + registration
+                    for registration in authoritative_spent_registrations
+                ),
+                *(
+                    "--read-only-context-fit-cache-index=" + registration
+                    for registration in authoritative_context_registrations
+                ),
+            ],
+            "next_authenticated_provider_replay_arguments": [
+                *(
+                    "--read-only-review-spent-evidence-cache=" + registration
+                    for registration in spent_cache_registrations
+                ),
+            ],
+            "new_preparation_replay_arguments": [
+                *(
+                    "--read-only-review-spent-evidence-cache=" + registration
+                    for registration in spent_cache_registrations
+                ),
+            ],
+            "hierarchical_preparation_dir": str(validated.hierarchical_preparation_dir),
+            "hierarchical_job_cache_root": str(validated.hierarchical_job_cache_root),
+            "hierarchical_per_fold_job_cache_roots": {
+                str(fold.outer_fold): str(
+                    validated.hierarchical_job_cache_root / f"outer_fold_{fold.outer_fold:03d}"
+                )
+                for fold in prepared.folds
+            },
+            "next_execution_argument": (
+                "--hierarchical-approved-batch-sha256=" + prepared.approval_sha256
+            ),
+            "offline_review_packet_approval_ready": review_packet.approval_ready,
+            "offline_review_packet_sha256": review_packet.packet_sha256,
+            "offline_review_packet_json_path": str(persisted_review.packet_json_path),
+            "offline_review_packet_json_sha256": (persisted_review.packet_json_sha256),
+            "offline_review_packet_markdown_path": str(persisted_review.packet_markdown_path),
+            "offline_review_packet_markdown_sha256": (persisted_review.packet_markdown_sha256),
+            "offline_review_packet_manifest_path": str(persisted_review.manifest_path),
+            "offline_review_packet_manifest_sha256": (persisted_review.manifest_sha256),
+            "remote_execution_authorized_by_review_packet": False,
+            "remote_clients_constructed": False,
+            "remote_calls_made": False,
+            "hierarchical_json_jobs_executed": 0,
+            "preparation_scratch_output_dir": str(validated.output_dir),
+            "preparation_scratch_local_caches_materialized": (
+                validated.output_dir.exists() and any(validated.output_dir.iterdir())
+            ),
+            "predictions_written": False,
+            "final_run_manifest_written": False,
+            "execution_requires_fresh_output_dir": True,
+            "cross_process_provider_replay_requires_authenticated_read_only_overlays": True,
+            "first_gate_context_fit_replay_required_before_approval": False,
+            "oracle_columns_read": False,
+        }
+
     # This call must finish and freeze oracle-free predictions before the
     # evaluation flag can cause any oracle column to be read.
     result: AllEvidenceFusionRunResult = runner.run()
     response: dict[str, Any] = {
         "status": "completed",
+        "discovery_mode": str(args.discovery_mode),
+        "hierarchical_batch_approval_sha256": (
+            args.hierarchical_approved_batch_sha256 if hierarchical else None
+        ),
         "source_text_temporal_policy": source_text_temporal_policy_audit(),
         "benchmark_name": str(args.benchmark_name),
         "prediction_path": str(result.prediction_path),
@@ -1628,6 +2368,16 @@ def run_benchmark(args: argparse.Namespace) -> Mapping[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--benchmark-name", "--benchmark", required=True)
+    parser.add_argument(
+        "--discovery-mode",
+        choices=(_HIERARCHICAL_DISCOVERY_MODE, _LEGACY_STAGED_DISCOVERY_MODE),
+        default=_HIERARCHICAL_DISCOVERY_MODE,
+        help=(
+            "Initial feature discovery mode. Production defaults to the "
+            "architecture-at-a-time hierarchy; the staged mode exists only for "
+            "legacy tests and historical ablations."
+        ),
+    )
     parser.add_argument("--dataset", required=True, type=Path)
     parser.add_argument("--legacy-handoff", required=True, type=Path)
     parser.add_argument(
@@ -1638,6 +2388,67 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--primary-splits", required=True, type=Path)
     parser.add_argument("--output-dir", "--output", required=True, type=Path)
+    parser.add_argument(
+        "--hierarchical-preparation-dir",
+        type=Path,
+        help=(
+            "Separate non-nested directory for immutable all-fold approval packets "
+            "and resumable hierarchical JSON-job caches. Required in hierarchical mode."
+        ),
+    )
+    parser.add_argument(
+        "--hierarchical-job-cache-root",
+        type=Path,
+        help=(
+            "Stable job-cache root below hierarchical-preparation-dir. Defaults to "
+            "<preparation-dir>/hierarchical_job_cache; each outer fold has a stable "
+            "outer_fold_NNN child."
+        ),
+    )
+    parser.add_argument(
+        "--hierarchical-offline-review-packet-dir",
+        type=Path,
+        help=(
+            "Fresh direct child of hierarchical-preparation-dir used for immutable "
+            "human-readable and canonical offline review packets. Defaults to "
+            "<preparation-dir>/offline_review_packet."
+        ),
+    )
+    parser.add_argument(
+        "--historical-discovery-prompt",
+        metavar="PATH::SHA256",
+        help=(
+            "Byte-exact historical model-facing prompt and its known SHA-256. "
+            "Required by prepare-only mode; bytes are embedded without normalization."
+        ),
+    )
+    parser.add_argument(
+        "--old-hierarchy-prompt",
+        metavar="PATH::SHA256",
+        help=(
+            "Byte-exact old hierarchy prompt retained only for the prompt-quality "
+            "ablation. Required by prepare-only mode."
+        ),
+    )
+    parser.add_argument(
+        "--prepare-hierarchical-discovery",
+        "--hierarchical-prepare-only",
+        dest="prepare_hierarchical_discovery",
+        action="store_true",
+        help=(
+            "Prepare every fold and write the offline batch approval packet without "
+            "consulting the hierarchy job cache or making a remote call. Use a fresh "
+            "scratch output-dir for local provider caches."
+        ),
+    )
+    parser.add_argument(
+        "--hierarchical-approved-batch-sha256",
+        help=(
+            "Exact approval SHA-256 printed by prepare-only mode. Required for "
+            "hierarchical execution and checked before any hierarchy cache lookup or "
+            "remote JSON job."
+        ),
+    )
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--api-key", default="EMPTY")
@@ -1648,6 +2459,67 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-outer-folds", type=int, default=5)
     parser.add_argument("--interaction-inner-folds", type=int, default=3)
     parser.add_argument("--max-candidates", type=int, default=16)
+    parser.add_argument(
+        "--hierarchical-max-atoms-per-chunk",
+        type=int,
+        default=HIERARCHICAL_DISCOVERY_MAX_ATOMS_PER_INTERPRET_JOB,
+        help="Hard cap on complete semantic evidence atoms in one architecture chunk.",
+    )
+    parser.add_argument(
+        "--hierarchical-max-bytes-per-chunk",
+        type=int,
+        default=DEFAULT_MAX_BYTES_PER_ARCHITECTURE_CHUNK,
+        help="Hard cap on canonical input bytes in one architecture chunk.",
+    )
+    parser.add_argument(
+        "--hierarchical-max-semantic-member-ids-per-chunk",
+        type=int,
+        default=HIERARCHICAL_DISCOVERY_MAX_MEMBERS_PER_INTERPRET_JOB,
+        help=(
+            "Hard cap on semantic member IDs in one architecture chunk; complete atoms "
+            "are never split and an oversized atom is rejected before a model call."
+        ),
+    )
+    parser.add_argument(
+        "--hierarchical-max-cross-architecture-lookback-ids",
+        type=int,
+        default=24,
+    )
+    parser.add_argument(
+        "--hierarchical-max-cross-architecture-lookback-bytes",
+        type=int,
+        default=96_000,
+    )
+    parser.add_argument(
+        "--hierarchical-max-rejection-lookback-ids-per-candidate",
+        type=int,
+        default=24,
+    )
+    parser.add_argument(
+        "--hierarchical-max-extraction-lookback-ids-per-feature",
+        type=int,
+        default=8,
+    )
+    parser.add_argument(
+        "--hierarchical-max-extraction-lookback-bytes-per-feature",
+        type=int,
+        default=96_000,
+    )
+    parser.add_argument(
+        "--hierarchical-max-rejection-lookback-bytes-per-candidate",
+        type=int,
+        default=48_000,
+    )
+    parser.add_argument(
+        "--hierarchical-review-max-evidence-ids",
+        type=int,
+        default=_DEFAULT_FROZEN_REVIEW_MAX_EVIDENCE_IDS,
+    )
+    parser.add_argument(
+        "--hierarchical-review-max-evidence-bytes",
+        type=int,
+        default=_DEFAULT_FROZEN_REVIEW_MAX_EVIDENCE_BYTES,
+    )
     parser.add_argument(
         "--post-extraction-review-rounds",
         type=int,
@@ -1714,7 +2586,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Fresh executable exact-context neural-query cache. It must be a direct "
             "child of output-dir and nonexistent or empty; defaults to a dedicated "
-            "directory under output-dir. Existing checkpoints are never inputs."
+            "directory under output-dir. Existing checkpoints are never inputs; "
+            "cross-process hierarchy runs use authenticated read-only cache overlays."
         ),
     )
     parser.add_argument(
@@ -1873,10 +2746,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
+    "_minimal_historical_applied_config",
     "ValidatedBenchmarkInputs",
     "build_agent_config",
     "build_applied_inference_config",
+    "build_frozen_review_evidence_policy",
     "build_final_upstream_schema_config",
+    "build_hierarchical_discovery_config",
     "build_parser",
     "build_review_neural_query_config",
     "extraction_prompt_cache_identity",

@@ -472,6 +472,14 @@ def fit_in_memory_query_discovery(
 
     return {
         "runtime": NEURAL_QUERY_DISCOVERY_RUNTIME_ID,
+        "fit_input_binding_sha256": parent_binding,
+        "fit_nuisance_output_binding": {
+            "schema_version": "context_fit_neural_query_nuisance_output_binding_v1",
+            "fit_row_ids": list(row_ids),
+            "fit_e_sha256": _stable_hash(fit_e_values.tolist()),
+            "fit_m_sha256": _stable_hash(fit_m_values.tolist()),
+            "heldout_labels_accessed": False,
+        },
         "banks": final_banks,
         "subfold_audit": [
             {key: value for key, value in subfold.items() if key != "banks"}

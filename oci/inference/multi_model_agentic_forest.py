@@ -147,7 +147,7 @@ def _without_oracle_columns(frame: pd.DataFrame) -> pd.DataFrame:
     oracle_columns = [
         column
         for column in frame.columns
-        if str(column).lower().startswith(("true_", "oracle_"))
+        if str(column).lower().startswith(("true_", "oracle_", "ground_truth"))
     ]
     return frame.drop(columns=oracle_columns, errors="ignore")
 
@@ -321,7 +321,7 @@ class MultiModelAgenticForestRunner:
         htr_evidence_provider: Optional[Any] = None,
         resume: bool = True,
     ) -> None:
-        self.dataset = dataset.reset_index(drop=True).copy()
+        self.dataset = _without_oracle_columns(dataset).reset_index(drop=True).copy()
         self.dataset["_oci_row_id"] = np.arange(len(self.dataset), dtype=int)
         self.config = config
         self.output_path = Path(output_path)
@@ -1811,20 +1811,6 @@ class MultiModelAgenticForestRunner:
         loss = metrics["r_loss_mean"]
         if zero is not None and zero > 0 and loss is not None:
             metrics["r_loss_relative_improvement"] = float(1.0 - loss / zero)
-        if "true_ite_prob" in discovery_df.columns:
-            true_ite = discovery_df["true_ite_prob"].to_numpy(dtype=float)
-            metrics["tau_hat_true_ite_corr"] = _safe_corr(tau_hat, true_ite)
-            metrics["pseudo_target_true_ite_corr"] = _safe_corr(pseudo_target, true_ite)
-        if "true_treatment_prob" in discovery_df.columns:
-            metrics["treatment_true_prob_corr"] = _safe_corr(
-                e_hat,
-                discovery_df["true_treatment_prob"].to_numpy(dtype=float),
-            )
-        if "true_outcome_prob" in discovery_df.columns:
-            metrics["outcome_true_prob_corr"] = _safe_corr(
-                m_hat,
-                discovery_df["true_outcome_prob"].to_numpy(dtype=float),
-            )
         return metrics
 
     def _build_agent_context(

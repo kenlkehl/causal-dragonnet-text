@@ -31,7 +31,6 @@ from ..config import (
 from ..models.causal_forest_head import CausalForestHead
 from ..utils.calibration import BinaryProbabilityCalibrator
 from .agentic_attention_variable_forest import (
-    AgenticAttentionVariableForestRunner,
     _EffectNet,
     _NuisanceNet,
     _binary_log_loss_from_logits,
@@ -46,7 +45,6 @@ from .agentic_explicit_feature_forest import (
     _fit_predict_outcome,
     _fit_predict_propensity,
     _r_loss,
-    _safe_corr,
     _safe_roc_auc,
 )
 from .applied_explicit_feature_forest import _hstack_present
@@ -70,9 +68,6 @@ from .multi_model_agentic_forest import (
     _build_evidence_digest_agent_context,
     _clinical_text_examples,
     _compact_multi_model_agent_context,
-    _finite_or_none,
-    _fit_binary_bow_fold,
-    _fit_regression_bow_fold,
     _fit_regressor,
     _htr_effect_metrics,
     _htr_nuisance_metrics,
@@ -245,12 +240,13 @@ class MultiModelForestStage1HTRProvider(MultiModelHTREvidenceProvider):
             e_test=e_test,
             m_test=m_test,
             outer_fold=outer_fold,
-            effect_folds=runner.avf_config.effect_folds,
+            effect_folds=self.config.architecture.multi_model_forest.effect_folds,
             propensity_caliper=propensity_caliper,
             outcome_caliper=outcome_caliper,
             max_controls_per_candidate=max_controls_per_candidate,
             nearest_fallback_controls=nearest_fallback_controls,
             max_attention_pairs=max_attention_pairs,
+            native_capture_sink=getattr(self, "native_pair_capture_sink", None),
         )
 
     def fit_nuisance_inner_ensemble_predict(
@@ -319,6 +315,7 @@ class MultiModelForestStage1HTRProvider(MultiModelHTREvidenceProvider):
                 )
                 e_hat = prop_calibrator.transform(e_raw)
                 e_test = prop_calibrator.transform(e_test_raw)
+                outcome_calibrator = None
                 if runner.config.outcome_type == "continuous":
                     m_hat = m_raw
                     m_test = m_test_raw
@@ -334,6 +331,28 @@ class MultiModelForestStage1HTRProvider(MultiModelHTREvidenceProvider):
                 t = heldout[runner.config.treatment_column].to_numpy(dtype=float)
                 y_resid = y - m_hat
                 t_resid = t - e_hat
+                native_capture = getattr(self, "native_capture_sink", None)
+                if native_capture is not None:
+                    native_capture.record_nuisance_fold(
+                        model=model,
+                        train_df=train_df,
+                        test_df=test_df,
+                        fit_pos=fit_pos,
+                        validation_pos=heldout_pos,
+                        fold=fold,
+                        fit_e_raw=e_fit_raw,
+                        fit_m_raw=m_fit_raw,
+                        validation_e_raw=e_raw,
+                        validation_m_raw=m_raw,
+                        validation_e_hat=e_hat,
+                        validation_m_hat=m_hat,
+                        heldout_e_raw=e_test_raw,
+                        heldout_m_raw=m_test_raw,
+                        heldout_e_hat=e_test,
+                        heldout_m_hat=m_test,
+                        propensity_calibrator=prop_calibrator,
+                        outcome_calibrator=outcome_calibrator,
+                    )
                 fold_attention = runner._attention_evidence(
                     model.extractor,
                     heldout,
@@ -540,7 +559,9 @@ class MultiModelForestStage1HTRProvider(MultiModelHTREvidenceProvider):
                         else:
                             test_tau = _logistic_r_tau_from_delta(
                                 raw_test,
-                                np.clip(test_e, runner.avf_config.e_clip, 1.0 - runner.avf_config.e_clip),
+                                np.clip(
+                                    test_e, runner.avf_config.e_clip, 1.0 - runner.avf_config.e_clip
+                                ),
                                 clip_probability(test_m),
                                 e_clip=runner.avf_config.e_clip,
                             )
@@ -563,9 +584,31 @@ class MultiModelForestStage1HTRProvider(MultiModelHTREvidenceProvider):
                             if effect_objective == "pseudo_outcome_mse"
                             else (y_resid[heldout_pos] - tau_hat * t_resid[heldout_pos]) ** 2
                         )
-                    heldout_r_loss = (
-                        y_resid[heldout_pos] - tau_hat * t_resid[heldout_pos]
-                    ) ** 2
+                    heldout_r_loss = (y_resid[heldout_pos] - tau_hat * t_resid[heldout_pos]) ** 2
+                    native_capture = getattr(self, "native_capture_sink", None)
+                    if native_capture is not None:
+                        native_capture.record_effect_fold(
+                            model=model,
+                            train_df=train_df,
+                            test_df=test_df,
+                            fit_pos=fit_pos,
+                            eligible_fit_pos=eligible_fit_pos,
+                            validation_pos=heldout_pos,
+                            fold=fold,
+                            effect_objective=effect_objective,
+                            treatment=t,
+                            outcome=y,
+                            e_hat=e,
+                            m_hat=m,
+                            validation_raw_effect=raw_effect,
+                            validation_tau=tau_hat,
+                            validation_r_loss=heldout_r_loss,
+                            validation_effect_loss=heldout_effect_loss,
+                            heldout_raw_effect=raw_test,
+                            heldout_tau=test_tau,
+                            r_stage_min_propensity=r_stage_min,
+                            r_stage_max_propensity=r_stage_max,
+                        )
                     fold_attention = runner._attention_evidence(
                         model.extractor,
                         heldout,
@@ -771,8 +814,18 @@ class MultiModelForestStage1Runner:
         num_workers: int = 1,
         embedding_provider: Optional[Any] = None,
         htr_evidence_provider: Optional[Any] = None,
+        bow_native_capture_sink: Optional[Any] = None,
+        htr_native_capture_sink: Optional[Any] = None,
+        matched_pair_native_capture_sink: Optional[Any] = None,
     ) -> None:
-        self.dataset = dataset.reset_index(drop=True).copy()
+        oracle_columns = [
+            column
+            for column in dataset.columns
+            if str(column).lower().startswith(("true_", "oracle_", "ground_truth"))
+        ]
+        self.dataset = (
+            dataset.drop(columns=oracle_columns, errors="ignore").reset_index(drop=True).copy()
+        )
         self.dataset["_oci_row_id"] = np.arange(len(self.dataset), dtype=int)
         self.config = config
         self.output_path = Path(output_path)
@@ -783,6 +836,9 @@ class MultiModelForestStage1Runner:
         self.num_workers = 1 if num_workers is None else int(num_workers)
         self.embedding_provider = embedding_provider
         self.htr_evidence_provider = htr_evidence_provider
+        self.bow_native_capture_sink = bow_native_capture_sink
+        self.htr_native_capture_sink = htr_native_capture_sink
+        self.matched_pair_native_capture_sink = matched_pair_native_capture_sink
         self.nn_config: MultiModelForestConfig = getattr(
             config.architecture,
             "multi_model_forest",
@@ -907,9 +963,7 @@ class MultiModelForestStage1Runner:
                 self.embedding_feature_rows.extend(item["embedding_feature_rows"])
                 self.outer_metric_rows.extend(item["outer_metric_rows"])
                 self.agentic_handoff_rows.extend(item.get("agentic_handoff_rows", []))
-                self.inner_model_evidence_rows.extend(
-                    item.get("inner_model_evidence_rows", [])
-                )
+                self.inner_model_evidence_rows.extend(item.get("inner_model_evidence_rows", []))
         else:
             prediction_frames = []
             for outer_fold, train_idx, test_idx in splits:
@@ -1146,10 +1200,6 @@ class MultiModelForestStage1Runner:
             metrics["outcome_rmse"] = float(np.sqrt(mean_squared_error(y_test, outcome_pred)))
         else:
             metrics["outcome_auroc"] = _safe_roc_auc(y_test, outcome_pred)
-        if "true_ite_prob" in test_df.columns:
-            true_ite = test_df["true_ite_prob"].to_numpy(dtype=float)
-            metrics["oracle_true_ite_corr"] = _safe_corr(true_ite, tau)
-            metrics["oracle_true_ite_mae"] = float(np.mean(np.abs(true_ite - tau)))
         self.outer_metric_rows.append(metrics)
 
         if bundle.handoff_evidence is not None:
@@ -1269,6 +1319,8 @@ class MultiModelForestStage1Runner:
                         "view_index": int(view_index),
                         "e_hat": e_train,
                         "m_hat": m_train,
+                        "e_test": e_test,
+                        "m_test": m_test,
                     }
                 )
                 _append_feature(
@@ -1350,6 +1402,18 @@ class MultiModelForestStage1Runner:
             htr_m_train = htr_train_predictions["m_hat"].to_numpy(dtype=float)
             htr_e_test = htr_test_predictions["e_hat"].to_numpy(dtype=float)
             htr_m_test = htr_test_predictions["m_hat"].to_numpy(dtype=float)
+            if self.htr_native_capture_sink is not None:
+                for name, values, role in (
+                    ("htr_e_fit", htr_e_train, "fit_nuisance"),
+                    ("htr_m_fit", htr_m_train, "fit_nuisance"),
+                    ("htr_e_heldout", htr_e_test, "heldout_nuisance"),
+                    ("htr_m_heldout", htr_m_test, "heldout_nuisance"),
+                ):
+                    self.htr_native_capture_sink.record_scope_output(
+                        name,
+                        values,
+                        role=role,
+                    )
             nuisance_train.append(("htr_nuisance", htr_e_train, htr_m_train))
             nuisance_test.append(("htr_nuisance", htr_e_test, htr_m_test))
             _append_feature(
@@ -1413,9 +1477,7 @@ class MultiModelForestStage1Runner:
             )
 
         if not nuisance_train:
-            raise ValueError(
-                "multi_model_forest Stage 1 requires at least one nuisance source"
-            )
+            raise ValueError("multi_model_forest Stage 1 requires at least one nuisance source")
         e_train = np.nanmean(np.vstack([item[1] for item in nuisance_train]), axis=0)
         m_train = np.nanmean(np.vstack([item[2] for item in nuisance_train]), axis=0)
         e_test = np.nanmean(np.vstack([item[1] for item in nuisance_test]), axis=0)
@@ -1461,6 +1523,64 @@ class MultiModelForestStage1Runner:
                 "target_source": "ensemble_mean_nuisance_inner_ensemble",
             }
         )
+        if self.bow_native_capture_sink is not None:
+            self.bow_native_capture_sink.record_scope_output(
+                "treatment",
+                t,
+                role="fit_label",
+            )
+            self.bow_native_capture_sink.record_scope_output(
+                "outcome",
+                y,
+                role="fit_label",
+            )
+            for source_index, (
+                (source_name, source_e_train, source_m_train),
+                (_test_name, source_e_test, source_m_test),
+            ) in enumerate(zip(nuisance_train, nuisance_test)):
+                if source_name != _test_name:
+                    raise RuntimeError("BoW nuisance train/test source order changed")
+                self.bow_native_capture_sink.record_nuisance_source(
+                    source_index=source_index,
+                    source_name=source_name,
+                    e_fit=source_e_train,
+                    m_fit=source_m_train,
+                    e_heldout=source_e_test,
+                    m_heldout=source_m_test,
+                )
+            for nuisance_view in bow_nuisance_by_view:
+                view_index = int(nuisance_view["view_index"])
+                self.bow_native_capture_sink.record_scope_output(
+                    f"view_{view_index:04d}_e_fit",
+                    nuisance_view["e_hat"],
+                    role="fit_nuisance",
+                )
+                self.bow_native_capture_sink.record_scope_output(
+                    f"view_{view_index:04d}_m_fit",
+                    nuisance_view["m_hat"],
+                    role="fit_nuisance",
+                )
+                self.bow_native_capture_sink.record_scope_output(
+                    f"view_{view_index:04d}_e_heldout",
+                    nuisance_view["e_test"],
+                    role="heldout_nuisance",
+                )
+                self.bow_native_capture_sink.record_scope_output(
+                    f"view_{view_index:04d}_m_heldout",
+                    nuisance_view["m_test"],
+                    role="heldout_nuisance",
+                )
+            for name, values, role in (
+                ("ensemble_e_fit", e_train, "fit_nuisance"),
+                ("ensemble_m_fit", m_train, "fit_nuisance"),
+                ("ensemble_e_heldout", e_test, "heldout_nuisance"),
+                ("ensemble_m_heldout", m_test, "heldout_nuisance"),
+                ("y_residual", y_resid, "fit_residual"),
+                ("t_residual", t_resid, "fit_residual"),
+                ("pseudo_target", pseudo_target, "fit_pseudo_target"),
+                ("r_weight", r_weight, "fit_weight"),
+            ):
+                self.bow_native_capture_sink.record_scope_output(name, values, role=role)
         prediction_frames.append(
             _source_prediction_frame(
                 train_df,
@@ -1473,6 +1593,21 @@ class MultiModelForestStage1Runner:
                 },
             )
         )
+
+        if self.matched_pair_native_capture_sink is not None:
+            if not self._matched_pair_bow_enabled() or not self._matched_pair_htr_enabled():
+                raise RuntimeError(
+                    "native matched-pair proof requires both genuine BoW and HTR "
+                    "matched-pair subproducers"
+                )
+            self.matched_pair_native_capture_sink.record_scope_inputs(
+                treatment=t,
+                outcome=y,
+                e_fit=e_train,
+                m_fit=m_train,
+                e_heldout=e_test,
+                m_heldout=m_test,
+            )
 
         bow_pair_uplift_results: List[Dict[str, Any]] = []
         if self._matched_pair_bow_enabled():
@@ -1495,9 +1630,7 @@ class MultiModelForestStage1Runner:
                         view_name=view.name,
                         view_index=view_index,
                         effect_folds=int(self.nn_config.effect_folds),
-                        propensity_caliper=float(
-                            self.nn_config.matched_pair_propensity_caliper
-                        ),
+                        propensity_caliper=float(self.nn_config.matched_pair_propensity_caliper),
                         outcome_caliper=float(self.nn_config.matched_pair_outcome_caliper),
                         max_controls_per_candidate=int(
                             self.nn_config.matched_pair_max_controls_per_candidate
@@ -1508,8 +1641,13 @@ class MultiModelForestStage1Runner:
                         l2_alpha=float(self.nn_config.matched_pair_bow_l2_alpha),
                         max_iter=int(self.nn_config.matched_pair_bow_max_iter),
                         top_n=int(self.nn_config.top_n_features),
+                        native_capture_sink=self.matched_pair_native_capture_sink,
                     )
                 except Exception as exc:
+                    if self.matched_pair_native_capture_sink is not None:
+                        raise RuntimeError(
+                            "native matched-pair BoW proof capture failed closed"
+                        ) from exc
                     logger.exception(
                         "Outer fold %s BoW matched-pair uplift failed for view=%s: %s",
                         outer_fold,
@@ -1560,9 +1698,9 @@ class MultiModelForestStage1Runner:
                     provenance="inner_oof_pair_model_outer_test_inner_ensemble",
                     view_config=_bow_view_to_dict(view),
                 )
-                metrics[f"bow_pair_uplift_{view.name}_treated_oof_auroc"] = (
-                    pair_result.metrics.get("treated_oof", {}).get("auroc")
-                )
+                metrics[f"bow_pair_uplift_{view.name}_treated_oof_auroc"] = pair_result.metrics.get(
+                    "treated_oof", {}
+                ).get("auroc")
                 metrics[f"bow_pair_uplift_{view.name}_n_train_matched_pairs"] = (
                     pair_result.metrics.get("n_train_matched_pairs")
                 )
@@ -1588,6 +1726,37 @@ class MultiModelForestStage1Runner:
                         },
                     )
                 )
+                if self.matched_pair_native_capture_sink is not None:
+                    for value_name, fit_value, heldout_value, role in (
+                        (
+                            "delta",
+                            pair_result.train_delta_logit,
+                            pair_result.test_delta_logit,
+                            "uplift_delta_logit",
+                        ),
+                        (
+                            "probability",
+                            pair_result.train_pred_prob,
+                            pair_result.test_pred_prob,
+                            "treated_outcome_probability",
+                        ),
+                        (
+                            "n_controls",
+                            pair_result.train_n_controls,
+                            pair_result.test_n_controls,
+                            "matched_control_count",
+                        ),
+                    ):
+                        self.matched_pair_native_capture_sink.record_scope_output(
+                            f"bow_view_{view_index:04d}_{value_name}_fit",
+                            fit_value,
+                            role=f"fit_{role}",
+                        )
+                        self.matched_pair_native_capture_sink.record_scope_output(
+                            f"bow_view_{view_index:04d}_{value_name}_heldout",
+                            heldout_value,
+                            role=f"heldout_{role}",
+                        )
                 bow_pair_uplift_results.append(
                     {
                         "metrics": pair_result.metrics,
@@ -1615,9 +1784,7 @@ class MultiModelForestStage1Runner:
                         e_test=e_test,
                         m_test=m_test,
                         outer_fold=outer_fold,
-                        propensity_caliper=float(
-                            self.nn_config.matched_pair_propensity_caliper
-                        ),
+                        propensity_caliper=float(self.nn_config.matched_pair_propensity_caliper),
                         outcome_caliper=float(self.nn_config.matched_pair_outcome_caliper),
                         max_controls_per_candidate=int(
                             self.nn_config.matched_pair_max_controls_per_candidate
@@ -1630,6 +1797,10 @@ class MultiModelForestStage1Runner:
                         ),
                     )
                 except Exception as exc:
+                    if self.matched_pair_native_capture_sink is not None:
+                        raise RuntimeError(
+                            "native matched-pair HTR proof capture failed closed"
+                        ) from exc
                     logger.exception(
                         "Outer fold %s HTR matched-pair uplift failed: %s",
                         outer_fold,
@@ -1682,9 +1853,9 @@ class MultiModelForestStage1Runner:
                     objective="matched_pair_treated_outcome_probability",
                     provenance="inner_oof_pair_model_outer_test_inner_ensemble",
                 )
-                metrics["htr_pair_uplift_treated_oof_auroc"] = (
-                    htr_pair_uplift_result.metrics.get("treated_oof", {}).get("auroc")
-                )
+                metrics["htr_pair_uplift_treated_oof_auroc"] = htr_pair_uplift_result.metrics.get(
+                    "treated_oof", {}
+                ).get("auroc")
                 prediction_frames.append(
                     _source_prediction_frame(
                         train_df,
@@ -1718,6 +1889,37 @@ class MultiModelForestStage1Runner:
                     "attention": htr_pair_attention,
                     "objective": "matched_pair_uplift_delta_logit",
                 }
+                if self.matched_pair_native_capture_sink is not None:
+                    for value_name, fit_value, heldout_value, role in (
+                        (
+                            "delta",
+                            htr_pair_uplift_result.train_delta_logit,
+                            htr_pair_uplift_result.test_delta_logit,
+                            "uplift_delta_logit",
+                        ),
+                        (
+                            "probability",
+                            htr_pair_uplift_result.train_pred_prob,
+                            htr_pair_uplift_result.test_pred_prob,
+                            "treated_outcome_probability",
+                        ),
+                        (
+                            "n_controls",
+                            htr_pair_uplift_result.train_n_controls,
+                            htr_pair_uplift_result.test_n_controls,
+                            "matched_control_count",
+                        ),
+                    ):
+                        self.matched_pair_native_capture_sink.record_scope_output(
+                            f"htr_{value_name}_fit",
+                            fit_value,
+                            role=f"fit_{role}",
+                        )
+                        self.matched_pair_native_capture_sink.record_scope_output(
+                            f"htr_{value_name}_heldout",
+                            heldout_value,
+                            role=f"heldout_{role}",
+                        )
 
         if self._bow_enabled():
             for view_index, view in enumerate(self.nn_config.bow_views):
@@ -1745,6 +1947,34 @@ class MultiModelForestStage1Runner:
                     seed_offset=70_000,
                 )
                 inner_model_rows.extend(fold_rows)
+                if self.bow_native_capture_sink is not None:
+                    for name, values, role in (
+                        (
+                            f"view_{view_index:04d}_pseudo_fit",
+                            pseudo_train,
+                            "fit_effect_output",
+                        ),
+                        (
+                            f"view_{view_index:04d}_pseudo_heldout",
+                            pseudo_test,
+                            "heldout_effect_output",
+                        ),
+                        (
+                            f"view_{view_index:04d}_weighted_fit",
+                            r_train,
+                            "fit_effect_output",
+                        ),
+                        (
+                            f"view_{view_index:04d}_weighted_heldout",
+                            r_test,
+                            "heldout_effect_output",
+                        ),
+                    ):
+                        self.bow_native_capture_sink.record_scope_output(
+                            name,
+                            values,
+                            role=role,
+                        )
                 _append_feature(
                     x_train_cols,
                     x_test_cols,
@@ -1888,6 +2118,17 @@ class MultiModelForestStage1Runner:
                 )
                 train_tau = train_predictions["tau_hat_r_stage"].to_numpy(dtype=float)
                 test_tau = test_predictions["tau_hat_r_stage"].to_numpy(dtype=float)
+                if self.htr_native_capture_sink is not None:
+                    self.htr_native_capture_sink.record_scope_output(
+                        f"effect_{effect_objective}_fit",
+                        train_tau,
+                        role="fit_effect_output",
+                    )
+                    self.htr_native_capture_sink.record_scope_output(
+                        f"effect_{effect_objective}_heldout",
+                        test_tau,
+                        role="heldout_effect_output",
+                    )
                 effect_attention = [
                     dict(row) for row in htr_effect_train.get("attention", []) or []
                 ]
@@ -2059,7 +2300,9 @@ class MultiModelForestStage1Runner:
         y_resid: np.ndarray,
         t_resid: np.ndarray,
     ) -> Dict[str, Any]:
-        r_loss = (np.asarray(y_resid, dtype=float) - np.asarray(tau_hat, dtype=float) * t_resid) ** 2
+        r_loss = (
+            np.asarray(y_resid, dtype=float) - np.asarray(tau_hat, dtype=float) * t_resid
+        ) ** 2
         r_loss_at_zero = np.asarray(y_resid, dtype=float) ** 2
         metrics: Dict[str, Any] = {
             "treatment_auroc": _safe_roc_auc(t, e_hat),
@@ -2071,8 +2314,7 @@ class MultiModelForestStage1Runner:
             "r_loss_at_zero_mean": _finite_or_none(np.mean(r_loss_at_zero)),
             "r_loss_improvement": _finite_or_none(np.mean(r_loss_at_zero) - np.mean(r_loss)),
             "pseudo_target_construction": (
-                "Stage 1 ensemble nuisance predictions, then "
-                "(Y - mean_m_hat) / (T - mean_e_hat)"
+                "Stage 1 ensemble nuisance predictions, then " "(Y - mean_m_hat) / (T - mean_e_hat)"
             ),
         }
         try:
@@ -2091,15 +2333,6 @@ class MultiModelForestStage1Runner:
                 metrics["outcome_brier"] = _finite_or_none(brier_score_loss(y, m_hat))
             except Exception:
                 pass
-        if "true_ite_prob" in discovery_df.columns:
-            metrics["tau_hat_true_ite_corr"] = _safe_corr(
-                tau_hat,
-                discovery_df["true_ite_prob"].to_numpy(dtype=float),
-            )
-            metrics["pseudo_target_true_ite_corr"] = _safe_corr(
-                pseudo_target,
-                discovery_df["true_ite_prob"].to_numpy(dtype=float),
-            )
         return metrics
 
     def _fit_primary_feature_importance_models(
@@ -2112,27 +2345,42 @@ class MultiModelForestStage1Runner:
         pseudo_target_sample_weight: Optional[np.ndarray],
         view: BoWViewConfig,
     ) -> Dict[str, Any]:
-        vectorizer = _make_bow_vectorizer(_vectorizer_params(view))
+        vectorizer_params = _vectorizer_params(view)
+        vectorizer = _make_bow_vectorizer(vectorizer_params)
         x_model = vectorizer.fit_transform(texts)
         features = np.asarray(vectorizer.get_feature_names_out())
 
+        treatment_model = None
+        treatment_constant = None
         if len(np.unique(np.asarray(t, dtype=int))) < 2:
             treatment_coef = np.zeros(len(features), dtype=float)
+            treatment_constant = float(np.mean(np.asarray(t, dtype=float)))
+            treatment_prediction = np.full(len(t), treatment_constant, dtype=float)
         else:
             treatment_model = _make_bow_classifier(_model_params(view), random_state=101)
             treatment_model.fit(x_model, np.asarray(t, dtype=int))
             treatment_coef = _model_feature_scores(treatment_model, len(features))
+            treatment_prediction = treatment_model.predict_proba(x_model)[:, 1]
 
+        outcome_model = None
+        outcome_constant = None
         if str(self.config.outcome_type).lower() == "continuous":
             outcome_model = _make_bow_regressor(_model_params(view), random_state=202)
             outcome_model.fit(x_model, y)
             outcome_coef = _model_feature_scores(outcome_model, len(features))
+            outcome_prediction = outcome_model.predict(x_model)
+            outcome_classification = False
         elif len(np.unique(np.asarray(y, dtype=int))) < 2:
             outcome_coef = np.zeros(len(features), dtype=float)
+            outcome_constant = float(np.mean(np.asarray(y, dtype=float)))
+            outcome_prediction = np.full(len(y), outcome_constant, dtype=float)
+            outcome_classification = True
         else:
             outcome_model = _make_bow_classifier(_model_params(view), random_state=202)
             outcome_model.fit(x_model, np.asarray(y, dtype=int))
             outcome_coef = _model_feature_scores(outcome_model, len(features))
+            outcome_prediction = outcome_model.predict_proba(x_model)[:, 1]
+            outcome_classification = True
 
         effect_model = _make_bow_regressor(_model_params(view), random_state=303)
         _fit_regressor(
@@ -2142,6 +2390,48 @@ class MultiModelForestStage1Runner:
             sample_weight=pseudo_target_sample_weight,
         )
         effect_coef = _model_feature_scores(effect_model, len(features))
+        effect_prediction = effect_model.predict(x_model)
+
+        if self.bow_native_capture_sink is not None:
+            common = {
+                "view_name": view.name,
+                "view_config": _bow_view_to_dict(view),
+                "vectorizer_params": vectorizer_params,
+                "vectorizer": vectorizer,
+            }
+            self.bow_native_capture_sink.record_full_fit(
+                **common,
+                objective="treatment_importance",
+                seed=101,
+                target_values=t,
+                sample_weight=None,
+                learner=treatment_model,
+                classification=True,
+                constant_prediction=treatment_constant,
+                fit_prediction=treatment_prediction,
+            )
+            self.bow_native_capture_sink.record_full_fit(
+                **common,
+                objective="outcome_importance",
+                seed=202,
+                target_values=y,
+                sample_weight=None,
+                learner=outcome_model,
+                classification=outcome_classification,
+                constant_prediction=outcome_constant,
+                fit_prediction=outcome_prediction,
+            )
+            self.bow_native_capture_sink.record_full_fit(
+                **common,
+                objective="effect_weighted_r_importance",
+                seed=303,
+                target_values=pseudo_target,
+                sample_weight=pseudo_target_sample_weight,
+                learner=effect_model,
+                classification=False,
+                constant_prediction=None,
+                fit_prediction=effect_prediction,
+            )
 
         top_n = int(self.nn_config.top_n_features)
         confounder_score = np.abs(treatment_coef) * np.abs(outcome_coef)
@@ -2205,6 +2495,25 @@ class MultiModelForestStage1Runner:
             return {}
         generator = self._embedding_generator()
         generator.prepare(self.dataset)
+        native_observer = getattr(generator, "_native_embedding_proof_observer", None)
+        if native_observer is not None:
+            register_fit_outputs = getattr(
+                native_observer,
+                "record_registered_fit_outputs",
+                None,
+            )
+            if not callable(register_fit_outputs):
+                raise TypeError(
+                    "native embedding proof observer has no registered-fit-output method"
+                )
+            register_fit_outputs(
+                fit_row_ids=discovery_df["_oci_row_id"].astype(int).tolist(),
+                treatment=t,
+                outcome=y,
+                pseudo_target=[pseudo_target],
+                t_resid=[t_resid],
+                pseudo_target_names=["stage1_ensemble_mean_nuisance"],
+            )
         return generator.build_evidence(
             discovery_df=discovery_df,
             y=y,
@@ -2225,9 +2534,11 @@ class MultiModelForestStage1Runner:
         embedding_evidence: Optional[Dict[str, Any]] = None,
         htr_evidence: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        agent_context_mode = str(
-            getattr(self.nn_config, "agent_context_mode", "evidence_digest") or ""
-        ).strip().lower()
+        agent_context_mode = (
+            str(getattr(self.nn_config, "agent_context_mode", "evidence_digest") or "")
+            .strip()
+            .lower()
+        )
         if agent_context_mode == "evidence_digest":
             context = _build_evidence_digest_agent_context(
                 outer_fold=outer_fold,
@@ -2350,65 +2661,15 @@ class MultiModelForestStage1Runner:
     ) -> List[Dict[str, Any]]:
         if not bool(getattr(self.nn_config, "candidate_consistency_enabled", True)):
             return []
-        grouped: Dict[int, List[Dict[str, Any]]] = {}
-        for row in inner_model_rows:
-            if int(row.get("outer_fold", outer_fold)) != int(outer_fold):
-                continue
-            inner_fold = row.get("inner_fold")
-            if inner_fold is None:
-                continue
-            grouped.setdefault(int(inner_fold), []).append(copy.deepcopy(row))
-        if not grouped:
-            return []
-        rows: List[Dict[str, Any]] = []
-        for inner_fold in sorted(grouped):
-            fold_evidence = grouped[inner_fold]
-            sample = fold_evidence[0]
-            handoff_result = copy.deepcopy(base_result)
-            context = copy.deepcopy(handoff_result.get("context") or {})
-            context.update(
-                {
-                    "outer_fold": int(outer_fold),
-                    "inner_fold": int(inner_fold),
-                    "consistency_scope": "inner_train",
-                    "inner_train_rows": int(sample.get("train_rows") or 0),
-                    "inner_heldout_rows": int(sample.get("heldout_rows") or 0),
-                    "stage1_inner_model_evidence": fold_evidence,
-                }
-            )
-            provenance = dict(context.get("handoff_provenance") or {})
-            provenance.update(
-                {
-                    "candidate_consistency_evidence": "stage1_inner_fold_models",
-                    "stage2_raw_text_modeling_required": False,
-                    "outer_test_prediction": "mean_of_stage1_inner_fold_models",
-                }
-            )
-            context["handoff_provenance"] = provenance
-            handoff_result["context"] = context
-            metrics = dict(handoff_result.get("metrics") or {})
-            metrics.update(
-                {
-                    "stage1_inner_model_evidence_count": int(len(fold_evidence)),
-                    "inner_train_rows": int(sample.get("train_rows") or 0),
-                    "inner_heldout_rows": int(sample.get("heldout_rows") or 0),
-                    "outer_train_rows": int(n_outer_train_rows),
-                }
-            )
-            handoff_result["metrics"] = metrics
-            handoff_result["inner_model_evidence"] = fold_evidence
-            rows.append(
-                _agentic_discovery_handoff_row(
-                    handoff_result,
-                    fold_key=1000 * int(outer_fold) + int(inner_fold),
-                    outer_fold=int(outer_fold),
-                    scope="candidate_consistency_inner_train",
-                    n_rows=int(sample.get("train_rows") or 0),
-                    inner_fold=int(inner_fold),
-                    heldout_rows=int(sample.get("heldout_rows") or 0),
-                )
-            )
-        return rows
+        del base_result, inner_model_rows, n_outer_train_rows
+        raise RuntimeError(
+            "refusing to synthesize exact-inner Stage 1 handoffs for outer fold "
+            f"{int(outer_fold)}: architecture-local cross-fit row numbers do not share "
+            "one canonical split registry, and copying full-outer importance, embedding, "
+            "or HTR evidence into an inner_train row is leakage. Use the authenticated "
+            "stage1_exact_inner_evidence producer contract and refit all ten active "
+            "families on each exact canonical inner scope."
+        )
 
     def _fit_bow_binary_train_test(
         self,
@@ -2439,6 +2700,7 @@ class MultiModelForestStage1Runner:
         vectorizer_params = _vectorizer_params(view)
         model_params = _model_params(view)
         e_clip = float(self.nn_config.e_clip)
+        capture_sink = self.bow_native_capture_sink
         n_jobs = self._fold_n_jobs(len(split_items))
         logger.info(
             "Outer fold %s BoW binary %s view=%s model=%s folds=%s n_jobs=%s " "backend=%s",
@@ -2454,13 +2716,17 @@ class MultiModelForestStage1Runner:
         def run_fold(fold: int, fit_pos: np.ndarray, heldout_pos: np.ndarray):
             fit_pos = np.asarray(fit_pos, dtype=int)
             heldout_pos = np.asarray(heldout_pos, dtype=int)
+            vectorizer = None
+            model = None
+            constant_prediction = None
             if len(np.unique(labels[fit_pos])) < 2:
+                constant_prediction = float(np.mean(labels[fit_pos]))
                 heldout_pred = np.full(
                     len(heldout_pos),
-                    float(np.mean(labels[fit_pos])),
+                    constant_prediction,
                     dtype=float,
                 )
-                test_pred = np.full(len(texts_test), float(np.mean(labels[fit_pos])), dtype=float)
+                test_pred = np.full(len(texts_test), constant_prediction, dtype=float)
             else:
                 vectorizer = _make_bow_vectorizer(vectorizer_params)
                 fit_texts = [texts_train[int(pos)] for pos in fit_pos]
@@ -2482,6 +2748,26 @@ class MultiModelForestStage1Runner:
                 e_clip,
                 1.0 - e_clip,
             )
+            if capture_sink is not None:
+                capture_sink.record_fold(
+                    family="bow_nuisance",
+                    objective=f"{label_name}_nuisance",
+                    view_name=view.name,
+                    view_config=_bow_view_to_dict(view),
+                    fold=int(fold),
+                    fit_positions=fit_pos,
+                    validation_positions=heldout_pos,
+                    seed=17 + int(fold),
+                    target_values=labels,
+                    sample_weight=None,
+                    vectorizer_params=vectorizer_params,
+                    vectorizer=vectorizer,
+                    learner=model,
+                    classification=True,
+                    constant_prediction=constant_prediction,
+                    validation_prediction=heldout_pred,
+                    heldout_prediction=test_pred,
+                )
             return {
                 "fold": int(fold),
                 "heldout_pos": heldout_pos,
@@ -2553,6 +2839,7 @@ class MultiModelForestStage1Runner:
         split_items = list(enumerate(splitter.split(texts_train), start=1))
         vectorizer_params = _vectorizer_params(view)
         model_params = _model_params(view)
+        capture_sink = self.bow_native_capture_sink
         n_jobs = self._fold_n_jobs(len(split_items))
         logger.info(
             "Outer fold %s BoW regression %s view=%s model=%s folds=%s n_jobs=%s " "backend=%s",
@@ -2585,6 +2872,26 @@ class MultiModelForestStage1Runner:
             heldout_pred = model.predict(x_heldout)
             test_pred = model.predict(x_test)
             heldout_values = values[heldout_pos]
+            if capture_sink is not None:
+                capture_sink.record_fold(
+                    family=("bow_r_loss" if "effect" in target_name else "bow_nuisance"),
+                    objective=("outcome_nuisance" if target_name == "outcome" else target_name),
+                    view_name=view.name,
+                    view_config=_bow_view_to_dict(view),
+                    fold=int(fold),
+                    fit_positions=fit_pos,
+                    validation_positions=heldout_pos,
+                    seed=17 + int(seed_offset) + int(fold),
+                    target_values=values,
+                    sample_weight=sample_weight,
+                    vectorizer_params=vectorizer_params,
+                    vectorizer=vectorizer,
+                    learner=model,
+                    classification=False,
+                    constant_prediction=None,
+                    validation_prediction=heldout_pred,
+                    heldout_prediction=test_pred,
+                )
             return {
                 "fold": int(fold),
                 "heldout_pos": heldout_pos,
@@ -3268,6 +3575,14 @@ class MultiModelForestStage1Runner:
 
     def _htr_provider(self) -> Any:
         if self.htr_evidence_provider is not None:
+            if (
+                self.htr_native_capture_sink is not None
+                or self.matched_pair_native_capture_sink is not None
+            ):
+                raise RuntimeError(
+                    "native HTR or matched-pair proof capture requires the genuine "
+                    "default HTR provider"
+                )
             return self.htr_evidence_provider
         if self._default_htr_provider is None:
             htr_num_workers = 0 if self._outer_backend_name() == "processes" else self.num_workers
@@ -3277,6 +3592,10 @@ class MultiModelForestStage1Runner:
                 device=self.device,
                 gpu_ids=self.gpu_ids,
                 num_workers=htr_num_workers,
+            )
+            self._default_htr_provider.native_capture_sink = self.htr_native_capture_sink
+            self._default_htr_provider.native_pair_capture_sink = (
+                self.matched_pair_native_capture_sink
             )
         return self._default_htr_provider
 
@@ -3338,6 +3657,12 @@ class MultiModelForestStage1Runner:
         return [self.device]
 
     def _fold_n_jobs(self, folds: int) -> int:
+        # The proof sink owns in-memory references to the actual fitted sklearn
+        # objects.  A process backend would copy the sink and silently discard
+        # child-process captures; serialized capture mode is therefore
+        # deliberately single-process and deterministic.
+        if self.bow_native_capture_sink is not None:
+            return 1
         return self._parallel_n_jobs(
             self._bow_fold_parallelism_setting(),
             folds,
@@ -3389,9 +3714,7 @@ class MultiModelForestStage1Runner:
                     "schema_version": "multi_model_agentic_discovery_handoff_v1",
                     "path": str(handoff_path),
                     "n_rows": int(len(self.agentic_handoff_rows)),
-                    "scopes": sorted(
-                        {str(row.get("scope")) for row in self.agentic_handoff_rows}
-                    ),
+                    "scopes": sorted({str(row.get("scope")) for row in self.agentic_handoff_rows}),
                     "source": "stage1_primary_text_model_forest",
                 },
             )
@@ -3448,6 +3771,7 @@ def _bow_view_to_dict(view: BoWViewConfig) -> Dict[str, Any]:
         "sublinear_tf": bool(view.sublinear_tf),
         "bow_model": str(view.bow_model),
         "logistic_c": float(view.logistic_c),
+        "logistic_max_iter": int(view.logistic_max_iter),
         "ridge_alpha": float(view.ridge_alpha),
     }
 

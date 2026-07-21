@@ -192,7 +192,7 @@ def test_extraction_prompt_distinguishes_unknown_from_not_documented():
     assert "For continuous fields" in prompt
 
 
-def test_neural_query_rag_prompt_treats_prior_outcomes_as_valid_history():
+def test_neural_query_rag_prompt_uses_retrieved_excerpt_instruction_without_policy():
     specs = [
         ExplicitFeatureSpec(
             name="prior_platinum_response",
@@ -208,12 +208,13 @@ def test_neural_query_rag_prompt_treats_prior_outcomes_as_valid_history():
 
     prompt = build_extraction_prompt(document, specs)
 
-    assert "Read every retrieved baseline-history excerpt" in prompt
-    assert "prior therapies, responses, or outcomes" in prompt
+    assert "Read every retrieved excerpt" in prompt
+    assert "prior therapies, responses, or outcomes" not in prompt
+    assert "current treatment decision" not in prompt
     assert "complete clinical note" not in prompt
 
 
-def test_temporally_valid_source_opt_in_removes_extraction_boundary_from_main_and_repair():
+def test_extraction_prompts_contain_no_temporal_policy_text():
     specs = [
         ExplicitFeatureSpec(
             name="response_status",
@@ -234,20 +235,21 @@ def test_temporally_valid_source_opt_in_removes_extraction_boundary_from_main_an
     )
 
     for text in (prompt, repair):
-        assert "temporally valid by design" in text
-        assert "Do not infer or enforce a treatment-time boundary" in text
-    assert "Use only information available before" not in prompt
-    assert "does not state this value before treatment" not in prompt
-    assert "information documented before treatment" not in repair
+        assert "temporally valid by design" not in text
+        assert "treatment-time boundary" not in text
+        assert "source_text_temporal_policy" not in text
+        assert "current treatment" not in text
 
 
-def test_legacy_extraction_prompt_default_keeps_treatment_time_boundary():
+def test_default_extraction_prompt_also_contains_no_temporal_policy_text():
     specs = [ExplicitFeatureSpec(name="age", type="continuous", roles=["confounder"])]
     prompt = build_extraction_prompt("Age 70.", specs)
     repair = build_extraction_repair_prompt(["malformed JSON"], specs)
 
-    assert "Use only information available before or at" in prompt
-    assert "information documented before treatment" in repair
+    assert "treatment" not in prompt.casefold()
+    assert "treatment" not in repair.casefold()
+    assert "temporally" not in prompt.casefold()
+    assert "temporally" not in repair.casefold()
 
 
 def test_parse_extraction_response_accepts_quoted_null_as_missing():

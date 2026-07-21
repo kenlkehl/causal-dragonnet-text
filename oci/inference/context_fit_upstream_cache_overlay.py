@@ -679,6 +679,7 @@ class AuthenticatedContextFitGateCacheOverlay:
         runtime_producer: FinalContextFitUpstreamProducer,
         sources: Sequence[AuthenticatedContextFitCacheSource],
         output_root: Path | str,
+        hierarchical_first_gate_preparation: bool = False,
     ) -> None:
         if type(provider) is not ContextFitUpstreamGateProvider:
             raise TypeError("gate cache overlay requires the exact current gate provider")
@@ -686,6 +687,9 @@ class AuthenticatedContextFitGateCacheOverlay:
             raise TypeError("gate cache overlay requires the exact current final producer")
         self.provider = provider
         self.runtime_producer = runtime_producer
+        if not isinstance(hierarchical_first_gate_preparation, bool):
+            raise TypeError("hierarchical_first_gate_preparation must be a boolean")
+        self.hierarchical_first_gate_preparation = hierarchical_first_gate_preparation
         self.sources = tuple(row for row in sources if row.kind == "review_gate")
         if not self.sources:
             raise ValueError("gate cache overlay requires at least one gate source")
@@ -731,7 +735,15 @@ class AuthenticatedContextFitGateCacheOverlay:
                 source.cache_manifest_sha256 for source in ineligible
             ),
             "historical_source_writes_allowed": False,
-            "materialization_boundary": "bind_fold_after_proposal_and_quality_guard",
+            "materialization_boundary": (
+                "first_gate_after_exact_hierarchy_approval_and_review_proposal_freeze_"
+                "before_gate_evaluation_then_later_gates_after_proposal_and_quality_guard"
+                if self.hierarchical_first_gate_preparation
+                else "bind_fold_after_proposal_and_quality_guard"
+            ),
+            "hierarchical_deferred_first_gate_materialization_allowed": (
+                self.hierarchical_first_gate_preparation
+            ),
             "matrix_values_decoded_during_registration": False,
         }
 

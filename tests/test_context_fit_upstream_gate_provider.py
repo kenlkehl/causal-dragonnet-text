@@ -166,6 +166,10 @@ def test_context_fit_provider_separates_calibrated_and_raw_views(tmp_path: Path)
 
     source = bound.get_gate_source_view(outer_fold=2, exact_gate_row_ids=(8, 9))
     features = bound.get_gate_feature_bank_view(outer_fold=2, exact_gate_row_ids=(8, 9))
+    cache_manifest = bound.authenticated_cache_manifest_path
+    assert cache_manifest.name == "manifest.json"
+    assert cache_manifest.parent.parent == tmp_path
+    assert len(bound.identity()["cache_manifest_sha256"]) == 64
     assert source.values.shape == (2, 2)
     assert features.values.shape == (2, 3)
     assert source.context_values.shape == (4, 2)

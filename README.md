@@ -36,6 +36,21 @@ python oracle_experiment_scripts/run_oracle_experiments.py \
     --n-folds 5
 ```
 
+### Hierarchical all-evidence pipeline
+
+The production architecture-at-a-time feature-discovery benchmark has separate
+operator documentation:
+
+- [Operations runbook](docs/hierarchical_all_evidence_operations_runbook.md):
+  prerequisites, dry run, immutable preparation, approval, execution, completion,
+  and interruption handling.
+- [Reproducibility and recovery runbook](docs/hierarchical_all_evidence_reproducibility_runbook.md):
+  artifact preservation, exact cache replay, relocation limits, verification, and
+  recovery after conversation compaction.
+- [Model-facing interface specification](docs/all_evidence_discovery_interfaces.md):
+  architecture-local interpretation, dossiers, bounded raw-evidence lookback, and
+  adaptive hierarchical review.
+
 ## Architecture
 
 OCI has five feature extractors and four causal heads.

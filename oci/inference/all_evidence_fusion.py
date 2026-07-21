@@ -52,6 +52,7 @@ MATCHED_PAIR_UPLIFT = "matched_pair_uplift"
 HTR_NEURAL = "htr_neural"
 EMBEDDING_WHOLE_COHORT = "embedding_whole_cohort"
 EMBEDDING_CLUSTERED = "embedding_clustered"
+TFIDF_SEMANTIC_RETRIEVAL = "tfidf_semantic_retrieval_contrasts"
 TFIDF_TOPICS = "tfidf_topics"
 TFIDF_ORPHAN_NGRAMS = "tfidf_orphan_ngrams"
 NEURAL_QUERY_MOMENTS = "neural_query_moments"
@@ -74,6 +75,7 @@ ALL_SOURCE_FAMILIES = (
     SPARSE_QUERY_MOMENTS,
 )
 _SOURCE_FAMILY_SET = frozenset(ALL_SOURCE_FAMILIES)
+_CANDIDATE_SOURCE_FAMILY_SET = _SOURCE_FAMILY_SET | {TFIDF_SEMANTIC_RETRIEVAL}
 
 _VALID_SCOPES = frozenset({"outer_train", "inner_train"})
 _VALID_ROLES = frozenset({"confounder", "effect_modifier"})
@@ -384,7 +386,7 @@ class CandidateContract:
         _reject_forbidden_content(spec, path="candidate.extraction_spec")
         _validate_extraction_spec(spec, source="candidate.extraction_spec")
         families = tuple(dict.fromkeys(str(value).strip() for value in source_families))
-        unknown = set(families) - _SOURCE_FAMILY_SET
+        unknown = set(families) - _CANDIDATE_SOURCE_FAMILY_SET
         if unknown:
             raise ValueError(f"unknown candidate source families: {sorted(unknown)}")
         object.__setattr__(self, "_spec_json", _canonical_json(spec))
@@ -835,8 +837,12 @@ def render_all_evidence_fusion_prompt(request: AllEvidenceFusionRequest) -> str:
             "the evidence supports, up to the cap; do not default to a short list."
         )
     )
+    prompt_context = request.context()
+    # Preserve provenance in the immutable request without turning it into a
+    # model-facing policy instruction.
+    prompt_context.pop("source_text_temporal_policy", None)
     payload = json.dumps(
-        request.context(),
+        prompt_context,
         sort_keys=True,
         indent=2,
         ensure_ascii=False,
@@ -846,9 +852,7 @@ def render_all_evidence_fusion_prompt(request: AllEvidenceFusionRequest) -> str:
         "patient variables for causal adjustment and treatment-effect heterogeneity.\n\n"
         "Prefer variables supported by independent source families. Treat neural, "
         "matched-pair, embedding, and sparse-text signals as fallible discovery "
-        "evidence. The source text is temporally valid by design, so do not infer or "
-        "enforce a treatment-time boundary and do not reject a construct because of "
-        "temporal wording. Exclude administrative artifacts, identifiers, and "
+        "evidence. Exclude administrative artifacts, identifiers, and "
         "redundant aliases. Use only "
         "the supplied evidence; do not use held-out rows or external dataset "
         "knowledge. Prefer one specific, directly extractable construct per contract; "

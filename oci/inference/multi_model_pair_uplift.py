@@ -18,7 +18,6 @@ from scipy.special import expit, logit
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
 from sklearn.model_selection import KFold
 
-from .agentic_explicit_feature_forest import _safe_corr
 from .multi_model_agentic_forest import (
     _fit_regressor,
     _make_bow_regressor,
@@ -512,6 +511,7 @@ def fit_bow_pair_uplift_train_test(
     l2_alpha: float,
     max_iter: int,
     top_n: int,
+    native_capture_sink: Optional[Any] = None,
 ) -> PairUpliftFitResult:
     y_train = np.asarray(y_train, dtype=float)
     t_train = np.asarray(t_train, dtype=float)
@@ -606,6 +606,26 @@ def fit_bow_pair_uplift_train_test(
         test_deltas.append(fold_test_delta)
         test_probs.append(fold_test_prob)
         test_n_controls.append(fold_test_n)
+        if native_capture_sink is not None:
+            native_capture_sink.record_bow_pair_fold(
+                view_name=view_name,
+                view_index=view_index,
+                fold=inner_fold,
+                fit_pos=fit_pos,
+                validation_pos=heldout_pos,
+                fit_pairs=fit_pairs,
+                validation_pairs=heldout_pairs,
+                heldout_pairs=test_pairs,
+                model=model,
+                validation_pair_delta=heldout_pair_delta,
+                validation_delta=fold_delta,
+                validation_probability=fold_prob,
+                validation_n_controls=fold_n,
+                heldout_pair_delta=test_pair_delta,
+                heldout_delta=fold_test_delta,
+                heldout_probability=fold_test_prob,
+                heldout_n_controls=fold_test_n,
+            )
         treated_eval = (t_train[heldout_pos].astype(int) == 1) & np.isfinite(fold_prob)
         evidence_rows.append(
             {
@@ -658,6 +678,7 @@ def fit_bow_pair_uplift_train_test(
         random_state=77_000 + int(outer_fold),
     ).fit(full_pairs)
     importance = full_model.top_features(top_n)
+    ridge_model: Optional[RidgeDeltaBoWPairModel] = None
     try:
         ridge_model = RidgeDeltaBoWPairModel(
             vectorizer_params=vectorizer_params,
@@ -666,7 +687,21 @@ def fit_bow_pair_uplift_train_test(
         ).fit(full_pairs)
         importance.update(ridge_model.top_features(top_n))
     except Exception as exc:
+        if native_capture_sink is not None:
+            raise RuntimeError(
+                "native matched-pair proof requires the genuine full Ridge diagnostic fit"
+            ) from exc
         logger.debug("Skipping ridge pair-uplift feature table for %s: %s", view_name, exc)
+    if native_capture_sink is not None:
+        if ridge_model is None:
+            raise RuntimeError("native matched-pair proof lacks its full Ridge diagnostic fit")
+        native_capture_sink.record_bow_pair_full(
+            view_name=view_name,
+            view_index=view_index,
+            full_pairs=full_pairs,
+            offset_model=full_model,
+            ridge_model=ridge_model,
+        )
     importance.update(
         {
             "view_name": str(view_name),
@@ -686,12 +721,6 @@ def fit_bow_pair_uplift_train_test(
         "test_candidate_control_mean": _finite_or_none(np.nanmean(test_n)),
         "treated_oof": _binary_metrics(y_train[treated_eval], train_prob[treated_eval]),
     }
-    if "true_ite_prob" in train_df.columns:
-        metrics["delta_logit_true_ite_corr"] = _safe_corr(
-            train_df["true_ite_prob"].to_numpy(dtype=float),
-            train_delta,
-        )
-
     if prediction_frames:
         pair_predictions = pd.concat(prediction_frames, ignore_index=True)
     else:
@@ -906,6 +935,7 @@ def fit_htr_pair_uplift_train_test(
     max_controls_per_candidate: int,
     nearest_fallback_controls: int,
     max_attention_pairs: int,
+    native_capture_sink: Optional[Any] = None,
 ) -> PairUpliftFitResult:
     y_train = np.asarray(y_train, dtype=float)
     t_train = np.asarray(t_train, dtype=float)
@@ -1018,6 +1048,24 @@ def fit_htr_pair_uplift_train_test(
             test_deltas.append(fold_test_delta)
             test_probs.append(fold_test_prob)
             test_n_controls.append(fold_test_n)
+            if native_capture_sink is not None:
+                native_capture_sink.record_htr_pair_fold(
+                    fold=inner_fold,
+                    fit_pos=fit_pos,
+                    validation_pos=heldout_pos,
+                    fit_pairs=fit_pairs,
+                    validation_pairs=heldout_pairs,
+                    heldout_pairs=test_pairs,
+                    model=model,
+                    validation_pair_delta=heldout_pair_delta,
+                    validation_delta=fold_delta,
+                    validation_probability=fold_prob,
+                    validation_n_controls=fold_n,
+                    heldout_pair_delta=test_pair_delta,
+                    heldout_delta=fold_test_delta,
+                    heldout_probability=fold_test_prob,
+                    heldout_n_controls=fold_test_n,
+                )
             treated_eval = (t_train[heldout_pos].astype(int) == 1) & np.isfinite(fold_prob)
             evidence_rows.append(
                 {
@@ -1063,11 +1111,6 @@ def fit_htr_pair_uplift_train_test(
         "test_candidate_control_mean": _finite_or_none(np.nanmean(test_n)),
         "treated_oof": _binary_metrics(y_train[treated_eval], train_prob[treated_eval]),
     }
-    if "true_ite_prob" in train_df.columns:
-        metrics["delta_logit_true_ite_corr"] = _safe_corr(
-            train_df["true_ite_prob"].to_numpy(dtype=float),
-            train_delta,
-        )
     prediction_frame = (
         pd.concat(prediction_frames, ignore_index=True) if prediction_frames else pd.DataFrame()
     )

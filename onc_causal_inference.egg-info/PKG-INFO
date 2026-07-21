@@ -28,6 +28,7 @@ Requires-Dist: accelerate>=0.20.0
 Requires-Dist: sentence-transformers>=3.0.0
 Requires-Dist: sentencepiece>=0.2.0
 Requires-Dist: tiktoken>=0.5.0
+Requires-Dist: jsonschema==4.26.0
 Requires-Dist: econml>=0.14.0
 Requires-Dist: llvmlite>=0.46.0
 Requires-Dist: numba>=0.60.0
@@ -82,6 +83,21 @@ python oracle_experiment_scripts/run_oracle_experiments.py \
     --epochs 20 \
     --n-folds 5
 ```
+
+### Hierarchical all-evidence pipeline
+
+The production architecture-at-a-time feature-discovery benchmark has separate
+operator documentation:
+
+- [Operations runbook](docs/hierarchical_all_evidence_operations_runbook.md):
+  prerequisites, dry run, immutable preparation, approval, execution, completion,
+  and interruption handling.
+- [Reproducibility and recovery runbook](docs/hierarchical_all_evidence_reproducibility_runbook.md):
+  artifact preservation, exact cache replay, relocation limits, verification, and
+  recovery after conversation compaction.
+- [Model-facing interface specification](docs/all_evidence_discovery_interfaces.md):
+  architecture-local interpretation, dossiers, bounded raw-evidence lookback, and
+  adaptive hierarchical review.
 
 ## Architecture
 
@@ -419,9 +435,11 @@ Final artifacts are written under `multi_model_agentic_forest/`, including
 `bow_view_feature_importance_by_fold.jsonl`,
 `embedding_contrast_evidence_by_fold.jsonl`, `agent_candidate_proposals.jsonl`,
 `extracted_feature_diagnostics_by_fold.jsonl`, `parsimony_review_by_fold.jsonl`,
-`selected_feature_sets.json`, and `outer_cv_metrics.csv`. The parsimony review is
-mandatory before final forest fitting; it may record `retain_all` when ablations
-do not justify pruning. The same run also writes skill-compatible aliases:
+`selected_feature_sets.json`, and `outer_cv_metrics.csv`. Parsimony review is
+disabled by default; disabled runs record `skipped` and retain the reviewed
+feature set. When enabled, the parsimony review runs before final forest fitting
+and may record `retain_all` when ablations do not justify pruning. The same run
+also writes skill-compatible aliases:
 `report.txt`, `text_evidence.bow.jsonl`, `text_evidence.embedding.jsonl`,
 `text_evidence.htr.parquet`, `ensemble_nuisance_predictions.parquet`,
 `candidate_features.parquet`, `candidate_signal_review.jsonl`,

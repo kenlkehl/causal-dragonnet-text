@@ -24,10 +24,17 @@ SAMPLE_TEXTS = [
 class TestSimpleCNN:
     def test_forward_shape(self):
         from oci.models.simple_cnn_extractor import SimpleCNNExtractor
+
         ext = SimpleCNNExtractor(
-            embedding_dim=32, conv_dim=32, kernel_size=3, num_conv_blocks=2,
-            max_length=100, vocab_size=500, gated_attention_dim=16,
-            projection_dim=24, dropout=0.0,
+            embedding_dim=32,
+            conv_dim=32,
+            kernel_size=3,
+            num_conv_blocks=2,
+            max_length=100,
+            vocab_size=500,
+            gated_attention_dim=16,
+            projection_dim=24,
+            dropout=0.0,
         )
         ext.fit_tokenizer(SAMPLE_TEXTS)
         out = ext(SAMPLE_TEXTS)
@@ -35,71 +42,97 @@ class TestSimpleCNN:
 
     def test_fit_tokenizer_required(self):
         from oci.models.simple_cnn_extractor import SimpleCNNExtractor
+
         ext = SimpleCNNExtractor(vocab_size=500, projection_dim=24)
         with pytest.raises(RuntimeError, match="not fitted"):
             ext(SAMPLE_TEXTS)
 
     def test_get_state(self):
         from oci.models.simple_cnn_extractor import SimpleCNNExtractor
+
         ext = SimpleCNNExtractor(vocab_size=500, projection_dim=24)
         ext.fit_tokenizer(SAMPLE_TEXTS)
         state = ext.get_state()
-        assert state['extractor_type'] == 'simple_cnn'
-        assert state['output_dim'] == 24
-        assert state['tokenizer_state'] is not None
+        assert state["extractor_type"] == "simple_cnn"
+        assert state["output_dim"] == 24
+        assert state["tokenizer_state"] is not None
 
     def test_get_num_parameters(self):
         from oci.models.simple_cnn_extractor import SimpleCNNExtractor
+
         ext = SimpleCNNExtractor(vocab_size=500, projection_dim=24)
         params = ext.get_num_parameters()
-        assert params['trainable'] > 0
-        assert params['frozen'] == 0
+        assert params["trainable"] > 0
+        assert params["frozen"] == 0
 
     def test_dict_input(self):
         from oci.models.simple_cnn_extractor import SimpleCNNExtractor
+
         ext = SimpleCNNExtractor(
-            embedding_dim=32, conv_dim=32, kernel_size=3, num_conv_blocks=2,
-            max_length=100, vocab_size=500, projection_dim=24,
+            embedding_dim=32,
+            conv_dim=32,
+            kernel_size=3,
+            num_conv_blocks=2,
+            max_length=100,
+            vocab_size=500,
+            projection_dim=24,
         )
         ext.fit_tokenizer(SAMPLE_TEXTS)
-        out = ext({'texts': SAMPLE_TEXTS})
+        out = ext({"texts": SAMPLE_TEXTS})
         assert out.shape == (4, 24)
 
     def test_tokenized_dict_input(self):
         from oci.data.collators import SimpleCNNTokenizingCollator
         from oci.data.dataset import ClinicalTextDataset
         from oci.models.simple_cnn_extractor import SimpleCNNExtractor
+
         ext = SimpleCNNExtractor(
-            embedding_dim=32, conv_dim=32, kernel_size=3, num_conv_blocks=2,
-            max_length=100, vocab_size=500, projection_dim=24, dropout=0.0,
+            embedding_dim=32,
+            conv_dim=32,
+            kernel_size=3,
+            num_conv_blocks=2,
+            max_length=100,
+            vocab_size=500,
+            projection_dim=24,
+            dropout=0.0,
         )
         ext.fit_tokenizer(SAMPLE_TEXTS)
-        df = pd.DataFrame({
-            'clinical_text': SAMPLE_TEXTS,
-            'outcome_indicator': [0, 1, 0, 1],
-            'treatment_indicator': [1, 0, 1, 0],
-        })
+        df = pd.DataFrame(
+            {
+                "clinical_text": SAMPLE_TEXTS,
+                "outcome_indicator": [0, 1, 0, 1],
+                "treatment_indicator": [1, 0, 1, 0],
+            }
+        )
         dataset = ClinicalTextDataset(
             df,
-            text_column='clinical_text',
-            outcome_column='outcome_indicator',
-            treatment_column='treatment_indicator',
+            text_column="clinical_text",
+            outcome_column="outcome_indicator",
+            treatment_column="treatment_indicator",
         )
         collator = SimpleCNNTokenizingCollator(ext._tokenizer, max_length=100)
         batch = collator([dataset[i] for i in range(len(dataset))])
         out = ext(batch)
         assert out.shape == (4, 24)
-        assert batch['input_ids'].dim() == 2
-        assert batch['attention_mask'].shape == batch['input_ids'].shape
+        assert batch["input_ids"].dim() == 2
+        assert batch["attention_mask"].shape == batch["input_ids"].shape
 
 
 class TestHierarchicalCNN:
     def test_forward_shape(self):
         from oci.models.hierarchical_cnn_extractor import HierarchicalCNNExtractor
+
         ext = HierarchicalCNNExtractor(
-            embedding_dim=32, conv_dim=32, kernel_size=3, num_conv_blocks=2,
-            chunk_size=20, chunk_overlap=4, max_chunks=8,
-            vocab_size=500, gated_attention_dim=16, projection_dim=24,
+            embedding_dim=32,
+            conv_dim=32,
+            kernel_size=3,
+            num_conv_blocks=2,
+            chunk_size=20,
+            chunk_overlap=4,
+            max_chunks=8,
+            vocab_size=500,
+            gated_attention_dim=16,
+            projection_dim=24,
         )
         ext.fit_tokenizer(SAMPLE_TEXTS)
         out = ext(SAMPLE_TEXTS)
@@ -107,17 +140,19 @@ class TestHierarchicalCNN:
 
     def test_fit_tokenizer_required(self):
         from oci.models.hierarchical_cnn_extractor import HierarchicalCNNExtractor
+
         ext = HierarchicalCNNExtractor(vocab_size=500, projection_dim=24)
         with pytest.raises(RuntimeError, match="not fitted"):
             ext(SAMPLE_TEXTS)
 
     def test_get_state(self):
         from oci.models.hierarchical_cnn_extractor import HierarchicalCNNExtractor
+
         ext = HierarchicalCNNExtractor(vocab_size=500, projection_dim=24)
         ext.fit_tokenizer(SAMPLE_TEXTS)
         state = ext.get_state()
-        assert state['extractor_type'] == 'hierarchical_cnn'
-        assert 'chunk_size' in state
+        assert state["extractor_type"] == "hierarchical_cnn"
+        assert "chunk_size" in state
 
     def test_tokenized_dict_input(self):
         from oci.data.collators import HierarchicalCNNTokenizingCollator
@@ -125,21 +160,30 @@ class TestHierarchicalCNN:
         from oci.models.hierarchical_cnn_extractor import HierarchicalCNNExtractor
 
         ext = HierarchicalCNNExtractor(
-            embedding_dim=32, conv_dim=32, kernel_size=3, num_conv_blocks=2,
-            chunk_size=20, chunk_overlap=4, max_chunks=8,
-            vocab_size=500, gated_attention_dim=16, projection_dim=24,
+            embedding_dim=32,
+            conv_dim=32,
+            kernel_size=3,
+            num_conv_blocks=2,
+            chunk_size=20,
+            chunk_overlap=4,
+            max_chunks=8,
+            vocab_size=500,
+            gated_attention_dim=16,
+            projection_dim=24,
         )
         ext.fit_tokenizer(SAMPLE_TEXTS)
-        df = pd.DataFrame({
-            'clinical_text': SAMPLE_TEXTS,
-            'outcome_indicator': [0, 1, 0, 1],
-            'treatment_indicator': [1, 0, 1, 0],
-        })
+        df = pd.DataFrame(
+            {
+                "clinical_text": SAMPLE_TEXTS,
+                "outcome_indicator": [0, 1, 0, 1],
+                "treatment_indicator": [1, 0, 1, 0],
+            }
+        )
         dataset = ClinicalTextDataset(
             df,
-            text_column='clinical_text',
-            outcome_column='outcome_indicator',
-            treatment_column='treatment_indicator',
+            text_column="clinical_text",
+            outcome_column="outcome_indicator",
+            treatment_column="treatment_indicator",
         )
         collator = HierarchicalCNNTokenizingCollator(
             ext._tokenizer,
@@ -150,17 +194,24 @@ class TestHierarchicalCNN:
         batch = collator([dataset[i] for i in range(len(dataset))])
         out = ext(batch)
         assert out.shape == (4, 24)
-        assert batch['input_ids'].dim() == 3
-        assert batch['chunk_mask'].shape == batch['input_ids'].shape[:2]
+        assert batch["input_ids"].dim() == 3
+        assert batch["chunk_mask"].shape == batch["input_ids"].shape[:2]
 
 
 class TestHierarchicalGRU:
     def test_forward_shape(self):
         from oci.models.hierarchical_gru_extractor import HierarchicalGRUExtractor
+
         ext = HierarchicalGRUExtractor(
-            embedding_dim=32, gru_hidden_dim=24, num_gru_layers=1,
-            chunk_size=20, chunk_overlap=4, max_chunks=8,
-            vocab_size=500, gated_attention_dim=16, projection_dim=24,
+            embedding_dim=32,
+            gru_hidden_dim=24,
+            num_gru_layers=1,
+            chunk_size=20,
+            chunk_overlap=4,
+            max_chunks=8,
+            vocab_size=500,
+            gated_attention_dim=16,
+            projection_dim=24,
         )
         ext.fit_tokenizer(SAMPLE_TEXTS)
         out = ext(SAMPLE_TEXTS)
@@ -168,17 +219,19 @@ class TestHierarchicalGRU:
 
     def test_fit_tokenizer_required(self):
         from oci.models.hierarchical_gru_extractor import HierarchicalGRUExtractor
+
         ext = HierarchicalGRUExtractor(vocab_size=500, projection_dim=24)
         with pytest.raises(RuntimeError, match="not fitted"):
             ext(SAMPLE_TEXTS)
 
     def test_get_state(self):
         from oci.models.hierarchical_gru_extractor import HierarchicalGRUExtractor
+
         ext = HierarchicalGRUExtractor(vocab_size=500, projection_dim=24)
         ext.fit_tokenizer(SAMPLE_TEXTS)
         state = ext.get_state()
-        assert state['extractor_type'] == 'hierarchical_gru'
-        assert 'gru_hidden_dim' in state
+        assert state["extractor_type"] == "hierarchical_gru"
+        assert "gru_hidden_dim" in state
 
 
 class TestHierarchicalTransformer:
@@ -303,9 +356,7 @@ class TestHierarchicalTransformer:
         assert bert._effective_sentence_encoder_backend() == "transformers"
         assert bert._effective_sentence_pooling() == "cls"
 
-        qwen = HierarchicalTransformerExtractor(
-            sentence_encoder_model="Qwen/Qwen3-Embedding-0.6B"
-        )
+        qwen = HierarchicalTransformerExtractor(sentence_encoder_model="Qwen/Qwen3-Embedding-0.6B")
         assert qwen._effective_sentence_encoder_backend() == "sentence_transformers"
         assert qwen._effective_sentence_pooling() == "last"
 
@@ -467,8 +518,7 @@ class TestHierarchicalTransformer:
             fake_init,
         )
         extractors = [
-            HierarchicalTransformerExtractor(sentence_encoder_model="some-bert")
-            for _ in range(3)
+            HierarchicalTransformerExtractor(sentence_encoder_model="some-bert") for _ in range(3)
         ]
         threads = [
             threading.Thread(target=extractor._ensure_encoder_initialized)
@@ -547,6 +597,47 @@ class TestHierarchicalTransformer:
         assert len(ext._chunk_cache) == 1
         assert len(ext._tokenization_cache) == 2
 
+    def test_transformer_tokenization_rejects_overflow_without_truncating(self):
+        from oci.models.hierarchical_transformer_extractor import (
+            HierarchicalTransformerExtractor,
+        )
+
+        calls = []
+
+        class OverflowTokenizer:
+            pad_token_id = 0
+            padding_side = "right"
+
+            def __call__(self, text, **kwargs):
+                calls.append((text, dict(kwargs)))
+                return {
+                    "input_ids": list(range(9)),
+                    "attention_mask": [1] * 9,
+                }
+
+        ext = HierarchicalTransformerExtractor(
+            sentence_encoder_model="some-bert",
+            chunk_size_words=3,
+            chunk_overlap_words=0,
+            max_chunks=2,
+            max_chunk_length=8,
+            num_transformer_layers=1,
+            num_attention_heads=2,
+            transformer_dim=8,
+            projection_dim=4,
+        )
+        ext._encoder_initialized = True
+        ext._tokenizer = OverflowTokenizer()
+
+        with pytest.raises(ValueError, match="semantic truncation is forbidden"):
+            ext(["one two three"])
+        assert calls == [
+            (
+                "one two three",
+                {"padding": False, "truncation": False},
+            )
+        ]
+
     def test_token_attention_pooling_exports_token_spans(self):
         import json
         import re
@@ -575,9 +666,11 @@ class TestHierarchicalTransformer:
                 words = list(re.finditer(r"\S+", text))
                 input_ids = [101] + list(range(10, 10 + len(words))) + [102]
                 attention_mask = [1] * len(input_ids)
-                offsets = [(0, 0)] + [
-                    (int(match.start()), int(match.end())) for match in words
-                ] + [(0, 0)]
+                offsets = (
+                    [(0, 0)]
+                    + [(int(match.start()), int(match.end())) for match in words]
+                    + [(0, 0)]
+                )
                 if max_length is not None:
                     input_ids = input_ids[:max_length]
                     attention_mask = attention_mask[:max_length]
@@ -652,9 +745,7 @@ class TestHierarchicalTransformer:
         assert "top_token_spans_json" in row
         spans = json.loads(row["top_token_spans_json"])
         assert spans
-        assert {"text", "focus_token", "token_attention", "salience"}.issubset(
-            spans[0]
-        )
+        assert {"text", "focus_token", "token_attention", "salience"}.issubset(spans[0])
         assert row["attended_token_summary"]
         assert "[[" in row["highlighted_chunk_text"]
 
@@ -695,9 +786,11 @@ class TestHierarchicalTransformer:
                 words = list(re.finditer(r"\S+", text))
                 input_ids = [101] + list(range(10, 10 + len(words))) + [102]
                 attention_mask = [1] * len(input_ids)
-                offsets = [(0, 0)] + [
-                    (int(match.start()), int(match.end())) for match in words
-                ] + [(0, 0)]
+                offsets = (
+                    [(0, 0)]
+                    + [(int(match.start()), int(match.end())) for match in words]
+                    + [(0, 0)]
+                )
                 if max_length is not None:
                     input_ids = input_ids[:max_length]
                     attention_mask = attention_mask[:max_length]
@@ -971,6 +1064,7 @@ class TestNeuralCausalForest:
 class TestLearnedTokenizer:
     def test_fit_and_encode(self):
         from oci.models.learned_tokenizer import LearnedTokenizer
+
         tok = LearnedTokenizer()
         tok.fit(SAMPLE_TEXTS, vocab_size=200, min_freq=1)
         assert tok.vocab_size > 2  # at least PAD and UNK
@@ -980,6 +1074,7 @@ class TestLearnedTokenizer:
 
     def test_encode_batch(self):
         from oci.models.learned_tokenizer import LearnedTokenizer
+
         tok = LearnedTokenizer()
         tok.fit(SAMPLE_TEXTS, vocab_size=200, min_freq=1)
         input_ids, mask = tok.encode_batch(SAMPLE_TEXTS[:2], max_length=20)
@@ -988,6 +1083,7 @@ class TestLearnedTokenizer:
 
     def test_state_roundtrip(self):
         from oci.models.learned_tokenizer import LearnedTokenizer
+
         tok = LearnedTokenizer()
         tok.fit(SAMPLE_TEXTS, vocab_size=200, min_freq=1)
         state = tok.get_state()
@@ -999,6 +1095,7 @@ class TestLearnedTokenizer:
 
     def test_unk_token(self):
         from oci.models.learned_tokenizer import LearnedTokenizer
+
         tok = LearnedTokenizer()
         tok.fit(["hello world"], vocab_size=100, min_freq=1)
         ids = tok.encode("xyzzy_unknown_word", max_length=5)

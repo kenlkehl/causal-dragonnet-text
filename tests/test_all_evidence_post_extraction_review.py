@@ -990,9 +990,130 @@ def test_reasoning_agent_prompt_exposes_operations_but_not_acceptance_gate():
     assert "repeat a canonical category as its own alias" in prompt
     assert "required_safety_remediation" in prompt
     assert "sealed candidate workspace" in prompt
+    assert "temporally valid by design" not in prompt
+    assert "source_text_temporal_policy" not in prompt
+    assert "filter temporal wording" not in prompt
 
     repair = build_post_extraction_review_repair_prompt(["operations[0] is missing neutral fields"])
     assert "exactly these six keys" in repair
     assert "contract:null" in repair
     assert "supporting_evidence_ids:[]" in repair
     assert "globally unique" in repair
+
+
+def test_exact_review_messages_strip_machine_metadata_but_keep_internal_audit():
+    spec = _continuous("sensor_reading")
+    frame = pd.DataFrame(
+        {
+            "explicit_feat_sensor_reading": [60.0, 61.0, 62.0, 63.0],
+            "explicit_feat_sensor_reading_missing": [False, False, False, False],
+        }
+    )
+    quality = build_extraction_quality_diagnostics(
+        frame,
+        [spec],
+        fold_ids=[1, 1, 2, 2],
+    )
+    context = _review_context([spec])
+    context["diagnostics"] = quality["features"]
+    context["artifact_sha256"] = "a" * 64
+    context["operation_apply_policy_version"] = "internal_apply_policy_v1"
+    context["grounding_diagnostic_version"] = "internal_grounding_v1"
+    context["diagnostics"][0]["nested_internal_metadata"] = {
+        "schema_version": "internal_quality_schema_v1",
+        "nested_artifact_sha256": "b" * 64,
+        "nested_policy_version": "internal_nested_policy_v1",
+        "nested_diagnostic_version": "internal_nested_diagnostic_v1",
+        "scientific_review_state": {
+            "effect_signal_preserved": True,
+            "evidence_id": "evidence_0001",
+        },
+    }
+    context["sanitized_evidence_catalog"] = _evidence_catalog("sensor reading")
+    internal_before = copy.deepcopy(context)
+    response = {
+        "operations": [
+            {
+                "action": "stop",
+                "target_names": [],
+                "contract": None,
+                "supporting_diagnostic_ids": [],
+                "supporting_evidence_ids": [],
+                "reason": "No defensible observable improvement remains.",
+            }
+        ],
+    }
+    client = _FakeClient([json.dumps(response)])
+    agent = OpenAICompatibleFeatureSearchAgent(
+        AgenticFeatureSearchConfig(
+            agent_model_name="mock-remote-model",
+            agent_schema_repair_attempts=0,
+        )
+    )
+    agent._client = client
+
+    result = agent.propose(context)
+
+    exact_messages = client.completions.calls[0]["messages"]
+
+    def recursively_collect_text(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                yield str(key)
+                yield from recursively_collect_text(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                yield from recursively_collect_text(child)
+        elif isinstance(value, str):
+            yield value
+
+    rendered = "\n".join(recursively_collect_text(exact_messages)).casefold()
+    forbidden = {
+        "source_text_temporal_policy",
+        "source_text_temporally_valid_by_design",
+        "temporal_boundary_enforced",
+        "post_treatment_semantic_filtering_enabled",
+        "temporal_eligibility_affects_selection_or_acceptance",
+        "semantic_timepoint_fields_allowed_as_extraction_meaning",
+        "temporally valid by design",
+        "filter temporal wording",
+        "timing as an eligibility or safety criterion",
+        "timepoint wording as an eligibility or safety criterion",
+    }
+    assert not {phrase for phrase in forbidden if phrase in rendered}
+
+    prompt = exact_messages[0]["content"]
+    model_context = json.loads(prompt.split("Sanitized review context:\n", 1)[1])
+
+    def recursively_collect_keys(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                yield str(key)
+                yield from recursively_collect_keys(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                yield from recursively_collect_keys(child)
+
+    rendered_keys = tuple(recursively_collect_keys(model_context))
+    assert not {
+        key
+        for key in rendered_keys
+        if key in {"prompt_version", "schema_version"}
+        or key.endswith(("_policy_version", "_sha256", "_diagnostic_version"))
+    }
+    assert model_context["diagnostics"][0]["diagnostic_id"] == "diagnostic_0001"
+    assert model_context["diagnostics"][0]["nested_internal_metadata"][
+        "scientific_review_state"
+    ] == {
+        "effect_signal_preserved": True,
+        "evidence_id": "evidence_0001",
+    }
+    assert model_context["sanitized_evidence_catalog"][0]["evidence_id"] == "evidence_0001"
+    assert '"schema_version"' not in prompt
+    assert POST_EXTRACTION_REVIEW_RESPONSE_SCHEMA_VERSION not in prompt
+    assert result["schema_version"] == POST_EXTRACTION_REVIEW_RESPONSE_SCHEMA_VERSION
+    assert context == internal_before
+    assert context["source_text_temporal_policy"] == source_text_temporal_policy_audit()
+    assert context["diagnostics"][0]["source_text_temporal_policy"] == (
+        source_text_temporal_policy_audit()
+    )

@@ -139,11 +139,15 @@ class HierarchicalTransformerBatchPreprocessor:
         encoded = self._tokenizer(
             key,
             padding=False,
-            truncation=True,
-            max_length=self._max_chunk_length,
+            truncation=False,
         )
         input_ids = tuple(int(token_id) for token_id in encoded["input_ids"])
         attention_mask = tuple(int(mask_value) for mask_value in encoded["attention_mask"])
+        if len(input_ids) > self._max_chunk_length:
+            raise ValueError(
+                "HTR tokenizer input exceeds max_chunk_length; semantic truncation is forbidden "
+                f"({len(input_ids)} > {self._max_chunk_length})"
+            )
         if len(self._tokenization_cache) < self._tokenization_cache_max_entries:
             self._tokenization_cache[key] = (input_ids, attention_mask)
         return input_ids, attention_mask
@@ -1323,14 +1327,18 @@ class HierarchicalTransformerExtractor(nn.Module):
 
         kwargs = {
             "padding": False,
-            "truncation": True,
-            "max_length": self._max_chunk_length,
+            "truncation": False,
         }
         if return_offsets_mapping and bool(getattr(self._tokenizer, "is_fast", False)):
             kwargs["return_offsets_mapping"] = True
         encoded = self._tokenizer(key, **kwargs)
         input_ids = tuple(int(token_id) for token_id in encoded["input_ids"])
         attention_mask = tuple(int(mask_value) for mask_value in encoded["attention_mask"])
+        if len(input_ids) > self._max_chunk_length:
+            raise ValueError(
+                "HTR tokenizer input exceeds max_chunk_length; semantic truncation is forbidden "
+                f"({len(input_ids)} > {self._max_chunk_length})"
+            )
         if return_offsets_mapping:
             offsets = encoded.get("offset_mapping")
             if offsets is None:

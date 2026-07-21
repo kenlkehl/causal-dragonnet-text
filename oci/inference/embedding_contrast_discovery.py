@@ -217,6 +217,22 @@ class EmbeddingContrastEvidenceGenerator:
             evidence["cluster_contrast_vectors"] = cluster_contrast_summary
         if self._concept_probe_skip_reason:
             evidence["concept_probe_skipped"] = self._concept_probe_skip_reason
+        native_observer = getattr(self, "_native_embedding_proof_observer", None)
+        if native_observer is not None:
+            record_build = getattr(native_observer, "record_build", None)
+            if not callable(record_build):
+                raise TypeError("native embedding proof observer has no record_build method")
+            record_build(
+                generator=self,
+                discovery_df=discovery_df,
+                y=y,
+                t=t,
+                pseudo_target=pseudo_target,
+                t_resid=t_resid,
+                pseudo_target_names=pseudo_target_names,
+                importance=importance,
+                evidence=evidence,
+            )
         return evidence
 
     def _prepare_from_provider(self) -> None:
@@ -801,6 +817,29 @@ class EmbeddingContrastEvidenceGenerator:
         cluster_counts = np.bincount(cluster_labels[usable], minlength=n_clusters).astype(int)
         summary["n_clusters"] = int(n_clusters)
         summary["cluster_counts"] = [int(item) for item in cluster_counts]
+        native_observer = getattr(self, "_native_embedding_proof_observer", None)
+        if native_observer is not None:
+            record_kmeans = getattr(native_observer, "record_cluster_kmeans", None)
+            if not callable(record_kmeans):
+                raise TypeError(
+                    "native embedding proof observer has no record_cluster_kmeans method"
+                )
+            record_kmeans(
+                fit_row_ids=[self._row_ids[int(position)] for position in positions],
+                usable_mask=usable,
+                cluster_labels=cluster_labels,
+                cluster_centers=np.asarray(kmeans.cluster_centers_, dtype=float),
+                cluster_counts=cluster_counts,
+                n_iter=int(kmeans.n_iter_),
+                inertia=float(kmeans.inertia_),
+                parameters={
+                    "n_clusters": int(n_clusters),
+                    "random_state": int(self.embedding_config.cluster_contrast_random_state),
+                    "batch_size": max(128, min(1024, n_usable)),
+                    "n_init": int(self.embedding_config.cluster_contrast_kmeans_n_init),
+                    "max_iter": 300,
+                },
+            )
 
         records: List[Dict[str, Any]] = []
         treatment_items = self._cluster_treatment_local_contrasts(
@@ -1006,6 +1045,18 @@ class EmbeddingContrastEvidenceGenerator:
         except np.linalg.LinAlgError:
             logger.warning("Cluster contrast SVD failed for %s contrasts", family_key)
             return []
+        native_observer = getattr(self, "_native_embedding_proof_observer", None)
+        if native_observer is not None:
+            record_svd = getattr(native_observer, "record_cluster_svd", None)
+            if not callable(record_svd):
+                raise TypeError("native embedding proof observer has no record_cluster_svd method")
+            record_svd(
+                family_key=family_key,
+                item_cluster_ids=[int(item["cluster_id"]) for item in items],
+                weighted_matrix=matrix,
+                singular_values=singular_values,
+                components=components,
+            )
         total_energy = float(np.sum(np.square(singular_values)))
         max_components = min(
             int(self.embedding_config.cluster_contrast_max_components),
@@ -1760,7 +1811,10 @@ def _coerce_torch_devices(devices: Sequence[Any]):
         return []
     import torch
 
-    return [device if isinstance(device, torch.device) else torch.device(str(device)) for device in devices]
+    return [
+        device if isinstance(device, torch.device) else torch.device(str(device))
+        for device in devices
+    ]
 
 
 def _release_sentence_transformer_model(model_name: str) -> None:

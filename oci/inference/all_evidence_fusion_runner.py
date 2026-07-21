@@ -12,7 +12,10 @@ import io
 import json
 import math
 import re
+import secrets
+import threading
 import unicodedata
+import weakref
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -46,6 +49,27 @@ from .all_evidence_fusion import (
     source_text_temporal_policy_audit,
     validate_all_evidence_fusion_response,
 )
+from .all_evidence_discovery_interfaces import ACTIVE_STAGE1_CONCEPT_FAMILIES
+from .adaptive_hierarchical_stage1_reconsideration import (
+    AdaptiveCurrentFeature,
+    AdaptiveDiagnostic,
+    AdaptiveHierarchicalStage1Reconsideration,
+    ExactSpentCatalogAuthentication,
+)
+from .authenticated_semantic_retrieval_compatibility import (
+    current_spent_projection_compatibility_identity,
+    restore_current_spent_projection_semantic_retrieval_view,
+)
+from .approved_hierarchical_discovery_agent import (
+    ApprovedHierarchicalDiscoveryAgent,
+    MetadataJsonDiscoveryJobRunner,
+)
+from .approved_hierarchical_discovery_batch import (
+    ApprovedHierarchicalDiscoveryBatchCoordinator,
+    ApprovedHierarchicalDiscoveryBatchResult,
+    FrozenReviewEvidencePolicyBinding,
+    OrderedFoldDiscoveryAgent,
+)
 from .all_evidence_post_extraction_review import (
     AppliedReviewOperations,
     CausalReviewConfig,
@@ -78,6 +102,11 @@ from .final_context_fit_upstream_bank import (
 from .authenticated_stable_nuisance_bridge import (
     derive_exact_nuisance_from_runtime_stable_stage1,
 )
+from .authenticated_coordinate_preserving_nuisance_bridge import (
+    coordinate_preserving_nuisance_contract_sha256,
+    derive_exact_nuisance_from_coordinate_preserved_stage1,
+    precommit_runtime_producer_identity_sha256,
+)
 from .final_context_fit_causal_forest_adapter import (
     FINAL_CONTEXT_FIT_CAUSAL_FOREST_ADAPTER_ID,
     FinalCausalForestBackend,
@@ -106,6 +135,31 @@ from .frozen_extraction_cache_overlay import (
     ordered_dataset_text_fingerprint,
     sha256_file,
 )
+from .frozen_hierarchical_review_evidence import (
+    FrozenHierarchicalReviewEvidence,
+    freeze_hierarchical_review_evidence,
+)
+from .first_untouched_gate_direct_numerical_preparation import (
+    prepare_first_untouched_gate_direct_numerical,
+)
+from .first_gate_materialization_contract import (
+    FirstGateMaterializationIntent,
+    prepare_first_gate_materialization_intent,
+)
+from .hierarchical_all_architecture_discovery import HierarchicalDiscoveryConfig
+from .hierarchical_discovery_job_cache import (
+    AuthenticatedHierarchicalDiscoveryJobCache,
+)
+from .lossless_stage1_evidence_catalog import (
+    DEFAULT_MAX_ATOMS_PER_ARCHITECTURE_CHUNK,
+    DEFAULT_MAX_BYTES_PER_ARCHITECTURE_CHUNK,
+    DEFAULT_MAX_SEMANTIC_MEMBER_IDS_PER_ARCHITECTURE_CHUNK,
+    ArchitectureChunkPlan,
+    RoleNeutralEvidenceCatalog,
+    build_complete_architecture_chunks,
+    build_role_neutral_evidence_catalog,
+    validate_role_neutral_catalog,
+)
 from .query_moment_evidence_adapter import (
     QueryMomentEvidenceAdapterConfig,
     derive_sparse_query_moment_evidence,
@@ -117,6 +171,7 @@ from .staged_all_evidence_fusion_agent import (
     STAGED_SELECTION_BACKFILL_VERSION,
     STAGED_SELECTION_UNION_POSTPROCESSING_VERSION,
 )
+from .stage1_architecture_explanations import production_stage1_family_explanations
 from .minimal_staged_selection_postprocessor import (
     MINIMAL_STAGED_SELECTION_OUTPUT_SCHEMA,
     MINIMAL_STAGED_SELECTION_POSTPROCESSOR_VERSION,
@@ -145,6 +200,12 @@ POST_EXTRACTION_REVIEW_ROUND_SCHEMA_VERSION = "all_evidence_post_extraction_revi
 POST_EXTRACTION_REVIEW_FAILURE_SCHEMA_VERSION = (
     "all_evidence_post_extraction_review_response_failure_v3"
 )
+ADAPTIVE_HIERARCHICAL_REVIEW_EXECUTION_SCHEMA_VERSION = (
+    "authenticated_adaptive_hierarchical_review_execution_v1"
+)
+ADAPTIVE_PRE_GATE_CANDIDATE_FREEZE_SCHEMA_VERSION = (
+    "adaptive_pre_gate_executable_and_provenance_freeze_v1"
+)
 POST_EXTRACTION_REVIEW_PARTITION_SCHEMA_VERSION = "all_evidence_post_extraction_review_partition_v2"
 POST_EXTRACTION_REVIEW_UNRESOLVED_ONTOLOGY_SCHEMA_VERSION = (
     "all_evidence_post_extraction_review_unresolved_ontology_v1"
@@ -163,6 +224,18 @@ SPENT_EVIDENCE_CONTEXT_EPOCH_POLICY_VERSION = (
 )
 FROZEN_PREDICTION_SCHEMA_VERSION = "all_evidence_fusion_predictions_v5"
 POSTHOC_EVALUATION_SCHEMA_VERSION = "all_evidence_fusion_posthoc_oracle_v1"
+HIERARCHICAL_DISCOVERY_PREPARATION_INPUT_SCHEMA_VERSION = (
+    "hierarchical_all_evidence_runner_preparation_input_v2"
+)
+HIERARCHICAL_DISCOVERY_PREPARATION_FOLD_SCHEMA_VERSION = (
+    "hierarchical_all_evidence_runner_fold_preparation_v2"
+)
+HIERARCHICAL_DISCOVERY_BATCH_PACKET_SCHEMA_VERSION = (
+    "hierarchical_all_evidence_runner_batch_packet_v1"
+)
+HIERARCHICAL_DISCOVERY_BATCH_RESULT_SCHEMA_VERSION = (
+    "hierarchical_all_evidence_runner_batch_result_v1"
+)
 LEGACY_HANDOFF_SCHEMA_VERSION = "multi_model_agentic_discovery_handoff_v1"
 FINAL_ITE_ESTIMATOR_AUDIT_SCHEMA_VERSION = "all_evidence_final_ite_estimator_v1"
 FINAL_FOREST_POTENTIAL_OUTCOME_POLICY_VERSION = (
@@ -453,6 +526,36 @@ def _write_immutable_json(path: Path, body: Mapping[str, Any], *, schema: str) -
     return digest
 
 
+def _assert_semantic_compatibility_identity_current(bound: Mapping[str, Any]) -> None:
+    """Fail if the preparation helper changes after its input-manifest bind."""
+
+    if current_spent_projection_compatibility_identity() != dict(bound):
+        raise RuntimeError("semantic-retrieval compatibility identity changed during preparation")
+
+
+def _write_immutable_plain_json(path: Path, payload: Mapping[str, Any]) -> str:
+    """Create one closed flat JSON artifact, or verify byte-identical replay."""
+
+    serialized = (
+        json.dumps(
+            json.loads(_canonical_json(dict(payload))),
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("x", encoding="utf-8") as handle:
+            handle.write(serialized)
+    except FileExistsError:
+        if path.read_text(encoding="utf-8") != serialized:
+            raise RuntimeError(f"refusing to mutate immutable JSON artifact: {path}")
+    return sha256_file(path)
+
+
 def _load_request_bound_fusion_response(
     path: Path,
     *,
@@ -560,6 +663,132 @@ def _load_request_bound_review_response(
     if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum != int(max_contracts):
         raise RuntimeError(f"post-extraction review max_contracts is invalid: {path}")
     return detached, applied_sha
+
+
+def _load_request_bound_adaptive_execution(
+    path: Path,
+    *,
+    outer_fold: int,
+    request_sha256: str,
+    review_round: int,
+    review_attempt: int,
+) -> tuple[Mapping[str, Any], AppliedReviewOperations, Mapping[str, Any]] | None:
+    """Replay one locally validated, hash-wrapped adaptive execution without model work."""
+
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"adaptive execution cache is invalid JSON: {path}") from exc
+    if payload.get("schema_version") != ADAPTIVE_HIERARCHICAL_REVIEW_EXECUTION_SCHEMA_VERSION:
+        raise RuntimeError(f"adaptive execution cache has an unsupported schema: {path}")
+    body = payload.get("body")
+    if not isinstance(body, Mapping) or payload.get("content_sha256") != _content_sha256(body):
+        raise RuntimeError(f"adaptive execution cache content hash is invalid: {path}")
+    expected_fields = {
+        "outer_fold",
+        "review_round",
+        "review_attempt",
+        "request_sha256",
+        "diagnostic_adapter_audit",
+        "authenticated_execution",
+        "proposal_frozen_before_executable_bridge",
+        "executable_revision_frozen_before_gate",
+        "complete_catalog_sent_to_legacy_review_agent",
+        "raw_response_persisted",
+        "raw_reasoning_persisted",
+        "gate_accessed",
+    }
+    if set(body) != expected_fields:
+        raise RuntimeError(f"adaptive execution cache violates its closed schema: {path}")
+    if body.get("request_sha256") != request_sha256:
+        raise RuntimeError(f"adaptive execution cache belongs to another request: {path}")
+    for field_name, expected in (
+        ("outer_fold", int(outer_fold)),
+        ("review_round", int(review_round)),
+        ("review_attempt", int(review_attempt)),
+    ):
+        value = body.get(field_name)
+        if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+            raise RuntimeError(f"adaptive execution cache attempt binding is invalid: {path}")
+    for field_name, expected in (
+        ("proposal_frozen_before_executable_bridge", True),
+        ("executable_revision_frozen_before_gate", True),
+        ("complete_catalog_sent_to_legacy_review_agent", False),
+        ("raw_response_persisted", False),
+        ("raw_reasoning_persisted", False),
+        ("gate_accessed", False),
+    ):
+        if body.get(field_name) is not expected:
+            raise RuntimeError(f"adaptive execution cache has unsafe flag {field_name}: {path}")
+    execution = body.get("authenticated_execution")
+    if not isinstance(execution, Mapping):
+        raise RuntimeError(f"adaptive execution cache lacks an execution object: {path}")
+    frozen = execution.get("frozen_round")
+    executable = execution.get("executable_revision")
+    audit = execution.get("audit")
+    if not all(isinstance(value, Mapping) for value in (frozen, executable, audit)):
+        raise RuntimeError(f"adaptive execution cache has malformed nested freezes: {path}")
+    frozen_body = {key: value for key, value in frozen.items() if key != "freeze_sha256"}
+    if frozen.get("freeze_sha256") != _content_sha256(frozen_body):
+        raise RuntimeError(f"adaptive proposal freeze hash is invalid: {path}")
+    proposal = frozen.get("proposal")
+    if not isinstance(proposal, Mapping) or frozen.get("proposal_sha256") != _content_sha256(
+        proposal
+    ):
+        raise RuntimeError(f"adaptive proposal hash is invalid: {path}")
+    executable_body = {
+        key: value for key, value in executable.items() if key != "executable_freeze_sha256"
+    }
+    if executable.get("executable_freeze_sha256") != _content_sha256(executable_body):
+        raise RuntimeError(f"adaptive executable freeze hash is invalid: {path}")
+    if executable.get("proposal_freeze_sha256") != frozen.get("freeze_sha256"):
+        raise RuntimeError(f"adaptive executable derives from another proposal: {path}")
+    applied = executable.get("applied")
+    expected_applied_fields = {
+        "specs",
+        "reextract_specs",
+        "removed_names",
+        "added_names",
+        "extraction_changed_names",
+        "role_only_changed_names",
+        "operation_audit",
+    }
+    if not isinstance(applied, Mapping) or set(applied) != expected_applied_fields:
+        raise RuntimeError(f"adaptive execution cache has malformed application: {path}")
+    if executable.get("applied_specs_sha256") != _content_sha256(applied["specs"]):
+        raise RuntimeError(f"adaptive applied-spec hash is invalid: {path}")
+    execution_identity = {
+        "schema_version": execution.get("schema_version"),
+        "freeze_sha256": frozen.get("freeze_sha256"),
+        "executable_freeze_sha256": executable.get("executable_freeze_sha256"),
+        "dossier_sha256s": execution.get("dossier_sha256s"),
+        "lookback_sha256": (
+            execution.get("lookback", {}).get("lookback_sha256")
+            if isinstance(execution.get("lookback"), Mapping)
+            else None
+        ),
+        "runner_identity_sha256": execution.get("runner_identity_sha256"),
+        "cache_identity_sha256": execution.get("cache_identity_sha256"),
+        "audit": audit,
+    }
+    if execution.get("execution_sha256") != _content_sha256(execution_identity):
+        raise RuntimeError(f"adaptive execution identity hash is invalid: {path}")
+    normalized_applied = AppliedReviewOperations(
+        specs=tuple(applied["specs"]),
+        reextract_specs=tuple(applied["reextract_specs"]),
+        removed_names=tuple(applied["removed_names"]),
+        added_names=tuple(applied["added_names"]),
+        extraction_changed_names=tuple(applied["extraction_changed_names"]),
+        role_only_changed_names=tuple(applied["role_only_changed_names"]),
+        operation_audit=tuple(applied["operation_audit"]),
+    )
+    return (
+        json.loads(_canonical_json(proposal)),
+        normalized_applied,
+        json.loads(_canonical_json(execution)),
+    )
 
 
 def _sanitized_review_failure_completion_attempts(
@@ -741,7 +970,11 @@ def _load_request_bound_review_failure(
         if isinstance(value, bool) or not isinstance(value, int) or value != expected:
             raise RuntimeError(f"post-extraction review failure attempt binding is invalid: {path}")
     failure_type = body.get("failure_type")
-    if failure_type not in {"remote_reviewer_exhausted", "runner_boundary_validation"}:
+    if failure_type not in {
+        "remote_reviewer_exhausted",
+        "runner_boundary_validation",
+        "adaptive_hierarchy_or_executable_validation",
+    }:
         raise RuntimeError(f"post-extraction review failure type is invalid: {path}")
     failure_code = body.get("failure_code")
     if failure_code not in _REVIEW_FAILURE_MESSAGE_BY_CODE:
@@ -3637,14 +3870,10 @@ def _spent_evidence_context_epoch(
     initial = tuple(map(int, schedule.initial_spent_fold_ids))
     gates = tuple(map(int, schedule.gate_fold_ids))
     if len(spent) < len(initial) or spent[: len(initial)] != initial:
-        raise ValueError(
-            "spent evidence folds must begin with the exact initial-spent fold order"
-        )
+        raise ValueError("spent evidence folds must begin with the exact initial-spent fold order")
     consumed = spent[len(initial) :]
     if consumed != gates[: len(consumed)]:
-        raise ValueError(
-            "spent evidence folds must add only the exact consumed review-gate prefix"
-        )
+        raise ValueError("spent evidence folds must add only the exact consumed review-gate prefix")
     return len(consumed)
 
 
@@ -4132,6 +4361,369 @@ class AllEvidenceFusionRunResult:
     prediction_sha256: str
 
 
+@dataclass(frozen=True)
+class PreparedHierarchicalDiscoveryFold:
+    """Local, transport-free inputs needed after one batch is approved."""
+
+    outer_fold: int
+    schedule: ReviewPartitionSchedule
+    evidence_inputs: tuple[FoldEvidenceInput, ...] = field(repr=False)
+    initial_spent_evidence_audit: Mapping[str, Any] = field(repr=False)
+    catalog: RoleNeutralEvidenceCatalog = field(repr=False)
+    chunk_plan: ArchitectureChunkPlan = field(repr=False)
+    first_gate_materialization_intent: FirstGateMaterializationIntent = field(repr=False)
+    first_gate_materialization_intent_path: Path
+    first_gate_materialization_intent_file_sha256: str
+    agent: ApprovedHierarchicalDiscoveryAgent = field(repr=False)
+    preparation_manifest_path: Path
+
+    def __post_init__(self) -> None:
+        if isinstance(self.outer_fold, bool) or not isinstance(self.outer_fold, int):
+            raise TypeError("prepared hierarchical outer_fold must be an integer")
+        if self.outer_fold < 1 or self.schedule.outer_fold != self.outer_fold:
+            raise ValueError("prepared hierarchical fold label differs from its schedule")
+        if self.catalog.outer_fold != self.outer_fold:
+            raise ValueError("prepared hierarchical fold label differs from its catalog")
+        if self.agent.catalog.catalog_sha256 != self.catalog.catalog_sha256:
+            raise ValueError("prepared hierarchical agent cites a different catalog")
+        if self.agent.chunk_plan.plan_sha256 != self.chunk_plan.plan_sha256:
+            raise ValueError("prepared hierarchical agent cites a different chunk plan")
+        self.first_gate_materialization_intent.verify()
+        agent_intent = getattr(self.agent, "first_gate_materialization_intent", None)
+        if (
+            not isinstance(agent_intent, FirstGateMaterializationIntent)
+            or agent_intent.content_sha256 != self.first_gate_materialization_intent.content_sha256
+        ):
+            raise ValueError("prepared hierarchical agent cites a different materialization intent")
+        if (
+            not self.first_gate_materialization_intent_path.is_file()
+            or not _SHA256.fullmatch(self.first_gate_materialization_intent_file_sha256)
+            or sha256_file(self.first_gate_materialization_intent_path)
+            != self.first_gate_materialization_intent_file_sha256
+        ):
+            raise ValueError("prepared first-gate materialization intent is unauthenticated")
+        if not self.preparation_manifest_path.is_file():
+            raise ValueError("prepared hierarchical fold manifest is missing")
+
+
+_PREPARED_HIERARCHY_CAPABILITY_LOCK = threading.Lock()
+_PREPARED_HIERARCHY_CAPABILITIES: dict[
+    int,
+    tuple[weakref.ReferenceType[object], str],
+] = {}
+
+PRODUCTION_HIERARCHY_RUNTIME_BINDING_SCHEMA = "production_hierarchy_same_process_runner_binding_v1"
+
+
+def _current_production_hierarchy_runtime_binding(
+    runner: "AllEvidenceFusionRunner",
+) -> tuple[dict[str, Any], tuple[tuple[str, object], ...]]:
+    """Reauthenticate the exact same-process objects used after preparation.
+
+    Production one-shot execution deliberately does not accept pathname-based
+    replay registrations.  The configured cache overlays already retain their
+    authenticated immutable source snapshots.  This binding instead pins the
+    exact runner/provider objects and freshly recomputed identities represented
+    by the generic preparation input manifest.
+    """
+
+    if type(runner) is not AllEvidenceFusionRunner:
+        raise TypeError("production hierarchy runtime binding requires the exact runner")
+    if not runner.hierarchical_discovery_enabled:
+        raise RuntimeError("production hierarchy runtime binding requires hierarchy mode")
+    if runner.review_spent_evidence_provider is not runner.review_partition_provider:
+        raise ValueError("production hierarchy requires one exact spent-catalog/partition provider")
+    if runner.review_gate_source_provider is not runner.review_gate_feature_bank_provider:
+        raise ValueError("production hierarchy requires one exact shared gate provider")
+
+    spent_identity = _review_provider_identity(
+        runner.review_spent_evidence_provider,
+        label="review_spent_evidence_provider",
+    )
+    partition_identity = _review_provider_identity(
+        runner.review_partition_provider,
+        label="review_partition_provider",
+    )
+    gate_source_identity = _review_provider_identity(
+        runner.review_gate_source_provider,
+        label="review_gate_source_provider",
+    )
+    gate_feature_identity = _review_provider_identity(
+        runner.review_gate_feature_bank_provider,
+        label="review_gate_feature_bank_provider",
+    )
+    if spent_identity != partition_identity:
+        raise ValueError("spent-catalog and partition provider identities differ")
+    if gate_source_identity != gate_feature_identity:
+        raise ValueError("shared gate provider identities differ")
+
+    def file_binding(path_value: Path | str) -> dict[str, Any]:
+        path = Path(path_value).resolve()
+        _snapshot, digest = _read_path_snapshot(path)
+        return {"path": str(path), "sha256": digest}
+
+    def registered_file_binding(
+        path_value: Path | str,
+        declared_sha256: str | None,
+        *,
+        label: str,
+    ) -> dict[str, Any]:
+        binding = file_binding(path_value)
+        if declared_sha256 is not None and binding["sha256"] != declared_sha256:
+            raise ValueError(f"{label} changed from its registered SHA-256")
+        return {**binding, "declared_sha256": declared_sha256}
+
+    candidate_pool_registry = {
+        str(fold): file_binding(path) for fold, path in sorted(runner.candidate_pool_paths.items())
+    }
+    query_artifact_registry = {
+        str(fold): {
+            **registered_file_binding(
+                artifact.path,
+                artifact.artifact_sha256,
+                label=f"query evidence fold {fold}",
+            ),
+            "outer_fold": artifact.outer_fold,
+            "scope": artifact.scope,
+            "fit_row_fingerprint": artifact.fit_row_fingerprint,
+            "heldout_row_fingerprint": artifact.heldout_row_fingerprint,
+        }
+        for fold, artifact in sorted(runner.query_evidence_by_fold.items())
+    }
+    orphan_artifact_registry = {
+        str(fold): {
+            **registered_file_binding(
+                artifact.path,
+                artifact.artifact_sha256,
+                label=f"orphan evidence fold {fold}",
+            ),
+        }
+        for fold, artifact in sorted(runner.tfidf_orphan_artifacts_by_fold.items())
+    }
+
+    hierarchical_runner_identity_raw = runner.hierarchical_discovery_runner.identity()
+    if not isinstance(hierarchical_runner_identity_raw, Mapping):
+        raise TypeError("hierarchical discovery runner identity must be a mapping")
+    hierarchical_runner_identity = json.loads(_canonical_json(hierarchical_runner_identity_raw))
+    runner.hierarchical_review_evidence_policy.validate_authentication()
+    body = {
+        "spent_evidence_provider": spent_identity,
+        "review_partition_provider": partition_identity,
+        "shared_first_gate_provider": gate_source_identity,
+        "final_upstream_producer": _review_provider_identity(
+            runner.final_upstream_producer,
+            label="final_upstream_producer",
+        ),
+        "raw_final_upstream_producer": _review_provider_identity(
+            runner.raw_final_upstream_producer,
+            label="raw_final_upstream_producer",
+        ),
+        "final_causal_forest_backend": _review_provider_identity(
+            runner.final_causal_forest_backend,
+            label="final_causal_forest_backend",
+        ),
+        "extraction_cache_overlay": _review_provider_identity(
+            runner.cache_overlay,
+            label="cache_overlay",
+        ),
+        "hierarchical_runner_identity": hierarchical_runner_identity,
+        "hierarchical_discovery_config": runner.hierarchical_discovery_config.as_dict(),
+        "frozen_review_evidence_policy": (runner.hierarchical_review_evidence_policy.as_dict()),
+        "effective_runner_config": asdict(runner.config),
+        "hierarchical_architecture_chunk_limits": {
+            "max_atoms_per_chunk": runner.hierarchical_max_atoms_per_chunk,
+            "max_bytes_per_chunk": runner.hierarchical_max_bytes_per_chunk,
+            "max_semantic_member_ids_per_chunk": (
+                runner.hierarchical_max_semantic_member_ids_per_chunk
+            ),
+        },
+        "dataset_artifact": file_binding(runner.dataset_path),
+        "legacy_handoff_artifact": file_binding(runner.legacy_handoff_path),
+        "tfidf_handoff_artifact": file_binding(runner.tfidf_handoff_path),
+        "legacy_primary_predictions_artifact": (
+            None
+            if runner.legacy_primary_predictions_path is None
+            else file_binding(runner.legacy_primary_predictions_path)
+        ),
+        "candidate_pool_registry": candidate_pool_registry,
+        "query_evidence_registry": query_artifact_registry,
+        "tfidf_orphan_registry": orphan_artifact_registry,
+        "coordinate_preserving_nuisance_view_names": (
+            None
+            if runner.coordinate_preserving_nuisance_view_names is None
+            else list(runner.coordinate_preserving_nuisance_view_names)
+        ),
+        "output_dir": str(runner.output_dir),
+        "hierarchical_preparation_dir": str(runner.hierarchical_preparation_dir),
+        "hierarchical_job_cache_root": str(runner.hierarchical_discovery_job_cache_root),
+        "caller_replay_registrations_accepted": False,
+        "runtime_sources_reauthenticated_by_exact_provider_identities": True,
+    }
+    binding = {
+        "schema_version": PRODUCTION_HIERARCHY_RUNTIME_BINDING_SCHEMA,
+        "content_sha256": _content_sha256(body),
+        "body": json.loads(_canonical_json(body)),
+    }
+    objects = tuple(
+        (
+            name,
+            getattr(runner, name),
+        )
+        for name in (
+            "review_spent_evidence_provider",
+            "review_partition_provider",
+            "review_gate_source_provider",
+            "review_gate_feature_bank_provider",
+            "final_upstream_producer",
+            "raw_final_upstream_producer",
+            "final_causal_forest_backend",
+            "cache_overlay",
+            "hierarchical_discovery_runner",
+            "hierarchical_discovery_config",
+            "hierarchical_review_evidence_policy",
+            "config",
+            "fusion_agent",
+            "extraction_provider",
+            "review_agent",
+            "tfidf_validator",
+            "candidate_pool_paths",
+            "query_evidence_by_fold",
+            "tfidf_orphan_artifacts_by_fold",
+        )
+    )
+    return binding, objects
+
+
+def _issue_prepared_hierarchy_capability(
+    prepared: "PreparedHierarchicalDiscoveryBatch",
+) -> None:
+    token = secrets.token_hex(32)
+    object.__setattr__(prepared, "_internal_capability_token", token)
+    identifier = id(prepared)
+
+    def discard(reference: weakref.ReferenceType[object]) -> None:
+        with _PREPARED_HIERARCHY_CAPABILITY_LOCK:
+            registered = _PREPARED_HIERARCHY_CAPABILITIES.get(identifier)
+            if registered is not None and registered[0] is reference:
+                _PREPARED_HIERARCHY_CAPABILITIES.pop(identifier, None)
+
+    reference = weakref.ref(prepared, discard)
+    with _PREPARED_HIERARCHY_CAPABILITY_LOCK:
+        if identifier in _PREPARED_HIERARCHY_CAPABILITIES:
+            raise RuntimeError("prepared hierarchy batch already has an internal capability")
+        _PREPARED_HIERARCHY_CAPABILITIES[identifier] = (reference, token)
+
+
+def _claim_prepared_hierarchy_capability(
+    prepared: "PreparedHierarchicalDiscoveryBatch",
+) -> str:
+    if type(prepared) is not PreparedHierarchicalDiscoveryBatch:
+        raise TypeError("prepared batch must be the concrete in-process prepared batch type")
+    token = prepared._internal_capability_token
+    with _PREPARED_HIERARCHY_CAPABILITY_LOCK:
+        registered = _PREPARED_HIERARCHY_CAPABILITIES.get(id(prepared))
+        if (
+            not token
+            or registered is None
+            or registered[0]() is not prepared
+            or registered[1] != token
+        ):
+            raise RuntimeError("prepared hierarchy batch has no fresh in-memory capability")
+        _PREPARED_HIERARCHY_CAPABILITIES.pop(id(prepared), None)
+    return token
+
+
+def _mark_prepared_hierarchy_external_execution(
+    prepared: "PreparedHierarchicalDiscoveryBatch",
+) -> None:
+    token = prepared._internal_capability_token
+    with _PREPARED_HIERARCHY_CAPABILITY_LOCK:
+        registered = _PREPARED_HIERARCHY_CAPABILITIES.get(id(prepared))
+        if registered is None or registered[0]() is not prepared or registered[1] != token:
+            raise RuntimeError("prepared hierarchy batch is not fresh for execution")
+        _PREPARED_HIERARCHY_CAPABILITIES.pop(id(prepared), None)
+
+
+@dataclass(frozen=True)
+class PreparedHierarchicalDiscoveryBatch:
+    """Inspectable all-fold batch assembled without a hierarchy runner call."""
+
+    coordinator: ApprovedHierarchicalDiscoveryBatchCoordinator = field(repr=False)
+    folds: tuple[PreparedHierarchicalDiscoveryFold, ...] = field(repr=False)
+    input_manifest_sha256: str
+    input_manifest_path: Path
+    context_fit_overlay_companion_path: Path
+    context_fit_overlay_companion_sha256: str
+    first_gate_materialization_intent_index_path: Path
+    first_gate_materialization_intent_index_sha256: str
+    batch_packet_path: Path
+    dataset_sha256: str
+    _internal_capability_token: str = field(
+        init=False,
+        repr=False,
+        compare=False,
+        default="",
+    )
+
+    def __post_init__(self) -> None:
+        if not _SHA256.fullmatch(self.input_manifest_sha256):
+            raise ValueError("hierarchical preparation input manifest SHA-256 is malformed")
+        if not _SHA256.fullmatch(self.dataset_sha256):
+            raise ValueError("hierarchical preparation dataset SHA-256 is malformed")
+        if self.coordinator.input_manifest_sha256 != self.input_manifest_sha256:
+            raise ValueError("hierarchical coordinator cites a different input manifest")
+        observed = tuple(row.outer_fold for row in self.folds)
+        if observed != tuple(range(1, len(observed) + 1)):
+            raise ValueError("hierarchical prepared folds must be complete and ordered")
+        if not self.input_manifest_path.is_file() or not self.batch_packet_path.is_file():
+            raise ValueError("hierarchical preparation artifacts are missing")
+        if (
+            not self.context_fit_overlay_companion_path.is_file()
+            or not _SHA256.fullmatch(self.context_fit_overlay_companion_sha256)
+            or sha256_file(self.context_fit_overlay_companion_path)
+            != self.context_fit_overlay_companion_sha256
+        ):
+            raise ValueError("hierarchical context-fit overlay companion is unauthenticated")
+        if (
+            not self.first_gate_materialization_intent_index_path.is_file()
+            or not _SHA256.fullmatch(self.first_gate_materialization_intent_index_sha256)
+            or sha256_file(self.first_gate_materialization_intent_index_path)
+            != self.first_gate_materialization_intent_index_sha256
+        ):
+            raise ValueError("hierarchical first-gate intent index is unauthenticated")
+
+    @property
+    def approval_sha256(self) -> str:
+        return self.coordinator.precommit.approval_sha256
+
+    def render_offline_precommit(self, *, indent: int = 2) -> str:
+        return self.coordinator.render_offline_precommit(indent=indent)
+
+    def execute(self, *, approved_batch_sha256: str) -> ApprovedHierarchicalDiscoveryBatchResult:
+        _mark_prepared_hierarchy_external_execution(self)
+        return self.coordinator.execute(approved_batch_sha256=approved_batch_sha256)
+
+    def execute_with_internal_authorization(
+        self,
+        *,
+        authorization: object,
+        runner: "AllEvidenceFusionRunner",
+    ) -> ApprovedHierarchicalDiscoveryBatchResult:
+        """Execute once using provider-bound authority, without a user digest."""
+
+        from .production_stage1_hierarchy_handoff import (
+            AuthenticatedProductionStage1HierarchyExecutionAuthorization,
+        )
+
+        if type(authorization) is not AuthenticatedProductionStage1HierarchyExecutionAuthorization:
+            raise TypeError("production hierarchy execution requires the exact typed authorization")
+        result = authorization._execute_for_prepared_batch(
+            prepared_batch=self,
+            runner=runner,
+        )
+        return result
+
+
 class AllEvidenceFusionRunner:
     """Run fold-local remote fusion and deterministic structured estimation."""
 
@@ -4142,7 +4734,7 @@ class AllEvidenceFusionRunner:
         legacy_handoff_path: Path | str,
         tfidf_handoff_path: Path | str,
         output_dir: Path | str,
-        fusion_agent: Callable[[Any], Mapping[str, Any]] | Any,
+        fusion_agent: Callable[[Any], Mapping[str, Any]] | Any | None,
         extraction_provider: Any,
         review_agent: Callable[[Any], Mapping[str, Any]] | Any | None = None,
         review_spent_evidence_provider: ReviewSpentEvidenceProvider | None = None,
@@ -4155,6 +4747,7 @@ class AllEvidenceFusionRunner:
         ) = None,
         final_upstream_producer: FinalUpstreamProducer | None = None,
         raw_final_upstream_producer: FinalContextFitUpstreamProducer | None = None,
+        coordinate_preserving_nuisance_view_names: Sequence[str] | None = None,
         final_causal_forest_backend: FinalCausalForestBackend | None = None,
         config: AllEvidenceFusionRunnerConfig = AllEvidenceFusionRunnerConfig(),
         candidate_pool_paths: Mapping[int, Path | str] | None = None,
@@ -4169,6 +4762,17 @@ class AllEvidenceFusionRunner:
         legacy_primary_predictions_path: Path | str | None = None,
         cache_overlay: FrozenExtractionCacheOverlay | None = None,
         tfidf_validator: Callable[..., Mapping[str, Any]] | None = None,
+        hierarchical_discovery_runner: MetadataJsonDiscoveryJobRunner | None = None,
+        hierarchical_discovery_config: HierarchicalDiscoveryConfig | None = None,
+        hierarchical_discovery_job_cache_root: Path | str | None = None,
+        hierarchical_discovery_approved_batch_sha256: str | None = None,
+        hierarchical_review_evidence_policy: FrozenReviewEvidencePolicyBinding | None = None,
+        hierarchical_preparation_dir: Path | str | None = None,
+        hierarchical_max_atoms_per_chunk: int = (DEFAULT_MAX_ATOMS_PER_ARCHITECTURE_CHUNK),
+        hierarchical_max_bytes_per_chunk: int = (DEFAULT_MAX_BYTES_PER_ARCHITECTURE_CHUNK),
+        hierarchical_max_semantic_member_ids_per_chunk: int = (
+            DEFAULT_MAX_SEMANTIC_MEMBER_IDS_PER_ARCHITECTURE_CHUNK
+        ),
     ) -> None:
         self.dataset_path = Path(dataset_path).resolve()
         self.legacy_handoff_path = Path(legacy_handoff_path).resolve()
@@ -4183,7 +4787,171 @@ class AllEvidenceFusionRunner:
         self.review_gate_feature_bank_provider = review_gate_feature_bank_provider
         self.final_upstream_producer = final_upstream_producer
         self.raw_final_upstream_producer = raw_final_upstream_producer
+        self.coordinate_preserving_nuisance_view_names = (
+            None
+            if coordinate_preserving_nuisance_view_names is None
+            else tuple(str(value).strip() for value in coordinate_preserving_nuisance_view_names)
+        )
         self.config = config
+        self.hierarchical_discovery_runner = hierarchical_discovery_runner
+        self.hierarchical_discovery_config = hierarchical_discovery_config
+        self.hierarchical_discovery_job_cache_root = (
+            None
+            if hierarchical_discovery_job_cache_root is None
+            else Path(hierarchical_discovery_job_cache_root).resolve()
+        )
+        self.hierarchical_discovery_approved_batch_sha256 = (
+            None
+            if hierarchical_discovery_approved_batch_sha256 is None
+            else str(hierarchical_discovery_approved_batch_sha256).strip().lower()
+        )
+        self.hierarchical_review_evidence_policy = hierarchical_review_evidence_policy
+        self.hierarchical_preparation_dir = (
+            None
+            if hierarchical_preparation_dir is None
+            else Path(hierarchical_preparation_dir).resolve()
+        )
+        self.hierarchical_max_atoms_per_chunk = hierarchical_max_atoms_per_chunk
+        self.hierarchical_max_bytes_per_chunk = hierarchical_max_bytes_per_chunk
+        self.hierarchical_max_semantic_member_ids_per_chunk = (
+            hierarchical_max_semantic_member_ids_per_chunk
+        )
+        for label in (
+            "hierarchical_max_atoms_per_chunk",
+            "hierarchical_max_bytes_per_chunk",
+            "hierarchical_max_semantic_member_ids_per_chunk",
+        ):
+            value = getattr(self, label)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{label} must be a positive integer")
+        self.hierarchical_discovery_enabled = self.hierarchical_discovery_runner is not None
+        hierarchical_values = {
+            "hierarchical_discovery_config": self.hierarchical_discovery_config,
+            "hierarchical_discovery_job_cache_root": (self.hierarchical_discovery_job_cache_root),
+            "hierarchical_discovery_approved_batch_sha256": (
+                self.hierarchical_discovery_approved_batch_sha256
+            ),
+            "hierarchical_review_evidence_policy": self.hierarchical_review_evidence_policy,
+            "hierarchical_preparation_dir": self.hierarchical_preparation_dir,
+        }
+        if not self.hierarchical_discovery_enabled:
+            unexpected = sorted(
+                name for name, value in hierarchical_values.items() if value is not None
+            )
+            if unexpected:
+                raise ValueError(
+                    "hierarchical discovery options require hierarchical_discovery_runner: "
+                    f"{unexpected}"
+                )
+            if self.fusion_agent is None:
+                raise ValueError("legacy initial discovery requires fusion_agent")
+        else:
+            if self.fusion_agent is not None:
+                raise ValueError(
+                    "hierarchical and legacy initial discovery agents are mutually exclusive"
+                )
+            if not isinstance(self.hierarchical_discovery_runner, MetadataJsonDiscoveryJobRunner):
+                raise TypeError(
+                    "hierarchical_discovery_runner must expose identity, run_json, and "
+                    "execution_metadata"
+                )
+            if not isinstance(self.hierarchical_discovery_config, HierarchicalDiscoveryConfig):
+                raise TypeError("hierarchical_discovery_config must be HierarchicalDiscoveryConfig")
+            if self.hierarchical_discovery_job_cache_root is None:
+                raise ValueError(
+                    "hierarchical discovery requires an explicit stable job cache root"
+                )
+            if not isinstance(
+                self.hierarchical_review_evidence_policy,
+                FrozenReviewEvidencePolicyBinding,
+            ):
+                raise TypeError(
+                    "hierarchical_review_evidence_policy must be "
+                    "FrozenReviewEvidencePolicyBinding"
+                )
+            self.hierarchical_review_evidence_policy.validate_authentication()
+            if (
+                self.hierarchical_review_evidence_policy.adaptive_config().max_operations
+                != self.config.post_extraction_review_max_operations
+            ):
+                raise ValueError(
+                    "hierarchical adaptive max_operations must equal the runner review bound"
+                )
+            adaptive_chunk_limits = self.hierarchical_review_evidence_policy.adaptive_config()
+            expected_chunk_limits = {
+                "max_atoms_per_chunk": self.hierarchical_max_atoms_per_chunk,
+                "max_bytes_per_chunk": self.hierarchical_max_bytes_per_chunk,
+                "max_semantic_member_ids_per_chunk": (
+                    self.hierarchical_max_semantic_member_ids_per_chunk
+                ),
+            }
+            observed_chunk_limits = {
+                key: getattr(adaptive_chunk_limits, key) for key in expected_chunk_limits
+            }
+            if observed_chunk_limits != expected_chunk_limits:
+                raise ValueError(
+                    "initial and adaptive hierarchical architecture chunk limits must match; "
+                    f"initial={expected_chunk_limits}, adaptive={observed_chunk_limits}"
+                )
+            if (
+                self.hierarchical_discovery_config.max_semantic_member_ids_per_chunk
+                != self.hierarchical_max_semantic_member_ids_per_chunk
+            ):
+                raise ValueError(
+                    "hierarchy config and initial architecture chunk plan must use the same "
+                    "max_semantic_member_ids_per_chunk"
+                )
+            if self.hierarchical_preparation_dir is None:
+                raise ValueError(
+                    "hierarchical discovery requires a separate hierarchical_preparation_dir"
+                )
+            output_resolved = self.output_dir.resolve()
+            preparation = self.hierarchical_preparation_dir
+            if (
+                preparation == output_resolved
+                or preparation.is_relative_to(output_resolved)
+                or output_resolved.is_relative_to(preparation)
+            ):
+                raise ValueError(
+                    "hierarchical_preparation_dir and final output_dir must be separate "
+                    "non-nested directories"
+                )
+            cache_root = self.hierarchical_discovery_job_cache_root
+            if not cache_root.is_relative_to(preparation):
+                raise ValueError(
+                    "hierarchical job cache root must be contained by the preparation directory"
+                )
+            if (
+                self.hierarchical_discovery_approved_batch_sha256 is not None
+                and _SHA256.fullmatch(self.hierarchical_discovery_approved_batch_sha256) is None
+            ):
+                raise ValueError(
+                    "hierarchical_discovery_approved_batch_sha256 must be a lowercase SHA-256"
+                )
+            if self.config.post_extraction_review_rounds < 1:
+                raise ValueError(
+                    "hierarchical production discovery requires at least one untouched review gate"
+                )
+            if (
+                self.review_gate_source_provider is None
+                or self.review_gate_source_provider is not self.review_gate_feature_bank_provider
+                or not callable(getattr(self.review_gate_source_provider, "bind_fold", None))
+            ):
+                raise ValueError(
+                    "hierarchical production discovery requires one shared bindable "
+                    "source/feature gate provider"
+                )
+            if self.review_spent_evidence_provider is None:
+                raise ValueError(
+                    "hierarchical production discovery requires spent-only Stage-1 evidence"
+                )
+            if (
+                self.hierarchical_discovery_config.max_integrated_features
+                > self.config.max_candidates
+            ):
+                raise ValueError(
+                    "hierarchical max_integrated_features cannot exceed runner max_candidates"
+                )
         if (
             self.raw_final_upstream_producer is not None
             and type(self.raw_final_upstream_producer) is not FinalContextFitUpstreamProducer
@@ -4205,6 +4973,13 @@ class AllEvidenceFusionRunner:
             raise ValueError(
                 "a final causal-forest backend may be injected only with the exact raw runtime"
             )
+        if (
+            self.coordinate_preserving_nuisance_view_names is not None
+            and self.raw_final_upstream_producer is None
+        ):
+            raise ValueError(
+                "coordinate-preserving nuisance views require the exact raw final runtime"
+            )
         self.final_causal_forest_backend_was_injected = final_causal_forest_backend is not None
         self.final_causal_forest_backend = (
             final_causal_forest_backend
@@ -4215,7 +4990,8 @@ class AllEvidenceFusionRunner:
                 else None
             )
         )
-        _validate_fusion_reasoning_configuration(self.fusion_agent, self.config)
+        if not self.hierarchical_discovery_enabled:
+            _validate_fusion_reasoning_configuration(self.fusion_agent, self.config)
         if self.config.post_extraction_review_rounds > 0:
             if self.review_agent is None:
                 raise ValueError(
@@ -4333,12 +5109,28 @@ class AllEvidenceFusionRunner:
             self.final_causal_forest_backend,
             label="final_causal_forest_backend",
         )
+        self.coordinate_preserving_nuisance_contract_sha256: str | None = None
+        self.coordinate_preserving_producer_precommit_sha256: str | None = None
         if self.raw_final_upstream_producer is not None:
             raw_digest = self._assert_raw_final_upstream_producer_identity()
             if self._assert_final_upstream_producer_identity() != raw_digest:
                 raise ValueError(
                     "the final package producer is not identity-bound to the exact raw runtime"
                 )
+            if self.coordinate_preserving_nuisance_view_names is not None:
+                self.coordinate_preserving_nuisance_contract_sha256 = (
+                    coordinate_preserving_nuisance_contract_sha256(
+                        self.coordinate_preserving_nuisance_view_names
+                    )
+                )
+                self.coordinate_preserving_producer_precommit_sha256 = (
+                    precommit_runtime_producer_identity_sha256(self.raw_final_upstream_producer)
+                )
+                if self.coordinate_preserving_producer_precommit_sha256 != raw_digest:
+                    raise ValueError(
+                        "coordinate-preserving producer precommit differs from the runner "
+                        "runtime identity"
+                    )
         self.candidate_pool_paths = {
             int(key): Path(value) for key, value in (candidate_pool_paths or {}).items()
         }
@@ -4440,6 +5232,445 @@ class AllEvidenceFusionRunner:
                 )
             return delegated
         return digest
+
+    def prepare_hierarchical_discovery_batch(
+        self,
+    ) -> PreparedHierarchicalDiscoveryBatch:
+        """Prepare every fold and one inspectable batch without running discovery.
+
+        This method is the public cross-process approval seam.  It may perform
+        local spent-context Stage-1 fitting and authenticate the first
+        label-free review-gate cache, but it never consults the hierarchical
+        JSON-job cache and never invokes ``hierarchical_discovery_runner``.
+        Every artifact it creates lives below ``hierarchical_preparation_dir``.
+        """
+
+        if not self.hierarchical_discovery_enabled:
+            raise RuntimeError("hierarchical discovery is not configured")
+        assert self.hierarchical_discovery_runner is not None
+        assert self.hierarchical_discovery_config is not None
+        assert self.hierarchical_discovery_job_cache_root is not None
+        assert self.hierarchical_review_evidence_policy is not None
+        assert self.hierarchical_preparation_dir is not None
+
+        runner_records_before = tuple(
+            json.loads(_canonical_json(row))
+            for row in self.hierarchical_discovery_runner.execution_metadata
+        )
+        data, dataset_sha256 = _load_sanitized_dataset_snapshot(
+            self.dataset_path,
+            text_column=self.config.text_column,
+            treatment_column=self.config.treatment_column,
+            outcome_column=self.config.outcome_column,
+        )
+        external_validation: Mapping[str, Any] | None = None
+        if self.tfidf_validator is not None:
+            external_validation = self.tfidf_validator(
+                dataset=data.drop(columns=["_oci_row_id"]),
+                handoff_path=self.tfidf_handoff_path,
+            )
+            if (
+                not isinstance(external_validation, Mapping)
+                or external_validation.get("status") != "passed"
+            ):
+                raise RuntimeError("external TF-IDF handoff validation did not pass")
+        legacy = load_legacy_full_outer_evidence(self.legacy_handoff_path)
+        tfidf = load_resealed_tfidf_handoff(
+            self.tfidf_handoff_path,
+            dataset_row_count=len(data),
+            require_registry_seal=self.config.require_registry_seal,
+        )
+        folds = tuple(sorted(tfidf.full_rows_by_outer_fold))
+        if set(legacy.rows_by_outer_fold) != set(folds):
+            raise ValueError("legacy and TF-IDF full-outer fold sets do not match exactly")
+        if folds != tuple(range(1, len(folds) + 1)):
+            raise ValueError(
+                "hierarchical batch approval requires complete one-based contiguous folds"
+            )
+        unexpected = (
+            (set(self.candidate_pool_paths) | set(self.query_evidence_by_fold))
+            | set(self.tfidf_orphan_artifacts_by_fold)
+        ) - set(folds)
+        if unexpected:
+            raise ValueError(
+                "candidate/query/orphan artifact registry contains an unknown outer fold"
+            )
+        legacy_split_audit: Mapping[str, Any] | None = None
+        if self.legacy_primary_predictions_path is not None:
+            legacy_heldout, legacy_primary_sha256 = (
+                _load_outer_splits_from_primary_predictions_snapshot(
+                    self.legacy_primary_predictions_path,
+                    dataset_row_count=len(data),
+                )
+            )
+            if set(legacy_heldout) != set(folds):
+                raise ValueError("legacy primary-prediction fold set does not match TF-IDF")
+            for outer_fold in folds:
+                tfidf_heldout = set(
+                    map(
+                        int,
+                        tfidf.full_rows_by_outer_fold[outer_fold]["heldout_row_ids"],
+                    )
+                )
+                if set(legacy_heldout[outer_fold]) != tfidf_heldout:
+                    raise ValueError(
+                        f"legacy and TF-IDF heldout splits differ for fold {outer_fold}"
+                    )
+            legacy_split_audit = {
+                "path": str(self.legacy_primary_predictions_path),
+                "sha256": legacy_primary_sha256,
+                "matches_tfidf_outer_splits": True,
+            }
+
+        shared_provider = self.review_gate_source_provider
+        if shared_provider is None or shared_provider is not self.review_gate_feature_bank_provider:
+            raise RuntimeError("hierarchical shared gate provider changed after construction")
+        current_shared_identity = _review_provider_identity(
+            shared_provider,
+            label="hierarchical_shared_gate_provider",
+        )
+        if (
+            current_shared_identity != self.review_gate_source_provider_identity
+            or current_shared_identity != self.review_gate_feature_bank_provider_identity
+        ):
+            raise RuntimeError("hierarchical shared gate provider identity changed")
+        current_spent_identity = _review_provider_identity(
+            self.review_spent_evidence_provider,
+            label="review_spent_evidence_provider",
+        )
+        if current_spent_identity != self.review_spent_evidence_provider_identity:
+            raise RuntimeError("spent-only evidence provider identity changed")
+        semantic_compatibility_identity = current_spent_projection_compatibility_identity()
+
+        preparation_dir = self.hierarchical_preparation_dir
+        companion_body = {
+            "runner_schema_version": RUNNER_SCHEMA_VERSION,
+            "post_extraction_review_providers": {
+                "calibrated_gate_sources": self.review_gate_source_provider_identity,
+                "role_aware_gate_feature_banks": (self.review_gate_feature_bank_provider_identity),
+            },
+            "final_upstream_model_inputs": {
+                "producer": self.final_upstream_producer_identity,
+            },
+        }
+        companion_identity_sha256 = _content_sha256(companion_body)
+        context_fit_overlay_companion_path = (
+            preparation_dir / "context_fit_overlay_companions" / f"{companion_identity_sha256}.json"
+        )
+        _write_immutable_json(
+            context_fit_overlay_companion_path,
+            companion_body,
+            schema=RUNNER_SCHEMA_VERSION,
+        )
+        context_fit_overlay_companion_sha256 = sha256_file(context_fit_overlay_companion_path)
+        input_manifest_body = {
+            "runner_schema_version": RUNNER_SCHEMA_VERSION,
+            "preparation_schema_version": (HIERARCHICAL_DISCOVERY_PREPARATION_INPUT_SCHEMA_VERSION),
+            "runner_implementation_file_sha256": hashlib.sha256(
+                Path(__file__).read_bytes()
+            ).hexdigest(),
+            "dataset": {
+                "path": str(self.dataset_path),
+                "sha256": dataset_sha256,
+                "row_count": len(data),
+                "text_fingerprint": ordered_dataset_text_fingerprint(
+                    data,
+                    text_column=self.config.text_column,
+                ),
+            },
+            "legacy_handoff": {
+                "path": legacy.artifact_path,
+                "sha256": legacy.artifact_sha256,
+                "primary_split_audit": legacy_split_audit,
+            },
+            "tfidf_handoff": {
+                "path": tfidf.artifact_path,
+                "sha256": tfidf.artifact_sha256,
+                "split_registry_content_hash": tfidf.split_registry_content_hash,
+                "external_validation": external_validation,
+            },
+            "outer_folds": [
+                {
+                    "outer_fold": outer_fold,
+                    "fit_row_fingerprint": row_set_fingerprint(
+                        tfidf.full_rows_by_outer_fold[outer_fold]["fit_row_ids"]
+                    ),
+                    "heldout_row_fingerprint": row_set_fingerprint(
+                        tfidf.full_rows_by_outer_fold[outer_fold]["heldout_row_ids"]
+                    ),
+                    "fit_row_count": len(tfidf.full_rows_by_outer_fold[outer_fold]["fit_row_ids"]),
+                    "heldout_row_count": len(
+                        tfidf.full_rows_by_outer_fold[outer_fold]["heldout_row_ids"]
+                    ),
+                }
+                for outer_fold in folds
+            ],
+            "effective_runner_config": asdict(self.config),
+            "hierarchical_discovery_config": self.hierarchical_discovery_config.as_dict(),
+            "hierarchical_architecture_chunk_limits": {
+                "max_atoms_per_chunk": self.hierarchical_max_atoms_per_chunk,
+                "max_bytes_per_chunk": self.hierarchical_max_bytes_per_chunk,
+                "max_semantic_member_ids_per_chunk": (
+                    self.hierarchical_max_semantic_member_ids_per_chunk
+                ),
+            },
+            "hierarchical_runner_identity": json.loads(
+                _canonical_json(self.hierarchical_discovery_runner.identity())
+            ),
+            "production_family_explanations": production_stage1_family_explanations(),
+            "semantic_retrieval_compatibility": semantic_compatibility_identity,
+            "spent_evidence_provider": self.review_spent_evidence_provider_identity,
+            "shared_first_gate_provider": current_shared_identity,
+            "frozen_review_evidence_policy": (self.hierarchical_review_evidence_policy.as_dict()),
+            "final_upstream_producer": self.final_upstream_producer_identity,
+            "raw_final_upstream_producer": self.raw_final_upstream_producer_identity,
+            "final_causal_forest_backend": self.final_causal_forest_backend_identity,
+            "extraction_cache_overlay": self.cache_overlay_identity,
+            "hierarchical_preparation_dir": str(preparation_dir),
+            "hierarchical_job_cache_root": str(self.hierarchical_discovery_job_cache_root),
+            "context_fit_overlay_companion": {
+                "path": str(context_fit_overlay_companion_path),
+                "sha256": context_fit_overlay_companion_sha256,
+                "overlay_compatible_closed_run_attestation": True,
+            },
+            "outer_heldout_labels_used": False,
+            "hierarchy_runner_calls_during_preparation": 0,
+        }
+        input_manifest_path = preparation_dir / "immutable_hierarchical_input_manifest.json"
+        input_manifest_sha256 = _write_immutable_json(
+            input_manifest_path,
+            input_manifest_body,
+            schema=HIERARCHICAL_DISCOVERY_PREPARATION_INPUT_SCHEMA_VERSION,
+        )
+
+        label_free = data[["_oci_row_id", self.config.text_column]].copy()
+        indexed = data.set_index("_oci_row_id", drop=False)
+        prepared_folds: list[PreparedHierarchicalDiscoveryFold] = []
+        ordered_agents: list[OrderedFoldDiscoveryAgent] = []
+        first_gate_intent_index_entries: list[dict[str, Any]] = []
+        family_explanations = production_stage1_family_explanations()
+        for outer_fold in folds:
+            fold_dir = preparation_dir / f"outer_fold_{outer_fold:03d}"
+            full = tfidf.full_rows_by_outer_fold[outer_fold]
+            train_ids = tuple(map(int, full["fit_row_ids"]))
+            outer_train = indexed.loc[list(train_ids)].reset_index(drop=True)
+            schedule = self._review_schedule(
+                outer_train=outer_train,
+                outer_fold=outer_fold,
+            )
+            evidence_inputs, evidence_audit, prefit_catalog = self._spent_evidence_inputs(
+                data=data,
+                schedule=schedule,
+                spent_fold_ids=schedule.initial_spent_fold_ids,
+                outer_fold=outer_fold,
+                review_round=0,
+            )
+            catalog = (
+                prefit_catalog
+                if prefit_catalog is not None
+                else build_role_neutral_evidence_catalog(evidence_inputs)
+            )
+            chunk_plan = build_complete_architecture_chunks(
+                catalog,
+                max_atoms_per_chunk=self.hierarchical_max_atoms_per_chunk,
+                max_bytes_per_chunk=self.hierarchical_max_bytes_per_chunk,
+                max_semantic_member_ids_per_chunk=(
+                    self.hierarchical_max_semantic_member_ids_per_chunk
+                ),
+            )
+
+            spent_ids = schedule.row_ids(schedule.initial_spent_fold_ids)
+            first_gate_ids = schedule.row_ids((schedule.gate_fold_ids[0],))
+            spent_frame = indexed.loc[list(spent_ids)]
+            fold_by_row = {
+                row_id: fold_id
+                for fold_id, rows in schedule.row_ids_by_fold.items()
+                for row_id in rows
+            }
+            spent_texts = tuple(spent_frame[self.config.text_column].astype(str).tolist())
+            gate_texts = tuple(
+                label_free.set_index("_oci_row_id", drop=False)
+                .loc[list(first_gate_ids)][self.config.text_column]
+                .astype(str)
+                .tolist()
+            )
+            first_gate_intent = prepare_first_gate_materialization_intent(
+                outer_fold=outer_fold,
+                initial_spent_row_ids=spent_ids,
+                initial_spent_texts=spent_texts,
+                initial_spent_treatment=spent_frame[self.config.treatment_column].to_numpy(
+                    dtype=float
+                ),
+                initial_spent_outcome=spent_frame[self.config.outcome_column].to_numpy(dtype=float),
+                initial_spent_inner_fold_ids=tuple(fold_by_row[row_id] for row_id in spent_ids),
+                first_gate_row_ids=first_gate_ids,
+                first_gate_texts=gate_texts,
+                catalog=catalog,
+                provider=shared_provider,
+            )
+            first_gate_intent.verify()
+            first_gate_intent_path = fold_dir / "first_gate_materialization_intent.json"
+            first_gate_intent_file_sha256 = _write_immutable_plain_json(
+                first_gate_intent_path,
+                first_gate_intent.as_dict(),
+            )
+            first_gate_intent_index_entries.append(
+                {
+                    "outer_fold": outer_fold,
+                    "intent_path": str(first_gate_intent_path),
+                    "intent_file_sha256": first_gate_intent_file_sha256,
+                    "intent_content_sha256": first_gate_intent.content_sha256,
+                    "source_cache_key": first_gate_intent.body["source_cache_key"],
+                    "materialization_deferred_until_after_exact_approval_and_proposal_freeze": (
+                        True
+                    ),
+                }
+            )
+            catalog_path = fold_dir / "role_neutral_evidence_catalog.json"
+            catalog_file_sha256 = _write_immutable_json(
+                catalog_path,
+                catalog.as_dict(),
+                schema="role_neutral_evidence_catalog_preparation_envelope_v1",
+            )
+            chunk_path = fold_dir / "architecture_chunk_plan.json"
+            chunk_file_sha256 = _write_immutable_json(
+                chunk_path,
+                chunk_plan.as_dict(),
+                schema="architecture_chunk_plan_preparation_envelope_v1",
+            )
+            job_cache = AuthenticatedHierarchicalDiscoveryJobCache(
+                root=(self.hierarchical_discovery_job_cache_root / f"outer_fold_{outer_fold:03d}")
+            )
+            agent = ApprovedHierarchicalDiscoveryAgent(
+                catalog=catalog,
+                chunk_plan=chunk_plan,
+                family_explanations=family_explanations,
+                first_gate_materialization_intent=first_gate_intent,
+                runner=self.hierarchical_discovery_runner,
+                config=self.hierarchical_discovery_config,
+                job_cache=job_cache,
+            )
+            wrapper_path = fold_dir / "approved_hierarchical_wrapper_precommit.json"
+            wrapper_file_sha256 = _write_immutable_json(
+                wrapper_path,
+                {
+                    "approval_sha256": agent.precommit.approval_sha256,
+                    "packet": agent.precommit.packet,
+                },
+                schema=HIERARCHICAL_DISCOVERY_BATCH_PACKET_SCHEMA_VERSION,
+            )
+            fold_manifest_path = fold_dir / "immutable_fold_preparation.json"
+            _write_immutable_json(
+                fold_manifest_path,
+                {
+                    "outer_fold": outer_fold,
+                    "schedule_audit": schedule.audit,
+                    "initial_spent_evidence_audit": evidence_audit,
+                    "catalog_path": str(catalog_path),
+                    "catalog_envelope_content_sha256": catalog_file_sha256,
+                    "catalog_sha256": catalog.catalog_sha256,
+                    "chunk_plan_path": str(chunk_path),
+                    "chunk_plan_envelope_content_sha256": chunk_file_sha256,
+                    "chunk_plan_sha256": chunk_plan.plan_sha256,
+                    "first_gate_materialization_intent_path": str(first_gate_intent_path),
+                    "first_gate_materialization_intent_file_sha256": (
+                        first_gate_intent_file_sha256
+                    ),
+                    "first_gate_materialization_intent_content_sha256": (
+                        first_gate_intent.content_sha256
+                    ),
+                    "first_gate_source_cache_key_precommitted": (
+                        first_gate_intent.body["source_cache_key"]
+                    ),
+                    "first_gate_cache_materialized_before_discovery": False,
+                    "first_gate_cache_materialization_deferred_until_after_exact_approval": True,
+                    "first_gate_cache_materialization_deferred_until_after_proposal_freeze": True,
+                    "first_gate_labels_supplied_to_provider": False,
+                    "first_gate_views_exposed_to_discovery": False,
+                    "wrapper_precommit_path": str(wrapper_path),
+                    "wrapper_precommit_envelope_content_sha256": wrapper_file_sha256,
+                    "wrapper_approval_sha256": agent.precommit.approval_sha256,
+                    "hierarchy_runner_calls_during_preparation": 0,
+                },
+                schema=HIERARCHICAL_DISCOVERY_PREPARATION_FOLD_SCHEMA_VERSION,
+            )
+            prepared = PreparedHierarchicalDiscoveryFold(
+                outer_fold=outer_fold,
+                schedule=schedule,
+                evidence_inputs=evidence_inputs,
+                initial_spent_evidence_audit=evidence_audit,
+                catalog=catalog,
+                chunk_plan=chunk_plan,
+                first_gate_materialization_intent=first_gate_intent,
+                first_gate_materialization_intent_path=first_gate_intent_path,
+                first_gate_materialization_intent_file_sha256=(first_gate_intent_file_sha256),
+                agent=agent,
+                preparation_manifest_path=fold_manifest_path,
+            )
+            prepared_folds.append(prepared)
+            ordered_agents.append(OrderedFoldDiscoveryAgent(outer_fold=outer_fold, agent=agent))
+
+        _assert_semantic_compatibility_identity_current(semantic_compatibility_identity)
+        first_gate_intent_index_content = {
+            "schema_version": "first_gate_materialization_intent_index_v1",
+            "entries": first_gate_intent_index_entries,
+            "all_first_gate_materializations_deferred": True,
+            "gate_labels_in_intents": False,
+        }
+        first_gate_intent_index_payload = {
+            **first_gate_intent_index_content,
+            "content_sha256": _content_sha256(first_gate_intent_index_content),
+        }
+        first_gate_intent_index_identity_sha256 = _content_sha256(first_gate_intent_index_payload)
+        first_gate_materialization_intent_index_path = (
+            preparation_dir
+            / "first_gate_materialization_intent_indexes"
+            / f"{first_gate_intent_index_identity_sha256}.json"
+        )
+        first_gate_materialization_intent_index_sha256 = _write_immutable_plain_json(
+            first_gate_materialization_intent_index_path,
+            first_gate_intent_index_payload,
+        )
+        coordinator = ApprovedHierarchicalDiscoveryBatchCoordinator(
+            input_manifest_sha256=input_manifest_sha256,
+            fold_agents=tuple(ordered_agents),
+            frozen_review_evidence_policy=self.hierarchical_review_evidence_policy,
+        )
+        batch_packet_path = preparation_dir / "approved_hierarchical_batch_precommit.json"
+        _write_immutable_json(
+            batch_packet_path,
+            {
+                "approval_sha256": coordinator.precommit.approval_sha256,
+                "packet": coordinator.precommit.packet,
+            },
+            schema=HIERARCHICAL_DISCOVERY_BATCH_PACKET_SCHEMA_VERSION,
+        )
+        runner_records_after = tuple(
+            json.loads(_canonical_json(row))
+            for row in self.hierarchical_discovery_runner.execution_metadata
+        )
+        if runner_records_after != runner_records_before:
+            raise RuntimeError(
+                "hierarchical discovery runner metadata changed during local preparation"
+            )
+        prepared_batch = PreparedHierarchicalDiscoveryBatch(
+            coordinator=coordinator,
+            folds=tuple(prepared_folds),
+            input_manifest_sha256=input_manifest_sha256,
+            input_manifest_path=input_manifest_path,
+            context_fit_overlay_companion_path=(context_fit_overlay_companion_path),
+            context_fit_overlay_companion_sha256=(context_fit_overlay_companion_sha256),
+            first_gate_materialization_intent_index_path=(
+                first_gate_materialization_intent_index_path
+            ),
+            first_gate_materialization_intent_index_sha256=(
+                first_gate_materialization_intent_index_sha256
+            ),
+            batch_packet_path=batch_packet_path,
+            dataset_sha256=dataset_sha256,
+        )
+        _issue_prepared_hierarchy_capability(prepared_batch)
+        return prepared_batch
 
     def _adapt_orphan_ngram_evidence(
         self,
@@ -4833,7 +6064,11 @@ class AllEvidenceFusionRunner:
         spent_fold_ids: Sequence[int],
         outer_fold: int,
         review_round: int,
-    ) -> tuple[tuple[FoldEvidenceInput, ...], Mapping[str, Any]]:
+    ) -> tuple[
+        tuple[FoldEvidenceInput, ...],
+        Mapping[str, Any],
+        RoleNeutralEvidenceCatalog | None,
+    ]:
         """Materialize only context-fit evidence for one adaptive proposal."""
 
         provider = self.review_spent_evidence_provider
@@ -4851,9 +6086,7 @@ class AllEvidenceFusionRunner:
 
         consumer_review_round = int(review_round)
         context_epoch = _spent_evidence_context_epoch(schedule, spent_fold_ids)
-        expected_context_epoch = (
-            0 if consumer_review_round == 0 else consumer_review_round - 1
-        )
+        expected_context_epoch = 0 if consumer_review_round == 0 else consumer_review_round - 1
         if consumer_review_round < 0 or context_epoch != expected_context_epoch:
             raise ValueError(
                 "spent-evidence context epoch must equal zero for the initial selector "
@@ -4870,20 +6103,77 @@ class AllEvidenceFusionRunner:
             raise RuntimeError("adaptive review evidence requires at least one sealed gate")
         indexed = data.set_index("_oci_row_id", drop=False)
         spent_frame = indexed.loc[list(spent_ids)]
+        spent_texts = tuple(spent_frame[self.config.text_column].astype(str).tolist())
         treatment = spent_frame[self.config.treatment_column].to_numpy(dtype=float).copy()
         outcome = spent_frame[self.config.outcome_column].to_numpy(dtype=float).copy()
         treatment.setflags(write=False)
         outcome.setflags(write=False)
-        raw_inputs = provider.get_spent_evidence_inputs(
-            outer_fold=int(outer_fold),
+        request_arguments = {
+            "outer_fold": int(outer_fold),
             # Provider/cache APIs retain this legacy keyword, but its value is
             # the context epoch, not the reasoning-agent consumer round.
-            review_round=int(context_epoch),
-            exact_spent_row_ids=spent_ids,
-            exact_sealed_row_ids=sealed_ids,
-            spent_texts=tuple(spent_frame[self.config.text_column].astype(str).tolist()),
-            spent_treatment=treatment,
-            spent_outcome=outcome,
+            "review_round": int(context_epoch),
+            "exact_spent_row_ids": spent_ids,
+            "exact_sealed_row_ids": sealed_ids,
+            "spent_texts": spent_texts,
+            "spent_treatment": treatment,
+            "spent_outcome": outcome,
+        }
+        prefit_catalog_method = getattr(provider, "get_spent_evidence_catalog", None)
+        if callable(prefit_catalog_method):
+            catalog = prefit_catalog_method(**request_arguments)
+            if not isinstance(catalog, RoleNeutralEvidenceCatalog):
+                raise TypeError(
+                    "prefit spent-evidence provider must return RoleNeutralEvidenceCatalog"
+                )
+            validate_role_neutral_catalog(catalog)
+            expected_provenance = FoldEvidenceProvenance(
+                outer_fold=int(outer_fold),
+                train_row_ids=tuple(map(int, spent_ids)),
+                heldout_row_ids=tuple(map(int, sealed_ids)),
+                scope="inner_train",
+                inner_fold=int(context_epoch) + 1,
+                artifact_id=(f"production-stage1-hierarchy-{int(outer_fold)}-{int(context_epoch)}"),
+            )
+            if (
+                catalog.outer_fold != int(outer_fold)
+                or catalog.scope != "inner_train"
+                or catalog.inner_fold != int(context_epoch) + 1
+                or catalog.split_fingerprint != expected_provenance.split_fingerprint
+            ):
+                raise ValueError("prefit spent catalog changed its canonical row scope")
+            family_counts = {
+                family: len(catalog.family_atoms(family))
+                for family in ACTIVE_STAGE1_CONCEPT_FAMILIES
+            }
+            if any(count < 1 for count in family_counts.values()):
+                raise ValueError("prefit spent catalog must contain all ten architectures")
+            audit = {
+                "review_round": consumer_review_round,
+                "consumer_review_round": consumer_review_round,
+                "spent_evidence_context_epoch": int(context_epoch),
+                "provider_review_round_argument": int(context_epoch),
+                "consumed_gate_count_before_context_fit": int(context_epoch),
+                "context_epoch_policy_version": (SPENT_EVIDENCE_CONTEXT_EPOCH_POLICY_VERSION),
+                "spent_row_count": len(spent_ids),
+                "sealed_row_count": len(sealed_ids),
+                "spent_row_fingerprint": row_set_fingerprint(spent_ids),
+                "sealed_row_fingerprint": row_set_fingerprint(sealed_ids),
+                "provider_identity_sha256": self.review_spent_evidence_provider_identity[
+                    "identity_sha256"
+                ],
+                "semantic_retrieval_compatibility": None,
+                "source_kinds": list(catalog.audit["source_kinds"]),
+                "family_atom_counts": family_counts,
+                "prefit_cumulative_spent_catalog_used": True,
+                "independent_runtime_stage1_refit_performed": False,
+                "future_gate_text_or_labels_supplied_to_provider": False,
+                "full_outer_discovery_evidence_used": False,
+            }
+            return (), json.loads(_canonical_json(audit)), catalog
+
+        raw_inputs = provider.get_spent_evidence_inputs(
+            **request_arguments,
         )
         if isinstance(raw_inputs, (str, bytes, Mapping)):
             raise TypeError("spent-only evidence provider must return a sequence of inputs")
@@ -4912,15 +6202,28 @@ class AllEvidenceFusionRunner:
                 raise ValueError(
                     "spent-only evidence provenance must hold out every sealed row in order"
                 )
+        semantic_compatibility_audit: Mapping[str, Any] | None = None
+        if self.hierarchical_discovery_enabled:
+            compatibility = restore_current_spent_projection_semantic_retrieval_view(
+                inputs,
+                spent_evidence_provider=provider,
+                outer_fold=int(outer_fold),
+                review_round=int(context_epoch),
+                exact_spent_row_ids=spent_ids,
+                exact_sealed_row_ids=sealed_ids,
+                spent_texts=spent_texts,
+                spent_treatment=treatment,
+                spent_outcome=outcome,
+            )
+            inputs = compatibility.evidence_inputs
+            semantic_compatibility_audit = compatibility.audit
         audit = {
             "review_round": consumer_review_round,
             "consumer_review_round": consumer_review_round,
             "spent_evidence_context_epoch": int(context_epoch),
             "provider_review_round_argument": int(context_epoch),
             "consumed_gate_count_before_context_fit": int(context_epoch),
-            "context_epoch_policy_version": (
-                SPENT_EVIDENCE_CONTEXT_EPOCH_POLICY_VERSION
-            ),
+            "context_epoch_policy_version": (SPENT_EVIDENCE_CONTEXT_EPOCH_POLICY_VERSION),
             "spent_row_count": len(spent_ids),
             "sealed_row_count": len(sealed_ids),
             "spent_row_fingerprint": row_set_fingerprint(spent_ids),
@@ -4928,11 +6231,14 @@ class AllEvidenceFusionRunner:
             "provider_identity_sha256": self.review_spent_evidence_provider_identity[
                 "identity_sha256"
             ],
+            "semantic_retrieval_compatibility": semantic_compatibility_audit,
             "source_kinds": sorted(item.source_kind for item in inputs),
+            "prefit_cumulative_spent_catalog_used": False,
+            "independent_runtime_stage1_refit_performed": True,
             "future_gate_text_or_labels_supplied_to_provider": False,
             "full_outer_discovery_evidence_used": False,
         }
-        return inputs, json.loads(_canonical_json(audit))
+        return inputs, json.loads(_canonical_json(audit)), None
 
     def _spent_fusion_request(
         self,
@@ -4944,13 +6250,17 @@ class AllEvidenceFusionRunner:
         review_round: int,
         candidates: Sequence[CandidateContract] = (),
     ) -> tuple[AllEvidenceFusionRequest, Mapping[str, Any]]:
-        inputs, audit = self._spent_evidence_inputs(
+        inputs, audit, prefit_catalog = self._spent_evidence_inputs(
             data=data,
             schedule=schedule,
             spent_fold_ids=spent_fold_ids,
             outer_fold=outer_fold,
             review_round=review_round,
         )
+        if prefit_catalog is not None:
+            raise RuntimeError(
+                "production prefit spent catalogs are consumed only by hierarchical discovery"
+            )
         request = prepare_all_evidence_fusion(
             inputs,
             candidates=candidates,
@@ -5145,13 +6455,10 @@ class AllEvidenceFusionRunner:
         accepted_round_baseline_specs: Sequence[Mapping[str, Any]] = (),
         workspace_stage_history: Sequence[Mapping[str, Any]] = (),
         workspace_extraction_sha256: str | None = None,
+        frozen_content_addressed_evidence: bool = False,
     ) -> Mapping[str, Any]:
-        if int(spent_evidence_audit.get("consumer_review_round", -1)) != int(
-            review_round
-        ):
-            raise ValueError(
-                "spent-evidence consumer review round does not match review context"
-            )
+        if int(spent_evidence_audit.get("consumer_review_round", -1)) != int(review_round):
+            raise ValueError("spent-evidence consumer review round does not match review context")
         if (
             spent_evidence_audit.get("context_epoch_policy_version")
             != SPENT_EVIDENCE_CONTEXT_EPOCH_POLICY_VERSION
@@ -5228,7 +6535,33 @@ class AllEvidenceFusionRunner:
         # Fail closed on collisions or malformed nested IDs before the context
         # is sent to the reasoning agent.
         collect_post_extraction_diagnostic_ids(diagnostics)
-        sanitized_evidence = self._sanitize_spent_evidence_catalog(evidence_catalog)
+        if frozen_content_addressed_evidence:
+            frozen_rows: list[dict[str, Any]] = []
+            seen_frozen_ids: set[str] = set()
+            for raw in evidence_catalog:
+                if not isinstance(raw, Mapping) or set(raw) != {
+                    "evidence_id",
+                    "source_families",
+                    "role_hint",
+                    "content",
+                }:
+                    raise ValueError("frozen hierarchical review evidence has a wrong closed shape")
+                evidence_id = str(raw["evidence_id"])
+                if (
+                    re.fullmatch(r"evidence_[0-9a-f]{64}", evidence_id) is None
+                    or evidence_id in seen_frozen_ids
+                ):
+                    raise ValueError(
+                        "frozen hierarchical evidence IDs must remain unique and "
+                        "content-addressed"
+                    )
+                if not isinstance(raw["content"], Mapping):
+                    raise TypeError("frozen hierarchical evidence content must be a mapping")
+                seen_frozen_ids.add(evidence_id)
+                frozen_rows.append(json.loads(_canonical_json(dict(raw))))
+            sanitized_evidence = frozen_rows
+        else:
+            sanitized_evidence = self._sanitize_spent_evidence_catalog(evidence_catalog)
         if not sanitized_evidence:
             raise ValueError("spent-only evidence provider produced no review evidence")
         current_by_name = {
@@ -5307,6 +6640,13 @@ class AllEvidenceFusionRunner:
                 "source_and_query_identifiers_are_opaque_or_removed": True,
                 "fresh_gate_derived_aggregates_available": False,
                 "spent_aggregate_numerical_diagnostics_available": True,
+                "hierarchical_frozen_accepted_support_active": bool(
+                    frozen_content_addressed_evidence
+                ),
+                "original_content_addressed_evidence_ids_preserved": bool(
+                    frozen_content_addressed_evidence
+                ),
+                "frozen_evidence_rows_changed_by_legacy_sanitizer": False,
                 "sanitized_prior_gate_feedback_count": sum(
                     str(row.get("kind")) == "prior_gate_feedback" for row in feedback_diagnostics
                 ),
@@ -5760,6 +7100,77 @@ class AllEvidenceFusionRunner:
             exact_gate_row_ids=gate_row_ids,
         )
         return view
+
+    def _hierarchical_gate_views(
+        self,
+        *,
+        outer_fold: int,
+        gate_row_ids: tuple[int, ...],
+        context: ObservableCausalRows,
+        context_texts: Sequence[str],
+        gate_texts: Sequence[str],
+        prebound_provider: Any | None,
+    ) -> tuple[GateSourceSignalView, GateFeatureBankView, bool]:
+        """Bind after proposal freeze, or consume that boundary's verified provider.
+
+        The returned boolean records whether the caller supplied an already
+        bound provider from the just-verified first-gate realization.  It never
+        means that numerical values existed during discovery preparation.
+        """
+
+        provider = self.review_gate_source_provider
+        if (
+            provider is None
+            or provider is not self.review_gate_feature_bank_provider
+            or not callable(getattr(provider, "bind_fold", None))
+        ):
+            raise RuntimeError("hierarchical review lost its shared bindable gate provider")
+        current = _review_provider_identity(
+            provider,
+            label="hierarchical_shared_gate_provider",
+        )
+        if (
+            current != self.review_gate_source_provider_identity
+            or current != self.review_gate_feature_bank_provider_identity
+        ):
+            raise RuntimeError("hierarchical shared gate provider identity changed")
+        lookup = prebound_provider
+        prebound_provider_used = lookup is not None
+        if lookup is None:
+            lookup = provider.bind_fold(
+                outer_fold=int(outer_fold),
+                context=context,
+                context_texts=tuple(map(str, context_texts)),
+                gate_texts=tuple(map(str, gate_texts)),
+                exact_gate_row_ids=gate_row_ids,
+            )
+        get_source = getattr(lookup, "get_gate_source_view", None)
+        get_features = getattr(lookup, "get_gate_feature_bank_view", None)
+        if not callable(get_source) or not callable(get_features):
+            raise TypeError("bound hierarchical gate provider lacks both view methods")
+        source = get_source(
+            outer_fold=int(outer_fold),
+            exact_gate_row_ids=gate_row_ids,
+        )
+        features = get_features(
+            outer_fold=int(outer_fold),
+            exact_gate_row_ids=gate_row_ids,
+        )
+        if not isinstance(source, GateSourceSignalView) or not isinstance(
+            features, GateFeatureBankView
+        ):
+            raise TypeError("bound hierarchical provider returned an invalid gate view")
+        if tuple(source.row_ids) != gate_row_ids or tuple(features.row_ids) != gate_row_ids:
+            raise ValueError("bound hierarchical provider changed exact gate row order")
+        for view in (source, features):
+            view.aligned_values(gate_row_ids)
+            self._gate_view_lineage_audit(view, context=context)
+            view.aligned_conditional_values(
+                exact_context_row_ids=context.row_ids,
+                exact_context_inner_fold_ids=context.inner_fold_ids or (),
+                exact_gate_row_ids=gate_row_ids,
+            )
+        return source, features, prebound_provider_used
 
     @staticmethod
     def _gate_view_lineage_audit(
@@ -6406,6 +7817,347 @@ class AllEvidenceFusionRunner:
         feedback["feedback_sha256"] = _content_sha256(feedback)
         return json.loads(_canonical_json(feedback))
 
+    @staticmethod
+    def _adaptive_feature_from_spec(
+        spec: Mapping[str, Any],
+        *,
+        supporting_evidence_ids: Sequence[str],
+        evidence_family_by_id: Mapping[str, str],
+    ) -> AdaptiveCurrentFeature:
+        canonical = CandidateContract(spec).extraction_spec
+        support = tuple(dict.fromkeys(map(str, supporting_evidence_ids)))
+        if not support:
+            raise ValueError("adaptive registry features require authenticated support")
+        missing = [
+            evidence_id for evidence_id in support if evidence_id not in evidence_family_by_id
+        ]
+        if missing:
+            raise ValueError(
+                "adaptive registry provenance cites unknown evidence IDs: " f"{sorted(missing)}"
+            )
+        cited_families = {evidence_family_by_id[evidence_id] for evidence_id in support}
+        families = tuple(
+            family for family in ACTIVE_STAGE1_CONCEPT_FAMILIES if family in cited_families
+        )
+        if cited_families != set(families):
+            raise ValueError("adaptive registry provenance cites an inactive architecture")
+        description = str(canonical["description"])
+        return AdaptiveCurrentFeature(
+            feature_name=str(canonical["name"]),
+            description=description,
+            value_shape_hypothesis=(
+                "continuous" if canonical["type"] == "continuous" else "categorical"
+            ),
+            source_families=families,
+            supporting_evidence_ids=support,
+            definition_summary=description,
+        )
+
+    @classmethod
+    def _initial_adaptive_registry(
+        cls,
+        *,
+        specs: Sequence[Mapping[str, Any]],
+        frozen_review_evidence: FrozenHierarchicalReviewEvidence,
+        initial_catalog: RoleNeutralEvidenceCatalog,
+    ) -> tuple[
+        tuple[AdaptiveCurrentFeature, ...],
+        dict[str, str],
+        dict[str, Any],
+    ]:
+        frozen_review_evidence.__post_init__()
+        if frozen_review_evidence.catalog_sha256 != initial_catalog.catalog_sha256:
+            raise ValueError("frozen review provenance cites another initial catalog")
+        family_by_id = {atom.evidence_id: atom.source_family for atom in initial_catalog.atoms}
+        raw_support = frozen_review_evidence.audit.get("accepted_feature_support")
+        if not isinstance(raw_support, list):
+            raise ValueError("frozen review evidence lost accepted feature provenance")
+        support_by_name: dict[str, tuple[str, ...]] = {}
+        for row in raw_support:
+            if not isinstance(row, Mapping) or set(row) != {
+                "canonical_name",
+                "supporting_evidence_ids",
+            }:
+                raise ValueError("frozen accepted feature provenance has a wrong shape")
+            name = str(row["canonical_name"])
+            ids = tuple(map(str, row["supporting_evidence_ids"]))
+            if not ids or name in support_by_name:
+                raise ValueError("frozen accepted feature provenance is incomplete or repeated")
+            support_by_name[name] = ids
+        canonical_specs = [CandidateContract(spec).extraction_spec for spec in specs]
+        names = [str(spec["name"]) for spec in canonical_specs]
+        if len(names) != len(set(names)):
+            raise ValueError("initial executable registry contains duplicate feature names")
+        if not set(names) <= set(support_by_name):
+            raise ValueError(
+                "initial executable registry is not covered by frozen accepted provenance"
+            )
+        registry = tuple(
+            cls._adaptive_feature_from_spec(
+                spec,
+                supporting_evidence_ids=support_by_name[str(spec["name"])],
+                evidence_family_by_id=family_by_id,
+            )
+            for spec in canonical_specs
+        )
+        excluded = sorted(set(support_by_name) - set(names))
+        audit = {
+            "modeled_registry_names_sha256": _content_sha256(names),
+            "frozen_accepted_feature_count": len(support_by_name),
+            "modeled_feature_count": len(names),
+            "excluded_nonmodeled_accepted_feature_count": len(excluded),
+            "excluded_nonmodeled_accepted_feature_names_sha256": _content_sha256(excluded),
+            "modeled_specs_are_unique_subset_of_frozen_accepted_support": True,
+            "excluded_nonmodeled_features_treated_as_executable": False,
+        }
+        return registry, family_by_id, audit
+
+    @classmethod
+    def _transition_adaptive_registry(
+        cls,
+        *,
+        before: Sequence[AdaptiveCurrentFeature],
+        after_specs: Sequence[Mapping[str, Any]],
+        operation_audit: Sequence[Mapping[str, Any]],
+        evidence_family_by_id: Mapping[str, str],
+    ) -> tuple[AdaptiveCurrentFeature, ...]:
+        """Apply exact support-provenance algebra in candidate-workspace order."""
+
+        support_by_name = {
+            item.feature_name: tuple(item.supporting_evidence_ids) for item in before
+        }
+
+        def union_support(*groups: Sequence[str]) -> tuple[str, ...]:
+            return tuple(dict.fromkeys(value for group in groups for value in group))
+
+        for index, raw in enumerate(operation_audit):
+            if not isinstance(raw, Mapping):
+                raise TypeError("adaptive provenance operation audit must contain mappings")
+            adaptive_kind = raw.get("adaptive_operation")
+            legacy_kind = raw.get("action")
+            if (adaptive_kind is None) == (legacy_kind is None):
+                raise ValueError("provenance operation must identify exactly one operation kind")
+            kind = str(adaptive_kind if adaptive_kind is not None else legacy_kind)
+            targets = tuple(map(str, raw.get("target_names") or ()))
+            citations = tuple(map(str, raw.get("supporting_evidence_ids") or ()))
+            unknown_citations = set(citations) - set(evidence_family_by_id)
+            if unknown_citations:
+                raise ValueError(
+                    f"operation {index} cites unavailable provenance: "
+                    f"{sorted(unknown_citations)}"
+                )
+            if kind == "stop":
+                if targets or citations:
+                    raise ValueError("stop cannot alter adaptive provenance")
+                continue
+            if not targets:
+                raise ValueError(f"operation {index} has no provenance target")
+            missing_targets = set(targets) - set(support_by_name)
+            if kind != "add" and missing_targets:
+                raise ValueError(
+                    f"operation {index} targets unavailable registry provenance: "
+                    f"{sorted(missing_targets)}"
+                )
+            if kind == "drop":
+                if adaptive_kind is not None and citations:
+                    raise ValueError("drop cannot add adaptive support provenance")
+                for target in targets:
+                    support_by_name.pop(target)
+                continue
+            contract = raw.get("contract")
+            if not isinstance(contract, Mapping):
+                raise ValueError(f"operation {index} requires an executable contract")
+            result_name = str(contract.get("name") or "")
+            if not result_name:
+                raise ValueError(f"operation {index} executable contract has no name")
+            if kind == "re_role":
+                if len(targets) != 1 or result_name != targets[0]:
+                    raise ValueError("re_role must preserve exact historical provenance")
+                continue
+            if kind in {"add", "split", "replace"}:
+                if not citations:
+                    raise ValueError(f"{kind} requires current cited support provenance")
+                if kind == "replace":
+                    for target in targets:
+                        support_by_name.pop(target)
+                elif kind == "split":
+                    if len(targets) != 1 or result_name in support_by_name:
+                        raise ValueError("split provenance is malformed")
+                elif result_name in support_by_name:
+                    raise ValueError("add provenance collides with the current registry")
+                support_by_name[result_name] = citations
+                continue
+            if kind in {"revise", "rename", "revise_definition", "merge"}:
+                if not citations:
+                    raise ValueError(f"{kind} requires current cited support provenance")
+                historical = union_support(*(support_by_name[target] for target in targets))
+                for target in targets:
+                    support_by_name.pop(target)
+                support_by_name[result_name] = union_support(historical, citations)
+                continue
+            raise ValueError(f"unsupported adaptive provenance operation: {kind}")
+
+        canonical_after = [CandidateContract(spec).extraction_spec for spec in after_specs]
+        after_names = [str(spec["name"]) for spec in canonical_after]
+        if set(after_names) != set(support_by_name) or len(after_names) != len(support_by_name):
+            raise ValueError("candidate specs and adaptive provenance registry diverged")
+        return tuple(
+            cls._adaptive_feature_from_spec(
+                spec,
+                supporting_evidence_ids=support_by_name[str(spec["name"])],
+                evidence_family_by_id=evidence_family_by_id,
+            )
+            for spec in canonical_after
+        )
+
+    @staticmethod
+    def _adaptive_diagnostics(
+        diagnostics: Sequence[Mapping[str, Any]],
+        *,
+        current_registry: Sequence[AdaptiveCurrentFeature],
+    ) -> tuple[tuple[AdaptiveDiagnostic, ...], dict[str, Any]]:
+        """Convert every real legacy diagnostic to a bounded semantic scalar row."""
+
+        kind_map = {
+            "feature_quality": "extraction_missingness",
+            "extraction_text_grounding": "extraction_validity",
+            "redundancy": "redundancy",
+            "nested_observable_causal_quality": "nuisance_residual",
+            "contract_ablation": "heterogeneity",
+            "prior_gate_feedback": "source_preservation",
+            "candidate_quality_retry_feedback": "extraction_validity",
+            "retained_registry_ontology_retry_feedback": "extraction_validity",
+            "review_response_validation_retry_feedback": "extraction_validity",
+        }
+        summaries = {
+            "extraction_missingness": "Observable extraction coverage and validity diagnostic.",
+            "extraction_validity": "Observable extraction-grounding or retry diagnostic.",
+            "redundancy": "Observable pairwise feature redundancy diagnostic.",
+            "nuisance_residual": "Nested observable nuisance-fit diagnostic.",
+            "heterogeneity": "Observable contract-ablation diagnostic.",
+            "source_preservation": "Prior untouched-gate source-preservation diagnostic.",
+        }
+        targets_by_id = collect_post_extraction_diagnostic_targets(diagnostics)
+        registry_names = {item.feature_name for item in current_registry}
+        rows_by_id: dict[str, Mapping[str, Any]] = {}
+
+        def collect(value: Any) -> None:
+            if isinstance(value, Mapping):
+                if "diagnostic_id" in value:
+                    diagnostic_id = str(value["diagnostic_id"])
+                    if diagnostic_id in rows_by_id:
+                        raise ValueError("adaptive diagnostics contain a duplicate ID")
+                    rows_by_id[diagnostic_id] = value
+                for key, child in value.items():
+                    if key != "diagnostic_id":
+                        collect(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    collect(child)
+
+        collect(diagnostics)
+        if tuple(rows_by_id) != tuple(targets_by_id):
+            raise RuntimeError("adaptive diagnostic traversal differs from target mapping")
+
+        forbidden_path = re.compile(
+            r"(?:^|_)(?:row|fold|gate|source|provider|identity|sha256|temporal|date|"
+            r"patient|record|note|oracle|treatment|outcome)(?:_|$)",
+            flags=re.IGNORECASE,
+        )
+        metric_key = re.compile(
+            r"(?:^|_)(?:coverage|missingness|rate|count|delta|loss|ratio|score|"
+            r"passed|applicable|agreement|association|complexity|warning|failure|"
+            r"minimum|maximum|median|std|importance)(?:_|$)",
+            flags=re.IGNORECASE,
+        )
+
+        def scalar_metrics(row: Mapping[str, Any]) -> dict[str, int | float | bool | None]:
+            found: dict[str, int | float | bool | None] = {}
+
+            def visit(value: Any, path: tuple[str, ...]) -> None:
+                if len(found) >= 32:
+                    return
+                if isinstance(value, Mapping):
+                    for key, child in value.items():
+                        lowered = str(key).strip().lower()
+                        if lowered in {"diagnostic_id", "kind"}:
+                            continue
+                        visit(child, (*path, lowered))
+                    return
+                if isinstance(value, (list, tuple)):
+                    return
+                if value is not None and not isinstance(value, (bool, int, float, np.generic)):
+                    return
+                if isinstance(value, np.generic):
+                    value = value.item()
+                if isinstance(value, float) and not math.isfinite(value):
+                    return
+                joined = "_".join(path)
+                if not joined or forbidden_path.search(joined) or not metric_key.search(joined):
+                    return
+                key = re.sub(r"[^a-z0-9_.:-]+", "_", joined).strip("_")
+                if not key or not key[0].isalpha():
+                    key = f"metric_{key}"
+                key = key[:96].rstrip("_")
+                if key in found:
+                    raise ValueError("adaptive diagnostic metric paths collide")
+                found[key] = value
+
+            visit(row, ())
+            return found
+
+        adapted: list[AdaptiveDiagnostic] = []
+        historical_kinds = {
+            "prior_gate_feedback",
+            "candidate_quality_retry_feedback",
+            "retained_registry_ontology_retry_feedback",
+            "review_response_validation_retry_feedback",
+        }
+        excluded_historical_targets: dict[str, list[str]] = {}
+        for diagnostic_id, row in rows_by_id.items():
+            kind = str(row.get("kind") or "")
+            if kind not in kind_map:
+                raise ValueError(f"unsupported adaptive diagnostic kind: {kind or '<missing>'}")
+            direct_targets = list(targets_by_id[diagnostic_id])
+            for extra_field in ("ontology_mismatched_contract_names",):
+                raw = row.get(extra_field)
+                if isinstance(raw, (list, tuple)):
+                    direct_targets.extend(str(value) for value in raw)
+            targets = tuple(dict.fromkeys(direct_targets))
+            unknown = set(targets) - registry_names
+            if unknown:
+                if kind not in historical_kinds:
+                    raise ValueError(
+                        "adaptive diagnostic targets absent registry features: "
+                        f"{sorted(unknown)}"
+                    )
+                excluded_historical_targets[diagnostic_id] = sorted(unknown)
+                targets = tuple(target for target in targets if target in registry_names)
+            diagnostic_kind = kind_map[kind]
+            adapted.append(
+                AdaptiveDiagnostic(
+                    diagnostic_id=diagnostic_id,
+                    diagnostic_kind=diagnostic_kind,
+                    affected_features=targets,
+                    summary=summaries[diagnostic_kind],
+                    aggregate_metrics=scalar_metrics(row),
+                )
+            )
+        if not adapted:
+            raise ValueError("adaptive reconsideration requires observable diagnostics")
+        audit = {
+            "input_diagnostic_count": len(rows_by_id),
+            "adapted_diagnostic_count": len(adapted),
+            "every_diagnostic_id_represented_once": len(rows_by_id) == len(adapted),
+            "excluded_historical_target_count": sum(
+                len(values) for values in excluded_historical_targets.values()
+            ),
+            "excluded_historical_targets_by_diagnostic": excluded_historical_targets,
+            "unknown_current_diagnostic_targets_fail_closed": True,
+            "model_context_contains_excluded_historical_names": False,
+        }
+        return tuple(adapted), audit
+
     def _run_post_extraction_review(
         self,
         *,
@@ -6418,10 +8170,74 @@ class AllEvidenceFusionRunner:
         fold_dir: Path,
         review_schedule: ReviewPartitionSchedule | None = None,
         initial_selector_evidence_audit: Mapping[str, Any] | None = None,
+        frozen_hierarchical_review_evidence: FrozenHierarchicalReviewEvidence | None = None,
+        hierarchical_first_gate_materialization_intent: (
+            FirstGateMaterializationIntent | None
+        ) = None,
+        hierarchical_first_gate_catalog: RoleNeutralEvidenceCatalog | None = None,
+        hierarchical_approved_runner_identity: Mapping[str, Any] | None = None,
+        hierarchical_approved_cache_identity: Mapping[str, Any] | None = None,
+        hierarchical_family_explanations: Mapping[str, str] | None = None,
     ) -> tuple[list[dict[str, Any]], pd.DataFrame, Mapping[str, Any]]:
         rounds = int(self.config.post_extraction_review_rounds)
         max_quality_retries = int(self.config.post_extraction_review_max_quality_retries)
         canonical_initial = [CandidateContract(spec).extraction_spec for spec in initial_specs]
+        hierarchical_review = frozen_hierarchical_review_evidence is not None
+        if hierarchical_review:
+            assert frozen_hierarchical_review_evidence is not None
+            frozen_hierarchical_review_evidence.__post_init__()
+            if not isinstance(
+                hierarchical_first_gate_materialization_intent,
+                FirstGateMaterializationIntent,
+            ) or not isinstance(hierarchical_first_gate_catalog, RoleNeutralEvidenceCatalog):
+                raise ValueError(
+                    "hierarchical review requires the approved first-gate materialization "
+                    "intent and its exact semantic catalog"
+                )
+            hierarchical_first_gate_materialization_intent.verify()
+            if (
+                hierarchical_first_gate_materialization_intent.body["semantic_catalog"][
+                    "catalog_sha256"
+                ]
+                != hierarchical_first_gate_catalog.catalog_sha256
+            ):
+                raise ValueError("hierarchical first-gate intent cites a different catalog")
+            if not isinstance(hierarchical_approved_runner_identity, Mapping) or not isinstance(
+                hierarchical_approved_cache_identity, Mapping
+            ):
+                raise ValueError(
+                    "hierarchical review requires the initially approved runner and cache "
+                    "identities"
+                )
+            if not isinstance(hierarchical_family_explanations, Mapping) or set(
+                hierarchical_family_explanations
+            ) != set(ACTIVE_STAGE1_CONCEPT_FAMILIES):
+                raise ValueError(
+                    "hierarchical review requires the exact prepared ten-family explanations"
+                )
+            if (
+                self.hierarchical_discovery_runner is None
+                or self.hierarchical_discovery_job_cache_root is None
+                or self.hierarchical_review_evidence_policy is None
+            ):
+                raise RuntimeError("hierarchical adaptive execution dependencies are missing")
+            self.hierarchical_review_evidence_policy.validate_authentication()
+            adaptive_config = self.hierarchical_review_evidence_policy.adaptive_config()
+            if adaptive_config.max_operations != self.config.post_extraction_review_max_operations:
+                raise ValueError(
+                    "adaptive hierarchy operation bound differs from the review runner"
+                )
+        elif (
+            hierarchical_first_gate_materialization_intent is not None
+            or hierarchical_first_gate_catalog is not None
+            or hierarchical_approved_runner_identity is not None
+            or hierarchical_approved_cache_identity is not None
+            or hierarchical_family_explanations is not None
+        ):
+            raise ValueError(
+                "hierarchical first-gate intent/catalog are forbidden without frozen review "
+                "evidence"
+            )
         if rounds == 0:
             return (
                 canonical_initial,
@@ -6480,6 +8296,21 @@ class AllEvidenceFusionRunner:
         spent_fold_ids = list(schedule.initial_spent_fold_ids)
         current_specs = canonical_initial
         current_extracted = initial_extracted
+        current_adaptive_registry: tuple[AdaptiveCurrentFeature, ...] | None = None
+        adaptive_evidence_family_by_id: dict[str, str] = {}
+        initial_adaptive_registry_audit: Mapping[str, Any] | None = None
+        if hierarchical_review:
+            assert frozen_hierarchical_review_evidence is not None
+            assert hierarchical_first_gate_catalog is not None
+            (
+                current_adaptive_registry,
+                adaptive_evidence_family_by_id,
+                initial_adaptive_registry_audit,
+            ) = self._initial_adaptive_registry(
+                specs=current_specs,
+                frozen_review_evidence=frozen_hierarchical_review_evidence,
+                initial_catalog=hierarchical_first_gate_catalog,
+            )
         initial_hashes = [extraction_contract_sha256(spec) for spec in current_specs]
         round_records: list[dict[str, Any]] = []
         prior_gate_feedback: list[Mapping[str, Any]] = []
@@ -6498,6 +8329,7 @@ class AllEvidenceFusionRunner:
         response_validation_retry_exhausted = False
         candidate_workspace_stage_count = 0
         total_review_attempts = 0
+        adaptive_execution_records: list[dict[str, Any]] = []
 
         def persist_attempt(
             *,
@@ -6571,19 +8403,164 @@ class AllEvidenceFusionRunner:
                 accepted_round_spent_extracted,
                 accepted_round_specs,
             )
+            accepted_round_adaptive_registry = current_adaptive_registry
             workspace_specs = [
                 CandidateContract(spec).extraction_spec for spec in accepted_round_specs
             ]
             workspace_spent_extracted = accepted_round_spent_extracted
+            workspace_adaptive_registry = accepted_round_adaptive_registry
             workspace_stage_history: list[dict[str, Any]] = []
             workspace_operation_audit_history: list[dict[str, Any]] = []
-            spent_request, spent_evidence_audit = self._spent_fusion_request(
-                data=data,
-                schedule=schedule,
-                spent_fold_ids=spent_fold_ids,
-                outer_fold=outer_fold,
-                review_round=round_index,
-            )
+            adaptive_catalog: RoleNeutralEvidenceCatalog | None = None
+            exact_spent_authentication: ExactSpentCatalogAuthentication | None = None
+            if hierarchical_review:
+                assert frozen_hierarchical_review_evidence is not None
+                assert workspace_adaptive_registry is not None
+                evidence_catalog = list(frozen_hierarchical_review_evidence.review_rows)
+                sealed_row_count = len(train_ids) - len(spent_ids)
+                if round_index == 1:
+                    spent_evidence_audit = {
+                        "review_round": int(round_index),
+                        "consumer_review_round": int(round_index),
+                        "spent_evidence_context_epoch": int(round_index - 1),
+                        "provider_review_round_argument": int(round_index - 1),
+                        "consumed_gate_count_before_context_fit": int(round_index - 1),
+                        "context_epoch_policy_version": (
+                            SPENT_EVIDENCE_CONTEXT_EPOCH_POLICY_VERSION
+                        ),
+                        "spent_row_count": len(spent_ids),
+                        "sealed_row_count": sealed_row_count,
+                        "spent_row_fingerprint": row_set_fingerprint(spent_ids),
+                        "sealed_row_fingerprint": row_set_fingerprint(
+                            tuple(row_id for row_id in train_ids if row_id not in set(spent_ids))
+                        ),
+                        "provider_identity_sha256": (
+                            frozen_hierarchical_review_evidence.binding_sha256
+                        ),
+                        "source_kinds": sorted(
+                            {
+                                family
+                                for row in evidence_catalog
+                                for family in row["source_families"]
+                            }
+                        ),
+                        "future_gate_text_or_labels_supplied_to_provider": False,
+                        "full_outer_discovery_evidence_used": False,
+                        "hierarchical_frozen_accepted_support": True,
+                        "round_1_initial_frozen_support_only": True,
+                        "later_round_fresh_exact_spent_catalog": False,
+                        "frozen_review_evidence_binding_sha256": (
+                            frozen_hierarchical_review_evidence.binding_sha256
+                        ),
+                        "frozen_review_evidence_sha256": (
+                            frozen_hierarchical_review_evidence.review_evidence_sha256
+                        ),
+                        "dynamic_stage1_semantic_refit_performed": False,
+                        "same_frozen_catalog_authorized_for_later_rounds": False,
+                    }
+                else:
+                    spent_inputs, provider_audit, prefit_catalog = self._spent_evidence_inputs(
+                        data=data,
+                        schedule=schedule,
+                        spent_fold_ids=spent_fold_ids,
+                        outer_fold=outer_fold,
+                        review_round=round_index,
+                    )
+                    adaptive_catalog = (
+                        prefit_catalog
+                        if prefit_catalog is not None
+                        else build_role_neutral_evidence_catalog(spent_inputs)
+                    )
+                    family_counts = {
+                        family: len(adaptive_catalog.family_atoms(family))
+                        for family in ACTIVE_STAGE1_CONCEPT_FAMILIES
+                    }
+                    if any(count < 1 for count in family_counts.values()):
+                        raise ValueError(
+                            "later adaptive review requires evidence from all ten architectures"
+                        )
+                    for atom in adaptive_catalog.atoms:
+                        prior_family = adaptive_evidence_family_by_id.get(atom.evidence_id)
+                        if prior_family is not None and prior_family != atom.source_family:
+                            raise ValueError(
+                                "content-addressed adaptive evidence changed source architecture"
+                            )
+                        adaptive_evidence_family_by_id[atom.evidence_id] = atom.source_family
+                    partition_by_fold = {
+                        int(row["fold_id"]): row for row in schedule.audit["partitions"]
+                    }
+                    consumed_gate_fingerprints = tuple(
+                        str(partition_by_fold[int(fold_id)]["row_fingerprint"])
+                        for fold_id in schedule.gate_fold_ids[: round_index - 1]
+                    )
+                    if len(consumed_gate_fingerprints) != round_index - 1:
+                        raise RuntimeError("consumed-gate authentication lost fold order")
+                    current_gate_ids = schedule.row_ids((gate_fold_id,))
+                    current_gate_fingerprint = row_set_fingerprint(current_gate_ids)
+                    if (
+                        current_gate_fingerprint
+                        != partition_by_fold[int(gate_fold_id)]["row_fingerprint"]
+                    ):
+                        raise RuntimeError("still-sealed gate fingerprint differs from schedule")
+                    spent_evidence_audit = {
+                        **dict(provider_audit),
+                        "hierarchical_frozen_accepted_support": False,
+                        "round_1_initial_frozen_support_only": False,
+                        "later_round_fresh_exact_spent_catalog": True,
+                        "adaptive_catalog_sha256": adaptive_catalog.catalog_sha256,
+                        "adaptive_catalog_split_fingerprint": (adaptive_catalog.split_fingerprint),
+                        "adaptive_family_atom_counts": family_counts,
+                        "prepared_family_explanations_sha256": _content_sha256(
+                            dict(hierarchical_family_explanations or {})
+                        ),
+                        "all_ten_stage1_architectures_present": True,
+                        "complete_catalog_sent_to_legacy_review_agent": False,
+                        "legacy_diagnostic_evidence_scope": (
+                            "round_1_frozen_accepted_support_local_grounding_only"
+                        ),
+                        "same_frozen_catalog_authorized_for_later_rounds": False,
+                    }
+                    upstream_authentication_sha256 = _content_sha256(
+                        {
+                            "complete_spent_provider_and_semantic_compatibility_audit": (
+                                spent_evidence_audit
+                            ),
+                            "catalog_sha256": adaptive_catalog.catalog_sha256,
+                            "catalog_split_fingerprint": adaptive_catalog.split_fingerprint,
+                            "family_atom_counts": family_counts,
+                        }
+                    )
+                    exact_spent_authentication = ExactSpentCatalogAuthentication.create(
+                        catalog=adaptive_catalog,
+                        accumulated_spent_scope_sha256=_content_sha256(
+                            {"ordered_spent_row_ids": list(map(int, spent_ids))}
+                        ),
+                        accumulated_spent_row_count=len(spent_ids),
+                        consumed_gate_fingerprints=consumed_gate_fingerprints,
+                        still_sealed_gate_fingerprint=current_gate_fingerprint,
+                        upstream_authentication_sha256=upstream_authentication_sha256,
+                    )
+                    spent_evidence_audit = {
+                        **spent_evidence_audit,
+                        "exact_spent_authentication_sha256": (
+                            exact_spent_authentication.authentication_sha256
+                        ),
+                        "accumulated_spent_scope_sha256": (
+                            exact_spent_authentication.accumulated_spent_scope_sha256
+                        ),
+                        "consumed_gate_fingerprints": list(consumed_gate_fingerprints),
+                        "still_sealed_gate_fingerprint": current_gate_fingerprint,
+                        "upstream_authentication_sha256": upstream_authentication_sha256,
+                    }
+            else:
+                spent_request, spent_evidence_audit = self._spent_fusion_request(
+                    data=data,
+                    schedule=schedule,
+                    spent_fold_ids=spent_fold_ids,
+                    outer_fold=outer_fold,
+                    review_round=round_index,
+                )
+                evidence_catalog = spent_request.context()["evidence"]
             round_dir = fold_dir / "post_extraction_review" / f"round_{round_index:03d}"
             attempt_records: list[dict[str, Any]] = []
             retry_feedback: list[Mapping[str, Any]] = []
@@ -6607,12 +8584,13 @@ class AllEvidenceFusionRunner:
                     spent=workspace_spent,
                     spent_texts=spent_texts,
                     specs=workspace_specs,
-                    evidence_catalog=spent_request.context()["evidence"],
+                    evidence_catalog=evidence_catalog,
                     spent_evidence_audit=spent_evidence_audit,
                     feedback_diagnostics=[*prior_gate_feedback, *retry_feedback],
                     accepted_round_baseline_specs=accepted_round_specs,
                     workspace_stage_history=workspace_stage_history,
                     workspace_extraction_sha256=workspace_extraction_sha256,
+                    frozen_content_addressed_evidence=hierarchical_review,
                 )
                 workspace_ontology = self._retained_registry_ontology_from_grounding(
                     workspace_specs,
@@ -6650,15 +8628,23 @@ class AllEvidenceFusionRunner:
                     },
                     schema=POST_EXTRACTION_REVIEW_REQUEST_SCHEMA_VERSION,
                 )
-                response_cache_path = attempt_dir / "immutable_review_response.json"
-                failure_cache_path = attempt_dir / "immutable_review_failure.json"
-                cached = _load_request_bound_review_response(
-                    response_cache_path,
-                    request_sha256=request_sha256,
-                    max_contracts=self.config.max_candidates,
-                    review_round=round_index,
-                    review_attempt=attempt_index,
+                adaptive_attempt = bool(hierarchical_review and round_index >= 2)
+                response_cache_path = (
+                    attempt_dir / "authenticated_adaptive_hierarchy.json"
+                    if adaptive_attempt
+                    else attempt_dir / "immutable_review_response.json"
                 )
+                failure_cache_path = attempt_dir / "immutable_review_failure.json"
+                adaptive_execution = None
+                adaptive_execution_record: Mapping[str, Any] | None = None
+                adaptive_execution_sha256: str | None = None
+                adaptive_proposal_freeze_sha256: str | None = None
+                adaptive_executable_freeze_sha256: str | None = None
+                adaptive_executable_freeze_validated = False
+                adaptive_diagnostic_audit: Mapping[str, Any] | None = None
+                adaptive_applied: AppliedReviewOperations | None = None
+                cached: tuple[Mapping[str, Any], str] | None = None
+                response_failure: BaseException | None = None
                 cached_failure = _load_request_bound_review_failure(
                     failure_cache_path,
                     request_sha256=request_sha256,
@@ -6666,11 +8652,162 @@ class AllEvidenceFusionRunner:
                     review_attempt=attempt_index,
                     expected_current_names=[str(spec["name"]) for spec in workspace_specs],
                 )
+                if adaptive_attempt and cached_failure is not None and response_cache_path.exists():
+                    raise RuntimeError(
+                        "adaptive review attempt has both an execution and failure artifact"
+                    )
+                if adaptive_attempt and cached_failure is None:
+                    if (
+                        adaptive_catalog is None
+                        or exact_spent_authentication is None
+                        or workspace_adaptive_registry is None
+                    ):
+                        raise RuntimeError("later adaptive hierarchy lost authenticated inputs")
+                    assert hierarchical_family_explanations is not None
+                    assert hierarchical_approved_runner_identity is not None
+                    assert hierarchical_approved_cache_identity is not None
+                    assert self.hierarchical_review_evidence_policy is not None
+                    assert self.hierarchical_discovery_job_cache_root is not None
+                    adaptive_diagnostics, adaptive_diagnostic_audit = self._adaptive_diagnostics(
+                        context["diagnostics"],
+                        current_registry=workspace_adaptive_registry,
+                    )
+                    adaptive_builder = AdaptiveHierarchicalStage1Reconsideration(
+                        catalog=adaptive_catalog,
+                        exact_spent_authentication=exact_spent_authentication,
+                        family_explanations=dict(hierarchical_family_explanations),
+                        current_registry=workspace_adaptive_registry,
+                        diagnostics=adaptive_diagnostics,
+                        config=self.hierarchical_review_evidence_policy.adaptive_config(),
+                    )
+                    adaptive_cache = AuthenticatedHierarchicalDiscoveryJobCache(
+                        root=(
+                            self.hierarchical_discovery_job_cache_root
+                            / f"outer_fold_{outer_fold:03d}"
+                        )
+                    )
+                    try:
+                        adaptive_execution = adaptive_builder.execute_authenticated(
+                            runner=self.hierarchical_discovery_runner,
+                            job_cache=adaptive_cache,
+                            approved_adaptive_identity=(
+                                self.hierarchical_review_evidence_policy.as_dict()[
+                                    "adaptive_reconsideration_identity"
+                                ]
+                            ),
+                            approved_runner_identity=hierarchical_approved_runner_identity,
+                            approved_cache_identity=hierarchical_approved_cache_identity,
+                            current_specs=workspace_specs,
+                            max_contracts=self.config.max_candidates,
+                        )
+                    except (TypeError, ValueError, RuntimeError) as exc:
+                        response_failure = exc
+                    else:
+                        adaptive_applied = adaptive_execution.executable_revision.applied
+                        adaptive_execution_record = adaptive_execution.as_dict()
+                        adaptive_execution_sha256 = adaptive_execution.execution_sha256
+                        adaptive_proposal_freeze_sha256 = (
+                            adaptive_execution.frozen_round.freeze_sha256
+                        )
+                        adaptive_executable_freeze_sha256 = (
+                            adaptive_execution.executable_revision.executable_freeze_sha256
+                        )
+                        adaptive_executable_freeze_validated = True
+                        adaptive_response = adaptive_execution.frozen_round.proposal
+                        cached = (
+                            adaptive_response,
+                            _content_sha256(list(adaptive_applied.specs)),
+                        )
+                        adaptive_artifact_body = {
+                            "outer_fold": int(outer_fold),
+                            "review_round": int(round_index),
+                            "review_attempt": int(attempt_index),
+                            "request_sha256": request_sha256,
+                            "diagnostic_adapter_audit": adaptive_diagnostic_audit,
+                            "authenticated_execution": adaptive_execution_record,
+                            "proposal_frozen_before_executable_bridge": True,
+                            "executable_revision_frozen_before_gate": True,
+                            "complete_catalog_sent_to_legacy_review_agent": False,
+                            "raw_response_persisted": False,
+                            "raw_reasoning_persisted": False,
+                            "gate_accessed": False,
+                        }
+                        prior_adaptive_artifact = _load_request_bound_adaptive_execution(
+                            response_cache_path,
+                            outer_fold=outer_fold,
+                            request_sha256=request_sha256,
+                            review_round=round_index,
+                            review_attempt=attempt_index,
+                        )
+                        if prior_adaptive_artifact is None:
+                            _write_immutable_json(
+                                response_cache_path,
+                                adaptive_artifact_body,
+                                schema=(ADAPTIVE_HIERARCHICAL_REVIEW_EXECUTION_SCHEMA_VERSION),
+                            )
+                        else:
+                            prior_response, prior_applied, prior_execution = prior_adaptive_artifact
+                            if (
+                                _content_sha256(prior_response)
+                                != _content_sha256(adaptive_response)
+                                or _content_sha256(list(prior_applied.specs))
+                                != _content_sha256(list(adaptive_applied.specs))
+                                or prior_execution["frozen_round"]["freeze_sha256"]
+                                != adaptive_proposal_freeze_sha256
+                                or prior_execution["executable_revision"][
+                                    "executable_freeze_sha256"
+                                ]
+                                != adaptive_executable_freeze_sha256
+                            ):
+                                raise RuntimeError(
+                                    "current authenticated per-job replay differs from the "
+                                    "immutable adaptive execution artifact"
+                                )
+                elif not adaptive_attempt:
+                    cached = _load_request_bound_review_response(
+                        response_cache_path,
+                        request_sha256=request_sha256,
+                        max_contracts=self.config.max_candidates,
+                        review_round=round_index,
+                        review_attempt=attempt_index,
+                    )
                 if cached is not None and cached_failure is not None:
                     raise RuntimeError(
                         "review attempt has both a valid response and a failure audit"
                     )
-                if cached is None and cached_failure is None:
+                if adaptive_attempt and response_failure is not None and cached_failure is None:
+                    failure_identity = _sanitized_review_failure_identity(response_failure)
+                    current_names = [str(spec["name"]) for spec in workspace_specs]
+                    failure_body = {
+                        "review_round": int(round_index),
+                        "review_attempt": int(attempt_index),
+                        "request_sha256": request_sha256,
+                        "failure_type": "adaptive_hierarchy_or_executable_validation",
+                        **failure_identity,
+                        "failed_contract_names": current_names,
+                        "completion_attempts": [],
+                        "raw_response_persisted": False,
+                        "raw_reasoning_persisted": False,
+                        "row_level_values_persisted": False,
+                        "gate_accessed": False,
+                        "gate_consumed": False,
+                        "outer_heldout_labels_used": False,
+                    }
+                    _write_immutable_json(
+                        failure_cache_path,
+                        failure_body,
+                        schema=POST_EXTRACTION_REVIEW_FAILURE_SCHEMA_VERSION,
+                    )
+                    cached_failure = _load_request_bound_review_failure(
+                        failure_cache_path,
+                        request_sha256=request_sha256,
+                        review_round=round_index,
+                        review_attempt=attempt_index,
+                        expected_current_names=current_names,
+                    )
+                    if cached_failure is None:  # pragma: no cover
+                        raise RuntimeError("adaptive failure audit disappeared after creation")
+                if not adaptive_attempt and cached is None and cached_failure is None:
                     returned_response_for_failure: Mapping[str, Any] | None = None
                     response_failure: BaseException | None = None
                     try:
@@ -6893,26 +9030,86 @@ class AllEvidenceFusionRunner:
                     break
 
                 response, cached_applied_specs_sha256 = cached
-                validated = validate_post_extraction_review_response(
-                    response,
-                    current_specs=workspace_specs,
-                    available_diagnostic_ids=diagnostic_ids,
-                    available_diagnostic_targets=diagnostic_targets,
-                    available_evidence_ids=evidence_ids,
-                    available_evidence_catalog=context["sanitized_evidence_catalog"],
-                    max_operations=self.config.post_extraction_review_max_operations,
-                )
-                applied = apply_post_extraction_review_operations(
-                    workspace_specs,
-                    validated,
-                    max_contracts=self.config.max_candidates,
-                )
+                if adaptive_attempt:
+                    if adaptive_applied is None or adaptive_execution_record is None:
+                        raise RuntimeError("adaptive executable freeze was not retained")
+                    applied = adaptive_applied
+                    proposal_stops = bool(response["converged"])
+                    response_cache_authority = (
+                        "authenticated_hierarchy_validated_and_executable_frozen"
+                    )
+                    adaptive_execution_records.append(
+                        {
+                            "review_round": int(round_index),
+                            "review_attempt": int(attempt_index),
+                            "exact_spent_authentication_sha256": (
+                                exact_spent_authentication.authentication_sha256
+                                if exact_spent_authentication is not None
+                                else None
+                            ),
+                            "execution_sha256": adaptive_execution_sha256,
+                            "proposal_freeze_sha256": adaptive_proposal_freeze_sha256,
+                            "executable_freeze_sha256": adaptive_executable_freeze_sha256,
+                            "outer_execution_artifact_used_as_authority": False,
+                        }
+                    )
+                else:
+                    validated = validate_post_extraction_review_response(
+                        response,
+                        current_specs=workspace_specs,
+                        available_diagnostic_ids=diagnostic_ids,
+                        available_diagnostic_targets=diagnostic_targets,
+                        available_evidence_ids=evidence_ids,
+                        available_evidence_catalog=context["sanitized_evidence_catalog"],
+                        max_operations=self.config.post_extraction_review_max_operations,
+                    )
+                    applied = apply_post_extraction_review_operations(
+                        workspace_specs,
+                        validated,
+                        max_contracts=self.config.max_candidates,
+                    )
+                    proposal_stops = validated.stops
+                    response_cache_authority = (
+                        "loaded_hash_verified_attempt_bound_response_"
+                        "validated_operations_applied"
+                    )
                 applied_specs_sha256 = _content_sha256(list(applied.specs))
                 if applied_specs_sha256 != cached_applied_specs_sha256:
                     raise RuntimeError("cached review application hash disagrees with replay")
                 response_sha256 = _content_sha256(response)
-                if response_sha256 != validated.response_sha256:
+                if not adaptive_attempt and response_sha256 != validated.response_sha256:
                     raise RuntimeError("cached review response hash disagrees with validator")
+                candidate_adaptive_registry: tuple[AdaptiveCurrentFeature, ...] | None = None
+                if hierarchical_review:
+                    if workspace_adaptive_registry is None:
+                        raise RuntimeError("hierarchical candidate workspace lost provenance")
+                    candidate_adaptive_registry = self._transition_adaptive_registry(
+                        before=workspace_adaptive_registry,
+                        after_specs=applied.specs,
+                        operation_audit=applied.operation_audit,
+                        evidence_family_by_id=adaptive_evidence_family_by_id,
+                    )
+                accepted_registry_sha256 = (
+                    None
+                    if accepted_round_adaptive_registry is None
+                    else _content_sha256(
+                        [item.as_prompt_item() for item in accepted_round_adaptive_registry]
+                    )
+                )
+                workspace_registry_sha256 = (
+                    None
+                    if workspace_adaptive_registry is None
+                    else _content_sha256(
+                        [item.as_prompt_item() for item in workspace_adaptive_registry]
+                    )
+                )
+                candidate_registry_sha256 = (
+                    None
+                    if candidate_adaptive_registry is None
+                    else _content_sha256(
+                        [item.as_prompt_item() for item in candidate_adaptive_registry]
+                    )
+                )
 
                 common_attempt_body = {
                     "outer_fold": int(outer_fold),
@@ -6928,13 +9125,20 @@ class AllEvidenceFusionRunner:
                     "request_manifest_sha256": request_manifest_sha256,
                     "response_sha256": response_sha256,
                     "response_cache_path": str(response_cache_path.resolve()),
-                    "response_cache_authority": (
-                        "loaded_hash_verified_attempt_bound_response_"
-                        "validated_operations_applied"
-                    ),
+                    "response_cache_authority": response_cache_authority,
                     "applied_specs_sha256": applied_specs_sha256,
                     "accepted_round_baseline_specs_sha256": _content_sha256(accepted_round_specs),
                     "workspace_specs_before_attempt_sha256": _content_sha256(workspace_specs),
+                    "accepted_round_registry_provenance_sha256": accepted_registry_sha256,
+                    "workspace_registry_provenance_before_attempt_sha256": (
+                        workspace_registry_sha256
+                    ),
+                    "candidate_registry_provenance_sha256": candidate_registry_sha256,
+                    "candidate_registry_private_items": (
+                        None
+                        if candidate_adaptive_registry is None
+                        else [item.as_prompt_item() for item in candidate_adaptive_registry]
+                    ),
                     "workspace_extraction_before_attempt_sha256": (workspace_extraction_sha256),
                     "workspace_stage_count_before_attempt": len(workspace_stage_history),
                     "workspace_stage_history": list(workspace_stage_history),
@@ -6942,6 +9146,9 @@ class AllEvidenceFusionRunner:
                         POST_EXTRACTION_REVIEW_CANDIDATE_WORKSPACE_POLICY_VERSION
                     ),
                     "validated_response": response,
+                    "adaptive_hierarchy_execution_sha256": (adaptive_execution_sha256),
+                    "adaptive_proposal_freeze_sha256": (adaptive_proposal_freeze_sha256),
+                    "adaptive_executable_freeze_sha256": (adaptive_executable_freeze_sha256),
                     "gate_fold_id": int(gate_fold_id),
                     "raw_response_persisted": False,
                     "raw_reasoning_persisted": False,
@@ -6952,7 +9159,7 @@ class AllEvidenceFusionRunner:
                 # remains wholly unavailable until the sealed spent-only candidate
                 # workspace clears changed-contract quality and retained ontology checks.
                 convergence_status = None
-                if validated.stops:
+                if proposal_stops:
                     convergence_status = "agent_stop"
                 elif list(applied.specs) == workspace_specs:
                     convergence_status = "no_semantic_change"
@@ -7228,11 +9435,16 @@ class AllEvidenceFusionRunner:
                                 )
                             )
                         if workspace_advanced:
+                            if hierarchical_review and candidate_adaptive_registry is None:
+                                raise RuntimeError(
+                                    "staged hierarchical workspace lost candidate provenance"
+                                )
                             candidate_workspace_stage_count += 1
                             workspace_specs = [
                                 CandidateContract(spec).extraction_spec for spec in candidate_specs
                             ]
                             workspace_spent_extracted = candidate_spent_extracted
+                            workspace_adaptive_registry = candidate_adaptive_registry
                             workspace_stage_history.append(stage_record)
                             workspace_operation_audit_history.extend(
                                 json.loads(_canonical_json(row)) for row in applied.operation_audit
@@ -7276,9 +9488,75 @@ class AllEvidenceFusionRunner:
                             str(row["response_sha256"]) for row in workspace_stage_history
                         ],
                         "terminal_response_sha256": response_sha256,
+                        "candidate_registry_provenance_sha256": candidate_registry_sha256,
+                        "adaptive_proposal_freeze_sha256": (adaptive_proposal_freeze_sha256),
+                        "adaptive_executable_freeze_sha256": (adaptive_executable_freeze_sha256),
                     }
                 )
+                pre_gate_candidate_record: Mapping[str, Any] | None = None
+                if hierarchical_review:
+                    if (
+                        accepted_registry_sha256 is None
+                        or workspace_registry_sha256 is None
+                        or candidate_registry_sha256 is None
+                        or candidate_adaptive_registry is None
+                    ):
+                        raise RuntimeError(
+                            "hierarchical candidate provenance is incomplete before gate"
+                        )
+                    pre_gate_candidate_path = (
+                        attempt_dir / "immutable_pre_gate_candidate_freeze.json"
+                    )
+                    pre_gate_candidate_body = {
+                        "outer_fold": int(outer_fold),
+                        "review_round": int(round_index),
+                        "review_attempt": int(attempt_index),
+                        "gate_fold_id": int(gate_fold_id),
+                        "accepted_round_specs_sha256": _content_sha256(accepted_round_specs),
+                        "candidate_specs_sha256": _content_sha256(candidate_specs),
+                        "accepted_registry_provenance_sha256": (accepted_registry_sha256),
+                        "workspace_registry_provenance_sha256": (workspace_registry_sha256),
+                        "candidate_registry_provenance_sha256": (candidate_registry_sha256),
+                        "candidate_registry_private_items": [
+                            item.as_prompt_item() for item in candidate_adaptive_registry
+                        ],
+                        "cumulative_operation_audit_sha256": _content_sha256(
+                            cumulative_operation_audit
+                        ),
+                        "cumulative_proposal_sha256": cumulative_proposal_sha256,
+                        "adaptive_proposal_freeze_sha256": (adaptive_proposal_freeze_sha256),
+                        "adaptive_executable_freeze_sha256": (adaptive_executable_freeze_sha256),
+                        "proposal_and_executable_specs_frozen_before_gate": True,
+                        "candidate_provenance_frozen_before_gate": True,
+                        "gate_accessed": False,
+                    }
+                    pre_gate_candidate_content_sha256 = _write_immutable_json(
+                        pre_gate_candidate_path,
+                        pre_gate_candidate_body,
+                        schema=ADAPTIVE_PRE_GATE_CANDIDATE_FREEZE_SCHEMA_VERSION,
+                    )
+                    pre_gate_candidate_record = {
+                        "path": str(pre_gate_candidate_path.resolve()),
+                        "content_sha256": pre_gate_candidate_content_sha256,
+                        "candidate_registry_provenance_sha256": (candidate_registry_sha256),
+                    }
                 gate_ids = schedule.row_ids((gate_fold_id,))
+                if adaptive_attempt:
+                    if (
+                        adaptive_execution_record is None
+                        or candidate_adaptive_registry is None
+                        or not adaptive_executable_freeze_validated
+                    ):
+                        raise RuntimeError(
+                            "adaptive proposal/executable/provenance freeze missing before gate"
+                        )
+                    if exact_spent_authentication is None or (
+                        exact_spent_authentication.still_sealed_gate_fingerprint
+                        != row_set_fingerprint(gate_ids)
+                    ):
+                        raise RuntimeError(
+                            "adaptive exact-spent authentication cites another sealed gate"
+                        )
                 gate_label_free = (
                     label_free.set_index("_oci_row_id", drop=False)
                     .loc[list(gate_ids)]
@@ -7318,20 +9596,118 @@ class AllEvidenceFusionRunner:
                 )
                 context_texts = list(spent_texts)
                 gate_texts = gate_label_free[self.config.text_column].astype(str).tolist()
-                source_view = self._gate_source_view(
-                    outer_fold=outer_fold,
-                    gate_row_ids=gate_ids,
-                    context=accepted_round_spent,
-                    context_texts=context_texts,
-                    gate_texts=gate_texts,
-                )
-                feature_bank_view = self._gate_feature_bank_view(
-                    outer_fold=outer_fold,
-                    gate_row_ids=gate_ids,
-                    context=accepted_round_spent,
-                    context_texts=context_texts,
-                    gate_texts=gate_texts,
-                )
+                first_gate_materialization_record: Mapping[str, Any] | None = None
+                prebound_gate_provider: Any | None = None
+                prebound_gate_provider_used = False
+                if hierarchical_review:
+                    if round_index == 1:
+                        assert isinstance(
+                            hierarchical_first_gate_materialization_intent,
+                            FirstGateMaterializationIntent,
+                        )
+                        assert isinstance(
+                            hierarchical_first_gate_catalog,
+                            RoleNeutralEvidenceCatalog,
+                        )
+                        shared_provider = self.review_gate_source_provider
+                        if shared_provider is None:
+                            raise RuntimeError(
+                                "hierarchical first-gate materialization lost its shared provider"
+                            )
+                        materialized = prepare_first_untouched_gate_direct_numerical(
+                            outer_fold=outer_fold,
+                            initial_spent_row_ids=accepted_round_spent.row_ids,
+                            initial_spent_texts=context_texts,
+                            initial_spent_treatment=accepted_round_spent.treatment,
+                            initial_spent_outcome=accepted_round_spent.outcome,
+                            initial_spent_inner_fold_ids=(
+                                accepted_round_spent.inner_fold_ids or ()
+                            ),
+                            first_gate_row_ids=gate_ids,
+                            first_gate_texts=gate_texts,
+                            catalog=hierarchical_first_gate_catalog,
+                            provider=shared_provider,
+                            destination=(
+                                attempt_dir / "first_gate_direct_upstream_numerical_manifest.json"
+                            ),
+                        )
+                        materialized.verify()
+                        realization_audit = {
+                            **dict(materialized.audit),
+                            "materialization_intent_sha256": (
+                                hierarchical_first_gate_materialization_intent.content_sha256
+                            ),
+                            "exact_hierarchy_approval_completed_before_materialization": True,
+                            "review_proposal_frozen_before_materialization": True,
+                            "frozen_review_proposal_sha256": cumulative_proposal_sha256,
+                        }
+                        realization_attestation = (
+                            hierarchical_first_gate_materialization_intent.verify_realization(
+                                materialized.persisted_manifest.manifest,
+                                preparation_audit=realization_audit,
+                                bound_provider=materialized.bound_provider,
+                            )
+                        )
+                        realization_path = (
+                            attempt_dir / "first_gate_materialization_realization_attestation.json"
+                        )
+                        realization_file_sha256 = _write_immutable_plain_json(
+                            realization_path,
+                            realization_attestation.as_dict(),
+                        )
+                        prebound_gate_provider = materialized.bound_provider
+                        first_gate_materialization_record = {
+                            "intent_content_sha256": (
+                                hierarchical_first_gate_materialization_intent.content_sha256
+                            ),
+                            "intent_source_cache_key": (
+                                hierarchical_first_gate_materialization_intent.body[
+                                    "source_cache_key"
+                                ]
+                            ),
+                            "realization_attestation_path": str(realization_path),
+                            "realization_attestation_file_sha256": realization_file_sha256,
+                            "realization_attestation_content_sha256": (
+                                realization_attestation.content_sha256
+                            ),
+                            "direct_manifest_path": str(materialized.persisted_manifest.path),
+                            "direct_manifest_file_sha256": (
+                                materialized.persisted_manifest.file_sha256
+                            ),
+                            "direct_manifest_content_sha256": (
+                                materialized.persisted_manifest.manifest.content_sha256
+                            ),
+                            "preparation_audit": realization_audit,
+                            "materialized_after_exact_approval": True,
+                            "materialized_after_review_proposal_freeze": True,
+                            "verified_before_first_gate_evaluation": True,
+                            "gate_labels_supplied_to_provider": False,
+                        }
+                    source_view, feature_bank_view, prebound_gate_provider_used = (
+                        self._hierarchical_gate_views(
+                            outer_fold=outer_fold,
+                            gate_row_ids=gate_ids,
+                            context=accepted_round_spent,
+                            context_texts=context_texts,
+                            gate_texts=gate_texts,
+                            prebound_provider=prebound_gate_provider,
+                        )
+                    )
+                else:
+                    source_view = self._gate_source_view(
+                        outer_fold=outer_fold,
+                        gate_row_ids=gate_ids,
+                        context=accepted_round_spent,
+                        context_texts=context_texts,
+                        gate_texts=gate_texts,
+                    )
+                    feature_bank_view = self._gate_feature_bank_view(
+                        outer_fold=outer_fold,
+                        gate_row_ids=gate_ids,
+                        context=accepted_round_spent,
+                        context_texts=context_texts,
+                        gate_texts=gate_texts,
+                    )
                 source_lineage_audit = self._gate_view_lineage_audit(
                     source_view,
                     context=accepted_round_spent,
@@ -7369,6 +9745,10 @@ class AllEvidenceFusionRunner:
                         specs=current_specs,
                         source="accepted accumulated review extraction",
                     )
+                    if hierarchical_review:
+                        if candidate_adaptive_registry is None:
+                            raise RuntimeError("accepted hierarchy lost candidate provenance")
+                        current_adaptive_registry = candidate_adaptive_registry
                 else:
                     current_extracted = self._combine_extraction_row_scopes(
                         [accepted_round_spent_extracted, current_gate_extracted],
@@ -7376,6 +9756,23 @@ class AllEvidenceFusionRunner:
                         specs=current_specs,
                         source="rejected accumulated review extraction",
                     )
+                    if hierarchical_review:
+                        if accepted_round_adaptive_registry is None:
+                            raise RuntimeError("rejected hierarchy lost baseline provenance")
+                        current_adaptive_registry = accepted_round_adaptive_registry
+
+                committed_registry_sha256 = (
+                    None
+                    if current_adaptive_registry is None
+                    else _content_sha256(
+                        [item.as_prompt_item() for item in current_adaptive_registry]
+                    )
+                )
+                expected_committed_registry_sha256 = (
+                    candidate_registry_sha256 if accepted else accepted_registry_sha256
+                )
+                if committed_registry_sha256 != expected_committed_registry_sha256:
+                    raise RuntimeError("gate commit/revert changed adaptive registry provenance")
 
                 # One gate is consumed after evaluation, including rejection.
                 spent_fold_ids.append(int(gate_fold_id))
@@ -7403,6 +9800,12 @@ class AllEvidenceFusionRunner:
                         "operation_audit": list(applied.operation_audit),
                         "cumulative_operation_audit": cumulative_operation_audit,
                         "cumulative_proposal_sha256": cumulative_proposal_sha256,
+                        "pre_gate_candidate_freeze": pre_gate_candidate_record,
+                        "accepted_round_registry_provenance_sha256": (accepted_registry_sha256),
+                        "candidate_registry_provenance_sha256": (candidate_registry_sha256),
+                        "committed_registry_provenance_sha256": (committed_registry_sha256),
+                        "gate_accept_commits_exact_candidate_registry": bool(accepted),
+                        "gate_reject_restores_exact_baseline_registry": bool(not accepted),
                         "workspace_stage_history_after_attempt": list(workspace_stage_history),
                         "workspace_specs_after_attempt_sha256": _content_sha256(candidate_specs),
                         "workspace_extraction_after_attempt_sha256": (candidate_extraction_sha256),
@@ -7447,6 +9850,14 @@ class AllEvidenceFusionRunner:
                             "row_ids_exposed_to_review_agent": False,
                             "current_gate_data_exposed_before_proposal_freeze": False,
                             "providers_invoked_after_proposal_freeze": True,
+                            "label_free_numerical_cache_materialized_before_discovery": False,
+                            "prebound_acceptance_views_first_consumed_after_proposal_freeze": (
+                                bool(prebound_gate_provider_used)
+                            ),
+                            "first_gate_materialization_intent_applicable": bool(
+                                hierarchical_review and round_index == 1
+                            ),
+                            "first_gate_materialization": first_gate_materialization_record,
                             "provider_bind_input_contract": (
                                 "spent_observable_rows_plus_exact_gate_ids_and_text_only_v1"
                             ),
@@ -7652,9 +10063,60 @@ class AllEvidenceFusionRunner:
             "partition_schedule": schedule.audit,
             "partition_provider": self.review_partition_provider_identity,
             "spent_evidence_provider": self.review_spent_evidence_provider_identity,
-            "spent_evidence_context_epoch_policy": (
-                _spent_evidence_context_epoch_policy_audit()
+            "hierarchical_frozen_review_evidence": (
+                None
+                if frozen_hierarchical_review_evidence is None
+                else frozen_hierarchical_review_evidence.as_binding_dict()
             ),
+            "hierarchical_first_gate_materialization_intent": (
+                None
+                if hierarchical_first_gate_materialization_intent is None
+                else {
+                    "content_sha256": (
+                        hierarchical_first_gate_materialization_intent.content_sha256
+                    ),
+                    "source_cache_key": (
+                        hierarchical_first_gate_materialization_intent.body["source_cache_key"]
+                    ),
+                    "materialization_boundary": (
+                        hierarchical_first_gate_materialization_intent.body[
+                            "materialization_boundary"
+                        ]
+                    ),
+                }
+            ),
+            "first_gate_numerical_materialization_before_discovery": False,
+            "round_1_frozen_accepted_support_atoms_used": bool(hierarchical_review),
+            "later_round_fresh_exact_spent_stage1_hierarchy_required": bool(
+                hierarchical_review and rounds >= 2
+            ),
+            "same_frozen_accepted_support_atoms_authorized_for_later_rounds_by_policy": False,
+            "same_frozen_accepted_support_atoms_used_for_every_executed_round": bool(
+                hierarchical_review and not adaptive_execution_records
+            ),
+            "later_round_complete_catalog_sent_to_legacy_review_agent": False,
+            "later_round_all_ten_architectures_incorporation_required": bool(
+                hierarchical_review and rounds >= 2
+            ),
+            "later_round_all_ten_architectures_incorporated": bool(adaptive_execution_records),
+            "adaptive_hierarchy_execution_count": len(adaptive_execution_records),
+            "adaptive_hierarchy_executed_round_indices": sorted(
+                {int(row["review_round"]) for row in adaptive_execution_records}
+            ),
+            "adaptive_hierarchy_execution_records": adaptive_execution_records,
+            "original_content_addressed_review_evidence_ids_preserved": bool(hierarchical_review),
+            "initial_adaptive_registry_provenance": initial_adaptive_registry_audit,
+            "final_adaptive_registry_provenance_sha256": (
+                None
+                if current_adaptive_registry is None
+                else _content_sha256([item.as_prompt_item() for item in current_adaptive_registry])
+            ),
+            "final_adaptive_registry_private_items": (
+                None
+                if current_adaptive_registry is None
+                else [item.as_prompt_item() for item in current_adaptive_registry]
+            ),
+            "spent_evidence_context_epoch_policy": (_spent_evidence_context_epoch_policy_audit()),
             "gate_source_provider": self.review_gate_source_provider_identity,
             "gate_feature_bank_provider": self.review_gate_feature_bank_provider_identity,
             "required_source_signals": self.config.require_review_source_signals,
@@ -7673,13 +10135,8 @@ class AllEvidenceFusionRunner:
                 )
                 is False
                 and initial_selector_evidence_audit.get("consumer_review_round") == 0
-                and initial_selector_evidence_audit.get(
-                    "spent_evidence_context_epoch"
-                )
-                == 0
-                and initial_selector_evidence_audit.get(
-                    "context_epoch_policy_version"
-                )
+                and initial_selector_evidence_audit.get("spent_evidence_context_epoch") == 0
+                and initial_selector_evidence_audit.get("context_epoch_policy_version")
                 == SPENT_EVIDENCE_CONTEXT_EPOCH_POLICY_VERSION
             ),
             "final_contract_sha256": [extraction_contract_sha256(spec) for spec in current_specs],
@@ -7734,7 +10191,148 @@ class AllEvidenceFusionRunner:
         }
         return current_specs, current_extracted, audit
 
-    def run(self) -> AllEvidenceFusionRunResult:
+    def run(
+        self,
+        *,
+        prepared_hierarchical_batch: PreparedHierarchicalDiscoveryBatch | None = None,
+        hierarchy_execution_authorization: object | None = None,
+    ) -> AllEvidenceFusionRunResult:
+        if (prepared_hierarchical_batch is None) != (hierarchy_execution_authorization is None):
+            raise ValueError(
+                "prepared_hierarchical_batch and hierarchy_execution_authorization "
+                "must be supplied together"
+            )
+        if prepared_hierarchical_batch is not None and not self.hierarchical_discovery_enabled:
+            raise RuntimeError(
+                "production hierarchy authorization requires hierarchical discovery mode"
+            )
+        hierarchical_preparation: PreparedHierarchicalDiscoveryBatch | None = None
+        hierarchical_batch_result: ApprovedHierarchicalDiscoveryBatchResult | None = None
+        production_runtime_binding: Mapping[str, Any] | None = None
+        hierarchical_runtime_by_fold: dict[
+            int,
+            tuple[
+                PreparedHierarchicalDiscoveryFold,
+                Any,
+                FrozenHierarchicalReviewEvidence,
+            ],
+        ] = {}
+        if self.hierarchical_discovery_enabled:
+            if prepared_hierarchical_batch is not None:
+                if type(prepared_hierarchical_batch) is not PreparedHierarchicalDiscoveryBatch:
+                    raise TypeError(
+                        "production execution requires the concrete prepared hierarchy batch"
+                    )
+                if self.hierarchical_discovery_approved_batch_sha256 is not None:
+                    raise ValueError(
+                        "production internal authorization cannot be combined with a "
+                        "caller-supplied hierarchy digest"
+                    )
+                if self.hierarchical_preparation_dir is None or (
+                    prepared_hierarchical_batch.input_manifest_path.parent.resolve()
+                    != self.hierarchical_preparation_dir.resolve()
+                ):
+                    raise ValueError("prepared hierarchy batch belongs to another runner root")
+                hierarchical_preparation = prepared_hierarchical_batch
+                hierarchical_batch_result = (
+                    hierarchical_preparation.execute_with_internal_authorization(
+                        authorization=hierarchy_execution_authorization,
+                        runner=self,
+                    )
+                )
+                production_runtime_binding = (
+                    hierarchy_execution_authorization._consumed_runtime_binding_for_runner(
+                        prepared_batch=hierarchical_preparation,
+                        runner=self,
+                    )
+                )
+            else:
+                hierarchical_preparation = self.prepare_hierarchical_discovery_batch()
+                approved_sha256 = self.hierarchical_discovery_approved_batch_sha256
+                if approved_sha256 is None:
+                    raise RuntimeError(
+                        "hierarchical discovery is prepared but not approved; inspect "
+                        f"{hierarchical_preparation.batch_packet_path} and rerun with "
+                        "hierarchical_discovery_approved_batch_sha256="
+                        f"{hierarchical_preparation.approval_sha256}"
+                    )
+                # The coordinator compares the approval before any fold preflight,
+                # job-cache lookup, or remote JSON job.
+                hierarchical_batch_result = hierarchical_preparation.execute(
+                    approved_batch_sha256=approved_sha256
+                )
+            hierarchical_batch_result.validate_authentication()
+            assert self.hierarchical_review_evidence_policy is not None
+            if len(hierarchical_batch_result.ordered_fold_results) != len(
+                hierarchical_preparation.folds
+            ):
+                raise RuntimeError("hierarchical batch result lost one or more outer folds")
+            result_rows: list[dict[str, Any]] = []
+            for prepared_fold, ordered_result in zip(
+                hierarchical_preparation.folds,
+                hierarchical_batch_result.ordered_fold_results,
+            ):
+                if ordered_result.outer_fold != prepared_fold.outer_fold:
+                    raise RuntimeError("hierarchical result order differs from preparation")
+                discovery_result = ordered_result.result
+                discovery_result.validate_authentication()
+                frozen_review = freeze_hierarchical_review_evidence(
+                    catalog=prepared_fold.catalog,
+                    completed=discovery_result.completed,
+                    config=(self.hierarchical_review_evidence_policy.materializer_config()),
+                )
+                fold_result_path = (
+                    self.hierarchical_preparation_dir
+                    / f"outer_fold_{prepared_fold.outer_fold:03d}"
+                    / "authenticated_hierarchical_discovery_result.json"
+                )
+                fold_result_sha256 = _write_immutable_json(
+                    fold_result_path,
+                    {
+                        "outer_fold": prepared_fold.outer_fold,
+                        "batch_approval_sha256": (hierarchical_batch_result.batch_approval_sha256),
+                        "batch_result_sha256": hierarchical_batch_result.result_sha256,
+                        "fold_result_binding": ordered_result.binding,
+                        "compiled_registry_sha256": (
+                            discovery_result.compiled_registry.registry_sha256
+                        ),
+                        "compiled_specs": discovery_result.compiled_registry.specs,
+                        "frozen_review_evidence": frozen_review.as_binding_dict(),
+                        "raw_reasoning_persisted": False,
+                        "row_level_numerical_values_persisted": False,
+                    },
+                    schema=HIERARCHICAL_DISCOVERY_BATCH_RESULT_SCHEMA_VERSION,
+                )
+                result_rows.append(
+                    {
+                        "outer_fold": prepared_fold.outer_fold,
+                        "fold_result_path": str(fold_result_path),
+                        "fold_result_content_sha256": fold_result_sha256,
+                        "fold_result_binding": ordered_result.binding,
+                        "frozen_review_evidence_binding_sha256": (frozen_review.binding_sha256),
+                    }
+                )
+                hierarchical_runtime_by_fold[prepared_fold.outer_fold] = (
+                    prepared_fold,
+                    discovery_result,
+                    frozen_review,
+                )
+            assert self.hierarchical_preparation_dir is not None
+            _write_immutable_json(
+                self.hierarchical_preparation_dir / "authenticated_hierarchical_batch_result.json",
+                {
+                    "batch_approval_sha256": (hierarchical_batch_result.batch_approval_sha256),
+                    "batch_result_sha256": hierarchical_batch_result.result_sha256,
+                    "input_manifest_sha256": (hierarchical_batch_result.input_manifest_sha256),
+                    "frozen_review_policy_sha256": (
+                        hierarchical_batch_result.frozen_review_policy_sha256
+                    ),
+                    "ordered_fold_results": result_rows,
+                    "all_fold_discovery_completed_before_per_fold_modeling": True,
+                },
+                schema=HIERARCHICAL_DISCOVERY_BATCH_RESULT_SCHEMA_VERSION,
+            )
+
         current_cache_overlay_identity = _review_provider_identity(
             self.cache_overlay,
             label="cache_overlay",
@@ -7747,6 +10345,18 @@ class AllEvidenceFusionRunner:
             treatment_column=self.config.treatment_column,
             outcome_column=self.config.outcome_column,
         )
+        if (
+            hierarchical_preparation is not None
+            and dataset_sha256 != hierarchical_preparation.dataset_sha256
+        ):
+            raise RuntimeError(
+                "dataset bytes changed after hierarchical batch preparation/execution"
+            )
+        if (
+            production_runtime_binding is not None
+            and dataset_sha256 != production_runtime_binding["dataset_artifact"]["sha256"]
+        ):
+            raise RuntimeError("dataset differs from the production runtime authorization")
         external_validation: Mapping[str, Any] | None = None
         if self.tfidf_validator is not None:
             external_validation = self.tfidf_validator(
@@ -7764,10 +10374,26 @@ class AllEvidenceFusionRunner:
             dataset_row_count=len(data),
             require_registry_seal=self.config.require_registry_seal,
         )
+        if production_runtime_binding is not None and (
+            legacy.artifact_sha256
+            != production_runtime_binding["legacy_handoff_artifact"]["sha256"]
+            or tfidf.artifact_sha256
+            != production_runtime_binding["tfidf_handoff_artifact"]["sha256"]
+        ):
+            raise RuntimeError(
+                "legacy or TF-IDF handoff differs from the production runtime authorization"
+            )
         folds = sorted(tfidf.full_rows_by_outer_fold)
         if set(legacy.rows_by_outer_fold) != set(folds):
             raise ValueError("legacy and TF-IDF full-outer fold sets do not match exactly")
         legacy_split_audit: Mapping[str, Any] | None = None
+        if production_runtime_binding is not None and (
+            (production_runtime_binding["legacy_primary_predictions_artifact"] is None)
+            != (self.legacy_primary_predictions_path is None)
+        ):
+            raise RuntimeError(
+                "legacy primary split registration changed after production authorization"
+            )
         if self.legacy_primary_predictions_path is not None:
             legacy_heldout, legacy_primary_sha256 = (
                 _load_outer_splits_from_primary_predictions_snapshot(
@@ -7794,6 +10420,14 @@ class AllEvidenceFusionRunner:
                 "columns_read": ["_oci_row_id", "outer_fold_or_cv_fold"],
                 "matches_tfidf_outer_splits": True,
             }
+            if (
+                production_runtime_binding is not None
+                and legacy_primary_sha256
+                != production_runtime_binding["legacy_primary_predictions_artifact"]["sha256"]
+            ):
+                raise RuntimeError(
+                    "legacy primary splits differ from the production runtime authorization"
+                )
         unexpected_pools = set(self.candidate_pool_paths) - set(folds)
         unexpected_queries = set(self.query_evidence_by_fold) - set(folds)
         unexpected_orphans = set(self.tfidf_orphan_artifacts_by_fold) - set(folds)
@@ -7815,10 +10449,32 @@ class AllEvidenceFusionRunner:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         input_manifest = {
             "runner_schema_version": RUNNER_SCHEMA_VERSION,
-            "source_text_temporal_policy": source_text_temporal_policy_audit(),
-            "spent_evidence_context_epoch_policy": (
-                _spent_evidence_context_epoch_policy_audit()
+            "initial_discovery": (
+                {
+                    "mode": "hierarchical_all_active_stage1_architectures",
+                    "preparation_input_manifest_path": str(
+                        hierarchical_preparation.input_manifest_path
+                    ),
+                    "preparation_input_manifest_sha256": (
+                        hierarchical_preparation.input_manifest_sha256
+                    ),
+                    "batch_packet_path": str(hierarchical_preparation.batch_packet_path),
+                    "batch_approval_sha256": hierarchical_preparation.approval_sha256,
+                    "batch_result_sha256": hierarchical_batch_result.result_sha256,
+                    "frozen_review_policy_sha256": (
+                        hierarchical_batch_result.frozen_review_policy_sha256
+                    ),
+                    "all_fold_discovery_completed_before_per_fold_modeling": True,
+                    "legacy_compact_fusion_agent_used": False,
+                }
+                if (hierarchical_preparation is not None and hierarchical_batch_result is not None)
+                else {
+                    "mode": "legacy_compact_fusion",
+                    "legacy_compact_fusion_agent_used": True,
+                }
             ),
+            "source_text_temporal_policy": source_text_temporal_policy_audit(),
+            "spent_evidence_context_epoch_policy": (_spent_evidence_context_epoch_policy_audit()),
             # Bind every prediction-affecting runner option at the first
             # immutable boundary.  Without this, reusing an output directory
             # with (for example) a different extraction model or head seed can
@@ -8046,7 +10702,49 @@ class AllEvidenceFusionRunner:
             initial_selector_evidence_audit: Mapping[str, Any] | None = None
             query_audit: Mapping[str, Any] | None = None
             candidate_audit: Mapping[str, Any] | None = None
-            if self.config.post_extraction_review_rounds > 0:
+            hierarchical_runtime = hierarchical_runtime_by_fold.get(outer_fold)
+            hierarchical_discovery_result: Any | None = None
+            frozen_hierarchical_review: FrozenHierarchicalReviewEvidence | None = None
+            hierarchical_first_gate_materialization_intent: (
+                FirstGateMaterializationIntent | None
+            ) = None
+            hierarchical_first_gate_catalog: RoleNeutralEvidenceCatalog | None = None
+            if hierarchical_runtime is not None:
+                (
+                    prepared_hierarchical_fold,
+                    hierarchical_discovery_result,
+                    frozen_hierarchical_review,
+                ) = hierarchical_runtime
+                review_schedule = prepared_hierarchical_fold.schedule
+                hierarchical_first_gate_materialization_intent = (
+                    prepared_hierarchical_fold.first_gate_materialization_intent
+                )
+                hierarchical_first_gate_catalog = prepared_hierarchical_fold.catalog
+                if set(
+                    row_id for rows in review_schedule.row_ids_by_fold.values() for row_id in rows
+                ) != set(train_ids):
+                    raise RuntimeError(
+                        "hierarchical prepared review schedule differs from final outer train"
+                    )
+                initial_selector_evidence_audit = dict(
+                    prepared_hierarchical_fold.initial_spent_evidence_audit
+                )
+                orphan_audit = {
+                    "excluded_from_adaptive_initial_selector": True,
+                    "reason": "full_outer_artifact_depends_on_sealed_review_rows",
+                    "hierarchical_spent_only_catalog_used": True,
+                }
+                query_audit = {
+                    "full_outer_query_evidence_excluded_from_adaptive_initial_selector": True,
+                    "spent_only_provider_used": True,
+                    "hierarchical_catalog_contains_neural_query_moments": True,
+                }
+                if outer_fold in self.candidate_pool_paths:
+                    candidate_audit = {
+                        "registered_but_excluded_from_adaptive_initial_selector": True,
+                        "reason": "candidate_pool_not_authenticated_to_initial_spent_rows",
+                    }
+            elif self.config.post_extraction_review_rounds > 0:
                 outer_train = (
                     data.set_index("_oci_row_id", drop=False)
                     .loc[list(train_ids)]
@@ -8141,58 +10839,110 @@ class AllEvidenceFusionRunner:
                     candidates=candidates,
                     max_candidates=self.config.max_candidates,
                 )
-            request_hash = _content_sha256(request.context())
-            response_cache_path = fold_dir / "immutable_fusion_response.json"
-            cached_response_record = _load_request_bound_fusion_response(
-                response_cache_path,
-                request_sha256=request_hash,
-            )
-            if cached_response_record is None:
-                response, response_hash = self._invoke_agent(request)
-                # Never persist an invalid remote response.
-                result = validate_all_evidence_fusion_response(request, response)
-                staged_fusion_audit = _validate_request_bound_staged_fusion_audit(
-                    getattr(self.fusion_agent, "last_stage_audit", None),
-                    request_sha256=request_hash,
-                    response_sha256=response_hash,
-                    outer_fold=outer_fold,
-                    split_fingerprint=request.split_fingerprint,
+            if hierarchical_discovery_result is not None:
+                assert hierarchical_batch_result is not None
+                assert hierarchical_preparation is not None
+                hierarchical_discovery_result.validate_authentication()
+                specs = hierarchical_discovery_result.compiled_registry.specs
+                request_hash = hierarchical_discovery_result.wrapper_approval_sha256
+                response_hash = hierarchical_discovery_result.result_sha256
+                response_cache_path = (
+                    self.hierarchical_preparation_dir
+                    / f"outer_fold_{outer_fold:03d}"
+                    / "authenticated_hierarchical_discovery_result.json"
                 )
+                staged_fusion_audit = None
                 staged_fusion_audit_status = (
-                    "captured_and_request_bound"
-                    if staged_fusion_audit is not None
-                    else "unavailable_not_exposed_by_agent"
+                    "not_applicable_hierarchical_architecture_at_a_time_discovery"
                 )
-                _write_immutable_json(
-                    response_cache_path,
-                    {
-                        "request_sha256": request_hash,
-                        "response": response,
-                        "staged_fusion_audit": staged_fusion_audit,
-                        "staged_fusion_audit_status": staged_fusion_audit_status,
-                    },
-                    schema=FUSION_RESPONSE_CACHE_SCHEMA_VERSION,
-                )
+                fusion_prompt_version = "hierarchical_all_architecture_discovery_precommitted_jobs"
+                fusion_source_family_coverage = {
+                    family: len(hierarchical_runtime[0].catalog.family_atoms(family))
+                    for family in ACTIVE_STAGE1_CONCEPT_FAMILIES
+                }
+                fusion_response_audit = {
+                    "mode": "hierarchical_all_active_stage1_architectures",
+                    "batch_approval_sha256": (hierarchical_batch_result.batch_approval_sha256),
+                    "batch_result_sha256": hierarchical_batch_result.result_sha256,
+                    "wrapper_approval_sha256": (
+                        hierarchical_discovery_result.wrapper_approval_sha256
+                    ),
+                    "inner_precommit_sha256": (
+                        hierarchical_discovery_result.inner_precommit_sha256
+                    ),
+                    "completion_sha256": (
+                        hierarchical_discovery_result.completed.completion_sha256
+                    ),
+                    "compiled_registry_sha256": (
+                        hierarchical_discovery_result.compiled_registry.registry_sha256
+                    ),
+                    "runner_trace_sha256": (
+                        hierarchical_discovery_result.runner_trace.trace_sha256
+                    ),
+                    "all_active_architectures_incorporated": True,
+                    "one_architecture_at_a_time_before_cross_architecture_integration": True,
+                    "legacy_all_evidence_dump_prompt_used": False,
+                }
+                initial_discovery_mode = "hierarchical_all_active_stage1_architectures"
             else:
-                (
-                    response,
-                    cached_staged_fusion_audit,
-                    staged_fusion_audit_status,
-                ) = cached_response_record
-                response_hash = _content_sha256(response)
-                # Revalidate cached JSON against the reconstructed immutable
-                # request before trusting any candidate IDs or contracts.
-                result = validate_all_evidence_fusion_response(request, response)
-                staged_fusion_audit = _validate_request_bound_staged_fusion_audit(
-                    cached_staged_fusion_audit,
+                request_hash = _content_sha256(request.context())
+                response_cache_path = fold_dir / "immutable_fusion_response.json"
+                cached_response_record = _load_request_bound_fusion_response(
+                    response_cache_path,
                     request_sha256=request_hash,
-                    response_sha256=response_hash,
-                    outer_fold=outer_fold,
-                    split_fingerprint=request.split_fingerprint,
                 )
-            specs = (
-                result.selected_specs if result.mode == "select" else list(result.proposed_specs)
-            )
+                if cached_response_record is None:
+                    response, response_hash = self._invoke_agent(request)
+                    # Never persist an invalid remote response.
+                    fusion_result = validate_all_evidence_fusion_response(request, response)
+                    staged_fusion_audit = _validate_request_bound_staged_fusion_audit(
+                        getattr(self.fusion_agent, "last_stage_audit", None),
+                        request_sha256=request_hash,
+                        response_sha256=response_hash,
+                        outer_fold=outer_fold,
+                        split_fingerprint=request.split_fingerprint,
+                    )
+                    staged_fusion_audit_status = (
+                        "captured_and_request_bound"
+                        if staged_fusion_audit is not None
+                        else "unavailable_not_exposed_by_agent"
+                    )
+                    _write_immutable_json(
+                        response_cache_path,
+                        {
+                            "request_sha256": request_hash,
+                            "response": response,
+                            "staged_fusion_audit": staged_fusion_audit,
+                            "staged_fusion_audit_status": staged_fusion_audit_status,
+                        },
+                        schema=FUSION_RESPONSE_CACHE_SCHEMA_VERSION,
+                    )
+                else:
+                    (
+                        response,
+                        cached_staged_fusion_audit,
+                        staged_fusion_audit_status,
+                    ) = cached_response_record
+                    response_hash = _content_sha256(response)
+                    # Revalidate cached JSON against the reconstructed immutable
+                    # request before trusting any candidate IDs or contracts.
+                    fusion_result = validate_all_evidence_fusion_response(request, response)
+                    staged_fusion_audit = _validate_request_bound_staged_fusion_audit(
+                        cached_staged_fusion_audit,
+                        request_sha256=request_hash,
+                        response_sha256=response_hash,
+                        outer_fold=outer_fold,
+                        split_fingerprint=request.split_fingerprint,
+                    )
+                specs = (
+                    fusion_result.selected_specs
+                    if fusion_result.mode == "select"
+                    else list(fusion_result.proposed_specs)
+                )
+                fusion_prompt_version = request.context()["prompt_version"]
+                fusion_source_family_coverage = request.source_family_coverage
+                fusion_response_audit = fusion_result.response_audit
+                initial_discovery_mode = "legacy_compact_fusion"
             if not specs:
                 raise ValueError(f"fusion selected no executable contracts for fold {outer_fold}")
             if len({str(spec["name"]) for spec in specs}) != len(specs):
@@ -8240,6 +10990,26 @@ class AllEvidenceFusionRunner:
                 fold_dir=fold_dir,
                 review_schedule=review_schedule,
                 initial_selector_evidence_audit=initial_selector_evidence_audit,
+                frozen_hierarchical_review_evidence=frozen_hierarchical_review,
+                hierarchical_first_gate_materialization_intent=(
+                    hierarchical_first_gate_materialization_intent
+                ),
+                hierarchical_first_gate_catalog=hierarchical_first_gate_catalog,
+                hierarchical_approved_runner_identity=(
+                    None
+                    if hierarchical_discovery_result is None
+                    else hierarchical_discovery_result.runner_trace.runner_identity
+                ),
+                hierarchical_approved_cache_identity=(
+                    None
+                    if hierarchical_discovery_result is None
+                    else hierarchical_discovery_result.runner_trace.cache_identity
+                ),
+                hierarchical_family_explanations=(
+                    None
+                    if hierarchical_discovery_result is None
+                    else dict(prepared_hierarchical_fold.agent.family_explanations)
+                ),
             )
             model_frame = data.merge(
                 extracted.drop(columns=[self.config.text_column], errors="ignore"),
@@ -8377,10 +11147,32 @@ class AllEvidenceFusionRunner:
                 if current_backend_identity != self.final_causal_forest_backend_identity:
                     raise ValueError("final causal-forest backend identity changed")
                 assert self.raw_final_upstream_producer is not None
-                nuisance_derivation = derive_exact_nuisance_from_runtime_stable_stage1(
-                    package,
-                    runtime_producer=self.raw_final_upstream_producer,
-                )
+                if self.coordinate_preserving_nuisance_view_names is not None:
+                    if (
+                        self.coordinate_preserving_producer_precommit_sha256 is None
+                        or self.coordinate_preserving_nuisance_contract_sha256 is None
+                    ):
+                        raise RuntimeError(
+                            "coordinate-preserving nuisance precommitments are missing"
+                        )
+                    nuisance_derivation = derive_exact_nuisance_from_coordinate_preserved_stage1(
+                        package,
+                        runtime_producer=self.raw_final_upstream_producer,
+                        bow_view_names=self.coordinate_preserving_nuisance_view_names,
+                        precommitted_producer_identity_sha256=(
+                            self.coordinate_preserving_producer_precommit_sha256
+                        ),
+                        precommitted_coordinate_contract_sha256=(
+                            self.coordinate_preserving_nuisance_contract_sha256
+                        ),
+                    )
+                    nuisance_bridge_mode = "coordinate_preserving_v3"
+                else:
+                    nuisance_derivation = derive_exact_nuisance_from_runtime_stable_stage1(
+                        package,
+                        runtime_producer=self.raw_final_upstream_producer,
+                    )
+                    nuisance_bridge_mode = "stable_family_summary_v2"
                 nuisance_derivation.verify_authenticated_content(
                     package,
                     runtime_producer=self.raw_final_upstream_producer,
@@ -8450,6 +11242,7 @@ class AllEvidenceFusionRunner:
                         and not self.final_causal_forest_backend_was_injected
                     ),
                     "test_backend_injected": self.final_causal_forest_backend_was_injected,
+                    "authenticated_nuisance_derivation_mode": nuisance_bridge_mode,
                     "authenticated_stable_nuisance_derivation": dict(
                         nuisance_derivation.audit_record()
                     ),
@@ -8551,18 +11344,48 @@ class AllEvidenceFusionRunner:
                     else "full_outer_train_nonadaptive"
                 ),
                 "initial_selector_evidence_audit": initial_selector_evidence_audit,
-                "fusion_prompt_version": request.context()["prompt_version"],
+                "initial_discovery_mode": initial_discovery_mode,
+                "fusion_prompt_version": fusion_prompt_version,
                 "fusion_request_sha256": request_hash,
-                "fusion_source_family_coverage": request.source_family_coverage,
+                "fusion_source_family_coverage": fusion_source_family_coverage,
                 "fusion_response_sha256": response_hash,
                 "fusion_response_cache_path": str(response_cache_path.resolve()),
                 "fusion_response_validated_before_cache_write_or_after_cache_load": True,
                 "staged_fusion_audit": {
                     "status": staged_fusion_audit_status,
-                    "persisted_with_request_bound_response_cache": True,
+                    "persisted_with_request_bound_response_cache": bool(
+                        hierarchical_discovery_result is None
+                    ),
                     "audit": staged_fusion_audit,
                 },
-                "fusion_response_audit": result.response_audit,
+                "fusion_response_audit": fusion_response_audit,
+                "hierarchical_discovery": (
+                    None
+                    if hierarchical_discovery_result is None
+                    else {
+                        "batch_approval_sha256": (hierarchical_batch_result.batch_approval_sha256),
+                        "batch_result_sha256": hierarchical_batch_result.result_sha256,
+                        "wrapper_approval_sha256": (
+                            hierarchical_discovery_result.wrapper_approval_sha256
+                        ),
+                        "completion_sha256": (
+                            hierarchical_discovery_result.completed.completion_sha256
+                        ),
+                        "compiled_registry_sha256": (
+                            hierarchical_discovery_result.compiled_registry.registry_sha256
+                        ),
+                        "frozen_review_evidence_binding_sha256": (
+                            frozen_hierarchical_review.binding_sha256
+                        ),
+                        "all_fold_discovery_completed_before_this_fold_modeling": True,
+                        "first_gate_materialization_intent_sha256": (
+                            hierarchical_first_gate_materialization_intent.content_sha256
+                        ),
+                        "first_gate_label_free_cache_materialized_before_discovery": False,
+                        "first_gate_cache_materialization_deferred_until_proposal_freeze": True,
+                        "first_gate_values_or_coordinate_metadata_exposed_to_discovery": False,
+                    }
+                ),
                 "initial_selected_contracts": initial_specs,
                 "initial_selected_contract_sha256": [
                     extraction_contract_sha256(spec) for spec in initial_specs
@@ -8636,9 +11459,7 @@ class AllEvidenceFusionRunner:
         prediction_sha = _write_immutable_parquet(prediction_path, combined)
         run_manifest_body = {
             "source_text_temporal_policy": source_text_temporal_policy_audit(),
-            "spent_evidence_context_epoch_policy": (
-                _spent_evidence_context_epoch_policy_audit()
-            ),
+            "spent_evidence_context_epoch_policy": (_spent_evidence_context_epoch_policy_audit()),
             "input_manifest_path": str(input_manifest_path.resolve()),
             "input_manifest_content_sha256": input_manifest_hash,
             "fold_manifest_paths": [str(path.resolve()) for path in fold_manifests],

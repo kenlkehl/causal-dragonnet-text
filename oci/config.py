@@ -1116,6 +1116,10 @@ class TfidfTopicDiscoveryConfig:
     # agent labeling.  Every bank retains a bounded evidence-ranked set; the
     # minimum is a power safeguard rather than a significance claim.
     score_test_enabled: bool = True
+    # Historical experiments scored on the registered context holdout. New
+    # production bundles split the registered fit partition again, freeze
+    # selection there, and only then transform the label-free holdout.
+    score_selection_label_policy: str = "registered_context_heldout"
     score_test_bootstrap_repeats: int = 500
     # Zero means every fitted topic.  Production defaults to the complete
     # family so a topic is never chosen for bootstrap calibration after its
@@ -1177,6 +1181,14 @@ class TfidfTopicDiscoveryConfig:
             raise ValueError("tfidf_topic.topic_label_parallelism must be >= 1")
         if self.score_test_bootstrap_repeats < 0:
             raise ValueError("tfidf_topic.score_test_bootstrap_repeats must be >= 0")
+        if self.score_selection_label_policy not in {
+            "registered_context_heldout",
+            "nested_fit_calibration",
+        }:
+            raise ValueError(
+                "tfidf_topic.score_selection_label_policy must be "
+                "registered_context_heldout or nested_fit_calibration"
+            )
         if self.score_test_bootstrap_top_topics < 0:
             raise ValueError("tfidf_topic.score_test_bootstrap_top_topics must be >= 0")
         if self.score_test_bootstrap_chunk_size < 1:
@@ -1268,6 +1280,9 @@ class MultiModelAgenticForestConfig:
     concept_inventory_max_concepts: int = 60
     candidate_consistency_enabled: bool = True
     candidate_consistency_inner_folds: int = 3
+    # Fit-only calibration inside a registered TF-IDF scope. This is distinct
+    # from hierarchy partitions and downstream interaction cross-fitting.
+    tfidf_nested_calibration_folds: int = 3
     candidate_consistency_min_folds: int = 2
     candidate_consistency_min_fold_fraction: float = 0.5
     candidate_consistency_recovery_max_candidates: int = 12
@@ -1409,6 +1424,10 @@ class MultiModelAgenticForestConfig:
         if self.candidate_consistency_inner_folds < 2:
             raise ValueError(
                 "multi_model_agentic_forest.candidate_consistency_inner_folds must be >= 2"
+            )
+        if self.tfidf_nested_calibration_folds < 2:
+            raise ValueError(
+                "multi_model_agentic_forest.tfidf_nested_calibration_folds must be >= 2"
             )
         if self.candidate_consistency_min_folds < 1:
             raise ValueError(

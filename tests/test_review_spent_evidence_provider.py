@@ -63,9 +63,7 @@ def test_stage1_spent_identity_rejects_live_parallelism_mutation() -> None:
     cache_identity = {"provider": "synthetic_cache"}
     backend.embedding_cache = SimpleNamespace(identity=lambda: copy.deepcopy(cache_identity))
     backend._identity = {
-        "effective_config_sha256": spent_module._effective_applied_config_sha256(
-            backend.config
-        ),
+        "effective_config_sha256": spent_module._effective_applied_config_sha256(backend.config),
         "embedding_cache": cache_identity,
     }
 
@@ -179,6 +177,28 @@ def test_lazy_embedding_cache_rejects_path_swap_during_snapshot(
     with pytest.raises(RuntimeError, match="changed while it was being authenticated"):
         SpentOnlyFrozenChunkEmbeddingCache(tmp_path)
     assert swapped is True
+
+
+def test_lazy_embedding_cache_rejects_symlink_root_before_resolution(tmp_path: Path) -> None:
+    cache_root = tmp_path / "real-cache"
+    cache_root.mkdir()
+    _write_lazy_embedding_cache(cache_root, ("one two three four",))
+    linked_root = tmp_path / "linked-cache"
+    linked_root.symlink_to(cache_root, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="root cannot be a symlink"):
+        SpentOnlyFrozenChunkEmbeddingCache(linked_root)
+
+
+def test_lazy_embedding_cache_rejects_symlink_file_before_snapshot(tmp_path: Path) -> None:
+    _write_lazy_embedding_cache(tmp_path, ("one two three four",))
+    metadata = tmp_path / "metadata.json"
+    real_metadata = tmp_path / "metadata.real.json"
+    metadata.rename(real_metadata)
+    metadata.symlink_to(real_metadata.name)
+
+    with pytest.raises(ValueError, match="files cannot be symlinks"):
+        SpentOnlyFrozenChunkEmbeddingCache(tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -591,7 +611,6 @@ def test_chunk_only_htr_projection_is_contrastive_deterministic_and_excerpt_free
     assert projected == permuted
     concepts = projected["effect"]["attention"]
     assert concepts
-    assert len(concepts) <= 6
     assert all(1 <= len(row["attended_token_summary"].split()) <= 3 for row in concepts)
     concept_tokens = [token for row in concepts for token in row["attended_token_summary"].split()]
     assert len(concept_tokens) == len(set(concept_tokens))
@@ -633,6 +652,61 @@ def test_chunk_only_htr_projection_is_contrastive_deterministic_and_excerpt_free
     )
     assert "htr_neural" in compacted.source_family_coverage["present_source_families"]
     assert all(text not in json.dumps(compacted.context(), sort_keys=True) for text in high_texts)
+
+
+def test_semantic_projection_default_is_exhaustive_beyond_old_4096_cap() -> None:
+    positive = " ".join(f"positiveconcept{index}" for index in range(900))
+    negative = " ".join(f"negativeconcept{index}" for index in range(900))
+    raw = {
+        "contrasts": [
+            {
+                "name": "fit retrieval direction",
+                "contrast_family": "marginal",
+                "direction_source": "fit rows only",
+                "positive_aligned_chunks": [{"text": positive}],
+                "negative_aligned_chunks": [{"text": negative}],
+            }
+        ]
+    }
+
+    exhaustive = _embedding_concepts_only(raw)["contrasts"][0]["concept_probe_scores"]
+    explicitly_bounded = spent_module._signed_contrastive_terms(
+        [positive],
+        [negative],
+        limit=4096,
+    )
+
+    assert len(exhaustive) > 4096
+    assert len(explicitly_bounded) == 4096
+    assert explicitly_bounded == exhaustive[:4096]
+
+
+def test_chunk_only_htr_projection_default_is_not_limited_to_six_concepts() -> None:
+    recurring = " ".join(
+        f"hydraulic{chr(97 + first)}{chr(97 + second)}" for first in range(5) for second in range(6)
+    )
+    attention = [
+        row
+        for row_id, suffix in ((201, "alpha"), (202, "beta"), (203, "gamma"))
+        for row in (
+            {
+                "row_id": row_id,
+                "chunk_index": 0,
+                "chunk_text": f"{recurring} variation{suffix}",
+                "attention": 0.9,
+            },
+            {
+                "row_id": row_id,
+                "chunk_index": 1,
+                "chunk_text": f"routine scheduling paperwork variation{suffix}",
+                "attention": 0.1,
+            },
+        )
+    ]
+
+    projected = _htr_concepts_only({"effect": {"attention": attention}})
+
+    assert len(projected["effect"]["attention"]) > 6
 
 
 def test_chunk_only_htr_projection_separates_model_folds_and_pair_sides() -> None:
@@ -813,7 +887,9 @@ def test_tfidf_backend_refits_only_spent_rows_and_builds_safe_orphans(
         ).to_parquet(scores_path, index=False)
         return {
             "topic_banks": {
-                "treatment": {"topics": [{"terms": [{"term": "baseline routing", "loading": 0.8}]}]},
+                "treatment": {
+                    "topics": [{"terms": [{"term": "baseline routing", "loading": 0.8}]}]
+                },
                 "outcome": {"topics": [{"terms": [{"term": "baseline failure", "loading": 0.7}]}]},
                 "effect": {"topics": [{"terms": [{"term": "represented sensor", "loading": 0.6}]}]},
             },

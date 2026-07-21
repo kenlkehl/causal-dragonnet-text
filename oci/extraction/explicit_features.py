@@ -269,36 +269,19 @@ def build_extraction_prompt(
         )
         document_label = "Contract-guided retrieved excerpts"
     elif "[neural_query_rag_v1]" in text:
-        if source_text_temporally_valid_by_design:
-            document_instruction = (
-                "Read every retrieved excerpt below and extract the following patient "
-                "characteristics according to each contract."
-            )
-            document_label = "Query-retrieved excerpts"
-        else:
-            document_instruction = (
-                "Read every retrieved baseline-history excerpt below and extract the "
-                "following patient characteristics. The excerpts may mention prior "
-                "therapies, responses, or outcomes; those are valid history before the "
-                "current treatment decision."
-            )
-            document_label = "Query-retrieved baseline excerpts"
+        document_instruction = (
+            "Read every retrieved excerpt below and extract the following patient "
+            "characteristics according to each contract."
+        )
+        document_label = "Query-retrieved excerpts"
     else:
         document_instruction = (
             "Read this complete clinical note and extract the following patient " "characteristics."
         )
         document_label = "Clinical Note"
 
-    temporal_instruction = (
-        "The supplied source text is temporally valid by design. Do not infer or enforce "
-        "a treatment-time boundary, and do not reject a documented value because of "
-        "temporal wording. Follow the extraction contract exactly. Do not guess."
-        if source_text_temporally_valid_by_design
-        else "Use only information available before or at the current treatment "
-        "initiation. Do not guess."
-    )
     prompt = f"""{document_instruction}
-{temporal_instruction}
+Follow each extraction contract exactly. Do not guess.
 For categorical fields, use a listed category when supported and follow each field's unknown/not_documented policy. Every categorical field may be JSON null when its value is not documented.
 For continuous fields that are not explicitly stated or cannot be deterministically converted, return null.
 
@@ -334,13 +317,8 @@ def build_extraction_repair_prompt(
     shape = "{" + ", ".join(fields) + "}"
     instruction_text = "\n".join(instructions)
     missing_rule = (
-        "The supplied source text is temporally valid by design. Do not infer or enforce a "
-        "treatment-time boundary, and do not reject a documented value because of temporal "
-        "wording. Use null when a value is unknown, not stated, or cannot be inferred from "
+        "Use null when a value is unknown, not stated, or cannot be inferred from "
         "the supplied source text."
-        if source_text_temporally_valid_by_design
-        else "Use null when a value is unknown, not stated, or cannot be inferred from "
-        "information documented before treatment."
     )
     return f"""The previous extraction response could not be used.
 

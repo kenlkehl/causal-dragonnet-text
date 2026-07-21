@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -20,7 +20,6 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 from scipy.optimize import linear_sum_assignment
-from sklearn.base import clone
 from sklearn.decomposition import NMF
 from sklearn.ensemble import (
     ExtraTreesClassifier,
@@ -186,9 +185,7 @@ class CrossFittedStack:
             else:
                 matrix = vectorizer.transform(texts)
                 prediction = (
-                    model.predict_proba(matrix)[:, 1]
-                    if self.binary
-                    else model.predict(matrix)
+                    model.predict_proba(matrix)[:, 1] if self.binary else model.predict(matrix)
                 )
             prediction = np.asarray(prediction, dtype=float)
             columns.append(prediction)
@@ -370,9 +367,7 @@ def _matrix_model_prediction(
     model.fit(x_fit, values.astype(int) if binary else values)
     if x_predict.shape[0] == 0:
         return np.zeros(0, dtype=float), model
-    prediction = (
-        model.predict_proba(x_predict)[:, 1] if binary else model.predict(x_predict)
-    )
+    prediction = model.predict_proba(x_predict)[:, 1] if binary else model.predict(x_predict)
     return np.asarray(prediction, dtype=float), model
 
 
@@ -397,9 +392,7 @@ def fit_joint_cross_fitted_nuisance_stacks(
     views = list(views)
     n_rows = len(texts)
     fold_count = _bounded_folds(folds, split_labels, stratified=True)
-    base_oof = {
-        target: np.full((n_rows, len(views)), np.nan, dtype=float) for target in targets
-    }
+    base_oof = {target: np.full((n_rows, len(views)), np.nan, dtype=float) for target in targets}
     stack_oof = {target: np.full(n_rows, np.nan, dtype=float) for target in targets}
     fold_ids = np.full(n_rows, -1, dtype=int)
     fit_positions_by_row: List[List[int]] = [[] for _ in range(n_rows)]
@@ -413,12 +406,9 @@ def fit_joint_cross_fitted_nuisance_stacks(
         fit_pos = np.asarray(fit_pos, dtype=int)
         heldout_pos = np.asarray(heldout_pos, dtype=int)
         fit_strata = split_labels[fit_pos]
-        sub_folds = _bounded_folds(
-            min(fold_count, len(fit_pos) // 2), fit_strata, stratified=True
-        )
+        sub_folds = _bounded_folds(min(fold_count, len(fit_pos) // 2), fit_strata, stratified=True)
         meta_fit = {
-            target: np.full((len(fit_pos), len(views)), np.nan, dtype=float)
-            for target in targets
+            target: np.full((len(fit_pos), len(views)), np.nan, dtype=float) for target in targets
         }
         for sub_fold, (sub_fit_local, sub_hold_local) in enumerate(
             _splitter(
@@ -534,7 +524,11 @@ def fit_joint_cross_fitted_nuisance_stacks(
                         values,
                         view,
                         binary=binary,
-                        seed=random_state + 50_000 + 100 * group_index + 10 * view_index + target_index,
+                        seed=random_state
+                        + 50_000
+                        + 100 * group_index
+                        + 10 * view_index
+                        + target_index,
                     )
                 fitted_bases[target][view_index] = (
                     vectorizer,
@@ -614,7 +608,9 @@ def expected_calibration_error(
     return float(error)
 
 
-def nuisance_metrics(values: np.ndarray, predictions: np.ndarray, *, binary: bool) -> Dict[str, Any]:
+def nuisance_metrics(
+    values: np.ndarray, predictions: np.ndarray, *, binary: bool
+) -> Dict[str, Any]:
     values = np.asarray(values, dtype=float)
     predictions = np.asarray(predictions, dtype=float)
     if not binary:
@@ -707,7 +703,9 @@ def unsigned_linear_screen(
             coefficients = np.zeros(x.shape[1], dtype=float)
         else:
             model = LogisticRegression(
-                C=float(logistic_c), solver="liblinear", max_iter=1000,
+                C=float(logistic_c),
+                solver="liblinear",
+                max_iter=1000,
                 random_state=random_state,
             ).fit(x, values.astype(int))
             coefficients = np.asarray(model.coef_).reshape(-1)
@@ -726,9 +724,7 @@ def unsigned_linear_screen(
     )
 
 
-def _subsample_indices(
-    strata: np.ndarray, fraction: float, rng: np.random.Generator
-) -> np.ndarray:
+def _subsample_indices(strata: np.ndarray, fraction: float, rng: np.random.Generator) -> np.ndarray:
     selected: List[int] = []
     for value in np.unique(strata):
         positions = np.where(strata == value)[0]
@@ -808,12 +804,13 @@ def add_effect_stability(
     reference_sign = np.sign(result["signed_score"].to_numpy(dtype=float))
     source_agreements: List[np.ndarray] = []
     for source_e, source_m in nuisance_sources:
-        source = cohort_contrast_scores(
-            x, names, treatment, outcome, source_e, source_m
-        )["signed_score"].to_numpy(dtype=float)
+        source = cohort_contrast_scores(x, names, treatment, outcome, source_e, source_m)[
+            "signed_score"
+        ].to_numpy(dtype=float)
         source_agreements.append((np.sign(source) == reference_sign).astype(float))
     result["nuisance_source_agreement"] = (
-        np.mean(np.vstack(source_agreements), axis=0) if source_agreements
+        np.mean(np.vstack(source_agreements), axis=0)
+        if source_agreements
         else np.ones(len(result), dtype=float)
     )
 
@@ -822,24 +819,27 @@ def add_effect_stability(
     signs = np.zeros(len(result), dtype=float)
     rng = np.random.default_rng(random_state)
     eligible_support = (
-        (result["support_control"].to_numpy() >= config.minimum_arm_document_support)
-        & (result["support_treated"].to_numpy() >= config.minimum_arm_document_support)
-    )
+        result["support_control"].to_numpy() >= config.minimum_arm_document_support
+    ) & (result["support_treated"].to_numpy() >= config.minimum_arm_document_support)
     eligible_count = max(1, int(np.sum(eligible_support)))
     top_count = max(1, int(np.ceil(config.top_fraction * eligible_count)))
     for _ in range(repeats):
         positions = _subsample_indices(strata, config.stability_fraction, rng)
         sample = cohort_contrast_scores(
-            x[positions], names, treatment[positions], outcome[positions],
-            stacked_e[positions], stacked_m[positions],
+            x[positions],
+            names,
+            treatment[positions],
+            outcome[positions],
+            stacked_e[positions],
+            stacked_m[positions],
         )
         magnitude = sample["unsigned_score"].to_numpy(dtype=float)
         valid = np.where(eligible_support)[0]
         chosen = valid[np.argsort(-magnitude[valid], kind="stable")[:top_count]]
         selection[chosen] += 1.0
-        signs += (
-            np.sign(sample["signed_score"].to_numpy(dtype=float)) == reference_sign
-        ).astype(float)
+        signs += (np.sign(sample["signed_score"].to_numpy(dtype=float)) == reference_sign).astype(
+            float
+        )
     divisor = max(1, repeats)
     result["subsample_selection_stability"] = selection / divisor
     result["subsample_sign_agreement"] = signs / divisor
@@ -860,10 +860,7 @@ def add_effect_stability(
     result["eligible"] = (
         eligible_support
         & (result["nuisance_source_agreement"] >= config.minimum_nuisance_source_agreement)
-        & (
-            result["subsample_selection_stability"]
-            >= config.minimum_subsample_selection_fraction
-        )
+        & (result["subsample_selection_stability"] >= config.minimum_subsample_selection_fraction)
         & (result["tail_contrast_sign_agreement"] >= config.minimum_tail_sign_agreement)
     )
     result["combined_importance"] = result["unsigned_score"] * (
@@ -1060,9 +1057,7 @@ class ConsensusNMFTopicBank:
         x = sparse.csr_matrix(matrix, dtype=np.float64)
         weighted = x[:, self.selected_indices].multiply(self.feature_weights).tocsr()
         aligned = []
-        for model, norms, permutation in zip(
-            self.models, self.component_norms, self.alignments
-        ):
+        for model, norms, permutation in zip(self.models, self.component_norms, self.alignments):
             values = model.transform(weighted) * norms[None, :]
             aligned.append(values[:, permutation])
         return np.mean(np.stack(aligned), axis=0)
@@ -1120,12 +1115,12 @@ def _strata(treatment: np.ndarray, outcome: np.ndarray, *, outcome_binary: bool)
         outcome_group = outcome.astype(int)
     else:
         try:
-            outcome_group = pd.qcut(outcome, q=min(4, len(np.unique(outcome))), labels=False,
-                                    duplicates="drop").to_numpy()
+            outcome_group = pd.qcut(
+                outcome, q=min(4, len(np.unique(outcome))), labels=False, duplicates="drop"
+            ).to_numpy()
         except AttributeError:
             outcome_group = np.asarray(
-                pd.qcut(outcome, q=min(4, len(np.unique(outcome))), labels=False,
-                        duplicates="drop")
+                pd.qcut(outcome, q=min(4, len(np.unique(outcome))), labels=False, duplicates="drop")
             )
         outcome_group = np.nan_to_num(outcome_group, nan=0).astype(int)
     return treatment.astype(int) * (int(np.max(outcome_group)) + 1) + outcome_group
@@ -1134,14 +1129,22 @@ def _strata(treatment: np.ndarray, outcome: np.ndarray, *, outcome_binary: bool)
 def compact_topic_score_tests(score_tests: Mapping[str, Any]) -> Dict[str, Any]:
     """Build the small handoff view while retaining auditable score evidence."""
     compact: Dict[str, Any] = {
-        "schema_version": score_tests.get(
-            "schema_version", TOPIC_SCORE_TEST_SCHEMA_VERSION
-        ),
+        "schema_version": score_tests.get("schema_version", TOPIC_SCORE_TEST_SCHEMA_VERSION),
         "status": score_tests.get("status", "not_run"),
         "reason": score_tests.get("reason"),
         "uses_heldout_treatment_and_outcome": bool(
             score_tests.get("uses_heldout_treatment_and_outcome", False)
         ),
+        "uses_registered_heldout_treatment_and_outcome": bool(
+            score_tests.get("uses_registered_heldout_treatment_and_outcome", False)
+        ),
+        "uses_nested_fit_calibration_treatment_and_outcome": bool(
+            score_tests.get("uses_nested_fit_calibration_treatment_and_outcome", False)
+        ),
+        "score_selection_label_policy": score_tests.get(
+            "score_selection_label_policy", "registered_context_heldout"
+        ),
+        "selection_frozen_sha256": score_tests.get("selection_frozen_sha256"),
         "banks": {},
     }
     for bank_name, bank_result in (score_tests.get("banks") or {}).items():
@@ -1267,7 +1270,8 @@ def fit_tfidf_topic_context(
 
     linear_view = next(
         (
-            view for view in views
+            view
+            for view in views
             if view.bow_model == "linear"
             and view.ngram_range_min == 1
             and view.ngram_range_max == 3
@@ -1285,8 +1289,12 @@ def fit_tfidf_topic_context(
     )
     treatment_scores = add_linear_stability(
         unsigned_linear_screen(
-            common_fit, feature_names, treatment, binary=True,
-            logistic_c=linear_view.logistic_c, random_state=config.random_state + 301,
+            common_fit,
+            feature_names,
+            treatment,
+            binary=True,
+            logistic_c=linear_view.logistic_c,
+            random_state=config.random_state + 301,
         ),
         common_fit,
         treatment,
@@ -1300,7 +1308,10 @@ def fit_tfidf_topic_context(
     treatment_scores["eligible"] = True
     outcome_scores = add_linear_stability(
         unsigned_linear_screen(
-            common_fit, feature_names, outcome, binary=outcome_binary,
+            common_fit,
+            feature_names,
+            outcome,
+            binary=outcome_binary,
             logistic_c=linear_view.logistic_c,
             ridge_alpha=linear_view.ridge_alpha,
             random_state=config.random_state + 401,
@@ -1318,8 +1329,9 @@ def fit_tfidf_topic_context(
 
     nuisance_sources = [
         (treatment_result["base_oof"][:, index], outcome_result["base_oof"][:, index])
-        for index in range(min(treatment_result["base_oof"].shape[1],
-                               outcome_result["base_oof"].shape[1]))
+        for index in range(
+            min(treatment_result["base_oof"].shape[1], outcome_result["base_oof"].shape[1])
+        )
     ]
     effect_scores = add_effect_stability(
         cohort_contrast_scores(
@@ -1449,9 +1461,7 @@ def fit_tfidf_topic_context(
             row[f"treatment_view__{view.name}"] = float(
                 treatment_result["base_oof"][position, index]
             )
-            row[f"outcome_view__{view.name}"] = float(
-                outcome_result["base_oof"][position, index]
-            )
+            row[f"outcome_view__{view.name}"] = float(outcome_result["base_oof"][position, index])
         oof_rows.append(row)
     external_rows: List[Dict[str, Any]] = []
     for position, row_id in enumerate(heldout_row_ids):

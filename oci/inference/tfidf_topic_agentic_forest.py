@@ -8,9 +8,8 @@ import logging
 import re
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -31,7 +30,6 @@ from .agentic_explicit_feature_forest import (
     StructuredInteractionExplicitEvaluator,
     _get_agent_response_trace,
     _normalize_feature_name,
-    _spec_to_dict,
     make_explicit_feature_extraction_provider,
     make_feature_search_agent,
 )
@@ -179,12 +177,8 @@ def evaluate_frozen_structured_predictions(
         error = estimate - truth
         return {
             "n": int(len(frame)),
-            "pearson_correlation": _safe_rank_correlation(
-                truth, estimate, rank=False
-            ),
-            "spearman_correlation": _safe_rank_correlation(
-                truth, estimate, rank=True
-            ),
+            "pearson_correlation": _safe_rank_correlation(truth, estimate, rank=False),
+            "spearman_correlation": _safe_rank_correlation(truth, estimate, rank=True),
             "mae": float(np.mean(np.abs(error))),
             "rmse": float(np.sqrt(np.mean(np.square(error)))),
             "mean_error": float(np.mean(error)),
@@ -209,9 +203,7 @@ def evaluate_frozen_structured_predictions(
         ],
     }
     output_dir = Path(output_dir)
-    evaluated.to_parquet(
-        output_dir / "posthoc_predictions_with_oracle.parquet", index=False
-    )
+    evaluated.to_parquet(output_dir / "posthoc_predictions_with_oracle.parquet", index=False)
     _write_json(output_dir / "posthoc_oracle_metrics.json", payload)
     return payload
 
@@ -255,9 +247,7 @@ def validate_tfidf_topic_stage2_handoff(
     rows = _read_jsonl(handoff_path)
     expected_hash = tfidf_topic_stage1_config_hash(config, data)
     expected_identity = tfidf_topic_stage1_identity(config, data)
-    required_inner = int(
-        config.architecture.multi_model_forest.candidate_consistency_inner_folds
-    )
+    required_inner = int(config.architecture.multi_model_forest.candidate_consistency_inner_folds)
     registry_path = getattr(
         config.architecture.multi_model_forest,
         "split_registry_path",
@@ -320,9 +310,7 @@ def validate_tfidf_topic_stage2_handoff(
             )
         if split_registry is not None:
             expected_fields = {
-                "dataset_content_fingerprint": expected_identity["dataset"][
-                    "content_fingerprint"
-                ],
+                "dataset_content_fingerprint": expected_identity["dataset"]["content_fingerprint"],
                 "dataset_ordered_row_fingerprint": expected_identity["dataset"][
                     "ordered_row_fingerprint"
                 ],
@@ -333,19 +321,15 @@ def validate_tfidf_topic_stage2_handoff(
             for key, expected_value in expected_fields.items():
                 if row.get(key) != expected_value:
                     raise RuntimeError(
-                        f"Registry-sealed handoff {key} mismatch in outer fold "
-                        f"{outer_fold}"
+                        f"Registry-sealed handoff {key} mismatch in outer fold " f"{outer_fold}"
                     )
                 if key != "split_registry_content_hash" and discovery.get(key) != expected_value:
                     raise RuntimeError(
-                        f"Registry-sealed discovery {key} mismatch in outer fold "
-                        f"{outer_fold}"
+                        f"Registry-sealed discovery {key} mismatch in outer fold " f"{outer_fold}"
                     )
         fit_ids = [int(value) for value in row.get("fit_row_ids", [])]
         heldout_ids = [int(value) for value in row.get("heldout_row_ids", [])]
-        if len(fit_ids) != len(set(fit_ids)) or len(heldout_ids) != len(
-            set(heldout_ids)
-        ):
+        if len(fit_ids) != len(set(fit_ids)) or len(heldout_ids) != len(set(heldout_ids)):
             raise RuntimeError(f"Duplicate row ids in fold {row.get('fold_key')}")
         if not (set(fit_ids) | set(heldout_ids)) <= valid_row_ids:
             raise RuntimeError(f"Out-of-range row id in fold {row.get('fold_key')}")
@@ -386,8 +370,7 @@ def validate_tfidf_topic_stage2_handoff(
         if set(ngram_paths) != {"treatment", "outcome", "effect"}:
             raise RuntimeError(f"Incomplete n-gram banks in fold {row.get('fold_key')}")
         referenced_paths.extend(
-            str(artifact_path(ngram_paths[bank]))
-            for bank in ("treatment", "outcome", "effect")
+            str(artifact_path(ngram_paths[bank])) for bank in ("treatment", "outcome", "effect")
         )
 
         bank_metadata = discovery.get("topic_banks") or {}
@@ -396,15 +379,11 @@ def validate_tfidf_topic_stage2_handoff(
         ) as heldout_archive:
             for bank in ("treatment", "outcome", "effect"):
                 if bank not in bank_metadata:
-                    raise RuntimeError(
-                        f"Missing {bank} topic bank in fold {row.get('fold_key')}"
-                    )
+                    raise RuntimeError(f"Missing {bank} topic bank in fold {row.get('fold_key')}")
                 topics = list((bank_metadata.get(bank) or {}).get("topics") or [])
                 topic_counts[bank].append(len(topics))
                 if any(len(topic.get("terms") or []) != 15 for topic in topics):
-                    raise RuntimeError(
-                        f"A {bank} topic does not contain exactly 15 terms"
-                    )
+                    raise RuntimeError(f"A {bank} topic does not contain exactly 15 terms")
                 fit_values = (
                     np.asarray(fit_archive[bank])
                     if bank in fit_archive.files
@@ -421,45 +400,49 @@ def validate_tfidf_topic_stage2_handoff(
                     )
                 if heldout_values.shape != (len(heldout_ids), len(topics)):
                     raise RuntimeError(
-                        f"Misaligned held-out {bank} topic values in fold "
-                        f"{row.get('fold_key')}"
+                        f"Misaligned held-out {bank} topic values in fold " f"{row.get('fold_key')}"
                     )
 
         nuisance = pd.read_parquet(nuisance_path)
-        fit_nuisance = nuisance.loc[
-            nuisance["prediction_scope"] == "fit_oof"
-        ].copy()
-        external_nuisance = nuisance.loc[
-            nuisance["prediction_scope"] == "external_heldout"
-        ].copy()
+        fit_nuisance = nuisance.loc[nuisance["prediction_scope"] == "fit_oof"].copy()
+        external_nuisance = nuisance.loc[nuisance["prediction_scope"] == "external_heldout"].copy()
         if set(map(int, fit_nuisance["_oci_row_id"])) != set(fit_ids):
             raise RuntimeError(f"Misaligned OOF nuisance rows in fold {row.get('fold_key')}")
         if set(map(int, external_nuisance["_oci_row_id"])) != set(heldout_ids):
-            raise RuntimeError(
-                f"Misaligned external nuisance rows in fold {row.get('fold_key')}"
-            )
+            raise RuntimeError(f"Misaligned external nuisance rows in fold {row.get('fold_key')}")
         required_prediction_columns = {"treatment_stacked", "outcome_stacked"}
         if not required_prediction_columns <= set(nuisance.columns):
             raise RuntimeError(f"Missing stacked nuisances in fold {row.get('fold_key')}")
-        if not np.isfinite(
-            nuisance[list(required_prediction_columns)].to_numpy(dtype=float)
-        ).all():
+        if not np.isfinite(nuisance[list(required_prediction_columns)].to_numpy(dtype=float)).all():
             raise RuntimeError(f"Non-finite nuisance prediction in fold {row.get('fold_key')}")
         fit_set = set(fit_ids)
-        for record in fit_nuisance[["_oci_row_id", "fit_row_ids"]].to_dict(
-            orient="records"
+        selection_policy = str(
+            discovery.get("score_selection_label_policy")
+            or config.architecture.multi_model_forest.tfidf_topic.score_selection_label_policy
+        )
+        model_fit_set = set(map(int, discovery.get("model_fit_row_ids") or fit_ids))
+        if selection_policy == "nested_fit_calibration" and (
+            not model_fit_set
+            or not model_fit_set < fit_set
+            or discovery.get("registered_heldout_labels_accessed") is not False
+            or not discovery.get("selection_frozen_sha256")
         ):
+            raise RuntimeError(
+                f"Invalid nested TF-IDF selection provenance in fold {row.get('fold_key')}"
+            )
+        for record in fit_nuisance[["_oci_row_id", "fit_row_ids"]].to_dict(orient="records"):
             training_ids = set(map(int, record["fit_row_ids"]))
             if int(record["_oci_row_id"]) in training_ids or not training_ids <= fit_set:
                 raise RuntimeError(
                     f"A fit OOF nuisance prediction includes its own label in fold "
                     f"{row.get('fold_key')}"
                 )
-        for record in external_nuisance[["_oci_row_id", "fit_row_ids"]].to_dict(
-            orient="records"
-        ):
+        for record in external_nuisance[["_oci_row_id", "fit_row_ids"]].to_dict(orient="records"):
             training_ids = set(map(int, record["fit_row_ids"]))
-            if int(record["_oci_row_id"]) in training_ids or training_ids != fit_set:
+            expected_training = (
+                model_fit_set if selection_policy == "nested_fit_calibration" else fit_set
+            )
+            if int(record["_oci_row_id"]) in training_ids or training_ids != expected_training:
                 raise RuntimeError(
                     f"An external nuisance prediction has invalid fit provenance in "
                     f"fold {row.get('fold_key')}"
@@ -472,11 +455,28 @@ def validate_tfidf_topic_stage2_handoff(
             score_path = artifact_path(score_artifact)
             referenced_paths.append(str(score_path))
             score_tests = json.loads(score_path.read_text(encoding="utf-8"))
+            nested_policy = selection_policy == "nested_fit_calibration"
             if (
-                score_tests.get("schema_version")
-                != TOPIC_SCORE_TEST_SCHEMA_VERSION
+                score_tests.get("schema_version") != TOPIC_SCORE_TEST_SCHEMA_VERSION
                 or score_tests.get("status") != "completed"
-                or not bool(score_tests.get("uses_heldout_treatment_and_outcome"))
+                or (
+                    nested_policy
+                    and (
+                        score_tests.get("uses_heldout_treatment_and_outcome") is not False
+                        or score_tests.get("uses_registered_heldout_treatment_and_outcome")
+                        is not False
+                        or score_tests.get("uses_nested_fit_calibration_treatment_and_outcome")
+                        is not True
+                        or score_tests.get("score_selection_label_policy")
+                        != "nested_fit_calibration"
+                        or score_tests.get("selection_frozen_sha256")
+                        != discovery.get("selection_frozen_sha256")
+                    )
+                )
+                or (
+                    not nested_policy
+                    and not bool(score_tests.get("uses_heldout_treatment_and_outcome"))
+                )
                 or bool(score_tests.get("fits_patient_level_cate_model"))
                 or bool(score_tests.get("constructs_divided_pseudo_target"))
             ):
@@ -486,9 +486,7 @@ def validate_tfidf_topic_stage2_handoff(
                 tests = list(bank_score.get("topic_tests") or [])
                 topics = list((bank_metadata.get(bank) or {}).get("topics") or [])
                 if len(tests) != len(topics):
-                    raise RuntimeError(
-                        f"{bank} score/topic mismatch in fold {row.get('fold_key')}"
-                    )
+                    raise RuntimeError(f"{bank} score/topic mismatch in fold {row.get('fold_key')}")
                 topic_ids = {str(topic["topic_id"]) for topic in topics}
                 selected_ids = set(map(str, bank_score.get("selected_topic_ids") or []))
                 if not selected_ids <= topic_ids:
@@ -535,34 +533,37 @@ def validate_tfidf_topic_stage2_handoff(
                 calibration = orphan.get("bootstrap_calibration") or {}
                 if (
                     orphan.get("status") != "completed"
-                    or not bool(orphan.get("uses_heldout_treatment_and_outcome"))
+                    or (
+                        nested_policy
+                        and (
+                            orphan.get("uses_heldout_treatment_and_outcome") is not False
+                            or orphan.get("uses_registered_heldout_treatment_and_outcome")
+                            is not False
+                            or orphan.get("uses_nested_fit_calibration_treatment_and_outcome")
+                            is not True
+                        )
+                    )
+                    or (
+                        not nested_policy
+                        and not bool(orphan.get("uses_heldout_treatment_and_outcome"))
+                    )
                     or bool(orphan.get("fits_patient_level_cate_model"))
                     or not bool(orphan.get("topic_term_exclusion_is_fit_side"))
                     or bool(orphan.get("cluster_construction_uses_heldout_rows_or_labels"))
-                    or selected_ids != {
-                        str(cluster.get("cluster_id"))
-                        for cluster in selected_clusters
-                    }
+                    or selected_ids
+                    != {str(cluster.get("cluster_id")) for cluster in selected_clusters}
                     or not selected_ids <= all_ids
                     or (
                         bool(clusters)
-                        and not bool(
-                            calibration.get("complete_term_group_family", False)
-                        )
+                        and not bool(calibration.get("complete_term_group_family", False))
                     )
                 ):
-                    raise RuntimeError(
-                        f"Invalid inner orphan n-gram branch: {score_path}"
-                    )
+                    raise RuntimeError(f"Invalid inner orphan n-gram branch: {score_path}")
                 for cluster in clusters:
                     terms = list(cluster.get("term_scores") or [])
                     if not 1 <= len(terms) <= 15:
-                        raise RuntimeError(
-                            "An orphan n-gram cluster does not contain 1-15 terms"
-                        )
-                    if effect_topic_terms & {
-                        str(term.get("term")) for term in terms
-                    }:
+                        raise RuntimeError("An orphan n-gram cluster does not contain 1-15 terms")
+                    if effect_topic_terms & {str(term.get("term")) for term in terms}:
                         raise RuntimeError(
                             "An orphan n-gram cluster overlaps a fitted topic summary"
                         )
@@ -571,7 +572,25 @@ def validate_tfidf_topic_stage2_handoff(
         elif row.get("scope") == "full_outer_train":
             outer_contexts += 1
             compact_score = discovery.get("topic_score_tests") or {}
-            if (
+            if selection_policy == "nested_fit_calibration":
+                score_path = artifact_path(score_artifact)
+                referenced_paths.append(str(score_path))
+                score_tests = json.loads(score_path.read_text(encoding="utf-8"))
+                if (
+                    compact_score.get("status") != "completed"
+                    or compact_score.get("uses_heldout_treatment_and_outcome") is not False
+                    or compact_score.get("uses_registered_heldout_treatment_and_outcome")
+                    is not False
+                    or compact_score.get("uses_nested_fit_calibration_treatment_and_outcome")
+                    is not True
+                    or score_tests.get("selection_frozen_sha256")
+                    != discovery.get("selection_frozen_sha256")
+                ):
+                    raise RuntimeError(
+                        f"A full-outer context lacks nested label-safe selection in fold "
+                        f"{outer_fold}"
+                    )
+            elif (
                 score_artifact is not None
                 or compact_score.get("status") != "not_run"
                 or bool(compact_score.get("uses_heldout_treatment_and_outcome"))
@@ -585,11 +604,7 @@ def validate_tfidf_topic_stage2_handoff(
     outer_test_occurrences: Counter = Counter()
     for outer_fold, fold_rows in sorted(rows_by_outer.items()):
         full = [row for row in fold_rows if row.get("scope") == "full_outer_train"]
-        inner = [
-            row
-            for row in fold_rows
-            if row.get("scope") == "candidate_selection_inner_fit"
-        ]
+        inner = [row for row in fold_rows if row.get("scope") == "candidate_selection_inner_fit"]
         if len(full) != 1 or len(inner) != required_inner:
             raise RuntimeError(
                 f"Incomplete exact contexts for outer fold {outer_fold}: "
@@ -608,9 +623,7 @@ def validate_tfidf_topic_stage2_handoff(
                     f"Inner fold {outer_fold}/{inner_row.get('inner_fold')} does not "
                     "partition its outer-training rows"
                 )
-    if set(outer_test_occurrences) != valid_row_ids or set(
-        outer_test_occurrences.values()
-    ) != {1}:
+    if set(outer_test_occurrences) != valid_row_ids or set(outer_test_occurrences.values()) != {1}:
         raise RuntimeError("Outer held-out folds do not form a once-only row partition")
 
     forbidden_reference_tokens = (
@@ -645,20 +658,15 @@ def validate_tfidf_topic_stage2_handoff(
         "exact_context_count": len(rows),
         "inner_score_context_count": inner_score_contexts,
         "full_outer_context_count": outer_contexts,
-        "topic_count_ranges": {
-            bank: value_range(values) for bank, values in topic_counts.items()
-        },
+        "topic_count_ranges": {bank: value_range(values) for bank, values in topic_counts.items()},
         "selected_topic_count_ranges": {
             bank: value_range(values) for bank, values in selected_counts.items()
         },
         "selected_ngram_count_ranges": {
-            bank: value_range(values)
-            for bank, values in selected_ngram_counts.items()
+            bank: value_range(values) for bank, values in selected_ngram_counts.items()
         },
         "orphan_cluster_count_range": value_range(orphan_cluster_counts),
-        "selected_orphan_cluster_count_range": value_range(
-            selected_orphan_cluster_counts
-        ),
+        "selected_orphan_cluster_count_range": value_range(selected_orphan_cluster_counts),
         "honest_nuisance_prediction_rows_checked": honest_nuisance_rows,
         "outer_test_rows_predicted_once": True,
         "outer_test_score_artifact_count": 0,
@@ -758,14 +766,10 @@ def select_topic_recovery_raw_ngrams(
         return {
             token
             for token in re.findall(r"[a-z0-9]+", str(value or "").lower())
-            if len(token) >= 3
-            and token not in _RECOVERY_NGRAM_STOPWORDS
-            and not token.isdigit()
+            if len(token) >= 3 and token not in _RECOVERY_NGRAM_STOPWORDS and not token.isdigit()
         }
 
-    topic_terms = {
-        str(term.get("term") or "") for term in topic.get("terms", [])
-    }
+    topic_terms = {str(term.get("term") or "") for term in topic.get("terms", [])}
     topic_tokens = set().union(*(tokens(term) for term in topic_terms))
     candidates: List[Tuple[int, int, str]] = []
     for fit_rank, feature in enumerate(frame["feature"].astype(str), start=1):
@@ -800,9 +804,7 @@ def select_topic_recovery_raw_ngrams(
 def render_topic_label_prompt(context: Dict[str, Any]) -> str:
     """Render the one-topic prompt; intentionally contains no forbidden jargon."""
     terms = list(context.get("topic_terms") or [])
-    is_orphan = (
-        context.get("prompt_version") == ORPHAN_NGRAM_LABEL_PROMPT_VERSION
-    )
+    is_orphan = context.get("prompt_version") == ORPHAN_NGRAM_LABEL_PROMPT_VERSION
     if is_orphan:
         if not 1 <= len(terms) <= 15:
             raise ValueError("Orphan n-gram prompt rendering requires 1-15 terms")
@@ -857,9 +859,7 @@ Topic context:
     return prompt
 
 
-def topic_label_response_issues(
-    response: Any, context: Dict[str, Any]
-) -> List[str]:
+def topic_label_response_issues(response: Any, context: Dict[str, Any]) -> List[str]:
     """Validate the two-part topic label and exact supporting-term provenance."""
     if not isinstance(response, dict):
         return ["topic response must be one JSON object, not a bare list"]
@@ -877,9 +877,9 @@ def topic_label_response_issues(
     if not isinstance(proposals, list):
         issues.append("proposals must be a list")
         return issues
-    supplied = {
-        str(row["term"]) for row in context.get("topic_terms", [])
-    } | {str(term) for term in context.get("uncovered_raw_ngrams", [])}
+    supplied = {str(row["term"]) for row in context.get("topic_terms", [])} | {
+        str(term) for term in context.get("uncovered_raw_ngrams", [])
+    }
     for index, proposal in enumerate(proposals, start=1):
         if not isinstance(proposal, dict):
             issues.append(f"proposal {index} must be an object")
@@ -1039,9 +1039,7 @@ Value-contract context:
 """
 
 
-def topic_harmonization_response_issues(
-    response: Any, context: Dict[str, Any]
-) -> List[str]:
+def topic_harmonization_response_issues(response: Any, context: Dict[str, Any]) -> List[str]:
     """Validate name/global/value harmonization responses before execution."""
     if not isinstance(response, dict):
         return ["harmonization response must be one JSON object"]
@@ -1075,7 +1073,10 @@ def topic_harmonization_response_issues(
             if action == "derive":
                 derivation = resolution.get("derivation")
                 sources = resolution.get("source_names")
-                if not isinstance(derivation, dict) or derivation.get("operation") not in _DERIVATION_OPERATIONS:
+                if (
+                    not isinstance(derivation, dict)
+                    or derivation.get("operation") not in _DERIVATION_OPERATIONS
+                ):
                     issues.append(f"resolution {index} has invalid derivation")
                 if (
                     not isinstance(sources, list)
@@ -1119,9 +1120,14 @@ def topic_harmonization_response_issues(
             if action == "derive":
                 derivation = decision.get("derivation")
                 sources = decision.get("source_names")
-                if not isinstance(derivation, dict) or derivation.get("operation") not in _DERIVATION_OPERATIONS:
+                if (
+                    not isinstance(derivation, dict)
+                    or derivation.get("operation") not in _DERIVATION_OPERATIONS
+                ):
                     issues.append(f"decision {index} has invalid derivation")
-                if not isinstance(sources, list) or any(str(name) not in by_name for name in sources):
+                if not isinstance(sources, list) or any(
+                    str(name) not in by_name for name in sources
+                ):
                     issues.append(f"decision {index} has invalid source_names")
         if len(seen) != len(set(seen)):
             issues.append("candidate_id decisions must be unique")
@@ -1159,7 +1165,9 @@ def topic_harmonization_response_issues(
             synonyms = feature.get("category_synonyms") or {}
             if not isinstance(synonyms, dict):
                 issues.append(f"feature {index} category_synonyms must be an object")
-            elif isinstance(categories, list) and any(str(key) not in {str(value) for value in categories} for key in synonyms):
+            elif isinstance(categories, list) and any(
+                str(key) not in {str(value) for value in categories} for key in synonyms
+            ):
                 issues.append(f"feature {index} synonym key is not a permitted category")
             elif any(not isinstance(values, list) for values in synonyms.values()):
                 issues.append(f"feature {index} category synonym values must be lists")
@@ -1172,7 +1180,10 @@ def topic_harmonization_response_issues(
                 issues.append(f"feature {index} has invalid ordinal_order")
             semantics = feature.get("missing_semantics")
             if not isinstance(semantics, dict) or set(semantics) != {
-                "missing", "unknown", "absent", "not_documented"
+                "missing",
+                "unknown",
+                "absent",
+                "not_documented",
             }:
                 issues.append(f"feature {index} has incomplete missing_semantics")
             elif len({str(value).strip() for value in semantics.values()}) != 4:
@@ -1211,9 +1222,9 @@ def _candidate_from_response(
     feature_type = str(row.get("type") or "").strip().lower()
     if not name or feature_type not in {"categorical", "continuous"}:
         return None
-    supplied = {
-        str(term["term"]) for term in context["topic_terms"]
-    } | {str(term) for term in context.get("uncovered_raw_ngrams", [])}
+    supplied = {str(term["term"]) for term in context["topic_terms"]} | {
+        str(term) for term in context.get("uncovered_raw_ngrams", [])
+    }
     supporting = [
         str(value).strip()
         for value in (row.get("supporting_terms") or [])
@@ -1226,7 +1237,9 @@ def _candidate_from_response(
     if feature_type == "categorical":
         if not isinstance(categories, list) or len(categories) < 2:
             categories = ["absent", "present", "unknown", "not_documented"]
-        categories = list(dict.fromkeys(str(value).strip() for value in categories if str(value).strip()))
+        categories = list(
+            dict.fromkeys(str(value).strip() for value in categories if str(value).strip())
+        )
         if len(categories) < 2:
             return None
     else:
@@ -1263,18 +1276,14 @@ def _candidate_from_response(
                         "signed_score": float(
                             term_rows.get(term, {}).get(
                                 "signed_score",
-                                term_rows.get(term, {}).get(
-                                    "fit_signed_score", 0.0
-                                ),
+                                term_rows.get(term, {}).get("fit_signed_score", 0.0),
                             )
                         ),
                     }
                     for term in supporting
                 ],
                 "objective": context["bank"],
-                "heldout_relevance_evidence": dict(
-                    context.get("heldout_relevance_evidence") or {}
-                ),
+                "heldout_relevance_evidence": dict(context.get("heldout_relevance_evidence") or {}),
             }
         ],
     }
@@ -1291,9 +1300,7 @@ def harmonize_topic_candidates(
         if not name:
             dropped.append({"candidate": candidate, "reason": "empty_normalized_name"})
             continue
-        domain = _normalize_feature_name(
-            candidate.get("clinical_domain") or name.split("_", 1)[0]
-        )
+        domain = _normalize_feature_name(candidate.get("clinical_domain") or name.split("_", 1)[0])
         grouped[(domain, name)].append({**candidate, "name": name})
 
     first_pass: List[Dict[str, Any]] = []
@@ -1322,9 +1329,7 @@ def harmonize_topic_candidates(
         provenance = [entry for member in compatible for entry in member.get("provenance", [])]
         descriptions = [str(member.get("description") or "") for member in compatible]
         description = max(descriptions, key=len, default=name.replace("_", " "))
-        requested_actions = [
-            str(member.get("action") or "extract") for member in compatible
-        ]
+        requested_actions = [str(member.get("action") or "extract") for member in compatible]
         action = "derive" if "derive" in requested_actions else "extract"
         derivation = next(
             (
@@ -1361,8 +1366,7 @@ def harmonize_topic_candidates(
                 "required_or_prespecified": any(
                     bool(member.get("required_or_prespecified"))
                     or any(
-                        item.get("bank") == "prespecified"
-                        for item in member.get("provenance", [])
+                        item.get("bank") == "prespecified" for item in member.get("provenance", [])
                     )
                     for member in compatible
                 ),
@@ -1380,8 +1384,7 @@ def harmonize_topic_candidates(
         current["roles"] = list(dict.fromkeys([*current["roles"], *candidate["roles"]]))
         current["provenance"].extend(candidate["provenance"])
         current["required_or_prespecified"] = bool(
-            current.get("required_or_prespecified")
-            or candidate.get("required_or_prespecified")
+            current.get("required_or_prespecified") or candidate.get("required_or_prespecified")
         )
         if current["type"] == "categorical":
             current["categories"] = list(
@@ -1454,9 +1457,7 @@ def _refresh_registry_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
     )
     result["roles"] = list(dict.fromkeys(map(str, result.get("roles") or [])))
     result["provenance"] = list(result.get("provenance") or [])
-    result["required_or_prespecified"] = bool(
-        result.get("required_or_prespecified")
-    )
+    result["required_or_prespecified"] = bool(result.get("required_or_prespecified"))
     data_type = str(result.get("type") or "categorical")
     result["type"] = data_type if data_type in {"categorical", "continuous"} else "categorical"
     if result["type"] == "continuous":
@@ -1497,16 +1498,15 @@ def _refresh_registry_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
                 if result["action"] == "derive"
                 else contract.get("deterministic_derivation")
             ),
-            "temporal_cutoff": (
-                "use only information documented before the treatment decision"
-            ),
+            "temporal_cutoff": ("use only information documented before the treatment decision"),
         }
     )
     result["value_contract"] = contract
     result["derivation"] = contract.get("deterministic_derivation")
-    result["candidate_id"] = str(result.get("candidate_id") or stable_hash(
-        {"name": result["name"], "provenance": result["provenance"]}
-    )[:20])
+    result["candidate_id"] = str(
+        result.get("candidate_id")
+        or stable_hash({"name": result["name"], "provenance": result["provenance"]})[:20]
+    )
     result["contract_hash"] = stable_hash(
         {
             "action": result["action"],
@@ -1530,8 +1530,7 @@ def _registry_entry_state_hash(entry: Dict[str, Any]) -> str:
     """
     refreshed = _refresh_registry_entry(entry)
     provenance_hashes = sorted(
-        stable_hash(provenance)
-        for provenance in refreshed.get("provenance", [])
+        stable_hash(provenance) for provenance in refreshed.get("provenance", [])
     )
     return stable_hash(
         {
@@ -1539,9 +1538,7 @@ def _registry_entry_state_hash(entry: Dict[str, Any]) -> str:
             "contract_hash": refreshed["contract_hash"],
             "roles": sorted(refreshed.get("roles", [])),
             "provenance_hashes": provenance_hashes,
-            "required_or_prespecified": bool(
-                refreshed.get("required_or_prespecified")
-            ),
+            "required_or_prespecified": bool(refreshed.get("required_or_prespecified")),
         }
     )
 
@@ -1577,15 +1574,14 @@ def _merge_executable_registry_entries(
             dict.fromkeys(role for member in compatible for role in member.get("roles", []))
         )
         result["provenance"] = [
-            provenance
-            for member in compatible
-            for provenance in member.get("provenance", [])
+            provenance for member in compatible for provenance in member.get("provenance", [])
         ]
         result["required_or_prespecified"] = any(
             member.get("required_or_prespecified", False) for member in compatible
         )
         result["action"] = (
-            "derive" if any(member.get("action") == "derive" for member in compatible)
+            "derive"
+            if any(member.get("action") == "derive" for member in compatible)
             else "extract"
         )
         if selected_type == "categorical":
@@ -1673,9 +1669,7 @@ _DISTINCT_SUBFIELD_NAME_TOKENS = {
 }
 
 
-def _alias_preserves_distinct_subfields(
-    source: Dict[str, Any], target: Dict[str, Any]
-) -> bool:
+def _alias_preserves_distinct_subfields(source: Dict[str, Any], target: Dict[str, Any]) -> bool:
     """Fail conservative when an alias would erase an explicit subfield."""
     if source.get("type") != target.get("type"):
         return False
@@ -1706,9 +1700,7 @@ def apply_topic_name_harmonization(
             continue
         alias_name = _normalize_feature_name(decision.get("alias_of") or "")
         alias_target = by_name.get(alias_name)
-        if alias_target is None or _alias_preserves_distinct_subfields(
-            entry, alias_target
-        ):
+        if alias_target is None or _alias_preserves_distinct_subfields(entry, alias_target):
             continue
         decisions[candidate_id] = {
             **decision,
@@ -1716,9 +1708,7 @@ def apply_topic_name_harmonization(
             "canonical_name": entry["name"],
             "alias_of": None,
             "reason": "retained_distinct_subfield_guardrail",
-            "_guardrail_reason": (
-                f"unsafe alias to {alias_name!r} would erase a named subfield"
-            ),
+            "_guardrail_reason": (f"unsafe alias to {alias_name!r} would erase a named subfield"),
         }
 
     dropped: List[Dict[str, Any]] = []
@@ -1748,9 +1738,7 @@ def apply_topic_name_harmonization(
             )
             name_targets[entry["name"]] = None
         elif action == "alias/drop":
-            name_targets[entry["name"]] = _normalize_feature_name(
-                decision.get("alias_of", "")
-            )
+            name_targets[entry["name"]] = _normalize_feature_name(decision.get("alias_of", ""))
         else:
             name_targets[entry["name"]] = _normalize_feature_name(
                 decision.get("canonical_name") or entry["name"]
@@ -1824,9 +1812,7 @@ def apply_topic_name_harmonization(
         ]
         source_names = [name for name in source_names if name]
         derivation = dict(decision.get("derivation") or {})
-        if _valid_derivation(
-            derivation, source_names, available, target_name=updated["name"]
-        ):
+        if _valid_derivation(derivation, source_names, available, target_name=updated["name"]):
             derivation["source_names"] = source_names
             derivation_by_name[updated["name"]] = derivation
         else:
@@ -1914,17 +1900,12 @@ def build_topic_global_dedup_blocks(
     if len(entries) < 2:
         return []
     vectors = np.asarray(
-        _parsimony_tfidf_semantic_vectors(
-            [_global_dedup_document(entry) for entry in entries]
-        ),
+        _parsimony_tfidf_semantic_vectors([_global_dedup_document(entry) for entry in entries]),
         dtype=float,
     )
     similarities = np.asarray(vectors @ vectors.T, dtype=float)
     np.fill_diagonal(similarities, -np.inf)
-    groups = [
-        (entry.get("clinical_domain"), entry.get("parent_object"))
-        for entry in entries
-    ]
+    groups = [(entry.get("clinical_domain"), entry.get("parent_object")) for entry in entries]
     name_tokens = [_global_dedup_name_tokens(entry["name"]) for entry in entries]
 
     edges: Dict[Tuple[int, int], float] = {}
@@ -1939,11 +1920,7 @@ def build_topic_global_dedup_blocks(
             if entries[right]["type"] != entry["type"]:
                 continue
             union = name_tokens[left] | name_tokens[right]
-            lexical = (
-                len(name_tokens[left] & name_tokens[right]) / len(union)
-                if union
-                else 0.0
-            )
+            lexical = len(name_tokens[left] & name_tokens[right]) / len(union) if union else 0.0
             semantic = float(similarities[left, right])
             if semantic < float(min_similarity) and lexical < 0.5:
                 continue
@@ -1967,11 +1944,7 @@ def build_topic_global_dedup_blocks(
         )
         members = set(seed)
         while len(members) < int(max_block_size):
-            touching = [
-                edge
-                for edge in uncovered
-                if (edge[0] in members) ^ (edge[1] in members)
-            ]
+            touching = [edge for edge in uncovered if (edge[0] in members) ^ (edge[1] in members)]
             if not touching:
                 break
             edge = max(
@@ -1987,11 +1960,7 @@ def build_topic_global_dedup_blocks(
         if block_key not in seen_blocks:
             seen_blocks.add(block_key)
             blocks.append([entries[index] for index in block_key])
-        uncovered = {
-            edge
-            for edge in uncovered
-            if not (edge[0] in members and edge[1] in members)
-        }
+        uncovered = {edge for edge in uncovered if not (edge[0] in members and edge[1] in members)}
     return blocks
 
 
@@ -2021,8 +1990,7 @@ def combine_topic_global_dedup_responses(
                 resolution.get("canonical_name") or ""
             )
             resolution["source_names"] = [
-                _normalize_feature_name(name)
-                for name in (resolution.get("source_names") or [])
+                _normalize_feature_name(name) for name in (resolution.get("source_names") or [])
             ]
             combined.append(resolution)
             claimed.update(members)
@@ -2161,11 +2129,7 @@ def _default_category_synonyms(categories: Sequence[str]) -> Dict[str, List[str]
             "noncompliant",
         ],
     }
-    return {
-        available[key]: aliases
-        for key, aliases in defaults.items()
-        if key in available
-    }
+    return {available[key]: aliases for key, aliases in defaults.items() if key in available}
 
 
 def apply_topic_value_harmonization(
@@ -2231,9 +2195,7 @@ def apply_topic_value_harmonization(
                 category_synonyms[category] = list(
                     dict.fromkeys([*(category_synonyms.get(category) or []), *aliases])
                 )
-            category_synonyms.setdefault(
-                "unknown", ["unknown", "uncertain", "indeterminate"]
-            )
+            category_synonyms.setdefault("unknown", ["unknown", "uncertain", "indeterminate"])
             category_synonyms.setdefault(
                 "not_documented",
                 ["not documented", "not stated", "not recorded"],
@@ -2248,18 +2210,12 @@ def apply_topic_value_harmonization(
             ),
             "unit_conversions": conversions,
             "category_synonyms": category_synonyms,
-            "ordinal_order": (
-                list(map(str, feature.get("ordinal_order") or [])) or None
-            ),
+            "ordinal_order": (list(map(str, feature.get("ordinal_order") or [])) or None),
             "missing_semantics": dict(feature.get("missing_semantics") or {}),
             "deterministic_derivation": (
-                feature.get("deterministic_derivation")
-                if entry["action"] == "derive"
-                else None
+                feature.get("deterministic_derivation") if entry["action"] == "derive" else None
             ),
-            "temporal_cutoff": (
-                "use only information documented before the treatment decision"
-            ),
+            "temporal_cutoff": ("use only information documented before the treatment decision"),
         }
         if entry["action"] == "derive":
             derivation = contract.get("deterministic_derivation") or entry.get("derivation")
@@ -2299,9 +2255,7 @@ def registry_specs(registry: Sequence[Dict[str, Any]]) -> List[ExplicitFeatureSp
             )
             policy_parts.append(f"Apply these deterministic unit conversions: {conversions}")
         if contract.get("ordinal_order"):
-            policy_parts.append(
-                "Use this ordinal order: " + " < ".join(contract["ordinal_order"])
-            )
+            policy_parts.append("Use this ordinal order: " + " < ".join(contract["ordinal_order"]))
         if entry.get("action") == "derive" and contract.get("deterministic_derivation"):
             derivation = contract["deterministic_derivation"]
             policy_parts.append(
@@ -2334,11 +2288,7 @@ def apply_registry_derivations(
 ) -> pd.DataFrame:
     """Materialize validated deterministic derivations from extracted source columns."""
     result = frame.copy()
-    pending = {
-        entry["name"]: entry
-        for entry in registry
-        if entry.get("action") == "derive"
-    }
+    pending = {entry["name"]: entry for entry in registry if entry.get("action") == "derive"}
     while pending:
         progressed = False
         for name, entry in list(pending.items()):
@@ -2510,10 +2460,7 @@ def _topic_evidence_mass(topic: Dict[str, Any]) -> float:
     """Return unsigned topic evidence mass from fixed Stage 1 loadings/scores."""
     mass = float(
         sum(
-            abs(
-                float(term.get("loading", 0.0))
-                * float(term.get("signed_score", 0.0))
-            )
+            abs(float(term.get("loading", 0.0)) * float(term.get("signed_score", 0.0)))
             for term in topic.get("terms", [])
         )
     )
@@ -2575,16 +2522,11 @@ def select_initial_topic_evidence_registry(
     banks = ("treatment", "outcome", "effect")
     masses: Dict[Tuple[str, str], float] = {}
     for bank in banks:
-        for topic in (metadata.get("topic_banks", {}).get(bank, {}) or {}).get(
-            "topics", []
-        ):
+        for topic in (metadata.get("topic_banks", {}).get(bank, {}) or {}).get("topics", []):
             masses[(bank, str(topic["topic_id"]))] = _topic_evidence_mass(topic)
-    orphan_branch = (
-        (metadata.get("topic_score_tests") or {}).get(
-            "effect_orphan_ngram_branch"
-        )
-        or {}
-    )
+    orphan_branch = (metadata.get("topic_score_tests") or {}).get(
+        "effect_orphan_ngram_branch"
+    ) or {}
     for cluster in orphan_branch.get("selected_clusters") or []:
         cluster_id = str(cluster.get("cluster_id") or "").strip()
         if not cluster_id:
@@ -2596,24 +2538,22 @@ def select_initial_topic_evidence_registry(
         )
 
     topic_sets = [
-        {key for key in _registry_topic_keys(entry) if key in masses}
-        for entry in entries
+        {key for key in _registry_topic_keys(entry) if key in masses} for entry in entries
     ]
     operational_topics = set().union(*topic_sets) if topic_sets else set()
     operational_totals = {
         bank: float(
-            sum(mass for key, mass in masses.items() if key[0] == bank and key in operational_topics)
+            sum(
+                mass for key, mass in masses.items() if key[0] == bank and key in operational_topics
+            )
         )
         for bank in banks
     }
     all_totals = {
-        bank: float(sum(mass for key, mass in masses.items() if key[0] == bank))
-        for bank in banks
+        bank: float(sum(mass for key, mass in masses.items() if key[0] == bank)) for bank in banks
     }
 
-    raw_path = (
-        metadata.get("artifacts", {}).get("ngram_scores", {}).get("effect")
-    )
+    raw_path = metadata.get("artifacts", {}).get("ngram_scores", {}).get("effect")
     highest_ranked: List[str] = []
     if (
         orphan_branch.get("status") != "completed"
@@ -2625,54 +2565,33 @@ def select_initial_topic_evidence_registry(
         if "eligible" in raw_scores.columns:
             raw_scores = raw_scores[raw_scores["eligible"].astype(bool)]
         highest_ranked = (
-            raw_scores.head(int(highest_ranked_effect_count))["feature"]
-            .astype(str)
-            .tolist()
+            raw_scores.head(int(highest_ranked_effect_count))["feature"].astype(str).tolist()
         )
     effect_term_sets = [_registry_effect_terms(entry) for entry in entries]
-    operational_effect_terms = (
-        set().union(*effect_term_sets) if effect_term_sets else set()
-    )
-    mappable_highest = [
-        term for term in highest_ranked if term in operational_effect_terms
-    ]
+    operational_effect_terms = set().union(*effect_term_sets) if effect_term_sets else set()
+    mappable_highest = [term for term in highest_ranked if term in operational_effect_terms]
 
-    fixed_priority = {
-        _normalize_feature_name(name) for name in (fixed_policy_priority_names or [])
-    }
+    fixed_priority = {_normalize_feature_name(name) for name in (fixed_policy_priority_names or [])}
     selected: set = {
         index
         for index, entry in enumerate(entries)
-        if bool(entry.get("required_or_prespecified"))
-        or entry["name"] in fixed_priority
+        if bool(entry.get("required_or_prespecified")) or entry["name"] in fixed_priority
     }
-    covered_topics = set().union(
-        *(topic_sets[index] for index in selected)
-    ) if selected else set()
-    covered_effect_terms = set().union(
-        *(effect_term_sets[index] for index in selected)
-    ) if selected else set()
+    covered_topics = set().union(*(topic_sets[index] for index in selected)) if selected else set()
+    covered_effect_terms = (
+        set().union(*(effect_term_sets[index] for index in selected)) if selected else set()
+    )
 
     def bank_fraction(bank: str) -> float:
         denominator = operational_totals[bank]
         if denominator <= 0.0:
             return 1.0
-        return float(
-            sum(
-                masses[key]
-                for key in covered_topics
-                if key[0] == bank
-            )
-            / denominator
-        )
+        return float(sum(masses[key] for key in covered_topics if key[0] == bank) / denominator)
 
     def raw_fraction() -> float:
         if not mappable_highest:
             return 1.0
-        return float(
-            len(set(mappable_highest) & covered_effect_terms)
-            / len(set(mappable_highest))
-        )
+        return float(len(set(mappable_highest) & covered_effect_terms) / len(set(mappable_highest)))
 
     while any(bank_fraction(bank) + 1e-12 < target for bank in banks) or (
         raw_fraction() + 1e-12 < target
@@ -2688,14 +2607,10 @@ def select_initial_topic_evidence_registry(
                     continue
                 denominator = operational_totals[bank]
                 if denominator > 0.0:
-                    normalized_gain += sum(
-                        masses[key] for key in new_topics if key[0] == bank
-                    ) / denominator
-            new_raw = (
-                effect_term_sets[index]
-                & set(mappable_highest)
-                - covered_effect_terms
-            )
+                    normalized_gain += (
+                        sum(masses[key] for key in new_topics if key[0] == bank) / denominator
+                    )
+            new_raw = effect_term_sets[index] & set(mappable_highest) - covered_effect_terms
             if raw_fraction() + 1e-12 < target and mappable_highest:
                 normalized_gain += len(new_raw) / len(set(mappable_highest))
             candidates.append(
@@ -2722,9 +2637,11 @@ def select_initial_topic_evidence_registry(
     while changed:
         changed = False
         for index in list(selected):
-            derivation = entries[index].get("derivation") or (
-                entries[index].get("value_contract") or {}
-            ).get("deterministic_derivation") or {}
+            derivation = (
+                entries[index].get("derivation")
+                or (entries[index].get("value_contract") or {}).get("deterministic_derivation")
+                or {}
+            )
             for source_name in derivation.get("source_names", []):
                 source_index = by_name.get(_normalize_feature_name(source_name))
                 if source_index is not None and source_index not in selected:
@@ -2738,9 +2655,7 @@ def select_initial_topic_evidence_registry(
     bank_audit: Dict[str, Any] = {}
     for bank in banks:
         operational = operational_totals[bank]
-        covered = float(
-            sum(masses[key] for key in covered_topics if key[0] == bank)
-        )
+        covered = float(sum(masses[key] for key in covered_topics if key[0] == bank))
         bank_audit[bank] = {
             "covered_operational_mass": covered,
             "operational_nonartifactual_mass": operational,
@@ -2749,13 +2664,9 @@ def select_initial_topic_evidence_registry(
             "all_topic_coverage_fraction": (
                 1.0 if all_totals[bank] <= 0.0 else covered / all_totals[bank]
             ),
-            "operational_topic_ids": sorted(
-                key[1] for key in operational_topics if key[0] == bank
-            ),
+            "operational_topic_ids": sorted(key[1] for key in operational_topics if key[0] == bank),
             "excluded_topic_ids_without_operational_candidate": sorted(
-                key[1]
-                for key in masses
-                if key[0] == bank and key not in operational_topics
+                key[1] for key in masses if key[0] == bank and key not in operational_topics
             ),
         }
     audit = {
@@ -2783,9 +2694,7 @@ def select_initial_topic_evidence_registry(
         ],
         "mappable_highest_ranked_effect_ngram_preservation": raw_fraction(),
         "required_or_prespecified_names": [
-            entry["name"]
-            for entry in active
-            if entry.get("required_or_prespecified")
+            entry["name"] for entry in active if entry.get("required_or_prespecified")
         ],
         "fixed_inner_policy_priority_names": sorted(
             entry["name"] for entry in active if entry["name"] in fixed_priority
@@ -2827,16 +2736,11 @@ def select_deferred_review_additions(
 
     masses: Dict[Tuple[str, str], float] = {}
     for bank in ("treatment", "outcome", "effect"):
-        for topic in (metadata.get("topic_banks", {}).get(bank, {}) or {}).get(
-            "topics", []
-        ):
+        for topic in (metadata.get("topic_banks", {}).get(bank, {}) or {}).get("topics", []):
             masses[(bank, str(topic["topic_id"]))] = _topic_evidence_mass(topic)
-    orphan_branch = (
-        (metadata.get("topic_score_tests") or {}).get(
-            "effect_orphan_ngram_branch"
-        )
-        or {}
-    )
+    orphan_branch = (metadata.get("topic_score_tests") or {}).get(
+        "effect_orphan_ngram_branch"
+    ) or {}
     for cluster in orphan_branch.get("selected_clusters") or []:
         cluster_id = str(cluster.get("cluster_id") or "").strip()
         if cluster_id:
@@ -2845,9 +2749,11 @@ def select_deferred_review_additions(
                 float(cluster.get("maximum_absolute_standardized_score") or 0.0),
                 1e-12,
             )
-    covered_topics = set().union(
-        *(_registry_topic_keys(entry) for entry in active_registry)
-    ) if active_registry else set()
+    covered_topics = (
+        set().union(*(_registry_topic_keys(entry) for entry in active_registry))
+        if active_registry
+        else set()
+    )
     coverage = diagnostic.get("effect_coverage", {})
     missing_effect_terms = (
         set()
@@ -2859,9 +2765,7 @@ def select_deferred_review_additions(
     remaining = [
         _refresh_registry_entry(entry)
         for entry in deferred_registry
-        if _registry_topic_keys(entry) & {
-            key for key in masses if key[0] in relevant_banks
-        }
+        if _registry_topic_keys(entry) & {key for key in masses if key[0] in relevant_banks}
     ]
     selected: List[Dict[str, Any]] = []
     while remaining and len(selected) < limit:
@@ -2879,10 +2783,7 @@ def select_deferred_review_additions(
             # therefore provides a small, deterministic secondary score.
             cited_mass = float(
                 sum(
-                    abs(
-                        float(term.get("loading", 0.0))
-                        * float(term.get("signed_score", 0.0))
-                    )
+                    abs(float(term.get("loading", 0.0)) * float(term.get("signed_score", 0.0)))
                     for provenance in entry.get("provenance", [])
                     if str(provenance.get("bank")) in relevant_banks
                     for term in provenance.get("supporting_terms", [])
@@ -2918,9 +2819,11 @@ def select_deferred_review_additions(
     executable: List[Dict[str, Any]] = []
     selected_names: set = set()
     for entry in selected:
-        derivation = entry.get("derivation") or (
-            entry.get("value_contract") or {}
-        ).get("deterministic_derivation") or {}
+        derivation = (
+            entry.get("derivation")
+            or (entry.get("value_contract") or {}).get("deterministic_derivation")
+            or {}
+        )
         needed = [
             deferred_by_name[name]
             for raw_name in derivation.get("source_names", [])
@@ -3005,18 +2908,12 @@ def _effect_evidence_coverage(
         # agent.  A topic cannot disappear from the coverage denominator just
         # because the agent failed to produce an executable candidate for it.
         # Additive recovery topics join that universe once operationalized.
-        denominator_topics = set(masses) & (
-            score_selected_topic_ids | operational_topic_ids
-        )
+        denominator_topics = set(masses) & (score_selected_topic_ids | operational_topic_ids)
     else:
         denominator_topics = set(masses) & operational_topic_ids
     total = float(sum(masses[topic_id] for topic_id in denominator_topics))
     covered = float(
-        sum(
-            masses[topic_id]
-            for topic_id in denominator_topics
-            if topic_id in supported_topics
-        )
+        sum(masses[topic_id] for topic_id in denominator_topics if topic_id in supported_topics)
     )
     score_path = metadata.get("artifacts", {}).get("ngram_scores", {}).get("effect")
     highest_ranked: List[str] = []
@@ -3035,12 +2932,9 @@ def _effect_evidence_coverage(
     # Otherwise an omitted but strong n-gram vanishes from the denominator and
     # the recovery gate can pass without ever revisiting it.
     preserved_highest = [term for term in highest_ranked if term in supported_terms]
-    orphan_branch = (
-        (metadata.get("topic_score_tests") or {}).get(
-            "effect_orphan_ngram_branch"
-        )
-        or {}
-    )
+    orphan_branch = (metadata.get("topic_score_tests") or {}).get(
+        "effect_orphan_ngram_branch"
+    ) or {}
     selected_orphan_clusters = list(orphan_branch.get("selected_clusters") or [])
     orphan_masses = {
         str(cluster.get("cluster_id")): max(
@@ -3053,11 +2947,7 @@ def _effect_evidence_coverage(
     }
     orphan_total = float(sum(orphan_masses.values()))
     orphan_covered = float(
-        sum(
-            mass
-            for cluster_id, mass in orphan_masses.items()
-            if cluster_id in supported_topics
-        )
+        sum(mass for cluster_id, mass in orphan_masses.items() if cluster_id in supported_topics)
     )
     uncovered_orphan_ids = sorted(set(orphan_masses) - supported_topics)
     return {
@@ -3085,15 +2975,11 @@ def _effect_evidence_coverage(
         ],
         "preserved_highest_ranked_raw_ngrams": preserved_highest,
         "highest_ranked_raw_ngram_preservation": (
-            1.0
-            if not highest_ranked
-            else len(preserved_highest) / len(highest_ranked)
+            1.0 if not highest_ranked else len(preserved_highest) / len(highest_ranked)
         ),
         "orphan_ngram_branch_status": orphan_branch.get("status"),
         "selected_orphan_cluster_ids": sorted(orphan_masses),
-        "covered_orphan_cluster_ids": sorted(
-            set(orphan_masses) & supported_topics
-        ),
+        "covered_orphan_cluster_ids": sorted(set(orphan_masses) & supported_topics),
         "uncovered_orphan_cluster_ids": uncovered_orphan_ids,
         "orphan_cluster_covered_mass": orphan_covered,
         "orphan_cluster_total_mass": orphan_total,
@@ -3134,23 +3020,15 @@ def structured_heldout_diagnostic(
                 "n_unique_observed": int(observed.nunique(dropna=True)),
             }
         )
-    w_fit, w_heldout, w_names = _role_matrix(
-        fit_df, heldout_df, specs, role="confounder"
-    )
-    x_fit, x_heldout, x_names = _role_matrix(
-        fit_df, heldout_df, specs, role="effect_modifier"
-    )
+    w_fit, w_heldout, w_names = _role_matrix(fit_df, heldout_df, specs, role="confounder")
+    x_fit, x_heldout, x_names = _role_matrix(fit_df, heldout_df, specs, role="effect_modifier")
     t_fit = fit_df[config.treatment_column].to_numpy(dtype=float)
     y_fit = fit_df[config.outcome_column].to_numpy(dtype=float)
     t_heldout = heldout_df[config.treatment_column].to_numpy(dtype=float)
     y_heldout = heldout_df[config.outcome_column].to_numpy(dtype=float)
     outcome_binary = str(config.outcome_type).lower() != "continuous"
-    structured_e = _fit_nuisance_from_structured(
-        w_fit, w_heldout, t_fit, binary=True
-    )
-    structured_m = _fit_nuisance_from_structured(
-        w_fit, w_heldout, y_fit, binary=outcome_binary
-    )
+    structured_e = _fit_nuisance_from_structured(w_fit, w_heldout, t_fit, binary=True)
+    structured_m = _fit_nuisance_from_structured(w_fit, w_heldout, y_fit, binary=outcome_binary)
     treatment_metrics = nuisance_metrics(t_heldout, structured_e, binary=True)
     outcome_metrics = nuisance_metrics(y_heldout, structured_m, binary=outcome_binary)
     benchmark = _nuisance_benchmark(
@@ -3177,9 +3055,7 @@ def structured_heldout_diagnostic(
         fit_values = np.asarray(fit_topics["effect"], dtype=float)
         heldout_values = np.asarray(heldout_topics["effect"], dtype=float)
         effect_topics = list(
-            (metadata.get("topic_banks", {}).get("effect") or {}).get(
-                "topics", []
-            )
+            (metadata.get("topic_banks", {}).get("effect") or {}).get("topics", [])
         )
         selected_effect_ids = set(
             map(
@@ -3200,8 +3076,7 @@ def structured_heldout_diagnostic(
                 str(provenance.get("topic_id"))
                 for entry in candidate_evidence_universe
                 for provenance in entry.get("provenance", [])
-                if provenance.get("bank") == "effect"
-                and provenance.get("topic_id") is not None
+                if provenance.get("bank") == "effect" and provenance.get("topic_id") is not None
             )
         if selected_effect_ids:
             selected_indices = [
@@ -3246,24 +3121,34 @@ def structured_heldout_diagnostic(
 
     contrast = {"mean_sign_agreement": None, "feature_names": x_names}
     nuisance_frame = pd.read_parquet(metadata["artifacts"]["nuisance_predictions"])
-    fit_nuisance = nuisance_frame[nuisance_frame["prediction_scope"] == "fit_oof"].set_index(
-        "_oci_row_id"
-    ).loc[fit_df["_oci_row_id"].astype(int)]
-    heldout_nuisance = nuisance_frame[
-        nuisance_frame["prediction_scope"] == "external_heldout"
-    ].set_index("_oci_row_id").loc[heldout_df["_oci_row_id"].astype(int)]
+    fit_nuisance = (
+        nuisance_frame[nuisance_frame["prediction_scope"] == "fit_oof"]
+        .set_index("_oci_row_id")
+        .loc[fit_df["_oci_row_id"].astype(int)]
+    )
+    heldout_nuisance = (
+        nuisance_frame[nuisance_frame["prediction_scope"] == "external_heldout"]
+        .set_index("_oci_row_id")
+        .loc[heldout_df["_oci_row_id"].astype(int)]
+    )
     if x_fit.shape[1] > 0:
         fit_scores = cohort_contrast_scores(
-            x_fit, x_names, t_fit, y_fit,
-            fit_nuisance["treatment_stacked"], fit_nuisance["outcome_stacked"],
+            x_fit,
+            x_names,
+            t_fit,
+            y_fit,
+            fit_nuisance["treatment_stacked"],
+            fit_nuisance["outcome_stacked"],
         )
         heldout_scores = cohort_contrast_scores(
-            x_heldout, x_names, t_heldout, y_heldout,
-            heldout_nuisance["treatment_stacked"], heldout_nuisance["outcome_stacked"],
+            x_heldout,
+            x_names,
+            t_heldout,
+            y_heldout,
+            heldout_nuisance["treatment_stacked"],
+            heldout_nuisance["outcome_stacked"],
         )
-        agreement = np.sign(fit_scores["signed_score"]) == np.sign(
-            heldout_scores["signed_score"]
-        )
+        agreement = np.sign(fit_scores["signed_score"]) == np.sign(heldout_scores["signed_score"])
         contrast = {
             "mean_sign_agreement": float(np.mean(agreement)),
             "feature_names": x_names,
@@ -3360,9 +3245,7 @@ def structured_review_gate(
         )
         contrast = diagnostic.get("structured_contrast", {})
         sign_agreement = contrast.get("mean_sign_agreement")
-        contrast_target = float(
-            nn_config.tfidf_topic.minimum_tail_sign_agreement
-        )
+        contrast_target = float(nn_config.tfidf_topic.minimum_tail_sign_agreement)
         criteria.append(
             {
                 "family": "effect",
@@ -3382,9 +3265,7 @@ def structured_review_gate(
                 {
                     "family": "effect",
                     "metric": "selected_orphan_ngram_cluster_coverage",
-                    "observed": coverage[
-                        "orphan_cluster_coverage_fraction"
-                    ],
+                    "observed": coverage["orphan_cluster_coverage_fraction"],
                     "target": nn_config.tfidf_topic.initial_effect_coverage_target,
                     "passed": bool(
                         coverage["orphan_cluster_coverage_fraction"]
@@ -3398,9 +3279,7 @@ def structured_review_gate(
                 {
                     "family": "effect",
                     "metric": "highest_ranked_raw_ngram_preservation",
-                    "observed": coverage[
-                        "highest_ranked_raw_ngram_preservation"
-                    ],
+                    "observed": coverage["highest_ranked_raw_ngram_preservation"],
                     "target": nn_config.tfidf_topic.initial_effect_coverage_target,
                     "passed": bool(
                         coverage["highest_ranked_raw_ngram_preservation"]
@@ -3495,8 +3374,7 @@ class TfidfTopicAgenticForestRunner:
         else:
             evaluator_class = (
                 StructuredInteractionExplicitEvaluator
-                if self.nn_config.structured_effect_estimator
-                == "interaction_s_learner"
+                if self.nn_config.structured_effect_estimator == "interaction_s_learner"
                 else CausalForestExplicitEvaluator
             )
             self.evaluator = evaluator_class(
@@ -3529,9 +3407,7 @@ class TfidfTopicAgenticForestRunner:
     @staticmethod
     def _without_oracle_columns(frame: pd.DataFrame) -> pd.DataFrame:
         """Return the exact modeling frame with every synthetic oracle removed."""
-        oracle_columns = [
-            column for column in frame.columns if str(column).startswith("true_")
-        ]
+        oracle_columns = [column for column in frame.columns if str(column).startswith("true_")]
         return frame.drop(columns=oracle_columns, errors="ignore")
 
     def _prespecified_candidates(self) -> List[Dict[str, Any]]:
@@ -3558,12 +3434,14 @@ class TfidfTopicAgenticForestRunner:
 
     def _rows_for_outer(self, outer_fold: int):
         full = [
-            row for row in self.rows
+            row
+            for row in self.rows
             if int(row["outer_fold"]) == outer_fold and row["scope"] == "full_outer_train"
         ]
         inner = sorted(
             [
-                row for row in self.rows
+                row
+                for row in self.rows
                 if int(row["outer_fold"]) == outer_fold
                 and row["scope"] == "candidate_selection_inner_fit"
             ],
@@ -3595,9 +3473,7 @@ class TfidfTopicAgenticForestRunner:
                 f"{TOPIC_SCORE_TEST_SCHEMA_VERSION!r}. Rerun Stage 1."
             )
         if payload.get("status") != "completed":
-            raise RuntimeError(
-                f"Exact-context topic score tests are incomplete: {path}"
-            )
+            raise RuntimeError(f"Exact-context topic score tests are incomplete: {path}")
         return payload
 
     def _topic_score_selection_snapshot(self, row: Dict[str, Any]) -> Dict[str, Any]:
@@ -3612,9 +3488,7 @@ class TfidfTopicAgenticForestRunner:
         }
         for bank in ("treatment", "outcome", "effect"):
             bank_payload = (payload.get("banks") or {}).get(bank) or {}
-            selected_ids = set(
-                map(str, bank_payload.get("selected_topic_ids") or [])
-            )
+            selected_ids = set(map(str, bank_payload.get("selected_topic_ids") or []))
             selected_topics = []
             for test in bank_payload.get("topic_tests", []):
                 if str(test.get("topic_id")) not in selected_ids:
@@ -3655,29 +3529,17 @@ class TfidfTopicAgenticForestRunner:
                 "selected_topics": selected_topics,
                 "selection_count": int(bank_payload.get("selection_count") or 0),
                 "selection_rule": bank_payload.get("selection_rule"),
-                "bootstrap_calibration": bank_payload.get(
-                    "bootstrap_calibration"
-                ) or {},
-                "selected_ngrams": list(
-                    bank_payload.get("selected_ngrams") or []
-                ),
-                "selected_ngram_terms": list(
-                    bank_payload.get("selected_ngram_terms") or []
-                ),
-                "ngram_selection_count": int(
-                    bank_payload.get("ngram_selection_count") or 0
-                ),
-                "ngram_selection_rule": bank_payload.get(
-                    "ngram_selection_rule"
-                ),
+                "bootstrap_calibration": bank_payload.get("bootstrap_calibration") or {},
+                "selected_ngrams": list(bank_payload.get("selected_ngrams") or []),
+                "selected_ngram_terms": list(bank_payload.get("selected_ngram_terms") or []),
+                "ngram_selection_count": int(bank_payload.get("ngram_selection_count") or 0),
+                "ngram_selection_rule": bank_payload.get("ngram_selection_rule"),
             }
         orphan = payload.get("effect_orphan_ngram_branch") or {}
         snapshot["effect_orphan_ngram_branch"] = {
             "status": orphan.get("status"),
             "candidate_definition": orphan.get("candidate_definition"),
-            "selected_cluster_ids": list(
-                orphan.get("selected_cluster_ids") or []
-            ),
+            "selected_cluster_ids": list(orphan.get("selected_cluster_ids") or []),
             "selected_clusters": list(orphan.get("selected_clusters") or []),
             "selection_count": int(orphan.get("selection_count") or 0),
             "selection_rule": orphan.get("selection_rule"),
@@ -3700,12 +3562,9 @@ class TfidfTopicAgenticForestRunner:
         policy: Dict[str, Any],
     ) -> Tuple[List[Tuple[str, Dict[str, Any]]], Dict[str, Any]]:
         """Map fixed inner orphan signatures onto full-training raw evidence."""
-        orphan_policy = (
-            (policy.get("topic_score_selection") or {}).get(
-                "effect_orphan_ngram_branch"
-            )
-            or {}
-        )
+        orphan_policy = (policy.get("topic_score_selection") or {}).get(
+            "effect_orphan_ngram_branch"
+        ) or {}
         signatures = [
             dict(signature)
             for signature in orphan_policy.get("signatures") or []
@@ -3729,9 +3588,7 @@ class TfidfTopicAgenticForestRunner:
         signature_similarity = signature_vectors @ signature_vectors.T
         ungrouped = set(range(len(signatures)))
         signature_groups: List[List[int]] = []
-        threshold = float(
-            self.nn_config.tfidf_topic.orphan_ngram_cluster_similarity_threshold
-        )
+        threshold = float(self.nn_config.tfidf_topic.orphan_ngram_cluster_similarity_threshold)
         for seed in range(len(signatures)):
             if seed not in ungrouped:
                 continue
@@ -3751,17 +3608,12 @@ class TfidfTopicAgenticForestRunner:
         signature_groups.sort(
             key=lambda members: (
                 -len({int(signatures[index]["inner_fold"]) for index in members}),
-                min(
-                    float(signatures[index].get("primary_p") or 1.0)
-                    for index in members
-                ),
+                min(float(signatures[index].get("primary_p") or 1.0) for index in members),
                 min(str(signatures[index].get("cluster_id")) for index in members),
             )
         )
 
-        score_path = Path(
-            str(row["discovery"]["artifacts"]["ngram_scores"]["effect"])
-        )
+        score_path = Path(str(row["discovery"]["artifacts"]["ngram_scores"]["effect"]))
         raw = pd.read_parquet(score_path).copy()
         raw["feature"] = raw["feature"].astype(str)
         raw["fit_rank"] = np.arange(1, len(raw) + 1, dtype=int)
@@ -3773,11 +3625,7 @@ class TfidfTopicAgenticForestRunner:
         ].copy()
         represented = {
             str(term.get("term"))
-            for topic in (
-                row["discovery"]["topic_banks"].get("effect", {}).get(
-                    "topics", []
-                )
-            )
+            for topic in (row["discovery"]["topic_banks"].get("effect", {}).get("topics", []))
             for term in topic.get("terms", [])
         }
         raw = raw.loc[~raw["feature"].isin(represented)].copy()
@@ -3799,36 +3647,24 @@ class TfidfTopicAgenticForestRunner:
         if not candidate_terms or not signature_terms:
             audit["status"] = "no_full_context_fit_side_candidates"
             return [], audit
-        semantic_vectors = _parsimony_tfidf_semantic_vectors(
-            [*signature_terms, *candidate_terms]
-        )
+        semantic_vectors = _parsimony_tfidf_semantic_vectors([*signature_terms, *candidate_terms])
         signature_term_vectors = semantic_vectors[: len(signature_terms)]
         candidate_vectors = semantic_vectors[len(signature_terms) :]
         term_similarity = candidate_vectors @ signature_term_vectors.T
-        signature_term_index = {
-            term: index for index, term in enumerate(signature_terms)
-        }
+        signature_term_index = {term: index for index, term in enumerate(signature_terms)}
         required_folds = min(
             int(self.nn_config.tfidf_topic.orphan_ngram_full_min_inner_folds),
             int(policy.get("inner_fold_count") or 1),
         )
-        maximum_terms = int(
-            self.nn_config.tfidf_topic.orphan_ngram_cluster_max_terms
-        )
+        maximum_terms = int(self.nn_config.tfidf_topic.orphan_ngram_cluster_max_terms)
         assigned_terms: set[str] = set()
         jobs: List[Tuple[str, Dict[str, Any]]] = []
         for group_index, members in enumerate(signature_groups, start=1):
-            inner_folds = sorted(
-                {int(signatures[index]["inner_fold"]) for index in members}
-            )
+            inner_folds = sorted({int(signatures[index]["inner_fold"]) for index in members})
             if len(inner_folds) < required_folds:
                 continue
             group_terms = sorted(
-                {
-                    str(term)
-                    for index in members
-                    for term in signatures[index].get("terms") or []
-                }
+                {str(term) for index in members for term in signatures[index].get("terms") or []}
             )
             group_columns = [signature_term_index[term] for term in group_terms]
             ranked_candidates: List[Tuple[int, float, int, str, Dict[str, Any]]] = []
@@ -3837,9 +3673,7 @@ class TfidfTopicAgenticForestRunner:
                 if term in assigned_terms:
                     continue
                 exact = term in group_terms
-                similarity = float(
-                    np.max(term_similarity[candidate_index, group_columns])
-                )
+                similarity = float(np.max(term_similarity[candidate_index, group_columns]))
                 if not exact and similarity < threshold:
                     continue
                 ranked_candidates.append(
@@ -3866,12 +3700,8 @@ class TfidfTopicAgenticForestRunner:
                         "signed_score": float(record["signed_score"]),
                         "fit_rank": int(record["fit_rank"]),
                         "fit_signed_score": float(record["signed_score"]),
-                        "fit_unsigned_score": float(
-                            abs(float(record["signed_score"]))
-                        ),
-                        "combined_importance": float(
-                            record.get("combined_importance", 0.0)
-                        ),
+                        "fit_unsigned_score": float(abs(float(record["signed_score"]))),
+                        "combined_importance": float(record.get("combined_importance", 0.0)),
                         "mapped_exactly": exact_rank == 0,
                         "mapping_similarity": float(-negative_similarity),
                     }
@@ -3928,9 +3758,7 @@ class TfidfTopicAgenticForestRunner:
             "banks": {},
         }
         for bank in ("treatment", "outcome", "effect"):
-            topics = list(
-                row["discovery"]["topic_banks"].get(bank, {}).get("topics", [])
-            )
+            topics = list(row["discovery"]["topic_banks"].get(bank, {}).get("topics", []))
             signatures = list((policy_banks.get(bank) or {}).get("signatures") or [])
             if not topics:
                 audit["banks"][bank] = {
@@ -3946,21 +3774,18 @@ class TfidfTopicAgenticForestRunner:
                 }
                 continue
             documents = [
-                " ; ".join(map(str, signature.get("terms") or []))
-                for signature in signatures
+                " ; ".join(map(str, signature.get("terms") or [])) for signature in signatures
             ] + [self._topic_document(topic) for topic in topics]
             vectors = _parsimony_tfidf_semantic_vectors(documents)
             signature_vectors = vectors[: len(signatures)]
-            topic_vectors = vectors[len(signatures):]
+            topic_vectors = vectors[len(signatures) :]
             similarities = topic_vectors @ signature_vectors.T
             term_fold_recurrence = {
                 str(term): int(count)
                 for term, count in (
                     (policy_banks.get(bank) or {}).get(
                         "selected_ngram_fold_recurrence",
-                        (policy_banks.get(bank) or {}).get(
-                            "selected_term_fold_recurrence", {}
-                        ),
+                        (policy_banks.get(bank) or {}).get("selected_term_fold_recurrence", {}),
                     )
                 ).items()
             }
@@ -3991,9 +3816,7 @@ class TfidfTopicAgenticForestRunner:
                         continue
                     strongest_terms = sorted(
                         list(signature.get("term_scores") or []),
-                        key=lambda term: -abs(
-                            float(term.get("heldout_standardized_score") or 0.0)
-                        ),
+                        key=lambda term: -abs(float(term.get("heldout_standardized_score") or 0.0)),
                     )[:5]
                     matched_evidence.append(
                         {
@@ -4005,18 +3828,10 @@ class TfidfTopicAgenticForestRunner:
                             "primary_p_source": signature.get("primary_p_source"),
                             "fdr_q": signature.get("fdr_q"),
                             "familywise_p": signature.get("familywise_p"),
-                            "topic_standardized_score": signature.get(
-                                "topic_standardized_score"
-                            ),
-                            "topic_score_moment": signature.get(
-                                "topic_score_moment"
-                            ),
-                            "term_group_primary_p": signature.get(
-                                "term_group_primary_p"
-                            ),
-                            "term_group_fdr_q": signature.get(
-                                "term_group_fdr_q"
-                            ),
+                            "topic_standardized_score": signature.get("topic_standardized_score"),
+                            "topic_score_moment": signature.get("topic_score_moment"),
+                            "term_group_primary_p": signature.get("term_group_primary_p"),
+                            "term_group_fdr_q": signature.get("term_group_fdr_q"),
                             "evidence_rank": signature.get("evidence_rank"),
                             "quadratic_statistic_per_rank": signature.get(
                                 "quadratic_statistic_per_rank"
@@ -4028,17 +3843,11 @@ class TfidfTopicAgenticForestRunner:
                     key=lambda evidence: (
                         -len(evidence["exact_term_overlap"]),
                         -float(evidence["semantic_similarity"]),
-                        float(
-                            evidence["primary_p"]
-                            if evidence["primary_p"] is not None
-                            else 1.0
-                        ),
+                        float(evidence["primary_p"] if evidence["primary_p"] is not None else 1.0),
                         int(evidence["inner_fold"]),
                     )
                 )
-                exact_weight = int(
-                    sum(term_fold_recurrence.get(term, 0) for term in topic_terms)
-                )
+                exact_weight = int(sum(term_fold_recurrence.get(term, 0) for term in topic_terms))
                 best_similarity = float(np.max(similarities[topic_index]))
                 scored.append(
                     {
@@ -4052,8 +3861,7 @@ class TfidfTopicAgenticForestRunner:
                         "matched_inner_evidence": matched_evidence[:6],
                         "mapping_score": float(
                             len(matched_folds)
-                            + exact_weight
-                            / max(1, 15 * int(policy.get("inner_fold_count") or 1))
+                            + exact_weight / max(1, 15 * int(policy.get("inner_fold_count") or 1))
                             + best_similarity
                         ),
                     }
@@ -4075,15 +3883,11 @@ class TfidfTopicAgenticForestRunner:
                 maximum,
             )
             required_folds = min(
-                int(
-                    self.nn_config.tfidf_topic.score_test_full_topic_min_inner_folds
-                ),
+                int(self.nn_config.tfidf_topic.score_test_full_topic_min_inner_folds),
                 int(policy.get("inner_fold_count") or 1),
             )
             selected = [
-                item
-                for item in scored
-                if int(item["matched_inner_fold_count"]) >= required_folds
+                item for item in scored if int(item["matched_inner_fold_count"]) >= required_folds
             ][:maximum]
             selected_ids = {item["topic_id"] for item in selected}
             for item in scored:
@@ -4104,17 +3908,13 @@ class TfidfTopicAgenticForestRunner:
                 }
                 jobs.append((bank, {**topic, "_selection_evidence": evidence}))
             audit["banks"][bank] = {
-                "selected_topic_ids": [
-                    str(item["topic_id"]) for item in selected
-                ],
+                "selected_topic_ids": [str(item["topic_id"]) for item in selected],
                 "required_inner_fold_recurrence": required_folds,
                 "minimum_topics": minimum,
                 "maximum_topics": maximum,
                 "topic_mapping": scored,
             }
-        orphan_jobs, orphan_audit = self._full_orphan_jobs_from_policy(
-            row, policy
-        )
+        orphan_jobs, orphan_audit = self._full_orphan_jobs_from_policy(row, policy)
         jobs.extend(orphan_jobs)
         audit["effect_orphan_ngram_branch"] = orphan_audit
         return jobs, audit
@@ -4128,9 +3928,7 @@ class TfidfTopicAgenticForestRunner:
             return [
                 (bank, topic)
                 for bank in ("treatment", "outcome", "effect")
-                for topic in row["discovery"]["topic_banks"].get(bank, {}).get(
-                    "topics", []
-                )
+                for topic in row["discovery"]["topic_banks"].get(bank, {}).get("topics", [])
             ]
         if row.get("scope") == "full_outer_train":
             if selection_policy is None:
@@ -4144,17 +3942,11 @@ class TfidfTopicAgenticForestRunner:
         topic_jobs = [
             (bank, topic)
             for bank, topic in self._inner_ranked_topic_jobs(row)
-            if bool(
-                (topic.get("_selection_evidence") or {}).get(
-                    "selected_for_agent", False
-                )
-            )
+            if bool((topic.get("_selection_evidence") or {}).get("selected_for_agent", False))
         ]
         return [*topic_jobs, *self._inner_orphan_jobs(row)]
 
-    def _inner_orphan_jobs(
-        self, row: Dict[str, Any]
-    ) -> List[Tuple[str, Dict[str, Any]]]:
+    def _inner_orphan_jobs(self, row: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
         """Return held-out-selected groups from the predeclared fit-side universe."""
         if row.get("scope") == "full_outer_train":
             raise ValueError("Inner orphan score evidence is unavailable for full contexts")
@@ -4182,9 +3974,7 @@ class TfidfTopicAgenticForestRunner:
                         **dict(term),
                         "loading": 0.0,
                         "screen_rank": int(term.get("fit_rank") or 0),
-                        "signed_score": float(
-                            term.get("fit_signed_score") or 0.0
-                        ),
+                        "signed_score": float(term.get("fit_signed_score") or 0.0),
                     }
                 )
             if not 1 <= len(term_rows) <= 15:
@@ -4192,9 +3982,19 @@ class TfidfTopicAgenticForestRunner:
                     f"Selected orphan cluster {cluster.get('cluster_id')} has "
                     f"{len(term_rows)} terms; expected 1-15"
                 )
+            nested_policy = (
+                str(self.nn_config.tfidf_topic.score_selection_label_policy)
+                == "nested_fit_calibration"
+            )
             evidence = {
-                "source": "exact_inner_heldout_orphan_ngram_group_score_test",
-                "uses_heldout_treatment_and_outcome": True,
+                "source": (
+                    "nested_fit_calibration_orphan_ngram_group_score_test"
+                    if nested_policy
+                    else "exact_inner_heldout_orphan_ngram_group_score_test"
+                ),
+                "uses_heldout_treatment_and_outcome": not nested_policy,
+                "uses_registered_heldout_treatment_and_outcome": False,
+                "uses_nested_fit_calibration_treatment_and_outcome": nested_policy,
                 **dict(cluster),
             }
             jobs.append(
@@ -4212,9 +4012,7 @@ class TfidfTopicAgenticForestRunner:
             )
         return jobs
 
-    def _inner_ranked_topic_jobs(
-        self, row: Dict[str, Any]
-    ) -> List[Tuple[str, Dict[str, Any]]]:
+    def _inner_ranked_topic_jobs(self, row: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
         """Return every inner topic in held-out evidence order.
 
         The initial labeling pass consumes only ``selected_for_agent`` topics.
@@ -4227,9 +4025,7 @@ class TfidfTopicAgenticForestRunner:
             return [
                 (bank, topic)
                 for bank in ("treatment", "outcome", "effect")
-                for topic in row["discovery"]["topic_banks"].get(bank, {}).get(
-                    "topics", []
-                )
+                for topic in row["discovery"]["topic_banks"].get(bank, {}).get("topics", [])
             ]
         score_tests = self._load_topic_score_tests(row)
         jobs: List[Tuple[str, Dict[str, Any]]] = []
@@ -4237,9 +4033,7 @@ class TfidfTopicAgenticForestRunner:
             bank_tests = (score_tests.get("banks") or {}).get(bank) or {}
             topics_by_id = {
                 str(topic["topic_id"]): topic
-                for topic in row["discovery"]["topic_banks"].get(bank, {}).get(
-                    "topics", []
-                )
+                for topic in row["discovery"]["topic_banks"].get(bank, {}).get("topics", [])
             }
             ranked_tests = sorted(
                 bank_tests.get("topic_tests", []),
@@ -4253,9 +4047,19 @@ class TfidfTopicAgenticForestRunner:
                 topic = topics_by_id.get(topic_id)
                 if topic is None:
                     continue
+                nested_policy = (
+                    str(self.nn_config.tfidf_topic.score_selection_label_policy)
+                    == "nested_fit_calibration"
+                )
                 evidence = {
-                    "source": "exact_inner_heldout_topic_and_ngram_score_test",
-                    "uses_heldout_treatment_and_outcome": True,
+                    "source": (
+                        "nested_fit_calibration_topic_and_ngram_score_test"
+                        if nested_policy
+                        else "exact_inner_heldout_topic_and_ngram_score_test"
+                    ),
+                    "uses_heldout_treatment_and_outcome": not nested_policy,
+                    "uses_registered_heldout_treatment_and_outcome": False,
+                    "uses_nested_fit_calibration_treatment_and_outcome": nested_policy,
                     **test,
                 }
                 jobs.append((bank, {**topic, "_selection_evidence": evidence}))
@@ -4271,21 +4075,13 @@ class TfidfTopicAgenticForestRunner:
         model_identity = self._harmonization_agent_model_identity()
         request_settings_hash = stable_hash(
             {
-                "agent_provider": getattr(
-                    self.search_config, "agent_provider", "openai"
-                ),
-                "agent_server_url": getattr(
-                    self.search_config, "agent_server_url", None
-                ),
-                "configured_model_name": getattr(
-                    self.search_config, "agent_model_name", None
-                ),
+                "agent_provider": getattr(self.search_config, "agent_provider", "openai"),
+                "agent_server_url": getattr(self.search_config, "agent_server_url", None),
+                "configured_model_name": getattr(self.search_config, "agent_model_name", None),
                 "resolved_model_identity": model_identity,
                 "agent_temperature": self.search_config.agent_temperature,
                 "agent_max_tokens": self.search_config.agent_max_tokens,
-                "agent_enable_thinking": getattr(
-                    self.search_config, "agent_enable_thinking", None
-                ),
+                "agent_enable_thinking": getattr(self.search_config, "agent_enable_thinking", None),
                 "agent_thinking_token_budget": getattr(
                     self.search_config, "agent_thinking_token_budget", None
                 ),
@@ -4301,22 +4097,21 @@ class TfidfTopicAgenticForestRunner:
         jobs = self._topic_jobs(row, selection_policy=selection_policy)
         selection_audit: Dict[str, Any]
         if row.get("scope") == "full_outer_train" and selection_policy is not None:
-            _jobs, selection_audit = self._full_topic_jobs_from_policy(
-                row, selection_policy
-            )
+            _jobs, selection_audit = self._full_topic_jobs_from_policy(row, selection_policy)
         else:
             selection_audit = {
                 "source": (
-                    "exact_inner_heldout_topic_and_ngram_score_test"
+                    (
+                        "nested_fit_calibration_topic_and_ngram_score_test"
+                        if str(self.nn_config.tfidf_topic.score_selection_label_policy)
+                        == "nested_fit_calibration"
+                        else "exact_inner_heldout_topic_and_ngram_score_test"
+                    )
                     if self.nn_config.tfidf_topic.score_test_enabled
                     else "score_test_filter_disabled"
                 ),
                 "selected_topic_ids_by_bank": {
-                    bank: [
-                        str(topic["topic_id"])
-                        for job_bank, topic in jobs
-                        if job_bank == bank
-                    ]
+                    bank: [str(topic["topic_id"]) for job_bank, topic in jobs if job_bank == bank]
                     for bank in ("treatment", "outcome", "effect")
                 },
             }
@@ -4329,9 +4124,7 @@ class TfidfTopicAgenticForestRunner:
                 inner_fold=row.get("inner_fold"),
                 bank=bank,
                 topic=topic,
-                prompt_version=str(
-                    topic.get("_prompt_version") or TOPIC_LABEL_PROMPT_VERSION
-                ),
+                prompt_version=str(topic.get("_prompt_version") or TOPIC_LABEL_PROMPT_VERSION),
                 score_test_evidence=topic.get("_selection_evidence"),
             )
             try:
@@ -4340,9 +4133,12 @@ class TfidfTopicAgenticForestRunner:
                 candidates = [
                     candidate
                     for proposal in _proposal_rows(response)
-                    if (candidate := _candidate_from_response(
-                        proposal, context=context, topic=topic
-                    )) is not None
+                    if (
+                        candidate := _candidate_from_response(
+                            proposal, context=context, topic=topic
+                        )
+                    )
+                    is not None
                 ]
                 return {
                     "topic_id": topic["topic_id"],
@@ -4376,9 +4172,7 @@ class TfidfTopicAgenticForestRunner:
                 inner_fold=row.get("inner_fold"),
                 bank=bank,
                 topic=topic,
-                prompt_version=str(
-                    topic.get("_prompt_version") or TOPIC_LABEL_PROMPT_VERSION
-                ),
+                prompt_version=str(topic.get("_prompt_version") or TOPIC_LABEL_PROMPT_VERSION),
                 score_test_evidence=topic.get("_selection_evidence"),
             )
             existing = completed.get(str(topic["topic_id"]))
@@ -4386,8 +4180,7 @@ class TfidfTopicAgenticForestRunner:
                 existing is None
                 or existing.get("context_hash") != stable_hash(expected_context)
                 or existing.get("model_identity") != model_identity
-                or existing.get("request_settings_hash")
-                != request_settings_hash
+                or existing.get("request_settings_hash") != request_settings_hash
             ):
                 pending.append((bank, topic))
         if pending:
@@ -4440,14 +4233,10 @@ class TfidfTopicAgenticForestRunner:
         model_identity = self._harmonization_agent_model_identity()
         request_settings_hash = stable_hash(
             {
-                "agent_provider": getattr(
-                    self.search_config, "agent_provider", "openai"
-                ),
+                "agent_provider": getattr(self.search_config, "agent_provider", "openai"),
                 "agent_temperature": self.search_config.agent_temperature,
                 "agent_max_tokens": self.search_config.agent_max_tokens,
-                "agent_enable_thinking": getattr(
-                    self.search_config, "agent_enable_thinking", None
-                ),
+                "agent_enable_thinking": getattr(self.search_config, "agent_enable_thinking", None),
                 "agent_thinking_token_budget": getattr(
                     self.search_config, "agent_thinking_token_budget", None
                 ),
@@ -4472,10 +4261,7 @@ class TfidfTopicAgenticForestRunner:
             ):
                 valid[request_id] = record
         completed = valid
-        pending = [
-            context for context in contexts
-            if str(context["request_id"]) not in completed
-        ]
+        pending = [context for context in contexts if str(context["request_id"]) not in completed]
 
         ensure_client = getattr(self.proposal_agent, "_ensure_client", None)
         if pending and callable(ensure_client):
@@ -4495,9 +4281,7 @@ class TfidfTopicAgenticForestRunner:
                     "request_settings_hash": request_settings_hash,
                     "status": "completed",
                     "response": response,
-                    "response_trace": (
-                        trace if self.search_config.save_agent_raw_output else None
-                    ),
+                    "response_trace": (trace if self.search_config.save_agent_raw_output else None),
                 }
             except Exception as exc:
                 return {
@@ -4510,22 +4294,15 @@ class TfidfTopicAgenticForestRunner:
                 }
 
         if pending:
-            workers = min(
-                len(pending), int(self.nn_config.tfidf_topic.topic_label_parallelism)
-            )
+            workers = min(len(pending), int(self.nn_config.tfidf_topic.topic_label_parallelism))
             with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-                futures = {
-                    executor.submit(run_one, context): context for context in pending
-                }
+                futures = {executor.submit(run_one, context): context for context in pending}
                 for future in as_completed(futures):
                     record = future.result()
                     completed[str(record["request_id"])] = record
                     _write_jsonl_atomic(
                         checkpoint,
-                        [
-                            completed[request_id]
-                            for request_id in sorted(completed)
-                        ],
+                        [completed[request_id] for request_id in sorted(completed)],
                     )
         return [completed[str(context["request_id"])] for context in contexts]
 
@@ -4540,9 +4317,7 @@ class TfidfTopicAgenticForestRunner:
                     "clinical_domain": entry.get("clinical_domain"),
                     "parent_object": entry.get("parent_object"),
                     "alias_of": None,
-                    "source_names": (entry.get("derivation") or {}).get(
-                        "source_names", []
-                    ),
+                    "source_names": (entry.get("derivation") or {}).get("source_names", []),
                     "derivation": entry.get("derivation"),
                     "reason": "no competing candidate in this harmonization block",
                 }
@@ -4560,9 +4335,7 @@ class TfidfTopicAgenticForestRunner:
             "inner_fold": row.get("inner_fold"),
             "scope": row["scope"],
             "fit_row_fingerprint": row["fit_row_fingerprint"],
-            "temporal_cutoff": (
-                "use only information documented before the treatment decision"
-            ),
+            "temporal_cutoff": ("use only information documented before the treatment decision"),
             "allowed_final_actions": ["extract", "derive", "alias/drop", "drop"],
             "roles_are_mechanically_assigned": True,
         }
@@ -4598,9 +4371,7 @@ class TfidfTopicAgenticForestRunner:
                         stage="domain_parent_annotation",
                     ),
                     "request_id": f"annotation_{batch_index:04d}",
-                    "candidates": [
-                        _compact_harmonization_candidate(entry) for entry in batch
-                    ],
+                    "candidates": [_compact_harmonization_candidate(entry) for entry in batch],
                 }
             )
         annotation_records = self._run_harmonization_requests(
@@ -4612,9 +4383,7 @@ class TfidfTopicAgenticForestRunner:
             for record in annotation_records
             if record.get("status") == "completed"
         ]
-        registry, pass_drops = apply_topic_name_harmonization(
-            registry, annotation_responses
-        )
+        registry, pass_drops = apply_topic_name_harmonization(registry, annotation_responses)
         dropped.extend(pass_drops)
         dropped.extend(
             {
@@ -4655,9 +4424,7 @@ class TfidfTopicAgenticForestRunner:
                             "clinical_domain": group_key[0],
                             "parent_object": group_key[1],
                         },
-                        "candidates": [
-                            _compact_harmonization_candidate(entry) for entry in batch
-                        ],
+                        "candidates": [_compact_harmonization_candidate(entry) for entry in batch],
                     }
                 )
         domain_records = self._run_harmonization_requests(
@@ -4672,9 +4439,7 @@ class TfidfTopicAgenticForestRunner:
                 if record.get("status") == "completed"
             ],
         ]
-        registry, pass_drops = apply_topic_name_harmonization(
-            registry, domain_responses
-        )
+        registry, pass_drops = apply_topic_name_harmonization(registry, domain_responses)
         dropped.extend(pass_drops)
         dropped.extend(
             {
@@ -4691,9 +4456,7 @@ class TfidfTopicAgenticForestRunner:
         # bounded. Word/character TF-IDF blocks likely cross-group aliases; the
         # agent returns sparse changes only, and omitted entries remain distinct.
         global_contexts: List[Dict[str, Any]] = []
-        for block_index, block in enumerate(
-            build_topic_global_dedup_blocks(registry), start=1
-        ):
+        for block_index, block in enumerate(build_topic_global_dedup_blocks(registry), start=1):
             global_contexts.append(
                 {
                     **self._harmonization_context_base(
@@ -4725,9 +4488,7 @@ class TfidfTopicAgenticForestRunner:
         if not global_contexts:
             _write_jsonl_atomic(global_checkpoint, [])
         completed_global_responses = [
-            record["response"]
-            for record in global_records
-            if record.get("status") == "completed"
+            record["response"] for record in global_records if record.get("status") == "completed"
         ]
         if completed_global_responses:
             registry, pass_drops = apply_topic_global_dedup(
@@ -4796,16 +4557,11 @@ class TfidfTopicAgenticForestRunner:
                                 "clinical_domain": group_key[0],
                                 "parent_object": None,
                                 "parent_objects": sorted(
-                                    {
-                                        str(entry["parent_object"])
-                                        for entry in batch
-                                    }
+                                    {str(entry["parent_object"]) for entry in batch}
                                 ),
                             }
                         ),
-                        "candidates": [
-                            _compact_harmonization_candidate(entry) for entry in batch
-                        ],
+                        "candidates": [_compact_harmonization_candidate(entry) for entry in batch],
                     }
                 )
         value_records = self._run_harmonization_requests(
@@ -4813,13 +4569,9 @@ class TfidfTopicAgenticForestRunner:
             checkpoint=value_checkpoint,
         )
         value_responses = [
-            record["response"]
-            for record in value_records
-            if record.get("status") == "completed"
+            record["response"] for record in value_records if record.get("status") == "completed"
         ]
-        registry, value_drops = apply_topic_value_harmonization(
-            registry, value_responses
-        )
+        registry, value_drops = apply_topic_value_harmonization(registry, value_responses)
         dropped.extend(value_drops)
         dropped.extend(
             {
@@ -4888,9 +4640,7 @@ class TfidfTopicAgenticForestRunner:
                     issues.append("non_numeric_values_under_continuous_contract")
             else:
                 permitted = set(map(str, entry.get("categories") or []))
-                unexpected = sorted(
-                    {str(value) for value in observed.tolist()} - permitted
-                )
+                unexpected = sorted({str(value) for value in observed.tolist()} - permitted)
                 if unexpected:
                     issues.append("out_of_contract_categories")
                 else:
@@ -4946,18 +4696,12 @@ class TfidfTopicAgenticForestRunner:
             )
         records = self._run_harmonization_requests(
             contexts=contexts,
-            checkpoint=(
-                context_dir / "harmonization" / "training_value_repairs.jsonl"
-            ),
+            checkpoint=(context_dir / "harmonization" / "training_value_repairs.jsonl"),
         )
         responses = [
-            record["response"]
-            for record in records
-            if record.get("status") == "completed"
+            record["response"] for record in records if record.get("status") == "completed"
         ]
-        repaired, repair_drops = apply_topic_value_harmonization(
-            issue_entries, responses
-        )
+        repaired, repair_drops = apply_topic_value_harmonization(issue_entries, responses)
         repaired_by_name = {entry["name"]: entry for entry in repaired}
         combined: List[Dict[str, Any]] = []
         for entry in registry:
@@ -4997,32 +4741,25 @@ class TfidfTopicAgenticForestRunner:
         )
         extracted = apply_registry_derivations(extracted, registry)
         columns = [
-            column for column in extracted.columns
+            column
+            for column in extracted.columns
             if column == "_oci_row_id" or column.startswith("explicit_feat_")
         ]
         return source.merge(extracted[columns], on="_oci_row_id", how="left", validate="one_to_one")
 
-    def _run_inner_context(
-        self, row: Dict[str, Any], outer_dir: Path
-    ) -> Dict[str, Any]:
+    def _run_inner_context(self, row: Dict[str, Any], outer_dir: Path) -> Dict[str, Any]:
         inner_fold = int(row["inner_fold"])
         context_dir = outer_dir / f"inner_{inner_fold:03d}"
         labels = self._label_context_topics(row, context_dir)
-        initially_labeled_topic_ids = {
-            str(label["topic_id"]) for label in labels
-        }
+        initially_labeled_topic_ids = {str(label["topic_id"]) for label in labels}
         recovery_topic_attempts: Counter = Counter()
         attempted_recovery_raw_terms: set[str] = set()
         recovery_topic_evidence: List[Dict[str, Any]] = []
         candidates = [
             {
                 **candidate,
-                "source_topic_general_topic": (
-                    (label.get("response") or {}).get("general_topic")
-                ),
-                "source_topic_quality": (
-                    (label.get("response") or {}).get("topic_quality")
-                ),
+                "source_topic_general_topic": ((label.get("response") or {}).get("general_topic")),
+                "source_topic_quality": ((label.get("response") or {}).get("topic_quality")),
             }
             for label in labels
             for candidate in label.get("candidates", [])
@@ -5032,14 +4769,10 @@ class TfidfTopicAgenticForestRunner:
             context_dir=context_dir,
             candidates=candidates,
         )
-        registry, deferred_registry, initial_selection = (
-            select_initial_topic_evidence_registry(
-                candidate_pool,
-                row["discovery"],
-                coverage_target=float(
-                    self.nn_config.tfidf_topic.initial_effect_coverage_target
-                ),
-            )
+        registry, deferred_registry, initial_selection = select_initial_topic_evidence_registry(
+            candidate_pool,
+            row["discovery"],
+            coverage_target=float(self.nn_config.tfidf_topic.initial_effect_coverage_target),
         )
         _write_json(context_dir / "initial_review_selection.json", initial_selection)
         fit_df = self._extract_scope(row["fit_row_ids"], registry)
@@ -5089,15 +4822,13 @@ class TfidfTopicAgenticForestRunner:
         for round_index in range(1, int(self.nn_config.extracted_feature_review_max_rounds) + 1):
             if gate["passed"]:
                 break
-            addition_registry, deferred_addition_audit = (
-                select_deferred_review_additions(
-                    registry,
-                    deferred_registry,
-                    gate,
-                    diagnostic,
-                    row["discovery"],
-                    max_additions=20,
-                )
+            addition_registry, deferred_addition_audit = select_deferred_review_additions(
+                registry,
+                deferred_registry,
+                gate,
+                diagnostic,
+                row["discovery"],
+                max_additions=20,
             )
             newly_dropped: List[Dict[str, Any]] = []
             recovery_source = "deferred_canonical_contracts"
@@ -5106,9 +4837,7 @@ class TfidfTopicAgenticForestRunner:
             if not addition_registry:
                 # Only when the fold-local valid pool has no relevant contract
                 # do we revisit one uncovered source topic with a bounded prompt.
-                uncovered = diagnostic["effect_coverage"].get(
-                    "uncovered_topic_ids", []
-                )
+                uncovered = diagnostic["effect_coverage"].get("uncovered_topic_ids", [])
                 failed_targets = [
                     str(criterion.get("target"))
                     for criterion in gate.get("criteria", [])
@@ -5118,8 +4847,7 @@ class TfidfTopicAgenticForestRunner:
                 ]
                 relevant_banks = set(failed_targets)
                 if any(
-                    not criterion.get("passed", False)
-                    and criterion.get("family") == "effect"
+                    not criterion.get("passed", False) and criterion.get("family") == "effect"
                     for criterion in gate.get("criteria", [])
                 ):
                     relevant_banks.add("effect")
@@ -5129,16 +4857,12 @@ class TfidfTopicAgenticForestRunner:
                 ]
                 if not relevant_banks:
                     relevant_banks = {bank for bank, _topic in ranked_jobs}
-                by_id = {
-                    str(topic["topic_id"]): (bank, topic)
-                    for bank, topic in ranked_jobs
-                }
+                by_id = {str(topic["topic_id"]): (bank, topic) for bank, topic in ranked_jobs}
                 topic_choice: Optional[Tuple[str, Dict[str, Any]]] = next(
                     (
                         by_id[str(topic_id)]
                         for topic_id in uncovered
-                        if str(topic_id) in by_id
-                        and recovery_topic_attempts[str(topic_id)] == 0
+                        if str(topic_id) in by_id and recovery_topic_attempts[str(topic_id)] == 0
                     ),
                     None,
                 )
@@ -5154,14 +4878,10 @@ class TfidfTopicAgenticForestRunner:
                             if bank in relevant_banks
                             and (
                                 bank != "effect"
-                                or not bool(
-                                    self.nn_config.tfidf_topic.orphan_ngram_enabled
-                                )
-                                or str(topic["topic_id"])
-                                in initially_labeled_topic_ids
+                                or not bool(self.nn_config.tfidf_topic.orphan_ngram_enabled)
+                                or str(topic["topic_id"]) in initially_labeled_topic_ids
                             )
-                            and str(topic["topic_id"])
-                            not in initially_labeled_topic_ids
+                            and str(topic["topic_id"]) not in initially_labeled_topic_ids
                             and recovery_topic_attempts[str(topic["topic_id"])] == 0
                         ),
                         None,
@@ -5174,11 +4894,8 @@ class TfidfTopicAgenticForestRunner:
                             if bank in relevant_banks
                             and (
                                 bank != "effect"
-                                or not bool(
-                                    self.nn_config.tfidf_topic.orphan_ngram_enabled
-                                )
-                                or str(topic["topic_id"])
-                                in initially_labeled_topic_ids
+                                or not bool(self.nn_config.tfidf_topic.orphan_ngram_enabled)
+                                or str(topic["topic_id"]) in initially_labeled_topic_ids
                             )
                             and recovery_topic_attempts[str(topic["topic_id"])] == 0
                         ),
@@ -5198,11 +4915,7 @@ class TfidfTopicAgenticForestRunner:
                 score_path = row["discovery"]["artifacts"]["ngram_scores"][bank]
                 raw_scores = pd.read_parquet(score_path)
                 covered_raw_terms = {
-                    str(
-                        term.get("term")
-                        if isinstance(term, dict)
-                        else term
-                    )
+                    str(term.get("term") if isinstance(term, dict) else term)
                     for entry in registry
                     for provenance in entry.get("provenance", [])
                     for term in provenance.get("supporting_terms", [])
@@ -5210,14 +4923,10 @@ class TfidfTopicAgenticForestRunner:
                 covered_raw_terms.update(attempted_recovery_raw_terms)
                 if bank == "effect":
                     preserved = set(
-                        diagnostic["effect_coverage"].get(
-                            "preserved_highest_ranked_raw_ngrams", []
-                        )
+                        diagnostic["effect_coverage"].get("preserved_highest_ranked_raw_ngrams", [])
                     )
                     covered_raw_terms.update(map(str, preserved))
-                is_orphan_cluster = (
-                    topic.get("evidence_kind") == "orphan_raw_ngram_cluster"
-                )
+                is_orphan_cluster = topic.get("evidence_kind") == "orphan_raw_ngram_cluster"
                 raw_terms = (
                     []
                     if is_orphan_cluster
@@ -5272,21 +4981,20 @@ class TfidfTopicAgenticForestRunner:
                     "bank": bank,
                     "topic_id": topic_id,
                     "was_initially_selected": topic_id in initially_labeled_topic_ids,
-                    "terms": [
-                        str(term.get("term")) for term in topic.get("terms", [])
-                    ],
-                    "score_test_evidence": dict(
-                        topic.get("_selection_evidence") or {}
-                    ),
+                    "terms": [str(term.get("term")) for term in topic.get("terms", [])],
+                    "score_test_evidence": dict(topic.get("_selection_evidence") or {}),
                 }
                 recovery_topic_evidence.append(recovery_topic_summary)
                 response = self.proposal_agent.propose(recovery_prompt_context)
                 additions = [
                     candidate
                     for proposal in _proposal_rows(response)[:20]
-                    if (candidate := _candidate_from_response(
-                        proposal, context=recovery_prompt_context, topic=topic
-                    )) is not None
+                    if (
+                        candidate := _candidate_from_response(
+                            proposal, context=recovery_prompt_context, topic=topic
+                        )
+                    )
+                    is not None
                 ]
                 addition_registry, newly_dropped = self._harmonize_context_candidates(
                     row=row,
@@ -5296,12 +5004,9 @@ class TfidfTopicAgenticForestRunner:
                 )
                 recovery_source = "targeted_source_topic_prompt"
             old_registry_state = {
-                entry["name"]: _registry_entry_state_hash(entry)
-                for entry in registry
+                entry["name"]: _registry_entry_state_hash(entry) for entry in registry
             }
-            old_contract_hashes = {
-                entry["name"]: entry["contract_hash"] for entry in registry
-            }
+            old_contract_hashes = {entry["name"]: entry["contract_hash"] for entry in registry}
             updated, merge_drops = _merge_executable_registry_entries(
                 [*registry, *addition_registry]
             )
@@ -5309,8 +5014,7 @@ class TfidfTopicAgenticForestRunner:
             changed = [
                 entry
                 for entry in updated
-                if old_registry_state.get(entry["name"])
-                != _registry_entry_state_hash(entry)
+                if old_registry_state.get(entry["name"]) != _registry_entry_state_hash(entry)
             ]
             if not changed:
                 rounds.append(
@@ -5351,27 +5055,29 @@ class TfidfTopicAgenticForestRunner:
                 fit_df = self._extract_scope(row["fit_row_ids"], registry)
             heldout_df = self._extract_scope(row["heldout_row_ids"], registry)
             diagnostic = structured_heldout_diagnostic(
-                fit_df=fit_df, heldout_df=heldout_df, registry=registry,
-                metadata=row["discovery"], config=self.config,
+                fit_df=fit_df,
+                heldout_df=heldout_df,
+                registry=registry,
+                metadata=row["discovery"],
+                config=self.config,
                 candidate_evidence_universe=candidate_pool,
             )
             gate = structured_review_gate(diagnostic, self.nn_config)
             score = int(gate["n_failed_criteria"])
-            consecutive_non_improving = consecutive_non_improving + 1 if score >= previous_score else 0
+            consecutive_non_improving = (
+                consecutive_non_improving + 1 if score >= previous_score else 0
+            )
             previous_score = score
             rounds.append(
                 {
                     "round": round_index,
                     "gate": gate,
                     "diagnostic": diagnostic,
-                    "changed_registry_entries": [
-                        entry["name"] for entry in changed
-                    ],
+                    "changed_registry_entries": [entry["name"] for entry in changed],
                     "materially_changed_extraction_contracts": [
                         entry["name"]
                         for entry in changed
-                        if old_contract_hashes.get(entry["name"])
-                        != entry["contract_hash"]
+                        if old_contract_hashes.get(entry["name"]) != entry["contract_hash"]
                     ],
                     "registry_size": len(registry),
                     "deferred_valid_contracts": len(deferred_registry),
@@ -5454,17 +5160,18 @@ class TfidfTopicAgenticForestRunner:
             "final_gate": gate,
             "final_diagnostic": diagnostic,
             "parsimony": parsimony,
-            "pre_parsimony_feature_names": [
-                entry["name"] for entry in pre_parsimony_registry
-            ],
+            "pre_parsimony_feature_names": [entry["name"] for entry in pre_parsimony_registry],
             "inner_forest_audit": audit,
             "topic_score_selection": self._topic_score_selection_snapshot(row),
             "recovery_topic_evidence": recovery_topic_evidence,
         }
-        _write_json(context_dir / "canonical_registry.json", {
-            "schema_version": CANONICAL_REGISTRY_SCHEMA_VERSION,
-            **result,
-        })
+        _write_json(
+            context_dir / "canonical_registry.json",
+            {
+                "schema_version": CANONICAL_REGISTRY_SCHEMA_VERSION,
+                **result,
+            },
+        )
         return result
 
     def _aggregate_policy(self, inner_results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -5528,17 +5235,12 @@ class TfidfTopicAgenticForestRunner:
                         "added_entries": [
                             entry for entry in result["registry"] if entry["name"] not in before
                         ],
-                        "accepted_cluster_ids": result["parsimony"].get(
-                            "accepted_cluster_ids", []
-                        ),
+                        "accepted_cluster_ids": result["parsimony"].get("accepted_cluster_ids", []),
                     }
                 )
         completed_rounds = [
             max(
-                [
-                    int(round_row.get("round", 0))
-                    for round_row in result.get("review_rounds", [])
-                ],
+                [int(round_row.get("round", 0)) for round_row in result.get("review_rounds", [])],
                 default=0,
             )
             for result in inner_results
@@ -5572,9 +5274,7 @@ class TfidfTopicAgenticForestRunner:
                 inner_fold = int(result["inner_fold"])
                 seen_inner_topics: set = set()
                 bank_selection = (
-                    (result.get("topic_score_selection") or {})
-                    .get("banks", {})
-                    .get(bank, {})
+                    (result.get("topic_score_selection") or {}).get("banks", {}).get(bank, {})
                 )
                 for ngram in bank_selection.get("selected_ngrams", []):
                     term = str(ngram.get("term") or "")
@@ -5599,19 +5299,11 @@ class TfidfTopicAgenticForestRunner:
                             "primary_p_source": topic.get("primary_p_source"),
                             "fdr_q": topic.get("fdr_q"),
                             "familywise_p": topic.get("familywise_p"),
-                            "topic_standardized_score": topic.get(
-                                "topic_standardized_score"
-                            ),
+                            "topic_standardized_score": topic.get("topic_standardized_score"),
                             "topic_score_moment": topic.get("topic_score_moment"),
-                            "topic_familywise_p": topic.get(
-                                "topic_familywise_p"
-                            ),
-                            "term_group_primary_p": topic.get(
-                                "term_group_primary_p"
-                            ),
-                            "term_group_fdr_q": topic.get(
-                                "term_group_fdr_q"
-                            ),
+                            "topic_familywise_p": topic.get("topic_familywise_p"),
+                            "term_group_primary_p": topic.get("term_group_primary_p"),
+                            "term_group_fdr_q": topic.get("term_group_fdr_q"),
                             "selection_reason": topic.get("selection_reason"),
                             "evidence_rank": topic.get("evidence_rank"),
                             "quadratic_statistic_per_rank": topic.get(
@@ -5635,9 +5327,7 @@ class TfidfTopicAgenticForestRunner:
                     evidence = dict(recovered.get("score_test_evidence") or {})
                     term_scores = list(evidence.get("term_scores") or [])
                     terms = [
-                        str(term)
-                        for term in (recovered.get("terms") or [])
-                        if str(term).strip()
+                        str(term) for term in (recovered.get("terms") or []) if str(term).strip()
                     ]
                     if not terms:
                         terms = [
@@ -5656,21 +5346,11 @@ class TfidfTopicAgenticForestRunner:
                             "primary_p_source": evidence.get("primary_p_source"),
                             "fdr_q": evidence.get("fdr_q"),
                             "familywise_p": evidence.get("familywise_p"),
-                            "topic_standardized_score": evidence.get(
-                                "topic_standardized_score"
-                            ),
-                            "topic_score_moment": evidence.get(
-                                "topic_score_moment"
-                            ),
-                            "topic_familywise_p": evidence.get(
-                                "topic_familywise_p"
-                            ),
-                            "term_group_primary_p": evidence.get(
-                                "term_group_primary_p"
-                            ),
-                            "term_group_fdr_q": evidence.get(
-                                "term_group_fdr_q"
-                            ),
+                            "topic_standardized_score": evidence.get("topic_standardized_score"),
+                            "topic_score_moment": evidence.get("topic_score_moment"),
+                            "topic_familywise_p": evidence.get("topic_familywise_p"),
+                            "term_group_primary_p": evidence.get("term_group_primary_p"),
+                            "term_group_fdr_q": evidence.get("term_group_fdr_q"),
                             "selection_reason": "additive_review_expansion",
                             "evidence_rank": evidence.get("evidence_rank"),
                             "quadratic_statistic_per_rank": evidence.get(
@@ -5691,12 +5371,10 @@ class TfidfTopicAgenticForestRunner:
                 "signatures": signatures,
                 "selected_topic_count": len(signatures),
                 "selected_term_fold_recurrence": {
-                    term: len(folds)
-                    for term, folds in sorted(selected_term_folds.items())
+                    term: len(folds) for term, folds in sorted(selected_term_folds.items())
                 },
                 "selected_ngram_fold_recurrence": {
-                    term: len(folds)
-                    for term, folds in sorted(selected_ngram_folds.items())
+                    term: len(folds) for term, folds in sorted(selected_ngram_folds.items())
                 },
                 "selected_ngram_count": len(selected_ngram_folds),
                 "inner_folds_with_selected_topics": sorted(
@@ -5707,12 +5385,9 @@ class TfidfTopicAgenticForestRunner:
         orphan_term_folds: Dict[str, set] = defaultdict(set)
         for result in inner_results:
             inner_fold = int(result["inner_fold"])
-            orphan_selection = (
-                (result.get("topic_score_selection") or {}).get(
-                    "effect_orphan_ngram_branch"
-                )
-                or {}
-            )
+            orphan_selection = (result.get("topic_score_selection") or {}).get(
+                "effect_orphan_ngram_branch"
+            ) or {}
             for cluster in orphan_selection.get("selected_clusters") or []:
                 term_scores = list(cluster.get("term_scores") or [])
                 terms = [
@@ -5731,9 +5406,7 @@ class TfidfTopicAgenticForestRunner:
                         "primary_p_source": cluster.get("primary_p_source"),
                         "fdr_q": cluster.get("fdr_q"),
                         "familywise_p": cluster.get("familywise_p"),
-                        "quadratic_statistic_per_rank": cluster.get(
-                            "quadratic_statistic_per_rank"
-                        ),
+                        "quadratic_statistic_per_rank": cluster.get("quadratic_statistic_per_rank"),
                         "maximum_absolute_standardized_score": cluster.get(
                             "maximum_absolute_standardized_score"
                         ),
@@ -5746,8 +5419,7 @@ class TfidfTopicAgenticForestRunner:
             "signatures": orphan_signatures,
             "selected_cluster_count": len(orphan_signatures),
             "selected_term_fold_recurrence": {
-                term: len(folds)
-                for term, folds in sorted(orphan_term_folds.items())
+                term: len(folds) for term, folds in sorted(orphan_term_folds.items())
             },
             "inner_folds_with_selected_clusters": sorted(
                 {int(signature["inner_fold"]) for signature in orphan_signatures}
@@ -5773,9 +5445,9 @@ class TfidfTopicAgenticForestRunner:
                 self.nn_config.extracted_feature_review_loss_relative_margin
             ),
             "effect_coverage_target": self.nn_config.tfidf_topic.initial_effect_coverage_target,
-            "fixed_recovery_round_limit": int(np.median(completed_rounds))
-            if completed_rounds
-            else 0,
+            "fixed_recovery_round_limit": (
+                int(np.median(completed_rounds)) if completed_rounds else 0
+            ),
             "inner_accepted_parsimony_replacements": replacements,
             "strong_full_outer_evidence_not_vetoed_by_name_recurrence": True,
             "agent_selector_can_veto_stable_evidence": False,
@@ -5827,9 +5499,7 @@ class TfidfTopicAgenticForestRunner:
                 semantically_present.append(name)
                 continue
             template["recovered_from_inner_policy"] = True
-            template["supporting_inner_folds"] = candidate.get(
-                "supporting_inner_folds", []
-            )
+            template["supporting_inner_folds"] = candidate.get("supporting_inner_folds", [])
             current.append(_refresh_registry_entry(template))
             existing_terms.append(template_terms)
             existing_names.add(name)
@@ -5889,9 +5559,7 @@ class TfidfTopicAgenticForestRunner:
                 "semantic_inner_folds": sorted(semantic_folds),
                 "supporting_term_inner_folds": sorted(topic_term_folds),
                 "best_contract_token_similarity": float(best_similarity),
-                "priority_fold_count": len(
-                    matched_folds | semantic_folds | topic_term_folds
-                ),
+                "priority_fold_count": len(matched_folds | semantic_folds | topic_term_folds),
                 "hard_requirement": False,
             }
             entry["inner_recurrence_evidence"] = recurrence
@@ -5941,8 +5609,7 @@ class TfidfTopicAgenticForestRunner:
             # identical replacement that independently passed in enough inner
             # contexts; otherwise the unpruned full-outer registry wins.
             replacements = list(
-                (fixed_policy or {}).get("inner_accepted_parsimony_replacements")
-                or []
+                (fixed_policy or {}).get("inner_accepted_parsimony_replacements") or []
             )
             signatures: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
             for replacement in replacements:
@@ -5950,8 +5617,7 @@ class TfidfTopicAgenticForestRunner:
                     {
                         "removed_names": replacement.get("removed_names") or [],
                         "added_names": sorted(
-                            entry["name"]
-                            for entry in replacement.get("added_entries") or []
+                            entry["name"] for entry in replacement.get("added_entries") or []
                         ),
                     }
                 )
@@ -6013,9 +5679,7 @@ class TfidfTopicAgenticForestRunner:
                 ] + additions
                 if encoded_dimension(trial) >= encoded_dimension(selected):
                     reasons.append("encoded_dimension_not_reduced")
-                before_roles = {
-                    role for entry in selected for role in entry.get("roles", [])
-                }
+                before_roles = {role for entry in selected for role in entry.get("roles", [])}
                 after_roles = {role for entry in trial for role in entry.get("roles", [])}
                 if before_roles != after_roles:
                     reasons.append("role_union_changed")
@@ -6069,9 +5733,7 @@ class TfidfTopicAgenticForestRunner:
                 "protected_members": [
                     spec.name for spec in members if spec.name in protected_names
                 ],
-                "required_role_union": sorted(
-                    {role for spec in members for role in spec.roles}
-                ),
+                "required_role_union": sorted({role for spec in members for role in spec.roles}),
                 "max_factors": min(2, int(self.nn_config.parsimony_max_factors_per_cluster)),
                 "members": [
                     {
@@ -6108,17 +5770,13 @@ class TfidfTopicAgenticForestRunner:
 
         def diagnostic_losses(trial: Dict[str, Any]) -> Tuple[float, float]:
             assert base_diagnostic is not None
-            base_coverage = float(
-                base_diagnostic["effect_coverage"].get("coverage_fraction", 0.0)
-            )
+            base_coverage = float(base_diagnostic["effect_coverage"].get("coverage_fraction", 0.0))
             trial_coverage = float(trial["effect_coverage"].get("coverage_fraction", 0.0))
             coverage_loss = max(0.0, base_coverage - trial_coverage)
             base_reconstruction = base_diagnostic["effect_topic_reconstruction"].get(
                 "mean_correlation"
             )
-            trial_reconstruction = trial["effect_topic_reconstruction"].get(
-                "mean_correlation"
-            )
+            trial_reconstruction = trial["effect_topic_reconstruction"].get("mean_correlation")
             if base_reconstruction is None:
                 reconstruction_loss = 0.0
             elif trial_reconstruction is None:
@@ -6173,9 +5831,7 @@ class TfidfTopicAgenticForestRunner:
                 config=self.config,
                 candidate_evidence_universe=candidate_evidence_universe,
             )
-            dimension = int(trial_diagnostic["n_w_encoded"]) + int(
-                trial_diagnostic["n_x_encoded"]
-            )
+            dimension = int(trial_diagnostic["n_w_encoded"]) + int(trial_diagnostic["n_x_encoded"])
             return trial_registry, trial_diagnostic, dimension
 
         for cluster in clusters:
@@ -6192,9 +5848,7 @@ class TfidfTopicAgenticForestRunner:
             response = proposal.get("response")
             context = {
                 "cluster_id": cluster["cluster_id"],
-                "max_factors": min(
-                    2, int(self.nn_config.parsimony_max_factors_per_cluster)
-                ),
+                "max_factors": min(2, int(self.nn_config.parsimony_max_factors_per_cluster)),
             }
             candidate, validation = _validate_parsimony_factor_candidate(
                 response=response,
@@ -6230,9 +5884,7 @@ class TfidfTopicAgenticForestRunner:
                 factor_registry, factor_drops = self._harmonize_context_candidates(
                     row=parsimony_row,
                     context_dir=(
-                        outer_dir
-                        / "parsimony_factor_contracts"
-                        / str(cluster["cluster_id"])
+                        outer_dir / "parsimony_factor_contracts" / str(cluster["cluster_id"])
                     ),
                     candidates=factor_inputs,
                     include_prespecified=False,
@@ -6317,9 +5969,7 @@ class TfidfTopicAgenticForestRunner:
             joint_registry = [entry for entry in registry if entry["name"] not in removed] + [
                 factor for item in nonoverlapping for factor in item["factors"]
             ]
-            joint_registry, joint_diagnostic, joint_dimension = evaluate_registry(
-                joint_registry
-            )
+            joint_registry, joint_diagnostic, joint_dimension = evaluate_registry(joint_registry)
             base_dimension = int(base_diagnostic["n_w_encoded"]) + int(
                 base_diagnostic["n_x_encoded"]
             )
@@ -6400,12 +6050,8 @@ class TfidfTopicAgenticForestRunner:
         candidates = [
             {
                 **candidate,
-                "source_topic_general_topic": (
-                    (label.get("response") or {}).get("general_topic")
-                ),
-                "source_topic_quality": (
-                    (label.get("response") or {}).get("topic_quality")
-                ),
+                "source_topic_general_topic": ((label.get("response") or {}).get("general_topic")),
+                "source_topic_quality": ((label.get("response") or {}).get("topic_quality")),
             }
             for label in labels
             for candidate in label.get("candidates", [])
@@ -6415,14 +6061,10 @@ class TfidfTopicAgenticForestRunner:
             context_dir=full_context_dir,
             candidates=candidates,
         )
-        candidate_pool, recovery_audit = self._recover_from_inner_policy(
-            candidate_pool, policy
-        )
+        candidate_pool, recovery_audit = self._recover_from_inner_policy(candidate_pool, policy)
         dropped.extend(recovery_audit.get("merge_drops") or [])
         _write_json(full_context_dir / "fixed_inner_recovery_policy.json", recovery_audit)
-        candidate_pool = self._annotate_registry_with_inner_policy(
-            candidate_pool, policy
-        )
+        candidate_pool = self._annotate_registry_with_inner_policy(candidate_pool, policy)
         recurrence_minimum = min(
             max(2, int(self.nn_config.candidate_consistency_min_folds)),
             max(2, int(policy.get("inner_fold_count") or 2)),
@@ -6430,26 +6072,16 @@ class TfidfTopicAgenticForestRunner:
         fixed_priority_names = [
             entry["name"]
             for entry in candidate_pool
-            if int(
-                (entry.get("inner_recurrence_evidence") or {}).get(
-                    "priority_fold_count", 0
-                )
-            )
+            if int((entry.get("inner_recurrence_evidence") or {}).get("priority_fold_count", 0))
             >= recurrence_minimum
         ]
-        registry, deferred_registry, initial_selection = (
-            select_initial_topic_evidence_registry(
-                candidate_pool,
-                full_row["discovery"],
-                coverage_target=float(
-                    self.nn_config.tfidf_topic.initial_effect_coverage_target
-                ),
-                fixed_policy_priority_names=fixed_priority_names,
-            )
+        registry, deferred_registry, initial_selection = select_initial_topic_evidence_registry(
+            candidate_pool,
+            full_row["discovery"],
+            coverage_target=float(self.nn_config.tfidf_topic.initial_effect_coverage_target),
+            fixed_policy_priority_names=fixed_priority_names,
         )
-        _write_json(
-            full_context_dir / "initial_review_selection.json", initial_selection
-        )
+        _write_json(full_context_dir / "initial_review_selection.json", initial_selection)
         train_df = self._extract_scope(full_row["fit_row_ids"], registry)
         registry, value_audit, value_drops = self._revise_value_contracts_from_training(
             row=full_row,
@@ -6463,9 +6095,7 @@ class TfidfTopicAgenticForestRunner:
         )
         dropped.extend(pool_merge_drops)
         active_names = {entry["name"] for entry in registry}
-        deferred_registry = [
-            entry for entry in candidate_pool if entry["name"] not in active_names
-        ]
+        deferred_registry = [entry for entry in candidate_pool if entry["name"] not in active_names]
         if value_audit.get("changed_contracts"):
             train_df = self._extract_scope(full_row["fit_row_ids"], registry)
         registry, parsimony = self._parsimony_review(
@@ -6513,9 +6143,7 @@ class TfidfTopicAgenticForestRunner:
         )
         stage1_nuisance = stage1_nuisance[
             stage1_nuisance["prediction_scope"] == "external_heldout"
-        ][
-            ["_oci_row_id", "treatment_stacked", "outcome_stacked", "fit_row_ids"]
-        ].rename(
+        ][["_oci_row_id", "treatment_stacked", "outcome_stacked", "fit_row_ids"]].rename(
             columns={
                 "treatment_stacked": "stage1_bow_propensity_prediction",
                 "outcome_stacked": "stage1_bow_outcome_prediction",
@@ -6587,9 +6215,7 @@ class TfidfTopicAgenticForestRunner:
             {
                 "schema_version": "tfidf_topic_agentic_forest_v7",
                 "handoff_schema_version": HANDOFF_SCHEMA_VERSION,
-                "topic_score_test_schema_version": (
-                    TOPIC_SCORE_TEST_SCHEMA_VERSION
-                ),
+                "topic_score_test_schema_version": (TOPIC_SCORE_TEST_SCHEMA_VERSION),
                 "n_outer_folds": len(outer_folds),
                 "final_ite_source": "structured_causal_forest_only",
                 "forbidden_artifacts_present": False,

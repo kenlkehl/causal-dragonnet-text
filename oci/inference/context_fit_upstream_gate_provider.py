@@ -45,9 +45,7 @@ from .fold_honest_r_stack import FitRowProvenance
 CONTEXT_FIT_UPSTREAM_PREDICTION_SCHEMA_VERSION = "context_fit_upstream_prediction_v1"
 CONTEXT_FIT_UPSTREAM_CACHE_SCHEMA_VERSION = "context_fit_upstream_gate_cache_v6"
 CONTEXT_FIT_UPSTREAM_PROVIDER_ID = "context_fit_upstream_gate_provider_v6"
-CONTEXT_FIT_UPSTREAM_CALL_CHECKPOINT_SCHEMA_VERSION = (
-    "context_fit_upstream_call_checkpoint_v1"
-)
+CONTEXT_FIT_UPSTREAM_CALL_CHECKPOINT_SCHEMA_VERSION = "context_fit_upstream_call_checkpoint_v1"
 
 _ROLES = frozenset(
     {
@@ -487,9 +485,7 @@ class ContextFitUpstreamGateProvider:
             "gate_labels_exposed_to_backend": False,
             "raw_features_are_calibrated_effects": False,
             "cache_matrix_authentication": "single_read_sha256_bytesio_numpy_v1",
-            "fit_call_checkpoint_schema": (
-                CONTEXT_FIT_UPSTREAM_CALL_CHECKPOINT_SCHEMA_VERSION
-            ),
+            "fit_call_checkpoint_schema": (CONTEXT_FIT_UPSTREAM_CALL_CHECKPOINT_SCHEMA_VERSION),
             "fit_call_checkpoint_binding": "exact_observable_inputs_no_gate_labels_v1",
             "fit_call_checkpoint_publication": "matrices_then_manifest_atomic_replace_v1",
             "cache_key_concurrency": "exclusive_advisory_file_lock_across_compute_publish_v1",
@@ -758,9 +754,7 @@ class ContextFitUpstreamGateProvider:
         """Seal one backend call without ever admitting gate labels."""
 
         return {
-            "checkpoint_schema_version": (
-                CONTEXT_FIT_UPSTREAM_CALL_CHECKPOINT_SCHEMA_VERSION
-            ),
+            "checkpoint_schema_version": (CONTEXT_FIT_UPSTREAM_CALL_CHECKPOINT_SCHEMA_VERSION),
             "provider_code_sha256": _module_sha256(),
             "backend_identity": self._backend_identity,
             "outer_fold": int(outer_fold),
@@ -796,10 +790,7 @@ class ContextFitUpstreamGateProvider:
             raise ValueError("context-fit call checkpoint manifest is unreadable") from exc
         if not isinstance(payload, Mapping) or set(payload) != _CALL_CHECKPOINT_FIELDS:
             raise ValueError("context-fit call checkpoint does not match its closed schema")
-        if (
-            payload["schema_version"]
-            != CONTEXT_FIT_UPSTREAM_CALL_CHECKPOINT_SCHEMA_VERSION
-        ):
+        if payload["schema_version"] != CONTEXT_FIT_UPSTREAM_CALL_CHECKPOINT_SCHEMA_VERSION:
             raise ValueError("unsupported context-fit call checkpoint schema")
         if payload["cache_key"] != cache_key or payload["binding"] != binding:
             raise ValueError("context-fit call checkpoint binding mismatch")
@@ -1148,6 +1139,8 @@ class ContextFitUpstreamGateProvider:
             exact_gate_row_ids=gate_ids,
             views=views,
             parent_identity=self.identity(),
+            cache_manifest_path=manifest_path,
+            cache_manifest_sha256=_sha256_file(manifest_path),
         )
 
     def get_gate_source_view(
@@ -1185,11 +1178,25 @@ class BoundContextFitUpstreamGateProvider:
         exact_gate_row_ids: Sequence[int],
         views: _PreparedViews,
         parent_identity: Mapping[str, Any],
+        cache_manifest_path: Path | str,
+        cache_manifest_sha256: str,
     ) -> None:
         self.outer_fold = _positive_int(outer_fold, name="outer_fold")
         self.exact_gate_row_ids = _integer_rows(exact_gate_row_ids, name="exact_gate_row_ids")
         self._views = views
         self._parent_identity = _closed_json(parent_identity, path="parent_identity")
+        manifest_path = Path(cache_manifest_path).resolve(strict=True)
+        if manifest_path.name != "manifest.json" or not manifest_path.is_file():
+            raise ValueError("bound upstream cache manifest path is not canonical")
+        manifest_sha256 = str(cache_manifest_sha256).strip().lower()
+        if len(manifest_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in manifest_sha256
+        ):
+            raise ValueError("bound upstream cache manifest SHA-256 is malformed")
+        if _sha256_file(manifest_path) != manifest_sha256:
+            raise ValueError("bound upstream cache manifest failed authentication")
+        self._cache_manifest_path = manifest_path
+        self._cache_manifest_sha256 = manifest_sha256
         for view in (views.source, views.features):
             if view is not None and tuple(view.row_ids) != self.exact_gate_row_ids:
                 raise ValueError("bound upstream view changed gate identity/order")
@@ -1200,7 +1207,19 @@ class BoundContextFitUpstreamGateProvider:
             "outer_fold": self.outer_fold,
             "gate_row_ids_sha256": _sha256_json(list(self.exact_gate_row_ids)),
             "parent_identity_sha256": _sha256_json(self._parent_identity),
+            "cache_manifest_sha256": self._cache_manifest_sha256,
         }
+
+    @property
+    def authenticated_cache_manifest_path(self) -> Path:
+        """Return the exact cache manifest after reauthenticating its bytes."""
+
+        if (
+            not self._cache_manifest_path.is_file()
+            or _sha256_file(self._cache_manifest_path) != self._cache_manifest_sha256
+        ):
+            raise ValueError("bound upstream cache manifest changed after binding")
+        return self._cache_manifest_path
 
     def _validate(self, outer_fold: int, exact_gate_row_ids: Sequence[int]) -> None:
         fold = _positive_int(outer_fold, name="outer_fold")
