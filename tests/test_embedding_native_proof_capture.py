@@ -19,10 +19,12 @@ from oci.inference.all_evidence_fusion import (
     FoldEvidenceProvenance,
 )
 from oci.inference.embedding_native_proof_capture import (
+    EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA,
     SEMANTIC_RETRIEVAL_TRAINING_ONLY_SCHEMA,
     NativeEmbeddingProofCaptureSink,
     build_semantic_retrieval_training_only_policy,
     semantic_retrieval_projection_bundle,
+    validate_embedding_cluster_support_state,
     validate_embedding_native_capture,
 )
 from oci.inference.lossless_stage1_evidence_catalog import (
@@ -83,9 +85,7 @@ def test_mixed_unicode_text_keeps_raw_embedding_and_normalized_legacy_projection
     )
     fit_rows = (1, 0)
     heldout_rows = (3, 2)
-    raw_fit, normalized_fit = _native_scope_text_projections(
-        texts[row_id] for row_id in fit_rows
-    )
+    raw_fit, normalized_fit = _native_scope_text_projections(texts[row_id] for row_id in fit_rows)
     assert raw_fit == (texts[1], texts[0])
     assert normalized_fit == (
         "follow-up-stable <= 3",
@@ -292,16 +292,167 @@ def test_embedding_capture_replays_generator_kmeans_svd_and_semantic_projection(
     assert replay == case["metadata"]
     assert replay["cluster_kmeans"] is not None
     assert replay["cluster_svds"]
-    assert {row["family_key"] for row in replay["cluster_svds"]} <= {
+    assert {row["family_key"] for row in replay["cluster_svds"]} == {
         "treatment",
         "residualized_interaction",
     }
+    support = replay["cluster_support_contract"]
+    assert "kmeans_inertia" not in support
+    assert replay["cluster_kmeans"]["inertia"] >= 0.0
+    assert support["kmeans_parameters"] == replay["cluster_kmeans"]["parameters"]
+    assert support["kmeans_parameters"] == {
+        "n_clusters": 4,
+        "random_state": 42,
+        "batch_size": 128,
+        "n_init": 3,
+        "max_iter": 300,
+    }
+    assert support["schema_version"] == EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA
+    assert {row["family_key"] for row in support["svd_families"]} == {
+        "treatment",
+        "residualized_interaction",
+    }
+    assert all(row["local_contrast_count"] >= 2 for row in support["svd_families"])
+    assert all(row["numerical_rank"] >= 2 for row in support["svd_families"])
+    assert all(row["second_singular_value"] > 0.0 for row in support["svd_families"])
+    assert all(
+        row["second_singular_value"] > row["numerical_rank_tolerance_float32"]
+        for row in support["svd_families"]
+    )
     assert replay["tfidf_training_scope_policy"]["schema_version"] == (
         SEMANTIC_RETRIEVAL_TRAINING_ONLY_SCHEMA
     )
     assert replay["heldout_text_accessed"] is False
     raw = json.loads((case["artifact_dir"] / "raw_embedding_evidence.json").read_text())
     assert raw == case["evidence"]
+
+
+def test_cluster_support_contract_rejects_missing_single_cluster_and_rank_one_state():
+    kmeans = {
+        "fit_row_ids": [0, 1, 2, 3],
+        "parameters": {
+            "n_clusters": 2,
+            "random_state": 42,
+            "batch_size": 128,
+            "n_init": 3,
+            "max_iter": 300,
+        },
+        "usable_mask": np.asarray([True, True, True, True]),
+        "cluster_labels": np.asarray([0, 0, 1, 1]),
+        "cluster_centers": np.asarray([[1.0, 0.0], [0.0, 1.0]]),
+        "cluster_counts": np.asarray([2, 2]),
+        "n_iter": 2,
+        "inertia": 0.5,
+    }
+
+    def state(family: str, matrix: np.ndarray) -> dict[str, object]:
+        _left, values, components = np.linalg.svd(matrix, full_matrices=False)
+        return {
+            "family_key": family,
+            "item_cluster_ids": [0, 1],
+            "weighted_matrix": matrix,
+            "singular_values": values,
+            "components": components,
+        }
+
+    treatment = state("treatment", np.asarray([[1.0, 0.0], [0.0, 1.0]]))
+    interaction = state(
+        "residualized_interaction",
+        np.asarray([[1.0, 1.0], [1.0, -1.0]]),
+    )
+    expected_kmeans_configuration = {
+        "cluster_contrast_n_clusters": 2,
+        "cluster_contrast_random_state": 42,
+        "cluster_contrast_kmeans_n_init": 3,
+    }
+    valid = validate_embedding_cluster_support_state(
+        kmeans_state=kmeans,
+        svd_states=[treatment, interaction],
+        expected_cluster_count=2,
+        expected_kmeans_configuration=expected_kmeans_configuration,
+    )
+    assert valid["required_svd_families"] == ["treatment", "residualized_interaction"]
+    assert "kmeans_inertia" not in valid
+    assert all(
+        row["second_singular_value"] > row["numerical_rank_tolerance_float32"]
+        for row in valid["svd_families"]
+    )
+    changed_inertia = dict(kmeans)
+    changed_inertia["inertia"] = 999.0
+    assert (
+        validate_embedding_cluster_support_state(
+            kmeans_state=changed_inertia,
+            svd_states=[treatment, interaction],
+            expected_cluster_count=2,
+            expected_kmeans_configuration=expected_kmeans_configuration,
+        )
+        == valid
+    )
+
+    for field, changed_value in (
+        ("random_state", 41),
+        ("batch_size", 129),
+        ("n_init", 4),
+        ("max_iter", 301),
+    ):
+        changed_parameters = dict(kmeans)
+        changed_parameters["parameters"] = dict(kmeans["parameters"])
+        changed_parameters["parameters"][field] = changed_value
+        with pytest.raises(ValueError, match="KMeans numerical state is invalid"):
+            validate_embedding_cluster_support_state(
+                kmeans_state=changed_parameters,
+                svd_states=[treatment, interaction],
+                expected_cluster_count=2,
+                expected_kmeans_configuration=expected_kmeans_configuration,
+            )
+
+    with pytest.raises(ValueError, match="KMeans numerical state is invalid"):
+        validate_embedding_cluster_support_state(
+            kmeans_state=kmeans,
+            svd_states=[treatment, interaction],
+            expected_cluster_count=3,
+        )
+
+    with pytest.raises(ValueError, match="requires treatment and residualized_interaction"):
+        validate_embedding_cluster_support_state(
+            kmeans_state=kmeans,
+            svd_states=[treatment],
+        )
+
+    one_cluster = dict(interaction)
+    one_cluster.update(
+        {
+            "item_cluster_ids": [0],
+            "weighted_matrix": np.asarray([[1.0, 1.0]]),
+            "singular_values": np.asarray([np.sqrt(2.0)]),
+            "components": np.asarray([[2**-0.5, 2**-0.5]]),
+        }
+    )
+    with pytest.raises(ValueError, match="SVD state is invalid"):
+        validate_embedding_cluster_support_state(
+            kmeans_state=kmeans,
+            svd_states=[treatment, one_cluster],
+        )
+
+    rank_one = state(
+        "residualized_interaction",
+        np.asarray([[1.0, 0.0], [2.0, 0.0]]),
+    )
+    with pytest.raises(ValueError, match="rank-two support"):
+        validate_embedding_cluster_support_state(
+            kmeans_state=kmeans,
+            svd_states=[treatment, rank_one],
+        )
+
+    near_collinear = state(
+        "residualized_interaction",
+        np.asarray([[1.0, 0.0], [1.0, 1e-8]], dtype=np.float32),
+    )
+    with pytest.raises(ValueError, match="rank-two support"):
+        validate_embedding_cluster_support_state(
+            kmeans_state=kmeans,
+            svd_states=[treatment, near_collinear],
+        )
 
 
 def test_embedding_capture_artifacts_contain_no_heldout_text(tmp_path: Path):

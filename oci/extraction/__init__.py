@@ -23,6 +23,14 @@ from .contract_lexical_context import (
     RetrievedContractExcerpt,
     compact_contract_lexical_context,
 )
+from .complete_paged import (
+    COMPLETE_PAGED_VERSION,
+    CompleteNotePage,
+    bounded_recursive_reconcile,
+    plan_complete_note_pages,
+    validate_absolute_citations,
+    validate_complete_note_page_plan,
+)
 from .numeric_inventory import (
     AgenticNumericInventoryExtractor,
     CompletionResult,
@@ -64,6 +72,12 @@ __all__ = [
     "ContractLexicalContext",
     "RetrievedContractExcerpt",
     "compact_contract_lexical_context",
+    "COMPLETE_PAGED_VERSION",
+    "CompleteNotePage",
+    "bounded_recursive_reconcile",
+    "plan_complete_note_pages",
+    "validate_absolute_citations",
+    "validate_complete_note_page_plan",
     "AgenticNumericInventoryExtractor",
     "CompletionResult",
     "NumericInventoryConfig",

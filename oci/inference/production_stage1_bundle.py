@@ -90,11 +90,15 @@ from .bow_native_proof_capture import (
     validate_bow_native_capture,
 )
 from .embedding_native_proof_capture import (
+    EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA,
     EMBEDDING_NATIVE_CAPTURE_SCHEMA,
     SEMANTIC_RETRIEVAL_TRAINING_ONLY_SCHEMA,
     NativeEmbeddingProofCaptureSink,
+    validate_embedding_cluster_support_contract,
+    validate_embedding_cluster_support_state,
     validate_embedding_native_capture,
 )
+from .embedding_contrast_discovery import _embedding_cluster_kmeans_parameters
 from .htr_native_proof_capture import (
     HTR_NATIVE_CAPTURE_SCHEMA,
     NativeHTRProofCaptureSink,
@@ -211,7 +215,7 @@ from .tfidf_topic_stage1 import (
     tfidf_topic_stage1_cache_is_valid,
 )
 
-STAGE1_BUNDLE_REQUEST_SCHEMA = "production_all_evidence_stage1_request_v4"
+STAGE1_BUNDLE_REQUEST_SCHEMA = "production_all_evidence_stage1_request_v5"
 STAGE1_COMPONENT_MANIFEST_SCHEMA = "production_all_evidence_stage1_component_v2"
 STAGE1_BUNDLE_MANIFEST_SCHEMA = "production_all_evidence_stage1_bundle_v3"
 STAGE1_SCOPE_INDEX_SCHEMA = "production_all_evidence_stage1_scope_index_v2"
@@ -249,6 +253,9 @@ STAGE1_CUMULATIVE_ALL_TEN_ROOT_INDEX_SCHEMA = "production_stage1_cumulative_all_
 STAGE1_EXACT_INNER_ROOT_INDEX_SCHEMA = "production_stage1_exact_inner_evidence_index_v2"
 STAGE1_TFIDF_RESUME_POLICY = "sealed_complete_component_only_no_partial_checkpoint_reuse_v1"
 STAGE1_HTR_INPUT_NONTRUNCATION_AUDIT_SCHEMA = "production_stage1_htr_input_nontruncation_audit_v1"
+STAGE1_EMBEDDING_CLUSTER_FEASIBILITY_AUDIT_SCHEMA = (
+    "production_stage1_embedding_cluster_feasibility_audit_v1"
+)
 
 # These component-local tuples enumerate all ten families whose native producer
 # persists every artifact required by ``bind_native_family_fit_proof``.  Keeping
@@ -2457,11 +2464,21 @@ def _embedding_capture_family_bindings(
     if family == EMBEDDING_CLUSTERED:
         kmeans = capture.get("cluster_kmeans")
         svds = capture.get("cluster_svds")
-        if not isinstance(kmeans, Mapping) or not isinstance(svds, list) or not svds:
-            raise ValueError("clustered embedding capture lacks actual KMeans/SVD state")
+        cluster_support = capture.get("cluster_support_contract")
+        if (
+            not isinstance(kmeans, Mapping)
+            or not isinstance(svds, list)
+            or not isinstance(cluster_support, Mapping)
+            or {row.get("family_key") for row in svds} != {"treatment", "residualized_interaction"}
+            or cluster_support.get("schema_version") != EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA
+        ):
+            raise ValueError(
+                "clustered embedding capture lacks genuine two-family rank-two KMeans/SVD state"
+            )
         return {
             **common,
             "native_evidence": copy.deepcopy(evidence_inventory.get("raw_embedding_evidence")),
+            "cluster_support_contract": copy.deepcopy(dict(cluster_support)),
             "kmeans": {
                 "fit_row_ids": copy.deepcopy(kmeans.get("fit_row_ids")),
                 "parameters": copy.deepcopy(kmeans.get("parameters")),
@@ -5526,9 +5543,7 @@ def _validate_htr_native_family_proof_index(
         }
         fit_rows = tuple(map(int, expected["fit_row_ids"]))
         heldout_rows = tuple(map(int, expected["heldout_row_ids"]))
-        fit_texts = tuple(
-            str(value) for value in modeling_data.iloc[list(fit_rows)][text_column]
-        )
+        fit_texts = tuple(str(value) for value in modeling_data.iloc[list(fit_rows)][text_column])
         heldout_texts = tuple(
             str(value) for value in modeling_data.iloc[list(heldout_rows)][text_column]
         )
@@ -6929,6 +6944,10 @@ def _validate_effective_config(
     embedding = nn_config.embedding_contrast
     if not embedding.enabled or not embedding.include_cluster_contrast_vectors:
         raise ValueError("production Stage 1 requires whole-cohort and clustered embeddings")
+    if int(embedding.cluster_contrast_max_components) < 2:
+        raise ValueError(
+            "production clustered embeddings require at least two emitted components per SVD family"
+        )
     if str(embedding.chunk_selection).strip().lower() != "last":
         raise ValueError(
             "the authenticated production embedding cache requires last-chunk selection"
@@ -7195,6 +7214,855 @@ def _registry_scopes(registry: Mapping[str, Any]) -> tuple[Mapping[str, Any], ..
                 }
             )
     return tuple(scopes)
+
+
+class _EmbeddingClusterPreflightObserver:
+    """Retain only the native KMeans/SVD state needed by readiness preflight."""
+
+    def __init__(self) -> None:
+        self.kmeans: dict[str, Any] | None = None
+        self.svds: list[dict[str, Any]] = []
+        self.evidence: Mapping[str, Any] | None = None
+
+    def record_cluster_kmeans(self, **kwargs: Any) -> None:
+        if self.kmeans is not None:
+            raise RuntimeError("embedding cluster preflight observed KMeans twice")
+        self.kmeans = {
+            "fit_row_ids": list(map(int, kwargs["fit_row_ids"])),
+            "parameters": copy.deepcopy(dict(kwargs["parameters"])),
+            "usable_mask": np.asarray(kwargs["usable_mask"], dtype=np.bool_).copy(),
+            "cluster_labels": np.asarray(kwargs["cluster_labels"], dtype=np.int64).copy(),
+            "cluster_centers": np.asarray(kwargs["cluster_centers"], dtype=np.float64).copy(),
+            "cluster_counts": np.asarray(kwargs["cluster_counts"], dtype=np.int64).copy(),
+            "n_iter": int(kwargs["n_iter"]),
+            "inertia": float(kwargs["inertia"]),
+        }
+
+    def record_cluster_svd(self, **kwargs: Any) -> None:
+        family = str(kwargs["family_key"])
+        if any(row["family_key"] == family for row in self.svds):
+            raise RuntimeError("embedding cluster preflight observed an SVD family twice")
+        self.svds.append(
+            {
+                "family_key": family,
+                "item_cluster_ids": list(map(int, kwargs["item_cluster_ids"])),
+                "weighted_matrix": np.asarray(kwargs["weighted_matrix"], dtype=np.float64).copy(),
+                "singular_values": np.asarray(kwargs["singular_values"], dtype=np.float64).copy(),
+                "components": np.asarray(kwargs["components"], dtype=np.float64).copy(),
+            }
+        )
+
+    def record_build(self, **kwargs: Any) -> None:
+        if self.evidence is not None:
+            raise RuntimeError("embedding cluster preflight observed native evidence twice")
+        evidence = kwargs.get("evidence")
+        if not isinstance(evidence, Mapping):
+            raise TypeError("embedding cluster preflight received malformed native evidence")
+        self.evidence = evidence
+
+
+def _embedding_cluster_feasibility_scopes(
+    registry: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], ...]:
+    """Enumerate every native embedding fit in its authoritative row order."""
+
+    rows: list[dict[str, Any]] = []
+    for scope in _registry_scopes(registry):
+        inner_fold = scope.get("inner_fold")
+        rows.append(
+            {
+                "scope_id": str(scope["scope_id"]),
+                "scope_kind": "full_outer" if inner_fold is None else "exact_inner",
+                "outer_fold": int(scope["outer_fold"]),
+                "inner_fold": None if inner_fold is None else int(inner_fold),
+                "context_epoch": None,
+                "provider_inner_fold": None,
+                "fit_row_ids": tuple(map(int, scope["fit_row_ids"])),
+                "heldout_row_ids": tuple(map(int, scope["heldout_row_ids"])),
+            }
+        )
+    schedule = _canonical_cumulative_spent_schedule(registry)
+    for scope in schedule.scopes:
+        rows.append(
+            {
+                "scope_id": str(scope.scope_id),
+                "scope_kind": "cumulative_spent",
+                "outer_fold": int(scope.outer_fold),
+                "inner_fold": None,
+                "context_epoch": int(scope.context_epoch),
+                "provider_inner_fold": int(scope.provider_inner_fold),
+                # Do not sort or set-normalize these rows. MiniBatchKMeans and
+                # the cumulative schedule both bind the supplied order.
+                "fit_row_ids": tuple(map(int, scope.spent_row_ids)),
+                "heldout_row_ids": tuple(map(int, scope.sealed_row_ids)),
+            }
+        )
+    scope_ids = [row["scope_id"] for row in rows]
+    if len(scope_ids) != len(set(scope_ids)):
+        raise RuntimeError("embedding cluster preflight scope IDs are not unique")
+    return tuple(rows)
+
+
+def _embedding_cluster_scope_binding(scope: Mapping[str, Any]) -> dict[str, Any]:
+    fit_rows = tuple(map(int, scope["fit_row_ids"]))
+    heldout_rows = tuple(map(int, scope["heldout_row_ids"]))
+    if not fit_rows or not heldout_rows or set(fit_rows) & set(heldout_rows):
+        raise ValueError("embedding cluster preflight scope has invalid row partitions")
+    return {
+        "scope_id": str(scope["scope_id"]),
+        "scope_kind": str(scope["scope_kind"]),
+        "outer_fold": int(scope["outer_fold"]),
+        "inner_fold": scope.get("inner_fold"),
+        "context_epoch": scope.get("context_epoch"),
+        "provider_inner_fold": scope.get("provider_inner_fold"),
+        "fit_row_count": len(fit_rows),
+        "heldout_row_count": len(heldout_rows),
+        "fit_row_order_fingerprint": row_order_fingerprint(fit_rows),
+        "heldout_row_order_fingerprint": row_order_fingerprint(heldout_rows),
+    }
+
+
+def _embedding_cluster_configuration(
+    config: AppliedInferenceConfig | Mapping[str, Any],
+) -> Mapping[str, Any]:
+    if isinstance(config, Mapping):
+        try:
+            embedding = config["architecture"]["multi_model_forest"]["embedding_contrast"]
+        except (KeyError, TypeError) as exc:
+            raise ValueError("Stage 1 request lacks its clustered embedding configuration") from exc
+        if not isinstance(embedding, Mapping):
+            raise ValueError("Stage 1 request has a malformed clustered embedding configuration")
+        return copy.deepcopy(dict(embedding))
+    return asdict(config.architecture.multi_model_forest.embedding_contrast)
+
+
+_EMBEDDING_CLUSTER_CONTRAST_FAMILIES = (
+    "cluster_local_treatment_contrast_basis",
+    "cluster_local_residualized_interaction_contrast_basis",
+)
+_EMBEDDING_CLUSTER_POSITIVE_TAILS = (
+    "positive_aligned_chunks",
+    "positive_external_chunks",
+)
+_EMBEDDING_CLUSTER_NEGATIVE_TAILS = (
+    "negative_aligned_chunks",
+    "negative_external_chunks",
+)
+
+
+def _strict_embedding_cache_binding_audit(
+    provider: BoundSpentFrozenChunkEmbeddingProvider,
+    *,
+    scope_id: str,
+) -> dict[str, Any]:
+    """Reject cache/text reconciliation and bind its empty fallback inventory."""
+
+    raw = getattr(provider, "token_bounded_row_ids", None)
+    if not isinstance(raw, tuple) or any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in raw
+    ):
+        raise ValueError(f"embedding cache binding is malformed in {scope_id}")
+    if raw:
+        raise ValueError(
+            f"embedding cache binding used token-bounded text reconciliation in {scope_id}"
+        )
+    return {
+        "token_bounded_row_count": 0,
+        "token_bounded_row_ids_sha256": _sha256_json([]),
+    }
+
+
+def _embedding_cluster_component_coverage(
+    *,
+    raw_rows: Sequence[Mapping[str, Any]],
+    semantic_rows: Sequence[Mapping[str, Any]],
+    catalog: RoleNeutralEvidenceCatalog,
+    configured_max_components: int,
+) -> tuple[list[dict[str, Any]], tuple[Any, ...], tuple[Any, ...]]:
+    """Prove exact nonempty raw/semantic/structural/mirror component equality."""
+
+    def evidence_inventory(
+        rows: Sequence[Mapping[str, Any]], *, semantic: bool
+    ) -> dict[str, dict[str, dict[str, int]]]:
+        inventory: dict[str, dict[str, dict[str, int]]] = {
+            family: {} for family in _EMBEDDING_CLUSTER_CONTRAST_FAMILIES
+        }
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise ValueError("clustered embedding component must be one mapping")
+            family = str(row.get("contrast_family") or "")
+            name = str(row.get("name") or "")
+            if family not in inventory or not name or name in inventory[family]:
+                raise ValueError("clustered embedding component identity is invalid or duplicated")
+            if semantic:
+                member_count = len(row.get("concept_probe_scores") or ())
+                if member_count < 1:
+                    raise ValueError("clustered embedding semantic component has no members")
+                inventory[family][name] = {"semantic_member_count": member_count}
+            else:
+                positive_count = sum(
+                    len(row.get(key) or ()) for key in _EMBEDDING_CLUSTER_POSITIVE_TAILS
+                )
+                negative_count = sum(
+                    len(row.get(key) or ()) for key in _EMBEDDING_CLUSTER_NEGATIVE_TAILS
+                )
+                if positive_count < 1 or negative_count < 1:
+                    raise ValueError(
+                        "clustered embedding raw component has an empty retrieval tail"
+                    )
+                inventory[family][name] = {
+                    "positive_member_count": positive_count,
+                    "negative_member_count": negative_count,
+                }
+        return inventory
+
+    def catalog_inventory(
+        atoms: Sequence[Any], *, semantic_mirror: bool
+    ) -> dict[str, dict[str, dict[str, Any]]]:
+        inventory: dict[str, dict[str, dict[str, Any]]] = {
+            family: {} for family in _EMBEDDING_CLUSTER_CONTRAST_FAMILIES
+        }
+        expected_kind = (
+            "tfidf_semantic_retrieval_contrast" if semantic_mirror else "embedding_contrast"
+        )
+        for atom in atoms:
+            content = atom.content
+            contrast = content.get("contrast")
+            origin = atom.origin
+            if atom.atom_kind != expected_kind or not isinstance(contrast, Mapping):
+                raise ValueError("clustered embedding catalog atom has the wrong architecture")
+            family = str(contrast.get("contrast_family") or "")
+            name = str(contrast.get("name") or "")
+            if family not in inventory or not name or not atom.member_ids:
+                raise ValueError("clustered embedding catalog component identity is invalid")
+            parent = str(origin.get("parent_collection_sha256") or "")
+            if _HEX_SHA256.fullmatch(parent) is None:
+                raise ValueError("clustered embedding catalog parent linkage is invalid")
+            if semantic_mirror:
+                if origin.get("architecture_view_of_parent") != EMBEDDING_CLUSTERED:
+                    raise ValueError("semantic retrieval atom is not a clustered mirror")
+            elif "architecture_view_of_parent" in origin:
+                raise ValueError("clustered structural atom unexpectedly declares a parent view")
+            component = inventory[family].setdefault(
+                name,
+                {"member_ids": set(), "parent_collection_sha256": set()},
+            )
+            member_ids = set(map(str, atom.member_ids))
+            if len(member_ids) != len(atom.member_ids) or component["member_ids"] & member_ids:
+                raise ValueError("clustered embedding catalog component repeats members")
+            component["member_ids"].update(member_ids)
+            component["parent_collection_sha256"].add(parent)
+        for family in _EMBEDDING_CLUSTER_CONTRAST_FAMILIES:
+            for component in inventory[family].values():
+                if not component["member_ids"] or len(component["parent_collection_sha256"]) != 1:
+                    raise ValueError("clustered embedding catalog component is not grounded")
+        return inventory
+
+    raw = evidence_inventory(raw_rows, semantic=False)
+    semantic = evidence_inventory(semantic_rows, semantic=True)
+    clustered_atoms = catalog.family_atoms(EMBEDDING_CLUSTERED)
+    mirror_atoms = catalog.family_atoms(TFIDF_SEMANTIC_RETRIEVAL)
+    clustered = catalog_inventory(clustered_atoms, semantic_mirror=False)
+    mirror = catalog_inventory(mirror_atoms, semantic_mirror=True)
+    coverage: list[dict[str, Any]] = []
+    for family in _EMBEDDING_CLUSTER_CONTRAST_FAMILIES:
+        raw_ids = sorted(raw[family])
+        semantic_ids = sorted(semantic[family])
+        clustered_ids = sorted(clustered[family])
+        mirror_ids = sorted(mirror[family])
+        if (
+            len(raw_ids) < 2
+            or len(raw_ids) > int(configured_max_components)
+            or semantic_ids != raw_ids
+            or clustered_ids != raw_ids
+            or mirror_ids != raw_ids
+        ):
+            raise ValueError("clustered embedding component coverage is not exact")
+        semantic_counts = [semantic[family][name]["semantic_member_count"] for name in raw_ids]
+        clustered_counts = [len(clustered[family][name]["member_ids"]) for name in raw_ids]
+        mirror_counts = [len(mirror[family][name]["member_ids"]) for name in raw_ids]
+        clustered_parents = [
+            next(iter(clustered[family][name]["parent_collection_sha256"])) for name in raw_ids
+        ]
+        mirror_parents = [
+            next(iter(mirror[family][name]["parent_collection_sha256"])) for name in raw_ids
+        ]
+        if semantic_counts != clustered_counts or semantic_counts != mirror_counts:
+            raise ValueError("clustered embedding catalog member coverage changed")
+        if clustered_parents != mirror_parents:
+            raise ValueError("semantic retrieval mirror parent linkage changed")
+        coverage.append(
+            {
+                "contrast_family": family,
+                "raw_component_ids": raw_ids,
+                "raw_component_count": len(raw_ids),
+                "raw_positive_member_counts": [
+                    raw[family][name]["positive_member_count"] for name in raw_ids
+                ],
+                "raw_negative_member_counts": [
+                    raw[family][name]["negative_member_count"] for name in raw_ids
+                ],
+                "semantic_component_ids": semantic_ids,
+                "semantic_component_count": len(semantic_ids),
+                "semantic_member_counts": semantic_counts,
+                "embedding_clustered_component_ids": clustered_ids,
+                "embedding_clustered_component_count": len(clustered_ids),
+                "embedding_clustered_member_counts": clustered_counts,
+                "embedding_clustered_parent_collection_sha256": clustered_parents,
+                "tfidf_semantic_retrieval_component_ids": mirror_ids,
+                "tfidf_semantic_retrieval_component_count": len(mirror_ids),
+                "tfidf_semantic_retrieval_member_counts": mirror_counts,
+                "tfidf_semantic_retrieval_parent_collection_sha256": mirror_parents,
+                "tfidf_semantic_retrieval_parent_family": EMBEDDING_CLUSTERED,
+            }
+        )
+    return coverage, clustered_atoms, mirror_atoms
+
+
+def _validate_embedding_cluster_component_coverage_audit(
+    value: Any,
+    *,
+    configured_max_components: int,
+) -> dict[str, Any]:
+    fields = {
+        "contrast_family",
+        "raw_component_ids",
+        "raw_component_count",
+        "raw_positive_member_counts",
+        "raw_negative_member_counts",
+        "semantic_component_ids",
+        "semantic_component_count",
+        "semantic_member_counts",
+        "embedding_clustered_component_ids",
+        "embedding_clustered_component_count",
+        "embedding_clustered_member_counts",
+        "embedding_clustered_parent_collection_sha256",
+        "tfidf_semantic_retrieval_component_ids",
+        "tfidf_semantic_retrieval_component_count",
+        "tfidf_semantic_retrieval_member_counts",
+        "tfidf_semantic_retrieval_parent_collection_sha256",
+        "tfidf_semantic_retrieval_parent_family",
+    }
+    if not isinstance(value, list) or len(value) != len(_EMBEDDING_CLUSTER_CONTRAST_FAMILIES):
+        raise ValueError("embedding cluster component coverage has an invalid family inventory")
+    raw_counts: dict[str, int] = {}
+    semantic_counts: dict[str, int] = {}
+    catalog_counts: dict[str, int] = {}
+    semantic_member_total = 0
+    catalog_member_total = 0
+    mirror_member_total = 0
+    for expected_family, row in zip(
+        _EMBEDDING_CLUSTER_CONTRAST_FAMILIES,
+        value,
+        strict=True,
+    ):
+        if not isinstance(row, Mapping) or set(row) != fields:
+            raise ValueError("embedding cluster component coverage has an invalid schema")
+        id_fields = (
+            "raw_component_ids",
+            "semantic_component_ids",
+            "embedding_clustered_component_ids",
+            "tfidf_semantic_retrieval_component_ids",
+        )
+        id_lists = [row.get(field) for field in id_fields]
+        raw_ids = id_lists[0]
+        if (
+            row.get("contrast_family") != expected_family
+            or not isinstance(raw_ids, list)
+            or len(raw_ids) < 2
+            or len(raw_ids) > int(configured_max_components)
+            or any(not isinstance(name, str) or not name for name in raw_ids)
+            or raw_ids != sorted(raw_ids)
+            or len(raw_ids) != len(set(raw_ids))
+            or any(ids != raw_ids for ids in id_lists[1:])
+            or row.get("tfidf_semantic_retrieval_parent_family") != EMBEDDING_CLUSTERED
+        ):
+            raise ValueError("embedding cluster component IDs are not exactly preserved")
+        count_fields = (
+            "raw_component_count",
+            "semantic_component_count",
+            "embedding_clustered_component_count",
+            "tfidf_semantic_retrieval_component_count",
+        )
+        if any(
+            isinstance(row.get(field), bool)
+            or not isinstance(row.get(field), int)
+            or row.get(field) != len(raw_ids)
+            for field in count_fields
+        ):
+            raise ValueError("embedding cluster component counts changed across views")
+        member_fields = (
+            "raw_positive_member_counts",
+            "raw_negative_member_counts",
+            "semantic_member_counts",
+            "embedding_clustered_member_counts",
+            "tfidf_semantic_retrieval_member_counts",
+        )
+        member_lists = [row.get(field) for field in member_fields]
+        if any(
+            not isinstance(counts, list)
+            or len(counts) != len(raw_ids)
+            or any(
+                isinstance(count, bool) or not isinstance(count, int) or count < 1
+                for count in counts
+            )
+            for counts in member_lists
+        ):
+            raise ValueError("embedding cluster component has empty or invalid members")
+        if member_lists[2] != member_lists[3] or member_lists[2] != member_lists[4]:
+            raise ValueError("embedding cluster semantic members changed across catalog views")
+        parent_fields = (
+            "embedding_clustered_parent_collection_sha256",
+            "tfidf_semantic_retrieval_parent_collection_sha256",
+        )
+        parents = [row.get(field) for field in parent_fields]
+        if (
+            any(
+                not isinstance(items, list)
+                or len(items) != len(raw_ids)
+                or any(_HEX_SHA256.fullmatch(str(item or "")) is None for item in items)
+                for items in parents
+            )
+            or parents[0] != parents[1]
+        ):
+            raise ValueError("semantic retrieval mirror parent linkage changed")
+        raw_counts[expected_family] = len(raw_ids)
+        semantic_counts[expected_family] = len(raw_ids)
+        catalog_counts[expected_family] = len(raw_ids)
+        semantic_member_total += sum(member_lists[2])
+        catalog_member_total += sum(member_lists[3])
+        mirror_member_total += sum(member_lists[4])
+    return {
+        "raw_counts": raw_counts,
+        "semantic_counts": semantic_counts,
+        "catalog_counts": catalog_counts,
+        "semantic_member_total": semantic_member_total,
+        "catalog_member_total": catalog_member_total,
+        "mirror_member_total": mirror_member_total,
+    }
+
+
+def validate_embedding_cluster_feasibility_audit(
+    audit: Mapping[str, Any],
+    *,
+    config: AppliedInferenceConfig | Mapping[str, Any],
+    registry: Mapping[str, Any],
+    registry_content_sha256: str,
+    embedding_cache_identity: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Validate the closed, input-bound all-scope clustered-embedding audit."""
+
+    if not isinstance(audit, Mapping):
+        raise ValueError("embedding cluster feasibility audit must be one mapping")
+    embedding_configuration = _embedding_cluster_configuration(config)
+    try:
+        configured_cluster_count = int(embedding_configuration["cluster_contrast_n_clusters"])
+        configured_max_components = int(embedding_configuration["cluster_contrast_max_components"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("clustered embedding configuration lacks its fixed architecture") from exc
+    if configured_cluster_count < 2 or configured_max_components < 2:
+        raise ValueError("clustered embedding configuration cannot emit two-family rank-two proof")
+    fields = {
+        "schema_version",
+        "split_registry_content_sha256",
+        "embedding_configuration_sha256",
+        "embedding_cache_identity_sha256",
+        "cluster_support_contract_schema_version",
+        "required_svd_families",
+        "configured_cluster_count",
+        "configured_max_components",
+        "minimum_grounded_components_per_svd_family",
+        "token_bounded_row_count",
+        "token_bounded_row_ids_sha256",
+        "scope_count",
+        "full_outer_scope_count",
+        "exact_inner_scope_count",
+        "cumulative_spent_scope_count",
+        "scope_order",
+        "scopes",
+        "all_required_scopes_passed",
+        "heldout_text_accessed",
+        "heldout_labels_accessed",
+        "oracle_fields_accessed",
+        "cluster_configuration_adapted",
+        "fallback_used",
+        "rank_one_support_allowed",
+        "semantic_member_limit",
+        "content_sha256",
+    }
+    body = {key: copy.deepcopy(value) for key, value in audit.items() if key != "content_sha256"}
+    expected_scopes = _embedding_cluster_feasibility_scopes(registry)
+    expected_bindings = [_embedding_cluster_scope_binding(scope) for scope in expected_scopes]
+    observed_scopes = audit.get("scopes")
+    if (
+        set(audit) != fields
+        or audit.get("schema_version") != STAGE1_EMBEDDING_CLUSTER_FEASIBILITY_AUDIT_SCHEMA
+        or audit.get("content_sha256") != _sha256_json(body)
+        or audit.get("split_registry_content_sha256") != str(registry_content_sha256)
+        or audit.get("embedding_configuration_sha256") != _sha256_json(embedding_configuration)
+        or audit.get("embedding_cache_identity_sha256")
+        != _sha256_json(dict(embedding_cache_identity))
+        or audit.get("cluster_support_contract_schema_version")
+        != EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA
+        or audit.get("required_svd_families") != ["treatment", "residualized_interaction"]
+        or audit.get("configured_cluster_count") != configured_cluster_count
+        or audit.get("configured_max_components") != configured_max_components
+        or audit.get("minimum_grounded_components_per_svd_family") != 2
+        or audit.get("token_bounded_row_count") != 0
+        or audit.get("token_bounded_row_ids_sha256") != _sha256_json([])
+        or not isinstance(observed_scopes, list)
+        or len(observed_scopes) != len(expected_scopes)
+        or int(audit.get("scope_count", -1)) != len(expected_scopes)
+        or audit.get("scope_order") != [row["scope_id"] for row in expected_bindings]
+        or int(audit.get("full_outer_scope_count", -1))
+        != sum(row["scope_kind"] == "full_outer" for row in expected_bindings)
+        or int(audit.get("exact_inner_scope_count", -1))
+        != sum(row["scope_kind"] == "exact_inner" for row in expected_bindings)
+        or int(audit.get("cumulative_spent_scope_count", -1))
+        != sum(row["scope_kind"] == "cumulative_spent" for row in expected_bindings)
+        or audit.get("all_required_scopes_passed") is not True
+        or audit.get("heldout_text_accessed") is not False
+        or audit.get("heldout_labels_accessed") is not False
+        or audit.get("oracle_fields_accessed") is not False
+        or audit.get("cluster_configuration_adapted") is not False
+        or audit.get("fallback_used") is not False
+        or audit.get("rank_one_support_allowed") is not False
+        or audit.get("semantic_member_limit") is not None
+    ):
+        raise ValueError("embedding cluster feasibility audit has an invalid closed envelope")
+    scope_fields = {
+        *set(expected_bindings[0]),
+        "cluster_support_contract",
+        "token_bounded_row_count",
+        "token_bounded_row_ids_sha256",
+        "raw_cluster_contrast_count",
+        "raw_contrast_count_by_family",
+        "semantic_cluster_contrast_count",
+        "semantic_contrast_count_by_family",
+        "semantic_member_count",
+        "catalog_atom_count",
+        "catalog_member_count",
+        "catalog_grounded_component_count_by_family",
+        "semantic_mirror_catalog_atom_count",
+        "semantic_mirror_catalog_member_count",
+        "component_coverage_by_family",
+        "uncapped_semantic_projection",
+    }
+    required_families = {
+        "cluster_local_treatment_contrast_basis",
+        "cluster_local_residualized_interaction_contrast_basis",
+    }
+    for expected, observed in zip(expected_bindings, observed_scopes, strict=True):
+        if not isinstance(observed, Mapping) or set(observed) != scope_fields:
+            raise ValueError("embedding cluster feasibility scope has an invalid schema")
+        if any(observed.get(key) != value for key, value in expected.items()):
+            raise ValueError("embedding cluster feasibility scope order or binding changed")
+        support = observed.get("cluster_support_contract")
+        try:
+            expected_kmeans_parameters = _embedding_cluster_kmeans_parameters(
+                embedding_configuration,
+                n_usable=int(observed.get("fit_row_count", 0)),
+            )
+            validated_support = validate_embedding_cluster_support_contract(
+                support,
+                expected_cluster_count=configured_cluster_count,
+                expected_kmeans_configuration=embedding_configuration,
+            )
+            coverage_summary = _validate_embedding_cluster_component_coverage_audit(
+                observed.get("component_coverage_by_family"),
+                configured_max_components=configured_max_components,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"embedding clustered architecture is infeasible in {expected['scope_id']}"
+            ) from exc
+        if (
+            validated_support != support
+            or not isinstance(support, Mapping)
+            or support.get("schema_version") != EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA
+            or support.get("required_svd_families") != ["treatment", "residualized_interaction"]
+            or support.get("kmeans_parameters") != expected_kmeans_parameters
+            or support.get("kmeans_usable_row_count") != observed.get("fit_row_count")
+            or observed.get("token_bounded_row_count") != 0
+            or observed.get("token_bounded_row_ids_sha256") != _sha256_json([])
+            or int(support.get("minimum_distinct_local_clusters_per_family", 0)) < 2
+            or int(support.get("minimum_numerical_rank_per_family", 0)) < 2
+            or {row.get("family_key") for row in support.get("svd_families") or ()}
+            != {"treatment", "residualized_interaction"}
+            or any(
+                int(row.get("local_contrast_count", 0)) < 2
+                or int(row.get("numerical_rank", 0)) < 2
+                or float(row.get("second_singular_value", 0.0)) <= 0.0
+                for row in support.get("svd_families") or ()
+            )
+            or set(coverage_summary["raw_counts"]) != required_families
+            or observed.get("raw_contrast_count_by_family") != coverage_summary["raw_counts"]
+            or observed.get("semantic_contrast_count_by_family")
+            != coverage_summary["semantic_counts"]
+            or observed.get("catalog_grounded_component_count_by_family")
+            != coverage_summary["catalog_counts"]
+            or observed.get("raw_cluster_contrast_count")
+            != sum(coverage_summary["raw_counts"].values())
+            or observed.get("semantic_cluster_contrast_count")
+            != sum(coverage_summary["semantic_counts"].values())
+            or observed.get("semantic_member_count") != coverage_summary["semantic_member_total"]
+            or isinstance(observed.get("catalog_atom_count"), bool)
+            or not isinstance(observed.get("catalog_atom_count"), int)
+            or observed.get("catalog_atom_count") < 1
+            or observed.get("catalog_atom_count") < sum(coverage_summary["catalog_counts"].values())
+            or observed.get("catalog_member_count") != coverage_summary["catalog_member_total"]
+            or observed.get("semantic_mirror_catalog_atom_count")
+            != observed.get("catalog_atom_count")
+            or observed.get("semantic_mirror_catalog_member_count")
+            != coverage_summary["mirror_member_total"]
+            or observed.get("uncapped_semantic_projection") is not True
+        ):
+            raise ValueError(
+                f"embedding clustered architecture is infeasible in {expected['scope_id']}"
+            )
+    return copy.deepcopy(dict(audit))
+
+
+def build_embedding_cluster_feasibility_audit(
+    *,
+    modeling_data: pd.DataFrame,
+    config: AppliedInferenceConfig,
+    embedding_cache: SpentOnlyFrozenChunkEmbeddingCache,
+    embedding_cache_identity: Mapping[str, Any],
+    registry: Mapping[str, Any],
+    registry_content_sha256: str,
+) -> Mapping[str, Any]:
+    """Run the actual frozen-cache clustered architecture before costly fits."""
+
+    required_columns = {
+        config.text_column,
+        config.treatment_column,
+        config.outcome_column,
+    }
+    if set(modeling_data.columns) != required_columns:
+        raise ValueError("embedding cluster preflight received another modeling projection")
+    identity_frame = pd.DataFrame({"_oci_row_id": np.arange(len(modeling_data), dtype=np.int64)})
+    raw_family_names = (
+        "cluster_local_treatment_contrast_basis",
+        "cluster_local_residualized_interaction_contrast_basis",
+    )
+    embedding_configuration = _embedding_cluster_configuration(config)
+    configured_cluster_count = int(embedding_configuration["cluster_contrast_n_clusters"])
+    if int(embedding_configuration["cluster_contrast_max_components"]) < 2:
+        raise ValueError(
+            "embedding cluster preflight requires at least two components per SVD family"
+        )
+    scope_audits: list[dict[str, Any]] = []
+    for scope in _embedding_cluster_feasibility_scopes(registry):
+        binding = _embedding_cluster_scope_binding(scope)
+        fit_rows = tuple(map(int, scope["fit_row_ids"]))
+        heldout_rows = tuple(map(int, scope["heldout_row_ids"]))
+        fit_texts = tuple(
+            str(value) for value in modeling_data.iloc[list(fit_rows)][config.text_column].tolist()
+        )
+        provider = embedding_cache.bind_spent(fit_rows, fit_texts)
+        binding_fallback_audit = _strict_embedding_cache_binding_audit(
+            provider,
+            scope_id=str(scope["scope_id"]),
+        )
+        generator = _FrozenCacheEmbeddingEvidenceGenerator(
+            config=config,
+            embedding_provider=provider,
+            dataset_row_count=len(modeling_data),
+            output_dir=Path("."),
+        )
+        generator.prepare(identity_frame)
+        observer = _EmbeddingClusterPreflightObserver()
+        generator._native_embedding_proof_observer = observer
+        discovery_frame = identity_frame.iloc[list(fit_rows)].copy()
+        evidence = generator.build_evidence(
+            discovery_df=discovery_frame,
+            y=modeling_data.iloc[list(fit_rows)][config.outcome_column].to_numpy(dtype=float),
+            t=modeling_data.iloc[list(fit_rows)][config.treatment_column].to_numpy(dtype=float),
+            pseudo_target=None,
+            t_resid=None,
+            pseudo_target_names=None,
+            importance={},
+        )
+        if observer.evidence is not evidence:
+            raise RuntimeError("embedding cluster preflight observer changed native evidence")
+        cluster_summary = evidence.get("cluster_contrast_vectors")
+        cluster_summary = (
+            copy.deepcopy(dict(cluster_summary))
+            if isinstance(cluster_summary, Mapping)
+            else {"missing_cluster_contrast_summary": True}
+        )
+        try:
+            support = validate_embedding_cluster_support_state(
+                kmeans_state=observer.kmeans,
+                svd_states=observer.svds,
+                expected_cluster_count=configured_cluster_count,
+                expected_kmeans_configuration=embedding_configuration,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "embedding clustered architecture is infeasible in "
+                f"{scope['scope_id']}; observed_cluster_summary="
+                f"{_canonical_json(cluster_summary)}"
+            ) from exc
+        raw_cluster = [
+            copy.deepcopy(dict(row))
+            for row in evidence.get("contrasts") or ()
+            if isinstance(row, Mapping) and row.get("contrast_family") in raw_family_names
+        ]
+        raw_counts = {
+            family: sum(row.get("contrast_family") == family for row in raw_cluster)
+            for family in raw_family_names
+        }
+        semantic = _embedding_concepts_only(
+            {"enabled": True, "contrasts": raw_cluster},
+            contrastive_term_limit=None,
+        )
+        semantic_rows = list(semantic.get("contrasts") or ())
+        semantic_counts = {
+            family: sum(row.get("contrast_family") == family for row in semantic_rows)
+            for family in raw_family_names
+        }
+        semantic_member_count = sum(
+            len(row.get("concept_probe_scores") or ()) for row in semantic_rows
+        )
+        digest = _catalog_ready_legacy_digest(
+            importance={},
+            embedding_evidence=semantic,
+            htr_evidence={},
+        )
+        is_full = scope["scope_kind"] == "full_outer"
+        catalog_inner_fold = (
+            None if is_full else int(scope.get("inner_fold") or scope.get("provider_inner_fold"))
+        )
+        provenance = FoldEvidenceProvenance(
+            outer_fold=int(scope["outer_fold"]),
+            train_row_ids=fit_rows,
+            heldout_row_ids=heldout_rows,
+            scope="outer_train" if is_full else "inner_train",
+            inner_fold=catalog_inner_fold,
+            artifact_id=f"embedding-cluster-feasibility-{scope['scope_id']}",
+        )
+        payload: dict[str, Any] = {
+            "outer_fold": int(scope["outer_fold"]),
+            "scope": "full_outer_train" if is_full else "inner_train",
+            "n_rows": len(fit_rows),
+            "context": {"evidence_digest": digest},
+        }
+        if catalog_inner_fold is not None:
+            payload["inner_fold"] = catalog_inner_fold
+        try:
+            catalog = build_role_neutral_evidence_catalog(
+                (FoldEvidenceInput(LEGACY_ALL_SOURCE, payload, provenance),),
+                require_all_source_kinds=False,
+                require_all_architecture_families=False,
+                require_upstream_completeness=True,
+            )
+            # Exercise the same native-family projection used by exact/cumulative
+            # registration; an empty catalog must fail here rather than be padded.
+            _payload, projected_count = family_payload_from_catalog(
+                catalog,
+                family=EMBEDDING_CLUSTERED,
+            )
+            _mirror_payload, mirror_projected_count = family_payload_from_catalog(
+                catalog,
+                family=TFIDF_SEMANTIC_RETRIEVAL,
+            )
+            component_coverage, clustered_atoms, mirror_atoms = (
+                _embedding_cluster_component_coverage(
+                    raw_rows=raw_cluster,
+                    semantic_rows=semantic_rows,
+                    catalog=catalog,
+                    configured_max_components=int(
+                        embedding_configuration["cluster_contrast_max_components"]
+                    ),
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            diagnostic = {
+                "cluster_summary": cluster_summary,
+                "raw_contrast_count_by_family": raw_counts,
+                "semantic_contrast_count_by_family": semantic_counts,
+                "semantic_member_count": semantic_member_count,
+            }
+            raise ValueError(
+                "embedding clustered catalog coverage is infeasible in "
+                f"{scope['scope_id']}; observed={_canonical_json(diagnostic)}"
+            ) from exc
+        catalog_member_count = sum(len(atom.member_ids) for atom in clustered_atoms)
+        mirror_catalog_member_count = sum(len(atom.member_ids) for atom in mirror_atoms)
+        catalog_component_counts = {
+            row["contrast_family"]: row["embedding_clustered_component_count"]
+            for row in component_coverage
+        }
+        scope_audits.append(
+            {
+                **binding,
+                **binding_fallback_audit,
+                "cluster_support_contract": support,
+                "raw_cluster_contrast_count": len(raw_cluster),
+                "raw_contrast_count_by_family": raw_counts,
+                "semantic_cluster_contrast_count": len(semantic_rows),
+                "semantic_contrast_count_by_family": semantic_counts,
+                "semantic_member_count": semantic_member_count,
+                "catalog_atom_count": int(projected_count),
+                "catalog_member_count": catalog_member_count,
+                "catalog_grounded_component_count_by_family": catalog_component_counts,
+                "semantic_mirror_catalog_atom_count": int(mirror_projected_count),
+                "semantic_mirror_catalog_member_count": mirror_catalog_member_count,
+                "component_coverage_by_family": component_coverage,
+                "uncapped_semantic_projection": all(
+                    row["raw_component_ids"] == row["semantic_component_ids"]
+                    for row in component_coverage
+                ),
+            }
+        )
+    body = {
+        "schema_version": STAGE1_EMBEDDING_CLUSTER_FEASIBILITY_AUDIT_SCHEMA,
+        "split_registry_content_sha256": str(registry_content_sha256),
+        "embedding_configuration_sha256": _sha256_json(embedding_configuration),
+        "embedding_cache_identity_sha256": _sha256_json(dict(embedding_cache_identity)),
+        "cluster_support_contract_schema_version": EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA,
+        "required_svd_families": ["treatment", "residualized_interaction"],
+        "configured_cluster_count": configured_cluster_count,
+        "configured_max_components": int(
+            embedding_configuration["cluster_contrast_max_components"]
+        ),
+        "minimum_grounded_components_per_svd_family": 2,
+        "token_bounded_row_count": sum(int(row["token_bounded_row_count"]) for row in scope_audits),
+        "token_bounded_row_ids_sha256": _sha256_json([]),
+        "scope_count": len(scope_audits),
+        "full_outer_scope_count": sum(row["scope_kind"] == "full_outer" for row in scope_audits),
+        "exact_inner_scope_count": sum(row["scope_kind"] == "exact_inner" for row in scope_audits),
+        "cumulative_spent_scope_count": sum(
+            row["scope_kind"] == "cumulative_spent" for row in scope_audits
+        ),
+        "scope_order": [row["scope_id"] for row in scope_audits],
+        "scopes": scope_audits,
+        "all_required_scopes_passed": True,
+        "heldout_text_accessed": False,
+        "heldout_labels_accessed": False,
+        "oracle_fields_accessed": False,
+        "cluster_configuration_adapted": any(
+            row["cluster_support_contract"]["kmeans_parameters"]
+            != _embedding_cluster_kmeans_parameters(
+                embedding_configuration,
+                n_usable=int(row["fit_row_count"]),
+            )
+            for row in scope_audits
+        ),
+        "fallback_used": any(int(row["token_bounded_row_count"]) != 0 for row in scope_audits),
+        "rank_one_support_allowed": False,
+        "semantic_member_limit": None,
+    }
+    audit = {**body, "content_sha256": _sha256_json(body)}
+    return validate_embedding_cluster_feasibility_audit(
+        audit,
+        config=config,
+        registry=registry,
+        registry_content_sha256=registry_content_sha256,
+        embedding_cache_identity=embedding_cache_identity,
+    )
 
 
 def _canonical_exact_registry_from_wrapper(
@@ -7523,6 +8391,7 @@ class _PreparedBuild:
     htr_model_path: Path
     htr_model_sha256: str
     htr_input_nontruncation_audit: Mapping[str, Any]
+    embedding_cluster_feasibility_audit: Mapping[str, Any]
     embedding_cache_path: Path
     embedding_cache: SpentOnlyFrozenChunkEmbeddingCache
     embedding_cache_identity: Mapping[str, Any]
@@ -7708,7 +8577,11 @@ class ProductionStage1BundleBuilder:
         all_texts = tuple(modeling_data[config.text_column].tolist())
         # This binds every cache row to the exact projected cohort text without
         # exposing treatment/outcome or constructing an embedding model.
-        embedding_cache.bind_spent(all_rows, all_texts)
+        full_cache_binding = embedding_cache.bind_spent(all_rows, all_texts)
+        _strict_embedding_cache_binding_audit(
+            full_cache_binding,
+            scope_id="production_prepare_full_cohort",
+        )
         cache_identity = embedding_cache.identity()
         cache_input_identity = validate_published_production_embedding_cache(
             cache_dir=cache_dir,
@@ -7733,6 +8606,14 @@ class ProductionStage1BundleBuilder:
             seed=options.seed,
         )
         registry_sha = _sha256_json(registry)
+        embedding_cluster_feasibility_audit = build_embedding_cluster_feasibility_audit(
+            modeling_data=modeling_data,
+            config=config,
+            embedding_cache=embedding_cache,
+            embedding_cache_identity=cache_identity,
+            registry=registry,
+            registry_content_sha256=registry_sha,
+        )
         exact_inner_contract_status = _exact_inner_contract_registry_status(registry)
         query_config, query_config_identity = self._load_query_config(options.query_config_path)
         hierarchical_discovery_contract_identity = (
@@ -7792,6 +8673,7 @@ class ProductionStage1BundleBuilder:
                 "sentence_encoder_unfrozen": True,
             },
             "htr_input_nontruncation_audit": htr_input_nontruncation_audit,
+            "embedding_cluster_feasibility_audit": (embedding_cluster_feasibility_audit),
             "split_registry_content_sha256": registry_sha,
             "exact_inner_contract": {
                 **exact_inner_contract_status,
@@ -7842,6 +8724,7 @@ class ProductionStage1BundleBuilder:
             htr_model_path=htr_model_path,
             htr_model_sha256=htr_sha,
             htr_input_nontruncation_audit=htr_input_nontruncation_audit,
+            embedding_cluster_feasibility_audit=embedding_cluster_feasibility_audit,
             embedding_cache_path=cache_dir,
             embedding_cache=embedding_cache,
             embedding_cache_identity=cache_identity,
@@ -7927,6 +8810,19 @@ class ProductionStage1BundleBuilder:
         current_cache_identity = prepared.embedding_cache.identity()
         if current_cache_identity != prepared.embedding_cache_identity:
             raise RuntimeError("frozen embedding cache changed after preflight")
+        validated_cluster_audit = validate_embedding_cluster_feasibility_audit(
+            prepared.embedding_cluster_feasibility_audit,
+            config=prepared.config,
+            registry=prepared.registry,
+            registry_content_sha256=prepared.registry_content_sha256,
+            embedding_cache_identity=current_cache_identity,
+        )
+        if (
+            validated_cluster_audit != prepared.embedding_cluster_feasibility_audit
+            or validated_cluster_audit
+            != prepared.request.get("embedding_cluster_feasibility_audit")
+        ):
+            raise RuntimeError("embedding cluster feasibility audit changed after preflight")
         current_cache_input_identity = validate_published_production_embedding_cache(
             cache_dir=prepared.embedding_cache_path,
             dataset_path=Path(prepared.input_file_identities["dataset"]["path"]),
@@ -7955,6 +8851,9 @@ class ProductionStage1BundleBuilder:
                 "genuine_one_shot_e2e_certified": False,
                 "exact_inner_contract": prepared.request["exact_inner_contract"],
                 "htr_input_nontruncation_audit": (prepared.htr_input_nontruncation_audit),
+                "embedding_cluster_feasibility_audit": (
+                    prepared.embedding_cluster_feasibility_audit
+                ),
                 "hierarchical_discovery_contract_identity_sha256": (
                     prepared.hierarchical_discovery_contract_identity["content_sha256"]
                 ),
@@ -8221,9 +9120,7 @@ class ProductionStage1BundleBuilder:
         raw_fit_texts, normalized_fit_texts = _native_scope_text_projections(
             row.text for row in request.spent_rows
         )
-        raw_canary_texts, normalized_canary_texts = _native_scope_text_projections(
-            (canary.text,)
-        )
+        raw_canary_texts, normalized_canary_texts = _native_scope_text_projections((canary.text,))
         bow_path = bow_models_dir / request.scope_id
         htr_path = htr_models_dir / request.scope_id
         pair_path = matched_pair_models_dir / request.scope_id
@@ -11563,14 +12460,17 @@ __all__ = [
     "PRODUCTION_TFIDF_REGISTERED_NATIVE_FAMILY_ADAPTERS",
     "STAGE1_BUNDLE_MANIFEST_SCHEMA",
     "STAGE1_BUNDLE_REQUEST_SCHEMA",
+    "STAGE1_EMBEDDING_CLUSTER_FEASIBILITY_AUDIT_SCHEMA",
     "STAGE1_HTR_INPUT_NONTRUNCATION_AUDIT_SCHEMA",
     "ProductionStage1BundleBuilder",
     "Stage1BundleBuildOptions",
+    "build_embedding_cluster_feasibility_audit",
     "build_canonical_split_registry",
     "build_parser",
     "exact_inner_family_adapter_gate",
     "load_applied_stage1_config",
     "main",
     "options_from_args",
+    "validate_embedding_cluster_feasibility_audit",
     "validate_htr_input_nontruncation_audit",
 ]

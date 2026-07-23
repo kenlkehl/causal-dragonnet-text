@@ -227,7 +227,7 @@ fails closed. Metadata and provenance persist `max_observed_token_count`,
 `ordered_token_counts_sha256`, and `tokenizer_truncation_allowed=false`, with
 `chunking_mode=whitespace_word_chunks_tokenizer_verified_nontruncating_v2`.
 
-The bundle request is now `production_all_evidence_stage1_request_v4`. Its
+The bundle request is now `production_all_evidence_stage1_request_v5`. Its
 closed `production_stage1_htr_input_nontruncation_audit_v1` applies to
 `htr_neural` and the HTR subproducer of `matched_pair_uplift`. During
 preparation, before an embedding cache is built or loaded and before any Stage 1

@@ -259,8 +259,16 @@ def build_extraction_prompt(
             specs,
             max_chars=int(max_text_length),
         ).text
+    elif strategy == "complete_paged_v1":
+        # Page construction and reconciliation are owned by the production
+        # provider.  Each call here receives one already bounded complete page.
+        if max_text_length is not None and len(text) > int(max_text_length):
+            raise ValueError("complete_paged_v1 received an oversized unpaged input")
     else:
-        raise ValueError("context_strategy must be 'tail' or 'contract_lexical_rag'")
+        raise ValueError(
+            "context_strategy must be 'tail', 'contract_lexical_rag', or "
+            "'complete_paged_v1'"
+        )
 
     if strategy == "contract_lexical_rag":
         document_instruction = (
@@ -537,6 +545,8 @@ class VLLMFeatureExtractor:
         max_text_length: Optional[int] = 400000,
         context_strategy: str = "tail",
         source_text_temporally_valid_by_design: bool = False,
+        schema_repair_attempts: Optional[int] = None,
+        fail_closed: bool = False,
     ):
         """Initialize extractor.
 
@@ -609,6 +619,12 @@ class VLLMFeatureExtractor:
         self.max_text_length = max_text_length
         self.context_strategy = str(context_strategy)
         self.source_text_temporally_valid_by_design = bool(source_text_temporally_valid_by_design)
+        self.schema_repair_attempts = (
+            None if schema_repair_attempts is None else int(schema_repair_attempts)
+        )
+        if self.schema_repair_attempts is not None and self.schema_repair_attempts < 0:
+            raise ValueError("schema_repair_attempts cannot be negative")
+        self.fail_closed = bool(fail_closed)
 
         # These are set lazily
         self._client = None
@@ -727,7 +743,11 @@ class VLLMFeatureExtractor:
         )
         messages = [{"role": "user", "content": prompt}]
         best_result = None
-        max_attempts = max(1, int(self.max_retries))
+        max_attempts = (
+            1 + self.schema_repair_attempts
+            if self.schema_repair_attempts is not None
+            else max(1, int(self.max_retries))
+        )
         start_index = (
             self._client_pool.reserve_start_index() if self._client_pool is not None else 0
         )
@@ -815,6 +835,8 @@ class VLLMFeatureExtractor:
                     if not parsed.issues:
                         return result
             except Exception as e:
+                if self.fail_closed:
+                    raise RuntimeError("production extraction transport failed") from e
                 logger.debug(f"Extraction attempt {attempt + 1} failed: {e}")
                 if attempt < max_attempts - 1 and is_retryable_llm_exception(e):
                     delay = retry_delay(
@@ -835,6 +857,8 @@ class VLLMFeatureExtractor:
                     time.sleep(delay)
 
         # Return best partial result, or all-missing if no successful parse
+        if self.fail_closed:
+            raise ValueError("production extraction exhausted its single schema repair")
         if best_result is not None:
             return best_result
         return self._missing_result()

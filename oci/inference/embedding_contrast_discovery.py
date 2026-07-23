@@ -7,7 +7,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -25,6 +25,36 @@ from ..models.concept_embedding_cache import (
 from ..models.concept_embedding_utils import chunk_text_words
 
 logger = logging.getLogger(__name__)
+
+_CLUSTER_KMEANS_MAX_ITER = 300
+
+
+def _embedding_cluster_kmeans_parameters(
+    embedding_config: EmbeddingContrastDiscoveryConfig | Mapping[str, Any],
+    *,
+    n_usable: int,
+    n_clusters: int | None = None,
+) -> Dict[str, int]:
+    """Return the one closed MiniBatchKMeans parameterization used natively."""
+
+    def configured(name: str) -> Any:
+        if isinstance(embedding_config, Mapping):
+            return embedding_config[name]
+        return getattr(embedding_config, name)
+
+    usable = int(n_usable)
+    if usable < 1:
+        raise ValueError("clustered embedding KMeans requires usable rows")
+    cluster_count = (
+        int(configured("cluster_contrast_n_clusters")) if n_clusters is None else int(n_clusters)
+    )
+    return {
+        "n_clusters": cluster_count,
+        "random_state": int(configured("cluster_contrast_random_state")),
+        "batch_size": max(128, min(1024, usable)),
+        "n_init": int(configured("cluster_contrast_kmeans_n_init")),
+        "max_iter": _CLUSTER_KMEANS_MAX_ITER,
+    }
 
 
 class EmbeddingContrastEvidenceGenerator:
@@ -798,14 +828,13 @@ class EmbeddingContrastEvidenceGenerator:
             summary["skipped"] = "too_few_patients_for_cluster_contrasts"
             return [], summary
 
+        kmeans_parameters = _embedding_cluster_kmeans_parameters(
+            self.embedding_config,
+            n_usable=n_usable,
+            n_clusters=n_clusters,
+        )
         try:
-            kmeans = MiniBatchKMeans(
-                n_clusters=n_clusters,
-                random_state=int(self.embedding_config.cluster_contrast_random_state),
-                batch_size=max(128, min(1024, n_usable)),
-                n_init=int(self.embedding_config.cluster_contrast_kmeans_n_init),
-                max_iter=300,
-            )
+            kmeans = MiniBatchKMeans(**kmeans_parameters)
             cluster_labels = np.full(len(patient_embeddings), -1, dtype=int)
             cluster_labels[usable] = kmeans.fit_predict(patient_embeddings[usable])
         except Exception as exc:
@@ -832,13 +861,7 @@ class EmbeddingContrastEvidenceGenerator:
                 cluster_counts=cluster_counts,
                 n_iter=int(kmeans.n_iter_),
                 inertia=float(kmeans.inertia_),
-                parameters={
-                    "n_clusters": int(n_clusters),
-                    "random_state": int(self.embedding_config.cluster_contrast_random_state),
-                    "batch_size": max(128, min(1024, n_usable)),
-                    "n_init": int(self.embedding_config.cluster_contrast_kmeans_n_init),
-                    "max_iter": 300,
-                },
+                parameters=kmeans_parameters,
             )
 
         records: List[Dict[str, Any]] = []

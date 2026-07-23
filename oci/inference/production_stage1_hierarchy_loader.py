@@ -36,6 +36,7 @@ from .production_stage1_bundle import (
     _sha256_json,
     _registry_scopes,
     _source_identity,
+    validate_embedding_cluster_feasibility_audit,
     validate_htr_input_nontruncation_audit,
 )
 from .production_embedding_cache_builder import (
@@ -1015,6 +1016,7 @@ def load_authenticated_stage1_bundle_for_hierarchy(
     dataset_request = request.get("dataset")
     htr_model_request = request.get("htr_model")
     htr_audit = request.get("htr_input_nontruncation_audit")
+    cluster_audit = request.get("embedding_cluster_feasibility_audit")
     security = request.get("security")
     if (
         not isinstance(effective_config, Mapping)
@@ -1034,6 +1036,8 @@ def load_authenticated_stage1_bundle_for_hierarchy(
         expected_rows=int(dataset_request.get("row_count", -1)),
         expected_htr_model_tree_sha256=str(htr_model_request["tree_sha256"]),
     )
+    if not isinstance(cluster_audit, Mapping):
+        raise ValueError("Stage 1 request lacks its clustered-embedding feasibility audit")
     exact_status = request.get("exact_inner_contract") or {}
     if (
         exact_status.get("contract_module_available") is not True
@@ -1569,6 +1573,18 @@ def load_authenticated_stage1_bundle_for_hierarchy(
             raise ValueError(
                 "production embedding-cache build identity differs from current inputs"
             )
+    try:
+        validate_embedding_cluster_feasibility_audit(
+            cluster_audit,
+            config=effective_config,
+            registry=wrapper_registry,
+            registry_content_sha256=str(request.get("split_registry_content_sha256") or ""),
+            embedding_cache_identity=expected_cache_identity,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Stage 1 clustered-embedding feasibility audit is missing or invalid"
+        ) from exc
 
     query_index = _load_json_snapshot(
         registered_snapshots["neural_query_artifact_index"],

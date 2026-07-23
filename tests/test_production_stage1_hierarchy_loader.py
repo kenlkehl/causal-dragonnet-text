@@ -33,13 +33,19 @@ from oci.inference.production_stage1_bundle import (
     STAGE1_BUNDLE_REQUEST_SCHEMA,
     STAGE1_CUMULATIVE_ALL_TEN_ROOT_INDEX_SCHEMA,
     STAGE1_EXACT_INNER_ROOT_INDEX_SCHEMA,
+    STAGE1_EMBEDDING_CLUSTER_FEASIBILITY_AUDIT_SCHEMA,
     STAGE1_HTR_INPUT_NONTRUNCATION_AUDIT_SCHEMA,
     STAGE1_SCOPE_INDEX_SCHEMA,
     _seal_component,
+    _embedding_cluster_feasibility_scopes,
+    _embedding_cluster_scope_binding,
     _sha256_file,
     _sha256_json,
     _source_identity,
     _write_raw_evidence_sidecar,
+)
+from oci.inference.embedding_native_proof_capture import (
+    EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA,
 )
 from oci.inference.production_stage1_hierarchy_loader import (
     STAGE1_EXACT_INNER_INDEX_SCHEMA,
@@ -325,6 +331,144 @@ def _contract_scopes(contract: CanonicalStage1SplitRegistry):
                 "fit_row_ids": list(inner.fit_row_ids),
                 "heldout_row_ids": list(inner.heldout_row_ids),
             }
+
+
+def _cluster_feasibility_audit(
+    *,
+    registry: dict,
+    embedding_configuration: dict,
+    embedding_cache_identity: dict,
+) -> dict:
+    configured_clusters = int(embedding_configuration["cluster_contrast_n_clusters"])
+    contrast_families = (
+        "cluster_local_treatment_contrast_basis",
+        "cluster_local_residualized_interaction_contrast_basis",
+    )
+    scopes = []
+    for scope in _embedding_cluster_feasibility_scopes(registry):
+        binding = _embedding_cluster_scope_binding(scope)
+        fit_count = int(binding["fit_row_count"])
+        counts = [fit_count // configured_clusters] * configured_clusters
+        for index in range(fit_count % configured_clusters):
+            counts[index] += 1
+        support = {
+            "schema_version": EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA,
+            "required_svd_families": ["treatment", "residualized_interaction"],
+            "minimum_distinct_local_clusters_per_family": 2,
+            "minimum_numerical_rank_per_family": 2,
+            "kmeans_cluster_count": configured_clusters,
+            "kmeans_parameters": {
+                "n_clusters": configured_clusters,
+                "random_state": int(embedding_configuration["cluster_contrast_random_state"]),
+                "batch_size": max(128, min(1024, fit_count)),
+                "n_init": int(embedding_configuration["cluster_contrast_kmeans_n_init"]),
+                "max_iter": 300,
+            },
+            "kmeans_cluster_counts": counts,
+            "kmeans_usable_row_count": fit_count,
+            "kmeans_n_iter": 2,
+            "svd_families": [
+                {
+                    "family_key": family,
+                    "item_cluster_ids": [0, 1],
+                    "local_contrast_count": 2,
+                    "weighted_matrix_shape": [2, 4],
+                    "weighted_matrix_sha256": _sha({"matrix": family, "scope": scope["scope_id"]}),
+                    "singular_value_count": 2,
+                    "singular_values_sha256": _sha(
+                        {"singular": family, "scope": scope["scope_id"]}
+                    ),
+                    "second_singular_value": 1.0,
+                    "numerical_rank_tolerance_float32": 1e-6,
+                    "numerical_rank": 2,
+                    "components_shape": [2, 4],
+                    "components_sha256": _sha({"components": family, "scope": scope["scope_id"]}),
+                }
+                for family in ("treatment", "residualized_interaction")
+            ],
+        }
+        component_coverage = []
+        for family in contrast_families:
+            component_ids = [f"{family}_component_{index}" for index in (1, 2)]
+            parents = [
+                _sha({"family": family, "component": component, "scope": scope["scope_id"]})
+                for component in component_ids
+            ]
+            component_coverage.append(
+                {
+                    "contrast_family": family,
+                    "raw_component_ids": component_ids,
+                    "raw_component_count": 2,
+                    "raw_positive_member_counts": [2, 2],
+                    "raw_negative_member_counts": [2, 2],
+                    "semantic_component_ids": component_ids,
+                    "semantic_component_count": 2,
+                    "semantic_member_counts": [2, 2],
+                    "embedding_clustered_component_ids": component_ids,
+                    "embedding_clustered_component_count": 2,
+                    "embedding_clustered_member_counts": [2, 2],
+                    "embedding_clustered_parent_collection_sha256": parents,
+                    "tfidf_semantic_retrieval_component_ids": component_ids,
+                    "tfidf_semantic_retrieval_component_count": 2,
+                    "tfidf_semantic_retrieval_member_counts": [2, 2],
+                    "tfidf_semantic_retrieval_parent_collection_sha256": parents,
+                    "tfidf_semantic_retrieval_parent_family": "embedding_clustered",
+                }
+            )
+        scopes.append(
+            {
+                **binding,
+                "token_bounded_row_count": 0,
+                "token_bounded_row_ids_sha256": _sha256_json([]),
+                "cluster_support_contract": support,
+                "raw_cluster_contrast_count": 4,
+                "raw_contrast_count_by_family": {family: 2 for family in contrast_families},
+                "semantic_cluster_contrast_count": 4,
+                "semantic_contrast_count_by_family": {family: 2 for family in contrast_families},
+                "semantic_member_count": 8,
+                "catalog_atom_count": 4,
+                "catalog_member_count": 8,
+                "catalog_grounded_component_count_by_family": {
+                    family: 2 for family in contrast_families
+                },
+                "semantic_mirror_catalog_atom_count": 4,
+                "semantic_mirror_catalog_member_count": 8,
+                "component_coverage_by_family": component_coverage,
+                "uncapped_semantic_projection": True,
+            }
+        )
+    body = {
+        "schema_version": STAGE1_EMBEDDING_CLUSTER_FEASIBILITY_AUDIT_SCHEMA,
+        "split_registry_content_sha256": _sha256_json(registry),
+        "embedding_configuration_sha256": _sha256_json(embedding_configuration),
+        "embedding_cache_identity_sha256": _sha256_json(embedding_cache_identity),
+        "cluster_support_contract_schema_version": EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA,
+        "required_svd_families": ["treatment", "residualized_interaction"],
+        "configured_cluster_count": configured_clusters,
+        "configured_max_components": int(
+            embedding_configuration["cluster_contrast_max_components"]
+        ),
+        "minimum_grounded_components_per_svd_family": 2,
+        "token_bounded_row_count": 0,
+        "token_bounded_row_ids_sha256": _sha256_json([]),
+        "scope_count": len(scopes),
+        "full_outer_scope_count": sum(row["scope_kind"] == "full_outer" for row in scopes),
+        "exact_inner_scope_count": sum(row["scope_kind"] == "exact_inner" for row in scopes),
+        "cumulative_spent_scope_count": sum(
+            row["scope_kind"] == "cumulative_spent" for row in scopes
+        ),
+        "scope_order": [row["scope_id"] for row in scopes],
+        "scopes": scopes,
+        "all_required_scopes_passed": True,
+        "heldout_text_accessed": False,
+        "heldout_labels_accessed": False,
+        "oracle_fields_accessed": False,
+        "cluster_configuration_adapted": False,
+        "fallback_used": False,
+        "rank_one_support_allowed": False,
+        "semantic_member_limit": None,
+    }
+    return {**body, "content_sha256": _sha256_json(body)}
 
 
 def _matched_pair_proofs(scope_id: str) -> dict:
@@ -752,12 +896,13 @@ def _write_hierarchy_spent_graph(
 def _build_bundle(
     tmp_path: Path,
     *,
-    inner_fold_count: int = 2,
+    inner_fold_count: int = 4,
     hierarchy_review_rounds: int | None = None,
     interaction_inner_folds: int = 3,
     tfidf_nested_calibration_folds: int = 3,
     root_graph_v2: bool = False,
     candidate_cache_build_identity: dict | None = None,
+    cluster_audit_mode: str = "valid",
 ) -> tuple[Path, Path]:
     if root_graph_v2 and hierarchy_review_rounds is None:
         raise ValueError("root_graph_v2 requires a hierarchy schedule")
@@ -861,10 +1006,31 @@ def _build_bundle(
                     "chunk_selection": "last",
                     "normalize_embeddings": True,
                     "max_seq_length": None,
+                    "cluster_contrast_n_clusters": 2,
+                    "cluster_contrast_max_components": 2,
+                    "cluster_contrast_random_state": 42,
+                    "cluster_contrast_kmeans_n_init": 20,
                 }
             },
         },
     }
+    cluster_audit = _cluster_feasibility_audit(
+        registry=wrapper_registry,
+        embedding_configuration=effective_config["architecture"]["multi_model_forest"][
+            "embedding_contrast"
+        ],
+        embedding_cache_identity=embedding_cache_identity,
+    )
+    if cluster_audit_mode == "tampered_grounding":
+        first_scope = cluster_audit["scopes"][0]
+        first_scope["catalog_grounded_component_count_by_family"][
+            "cluster_local_treatment_contrast_basis"
+        ] = 1
+        cluster_audit["content_sha256"] = _sha256_json(
+            {key: value for key, value in cluster_audit.items() if key != "content_sha256"}
+        )
+    elif cluster_audit_mode not in {"valid", "missing"}:
+        raise ValueError("unknown cluster_audit_mode")
     request_body = {
         "schema_version": STAGE1_BUNDLE_REQUEST_SCHEMA,
         "dataset": {
@@ -889,6 +1055,11 @@ def _build_bundle(
             "sentence_encoder_unfrozen": True,
         },
         "htr_input_nontruncation_audit": htr_audit,
+        **(
+            {"embedding_cluster_feasibility_audit": cluster_audit}
+            if cluster_audit_mode != "missing"
+            else {}
+        ),
         "exact_inner_contract": {
             "contract_module_available": True,
             "registry_matches_contract": True,
@@ -1215,6 +1386,26 @@ def test_authenticated_bundle_contract_projects_candidate_arguments_and_detects_
 
     tamper_target.write_bytes(tamper_target.read_bytes() + b"\n")
     with pytest.raises(ValueError, match="registered bytes changed"):
+        load_authenticated_stage1_bundle_for_hierarchy(manifest_path)
+
+
+def test_hierarchy_loader_requires_v5_cluster_feasibility_audit(tmp_path: Path):
+    manifest_path, _tamper_target = _build_bundle(
+        tmp_path,
+        cluster_audit_mode="missing",
+    )
+    with pytest.raises(ValueError, match="lacks its clustered-embedding feasibility audit"):
+        load_authenticated_stage1_bundle_for_hierarchy(manifest_path)
+
+
+def test_hierarchy_loader_semantically_rejects_rehashed_cluster_audit_tamper(
+    tmp_path: Path,
+):
+    manifest_path, _tamper_target = _build_bundle(
+        tmp_path,
+        cluster_audit_mode="tampered_grounding",
+    )
+    with pytest.raises(ValueError, match="clustered-embedding feasibility audit"):
         load_authenticated_stage1_bundle_for_hierarchy(manifest_path)
 
 

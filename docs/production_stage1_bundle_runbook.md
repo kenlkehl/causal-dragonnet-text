@@ -266,7 +266,7 @@ fails closed. Metadata and provenance persist `max_observed_token_count`,
 
 ### Global HTR input no-truncation contract
 
-The bundle request is `production_all_evidence_stage1_request_v4`. It carries
+The bundle request is `production_all_evidence_stage1_request_v5`. It carries
 the closed `production_stage1_htr_input_nontruncation_audit_v1`, which applies
 to `htr_neural` and the HTR subproducer of `matched_pair_uplift`. During
 preparation, before an embedding cache is built or loaded and before any Stage 1
@@ -363,8 +363,23 @@ reuses only byte-verified sealed components from the identical request.
 
 `--dry-run` authenticates and validates the cohort, config, model tree, cache,
 canonical split feasibility, exact-inner contract availability, and adapter
-readiness without writing outputs or fitting models. A blocked result is not a
-successful production readiness result.
+readiness without writing outputs, using a GPU, or fitting the supervised Stage
+1 estimators. It does run the frozen-cache cluster KMeans and label-conditioned
+local-contrast SVD readiness calculation described below. A blocked result is
+not a successful production readiness result.
+
+Clustered-embedding readiness is an execution preflight, not a row-count
+estimate. The wrapper runs the configured frozen-cache KMeans/local-contrast/SVD
+path in every ordered full, exact-inner, and cumulative-spent scope and requires
+both native local-contrast families to have genuine rank-two support and
+exact uncapped component preservation across raw records, semantic records,
+clustered catalog atoms, and their TF-IDF semantic-retrieval mirrors. Every
+component must retain nonempty members and identical mirror-parent linkage.
+The cache binding must also report zero token-bounded reconciliation rows. It
+fails closed before bundle output or GPU model fitting if any scope is
+infeasible. It never changes cluster counts or support thresholds, emits
+rank-one substitutes, reconciles mismatched cache text, or drops the clustered
+family.
 
 After the bundle completes, run the generic runtime canary directly against the
 one endpoint and model intended for this invocation. The canary performs the

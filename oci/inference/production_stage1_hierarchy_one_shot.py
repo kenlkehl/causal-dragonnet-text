@@ -32,12 +32,19 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
+import pandas as pd
+
 from ..config import (
     AgenticFeatureSearchConfig,
     AppliedInferenceConfig,
     ExplicitFeatureExtractionConfig,
 )
-from ..extraction import CONTRACT_LEXICAL_CONTEXT_VERSION, EXTRACTION_GROUPING_VERSION
+from ..extraction import (
+    COMPLETE_PAGED_VERSION,
+    CONTRACT_LEXICAL_CONTEXT_VERSION,
+    EXTRACTION_GROUPING_VERSION,
+    plan_complete_note_pages,
+)
 from ..extraction import VLLMFeatureExtractor
 from .adaptive_hierarchical_stage1_reconsideration import (
     AdaptiveReconsiderationConfig,
@@ -535,6 +542,7 @@ class ProductionSingleEndpointExplicitFeatureExtractionProvider(
             self._production_endpoint: self._production_model
         }:
             raise RuntimeError("production extraction resolved a substituted endpoint/model")
+        complete_paged = self.feature_config.extraction_context_strategy == COMPLETE_PAGED_VERSION
         extractor = ProductionSingleEndpointVLLMFeatureExtractor(
             specs=specs,
             mode=self.feature_config.vllm_mode,
@@ -558,7 +566,11 @@ class ProductionSingleEndpointExplicitFeatureExtractionProvider(
             temperature=self.feature_config.extraction_temperature,
             max_tokens=self.feature_config.extraction_max_tokens,
             max_text_length=self.feature_config.extraction_max_text_length,
-            context_strategy=getattr(self.feature_config, "extraction_context_strategy", "tail"),
+            context_strategy=(
+                COMPLETE_PAGED_VERSION
+                if complete_paged
+                else getattr(self.feature_config, "extraction_context_strategy", "tail")
+            ),
             source_text_temporally_valid_by_design=bool(
                 getattr(
                     self.feature_config,
@@ -566,12 +578,63 @@ class ProductionSingleEndpointExplicitFeatureExtractionProvider(
                     False,
                 )
             ),
+            schema_repair_attempts=1,
+            fail_closed=True,
         )
         try:
-            return extractor.extract_to_dataframe(
-                dataset[self.config.text_column].tolist(),
-                batch_size=self.feature_config.extraction_batch_size,
+            texts = dataset[self.config.text_column].astype(str).tolist()
+            if not complete_paged:
+                return extractor.extract_to_dataframe(
+                    texts, batch_size=self.feature_config.extraction_batch_size,
+                )
+            page_texts: list[str] = []
+            owners: list[int] = []
+            plans: list[list[dict[str, Any]]] = []
+            for owner, text in enumerate(texts):
+                pages = plan_complete_note_pages(text)
+                plans.append([page.as_dict() for page in pages])
+                for page in pages:
+                    page_texts.append(text[page.context_start:page.context_end])
+                    owners.append(owner)
+            planned = len(page_texts)
+            page_frame = extractor.extract_to_dataframe(
+                page_texts, batch_size=self.feature_config.extraction_batch_size,
             )
+            if len(page_frame) != planned:
+                raise RuntimeError("complete-note extraction omitted a planned page response")
+            rows: list[dict[str, Any]] = []
+            for owner in range(len(texts)):
+                indices = [index for index, value in enumerate(owners) if value == owner]
+                row: dict[str, Any] = {}
+                for spec in specs:
+                    value_column = f"explicit_feat_{spec.name}"
+                    missing_column = f"{value_column}_missing"
+                    values = [
+                        page_frame.iloc[index][value_column]
+                        for index in indices
+                        if not bool(page_frame.iloc[index][missing_column])
+                    ]
+                    distinct = list(dict.fromkeys(values))
+                    if len(distinct) > 1:
+                        # Conflicting page values require a contract-aware remote
+                        # reconciliation job.  Never silently select one.
+                        raise RuntimeError(
+                            f"complete-note extraction needs reconciliation for {spec.name}"
+                        )
+                    row[value_column] = distinct[0] if distinct else None
+                    row[missing_column] = not distinct
+                rows.append(row)
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            ledger = {
+                "schema_version": COMPLETE_PAGED_VERSION,
+                "planned_page_request_count": planned,
+                "completed_page_request_count": len(page_frame),
+                "plans": plans,
+                "raw_notes_copied_to_ledger": False,
+            }
+            ledger_path = self.output_dir / "complete_paged_request_ledger.json"
+            ledger_path.write_text(json.dumps(ledger, indent=2, sort_keys=True), encoding="utf-8")
+            return pd.DataFrame(rows)
         finally:
             extractor.cleanup()
 
@@ -645,12 +708,12 @@ class ProductionStage1HierarchyOneShotOptions:
     seed: int = 42
     proposal_max_tokens: int = 25_000
     extraction_max_tokens: int = 25_000
-    proposal_schema_repair_attempts: int = 2
-    request_max_retries: int = 3
+    proposal_schema_repair_attempts: int = 1
+    request_max_retries: int = 0
     request_timeout: float = 1_800.0
     extraction_batch_size: int = 128
     extraction_grouping_strategy: str = "packed"
-    extraction_context_strategy: str = "contract_lexical_rag"
+    extraction_context_strategy: str = "complete_paged_v1"
     extraction_max_text_length: int = 14_000
     extraction_prompt_version: str = EXTRACTION_PROMPT_VERSION
     post_extraction_review_max_operations: int = 4
@@ -731,7 +794,9 @@ def _validate_options(options: ProductionStage1HierarchyOneShotOptions) -> None:
         raise ValueError("review_stage1_bow_parallel_backend is unsupported")
     if options.extraction_grouping_strategy not in {"clinical_domain", "packed"}:
         raise ValueError("extraction_grouping_strategy is unsupported")
-    if options.extraction_context_strategy not in {"tail", "contract_lexical_rag"}:
+    if options.extraction_context_strategy not in {
+        "tail", "contract_lexical_rag", "complete_paged_v1"
+    }:
         raise ValueError("extraction_context_strategy is unsupported")
     if not str(options.extraction_prompt_version).strip():
         raise ValueError("extraction_prompt_version must be non-empty")
@@ -1434,8 +1499,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--proposal-max-tokens", type=int, default=25_000)
     parser.add_argument("--extraction-max-tokens", type=int, default=25_000)
-    parser.add_argument("--proposal-schema-repair-attempts", type=int, default=2)
-    parser.add_argument("--request-max-retries", type=int, default=3)
+    parser.add_argument("--proposal-schema-repair-attempts", type=int, default=1)
+    parser.add_argument("--request-max-retries", type=int, default=0)
     parser.add_argument("--request-timeout", type=float, default=1_800.0)
     parser.add_argument("--extraction-batch-size", type=int, default=128)
     parser.add_argument(
@@ -1445,8 +1510,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--extraction-context-strategy",
-        choices=("tail", "contract_lexical_rag"),
-        default="contract_lexical_rag",
+        choices=("tail", "contract_lexical_rag", "complete_paged_v1"),
+        default="complete_paged_v1",
     )
     parser.add_argument("--extraction-max-text-length", type=int, default=14_000)
     parser.add_argument("--extraction-prompt-version", default=EXTRACTION_PROMPT_VERSION)

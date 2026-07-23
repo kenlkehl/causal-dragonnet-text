@@ -237,7 +237,7 @@ fails closed. Metadata and provenance persist `max_observed_token_count`,
 
 ## Global HTR input no-truncation contract
 
-The bundle request is `production_all_evidence_stage1_request_v4`. It carries
+The bundle request is `production_all_evidence_stage1_request_v5`. It carries
 the closed `production_stage1_htr_input_nontruncation_audit_v1`, which applies
 to `htr_neural` and the HTR subproducer of `matched_pair_uplift`. During
 preparation, before an embedding cache is built or loaded and before any Stage 1

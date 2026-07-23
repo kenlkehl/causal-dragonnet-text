@@ -39,6 +39,7 @@ from oci.inference.production_stage1_bundle import (
     PRODUCTION_MATCHED_PAIR_REGISTERED_NATIVE_FAMILY_ADAPTERS,
     PRODUCTION_REGISTERED_NATIVE_FAMILY_ADAPTERS,
     STAGE1_BEHAVIOR_IDENTITY_SCHEMA,
+    STAGE1_EMBEDDING_CLUSTER_FEASIBILITY_AUDIT_SCHEMA,
     STAGE1_NATIVE_FAMILY_PROOF_INDEX_SCHEMA,
     STAGE1_NATIVE_FAMILY_PROOF_REGISTRATION_SCHEMA,
     STAGE1_QUERY_ARTIFACT_SCHEMA,
@@ -63,12 +64,17 @@ from oci.inference.production_stage1_bundle import (
     _write_neural_query_moment_artifact,
     _write_immutable_json,
     _write_raw_evidence_sidecar,
+    build_embedding_cluster_feasibility_audit,
     build_canonical_split_registry,
     build_parser,
     exact_inner_family_adapter_gate,
     main,
     options_from_args,
+    validate_embedding_cluster_feasibility_audit,
     validate_htr_input_nontruncation_audit,
+)
+from oci.inference.review_spent_evidence_provider import (
+    SpentOnlyFrozenChunkEmbeddingCache,
 )
 from oci.inference.tfidf_topic_discovery import row_set_fingerprint
 from oci.inference.stage1_exact_inner_evidence import CanonicalStage1SplitRegistry
@@ -132,6 +138,107 @@ def _valid_config(tmp_path: Path) -> tuple[AppliedInferenceConfig, Path]:
     forest.embedding_contrast.enabled = True
     forest.embedding_contrast.include_cluster_contrast_vectors = True
     return config, model_dir
+
+
+def _write_cluster_preflight_cache(
+    path: Path,
+    *,
+    texts: tuple[str, ...],
+    embeddings: np.ndarray,
+) -> SpentOnlyFrozenChunkEmbeddingCache:
+    path.mkdir(parents=True)
+    if embeddings.shape[0] != len(texts):
+        raise AssertionError("cluster-preflight cache needs one embedding per row")
+    np.save(path / "chunk_embeddings.npy", np.asarray(embeddings, dtype=np.float32))
+    np.save(path / "offsets.npy", np.arange(len(texts) + 1, dtype=np.int64))
+    (path / "metadata.json").write_text(
+        json.dumps(
+            {
+                "num_samples": len(texts),
+                "hidden_size": int(embeddings.shape[1]),
+                "chunk_size_words": 64,
+                "chunk_overlap_words": 0,
+                "max_chunks": 1,
+                "chunk_selection": "last",
+            }
+        ),
+        encoding="utf-8",
+    )
+    with (path / "chunk_texts.jsonl").open("w", encoding="utf-8") as handle:
+        for value in texts:
+            handle.write(json.dumps({"chunks": [value]}) + "\n")
+    return SpentOnlyFrozenChunkEmbeddingCache(path)
+
+
+def _cluster_preflight_case(tmp_path: Path) -> dict[str, object]:
+    config = AppliedInferenceConfig(cv_folds=2)
+    forest = config.architecture.multi_model_forest
+    forest.candidate_consistency_inner_folds = 4
+    embedding = forest.embedding_contrast
+    embedding.enabled = True
+    embedding.disable_reason = None
+    embedding.chunk_size_words = 64
+    embedding.chunk_overlap_words = 0
+    embedding.max_chunks = 1
+    embedding.chunk_selection = "last"
+    embedding.max_chunks_per_patient = 1
+    embedding.top_k_chunks_per_tail = 20
+    embedding.include_bow_phrases_as_concepts = False
+    embedding.concept_phrases = []
+    embedding.external_corpus_cache_dirs = []
+    embedding.cluster_contrast_n_clusters = 8
+    embedding.cluster_contrast_min_cluster_size = 10
+    embedding.cluster_contrast_min_group_size = 5
+    embedding.cluster_contrast_min_cell_size = 2
+    embedding.cluster_contrast_max_components = 3
+    embedding.cluster_contrast_top_loadings = 4
+    embedding.cluster_contrast_random_state = 42
+    embedding.cluster_contrast_kmeans_n_init = 3
+
+    rows: list[dict[str, object]] = []
+    vectors: list[np.ndarray] = []
+    for repetition in range(16):
+        for cluster in range(8):
+            for treatment, outcome in ((0, 0), (0, 1), (1, 0), (1, 1)):
+                concordant = treatment == outcome
+                text = " ".join(
+                    (
+                        f"clusterword{cluster}",
+                        "treatedword" if treatment else "untreatedword",
+                        "positiveword" if outcome else "negativeword",
+                        "concordantword" if concordant else "discordantword",
+                        f"repeatword{repetition}",
+                    )
+                )
+                rows.append(
+                    {
+                        config.text_column: text,
+                        config.treatment_column: treatment,
+                        config.outcome_column: outcome,
+                    }
+                )
+                vector = np.zeros(32, dtype=np.float32)
+                vector[cluster] = 20.0
+                vector[8 + cluster] = 1.5 if treatment else -1.5
+                vector[16 + cluster] = 1.25 if outcome else -1.25
+                vector[24 + cluster] = 1.0 if concordant else -1.0
+                vectors.append(vector)
+    modeling_data = pd.DataFrame(rows)
+    texts = tuple(modeling_data[config.text_column].astype(str))
+    cache = _write_cluster_preflight_cache(
+        tmp_path / "cluster_preflight_cache",
+        texts=texts,
+        embeddings=np.asarray(vectors, dtype=np.float32),
+    )
+    registry = build_canonical_split_registry(data=modeling_data, config=config, seed=42)
+    return {
+        "config": config,
+        "modeling_data": modeling_data,
+        "cache": cache,
+        "cache_identity": cache.identity(),
+        "registry": registry,
+        "registry_sha256": _sha256_json(registry),
+    }
 
 
 def _registry() -> dict:
@@ -1072,6 +1179,19 @@ def test_effective_config_requires_every_legacy_architecture(tmp_path: Path):
             seed=19,
         )
 
+    one_cluster_component = copy.deepcopy(config)
+    one_cluster_component.architecture.multi_model_forest.embedding_contrast.cluster_contrast_max_components = (
+        1
+    )
+    with pytest.raises(ValueError, match="at least two emitted components"):
+        _validate_effective_config(
+            one_cluster_component,
+            dataset_path=tmp_path / "cohort.parquet",
+            embedding_cache_dir=tmp_path / "cache",
+            config_dir=tmp_path,
+            seed=19,
+        )
+
 
 def test_htr_input_audit_is_lossless_and_closed(tmp_path: Path):
     config, model_dir = _valid_config(tmp_path)
@@ -1191,8 +1311,316 @@ def test_cache_configuration_requires_explicit_last_chunk_selection(
     _validate_cache_configuration(SimpleNamespace(metadata=metadata), config)
 
 
+def test_embedding_cluster_preflight_enumerates_all_native_scopes_with_real_catalogs(
+    tmp_path: Path,
+):
+    case = _cluster_preflight_case(tmp_path)
+    audit = build_embedding_cluster_feasibility_audit(
+        modeling_data=case["modeling_data"],
+        config=case["config"],
+        embedding_cache=case["cache"],
+        embedding_cache_identity=case["cache_identity"],
+        registry=case["registry"],
+        registry_content_sha256=case["registry_sha256"],
+    )
+    repeated_audit = build_embedding_cluster_feasibility_audit(
+        modeling_data=case["modeling_data"],
+        config=case["config"],
+        embedding_cache=case["cache"],
+        embedding_cache_identity=case["cache_identity"],
+        registry=case["registry"],
+        registry_content_sha256=case["registry_sha256"],
+    )
+    assert repeated_audit == audit
+    assert repeated_audit["content_sha256"] == audit["content_sha256"]
+
+    assert audit["schema_version"] == STAGE1_EMBEDDING_CLUSTER_FEASIBILITY_AUDIT_SCHEMA
+    assert audit["scope_count"] == 12
+    assert audit["full_outer_scope_count"] == 2
+    assert audit["exact_inner_scope_count"] == 8
+    assert audit["cumulative_spent_scope_count"] == 2
+    assert audit["scope_order"] == [row["scope_id"] for row in audit["scopes"]]
+    assert audit["token_bounded_row_count"] == 0
+    assert audit["token_bounded_row_ids_sha256"] == _sha256_json([])
+    assert all(row["catalog_atom_count"] > 0 for row in audit["scopes"])
+    assert all(row["catalog_member_count"] > 0 for row in audit["scopes"])
+    assert all(
+        all(value >= 2 for value in row["raw_contrast_count_by_family"].values())
+        and all(value >= 2 for value in row["semantic_contrast_count_by_family"].values())
+        and all(value >= 2 for value in row["catalog_grounded_component_count_by_family"].values())
+        for row in audit["scopes"]
+    )
+    assert all(
+        row["cluster_support_contract"]["kmeans_cluster_count"] == audit["configured_cluster_count"]
+        for row in audit["scopes"]
+    )
+    assert all(
+        row["token_bounded_row_count"] == 0
+        and row["token_bounded_row_ids_sha256"] == _sha256_json([])
+        and row["cluster_support_contract"]["kmeans_parameters"]
+        == {
+            "n_clusters": audit["configured_cluster_count"],
+            "random_state": 42,
+            "batch_size": max(128, min(1024, row["fit_row_count"])),
+            "n_init": 3,
+            "max_iter": 300,
+        }
+        for row in audit["scopes"]
+    )
+    for scope in audit["scopes"]:
+        assert scope["semantic_mirror_catalog_atom_count"] > 0
+        assert scope["semantic_mirror_catalog_member_count"] > 0
+        for coverage in scope["component_coverage_by_family"]:
+            component_ids = coverage["raw_component_ids"]
+            assert component_ids == coverage["semantic_component_ids"]
+            assert component_ids == coverage["embedding_clustered_component_ids"]
+            assert component_ids == coverage["tfidf_semantic_retrieval_component_ids"]
+            assert all(
+                coverage[field] == len(component_ids)
+                for field in (
+                    "raw_component_count",
+                    "semantic_component_count",
+                    "embedding_clustered_component_count",
+                    "tfidf_semantic_retrieval_component_count",
+                )
+            )
+            assert all(
+                all(count > 0 for count in coverage[field])
+                for field in (
+                    "raw_positive_member_counts",
+                    "raw_negative_member_counts",
+                    "semantic_member_counts",
+                    "embedding_clustered_member_counts",
+                    "tfidf_semantic_retrieval_member_counts",
+                )
+            )
+            assert (
+                coverage["semantic_member_counts"] == coverage["embedding_clustered_member_counts"]
+            )
+            assert (
+                coverage["semantic_member_counts"]
+                == coverage["tfidf_semantic_retrieval_member_counts"]
+            )
+            assert (
+                coverage["embedding_clustered_parent_collection_sha256"]
+                == coverage["tfidf_semantic_retrieval_parent_collection_sha256"]
+            )
+            assert coverage["tfidf_semantic_retrieval_parent_family"] == ("embedding_clustered")
+    assert all("kmeans_inertia" not in row["cluster_support_contract"] for row in audit["scopes"])
+    assert all(
+        {family["family_key"] for family in row["cluster_support_contract"]["svd_families"]}
+        == {"treatment", "residualized_interaction"}
+        for row in audit["scopes"]
+    )
+    assert all(
+        family["local_contrast_count"] >= 2
+        and family["numerical_rank"] >= 2
+        and family["second_singular_value"] > 0.0
+        for row in audit["scopes"]
+        for family in row["cluster_support_contract"]["svd_families"]
+    )
+    assert (
+        validate_embedding_cluster_feasibility_audit(
+            audit,
+            config=case["config"],
+            registry=case["registry"],
+            registry_content_sha256=case["registry_sha256"],
+            embedding_cache_identity=case["cache_identity"],
+        )
+        == audit
+    )
+
+    truncated = copy.deepcopy(audit)
+    truncated["scopes"].pop()
+    truncated["content_sha256"] = _sha256_json(
+        {key: value for key, value in truncated.items() if key != "content_sha256"}
+    )
+    with pytest.raises(ValueError, match="invalid closed envelope"):
+        validate_embedding_cluster_feasibility_audit(
+            truncated,
+            config=case["config"],
+            registry=case["registry"],
+            registry_content_sha256=case["registry_sha256"],
+            embedding_cache_identity=case["cache_identity"],
+        )
+
+    wrong_effective_k = copy.deepcopy(audit)
+    support = wrong_effective_k["scopes"][0]["cluster_support_contract"]
+    support["kmeans_cluster_count"] -= 1
+    support["kmeans_cluster_counts"][0] += support["kmeans_cluster_counts"].pop()
+    wrong_effective_k["content_sha256"] = _sha256_json(
+        {key: value for key, value in wrong_effective_k.items() if key != "content_sha256"}
+    )
+    with pytest.raises(ValueError, match="infeasible in outer_001_full"):
+        validate_embedding_cluster_feasibility_audit(
+            wrong_effective_k,
+            config=case["config"],
+            registry=case["registry"],
+            registry_content_sha256=case["registry_sha256"],
+            embedding_cache_identity=case["cache_identity"],
+        )
+
+    tamper_cases = []
+    missing_semantic = copy.deepcopy(audit)
+    missing_semantic["scopes"][0]["component_coverage_by_family"][0]["semantic_component_ids"][
+        0
+    ] = "missing-semantic-component"
+    tamper_cases.append(missing_semantic)
+    wrong_mirror_parent = copy.deepcopy(audit)
+    wrong_mirror_parent["scopes"][0]["component_coverage_by_family"][0][
+        "tfidf_semantic_retrieval_parent_collection_sha256"
+    ][0] = ("f" * 64)
+    tamper_cases.append(wrong_mirror_parent)
+    empty_member = copy.deepcopy(audit)
+    empty_member["scopes"][0]["component_coverage_by_family"][0][
+        "tfidf_semantic_retrieval_member_counts"
+    ][0] = 0
+    tamper_cases.append(empty_member)
+    wrong_parameters = copy.deepcopy(audit)
+    wrong_parameters["scopes"][0]["cluster_support_contract"]["kmeans_parameters"]["n_init"] += 1
+    tamper_cases.append(wrong_parameters)
+    for tampered in tamper_cases:
+        tampered["content_sha256"] = _sha256_json(
+            {key: value for key, value in tampered.items() if key != "content_sha256"}
+        )
+        with pytest.raises(ValueError, match="infeasible in outer_001_full"):
+            validate_embedding_cluster_feasibility_audit(
+                tampered,
+                config=case["config"],
+                registry=case["registry"],
+                registry_content_sha256=case["registry_sha256"],
+                embedding_cache_identity=case["cache_identity"],
+            )
+
+
+def test_embedding_cluster_preflight_rejects_token_bounded_cache_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    case = _cluster_preflight_case(tmp_path)
+    original_bind = case["cache"].bind_spent
+
+    def token_bounded_bind(row_ids, texts):
+        provider = original_bind(row_ids, texts)
+        provider.token_bounded_row_ids = (int(tuple(row_ids)[0]),)
+        return provider
+
+    monkeypatch.setattr(case["cache"], "bind_spent", token_bounded_bind)
+    with pytest.raises(
+        ValueError,
+        match="token-bounded text reconciliation in outer_001_full",
+    ):
+        build_embedding_cluster_feasibility_audit(
+            modeling_data=case["modeling_data"],
+            config=case["config"],
+            embedding_cache=case["cache"],
+            embedding_cache_identity=case["cache_identity"],
+            registry=case["registry"],
+            registry_content_sha256=case["registry_sha256"],
+        )
+
+
+def test_embedding_cluster_preflight_reports_first_infeasible_ordered_scope(
+    tmp_path: Path,
+):
+    case = _cluster_preflight_case(tmp_path)
+    failing_config = copy.deepcopy(case["config"])
+    failing_config.architecture.multi_model_forest.embedding_contrast.cluster_contrast_min_cluster_size = (
+        200
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"infeasible in outer_001_full; observed_cluster_summary=",
+    ):
+        build_embedding_cluster_feasibility_audit(
+            modeling_data=case["modeling_data"],
+            config=failing_config,
+            embedding_cache=case["cache"],
+            embedding_cache_identity=case["cache_identity"],
+            registry=case["registry"],
+            registry_content_sha256=case["registry_sha256"],
+        )
+
+
+def test_embedding_cluster_preflight_rejects_later_exact_scope_with_kmeans_but_no_svds(
+    tmp_path: Path,
+):
+    case = _cluster_preflight_case(tmp_path)
+    config = copy.deepcopy(case["config"])
+    embedding = config.architecture.multi_model_forest.embedding_contrast
+    embedding.cluster_contrast_min_group_size = 2
+    embedding.cluster_contrast_min_cell_size = 1
+    modeling_data = case["modeling_data"].copy(deep=True)
+    outer = case["registry"]["outer_folds"][1]
+    target_partition = set(outer["inner_folds"][3]["heldout_row_ids"])
+    for row_id in outer["fit_row_ids"]:
+        cluster = (int(row_id) // 4) % 8
+        if cluster == 0 or (cluster == 1 and int(row_id) in target_partition):
+            continue
+        modeling_data.loc[int(row_id), config.treatment_column] = 0
+        modeling_data.loc[int(row_id), config.outcome_column] = 0
+    target_cluster_rows = sorted(
+        row_id for row_id in target_partition if (int(row_id) // 4) % 8 == 1
+    )
+    assert len(target_cluster_rows) >= 4
+    balanced_cells = ((0, 0), (0, 1), (1, 0), (1, 1))
+    for index, row_id in enumerate(target_cluster_rows):
+        treatment, outcome = balanced_cells[index % len(balanced_cells)]
+        modeling_data.loc[int(row_id), config.treatment_column] = treatment
+        modeling_data.loc[int(row_id), config.outcome_column] = outcome
+
+    with pytest.raises(ValueError) as captured:
+        build_embedding_cluster_feasibility_audit(
+            modeling_data=modeling_data,
+            config=config,
+            embedding_cache=case["cache"],
+            embedding_cache_identity=case["cache_identity"],
+            registry=case["registry"],
+            registry_content_sha256=case["registry_sha256"],
+        )
+    message = str(captured.value)
+    assert "infeasible in outer_002_inner_004" in message
+    assert '"n_clusters":8' in message
+    assert '"usable_treatment_local_contrasts":1' in message
+    assert '"usable_residualized_interaction_local_contrasts":1' in message
+
+
+def test_builder_does_not_initialize_output_when_preflight_prepare_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_dir = tmp_path / "stage1_bundle"
+    builder = ProductionStage1BundleBuilder(
+        Stage1BundleBuildOptions(
+            dataset_path=tmp_path / "unused.parquet",
+            config_path=tmp_path / "unused.json",
+            embedding_cache_dir=tmp_path / "unused_cache",
+            output_dir=output_dir,
+            unit_id_column="person_key",
+        )
+    )
+    initialized = False
+
+    def fail_preflight_prepare():
+        raise ValueError("embedding clustered architecture is infeasible in outer_001_full")
+
+    def record_initialize(*_args, **_kwargs):
+        nonlocal initialized
+        initialized = True
+
+    monkeypatch.setattr(builder, "prepare", fail_preflight_prepare)
+    monkeypatch.setattr(builder, "_initialize_output", record_initialize)
+    with pytest.raises(ValueError, match="infeasible in outer_001_full"):
+        builder.build()
+    assert initialized is False
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize("token_bounded_row_ids", ((), (0,)))
 def test_prepare_projects_only_id_text_treatment_and_observed_outcome(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    token_bounded_row_ids: tuple[int, ...],
 ):
     config, _model_dir = _valid_config(tmp_path)
     dataset_path = tmp_path / "cohort.parquet"
@@ -1237,7 +1665,7 @@ def test_prepare_projects_only_id_text_treatment_and_observed_outcome(
         def bind_spent(self, row_ids, texts):
             assert tuple(row_ids) == tuple(range(len(projected)))
             assert len(texts) == len(projected)
-            return object()
+            return SimpleNamespace(token_bounded_row_ids=token_bounded_row_ids)
 
         def identity(self):
             return {"cache_sha256": "d" * 64, "row_count": self.row_count}
@@ -1254,7 +1682,12 @@ def test_prepare_projects_only_id_text_treatment_and_observed_outcome(
             "provider_identity": FakeCache(cache_dir).identity(),
         },
     )
-    prepared = ProductionStage1BundleBuilder(
+    cluster_audit = {"test_cluster_preflight": "closed"}
+    monkeypatch.setattr(
+        "oci.inference.production_stage1_bundle.build_embedding_cluster_feasibility_audit",
+        lambda **_kwargs: cluster_audit,
+    )
+    builder = ProductionStage1BundleBuilder(
         Stage1BundleBuildOptions(
             dataset_path=dataset_path,
             config_path=config_path,
@@ -1263,7 +1696,12 @@ def test_prepare_projects_only_id_text_treatment_and_observed_outcome(
             unit_id_column="person_key",
             dry_run=True,
         )
-    ).prepare()
+    )
+    if token_bounded_row_ids:
+        with pytest.raises(ValueError, match="token-bounded text reconciliation"):
+            builder.prepare()
+        return
+    prepared = builder.prepare()
     assert observed_columns == [
         "person_key",
         "clinical_text",
@@ -1280,6 +1718,7 @@ def test_prepare_projects_only_id_text_treatment_and_observed_outcome(
     assert prepared.request["security"]["htr_source_word_truncation_allowed"] is False
     assert prepared.request["security"]["htr_tokenizer_truncation_allowed"] is False
     assert prepared.request["htr_input_nontruncation_audit"]["chunk_cap_nonbinding"] is True
+    assert prepared.request["embedding_cluster_feasibility_audit"] == cluster_audit
     assert (
         prepared.request["htr_input_nontruncation_audit"]["tokenizer_truncation_allowed"] is False
     )

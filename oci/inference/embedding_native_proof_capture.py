@@ -23,22 +23,26 @@ import tempfile
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 
 from oci.config import EmbeddingContrastDiscoveryConfig
 
-from .embedding_contrast_discovery import _named_pseudo_targets
+from .embedding_contrast_discovery import (
+    _embedding_cluster_kmeans_parameters,
+    _named_pseudo_targets,
+)
 from .review_spent_evidence_provider import (
     BoundSpentFrozenChunkEmbeddingProvider,
     _FrozenCacheEmbeddingEvidenceGenerator,
     _embedding_concepts_only,
 )
 
-EMBEDDING_NATIVE_CAPTURE_SCHEMA = "production_embedding_native_capture_v1"
+EMBEDDING_NATIVE_CAPTURE_SCHEMA = "production_embedding_native_capture_v2"
 EMBEDDING_NATIVE_ARRAY_SCHEMA = "production_embedding_native_capture_array_v1"
+EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA = "production_embedding_cluster_support_contract_v1"
 SEMANTIC_RETRIEVAL_TRAINING_ONLY_SCHEMA = (
     "semantic_retrieval_training_only_exhaustive_no_selection_v1"
 )
@@ -68,6 +72,14 @@ _RETRIEVAL_KEYS = (
     "positive_external_chunks",
     "negative_external_chunks",
 )
+_REQUIRED_CLUSTER_SVD_FAMILIES = (
+    "treatment",
+    "residualized_interaction",
+)
+_CLUSTER_CONTRAST_FAMILY_BY_SVD_FAMILY = {
+    "treatment": "cluster_local_treatment_contrast_basis",
+    "residualized_interaction": ("cluster_local_residualized_interaction_contrast_basis"),
+}
 
 
 def _json_default(value: Any) -> Any:
@@ -226,6 +238,429 @@ class _ArrayStore:
             "content_sha256": _array_sha256(array),
         }
         return key
+
+
+def validate_embedding_cluster_support_state(
+    *,
+    kmeans_state: Mapping[str, Any] | None,
+    svd_states: Sequence[Mapping[str, Any]],
+    array_resolver: Callable[[Any], Any] | None = None,
+    expected_cluster_count: int | None = None,
+    expected_kmeans_configuration: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Require genuine two-family, rank-two cluster-local native state.
+
+    The clustered architecture is an SVD basis over multiple independently
+    supported cluster-local contrasts.  A single local direction, one SVD
+    family, or a rank-one matrix is not a substitute for that architecture.
+    This validator is shared by live capture finalization, persisted replay,
+    and the production feasibility preflight so those boundaries cannot drift.
+    """
+
+    resolve = array_resolver or (lambda value: value)
+    if not isinstance(kmeans_state, Mapping):
+        raise ValueError("clustered embedding state has no actual KMeans fit")
+    required_kmeans_fields = {
+        "fit_row_ids",
+        "parameters",
+        "usable_mask",
+        "cluster_labels",
+        "cluster_centers",
+        "cluster_counts",
+        "n_iter",
+        "inertia",
+    }
+    if set(kmeans_state) != required_kmeans_fields:
+        raise ValueError("clustered embedding KMeans state has an open or incomplete schema")
+    fit_rows = tuple(map(int, kmeans_state.get("fit_row_ids") or ()))
+    if not fit_rows or len(fit_rows) != len(set(fit_rows)) or any(row < 0 for row in fit_rows):
+        raise ValueError("clustered embedding KMeans fit rows are invalid")
+    usable = np.asarray(resolve(kmeans_state["usable_mask"]), dtype=np.bool_)
+    labels = np.asarray(resolve(kmeans_state["cluster_labels"]), dtype=np.int64)
+    centers = np.asarray(resolve(kmeans_state["cluster_centers"]), dtype=np.float64)
+    counts = np.asarray(resolve(kmeans_state["cluster_counts"]), dtype=np.int64)
+    parameters = kmeans_state.get("parameters")
+    required_kmeans_parameters = {
+        "n_clusters",
+        "random_state",
+        "batch_size",
+        "n_init",
+        "max_iter",
+    }
+    expected_parameters = None
+    if expected_kmeans_configuration is not None:
+        try:
+            expected_parameters = _embedding_cluster_kmeans_parameters(
+                expected_kmeans_configuration,
+                n_usable=int(np.sum(usable)),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("clustered embedding KMeans configuration is invalid") from exc
+        if expected_cluster_count is not None and expected_parameters["n_clusters"] != int(
+            expected_cluster_count
+        ):
+            raise ValueError("clustered embedding KMeans expectations disagree")
+    if (
+        usable.shape != (len(fit_rows),)
+        or labels.shape != usable.shape
+        or centers.ndim != 2
+        or counts.ndim != 1
+        or len(counts) < 2
+        or centers.shape[0] != len(counts)
+        or not np.isfinite(centers).all()
+        or np.any(counts < 0)
+        or not isinstance(parameters, Mapping)
+        or set(parameters) != required_kmeans_parameters
+        or any(
+            isinstance(parameters.get(field), bool) or not isinstance(parameters.get(field), int)
+            for field in required_kmeans_parameters
+        )
+        or int(parameters.get("n_clusters", -1)) != len(counts)
+        or (
+            expected_cluster_count is not None
+            and int(parameters.get("n_clusters", -1)) != int(expected_cluster_count)
+        )
+        or int(parameters.get("batch_size", 0)) < 1
+        or int(parameters.get("n_init", 0)) < 1
+        or int(parameters.get("max_iter", 0)) < 1
+        or (expected_parameters is not None and dict(parameters) != expected_parameters)
+    ):
+        raise ValueError("clustered embedding KMeans numerical state is invalid")
+    if (
+        np.any(labels[~usable] != -1)
+        or np.any(labels[usable] < 0)
+        or np.any(labels[usable] >= len(counts))
+        or not np.array_equal(
+            np.bincount(labels[usable], minlength=len(counts)).astype(np.int64),
+            counts,
+        )
+    ):
+        raise ValueError("clustered embedding KMeans labels and counts disagree")
+    try:
+        n_iter = int(kmeans_state.get("n_iter"))
+        inertia = float(kmeans_state.get("inertia"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("clustered embedding KMeans fit statistics are invalid") from exc
+    if n_iter < 1 or not np.isfinite(inertia) or inertia < 0.0:
+        raise ValueError("clustered embedding KMeans fit statistics are invalid")
+
+    if not isinstance(svd_states, Sequence) or isinstance(svd_states, (str, bytes)):
+        raise ValueError("clustered embedding SVD state inventory is invalid")
+    by_family: dict[str, Mapping[str, Any]] = {}
+    required_svd_fields = {
+        "family_key",
+        "item_cluster_ids",
+        "weighted_matrix",
+        "singular_values",
+        "components",
+    }
+    for raw in svd_states:
+        if not isinstance(raw, Mapping) or set(raw) != required_svd_fields:
+            raise ValueError("clustered embedding SVD state has an open or incomplete schema")
+        family = str(raw.get("family_key") or "")
+        if family in by_family:
+            raise ValueError("clustered embedding SVD family was emitted more than once")
+        by_family[family] = raw
+    if set(by_family) != set(_REQUIRED_CLUSTER_SVD_FAMILIES):
+        raise ValueError(
+            "clustered embedding proof requires treatment and residualized_interaction SVD state"
+        )
+
+    family_summaries: list[dict[str, Any]] = []
+    for family in _REQUIRED_CLUSTER_SVD_FAMILIES:
+        state = by_family[family]
+        cluster_ids = tuple(map(int, state.get("item_cluster_ids") or ()))
+        matrix = np.asarray(resolve(state["weighted_matrix"]), dtype=np.float64)
+        singular_values = np.asarray(resolve(state["singular_values"]), dtype=np.float64)
+        components = np.asarray(resolve(state["components"]), dtype=np.float64)
+        width = min(matrix.shape) if matrix.ndim == 2 else 0
+        if (
+            len(cluster_ids) < 2
+            or len(cluster_ids) != len(set(cluster_ids))
+            or any(cluster_id < 0 or cluster_id >= len(counts) for cluster_id in cluster_ids)
+            or matrix.ndim != 2
+            or matrix.shape[0] != len(cluster_ids)
+            or matrix.shape[1] != centers.shape[1]
+            or singular_values.ndim != 1
+            or singular_values.shape != (width,)
+            or components.ndim != 2
+            or components.shape != (width, matrix.shape[1])
+            or width < 2
+            or not np.isfinite(matrix).all()
+            or not np.isfinite(singular_values).all()
+            or not np.isfinite(components).all()
+        ):
+            raise ValueError(f"clustered embedding {family} SVD state is invalid")
+        actual_singular_values = np.linalg.svd(matrix, compute_uv=False)
+        rank_tolerance = float(
+            np.finfo(np.float32).eps * max(matrix.shape) * float(actual_singular_values[0])
+        )
+        numerical_rank = int(np.sum(actual_singular_values > rank_tolerance))
+        second_singular_value = float(actual_singular_values[1])
+        if (
+            numerical_rank < 2
+            or not np.allclose(
+                singular_values,
+                actual_singular_values,
+                rtol=2e-6,
+                atol=2e-7,
+            )
+            or any(int(counts[cluster_id]) < 1 for cluster_id in cluster_ids)
+            or float(actual_singular_values[0]) <= 0.0
+            or not np.isfinite(second_singular_value)
+            or second_singular_value <= rank_tolerance
+        ):
+            raise ValueError(f"clustered embedding {family} SVD must have genuine rank-two support")
+        family_summaries.append(
+            {
+                "family_key": family,
+                "item_cluster_ids": list(cluster_ids),
+                "local_contrast_count": len(cluster_ids),
+                "weighted_matrix_shape": list(matrix.shape),
+                "weighted_matrix_sha256": _array_sha256(matrix),
+                "singular_value_count": len(singular_values),
+                "singular_values_sha256": _array_sha256(singular_values),
+                "second_singular_value": second_singular_value,
+                "numerical_rank_tolerance_float32": rank_tolerance,
+                "numerical_rank": numerical_rank,
+                "components_shape": list(components.shape),
+                "components_sha256": _array_sha256(components),
+            }
+        )
+    contract = {
+        "schema_version": EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA,
+        "required_svd_families": list(_REQUIRED_CLUSTER_SVD_FAMILIES),
+        "minimum_distinct_local_clusters_per_family": 2,
+        "minimum_numerical_rank_per_family": 2,
+        "kmeans_cluster_count": len(counts),
+        "kmeans_parameters": dict(parameters),
+        "kmeans_cluster_counts": counts.tolist(),
+        "kmeans_usable_row_count": int(np.sum(usable)),
+        "kmeans_n_iter": n_iter,
+        "svd_families": family_summaries,
+    }
+    return validate_embedding_cluster_support_contract(
+        contract,
+        expected_cluster_count=expected_cluster_count,
+        expected_kmeans_configuration=expected_kmeans_configuration,
+    )
+
+
+def validate_embedding_cluster_support_contract(
+    contract: Mapping[str, Any],
+    *,
+    expected_cluster_count: int | None = None,
+    expected_kmeans_configuration: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate the closed JSON summary emitted by the native state validator."""
+
+    fields = {
+        "schema_version",
+        "required_svd_families",
+        "minimum_distinct_local_clusters_per_family",
+        "minimum_numerical_rank_per_family",
+        "kmeans_cluster_count",
+        "kmeans_parameters",
+        "kmeans_cluster_counts",
+        "kmeans_usable_row_count",
+        "kmeans_n_iter",
+        "svd_families",
+    }
+    family_fields = {
+        "family_key",
+        "item_cluster_ids",
+        "local_contrast_count",
+        "weighted_matrix_shape",
+        "weighted_matrix_sha256",
+        "singular_value_count",
+        "singular_values_sha256",
+        "second_singular_value",
+        "numerical_rank_tolerance_float32",
+        "numerical_rank",
+        "components_shape",
+        "components_sha256",
+    }
+    if not isinstance(contract, Mapping) or set(contract) != fields:
+        raise ValueError("embedding cluster support contract has an invalid closed schema")
+    counts_raw = contract.get("kmeans_cluster_counts")
+    families = contract.get("svd_families")
+    if (
+        contract.get("schema_version") != EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA
+        or contract.get("required_svd_families") != list(_REQUIRED_CLUSTER_SVD_FAMILIES)
+        or contract.get("minimum_distinct_local_clusters_per_family") != 2
+        or contract.get("minimum_numerical_rank_per_family") != 2
+        or not isinstance(counts_raw, list)
+        or not isinstance(families, list)
+        or len(families) != len(_REQUIRED_CLUSTER_SVD_FAMILIES)
+    ):
+        raise ValueError("embedding cluster support contract has invalid architecture fields")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in counts_raw
+    ):
+        raise ValueError("embedding cluster support contract has invalid KMeans counts")
+    cluster_count = contract.get("kmeans_cluster_count")
+    parameters = contract.get("kmeans_parameters")
+    usable_count = contract.get("kmeans_usable_row_count")
+    n_iter = contract.get("kmeans_n_iter")
+    required_kmeans_parameters = {
+        "n_clusters",
+        "random_state",
+        "batch_size",
+        "n_init",
+        "max_iter",
+    }
+    expected_parameters = None
+    if expected_kmeans_configuration is not None:
+        try:
+            expected_parameters = _embedding_cluster_kmeans_parameters(
+                expected_kmeans_configuration,
+                n_usable=int(usable_count),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("embedding cluster support has invalid KMeans configuration") from exc
+        if expected_cluster_count is not None and expected_parameters["n_clusters"] != int(
+            expected_cluster_count
+        ):
+            raise ValueError("embedding cluster support KMeans expectations disagree")
+    if (
+        isinstance(cluster_count, bool)
+        or not isinstance(cluster_count, int)
+        or cluster_count < 2
+        or cluster_count != len(counts_raw)
+        or not isinstance(parameters, Mapping)
+        or set(parameters) != required_kmeans_parameters
+        or any(
+            isinstance(parameters.get(field), bool) or not isinstance(parameters.get(field), int)
+            for field in required_kmeans_parameters
+        )
+        or parameters.get("n_clusters") != cluster_count
+        or int(parameters.get("batch_size", 0)) < 1
+        or int(parameters.get("n_init", 0)) < 1
+        or int(parameters.get("max_iter", 0)) < 1
+        or (expected_parameters is not None and dict(parameters) != expected_parameters)
+        or (expected_cluster_count is not None and cluster_count != int(expected_cluster_count))
+        or isinstance(usable_count, bool)
+        or not isinstance(usable_count, int)
+        or usable_count != sum(counts_raw)
+        or isinstance(n_iter, bool)
+        or not isinstance(n_iter, int)
+        or n_iter < 1
+    ):
+        raise ValueError("embedding cluster support contract has invalid KMeans statistics")
+
+    for expected_family, row in zip(_REQUIRED_CLUSTER_SVD_FAMILIES, families, strict=True):
+        if not isinstance(row, Mapping) or set(row) != family_fields:
+            raise ValueError("embedding cluster support SVD family has an invalid closed schema")
+        cluster_ids = row.get("item_cluster_ids")
+        local_count = row.get("local_contrast_count")
+        matrix_shape = row.get("weighted_matrix_shape")
+        singular_count = row.get("singular_value_count")
+        components_shape = row.get("components_shape")
+        numerical_rank = row.get("numerical_rank")
+        try:
+            second_singular = float(row.get("second_singular_value"))
+            rank_tolerance = float(row.get("numerical_rank_tolerance_float32"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("embedding cluster support has invalid rank statistics") from exc
+        if (
+            row.get("family_key") != expected_family
+            or not isinstance(cluster_ids, list)
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                or value >= cluster_count
+                for value in cluster_ids
+            )
+            or len(cluster_ids) != len(set(cluster_ids))
+            or isinstance(local_count, bool)
+            or not isinstance(local_count, int)
+            or local_count != len(cluster_ids)
+            or local_count < 2
+            or any(counts_raw[cluster_id] < 1 for cluster_id in cluster_ids)
+            or not isinstance(matrix_shape, list)
+            or len(matrix_shape) != 2
+            or any(isinstance(value, bool) or not isinstance(value, int) for value in matrix_shape)
+            or matrix_shape[0] != local_count
+            or matrix_shape[1] < 1
+            or isinstance(singular_count, bool)
+            or not isinstance(singular_count, int)
+            or singular_count != min(matrix_shape)
+            or singular_count < 2
+            or not isinstance(components_shape, list)
+            or components_shape != [singular_count, matrix_shape[1]]
+            or isinstance(numerical_rank, bool)
+            or not isinstance(numerical_rank, int)
+            or numerical_rank < 2
+            or numerical_rank > singular_count
+            or not np.isfinite(second_singular)
+            or not np.isfinite(rank_tolerance)
+            or rank_tolerance < 0.0
+            or second_singular <= rank_tolerance
+            or any(
+                _SHA256.fullmatch(str(row.get(field) or "")) is None
+                for field in (
+                    "weighted_matrix_sha256",
+                    "singular_values_sha256",
+                    "components_sha256",
+                )
+            )
+        ):
+            raise ValueError(
+                f"embedding cluster support contract has invalid {expected_family} SVD support"
+            )
+    return _clone(dict(contract))
+
+
+def _validate_embedding_cluster_component_coverage(
+    *,
+    raw_evidence: Mapping[str, Any],
+    semantic_evidence: Mapping[str, Any],
+    configured_max_components: int,
+) -> None:
+    if int(configured_max_components) < 2:
+        raise ValueError("clustered embedding configuration allows fewer than two components")
+    for family in _REQUIRED_CLUSTER_SVD_FAMILIES:
+        contrast_family = _CLUSTER_CONTRAST_FAMILY_BY_SVD_FAMILY[family]
+        raw_rows = [
+            row
+            for row in raw_evidence.get("contrasts") or ()
+            if isinstance(row, Mapping) and row.get("contrast_family") == contrast_family
+        ]
+        semantic_rows = [
+            row
+            for row in semantic_evidence.get("contrasts") or ()
+            if isinstance(row, Mapping) and row.get("contrast_family") == contrast_family
+        ]
+        raw_names = [str(row.get("name") or "") for row in raw_rows]
+        semantic_names = [str(row.get("name") or "") for row in semantic_rows]
+        raw_tail_counts = [
+            (
+                sum(
+                    len(row.get(key) or ())
+                    for key in ("positive_aligned_chunks", "positive_external_chunks")
+                ),
+                sum(
+                    len(row.get(key) or ())
+                    for key in ("negative_aligned_chunks", "negative_external_chunks")
+                ),
+            )
+            for row in raw_rows
+        ]
+        semantic_member_counts = [
+            len(row.get("concept_probe_scores") or ()) for row in semantic_rows
+        ]
+        if (
+            len(raw_names) < 2
+            or any(not name for name in raw_names)
+            or len(raw_names) != len(set(raw_names))
+            or semantic_names != raw_names
+            or any(positive < 1 or negative < 1 for positive, negative in raw_tail_counts)
+            or any(count < 1 for count in semantic_member_counts)
+        ):
+            raise ValueError(
+                f"clustered embedding {family} family lacks an exact nonempty semantic projection"
+            )
 
 
 def _finite_vector(value: Any, *, name: str, length: int) -> np.ndarray:
@@ -775,10 +1210,30 @@ class NativeEmbeddingProofCaptureSink:
             or self._semantic_bundle is None
         ):
             raise RuntimeError("embedding proof capture observed no native build")
-        if self.embedding_config.get("include_cluster_contrast_vectors") is True and (
-            self._kmeans_state is None or not self._svd_states
-        ):
-            raise RuntimeError("clustered embedding proof has no actual KMeans/SVD state")
+        cluster_support_contract = None
+        if self.embedding_config.get("include_cluster_contrast_vectors") is True:
+            try:
+                cluster_support_contract = validate_embedding_cluster_support_state(
+                    kmeans_state=self._kmeans_state,
+                    svd_states=self._svd_states,
+                    array_resolver=lambda key: self._store.arrays[str(key)],
+                    expected_cluster_count=int(
+                        self.embedding_config["cluster_contrast_n_clusters"]
+                    ),
+                    expected_kmeans_configuration=self.embedding_config,
+                )
+                _validate_embedding_cluster_component_coverage(
+                    raw_evidence=self._raw_evidence,
+                    semantic_evidence=self._semantic_bundle["full"],
+                    configured_max_components=int(
+                        self.embedding_config["cluster_contrast_max_components"]
+                    ),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "clustered embedding proof lacks genuine two-family rank-two "
+                    "KMeans/SVD state"
+                ) from exc
         self.artifact_dir.mkdir(parents=True, exist_ok=False)
         arrays_path = self.artifact_dir / "arrays.npz"
         _atomic_write_npz(arrays_path, self._store.arrays)
@@ -827,6 +1282,7 @@ class NativeEmbeddingProofCaptureSink:
             "build": self._build_state,
             "cluster_kmeans": self._kmeans_state,
             "cluster_svds": self._svd_states,
+            "cluster_support_contract": cluster_support_contract,
             "array_inventory": self._store.inventory,
             "array_file": arrays_path.name,
             "array_file_sha256": _sha256_file(arrays_path),
@@ -928,6 +1384,7 @@ def _load_capture(
         "build",
         "cluster_kmeans",
         "cluster_svds",
+        "cluster_support_contract",
         "array_inventory",
         "array_file",
         "array_file_sha256",
@@ -1268,9 +1725,36 @@ def validate_embedding_native_capture(
         or semantic["calibration_canary"] != evidence["semantic_calibration_replay_canary"]
     ):
         raise RuntimeError("semantic retrieval exhaustive projection differs on replay")
+    _validate_embedding_cluster_component_coverage(
+        raw_evidence=replayed,
+        semantic_evidence=semantic["full"],
+        configured_max_components=int(
+            metadata["embedding_config"]["cluster_contrast_max_components"]
+        ),
+    )
     captured_kmeans = metadata.get("cluster_kmeans")
-    if not isinstance(captured_kmeans, Mapping) or observer.kmeans is None:
-        raise ValueError("embedding clustered proof has no replayable KMeans state")
+    captured_svds = metadata.get("cluster_svds")
+    if (
+        not isinstance(captured_kmeans, Mapping)
+        or not isinstance(captured_svds, list)
+        or observer.kmeans is None
+    ):
+        raise ValueError("embedding clustered proof has no replayable KMeans/SVD state")
+    captured_support = validate_embedding_cluster_support_state(
+        kmeans_state=captured_kmeans,
+        svd_states=captured_svds,
+        array_resolver=lambda key: arrays[str(key)],
+        expected_cluster_count=int(metadata["embedding_config"]["cluster_contrast_n_clusters"]),
+        expected_kmeans_configuration=metadata["embedding_config"],
+    )
+    if metadata.get("cluster_support_contract") != captured_support:
+        raise ValueError("embedding clustered support contract changed")
+    validate_embedding_cluster_support_state(
+        kmeans_state=observer.kmeans,
+        svd_states=observer.svds,
+        expected_cluster_count=int(metadata["embedding_config"]["cluster_contrast_n_clusters"]),
+        expected_kmeans_configuration=metadata["embedding_config"],
+    )
     if (
         captured_kmeans.get("fit_row_ids") != observer.kmeans["fit_row_ids"]
         or captured_kmeans.get("parameters") != observer.kmeans["parameters"]
@@ -1289,8 +1773,7 @@ def validate_embedding_native_capture(
             observer.kmeans[field],
             name=f"cluster_kmeans.{field}",
         )
-    captured_svds = metadata.get("cluster_svds")
-    if not isinstance(captured_svds, list) or len(captured_svds) != len(observer.svds):
+    if len(captured_svds) != len(observer.svds):
         raise ValueError("embedding native SVD state inventory differs on replay")
     for index, (captured, replay_svd) in enumerate(zip(captured_svds, observer.svds)):
         if (
@@ -1308,10 +1791,13 @@ def validate_embedding_native_capture(
 
 
 __all__ = [
+    "EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA",
     "EMBEDDING_NATIVE_CAPTURE_SCHEMA",
     "SEMANTIC_RETRIEVAL_TRAINING_ONLY_SCHEMA",
     "NativeEmbeddingProofCaptureSink",
     "build_semantic_retrieval_training_only_policy",
     "semantic_retrieval_projection_bundle",
+    "validate_embedding_cluster_support_contract",
+    "validate_embedding_cluster_support_state",
     "validate_embedding_native_capture",
 ]
