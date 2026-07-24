@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import builtins
 from contextlib import nullcontext
+import hashlib
 import json
 import logging
 import multiprocessing as mp
 from dataclasses import asdict
 from pathlib import Path
 import sys
+import tempfile
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import joblib
@@ -41,6 +44,33 @@ TFIDF_TOPIC_SPLIT_SCHEMA_VERSION = "tfidf_topic_joint_treatment_outcome_v1"
 TFIDF_TOPIC_DATASET_FINGERPRINT_VERSION = "tfidf_topic_model_inputs_v1"
 _DEFAULT_STAGE1_SEED = 42
 TFIDF_NESTED_CALIBRATION_SCHEMA_VERSION = "tfidf_nested_fit_calibration_v1"
+
+
+def _serialized_loky_import_bootstrap(
+    *,
+    module_name: str,
+    lock_identity: str,
+) -> Dict[str, Any]:
+    """Serialize heavy worker imports across loky children on FUSE/SSHFS."""
+
+    lock_digest = hashlib.sha256(
+        str(lock_identity).encode("utf-8")
+    ).hexdigest()
+    lock_path = (
+        Path(tempfile.gettempdir())
+        / f"oci-stage1-loky-import-{lock_digest}.lock"
+    )
+    code = (
+        "import fcntl, importlib\n"
+        f"with open({str(lock_path)!r}, 'a+b') as _oci_import_lock:\n"
+        "    fcntl.flock(_oci_import_lock.fileno(), fcntl.LOCK_EX)\n"
+        f"    importlib.import_module({str(module_name)!r})\n"
+        "    fcntl.flock(_oci_import_lock.fileno(), fcntl.LOCK_UN)\n"
+    )
+    return {
+        "initializer": builtins.exec,
+        "initargs": (code,),
+    }
 
 
 def _float_hex_sha256(values: Sequence[float]) -> str:
@@ -111,6 +141,13 @@ def _configured_seed(config: AppliedInferenceConfig) -> int:
     controls every v2 outer and inner split.
     """
     return int(getattr(config, "seed", _DEFAULT_STAGE1_SEED))
+
+
+def _tfidf_context_scope_seed(*, global_seed: int, scope_id: str) -> int:
+    digest = hashlib.sha256(
+        f"{int(global_seed)}\0{str(scope_id)}".encode("utf-8")
+    ).digest()
+    return int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
 
 
 def make_joint_treatment_outcome_splits(
@@ -911,6 +948,19 @@ def _fit_tfidf_topic_stage1_spec(
     limit_native_threads: bool,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Pickle-safe joblib worker for one fold-isolated Stage 1 context."""
+    from .production_stage1_scope_scheduler import (
+        _enforce_stage1_torch_determinism,
+        seed_stage1_scope_rngs,
+    )
+
+    expected_seed = _tfidf_context_scope_seed(
+        global_seed=_configured_seed(config),
+        scope_id=str(spec["scope_id"]),
+    )
+    if int(spec.get("worker_scope_seed", -1)) != expected_seed:
+        raise ValueError("TF-IDF context worker seed binding changed")
+    _enforce_stage1_torch_determinism()
+    seed_stage1_scope_rngs(expected_seed, gpu_id=None)
     thread_limit = threadpool_limits(limits=1) if limit_native_threads else nullcontext()
     with thread_limit:
         return _fit_tfidf_topic_stage1_spec_impl(
@@ -922,6 +972,56 @@ def _fit_tfidf_topic_stage1_spec(
             split_semantics_hash=split_semantics_hash,
             split_schema_version=split_schema_version,
         )
+
+
+def _build_tfidf_worker_context_spec(
+    *,
+    outer_fold: int,
+    inner_fold: int | None,
+    scope: str,
+    fold_key: int,
+    fit_df: pd.DataFrame,
+    heldout_df: pd.DataFrame,
+    scope_id: str,
+    config: AppliedInferenceConfig,
+) -> Dict[str, Any]:
+    """Build one serialized worker input with production heldout isolation."""
+
+    strict_text_only = (
+        str(
+            config.architecture.multi_model_forest.tfidf_topic.score_selection_label_policy
+        )
+        == "nested_fit_calibration"
+    )
+    if strict_text_only:
+        required = {"_oci_row_id", config.text_column}
+        missing = sorted(required - set(heldout_df.columns))
+        if missing:
+            raise ValueError(
+                "TF-IDF heldout projection lacks ID/text: " + ", ".join(missing)
+            )
+        serialized_heldout = heldout_df.loc[
+            :, ["_oci_row_id", config.text_column]
+        ].copy()
+    else:
+        # Historical non-production policies still perform registered-context
+        # heldout score tests and are retained for compatibility. The supported
+        # production bundle requires nested_fit_calibration above.
+        serialized_heldout = heldout_df.copy()
+    return {
+        "outer_fold": int(outer_fold),
+        "inner_fold": inner_fold,
+        "scope": str(scope),
+        "fold_key": int(fold_key),
+        "fit_df": fit_df.copy(),
+        "heldout_df": serialized_heldout,
+        "scope_id": str(scope_id),
+        "worker_scope_seed": _tfidf_context_scope_seed(
+            global_seed=_configured_seed(config),
+            scope_id=str(scope_id),
+        ),
+        "registered_heldout_labels_serialized": not strict_text_only,
+    }
 
 
 def run_tfidf_topic_stage1(
@@ -1008,26 +1108,28 @@ def run_tfidf_topic_stage1(
                 }
             )
             context_specs.append(
-                {
-                    "outer_fold": int(outer_fold),
-                    "inner_fold": int(inner_fold),
-                    "scope": "candidate_selection_inner_fit",
-                    "fold_key": 1000 * int(outer_fold) + int(inner_fold),
-                    "fit_df": inner_fit,
-                    "heldout_df": inner_heldout,
-                    "scope_id": f"outer_{outer_fold:03d}_inner_{inner_fold:03d}",
-                }
+                _build_tfidf_worker_context_spec(
+                    outer_fold=int(outer_fold),
+                    inner_fold=int(inner_fold),
+                    scope="candidate_selection_inner_fit",
+                    fold_key=1000 * int(outer_fold) + int(inner_fold),
+                    fit_df=inner_fit,
+                    heldout_df=inner_heldout,
+                    scope_id=f"outer_{outer_fold:03d}_inner_{inner_fold:03d}",
+                    config=config,
+                )
             )
         context_specs.append(
-            {
-                "outer_fold": int(outer_fold),
-                "inner_fold": None,
-                "scope": "full_outer_train",
-                "fold_key": int(outer_fold),
-                "fit_df": outer_train,
-                "heldout_df": outer_test,
-                "scope_id": f"outer_{outer_fold:03d}_full_train",
-            }
+            _build_tfidf_worker_context_spec(
+                outer_fold=int(outer_fold),
+                inner_fold=None,
+                scope="full_outer_train",
+                fold_key=int(outer_fold),
+                fit_df=outer_train,
+                heldout_df=outer_test,
+                scope_id=f"outer_{outer_fold:03d}_full_train",
+                config=config,
+            )
         )
         split_rows.append(outer_split_row)
         all_context_specs.extend(context_specs)
@@ -1062,7 +1164,19 @@ def run_tfidf_topic_stage1(
     if joblib_backend == "loky":
         parallel_kwargs["inner_max_num_threads"] = 1
     with parallel_config(**parallel_kwargs):
-        completed_contexts = Parallel(batch_size=1, pre_dispatch="all")(
+        worker_bootstrap = (
+            _serialized_loky_import_bootstrap(
+                module_name=__name__,
+                lock_identity=str(contexts_dir.resolve()),
+            )
+            if joblib_backend == "loky"
+            else {}
+        )
+        completed_contexts = Parallel(
+            batch_size=1,
+            pre_dispatch="all",
+            **worker_bootstrap,
+        )(
             delayed(_fit_tfidf_topic_stage1_spec)(
                 spec,
                 contexts_dir=contexts_dir,

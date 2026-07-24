@@ -11,8 +11,10 @@ from joblib import Parallel, delayed, parallel_config
 from oci.config import AppliedInferenceConfig, ModelArchitectureConfig, MultiModelForestConfig
 from oci.inference.tfidf_topic_discovery import row_set_fingerprint, stable_hash
 from oci.inference.tfidf_topic_stage1 import (
+    _build_tfidf_worker_context_spec,
     _fit_tfidf_topic_stage1_spec,
     _resolve_tfidf_topic_stage1_parallel_backend,
+    _tfidf_context_scope_seed,
 )
 from scripts.run_tfidf_topic_stage1_from_primary_splits import (
     _apply_fork_guard_environment,
@@ -119,6 +121,66 @@ def test_parallel_backend_mapping_keeps_existing_semantics(monkeypatch):
     )
 
 
+def test_nested_production_worker_spec_serializes_no_heldout_labels():
+    config = _config("processes")
+    config.architecture.multi_model_forest.tfidf_topic.score_selection_label_policy = (
+        "nested_fit_calibration"
+    )
+    fit = pd.DataFrame(
+        {
+            "_oci_row_id": [0, 1],
+            "clinical_text": ["fit alpha", "fit beta"],
+            "treatment_indicator": [0, 1],
+            "outcome_indicator": [0, 1],
+        }
+    )
+    heldout = pd.DataFrame(
+        {
+            "_oci_row_id": [2, 3],
+            "clinical_text": ["heldout gamma", "heldout delta"],
+            "treatment_indicator": [0, 1],
+            "outcome_indicator": [1, 0],
+        }
+    )
+    mutated = heldout.copy()
+    mutated["treatment_indicator"] = [1, 0]
+    mutated["outcome_indicator"] = [0, 1]
+
+    first = _build_tfidf_worker_context_spec(
+        outer_fold=1,
+        inner_fold=1,
+        scope="candidate_selection_inner_fit",
+        fold_key=1001,
+        fit_df=fit,
+        heldout_df=heldout,
+        scope_id="outer_001_inner_001",
+        config=config,
+    )
+    second = _build_tfidf_worker_context_spec(
+        outer_fold=1,
+        inner_fold=1,
+        scope="candidate_selection_inner_fit",
+        fold_key=1001,
+        fit_df=fit,
+        heldout_df=mutated,
+        scope_id="outer_001_inner_001",
+        config=config,
+    )
+
+    assert list(first["heldout_df"].columns) == [
+        "_oci_row_id",
+        "clinical_text",
+    ]
+    assert first["registered_heldout_labels_serialized"] is False
+    pd.testing.assert_frame_equal(first["heldout_df"], second["heldout_df"])
+    serialized = json.dumps(
+        first["heldout_df"].to_dict(orient="list"),
+        sort_keys=True,
+    )
+    assert "treatment_indicator" not in serialized
+    assert "outcome_indicator" not in serialized
+
+
 def test_multiprocessing_backend_fails_closed_without_linux_fork(monkeypatch):
     monkeypatch.setattr("oci.inference.tfidf_topic_stage1.sys.platform", "linux")
     monkeypatch.setattr(
@@ -187,6 +249,10 @@ def _cached_spec(
         "scope": "full_outer_train",
         "fit_df": fit_df,
         "heldout_df": heldout_df,
+        "worker_scope_seed": _tfidf_context_scope_seed(
+            global_seed=int(getattr(config, "seed", 42)),
+            scope_id=scope_id,
+        ),
     }
 
 

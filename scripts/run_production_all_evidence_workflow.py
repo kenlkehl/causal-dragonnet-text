@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the resumable production all-evidence causal workflow."""
+"""Run the resumable all-evidence workflow or its isolated Stage 1 boundary."""
 
 from oci.inference.production_all_evidence_workflow import main
 

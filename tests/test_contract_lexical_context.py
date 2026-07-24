@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from oci.config import (
     AppliedInferenceConfig,
     ExplicitFeatureExtractionConfig,
@@ -301,7 +303,7 @@ def _cli_args(tmp_path: Path, *extra: str):
 
 def test_fusion_cli_wires_packed_contract_rag_and_composite_cache_identity(tmp_path):
     default_args = _cli_args(tmp_path)
-    rag_args = _cli_args(
+    invalid_grouped_review_args = _cli_args(
         tmp_path,
         "--extraction-grouping-strategy",
         "packed",
@@ -312,11 +314,36 @@ def test_fusion_cli_wires_packed_contract_rag_and_composite_cache_identity(tmp_p
         "--extraction-max-text-length",
         "12000",
     )
+    with pytest.raises(
+        ValueError,
+        match="max-variables-per-extraction-request 1",
+    ):
+        fusion_cli.build_applied_inference_config(invalid_grouped_review_args)
+
+    # Adaptive review is mandatory in the current production contract and
+    # changed-only extraction must remain contract-local. "packed" therefore
+    # has a cap of one here; the context strategy and grouping identity are
+    # still independently wired and cache-bound.
+    rag_args = _cli_args(
+        tmp_path,
+        "--extraction-grouping-strategy",
+        "packed",
+        "--max-variables-per-extraction-request",
+        "1",
+        "--extraction-context-strategy",
+        "contract_lexical_rag",
+        "--extraction-max-text-length",
+        "12000",
+        "--review-stage1-config",
+        str(tmp_path / "review-stage1.json"),
+        "--review-embedding-cache-dir",
+        str(tmp_path / "review-embedding-cache"),
+    )
 
     config = fusion_cli.build_applied_inference_config(rag_args)
 
     assert config.explicit_features.extraction_grouping_strategy == "packed"
-    assert config.explicit_features.max_variables_per_extraction_request == 4
+    assert config.explicit_features.max_variables_per_extraction_request == 1
     assert config.explicit_features.extraction_context_strategy == "contract_lexical_rag"
     assert config.explicit_features.extraction_max_text_length == 12000
     assert fusion_cli.extraction_prompt_cache_identity(default_args).startswith(

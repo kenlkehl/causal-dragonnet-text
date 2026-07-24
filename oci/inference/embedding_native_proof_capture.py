@@ -76,6 +76,7 @@ _REQUIRED_CLUSTER_SVD_FAMILIES = (
     "treatment",
     "residualized_interaction",
 )
+LOGICAL_FROZEN_EMBEDDING_CACHE_URI = "production://logical-frozen-embedding-cache/cache-dir-v1"
 _CLUSTER_CONTRAST_FAMILY_BY_SVD_FAMILY = {
     "treatment": "cluster_local_treatment_contrast_basis",
     "residualized_interaction": ("cluster_local_residualized_interaction_contrast_basis"),
@@ -670,7 +671,9 @@ def _finite_vector(value: Any, *, name: str, length: int) -> np.ndarray:
     return array
 
 
-def _embedding_config_mapping(value: Any) -> dict[str, Any]:
+def canonical_logical_embedding_config(value: Any) -> dict[str, Any]:
+    """Return scientific embedding settings independent of a physical cache path."""
+
     if isinstance(value, Mapping):
         raw = dict(value)
     elif is_dataclass(value):
@@ -678,6 +681,20 @@ def _embedding_config_mapping(value: Any) -> dict[str, Any]:
     else:
         raw = vars(value)
     config = _clone(raw)
+    # ``cache_dir`` is an execution capability, not a scientific
+    # hyperparameter.  Every isolated scope receives a different physical
+    # fit-only cache view, while the separately authenticated provider identity
+    # binds all of those views to the same logical source cache.  Persisting the
+    # physical path here would make otherwise identical scientific proofs
+    # differ solely because of their recovery/attempt location.
+    if "cache_dir" not in config:
+        raise ValueError("embedding native configuration lacks cache_dir")
+    config["cache_dir"] = LOGICAL_FROZEN_EMBEDDING_CACHE_URI
+    return config
+
+
+def _embedding_config_mapping(value: Any) -> dict[str, Any]:
+    config = canonical_logical_embedding_config(value)
     # The frozen-cache generator deliberately disables every external or
     # language-model concept source.  Its native proof may not weaken that.
     if (

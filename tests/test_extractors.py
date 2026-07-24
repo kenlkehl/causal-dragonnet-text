@@ -356,9 +356,23 @@ class TestHierarchicalTransformer:
         assert bert._effective_sentence_encoder_backend() == "transformers"
         assert bert._effective_sentence_pooling() == "cls"
 
-        qwen = HierarchicalTransformerExtractor(sentence_encoder_model="Qwen/Qwen3-Embedding-0.6B")
+        # The production HTR default is now trainable. An auto-selected
+        # sentence-transformers backend is therefore appropriate only when the
+        # encoder is explicitly frozen.
+        qwen = HierarchicalTransformerExtractor(
+            sentence_encoder_model="Qwen/Qwen3-Embedding-0.6B",
+            freeze_sentence_encoder=True,
+        )
         assert qwen._effective_sentence_encoder_backend() == "sentence_transformers"
         assert qwen._effective_sentence_pooling() == "last"
+
+        default_trainable_qwen = HierarchicalTransformerExtractor(
+            sentence_encoder_model="Qwen/Qwen3-Embedding-0.6B",
+        )
+        assert (
+            default_trainable_qwen._effective_sentence_encoder_backend()
+            == "transformers"
+        )
 
         trainable_qwen = HierarchicalTransformerExtractor(
             sentence_encoder_model="Qwen/Qwen3-Embedding-0.6B",

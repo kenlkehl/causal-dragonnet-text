@@ -32,6 +32,8 @@ from oci.inference.production_stage1_bundle import (
     STAGE1_BUNDLE_MANIFEST_SCHEMA,
     STAGE1_BUNDLE_REQUEST_SCHEMA,
     STAGE1_CUMULATIVE_ALL_TEN_ROOT_INDEX_SCHEMA,
+    STAGE1_EMBEDDING_CLUSTER_FIT_IDENTITY_SCHEMA,
+    STAGE1_EMBEDDING_CLUSTER_FIT_INDEX_SCHEMA,
     STAGE1_EXACT_INNER_ROOT_INDEX_SCHEMA,
     STAGE1_EMBEDDING_CLUSTER_FEASIBILITY_AUDIT_SCHEMA,
     STAGE1_HTR_INPUT_NONTRUNCATION_AUDIT_SCHEMA,
@@ -46,6 +48,7 @@ from oci.inference.production_stage1_bundle import (
 )
 from oci.inference.embedding_native_proof_capture import (
     EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA,
+    canonical_logical_embedding_config,
 )
 from oci.inference.production_stage1_hierarchy_loader import (
     STAGE1_EXACT_INNER_INDEX_SCHEMA,
@@ -258,6 +261,40 @@ def _refresh_bundle_manifest_registrations(manifest_path: Path, *registration_ke
     _write_json(manifest_path, {**body, "bundle_sha256": _sha(body)})
 
 
+def _reseal_legacy_component_and_bundle(
+    manifest_path: Path,
+    *,
+    cluster_fit_index_path: Path,
+) -> None:
+    root = manifest_path.parent
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    component = manifest["components"]["legacy_all_source"]
+    component_root = root / component["relative_path"]
+    (component_root / "component_manifest.json").unlink()
+    sealed = _seal_component(
+        component_root,
+        request_sha256=manifest["request_sha256"],
+        component="legacy_all_source",
+    )
+    manifest["components"]["legacy_all_source"] = {
+        "relative_path": component["relative_path"],
+        "manifest_sha256": _sha256_file(
+            component_root / "component_manifest.json"
+        ),
+        "content_sha256": sealed["content_sha256"],
+    }
+    manifest["embedding_cluster_fit_index"] = _registration(
+        cluster_fit_index_path,
+        root,
+    )
+    body = dict(manifest)
+    body.pop("bundle_sha256", None)
+    _write_json(
+        manifest_path,
+        {**body, "bundle_sha256": _sha256_json(body)},
+    )
+
+
 def _write_embedding_cache(path: Path, *, row_count: int) -> dict:
     path.mkdir()
     np.save(
@@ -345,6 +382,27 @@ def _cluster_feasibility_audit(
         "cluster_local_residualized_interaction_contrast_basis",
     )
     scopes = []
+
+    def array_identity(
+        *,
+        scope_id: str,
+        name: str,
+        dtype: str,
+        shape: list[int],
+    ) -> dict:
+        return {
+            "dtype": dtype,
+            "shape": shape,
+            "sha256": _sha(
+                {
+                    "scope_id": scope_id,
+                    "name": name,
+                    "dtype": dtype,
+                    "shape": shape,
+                }
+            ),
+        }
+
     for scope in _embedding_cluster_feasibility_scopes(registry):
         binding = _embedding_cluster_scope_binding(scope)
         fit_count = int(binding["fit_row_count"])
@@ -415,6 +473,111 @@ def _cluster_feasibility_audit(
                     "tfidf_semantic_retrieval_parent_family": "embedding_clustered",
                 }
             )
+        raw_concepts = [
+            {
+                "contrast_family": family,
+                "component_id": f"{family}_component_{component}",
+                "positive_member_ids": [f"positive_{component}"],
+                "negative_member_ids": [f"negative_{component}"],
+            }
+            for family in contrast_families
+            for component in (1, 2)
+        ]
+        semantic_concepts = [
+            {
+                "contrast_family": row["contrast_family"],
+                "component_id": row["component_id"],
+                "semantic_members": [f"semantic_{index}"],
+            }
+            for index, row in enumerate(raw_concepts, start=1)
+        ]
+        catalog_concepts = {
+            family: [
+                {
+                    "atom_kind": f"{family}_concept",
+                    "content": {
+                        "scope_id": scope["scope_id"],
+                        "ordinal": ordinal,
+                    },
+                }
+                for ordinal in (1, 2)
+            ]
+            for family in ("embedding_clustered", "tfidf_semantic_retrieval")
+        }
+        cluster_identity_body = {
+            "schema_version": STAGE1_EMBEDDING_CLUSTER_FIT_IDENTITY_SCHEMA,
+            "scope_id": scope["scope_id"],
+            "fit_row_ids": list(map(int, scope["fit_row_ids"])),
+            "fit_row_order_fingerprint": row_order_fingerprint(
+                scope["fit_row_ids"]
+            ),
+            "kmeans": {
+                "parameters": support["kmeans_parameters"],
+                "usable_mask": array_identity(
+                    scope_id=scope["scope_id"],
+                    name="usable_mask",
+                    dtype="|b1",
+                    shape=[fit_count],
+                ),
+                "cluster_labels": array_identity(
+                    scope_id=scope["scope_id"],
+                    name="cluster_labels",
+                    dtype="<i4",
+                    shape=[fit_count],
+                ),
+                "cluster_centers": array_identity(
+                    scope_id=scope["scope_id"],
+                    name="cluster_centers",
+                    dtype="<f4",
+                    shape=[configured_clusters, 2],
+                ),
+                "cluster_counts": array_identity(
+                    scope_id=scope["scope_id"],
+                    name="cluster_counts",
+                    dtype="<i8",
+                    shape=[configured_clusters],
+                ),
+                "n_iter": 2,
+                "inertia_hex": float(fit_count).hex(),
+            },
+            "svd_families": [
+                {
+                    "family_key": family,
+                    "item_cluster_ids": [0, 1],
+                    "weighted_matrix": array_identity(
+                        scope_id=scope["scope_id"],
+                        name=f"{family}_weighted_matrix",
+                        dtype="<f4",
+                        shape=[2, 2],
+                    ),
+                    "singular_values": array_identity(
+                        scope_id=scope["scope_id"],
+                        name=f"{family}_singular_values",
+                        dtype="<f4",
+                        shape=[2],
+                    ),
+                    "components": array_identity(
+                        scope_id=scope["scope_id"],
+                        name=f"{family}_components",
+                        dtype="<f4",
+                        shape=[2, 2],
+                    ),
+                }
+                for family in ("treatment", "residualized_interaction")
+            ],
+            "raw_cluster_concepts": raw_concepts,
+            "raw_cluster_concepts_sha256": _sha256_json(raw_concepts),
+            "semantic_cluster_concepts": semantic_concepts,
+            "semantic_cluster_concepts_sha256": _sha256_json(
+                semantic_concepts
+            ),
+            "final_catalog_concepts": catalog_concepts,
+            "final_catalog_concepts_sha256": _sha256_json(catalog_concepts),
+        }
+        cluster_identity = {
+            **cluster_identity_body,
+            "content_sha256": _sha256_json(cluster_identity_body),
+        }
         scopes.append(
             {
                 **binding,
@@ -434,13 +597,16 @@ def _cluster_feasibility_audit(
                 "semantic_mirror_catalog_atom_count": 4,
                 "semantic_mirror_catalog_member_count": 8,
                 "component_coverage_by_family": component_coverage,
+                "cluster_fit_identity": cluster_identity,
                 "uncapped_semantic_projection": True,
             }
         )
     body = {
         "schema_version": STAGE1_EMBEDDING_CLUSTER_FEASIBILITY_AUDIT_SCHEMA,
         "split_registry_content_sha256": _sha256_json(registry),
-        "embedding_configuration_sha256": _sha256_json(embedding_configuration),
+        "embedding_configuration_sha256": _sha256_json(
+            canonical_logical_embedding_config(embedding_configuration)
+        ),
         "embedding_cache_identity_sha256": _sha256_json(embedding_cache_identity),
         "cluster_support_contract_schema_version": EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA,
         "required_svd_families": ["treatment", "residualized_interaction"],
@@ -999,6 +1165,7 @@ def _build_bundle(
             "htr_max_chunk_length": 128,
             "multi_model_forest": {
                 "embedding_contrast": {
+                    "cache_dir": str(embedding_cache),
                     "model_name": "fixture/logical-embedding-model",
                     "chunk_size_words": 8,
                     "chunk_overlap_words": 0,
@@ -1180,11 +1347,79 @@ def _build_bundle(
         "".join(json.dumps(row, sort_keys=True) + "\n" for row in legacy_rows),
         encoding="utf-8",
     )
+    cluster_fit_rows = []
+    for cluster_scope in cluster_audit["scopes"]:
+        identity = cluster_scope["cluster_fit_identity"]
+        record_body = {
+            "schema_version": STAGE1_EMBEDDING_CLUSTER_FIT_IDENTITY_SCHEMA,
+            "scope_id": cluster_scope["scope_id"],
+            "scope_kind": cluster_scope["scope_kind"],
+            "preflight_identity_sha256": identity["content_sha256"],
+            "actual_identity": identity,
+            "actual_equals_preflight": True,
+        }
+        record_path = (
+            component_paths["legacy_all_source"]
+            / "embedding_cluster_fit_records"
+            / f"{cluster_scope['scope_id']}.json"
+        )
+        _write_json(
+            record_path,
+            {
+                **record_body,
+                "content_sha256": _sha256_json(record_body),
+            },
+        )
+        cluster_fit_rows.append(
+            {
+                "scope_id": cluster_scope["scope_id"],
+                "scope_kind": cluster_scope["scope_kind"],
+                "identity_sha256": identity["content_sha256"],
+                "record": _registration(
+                    record_path,
+                    component_paths["legacy_all_source"],
+                ),
+            }
+        )
+    cluster_fit_index_body = {
+        "schema_version": STAGE1_EMBEDDING_CLUSTER_FIT_INDEX_SCHEMA,
+        "request_sha256": request_sha,
+        "split_registry_content_sha256": wrapper_registry_sha,
+        "preflight_audit_content_sha256": cluster_audit["content_sha256"],
+        "scope_count": len(cluster_fit_rows),
+        "full_outer_scope_count": sum(
+            row["scope_kind"] == "full_outer" for row in cluster_fit_rows
+        ),
+        "exact_inner_scope_count": sum(
+            row["scope_kind"] == "exact_inner" for row in cluster_fit_rows
+        ),
+        "cumulative_spent_scope_count": sum(
+            row["scope_kind"] == "cumulative_spent" for row in cluster_fit_rows
+        ),
+        "scope_order": list(cluster_audit["scope_order"]),
+        "all_actual_identities_equal_preflight": True,
+        "scopes": cluster_fit_rows,
+    }
+    cluster_fit_index_path = (
+        component_paths["legacy_all_source"]
+        / "embedding_cluster_fit_index.json"
+    )
+    _write_json(
+        cluster_fit_index_path,
+        {
+            **cluster_fit_index_body,
+            "content_sha256": _sha256_json(cluster_fit_index_body),
+        },
+    )
     _write_json(
         component_paths["legacy_all_source"] / "exact_scope_index.json",
         {
             "schema_version": STAGE1_SCOPE_INDEX_SCHEMA,
             "split_registry_content_sha256": wrapper_registry_sha,
+            "embedding_cluster_fit_index": _registration(
+                cluster_fit_index_path,
+                component_paths["legacy_all_source"],
+            ),
             "scopes": legacy_index_rows,
         },
     )
@@ -1332,6 +1567,9 @@ def _build_bundle(
         "primary_splits": _registration(root / "primary_predictions.parquet", root),
         "row_registry": _registration(root / "row_registry.parquet", root),
         "legacy_handoff": _registration(legacy_handoff, root),
+        "embedding_cluster_fit_index": _registration(
+            cluster_fit_index_path, root
+        ),
         "tfidf_handoff": _registration(tfidf_handoff, root),
         "neural_query_artifact_index": _registration(
             query_root / "query_artifact_index.json", root
@@ -1406,6 +1644,59 @@ def test_hierarchy_loader_semantically_rejects_rehashed_cluster_audit_tamper(
         cluster_audit_mode="tampered_grounding",
     )
     with pytest.raises(ValueError, match="clustered-embedding feasibility audit"):
+        load_authenticated_stage1_bundle_for_hierarchy(manifest_path)
+
+
+@pytest.mark.parametrize("drift", ("reordered", "missing", "substituted"))
+def test_hierarchy_loader_rejects_rehashed_cluster_fit_index_drift(
+    tmp_path: Path,
+    drift: str,
+):
+    manifest_path, _tamper_target = _build_bundle(tmp_path)
+    root = manifest_path.parent
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    index_path = root / manifest["embedding_cluster_fit_index"]["relative_path"]
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    legacy_root = root / manifest["components"]["legacy_all_source"][
+        "relative_path"
+    ]
+    if drift == "reordered":
+        index["scopes"][0], index["scopes"][1] = (
+            index["scopes"][1],
+            index["scopes"][0],
+        )
+    elif drift == "missing":
+        index["scopes"].pop()
+    else:
+        first = index["scopes"][0]
+        second = index["scopes"][1]
+        first_record_path = legacy_root / first["record"]["relative_path"]
+        second_record_path = legacy_root / second["record"]["relative_path"]
+        first_record = json.loads(first_record_path.read_text(encoding="utf-8"))
+        second_record = json.loads(second_record_path.read_text(encoding="utf-8"))
+        first_record["actual_identity"] = copy.deepcopy(
+            second_record["actual_identity"]
+        )
+        _rewrite_content_hashed_json(first_record_path, first_record)
+        first["record"] = _registration(first_record_path, legacy_root)
+    _rewrite_content_hashed_json(index_path, index)
+    legacy_scope_index_path = legacy_root / "exact_scope_index.json"
+    legacy_scope_index = json.loads(
+        legacy_scope_index_path.read_text(encoding="utf-8")
+    )
+    legacy_scope_index["embedding_cluster_fit_index"] = _registration(
+        index_path,
+        legacy_root,
+    )
+    _write_json(legacy_scope_index_path, legacy_scope_index)
+    _reseal_legacy_component_and_bundle(
+        manifest_path,
+        cluster_fit_index_path=index_path,
+    )
+    with pytest.raises(
+        ValueError,
+        match="cluster-fit index|cluster-fit record",
+    ):
         load_authenticated_stage1_bundle_for_hierarchy(manifest_path)
 
 

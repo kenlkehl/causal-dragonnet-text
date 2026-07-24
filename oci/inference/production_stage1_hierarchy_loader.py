@@ -28,6 +28,8 @@ from .production_stage1_bundle import (
     STAGE1_BUNDLE_REQUEST_SCHEMA,
     STAGE1_COMPONENT_MANIFEST_SCHEMA,
     STAGE1_CUMULATIVE_ALL_TEN_ROOT_INDEX_SCHEMA,
+    STAGE1_EMBEDDING_CLUSTER_FIT_IDENTITY_SCHEMA,
+    STAGE1_EMBEDDING_CLUSTER_FIT_INDEX_SCHEMA,
     STAGE1_EXACT_INNER_ROOT_INDEX_SCHEMA,
     STAGE1_MATCHED_PAIR_PROOF_SCHEMA,
     STAGE1_RAW_EVIDENCE_SIDECAR_SCHEMA,
@@ -36,6 +38,7 @@ from .production_stage1_bundle import (
     _sha256_json,
     _registry_scopes,
     _source_identity,
+    _validate_embedding_cluster_fit_identity,
     validate_embedding_cluster_feasibility_audit,
     validate_htr_input_nontruncation_audit,
 )
@@ -56,7 +59,7 @@ from .stage1_cumulative_spent_evidence import (
 from .tfidf_topic_discovery import row_set_fingerprint
 
 STAGE1_EXACT_INNER_INDEX_SCHEMA = "production_stage1_exact_inner_evidence_index_v1"
-STAGE1_HIERARCHY_INPUTS_SCHEMA = "authenticated_stage1_hierarchy_inputs_v3"
+STAGE1_HIERARCHY_INPUTS_SCHEMA = "authenticated_stage1_hierarchy_inputs_v4"
 
 
 @dataclass(frozen=True)
@@ -738,6 +741,187 @@ def _validate_legacy_scope_lineage_snapshots(
             raise ValueError(f"legacy scope raw sidecar linkage mismatch: {scope_id}")
 
 
+def _validate_embedding_cluster_fit_index_snapshot(
+    *,
+    index: Mapping[str, Any],
+    index_snapshot: _StableFileSnapshot,
+    legacy_scope_index: Mapping[str, Any],
+    cluster_audit: Mapping[str, Any],
+    request_sha256: str,
+    registry_content_sha256: str,
+    bundle_root: _BundleRootCapability,
+    legacy_component_root: Path,
+) -> None:
+    """Reopen and semantically authenticate every fitted cluster identity."""
+
+    index_fields = {
+        "schema_version",
+        "request_sha256",
+        "split_registry_content_sha256",
+        "preflight_audit_content_sha256",
+        "scope_count",
+        "full_outer_scope_count",
+        "exact_inner_scope_count",
+        "cumulative_spent_scope_count",
+        "scope_order",
+        "all_actual_identities_equal_preflight",
+        "scopes",
+        "content_sha256",
+    }
+    body = {key: copy.deepcopy(value) for key, value in index.items() if key != "content_sha256"}
+    preflight_scopes = cluster_audit.get("scopes")
+    expected_order = cluster_audit.get("scope_order")
+    rows = index.get("scopes")
+    if (
+        not isinstance(index, Mapping)
+        or set(index) != index_fields
+        or index.get("schema_version") != STAGE1_EMBEDDING_CLUSTER_FIT_INDEX_SCHEMA
+        or index.get("request_sha256") != request_sha256
+        or index.get("split_registry_content_sha256") != registry_content_sha256
+        or index.get("preflight_audit_content_sha256")
+        != cluster_audit.get("content_sha256")
+        or index.get("content_sha256") != _sha256_json(body)
+        or index.get("all_actual_identities_equal_preflight") is not True
+        or not isinstance(preflight_scopes, list)
+        or not isinstance(expected_order, list)
+        or not isinstance(rows, list)
+        or index.get("scope_order") != expected_order
+        or [row.get("scope_id") for row in rows if isinstance(row, Mapping)]
+        != expected_order
+        or int(index.get("scope_count", -1)) != len(expected_order)
+    ):
+        raise ValueError("cluster-fit index has an invalid closed binding or scope order")
+    expected_counts = {
+        "full_outer_scope_count": sum(
+            row.get("scope_kind") == "full_outer" for row in preflight_scopes
+        ),
+        "exact_inner_scope_count": sum(
+            row.get("scope_kind") == "exact_inner" for row in preflight_scopes
+        ),
+        "cumulative_spent_scope_count": sum(
+            row.get("scope_kind") == "cumulative_spent" for row in preflight_scopes
+        ),
+    }
+    if any(int(index.get(key, -1)) != value for key, value in expected_counts.items()):
+        raise ValueError("cluster-fit index scope-kind counts changed")
+    preflight_by_scope = {
+        str(row.get("scope_id")): row
+        for row in preflight_scopes
+        if isinstance(row, Mapping)
+    }
+    if len(preflight_by_scope) != len(preflight_scopes) or set(preflight_by_scope) != set(
+        expected_order
+    ):
+        raise ValueError("cluster preflight scope identities are duplicated or incomplete")
+
+    component_registration = legacy_scope_index.get("embedding_cluster_fit_index")
+    expected_relative = (
+        legacy_component_root / "embedding_cluster_fit_index.json"
+    ).as_posix()
+    if (
+        not isinstance(component_registration, Mapping)
+        or component_registration.get("relative_path") != "embedding_cluster_fit_index.json"
+        or int(component_registration.get("size", -1)) != index_snapshot.stat_identity[2]
+        or component_registration.get("sha256") != index_snapshot.sha256
+        or index_snapshot.path
+        != bundle_root.path / Path(expected_relative)
+    ):
+        raise ValueError("legacy scope index substituted its cluster-fit index")
+
+    row_fields = {"scope_id", "scope_kind", "identity_sha256", "record"}
+    record_fields = {
+        "schema_version",
+        "scope_id",
+        "scope_kind",
+        "preflight_identity_sha256",
+        "actual_identity",
+        "actual_equals_preflight",
+        "content_sha256",
+    }
+    observed: set[str] = set()
+    for row, scope_id in zip(rows, expected_order, strict=True):
+        if not isinstance(row, Mapping) or set(row) != row_fields:
+            raise ValueError("cluster-fit index contains a malformed scope row")
+        expected_scope = preflight_by_scope[str(scope_id)]
+        preflight_identity = expected_scope.get("cluster_fit_identity")
+        fit_rows = tuple(
+            map(
+                int,
+                (
+                    preflight_identity.get("fit_row_ids")
+                    if isinstance(preflight_identity, Mapping)
+                    else ()
+                )
+                or (),
+            )
+        )
+        expected_identity = _validate_embedding_cluster_fit_identity(
+            preflight_identity,
+            scope_id=str(scope_id),
+            fit_row_ids=fit_rows,
+        )
+        if (
+            str(scope_id) in observed
+            or row.get("scope_id") != scope_id
+            or row.get("scope_kind") != expected_scope.get("scope_kind")
+            or row.get("identity_sha256") != expected_identity["content_sha256"]
+        ):
+            raise ValueError("cluster-fit index reordered or substituted a scope")
+        observed.add(str(scope_id))
+        registration = row.get("record")
+        expected_record_relative = (
+            f"embedding_cluster_fit_records/{scope_id}.json"
+        )
+        if (
+            not isinstance(registration, Mapping)
+            or set(registration) != {"relative_path", "size", "sha256"}
+            or registration.get("relative_path") != expected_record_relative
+        ):
+            raise ValueError("cluster-fit record registration is not canonical")
+        _path, record, _snapshot = _registered_json(
+            bundle_root,
+            {
+                **registration,
+                "relative_path": (
+                    legacy_component_root / expected_record_relative
+                ).as_posix(),
+            },
+            label=f"cluster-fit identity record {scope_id}",
+        )
+        record_body = {
+            key: copy.deepcopy(value)
+            for key, value in record.items()
+            if key != "content_sha256"
+        }
+        try:
+            actual_identity = _validate_embedding_cluster_fit_identity(
+                record.get("actual_identity"),
+                scope_id=str(scope_id),
+                fit_row_ids=fit_rows,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"cluster-fit record has an invalid identity: {scope_id}"
+            ) from exc
+        if (
+            set(record) != record_fields
+            or record.get("schema_version")
+            != STAGE1_EMBEDDING_CLUSTER_FIT_IDENTITY_SCHEMA
+            or record.get("scope_id") != scope_id
+            or record.get("scope_kind") != expected_scope.get("scope_kind")
+            or record.get("preflight_identity_sha256")
+            != expected_identity["content_sha256"]
+            or record.get("actual_equals_preflight") is not True
+            or record.get("content_sha256") != _sha256_json(record_body)
+            or actual_identity != expected_identity
+        ):
+            raise ValueError(
+                f"cluster-fit record differs from accepted preflight: {scope_id}"
+            )
+    if observed != set(map(str, expected_order)):
+        raise ValueError("cluster-fit index does not cover every preflight scope")
+
+
 def _validate_component(
     bundle_root: _BundleRootCapability,
     *,
@@ -820,6 +1004,7 @@ class AuthenticatedStage1HierarchyInputs:
     primary_splits_path: Path
     legacy_handoff_path: Path
     legacy_scope_index_path: Path
+    embedding_cluster_fit_index_path: Path
     tfidf_handoff_path: Path
     neural_query_artifact_index_path: Path
     exact_inner_evidence_index_path: Path
@@ -920,6 +1105,9 @@ class AuthenticatedStage1HierarchyInputs:
             "primary_splits_path": str(self.primary_splits_path),
             "legacy_handoff_path": str(self.legacy_handoff_path),
             "legacy_scope_index_path": str(self.legacy_scope_index_path),
+            "embedding_cluster_fit_index_path": str(
+                self.embedding_cluster_fit_index_path
+            ),
             "tfidf_handoff_path": str(self.tfidf_handoff_path),
             "neural_query_artifact_index_path": str(self.neural_query_artifact_index_path),
             "exact_inner_evidence_index_path": str(self.exact_inner_evidence_index_path),
@@ -979,6 +1167,7 @@ def load_authenticated_stage1_bundle_for_hierarchy(
         "primary_splits",
         "row_registry",
         "legacy_handoff",
+        "embedding_cluster_fit_index",
         "tfidf_handoff",
         "neural_query_artifact_index",
         "exact_inner_evidence_index",
@@ -1143,6 +1332,11 @@ def load_authenticated_stage1_bundle_for_hierarchy(
         bundle_root=root_capability,
         legacy_component_root=legacy_component_root,
     )
+    cluster_fit_index = _load_json_snapshot(
+        registered_snapshots["embedding_cluster_fit_index"],
+        label="embedding cluster-fit index",
+    )
+    registered_json_values["embedding_cluster_fit_index"] = cluster_fit_index
 
     exact_index = _load_json_snapshot(
         registered_snapshots["exact_inner_evidence_index"],
@@ -1585,6 +1779,18 @@ def load_authenticated_stage1_bundle_for_hierarchy(
         raise ValueError(
             "Stage 1 clustered-embedding feasibility audit is missing or invalid"
         ) from exc
+    _validate_embedding_cluster_fit_index_snapshot(
+        index=cluster_fit_index,
+        index_snapshot=registered_snapshots["embedding_cluster_fit_index"],
+        legacy_scope_index=legacy_scope_index,
+        cluster_audit=cluster_audit,
+        request_sha256=request_sha256,
+        registry_content_sha256=str(
+            request.get("split_registry_content_sha256") or ""
+        ),
+        bundle_root=root_capability,
+        legacy_component_root=legacy_component_root,
+    )
 
     query_index = _load_json_snapshot(
         registered_snapshots["neural_query_artifact_index"],
@@ -1638,6 +1844,7 @@ def load_authenticated_stage1_bundle_for_hierarchy(
         primary_splits_path=paths["primary_splits"],
         legacy_handoff_path=paths["legacy_handoff"],
         legacy_scope_index_path=legacy_scope_index_path,
+        embedding_cluster_fit_index_path=paths["embedding_cluster_fit_index"],
         tfidf_handoff_path=paths["tfidf_handoff"],
         neural_query_artifact_index_path=paths["neural_query_artifact_index"],
         exact_inner_evidence_index_path=paths["exact_inner_evidence_index"],

@@ -11,7 +11,7 @@ import pandas as pd
 import pytest
 import oci.inference.neural_query_context_backend as query_context_module
 
-from oci.config import AppliedInferenceConfig
+from oci.config import AppliedInferenceConfig, ExperimentConfig
 from oci.inference.all_evidence_discovery_interfaces import (
     ACTIVE_STAGE1_CONCEPT_FAMILIES,
     BOW_NUISANCE,
@@ -53,6 +53,7 @@ from oci.inference.production_stage1_bundle import (
     _matched_pair_subproducer_proofs,
     _read_stable_sha256,
     _registry_scopes,
+    _scientific_query_config_identity,
     _seal_component,
     _sha256_file,
     _sha256_json,
@@ -526,6 +527,26 @@ def test_cli_returns_nonzero_when_readiness_preflight_is_blocked(
             ]
         )
         == 2
+    )
+
+
+def test_query_config_scientific_identity_is_content_addressed(tmp_path):
+    path = tmp_path / "query.json"
+    payload = json.dumps(
+        asdict(NeuralQueryAgenticForestConfig()),
+        sort_keys=True,
+    )
+    path.write_text(payload, encoding="utf-8")
+    _config, first = ProductionStage1BundleBuilder._load_query_config(path)
+
+    replacement = tmp_path / "query.replacement.json"
+    replacement.write_text(payload, encoding="utf-8")
+    replacement.replace(path)
+    _config, second = ProductionStage1BundleBuilder._load_query_config(path)
+
+    assert first["stat_identity"] != second["stat_identity"]
+    assert _scientific_query_config_identity(first) == (
+        _scientific_query_config_identity(second)
     )
 
 
@@ -1330,6 +1351,7 @@ def test_embedding_cluster_preflight_enumerates_all_native_scopes_with_real_cata
         embedding_cache_identity=case["cache_identity"],
         registry=case["registry"],
         registry_content_sha256=case["registry_sha256"],
+        preflight_workers=2,
     )
     assert repeated_audit == audit
     assert repeated_audit["content_sha256"] == audit["content_sha256"]
@@ -1623,6 +1645,8 @@ def test_prepare_projects_only_id_text_treatment_and_observed_outcome(
     token_bounded_row_ids: tuple[int, ...],
 ):
     config, _model_dir = _valid_config(tmp_path)
+    config.architecture.multi_model_forest.bow_fold_parallelism = "3"
+    config.architecture.multi_model_forest.htr_fold_parallelism = "2"
     dataset_path = tmp_path / "cohort.parquet"
     dataset_path.write_bytes(b"authenticated parquet container placeholder")
     config_path = tmp_path / "stage1.json"
@@ -1702,6 +1726,22 @@ def test_prepare_projects_only_id_text_treatment_and_observed_outcome(
             builder.prepare()
         return
     prepared = builder.prepare()
+    effective = prepared.request["effective_stage1_config"]
+    legacy_effective = effective["architecture"]["multi_model_agentic_forest"]
+    integrated_effective = effective["architecture"]["multi_model_forest"]
+    assert "bow_fold_parallelism" not in legacy_effective
+    assert "htr_fold_parallelism" not in legacy_effective
+    assert legacy_effective["fold_parallelism"] == "auto"
+    assert integrated_effective["bow_fold_parallelism"] == "3"
+    assert integrated_effective["htr_fold_parallelism"] == "2"
+    parsed_effective = ExperimentConfig.from_dict(
+        {"applied_inference": effective}
+    ).applied_inference
+    assert asdict(parsed_effective) == effective
+    assert (
+        prepared.config.architecture.multi_model_agentic_forest
+        is not prepared.config.architecture.multi_model_forest
+    )
     assert observed_columns == [
         "person_key",
         "clinical_text",
