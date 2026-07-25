@@ -17,6 +17,7 @@ from oci.inference.all_evidence_discovery_interfaces import (
 )
 from oci.inference.hierarchical_all_architecture_discovery import (
     AUTHENTICATED_RESPONSE_REPAIR_BINDING,
+    LOCAL_JSON_SCHEMA_VALIDATION_FAILURE,
     SEMANTIC_VALIDATION_FAILURE,
     STRICT_JSON_PARSE_FAILURE,
 )
@@ -54,13 +55,11 @@ def prepared_repair_probe():
 
 def _valid_wire_response(evidence) -> dict[str, Any]:
     return {
-        "concepts": [],
         "evidence_dispositions": {
             item.evidence_id: {
-                "status": "reviewed_no_specific_concept",
-                "feature_names": [],
+                "evidence_findings": [],
                 "member_dispositions": {
-                    member_id: {"feature_names": []} for member_id in item.member_ids
+                    member_id: {"findings": []} for member_id in item.member_ids
                 },
                 "reason": "No specific concept is supported.",
             }
@@ -212,7 +211,7 @@ def test_preflight_reconstructs_exact_private_one_repair_job(prepared_repair_pro
         "assistant",
         "user",
     ]
-    assert binding["failure_category"] == SEMANTIC_VALIDATION_FAILURE
+    assert binding["failure_category"] == LOCAL_JSON_SCHEMA_VALIDATION_FAILURE
     assert binding["repair_attempt_number"] == 1
     assert binding["prior_response_content_sha256"] == (EXPECTED_INITIAL_RESPONSE_PROJECTION_SHA256)
     rendered = canonical_json(list(repair_job.messages))

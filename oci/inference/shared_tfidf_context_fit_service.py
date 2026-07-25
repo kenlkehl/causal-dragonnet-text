@@ -9,14 +9,14 @@ The adaptive reviewer needs two views of the same observable context:
 ``TfidfTopicOrphanContextBackend`` historically fit that complete context
 independently.  The fitted TF-IDF implementation already persists everything
 needed for the second operation: complete-context nuisance stacks, the common
-vectorizer, and fitted topic banks.  This module snapshots those newly produced
-bytes before the spent provider removes its private work directory and reuses
-them only when a later context call is an exact match for the most recently
-registered spent context in the same process.
+vectorizer, and fitted topic banks.  This module snapshots the complete
+authenticated JSON/NPY inventory before the spent provider removes its private
+work directory and reuses it only when a later context call is an exact match
+for the most recently registered spent context in the same process.
 
-The service deliberately has no cache path or import API.  It cannot accept a
-joblib artifact from a prior process.  Non-matching contexts, including every
-ordinary context-OOF subset, are delegated to the existing backend unchanged.
+The service deliberately has no cache path or import API.  It cannot accept an
+artifact from a prior process.  Non-matching contexts, including every ordinary
+context-OOF subset, are delegated to the existing backend unchanged.
 Gate treatment and outcome are absent from both the context-backend protocol
 and this transform path.
 """
@@ -30,11 +30,11 @@ import io
 import json
 import marshal
 import math
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-import joblib
 import numpy as np
 import pandas as pd
 
@@ -47,13 +47,17 @@ from .all_evidence_post_extraction_review import (
 from .context_fit_upstream_gate_provider import ContextFitUpstreamPrediction
 from .review_spent_evidence_provider import SpentDiscoveryEvidence
 from .tfidf_topic_discovery import FittedTopicContext
+from .tfidf_safe_artifacts import (
+    INDEX_FILENAME,
+    load_fitted_topic_context,
+)
 from .tfidf_upstream_gate_backend import TFIDF_CONTEXT_BACKEND_ID
 
-SHARED_TFIDF_FIT_SERVICE_ID = "in_memory_shared_tfidf_context_fit_service_v1"
-SHARED_TFIDF_SPENT_BACKEND_ID = "shared_tfidf_spent_discovery_backend_v1"
-SHARED_TFIDF_CONTEXT_BACKEND_ID = "shared_tfidf_context_gate_backend_v1"
-SHARED_TFIDF_FIT_SNAPSHOT_SCHEMA = "shared_tfidf_fit_snapshot_v1"
-SHARED_TFIDF_RUNTIME_GRAPH_ID = "shared_tfidf_context_fit_graph_v1"
+SHARED_TFIDF_FIT_SERVICE_ID = "in_memory_shared_tfidf_context_fit_service_v2"
+SHARED_TFIDF_SPENT_BACKEND_ID = "shared_tfidf_spent_discovery_backend_v2"
+SHARED_TFIDF_CONTEXT_BACKEND_ID = "shared_tfidf_context_gate_backend_v2"
+SHARED_TFIDF_FIT_SNAPSHOT_SCHEMA = "shared_tfidf_fit_snapshot_v2"
+SHARED_TFIDF_RUNTIME_GRAPH_ID = "shared_tfidf_context_fit_graph_v2"
 UNWRAPPED_TFIDF_RUNTIME_GRAPH_ID = "unwrapped_tfidf_context_fit_graph_v1"
 
 _REQUIRED_EFFECT_SCORE_COLUMNS = frozenset(
@@ -371,11 +375,66 @@ def _parse_json_bytes(payload: bytes, *, label: str) -> Mapping[str, Any]:
     return value
 
 
-def _load_fitted_context(payload: bytes) -> FittedTopicContext:
+def _safe_bundle_sha256(payload: Sequence[tuple[str, bytes]]) -> str:
+    return _sha256_json(
+        [
+            {
+                "relative_path": relative,
+                "size_bytes": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+            for relative, raw in payload
+        ]
+    )
+
+
+def _snapshot_fitted_context(
+    index_path: Path,
+    *,
+    root: Path,
+) -> tuple[tuple[str, bytes], ...]:
+    """Authenticate and snapshot every byte in a safe fitted-context artifact."""
+
+    fitted = load_fitted_topic_context(index_path)
+    if not isinstance(fitted, FittedTopicContext):
+        raise TypeError("spent TF-IDF artifact did not contain FittedTopicContext")
+    artifact_root = index_path.parent
     try:
-        fitted = joblib.load(io.BytesIO(payload))
-    except Exception as exc:  # joblib can surface backend-specific parse errors
-        raise ValueError("current-process fitted TF-IDF snapshot is unreadable") from exc
+        artifact_root.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("spent fitted TF-IDF context escaped the private work directory") from exc
+    paths = sorted(artifact_root.iterdir(), key=lambda path: path.name)
+    if not paths or INDEX_FILENAME not in {path.name for path in paths}:
+        raise ValueError("spent fitted TF-IDF context has no safe artifact index")
+    return tuple(
+        (
+            path.name,
+            _snapshot_bytes(
+                path,
+                root=artifact_root,
+                label=f"spent fitted TF-IDF payload {path.name}",
+            ),
+        )
+        for path in paths
+    )
+
+
+def _load_fitted_context(payload: Sequence[tuple[str, bytes]]) -> FittedTopicContext:
+    if not payload or [name for name, _raw in payload] != sorted(
+        name for name, _raw in payload
+    ):
+        raise ValueError("current-process fitted TF-IDF inventory is empty or reordered")
+    with tempfile.TemporaryDirectory(prefix="oci-shared-tfidf-safe-") as temporary:
+        root = Path(temporary) / "fitted_context"
+        root.mkdir()
+        for relative, raw in payload:
+            if relative != Path(relative).name or not isinstance(raw, bytes):
+                raise ValueError("current-process fitted TF-IDF inventory is invalid")
+            (root / relative).write_bytes(raw)
+        try:
+            fitted = load_fitted_topic_context(root / INDEX_FILENAME)
+        except Exception as exc:
+            raise ValueError("current-process fitted TF-IDF snapshot is unreadable") from exc
     if not isinstance(fitted, FittedTopicContext):
         raise TypeError("spent TF-IDF artifact did not contain FittedTopicContext")
     if not callable(getattr(fitted, "transform_topics", None)):
@@ -432,7 +491,7 @@ class _CurrentProcessFitSnapshot:
     outcome_sha256: str
     metadata_json: bytes = field(repr=False)
     metadata_sha256: str
-    fitted_context_joblib: bytes = field(repr=False)
+    fitted_context_files: tuple[tuple[str, bytes], ...] = field(repr=False)
     fitted_context_sha256: str
     effect_scores_parquet: bytes = field(repr=False)
     effect_scores_sha256: str
@@ -479,6 +538,7 @@ class InMemorySharedTfidfContextFitService(_SealedRuntimeMethodInstances):
             ],
             "storage": "private_current_process_memory_only",
             "cross_run_artifact_or_joblib_acceptance": False,
+            "fitted_context_serialization": "closed_json_and_per_array_npy_v1",
             "cache_path_or_import_api_exposed": False,
             "fit_binding": "exact_ordered_rows_text_treatment_outcome_and_outer_fold_v1",
             "reuse_scope": "most_recent_exact_spent_context_per_outer_fold_v1",
@@ -601,17 +661,16 @@ class InMemorySharedTfidfContextFitService(_SealedRuntimeMethodInstances):
             raise ValueError("spent TF-IDF metadata has no n-gram score registry")
         fitted_path = Path(str(artifacts.get("fitted_context") or ""))
         effect_path = Path(str(raw_scores.get("effect") or ""))
-        fitted_bytes = _snapshot_bytes(
+        fitted_files = _snapshot_fitted_context(
             fitted_path,
             root=root,
-            label="spent fitted TF-IDF context",
         )
         effect_bytes = _snapshot_bytes(
             effect_path,
             root=root,
             label="spent effect n-gram scores",
         )
-        fitted = _load_fitted_context(fitted_bytes)
+        fitted = _load_fitted_context(fitted_files)
         _effect_scores(effect_bytes)
         if str(metadata.get("config_hash") or "") != str(fitted.config_hash):
             raise ValueError("spent fitted TF-IDF config hash disagrees with metadata")
@@ -628,8 +687,8 @@ class InMemorySharedTfidfContextFitService(_SealedRuntimeMethodInstances):
             outcome_sha256=_vector_sha256(outcome),
             metadata_json=metadata_bytes,
             metadata_sha256=hashlib.sha256(metadata_bytes).hexdigest(),
-            fitted_context_joblib=fitted_bytes,
-            fitted_context_sha256=hashlib.sha256(fitted_bytes).hexdigest(),
+            fitted_context_files=fitted_files,
+            fitted_context_sha256=_safe_bundle_sha256(fitted_files),
             effect_scores_parquet=effect_bytes,
             effect_scores_sha256=hashlib.sha256(effect_bytes).hexdigest(),
         )
@@ -647,7 +706,7 @@ class InMemorySharedTfidfContextFitService(_SealedRuntimeMethodInstances):
         for payload, expected, label in (
             (snapshot.metadata_json, snapshot.metadata_sha256, "metadata"),
             (
-                snapshot.fitted_context_joblib,
+                snapshot.fitted_context_files,
                 snapshot.fitted_context_sha256,
                 "fitted context",
             ),
@@ -657,7 +716,12 @@ class InMemorySharedTfidfContextFitService(_SealedRuntimeMethodInstances):
                 "effect scores",
             ),
         ):
-            if hashlib.sha256(payload).hexdigest() != expected:
+            observed = (
+                _safe_bundle_sha256(payload)
+                if label == "fitted context"
+                else hashlib.sha256(payload).hexdigest()
+            )
+            if observed != expected:
                 raise RuntimeError(f"shared TF-IDF {label} bytes changed in memory")
 
     @staticmethod
@@ -744,7 +808,7 @@ class InMemorySharedTfidfContextFitService(_SealedRuntimeMethodInstances):
             snapshot.metadata_json,
             label="in-memory spent TF-IDF context metadata",
         )
-        fitted = _load_fitted_context(snapshot.fitted_context_joblib)
+        fitted = _load_fitted_context(snapshot.fitted_context_files)
         scores = _effect_scores(snapshot.effect_scores_parquet)
 
         topics = fitted.transform_topics(exact_gate_texts)

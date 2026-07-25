@@ -5,13 +5,15 @@ cumulative scope in one process.  This adapter preserves those native
 producers while moving the unit of execution to one canonical scope:
 
 * the parent publishes one immutable text-only cohort plus one fit-label
-  projection per scope;
+  projection per physical-fit owner;
 * a spawned worker authenticates the descriptor, loads only its fit labels,
   and executes exactly one scope on its assigned device;
 * the worker removes all aggregate indexes before sealing its scope-owned
   fragment; and
 * the parent authenticates all fragments before publishing the collision-safe
-  merge used by the component finalizer.
+  merge used by the component finalizer; and
+* deduplicated logical purposes fail closed until the legacy role-specific
+  accumulator is replaced by a role-neutral physical evidence artifact.
 
 No source dataset path or held-out treatment/outcome vector is present in the
 worker descriptor.
@@ -35,6 +37,7 @@ import numpy as np
 import pandas as pd
 
 from .production_stage1_legacy_scope_fragments import (
+    LEGACY_STAGE1_ROLE_NEUTRAL_BINDING_SET_SCHEMA,
     durably_sync_legacy_stage1_tree,
     merge_legacy_stage1_scope_fragments,
     seal_legacy_stage1_scope_fragment,
@@ -43,21 +46,23 @@ from .production_stage1_legacy_scope_fragments import (
     validate_legacy_stage1_scope_fragment,
 )
 from .production_stage1_scope_scheduler import (
+    STAGE1_LOGICAL_SCOPE_BINDING_FILENAME,
     Stage1ScopeAssignment,
+    Stage1ScopeAttemptStore,
     Stage1ScopeExecutionRequest,
     Stage1ScopePlan,
     Stage1ScopeSpec,
     ValidatedStage1ScopeAttempt,
-    derive_stage1_scope_seed,
+    derive_stage1_group_seed,
 )
 
 LEGACY_STAGE1_SCOPE_DESCRIPTOR_SCHEMA = "production_legacy_stage1_scope_worker_descriptor_v3"
 LEGACY_STAGE1_SCOPE_DESCRIPTOR_SET_SCHEMA = (
-    "production_legacy_stage1_scope_worker_descriptor_set_v2"
+    "production_legacy_stage1_scope_worker_descriptor_set_v3"
 )
 LEGACY_STAGE1_ONE_SCOPE_AUTHORITY_SCHEMA = "production_legacy_stage1_one_scope_authority_v1"
 LEGACY_STAGE1_SCOPE_DESCRIPTOR_RECOVERY_SCHEMA = (
-    "production_legacy_stage1_scope_descriptor_recovery_v1"
+    "production_legacy_stage1_scope_descriptor_recovery_v2"
 )
 LEGACY_STAGE1_SCOPE_DESCRIPTOR_MANIFEST = "descriptor_manifest.json"
 LEGACY_STAGE1_SCOPE_DESCRIPTOR_SET_MANIFEST = "descriptor_set_manifest.json"
@@ -65,6 +70,10 @@ LEGACY_STAGE1_SCOPE_DESCRIPTOR_RECOVERY_MANIFEST = "recovery_manifest.json"
 LEGACY_STAGE1_SCOPE_WORKER_TARGET = (
     "oci.inference.production_stage1_legacy_scope_adapter:" "run_legacy_stage1_scope_worker"
 )
+
+
+class LegacyStage1RoleSpecificDeduplicationError(RuntimeError):
+    """A logical alias cannot safely reinterpret a role-specific fragment."""
 
 _ROW_ID = "__production_stage1_scope_row_id_v1__"
 _TEXT_FILE = "visible_text.parquet"
@@ -78,8 +87,8 @@ _HEX = frozenset("0123456789abcdef")
 
 # These files describe an aggregate component.  A scope worker may use the
 # local versions to validate its native output, but they must never enter a
-# merge fragment.  The parent reconstructs every one from canonical
-# accumulator rows after all 40 fragments authenticate.
+# merge fragment.  The parent reconstructs every one from the authenticated
+# logical scope plan after every required physical/logical result authenticates.
 LEGACY_STAGE1_AGGREGATE_RELATIVE_PATHS = frozenset(
     {
         "handoff/discovery_contexts.jsonl",
@@ -567,7 +576,12 @@ def _one_scope_authority_from_prepared(
     if prepared.stage1_scope_plan.scope(scope.scope_id).as_dict() != scope.as_dict():
         raise ValueError("selected scope differs from the canonical parent plan")
     assignment = prepared.stage1_scope_plan.assignment(scope.scope_id)
-    schedule = bundle._canonical_cumulative_spent_schedule(prepared.registry)
+    schedule = bundle._canonical_cumulative_spent_schedule(
+        prepared.registry,
+        initial_training_partitions=(
+            prepared.stage1_scope_plan.initial_training_partitions
+        ),
+    )
     split_scope_fingerprint: str | None
     if scope.scope_kind == "exact_inner":
         split = bundle._canonical_exact_registry_from_wrapper(prepared.registry).inner_split(
@@ -697,7 +711,8 @@ def _scope_spec_from_authority(
         or spec.canonical_index < 0
         or spec.outer_fold < 1
         or spec.global_seed < 0
-        or spec.scope_seed != derive_stage1_scope_seed(spec.global_seed, spec.scope_id)
+        or spec.scope_seed
+        != derive_stage1_group_seed(spec.global_seed, spec.fit_row_ids)
         or len(set(spec.fit_row_ids)) != len(spec.fit_row_ids)
         or len(set(spec.heldout_row_ids)) != len(spec.heldout_row_ids)
         or set(spec.fit_row_ids) & set(spec.heldout_row_ids)
@@ -1046,8 +1061,11 @@ def _descriptor_recovery_body(*, prepared: Any, descriptor_root: Path) -> dict[s
         "registry_content_sha256": str(prepared.registry_content_sha256),
         "plan_content_sha256": str(plan.content_sha256),
         "descriptor_root": str(descriptor_root),
-        "canonical_scope_order": [scope.scope_id for scope in plan.scopes],
-        "scope_count": len(plan.scopes),
+        "physical_scope_order": [
+            scope.scope_id for scope in plan.physical_scopes
+        ],
+        "physical_scope_count": len(plan.physical_scopes),
+        "logical_scope_count": len(plan.scopes),
         "incomplete_attempts_preserved": True,
         "completed_scope_descriptors_reused_byte_for_byte": True,
     }
@@ -1085,7 +1103,10 @@ def _prepare_descriptor_recovery_root(
             raise ValueError("scope descriptor recovery belongs to another request")
         allowed = {
             LEGACY_STAGE1_SCOPE_DESCRIPTOR_RECOVERY_MANIFEST,
-            *(scope.scope_id for scope in prepared.stage1_scope_plan.scopes),
+            *(
+                scope.scope_id
+                for scope in prepared.stage1_scope_plan.physical_scopes
+            ),
         }
         for entry in recovery.iterdir():
             if entry.name not in allowed:
@@ -1151,7 +1172,7 @@ def publish_legacy_stage1_scope_descriptor(
     prepared: Any,
     descriptor_root: Path | str,
 ) -> AuthenticatedLegacyStage1ScopeDescriptorSet:
-    """Atomically publish one physically private descriptor per scope."""
+    """Atomically publish one private descriptor per physical-fit owner."""
 
     plan = prepared.stage1_scope_plan
     if not isinstance(plan, Stage1ScopePlan):
@@ -1174,7 +1195,9 @@ def publish_legacy_stage1_scope_descriptor(
     if root.resolve(strict=True) != root:
         raise ValueError("scope descriptor root must be canonical")
     _fsync_directory_path(root.parent)
-    expected_scope_ids = {scope.scope_id for scope in plan.scopes}
+    expected_scope_ids = {
+        scope.scope_id for scope in plan.physical_scopes
+    }
     for entry in root.iterdir():
         if entry.name not in expected_scope_ids or entry.is_symlink() or not entry.is_dir():
             raise ValueError("incomplete descriptor set contains an unexpected public entry")
@@ -1184,7 +1207,7 @@ def publish_legacy_stage1_scope_descriptor(
         descriptor_root=root,
     )
     registrations: list[Mapping[str, Any]] = []
-    for scope in plan.scopes:
+    for scope in plan.physical_scopes:
         scope_root = root / scope.scope_id
         if not scope_root.exists():
             attempt_parent = recovery / scope.scope_id
@@ -1229,8 +1252,14 @@ def publish_legacy_stage1_scope_descriptor(
         "schema_version": LEGACY_STAGE1_SCOPE_DESCRIPTOR_SET_SCHEMA,
         "stage1_request_sha256": prepared.request_sha256,
         "plan_content_sha256": plan.content_sha256,
-        "canonical_scope_order": [scope.scope_id for scope in plan.scopes],
-        "scope_count": len(plan.scopes),
+        "physical_scope_order": [
+            scope.scope_id for scope in plan.physical_scopes
+        ],
+        "physical_scope_count": len(plan.physical_scopes),
+        "logical_scope_count": len(plan.scopes),
+        "logical_physical_bindings": plan.as_dict()[
+            "logical_physical_bindings"
+        ],
         "descriptors": registrations,
         "heldout_labels_shared_between_descriptors": False,
         "full_split_registry_shared_with_workers": False,
@@ -1688,8 +1717,10 @@ def validate_legacy_stage1_scope_descriptor_set(
         "schema_version",
         "stage1_request_sha256",
         "plan_content_sha256",
-        "canonical_scope_order",
-        "scope_count",
+        "physical_scope_order",
+        "physical_scope_count",
+        "logical_scope_count",
+        "logical_physical_bindings",
         "descriptors",
         "heldout_labels_shared_between_descriptors",
         "full_split_registry_shared_with_workers",
@@ -1704,6 +1735,16 @@ def validate_legacy_stage1_scope_descriptor_set(
         or manifest.get("stage1_request_sha256") != expected_stage1_request_sha256
         or manifest.get("content_sha256") != _sha256_json(body)
         or not isinstance(rows, list)
+        or isinstance(manifest.get("physical_scope_count"), bool)
+        or not isinstance(manifest.get("physical_scope_count"), int)
+        or isinstance(manifest.get("logical_scope_count"), bool)
+        or not isinstance(manifest.get("logical_scope_count"), int)
+        or int(manifest["physical_scope_count"]) < 1
+        or int(manifest["logical_scope_count"])
+        < int(manifest["physical_scope_count"])
+        or not isinstance(manifest.get("logical_physical_bindings"), list)
+        or len(manifest["logical_physical_bindings"])
+        != int(manifest["logical_scope_count"])
         or manifest.get("heldout_labels_shared_between_descriptors") is not False
         or manifest.get("full_split_registry_shared_with_workers") is not False
         or manifest.get("full_scope_plan_shared_with_workers") is not False
@@ -1733,14 +1774,29 @@ def validate_legacy_stage1_scope_descriptor_set(
             prepared=prepared,
         )
     expected_order = (
-        [scope.scope_id for scope in prepared.stage1_scope_plan.scopes]
+        [
+            scope.scope_id
+            for scope in prepared.stage1_scope_plan.physical_scopes
+        ]
         if prepared is not None
-        else list(manifest.get("canonical_scope_order") or ())
+        else list(manifest.get("physical_scope_order") or ())
     )
     if (
         list(descriptors) != expected_order
-        or manifest.get("canonical_scope_order") != expected_order
-        or manifest.get("scope_count") != len(descriptors)
+        or manifest.get("physical_scope_order") != expected_order
+        or manifest.get("physical_scope_count") != len(descriptors)
+        or (
+            prepared is not None
+            and manifest.get("logical_scope_count")
+            != len(prepared.stage1_scope_plan.scopes)
+        )
+        or (
+            prepared is not None
+            and manifest.get("logical_physical_bindings")
+            != prepared.stage1_scope_plan.as_dict()[
+                "logical_physical_bindings"
+            ]
+        )
         or any(
             descriptor.plan_content_sha256 != str(manifest["plan_content_sha256"])
             for descriptor in descriptors.values()
@@ -1979,16 +2035,62 @@ def collect_and_merge_legacy_stage1_scope_attempts(
     merge_root: Path | str,
     require_production_coverage: bool = True,
 ) -> Mapping[str, Any]:
-    """Authenticate canonical attempts and publish their artifact-only merge."""
+    """Authenticate physical attempts and fail closed on role-specific aliases."""
 
     plan = prepared.stage1_scope_plan
     by_scope = {attempt.scope_id: attempt for attempt in attempts}
-    expected = {scope.scope_id for scope in plan.scopes}
+    expected = {scope.scope_id for scope in plan.physical_scopes}
     if len(by_scope) != len(attempts) or set(by_scope) != expected:
-        raise ValueError("legacy Stage 1 completed attempts have incomplete coverage")
+        raise ValueError(
+            "legacy Stage 1 physical attempts have incomplete owner coverage"
+        )
+    roots = {attempt.attempt_dir.parent.parent for attempt in attempts}
+    if len(roots) != 1:
+        raise ValueError(
+            "legacy Stage 1 physical attempts do not share one bound store"
+        )
+    attempt_store = Stage1ScopeAttemptStore(next(iter(roots)), plan)
+    logical_bindings = attempt_store.validate_logical_bindings()
+    if (
+        logical_bindings.path.name
+        != STAGE1_LOGICAL_SCOPE_BINDING_FILENAME
+        or logical_bindings.manifest.get("physical_fit_count")
+        != len(plan.physical_scopes)
+        or logical_bindings.manifest.get("logical_scope_count")
+        != len(plan.scopes)
+    ):
+        raise ValueError(
+            "legacy Stage 1 logical bindings have incomplete coverage"
+        )
+    reused_groups = [
+        (owner, members)
+        for owner, members in plan.physical_scope_groups
+        if len(members) > 1
+    ]
+    if reused_groups:
+        details = ", ".join(
+            (
+                f"{owner.scope_id}->"
+                + "/".join(member.scope_id for member in members[1:])
+                + "["
+                + ",".join(sorted({member.scope_kind for member in members}))
+                + "]"
+            )
+            for owner, members in reused_groups
+        )
+        raise LegacyStage1RoleSpecificDeduplicationError(
+            "authenticated physical-fit attempts contain only legacy "
+            "role-specific accumulators. Exact-inner workers may transform "
+            "held-out text, while cumulative-review views must keep sealed "
+            "text unavailable, so their logical evidence bytes cannot be "
+            "declared equal. Publication requires a complete "
+            f"{LEGACY_STAGE1_ROLE_NEUTRAL_BINDING_SET_SCHEMA} record with "
+            "ten fit-side family artifacts and distinct authenticated "
+            f"per-purpose logical views ({details})"
+        )
     fragment_roots: dict[str, Path] = {}
     attempt_request_hashes: dict[str, str] = {}
-    for scope in plan.scopes:
+    for scope in plan.physical_scopes:
         attempt = by_scope[scope.scope_id]
         request_payload = _read_json(
             attempt.attempt_dir / "attempt_request.json",
@@ -2008,6 +2110,7 @@ def collect_and_merge_legacy_stage1_scope_attempts(
         )
         fragment_roots[scope.scope_id] = fragment_root
         attempt_request_hashes[scope.scope_id] = request_sha
+
     destination = Path(merge_root)
     if destination.exists():
         return validate_legacy_stage1_fragment_merge(
@@ -2253,18 +2356,45 @@ def finalize_legacy_stage1_component_from_merge(
         cluster_rows = [
             row for payload in payloads for row in payload["embedding_cluster_fit_rows"]
         ]
+        planned_scopes = tuple(prepared.stage1_scope_plan.scopes)
+        exact_inner_count = sum(
+            scope.scope_kind == "exact_inner" for scope in planned_scopes
+        )
+        cumulative_count = sum(
+            scope.scope_kind == "cumulative_spent" for scope in planned_scopes
+        )
+        exact_handoff_count = sum(
+            scope.scope_kind in {"full_outer", "exact_inner"}
+            for scope in planned_scopes
+        )
         if (
-            len(handoff_rows) != 30
-            or len(scope_index_rows) != 30
-            or any(len(rows) != 25 for rows in (bow_rows, htr_rows, matched_rows, embedding_rows))
-            or len(cumulative_legacy) != 10
-            or len(cumulative_embedding) != 10
-            or len(cumulative_configurations) != 10
-            or len(cluster_rows) != 40
+            len(handoff_rows) != exact_handoff_count
+            or len(scope_index_rows) != exact_handoff_count
+            or any(
+                len(rows) != exact_inner_count
+                for rows in (
+                    bow_rows,
+                    htr_rows,
+                    matched_rows,
+                    embedding_rows,
+                )
+            )
+            or len(cumulative_legacy) != cumulative_count
+            or len(cumulative_embedding) != cumulative_count
+            or len(cumulative_configurations) != cumulative_count
+            or len(cluster_rows) != len(planned_scopes)
         ):
-            raise RuntimeError("legacy parent finalizer did not receive exact 5/25/10 coverage")
+            raise RuntimeError(
+                "legacy parent finalizer did not receive coverage matching "
+                "the authenticated logical scope plan"
+            )
 
-        schedule = bundle._canonical_cumulative_spent_schedule(prepared.registry)
+        schedule = bundle._canonical_cumulative_spent_schedule(
+            prepared.registry,
+            initial_training_partitions=(
+                prepared.stage1_scope_plan.initial_training_partitions
+            ),
+        )
         expected_requests: dict[str, Any] = {}
         for scope in schedule.scopes:
             expected_requests[scope.scope_id] = bundle._cumulative_spent_request_from_modeling_data(
@@ -2534,12 +2664,20 @@ def finalize_legacy_stage1_component_from_merge(
     published_handoff = destination / "handoff" / "discovery_contexts.jsonl"
     builder._validate_legacy_scope_lineage(published_handoff, prepared)
     load_legacy_full_outer_evidence(published_handoff)
+    planned_scopes = tuple(prepared.stage1_scope_plan.scopes)
     return {
         "component_root": str(destination),
-        "scope_count": len(prepared.stage1_scope_plan.scopes),
-        "full_outer_scope_count": 5,
-        "exact_inner_scope_count": 25,
-        "cumulative_spent_scope_count": 10,
+        "scope_count": len(planned_scopes),
+        "full_outer_scope_count": sum(
+            scope.scope_kind == "full_outer" for scope in planned_scopes
+        ),
+        "exact_inner_scope_count": sum(
+            scope.scope_kind == "exact_inner" for scope in planned_scopes
+        ),
+        "cumulative_spent_scope_count": sum(
+            scope.scope_kind == "cumulative_spent"
+            for scope in planned_scopes
+        ),
         "heldout_labels_supplied_to_workers": False,
         "aggregate_indexes_emitted_by_parent": True,
     }
@@ -2554,6 +2692,7 @@ __all__ = [
     "LEGACY_STAGE1_SCOPE_DESCRIPTOR_SCHEMA",
     "LEGACY_STAGE1_ONE_SCOPE_AUTHORITY_SCHEMA",
     "LEGACY_STAGE1_SCOPE_WORKER_TARGET",
+    "LegacyStage1RoleSpecificDeduplicationError",
     "collect_and_merge_legacy_stage1_scope_attempts",
     "finalize_legacy_stage1_component_from_merge",
     "publish_legacy_stage1_scope_descriptor",

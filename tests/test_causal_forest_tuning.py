@@ -16,6 +16,8 @@ class FakeCausalForestDML:
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+        for name, value in kwargs.items():
+            setattr(self, name, value)
         self.calls = []
         self.__class__.instances.append(self)
 
@@ -115,6 +117,52 @@ def test_causal_forest_head_can_use_fixed_configuration_without_tuning(monkeypat
     assert audit["tuning_attempted"] is False
     assert audit["tuning_succeeded"] is None
     assert audit["tuning_failure_fell_back_to_configured_parameters"] is False
+
+
+def test_causal_forest_head_forwards_and_audits_explicit_nuisance_settings(
+    monkeypatch,
+):
+    _patch_econml_dependencies(monkeypatch)
+    head = causal_forest_head.CausalForestHead(
+        n_estimators=12,
+        max_depth=7,
+        min_samples_leaf=3,
+        max_features=0.75,
+        honest=True,
+        inference=True,
+        random_state=19,
+        tune_model=False,
+        subforest_size=4,
+        nuisance_n_estimators=9,
+        nuisance_max_depth=5,
+        nuisance_min_samples_leaf=2,
+        nuisance_treatment_max_features="sqrt",
+        nuisance_outcome_max_features=1.0,
+        n_jobs=3,
+    )
+    head.fit(
+        X=np.arange(8, dtype=float).reshape(4, 2),
+        W=np.arange(4, dtype=float).reshape(4, 1),
+        T=np.array([0, 1, 0, 1]),
+        Y=np.array([0, 1, 1, 0]),
+    )
+
+    model = head.model
+    assert model.kwargs["subforest_size"] == 4
+    assert model.kwargs["n_jobs"] == 3
+    assert model.kwargs["model_t"].kwargs == {
+        "n_estimators": 9,
+        "max_depth": 5,
+        "min_samples_leaf": 2,
+        "max_features": "sqrt",
+        "random_state": 19,
+        "n_jobs": 3,
+    }
+    assert model.kwargs["model_y"].kwargs["max_features"] == 1.0
+    audit = head.fit_audit()
+    assert audit["configured_parameters"] == audit["effective_parameters"]
+    assert audit["configured_nuisance_parameters"] == audit["effective_nuisance_parameters"]
+    assert audit["operational_parameters"] == {"n_jobs": 3}
 
 
 def test_tune_causal_forest_model_returns_false_on_failure(caplog):

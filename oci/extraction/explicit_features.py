@@ -184,7 +184,7 @@ class _ExtractionParseResult:
 def build_extraction_prompt(
     clinical_text: str,
     specs: List[ExplicitFeatureSpec],
-    max_text_length: Optional[int] = 400000,
+    max_text_length: Optional[int] = None,
     context_strategy: str = "tail",
     source_text_temporally_valid_by_design: bool = False,
 ) -> str:
@@ -542,7 +542,7 @@ class VLLMFeatureExtractor:
         request_timeout: Optional[float] = 900.0,
         temperature: float = 0.0,
         max_tokens: int = 1024,
-        max_text_length: Optional[int] = 400000,
+        max_text_length: Optional[int] = None,
         context_strategy: str = "tail",
         source_text_temporally_valid_by_design: bool = False,
         schema_repair_attempts: Optional[int] = None,
@@ -1044,7 +1044,7 @@ def extract_explicit_features(
     request_timeout: Optional[float] = 900.0,
     temperature: float = 0.0,
     max_tokens: int = 1024,
-    max_text_length: Optional[int] = 400000,
+    max_text_length: Optional[int] = None,
     context_strategy: str = "tail",
     batch_size: int = 32,
 ) -> pd.DataFrame:

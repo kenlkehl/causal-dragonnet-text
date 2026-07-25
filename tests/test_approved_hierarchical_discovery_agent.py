@@ -19,9 +19,11 @@ from oci.inference.all_evidence_discovery_interfaces import (
 )
 from oci.inference.approved_hierarchical_discovery_agent import (
     ApprovedHierarchicalDiscoveryAgent,
+    AuthenticatedReferenceOnlyDirectNumericalContract,
     AuthenticatedRunnerExecutionTrace,
     direct_numerical_bindings_from_intent,
     direct_numerical_bindings_from_manifest,
+    direct_numerical_bindings_from_reference_contract,
 )
 from oci.inference.direct_upstream_numerical_manifest import (
     CALIBRATED_SOURCES_BLOCK,
@@ -269,6 +271,83 @@ def _manifest(catalog: RoleNeutralEvidenceCatalog) -> DirectUpstreamNumericalMan
         coordinates=tuple(coordinates),
         family_coverage=tuple(coverages),
     )
+
+
+def _reference_contract(
+    catalog: RoleNeutralEvidenceCatalog,
+) -> AuthenticatedReferenceOnlyDirectNumericalContract:
+    return AuthenticatedReferenceOnlyDirectNumericalContract.create(
+        outer_fold=catalog.outer_fold,
+        context_epoch=0,
+        plan_scientific_content_sha256="8" * 64,
+        source_execution_content_sha256="9" * 64,
+        reference_manifest_content_sha256="a" * 64,
+        runtime_binding_content_sha256="b" * 64,
+        provider_identity_sha256="c" * 64,
+        spent_row_ids=(0, 1),
+        gate_row_ids=(2, 3),
+        catalog=catalog,
+        family_coordinate_ids={
+            family: (f"coordinate_{index:03d}",)
+            for index, family in enumerate(
+                ACTIVE_STAGE1_CONCEPT_FAMILIES,
+                start=1,
+            )
+        },
+        projection_content_sha256="d" * 64,
+    )
+
+
+def test_reference_only_direct_numerical_contract_binds_all_ten_families():
+    catalog = _catalog()
+    contract = _reference_contract(catalog)
+
+    contract.verify(catalog=catalog)
+    bindings = direct_numerical_bindings_from_reference_contract(
+        contract,
+        catalog=catalog,
+    )
+
+    assert tuple(row.source_family for row in bindings) == (
+        ACTIVE_STAGE1_CONCEPT_FAMILIES
+    )
+    assert all(row.signal_count == 1 for row in bindings)
+    assert all(
+        row.direct_numerical_contract_sha256 == contract.content_sha256
+        for row in bindings
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "spent_hash",
+        "safety_flag",
+        "duplicate_coordinate",
+    ],
+)
+def test_reference_only_direct_numerical_contract_rejects_rehashed_forgery(
+    mutation,
+):
+    wire = _reference_contract(_catalog()).as_dict()
+    wire.pop("content_sha256")
+    if mutation == "spent_hash":
+        wire["spent_row_ids_sha256"] = "0" * 64
+    elif mutation == "safety_flag":
+        wire["row_values_included"] = True
+    else:
+        wire["family_coverage"][1]["coordinate_ids"] = list(
+            wire["family_coverage"][0]["coordinate_ids"]
+        )
+        wire["family_coverage"][1]["coordinate_ids_sha256"] = content_sha256(
+            wire["family_coverage"][1]["coordinate_ids"]
+        )
+
+    with pytest.raises(ValueError, match="reference-only"):
+        AuthenticatedReferenceOnlyDirectNumericalContract(
+            _body_json=canonical_json(wire),
+            content_sha256=content_sha256(wire),
+        )
 
 
 class _StructuralIntentFixture(FirstGateMaterializationIntent):

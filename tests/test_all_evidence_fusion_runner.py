@@ -23,6 +23,7 @@ from oci.inference.all_evidence_fusion_runner import (
     FoldTrainExplicitEncoder,
     QueryEvidenceArtifact,
     TfidfOrphanNgramArtifact,
+    _build_exact_inner_recurrence,
     _build_injected_review_partition_schedule,
     _build_final_upstream_meta_inner_fold_ids,
     _build_review_partition_schedule,
@@ -69,6 +70,22 @@ from oci.inference.frozen_extraction_cache_overlay import (
 )
 from oci.inference.staged_all_evidence_fusion_agent import StagedAllEvidenceFusionAgent
 from oci.inference.tfidf_topic_discovery import HANDOFF_SCHEMA_VERSION, row_set_fingerprint
+
+
+def test_exact_inner_recurrence_preserves_more_than_legacy_term_cap():
+    terms = {
+        ("bow_nuisance", "confounder", f"recurrent term {index:03d}")
+        for index in range(41)
+    }
+    recurrence = _build_exact_inner_recurrence(
+        {inner_fold: set(terms) for inner_fold in (1, 2, 3)}
+    )
+
+    assert len(recurrence["groups"]) == 1
+    group = recurrence["groups"][0]
+    assert group["discovered_recurrent_term_count"] == 41
+    assert group["retained_term_count"] == 41
+    assert len(group["terms"]) == 41
 
 
 def test_runner_default_grid_explores_stronger_logistic_regularization():
@@ -299,6 +316,40 @@ def test_injected_five_fold_schedule_uses_four_spent_folds_for_one_final_gate():
     assert schedule.initial_spent_fold_ids == (1, 2, 3, 4)
     assert schedule.gate_fold_ids == (5,)
     assert schedule.audit["initial_spent_partition_count"] == 4
+
+
+def test_injected_schedule_derives_one_initial_partition_without_hidden_three_fold_floor():
+    rows = pd.DataFrame(
+        {
+            "_oci_row_id": np.arange(60),
+            "treatment": np.tile([0, 0, 1, 1], 15),
+            "outcome": np.tile([0.0, 1.0, 0.0, 1.0], 15),
+        }
+    )
+
+    class Provider:
+        def get_review_partition_assignments(self, **kwargs):
+            assert kwargs["exact_outer_train_row_ids"] == tuple(range(60))
+            return {
+                fold: tuple(range((fold - 1) * 20, fold * 20))
+                for fold in range(1, 4)
+            }
+
+    schedule = _build_injected_review_partition_schedule(
+        rows,
+        outer_fold=1,
+        review_rounds=2,
+        minimum_partition_rows=8,
+        treatment_column="treatment",
+        outcome_column="outcome",
+        outcome_type="binary",
+        provider=Provider(),
+        provider_identity={"identity_sha256": "a" * 64},
+    )
+
+    assert schedule.initial_spent_fold_ids == (1,)
+    assert schedule.gate_fold_ids == (2, 3)
+    assert schedule.audit["initial_spent_partition_count"] == 1
 
 
 def test_review_config_requires_each_gate_provider_independently(tmp_path):
@@ -2375,6 +2426,103 @@ def test_review_response_exhaustion_raises_before_freezing_safe_baseline(
     assert_tamper_rejected(lambda payload: payload["body"].__setitem__("gate_accessed", True))
 
 
+def test_adaptive_review_failure_replays_without_legacy_completion_attempts(
+    tmp_path,
+):
+    body = {
+        "review_round": 2,
+        "review_attempt": 1,
+        "request_sha256": "1" * 64,
+        "failure_type": "adaptive_hierarchy_or_executable_validation",
+        "failure_code": "runner_boundary_response_invalid",
+        "failure_message": (
+            "The returned review object failed the closed response boundary."
+        ),
+        "failure_issue_sha256": "2" * 64,
+        "failed_contract_names": [
+            "baseline_age",
+            "egfr_mutation",
+        ],
+        "completion_attempts": [],
+        "raw_response_persisted": False,
+        "raw_reasoning_persisted": False,
+        "row_level_values_persisted": False,
+        "gate_accessed": False,
+        "gate_consumed": False,
+        "outer_heldout_labels_used": False,
+    }
+
+    def write_failure(*, name, current_body):
+        path = tmp_path / name
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": (
+                        fusion_runner_module
+                        .POST_EXTRACTION_REVIEW_FAILURE_SCHEMA_VERSION
+                    ),
+                    "body": current_body,
+                    "content_sha256": _json_content_sha256(current_body),
+                }
+            )
+        )
+        return path
+
+    adaptive_path = write_failure(
+        name="adaptive_failure.json",
+        current_body=body,
+    )
+    loaded = fusion_runner_module._load_request_bound_review_failure(
+        adaptive_path,
+        request_sha256=body["request_sha256"],
+        review_round=2,
+        review_attempt=1,
+        expected_current_names=["baseline_age", "egfr_mutation"],
+    )
+    assert loaded == body
+
+    for failure_type in (
+        "remote_reviewer_exhausted",
+        "runner_boundary_validation",
+    ):
+        remote_body = {
+            **body,
+            "failure_type": failure_type,
+        }
+        remote_path = write_failure(
+            name=f"{failure_type}.json",
+            current_body=remote_body,
+        )
+        with pytest.raises(RuntimeError, match="lacks attempt metadata"):
+            fusion_runner_module._load_request_bound_review_failure(
+                remote_path,
+                request_sha256=body["request_sha256"],
+                review_round=2,
+                review_attempt=1,
+                expected_current_names=[
+                    "baseline_age",
+                    "egfr_mutation",
+                ],
+            )
+
+    malformed_adaptive = {
+        **body,
+        "completion_attempts": [{}],
+    }
+    malformed_path = write_failure(
+        name="adaptive_with_legacy_attempt.json",
+        current_body=malformed_adaptive,
+    )
+    with pytest.raises(RuntimeError, match="contains legacy completion attempts"):
+        fusion_runner_module._load_request_bound_review_failure(
+            malformed_path,
+            request_sha256=body["request_sha256"],
+            review_round=2,
+            review_attempt=1,
+            expected_current_names=["baseline_age", "egfr_mutation"],
+        )
+
+
 def test_review_provider_infrastructure_value_error_is_not_cached_as_model_output(
     tmp_path,
     monkeypatch,
@@ -4358,6 +4506,39 @@ def test_blocking_review_contract_with_no_grounded_source_exposes_drop_fallback(
     assert blocking["safe_fallback_action"] == "drop"
 
 
+def test_spent_evidence_sanitizer_preserves_complete_safe_lists_and_text():
+    terms = [
+        {
+            "term": " ".join(
+                [f"complete_semantic_witness_{index:02d}"]
+                + [f"token_{token:02d}" for token in range(30)]
+            ),
+            "score": float(index),
+        }
+        for index in range(40)
+    ]
+    long_description = " ".join(f"description_{index:03d}" for index in range(80))
+
+    sanitized = AllEvidenceFusionRunner._sanitize_spent_evidence_catalog(
+        [
+            {
+                "source_families": ["tfidf_topics"],
+                "role_hint": "confounder",
+                "content": {
+                    "terms": terms,
+                    "description": long_description,
+                },
+            }
+        ]
+    )
+
+    assert len(sanitized[0]["content"]["terms"]) == len(terms)
+    assert [row["term"] for row in sanitized[0]["content"]["terms"]] == [
+        row["term"] for row in terms
+    ]
+    assert sanitized[0]["content"]["description"] == long_description
+
+
 def test_unqualified_timepoint_grounding_is_accepted_and_candidate_reaches_gate(
     tmp_path, monkeypatch
 ):
@@ -5327,6 +5508,8 @@ def test_runner_freezes_oracle_free_predictions_and_train_only_encoder_state(tmp
     cache_overlay = FrozenExtractionCacheOverlay(
         [overlay_index_path],
         expected_row_count=len(source),
+        row_id_column="_oci_row_id",
+        text_column="text",
     )
 
     agent = _FusionAgent()
@@ -5522,6 +5705,8 @@ def test_runner_freezes_oracle_free_predictions_and_train_only_encoder_state(tmp
         cache_overlay=FrozenExtractionCacheOverlay(
             [empty_index_path],
             expected_row_count=len(source),
+            row_id_column="_oci_row_id",
+            text_column="text",
         ),
         config=AllEvidenceFusionRunnerConfig(
             post_extraction_review_rounds=0,

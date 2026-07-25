@@ -42,6 +42,7 @@ from oci.inference.neural_cohort_witness import (  # noqa: E402
 from oci.inference.tfidf_topic_discovery import (  # noqa: E402
     _strata,
     fit_joint_cross_fitted_nuisance_stacks,
+    legacy_tfidf_nuisance_stack_v1,
 )
 from oci.models.causal_forest_head import CausalForestHead  # noqa: E402
 from oracle_experiment_scripts.run_topic_ngram_inner_fold_forest import (  # noqa: E402
@@ -172,6 +173,7 @@ def _subfold_fit(
             views=nuisance_views,
             folds=int(nuisance_folds),
             random_state=int(seed + 10_000),
+            nuisance_stack_config=legacy_tfidf_nuisance_stack_v1(),
         )
         train_e = np.asarray(nuisance["treatment"]["stacked_oof"], dtype=float)
         train_m = np.asarray(nuisance["outcome"]["stacked_oof"], dtype=float)

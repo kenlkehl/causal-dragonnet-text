@@ -8,7 +8,7 @@ import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -52,18 +52,25 @@ from .embedding_contrast_discovery import (
     EmbeddingContrastEvidenceGenerator,
     _binary_labels,
     _binary_mean_difference_direction,
+    _canonicalize_svd_component_signs,
+    _cluster_local_scientific_config,
+    _embedding_cluster_kmeans_parameters,
     _normalize_rows,
+    _normalize_rows_configured,
     _normalize_vector,
     _residualize_embeddings,
     _residualize_vector_from_basis,
     _tail_labels,
 )
+from .production_stage1_scope_scheduler import derive_stage1_group_seed
 from .multi_model_agentic_forest import (
     MultiModelHTREvidenceProvider,
     _agent_visible_metrics,
     _agentic_discovery_handoff_row,
     _align_htr_prediction_frame,
     _binary_split_items,
+    _bow_model_params,
+    _bow_vectorizer_params,
     _bounded_fold_count,
     _build_evidence_digest_agent_context,
     _clinical_text_examples,
@@ -2388,6 +2395,9 @@ class MultiModelForestStage1Runner:
             x_model,
             pseudo_target,
             sample_weight=pseudo_target_sample_weight,
+            unsupported_sample_weight_policy=(
+                view.unsupported_sample_weight_policy
+            ),
         )
         effect_coef = _model_feature_scores(effect_model, len(features))
         effect_prediction = effect_model.predict(x_model)
@@ -2495,6 +2505,16 @@ class MultiModelForestStage1Runner:
             return {}
         generator = self._embedding_generator()
         generator.prepare(self.dataset)
+        ordered_fit_rows = tuple(
+            discovery_df["_oci_row_id"].astype(int).tolist()
+        )
+        generator.bind_cluster_physical_fit_authority(
+            ordered_fit_row_ids=ordered_fit_rows,
+            canonical_group_seed=derive_stage1_group_seed(
+                int(self.config.seed),
+                ordered_fit_rows,
+            ),
+        )
         native_observer = getattr(generator, "_native_embedding_proof_observer", None)
         if native_observer is not None:
             register_fit_outputs = getattr(
@@ -2868,7 +2888,15 @@ class MultiModelForestStage1Runner:
             fold_weight = None
             if sample_weight is not None:
                 fold_weight = np.asarray(sample_weight, dtype=float)[fit_pos]
-            _fit_regressor(model, x_fit, values[fit_pos], sample_weight=fold_weight)
+            _fit_regressor(
+                model,
+                x_fit,
+                values[fit_pos],
+                sample_weight=fold_weight,
+                unsupported_sample_weight_policy=str(
+                    model_params["unsupported_sample_weight_policy"]
+                ),
+            )
             heldout_pred = model.predict(x_heldout)
             test_pred = model.predict(x_test)
             heldout_values = values[heldout_pos]
@@ -2960,6 +2988,12 @@ class MultiModelForestStage1Runner:
             heldout_pos = np.asarray(heldout_pos, dtype=int)
             directions, fold_metadata = self._embedding_directions(
                 patient_embeddings=train_patient[fit_pos],
+                fit_row_ids=tuple(
+                    map(
+                        int,
+                        train_df["_oci_row_id"].to_numpy()[fit_pos],
+                    )
+                ),
                 y=np.asarray(y, dtype=float)[fit_pos],
                 t=np.asarray(t, dtype=float)[fit_pos],
                 pseudo_target=np.asarray(pseudo_target, dtype=float)[fit_pos],
@@ -3049,6 +3083,7 @@ class MultiModelForestStage1Runner:
         self,
         *,
         patient_embeddings: np.ndarray,
+        fit_row_ids: Sequence[int],
         y: np.ndarray,
         t: np.ndarray,
         pseudo_target: np.ndarray,
@@ -3057,6 +3092,14 @@ class MultiModelForestStage1Runner:
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         directions: List[Dict[str, Any]] = []
         metadata: List[Dict[str, Any]] = []
+        ordered_fit_rows = tuple(map(int, fit_row_ids))
+        if (
+            len(ordered_fit_rows) != len(patient_embeddings)
+            or len(set(ordered_fit_rows)) != len(ordered_fit_rows)
+        ):
+            raise ValueError(
+                "embedding direction fit rows must be exact, ordered, and unique"
+            )
         finite = np.all(np.isfinite(patient_embeddings), axis=1)
         treatment_labels, treatment_mask = _binary_labels(t)
         t_direction, t_counts = _binary_mean_difference_direction(
@@ -3202,6 +3245,10 @@ class MultiModelForestStage1Runner:
                     finite=finite,
                     metadata=metadata,
                     outer_fold=outer_fold,
+                    canonical_group_seed=derive_stage1_group_seed(
+                        int(self.config.seed),
+                        ordered_fit_rows,
+                    ),
                 )
             )
         return directions, metadata
@@ -3257,45 +3304,42 @@ class MultiModelForestStage1Runner:
         finite: np.ndarray,
         metadata: List[Dict[str, Any]],
         outer_fold: int,
+        canonical_group_seed: int,
     ) -> List[Dict[str, Any]]:
         cfg = self.nn_config.embedding_contrast
+        scientific = _cluster_local_scientific_config(cfg)
+        dtype = np.dtype(scientific.computation_dtype)
         n_usable = int(np.sum(finite))
-        n_clusters = min(
-            int(cfg.cluster_contrast_n_clusters),
-            n_usable // int(cfg.cluster_contrast_min_cluster_size),
-        )
-        if n_clusters < 2:
-            metadata.append(
-                {
-                    "outer_fold": int(outer_fold),
-                    "name": "cluster_contrast_vectors",
-                    "skipped": "too_few_patients_for_cluster_contrasts",
-                    "n_usable_patients": n_usable,
-                }
+        n_clusters = int(scientific.requested_cluster_count)
+        if n_usable < n_clusters * int(scientific.minimum_cluster_size):
+            raise ValueError(
+                "cluster-local Stage 1 feature fit cannot satisfy the exact "
+                "configured cluster count and minimum support"
             )
-            return []
-        kmeans = MiniBatchKMeans(
+        kmeans_parameters = _embedding_cluster_kmeans_parameters(
+            cfg,
+            n_usable=n_usable,
+            canonical_group_seed=int(canonical_group_seed),
             n_clusters=n_clusters,
-            random_state=int(cfg.cluster_contrast_random_state),
-            batch_size=max(128, min(1024, n_usable)),
-            n_init=int(cfg.cluster_contrast_kmeans_n_init),
-            max_iter=300,
         )
+        kmeans = MiniBatchKMeans(**kmeans_parameters)
         labels = np.full(len(patient_embeddings), -1, dtype=int)
-        labels[finite] = kmeans.fit_predict(patient_embeddings[finite])
+        labels[finite] = kmeans.fit_predict(
+            np.asarray(patient_embeddings[finite], dtype=dtype)
+        )
         counts = np.bincount(labels[finite], minlength=n_clusters)
         treatment_items = []
         interaction_items = []
         for cluster_id in range(n_clusters):
-            if int(counts[cluster_id]) < int(cfg.cluster_contrast_min_cluster_size):
+            if int(counts[cluster_id]) < int(scientific.minimum_cluster_size):
                 continue
             cluster_mask = labels == cluster_id
             local_mask = cluster_mask & treatment_mask & finite
             pos = local_mask & (treatment_labels == 1)
             neg = local_mask & (treatment_labels == 0)
-            if int(np.sum(pos)) >= int(cfg.cluster_contrast_min_group_size) and int(
+            if int(np.sum(pos)) >= int(scientific.minimum_group_size) and int(
                 np.sum(neg)
-            ) >= int(cfg.cluster_contrast_min_group_size):
+            ) >= int(scientific.minimum_group_size):
                 direction = np.mean(patient_embeddings[pos], axis=0) - np.mean(
                     patient_embeddings[neg],
                     axis=0,
@@ -3325,6 +3369,28 @@ class MultiModelForestStage1Runner:
                     }
                 )
         result: List[Dict[str, Any]] = []
+        minimum_local = int(
+            scientific.minimum_distinct_local_clusters_per_family
+        )
+        if (
+            len(treatment_items) < minimum_local
+            or len(interaction_items) < minimum_local
+        ):
+            raise ValueError(
+                "cluster-local Stage 1 feature fit lacks the configured "
+                "independently supported local contrasts"
+            )
+        metadata.append(
+            {
+                "outer_fold": int(outer_fold),
+                "name": "cluster_contrast_vectors",
+                "n_usable_patients": n_usable,
+                "cluster_counts": [int(value) for value in counts],
+                "canonical_group_seed": int(canonical_group_seed),
+                "kmeans_parameters": copy.deepcopy(kmeans_parameters),
+                "scientific_configuration": scientific.as_dict(),
+            }
+        )
         result.extend(
             self._svd_cluster_components(
                 items=treatment_items,
@@ -3363,7 +3429,11 @@ class MultiModelForestStage1Runner:
         treated_negative = base & (treatment_labels == 1) & (outcome_labels == 0)
         untreated_positive = base & (treatment_labels == 0) & (outcome_labels == 1)
         untreated_negative = base & (treatment_labels == 0) & (outcome_labels == 0)
-        min_cell = int(self.nn_config.embedding_contrast.cluster_contrast_min_cell_size)
+        min_cell = int(
+            _cluster_local_scientific_config(
+                self.nn_config.embedding_contrast
+            ).minimum_cell_size
+        )
         if (
             min(
                 int(np.sum(treated_positive)),
@@ -3408,30 +3478,72 @@ class MultiModelForestStage1Runner:
         metadata: List[Dict[str, Any]],
         outer_fold: int,
     ) -> List[Dict[str, Any]]:
-        if len(items) < 2:
-            return []
+        scientific = _cluster_local_scientific_config(
+            self.nn_config.embedding_contrast
+        )
+        if len(items) < int(
+            scientific.minimum_distinct_local_clusters_per_family
+        ):
+            raise ValueError(
+                f"cluster-local {contrast_family} lacks configured support"
+            )
+        dtype = np.dtype(scientific.computation_dtype)
         matrix = np.vstack(
             [
-                _normalize_vector(np.asarray(item["direction"], dtype=float))
+                _normalize_rows_configured(
+                    np.asarray(item["direction"], dtype=dtype).reshape(1, -1),
+                    normalize=True,
+                    epsilon=float(scientific.normalization_epsilon),
+                    zero_vector_policy=scientific.zero_vector_policy,
+                    dtype=scientific.computation_dtype,
+                )[0]
                 * np.sqrt(float(item["n_cluster"]))
                 for item in items
             ]
+        ).astype(dtype, copy=False)
+        svd_parameters = {
+            "full_matrices": bool(scientific.svd_full_matrices),
+            "compute_uv": bool(scientific.svd_compute_uv),
+            "hermitian": bool(scientific.svd_hermitian),
+        }
+        _left, singular_values, components = np.linalg.svd(
+            matrix,
+            **svd_parameters,
         )
-        try:
-            _left, singular_values, components = np.linalg.svd(matrix, full_matrices=False)
-        except np.linalg.LinAlgError:
-            return []
+        components = _canonicalize_svd_component_signs(
+            components,
+            policy=scientific.svd_sign_canonicalization_policy,
+        )
+        rank_tolerance = (
+            float(scientific.svd_rank_tolerance_multiplier)
+            * np.finfo(np.dtype(scientific.svd_rank_tolerance_dtype)).eps
+            * max(matrix.shape)
+            * float(singular_values[0])
+        )
+        numerical_rank = int(np.sum(singular_values > rank_tolerance))
+        if numerical_rank < int(
+            scientific.minimum_numerical_rank_per_family
+        ):
+            raise ValueError(
+                f"cluster-local {contrast_family} lacks configured numerical rank"
+            )
         result = []
         max_components = min(
-            int(self.nn_config.embedding_contrast.cluster_contrast_max_components),
-            len(singular_values),
+            int(scientific.maximum_components_per_family),
+            numerical_rank,
         )
         total_energy = float(np.sum(np.square(singular_values)))
         for idx in range(max_components):
             sv = float(singular_values[idx])
             if not np.isfinite(sv) or sv <= 0.0:
                 continue
-            direction = _normalize_vector(components[idx])
+            direction = _normalize_rows_configured(
+                np.asarray(components[idx], dtype=dtype).reshape(1, -1),
+                normalize=True,
+                epsilon=float(scientific.normalization_epsilon),
+                zero_vector_policy=scientific.zero_vector_policy,
+                dtype=scientific.computation_dtype,
+            )[0]
             name = f"{prefix}_pc{idx + 1}"
             result.append(
                 {
@@ -3455,6 +3567,12 @@ class MultiModelForestStage1Runner:
                         float(sv**2 / total_energy) if total_energy > 0.0 else None
                     ),
                     "local_contrast_count": int(len(items)),
+                    "svd_parameters": copy.deepcopy(svd_parameters),
+                    "svd_sign_canonicalization_policy": (
+                        scientific.svd_sign_canonicalization_policy
+                    ),
+                    "svd_rank_tolerance": float(rank_tolerance),
+                    "svd_numerical_rank": numerical_rank,
                 }
             )
         return result
@@ -3741,39 +3859,15 @@ class MultiModelForestStage1Runner:
 
 
 def _vectorizer_params(view: BoWViewConfig) -> Dict[str, Any]:
-    return {
-        "ngram_range_min": int(view.ngram_range_min),
-        "ngram_range_max": int(view.ngram_range_max),
-        "min_df": int(view.min_df),
-        "max_df": float(view.max_df),
-        "sublinear_tf": bool(view.sublinear_tf),
-        "max_features": int(view.max_features),
-    }
+    return _bow_vectorizer_params(view)
 
 
 def _model_params(view: BoWViewConfig) -> Dict[str, Any]:
-    return {
-        "bow_model": str(view.bow_model).strip().lower(),
-        "logistic_c": float(view.logistic_c),
-        "logistic_max_iter": int(view.logistic_max_iter),
-        "ridge_alpha": float(view.ridge_alpha),
-    }
+    return _bow_model_params(view)
 
 
 def _bow_view_to_dict(view: BoWViewConfig) -> Dict[str, Any]:
-    return {
-        "name": view.name,
-        "max_features": int(view.max_features),
-        "min_df": int(view.min_df),
-        "max_df": float(view.max_df),
-        "ngram_range_min": int(view.ngram_range_min),
-        "ngram_range_max": int(view.ngram_range_max),
-        "sublinear_tf": bool(view.sublinear_tf),
-        "bow_model": str(view.bow_model),
-        "logistic_c": float(view.logistic_c),
-        "logistic_max_iter": int(view.logistic_max_iter),
-        "ridge_alpha": float(view.ridge_alpha),
-    }
+    return asdict(view)
 
 
 def _append_feature(

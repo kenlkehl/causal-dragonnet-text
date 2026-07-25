@@ -1,0 +1,85 @@
+{
+  "candidates": [
+    {
+      "accelerator_count": 1,
+      "concurrency_per_device": 1,
+      "executor_mode": "persistent_slots",
+      "host_cpu_budget": 8,
+      "name": "single_accelerator_one_fit"
+    },
+    {
+      "accelerator_count": 1,
+      "concurrency_per_device": 1,
+      "executor_mode": "fresh_per_fit",
+      "host_cpu_budget": 8,
+      "name": "single_accelerator_one_fit_fresh"
+    },
+    {
+      "accelerator_count": 1,
+      "concurrency_per_device": 2,
+      "executor_mode": "persistent_slots",
+      "host_cpu_budget": 8,
+      "name": "single_accelerator_two_fits"
+    },
+    {
+      "accelerator_count": 2,
+      "concurrency_per_device": 1,
+      "executor_mode": "persistent_slots",
+      "host_cpu_budget": 8,
+      "name": "two_accelerators_one_fit_each"
+    },
+    {
+      "accelerator_count": 2,
+      "concurrency_per_device": 2,
+      "executor_mode": "persistent_slots",
+      "host_cpu_budget": 8,
+      "name": "two_accelerators_two_fits_each"
+    }
+  ],
+  "gpu_sample_interval_seconds": 0.25,
+  "warmup_observations_per_candidate_scope": 1,
+  "preflight_compression_benchmark": {
+    "codecs": [
+      "none",
+      "zstd"
+    ],
+    "measured_repetitions_per_codec": 2,
+    "schema_version": "compact_preflight_compression_benchmark_config_v1",
+    "warmup_repetitions_per_codec": 1
+  },
+  "multi_device_baselines": [
+    {
+      "baseline": "single_accelerator_one_fit",
+      "candidate": "two_accelerators_one_fit_each"
+    },
+    {
+      "baseline": "single_accelerator_one_fit",
+      "candidate": "two_accelerators_two_fits_each"
+    }
+  ],
+  "representative_scopes": [
+    {
+      "fit_row_count": 800,
+      "fits_per_observation": 4,
+      "label": "configured_full_outer_fit"
+    },
+    {
+      "fit_row_count": 640,
+      "fits_per_observation": 4,
+      "label": "configured_exact_inner_fit"
+    }
+  ],
+  "resource_performance_safety": {
+    "fail_on_external_gpu_occupants": true,
+    "gpu_max_allocation_fraction": 0.85,
+    "gpu_minimum_headroom_bytes": 6442450944,
+    "maximum_coordination_proof_overhead_ratio": 0.3,
+    "maximum_ordinary_read_amplification": 2.0,
+    "minimum_benchmark_repetitions_per_scope": 2,
+    "minimum_multi_device_throughput_ratio": 1.5,
+    "read_counter_source": "process_read_bytes",
+    "schema_version": "portable_resource_performance_safety_policy_v1"
+  },
+  "schema_version": "portable_role_neutral_performance_benchmark_config_v3",
+  "scientific_reference_candidate": "single_accelerator_one_fit"
+}

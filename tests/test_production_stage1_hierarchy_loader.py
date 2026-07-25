@@ -375,6 +375,7 @@ def _cluster_feasibility_audit(
     registry: dict,
     embedding_configuration: dict,
     embedding_cache_identity: dict,
+    initial_training_partitions: int,
 ) -> dict:
     configured_clusters = int(embedding_configuration["cluster_contrast_n_clusters"])
     contrast_families = (
@@ -403,7 +404,11 @@ def _cluster_feasibility_audit(
             ),
         }
 
-    for scope in _embedding_cluster_feasibility_scopes(registry):
+    for scope in _embedding_cluster_feasibility_scopes(
+        registry,
+        initial_training_partitions=initial_training_partitions,
+        global_seed=42,
+    ):
         binding = _embedding_cluster_scope_binding(scope)
         fit_count = int(binding["fit_row_count"])
         counts = [fit_count // configured_clusters] * configured_clusters
@@ -1025,8 +1030,10 @@ def _write_hierarchy_spent_graph(
         "contract_split_registry_sha256": contract.content_sha256,
         "schedule_sha256": schedule.schedule_sha256,
         "review_rounds": schedule.review_rounds,
-        "initial_spent_partition_count": 3,
-        "canonical_hierarchy_partition_count": schedule.review_rounds + 3,
+        "initial_spent_partition_count": schedule.initial_spent_partition_count,
+        "canonical_hierarchy_partition_count": (
+            schedule.review_rounds + schedule.initial_spent_partition_count
+        ),
         "interaction_inner_folds": interaction_inner_folds,
         "tfidf_nested_calibration_folds": tfidf_nested_calibration_folds,
         "fold_domains_are_distinct": True,
@@ -1064,6 +1071,7 @@ def _build_bundle(
     *,
     inner_fold_count: int = 4,
     hierarchy_review_rounds: int | None = None,
+    initial_training_partitions: int = 3,
     interaction_inner_folds: int = 3,
     tfidf_nested_calibration_folds: int = 3,
     root_graph_v2: bool = False,
@@ -1108,6 +1116,7 @@ def _build_bundle(
         CanonicalHierarchySpentSchedule.build(
             registry=contract,
             review_rounds=hierarchy_review_rounds,
+            initial_training_partitions=initial_training_partitions,
         )
         if hierarchy_review_rounds is not None
         else None
@@ -1187,6 +1196,7 @@ def _build_bundle(
             "embedding_contrast"
         ],
         embedding_cache_identity=embedding_cache_identity,
+        initial_training_partitions=initial_training_partitions,
     )
     if cluster_audit_mode == "tampered_grounding":
         first_scope = cluster_audit["scopes"][0]
@@ -1216,6 +1226,9 @@ def _build_bundle(
             ),
         },
         "split_registry_content_sha256": wrapper_registry_sha,
+        "stage1_scope_plan": {
+            "initial_training_partitions": initial_training_partitions,
+        },
         "htr_model": {
             "path": str(tmp_path / "htr_model"),
             "tree_sha256": htr_model_sha256,
@@ -1263,8 +1276,10 @@ def _build_bundle(
             "schema_version": STAGE1_HIERARCHY_SPENT_CONTRACT_SCHEMA,
             "review_rounds": hierarchy_review_rounds,
             "partition_authority": ("canonical_stage1_inner_heldout_partitions_in_registry_order"),
-            "initial_spent_partition_count": 3,
-            "canonical_hierarchy_partition_count": hierarchy_review_rounds + 3,
+            "initial_spent_partition_count": initial_training_partitions,
+            "canonical_hierarchy_partition_count": (
+                hierarchy_review_rounds + initial_training_partitions
+            ),
             "interaction_inner_folds": interaction_inner_folds,
             "tfidf_nested_calibration_folds": tfidf_nested_calibration_folds,
             "fold_domains_are_distinct": True,
@@ -2107,10 +2122,14 @@ def test_hierarchy_loader_rejects_rehashed_weakened_htr_nontruncation_audit(
 def test_production_hierarchy_handoff_rejects_compatibility_only_bundle(tmp_path: Path):
     manifest_path, _tamper_target = _build_bundle(tmp_path)
     with pytest.raises(RuntimeError, match="no canonical accumulated-spent hierarchy contract"):
-        load_production_stage1_hierarchy_handoff(manifest_path, review_rounds=1)
+        load_production_stage1_hierarchy_handoff(
+            manifest_path,
+            review_rounds=1,
+            initial_training_partitions=3,
+        )
 
 
-def test_canonical_hierarchy_schedule_requires_three_initial_partitions():
+def test_canonical_hierarchy_schedule_requires_explicit_initial_partitions():
     registry = CanonicalStage1SplitRegistry.build(
         dataset_row_ids=tuple(range(20)),
         outer_heldout_row_ids={
@@ -2119,11 +2138,29 @@ def test_canonical_hierarchy_schedule_requires_three_initial_partitions():
         },
         inner_fold_count=4,
     )
-    schedule = CanonicalHierarchySpentSchedule.build(registry=registry, review_rounds=1)
+    schedule = CanonicalHierarchySpentSchedule.build(
+        registry=registry,
+        review_rounds=1,
+        initial_training_partitions=3,
+    )
     assert schedule.initial_spent_partition_count == 3
     assert len(schedule.scopes) == 2
-    with pytest.raises(ValueError, match=r"review_rounds \+ 3"):
-        CanonicalHierarchySpentSchedule.build(registry=registry, review_rounds=2)
+    alternative = CanonicalHierarchySpentSchedule.build(
+        registry=registry,
+        review_rounds=2,
+        initial_training_partitions=2,
+    )
+    assert alternative.initial_spent_partition_count == 2
+    assert alternative.scope(1, 0).spent_partition_ids == (1, 2)
+    with pytest.raises(
+        ValueError,
+        match=r"review_rounds \+ initial_training_partitions",
+    ):
+        CanonicalHierarchySpentSchedule.build(
+            registry=registry,
+            review_rounds=2,
+            initial_training_partitions=3,
+        )
 
 
 def test_canonical_hierarchy_schedule_binds_five_partitions_for_two_rounds():
@@ -2135,7 +2172,11 @@ def test_canonical_hierarchy_schedule_binds_five_partitions_for_two_rounds():
         },
         inner_fold_count=5,
     )
-    schedule = CanonicalHierarchySpentSchedule.build(registry=registry, review_rounds=2)
+    schedule = CanonicalHierarchySpentSchedule.build(
+        registry=registry,
+        review_rounds=2,
+        initial_training_partitions=3,
+    )
     assert schedule.review_rounds == 2
     assert all(
         tuple(partitions) == (1, 2, 3, 4, 5)
@@ -2147,6 +2188,31 @@ def test_canonical_hierarchy_schedule_binds_five_partitions_for_two_rounds():
     assert outer_one[0].sealed_partition_ids == (4, 5)
     assert outer_one[1].spent_partition_ids == (1, 2, 3, 4)
     assert outer_one[1].sealed_partition_ids == (5,)
+
+
+def test_handoff_authenticates_nonbenchmark_initial_partition_count(
+    tmp_path: Path,
+):
+    manifest_path, _tamper_target = _build_bundle(
+        tmp_path,
+        inner_fold_count=4,
+        hierarchy_review_rounds=2,
+        initial_training_partitions=2,
+        root_graph_v2=True,
+    )
+    handoff = load_production_stage1_hierarchy_handoff(
+        manifest_path,
+        review_rounds=2,
+        initial_training_partitions=2,
+    )
+    assert handoff.provider.schedule.initial_spent_partition_count == 2
+    assert handoff.provider.schedule.scope(1, 0).spent_partition_ids == (1, 2)
+    with pytest.raises(ValueError, match="contract is invalid"):
+        load_production_stage1_hierarchy_handoff(
+            manifest_path,
+            review_rounds=2,
+            initial_training_partitions=3,
+        )
 
 
 def test_semantic_retrieval_training_scope_policy_is_truthful_uncapped_and_nonselecting():
@@ -2162,6 +2228,7 @@ def test_semantic_retrieval_training_scope_policy_is_truthful_uncapped_and_nonse
     scope = CanonicalHierarchySpentSchedule.build(
         registry=registry,
         review_rounds=1,
+        initial_training_partitions=3,
     ).scope(1, 0)
     policy = _semantic_retrieval_training_scope_policy(
         scope,
@@ -2216,6 +2283,7 @@ def test_production_handoff_authenticates_and_serves_validated_native_proofs(
     handoff = load_production_stage1_hierarchy_handoff(
         manifest_path,
         review_rounds=1,
+        initial_training_partitions=3,
         interaction_inner_folds=3,
         tfidf_nested_calibration_folds=3,
     )
@@ -2331,7 +2399,11 @@ def test_handoff_rejects_nested_native_artifact_tamper_without_descriptor_or_pro
         (RuntimeError, ValueError),
         match=rf"native {artifact_label} artifact",
     ):
-        load_production_stage1_hierarchy_handoff(manifest_path, review_rounds=1)
+        load_production_stage1_hierarchy_handoff(
+            manifest_path,
+            review_rounds=1,
+            initial_training_partitions=3,
+        )
     assert descriptor_path.read_bytes() == descriptor_bytes
     assert proof_path.read_bytes() == proof_bytes
 
@@ -2357,7 +2429,11 @@ def test_handoff_consumes_retained_manifest_snapshot_without_a_to_b_reopen(
         "load_authenticated_stage1_bundle_for_hierarchy",
         load_then_replace,
     )
-    handoff = load_production_stage1_hierarchy_handoff(manifest_path, review_rounds=1)
+    handoff = load_production_stage1_hierarchy_handoff(
+        manifest_path,
+        review_rounds=1,
+        initial_training_partitions=3,
+    )
     assert handoff.inputs.bundle_sha256 == handoff.provider.identity()["bundle_sha256"]
     assert json.loads(manifest_path.read_text(encoding="utf-8")) == {"attacker": "replacement"}
 
@@ -2432,7 +2508,11 @@ def test_hierarchy_projection_binds_spent_labels_while_catalog_serving_is_gated(
         inner_fold_count=4,
         hierarchy_review_rounds=1,
     )
-    handoff = load_production_stage1_hierarchy_handoff(manifest_path, review_rounds=1)
+    handoff = load_production_stage1_hierarchy_handoff(
+        manifest_path,
+        review_rounds=1,
+        initial_training_partitions=3,
+    )
     scope = handoff.provider.schedule.scope(1, 0)
     data = pd.DataFrame(
         {
@@ -2482,7 +2562,11 @@ def test_runner_consumes_authenticated_prefit_cumulative_spent_catalog_directly(
         inner_fold_count=4,
         hierarchy_review_rounds=1,
     )
-    handoff = load_production_stage1_hierarchy_handoff(manifest_path, review_rounds=1)
+    handoff = load_production_stage1_hierarchy_handoff(
+        manifest_path,
+        review_rounds=1,
+        initial_training_partitions=3,
+    )
     monkeypatch.setattr(
         hierarchy_handoff_module,
         "GENUINE_HIERARCHY_NATIVE_PROOF_VALIDATION_READY",
@@ -2496,6 +2580,11 @@ def test_runner_consumes_authenticated_prefit_cumulative_spent_catalog_directly(
         attempt=1,
         initial_spent_fold_ids=(1, 2, 3),
         gate_fold_ids=(4,),
+        outer_train_row_ids=tuple(
+            row_id
+            for partition_rows in partitions.values()
+            for row_id in partition_rows
+        ),
         row_ids_by_fold=partitions,
         audit={},
     )
@@ -2547,7 +2636,11 @@ def test_handoff_rechecks_hierarchy_implementation_after_provider_binding(
         inner_fold_count=4,
         hierarchy_review_rounds=1,
     )
-    handoff = load_production_stage1_hierarchy_handoff(manifest_path, review_rounds=1)
+    handoff = load_production_stage1_hierarchy_handoff(
+        manifest_path,
+        review_rounds=1,
+        initial_training_partitions=3,
+    )
     monkeypatch.setattr(
         "oci.inference.all_evidence_discovery_interfaces.DISCOVERY_INTERFACE_SCHEMA_VERSION",
         "all_evidence_discovery_interfaces_v4",
@@ -2570,6 +2663,7 @@ def test_hierarchy_handoff_rejects_fold_domain_substitution(tmp_path: Path):
         load_production_stage1_hierarchy_handoff(
             manifest_path,
             review_rounds=1,
+            initial_training_partitions=3,
             interaction_inner_folds=4,
             tfidf_nested_calibration_folds=3,
         )
@@ -2577,6 +2671,7 @@ def test_hierarchy_handoff_rejects_fold_domain_substitution(tmp_path: Path):
         load_production_stage1_hierarchy_handoff(
             manifest_path,
             review_rounds=1,
+            initial_training_partitions=3,
             interaction_inner_folds=3,
             tfidf_nested_calibration_folds=4,
         )

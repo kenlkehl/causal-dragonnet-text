@@ -841,11 +841,31 @@ def test_candidate_contract_preserves_variable_specific_categories(categories):
     assert CandidateContract(spec).extraction_spec["categories"] == categories
 
 
-def test_candidate_contract_rejects_more_than_eight_categories():
+def test_candidate_contract_preserves_more_than_eight_categories_losslessly():
     spec = _candidate_spec("documented_material_phase")
-    spec["categories"] = [f"state_{index}" for index in range(9)]
+    spec["categories"] = [f"state_{index}" for index in range(12)]
 
-    with pytest.raises(ValueError, match="at most eight"):
+    validated = CandidateContract(spec).extraction_spec
+
+    assert validated["categories"] == spec["categories"]
+    assert len(validated["categories"]) == 12
+
+
+@pytest.mark.parametrize(
+    ("categories", "message"),
+    [
+        (None, "requires at least two"),
+        ("absent,present", "requires at least two"),
+        ([], "requires at least two"),
+        (["present"], "requires at least two"),
+        (["absent", " "], "cannot contain empty"),
+    ],
+)
+def test_candidate_contract_rejects_malformed_or_singleton_categories(categories, message):
+    spec = _candidate_spec("documented_material_phase")
+    spec["categories"] = categories
+
+    with pytest.raises(ValueError, match=message):
         CandidateContract(spec)
 
 
@@ -952,7 +972,10 @@ def test_proposal_prompt_uses_variable_specific_category_contract_version():
         "absent",
         "present",
     ]
-    assert "values specific to that variable" in request.render_prompt()
+    rendered = request.render_prompt()
+    assert "every supported mutually exclusive" in rendered
+    assert "at least two values" in rendered
+    assert "implicit category-count cap" in rendered
 
 
 def test_openai_agent_repairs_placeholder_categories_before_selection():
@@ -1377,7 +1400,7 @@ def test_fresh_openai_response_drops_one_category_row_but_standalone_stays_stric
         {
             "path": "proposals[1]",
             "reason_code": "malformed_spec",
-            "reason": ("proposals[1].categories requires at least two and at most eight values"),
+            "reason": ("proposals[1].categories requires at least two values"),
         }
     ]
 

@@ -32,7 +32,7 @@ import os
 import shutil
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -49,28 +49,47 @@ from oci.inference.hierarchical_all_architecture_discovery import (
     AUTHENTICATED_RESPONSE_CONTRACT_BINDING,
     INTERPRET_CHUNK_JOB,
     MAX_DISCOVERY_RESPONSE_REPAIR_ATTEMPTS,
-    SELECTOR_THINKING_TOKEN_BUDGET,
     DiscoveryJsonJob,
     discovery_response_repair_policy_identity,
     local_json_schema_validator_identity,
 )
 from oci.inference.openai_compatible_json_discovery_job_runner import (
+    Stage2GenerationPolicy,
     parse_strict_json_object,
+)
+from oci.inference.post_extraction_scientific_policy import (
+    PostExtractionScientificPolicy,
 )
 from oci.inference.production_stage1_hierarchy_handoff import (
     load_production_stage1_hierarchy_handoff,
 )
 from oci.inference.production_stage1_hierarchy_one_shot import (
     ProductionStage1HierarchyOneShotOptions,
+    _forest_max_features_argument,
+    _nullable_positive_int_argument,
     _validate_fresh_roots,
     _validate_options,
+    add_post_extraction_causal_review_arguments,
+    add_stage2_hierarchy_prompt_protocol_arguments,
     build_production_stage1_hierarchy_runner,
+    build_reference_only_role_neutral_stage2_runner,
+    post_extraction_causal_review_from_namespace,
+    stage2_hierarchy_prompt_protocol_from_namespace,
     validate_single_openai_compatible_endpoint,
 )
+from oci.inference.production_role_neutral_stage2_handoff import (
+    ROLE_NEUTRAL_STAGE1_REFERENCE_HANDOFF_KIND,
+    load_reference_only_role_neutral_stage1_handoff,
+)
 
-CANARY_REPORT_SCHEMA = "production_stage1_hierarchy_runtime_canary_report_v1"
+CANARY_REPORT_SCHEMA = "production_stage1_hierarchy_runtime_canary_report_v2"
+ROLE_NEUTRAL_STAGE2_CANARY_REPORT_SCHEMA = (
+    "production_role_neutral_stage2_runtime_canary_report_v1"
+)
+ROLE_NEUTRAL_STAGE2_CANARY_REPORT_FILENAME = (
+    "production_role_neutral_stage2_runtime_canary.json"
+)
 CANARY_FAILURE_SCHEMA = "production_stage1_hierarchy_runtime_canary_failure_v1"
-EXACT_MAX_TOKENS = 25_000
 EXACT_TRANSPORT_RETRIES = 0
 EXACT_SCHEMA_REPAIR_ATTEMPTS = 1
 
@@ -246,6 +265,8 @@ def _validate_exact_runner_identity(
     *,
     endpoint: str,
     model_name: str,
+    generation_policy: Stage2GenerationPolicy,
+    model_context_window_tokens: int,
 ) -> None:
     if identity.get("endpoint_urls") != [endpoint]:
         raise ValueError("canary hierarchy runner does not bind only the supplied endpoint")
@@ -255,39 +276,64 @@ def _validate_exact_runner_identity(
         "resolution": "explicit_only_no_autodiscovery",
     }:
         raise ValueError("canary hierarchy runner does not bind the exact supplied model")
-    if identity.get("max_tokens") != EXACT_MAX_TOKENS:
-        raise ValueError("canary hierarchy runner max_tokens differs from 25000")
+    if not isinstance(generation_policy, Stage2GenerationPolicy):
+        raise TypeError("canary generation policy must be Stage2GenerationPolicy")
+    if (
+        identity.get("generation_policy") != generation_policy.as_dict()
+        or identity.get("generation_policy_sha256")
+        != generation_policy.content_sha256
+        or identity.get("generation_policy_resolution")
+        != "explicit_closed_policy"
+    ):
+        raise ValueError(
+            "canary hierarchy runner generation policy differs from the "
+            "configured protocol"
+        )
     retry = identity.get("retry")
     if not isinstance(retry, Mapping) or (
         retry.get("max_retries") != EXACT_TRANSPORT_RETRIES or retry.get("max_attempts") != 1
     ):
         raise ValueError("canary hierarchy runner must disable transport retries")
-    semantics = identity.get("response_semantics")
-    selector = semantics.get("selector_thinking") if isinstance(semantics, Mapping) else None
-    extraction = semantics.get("extraction_thinking") if isinstance(semantics, Mapping) else None
-    if not isinstance(selector, Mapping) or selector != {
-        "enabled": True,
-        "thinking_token_budget": SELECTOR_THINKING_TOKEN_BUDGET,
+    prompt_guard = identity.get("prompt_nontruncation_guard")
+    if (
+        not isinstance(prompt_guard, Mapping)
+        or prompt_guard.get("model_name") != model_name
+        or prompt_guard.get("model_context_window_tokens")
+        != model_context_window_tokens
+    ):
+        raise ValueError(
+            "canary hierarchy runner does not bind the configured exact "
+            "tokenizer/context nontruncation guard"
+        )
+    accounting = prompt_guard.get("accounting")
+    if not isinstance(accounting, Mapping) or accounting != {
+        "apply_chat_template": True,
+        "tokenize": True,
+        "add_generation_prompt": True,
+        "truncation": False,
+        "endpoint_prompt_usage_exact_match_required": True,
+        "request_truncation_controls_allowed": False,
     }:
-        raise ValueError("canary selector thinking contract differs from exact production")
-    if not isinstance(extraction, Mapping) or extraction != {
-        "enabled": False,
-        "thinking_token_budget_field": "omitted",
-    }:
-        raise ValueError("canary extraction thinking contract differs from exact production")
+        raise ValueError("canary hierarchy runner prompt nontruncation contract drifted")
 
 
-def _publish_report(*, target: Path, body: Mapping[str, Any]) -> Path:
+def _publish_report(
+    *,
+    target: Path,
+    body: Mapping[str, Any],
+    schema_version: str = CANARY_REPORT_SCHEMA,
+    filename: str = "production_stage1_hierarchy_runtime_canary.json",
+) -> Path:
     _assert_hash_metadata_only(body)
     wrapper = {
-        "schema_version": CANARY_REPORT_SCHEMA,
+        "schema_version": schema_version,
         "content_sha256": content_sha256(body),
         "body": _clone(body),
     }
     parent = target.parent
     temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=parent))
     try:
-        path = temporary / "production_stage1_hierarchy_runtime_canary.json"
+        path = temporary / filename
         serialized = json.dumps(wrapper, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
         with path.open("x", encoding="utf-8") as handle:
             handle.write(serialized)
@@ -300,7 +346,7 @@ def _publish_report(*, target: Path, body: Mapping[str, Any]) -> Path:
         if temporary.exists():
             shutil.rmtree(temporary)
         raise
-    return target / "production_stage1_hierarchy_runtime_canary.json"
+    return target / filename
 
 
 def run_canary(options: ProductionStage1HierarchyOneShotOptions) -> Mapping[str, Any]:
@@ -317,35 +363,76 @@ def run_canary(options: ProductionStage1HierarchyOneShotOptions) -> Mapping[str,
     if not model_name or model_name != model_name.strip():
         raise ValueError("canary model must be one explicit nonempty canonical name")
     if (
-        options.proposal_max_tokens != EXACT_MAX_TOKENS
-        or options.extraction_max_tokens != EXACT_MAX_TOKENS
-        or options.request_max_retries != EXACT_TRANSPORT_RETRIES
+        options.request_max_retries != EXACT_TRANSPORT_RETRIES
         or options.proposal_schema_repair_attempts != EXACT_SCHEMA_REPAIR_ATTEMPTS
     ):
-        raise ValueError("canary token, retry, or repair settings differ from the fixed contract")
+        raise ValueError("canary retry or repair settings differ from the fixed contract")
     if MAX_DISCOVERY_RESPONSE_REPAIR_ATTEMPTS != EXACT_SCHEMA_REPAIR_ATTEMPTS:
         raise RuntimeError("hierarchy no longer has exactly one bounded response repair")
 
-    handoff = load_production_stage1_hierarchy_handoff(
-        options.bundle_manifest_path,
-        review_rounds=options.review_rounds,
-        interaction_inner_folds=options.interaction_inner_folds,
-        tfidf_nested_calibration_folds=options.tfidf_nested_calibration_folds,
+    try:
+        manifest_discriminator = json.loads(
+            options.bundle_manifest_path.read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "canary bundle manifest is not readable closed JSON"
+        ) from exc
+    reference_only_mode = bool(
+        isinstance(manifest_discriminator, Mapping)
+        and manifest_discriminator.get("handoff_kind")
+        == ROLE_NEUTRAL_STAGE1_REFERENCE_HANDOFF_KIND
     )
+    if reference_only_mode:
+        handoff = load_reference_only_role_neutral_stage1_handoff(
+            options.bundle_manifest_path
+        )
+    else:
+        handoff = load_production_stage1_hierarchy_handoff(
+            options.bundle_manifest_path,
+            review_rounds=options.review_rounds,
+            initial_training_partitions=options.initial_training_partitions,
+            interaction_inner_folds=options.interaction_inner_folds,
+            tfidf_nested_calibration_folds=options.tfidf_nested_calibration_folds,
+        )
     handoff_before = handoff.as_dict()
-    if (
+    if reference_only_mode:
+        if (
+            getattr(handoff, "handoff_kind", None)
+            != ROLE_NEUTRAL_STAGE1_REFERENCE_HANDOFF_KIND
+            or getattr(handoff, "stage2_provider", None) is None
+            or handoff_before.get("offline_handoff_validation_complete")
+            is not True
+            or handoff_before.get("independent_runtime_stage1_refit_allowed")
+            is not False
+            or handoff_before.get("legacy_bundle_build_invoked") is not False
+        ):
+            raise RuntimeError(
+                "authenticated reference-only Stage 1 handoff is invalid"
+            )
+    elif (
         handoff_before.get("manual_digest_approval_required") is not False
         or handoff_before.get("raw_all_architecture_prompt_allowed") is not False
         or handoff_before.get("per_architecture_interpretation_required") is not True
     ):
-        raise RuntimeError("authenticated Stage-1 bundle is not the production hierarchy handoff")
+        raise RuntimeError(
+            "authenticated Stage-1 bundle is not the production hierarchy handoff"
+        )
 
     production_runner: Any | None = None
     try:
-        production_runner = build_production_stage1_hierarchy_runner(
-            handoff=handoff,
-            options=options,
-            endpoint=endpoint,
+        production_runner = (
+            build_reference_only_role_neutral_stage2_runner(
+                handoff=handoff,
+                options=options,
+                endpoint=endpoint,
+            )
+            if reference_only_mode
+            else build_production_stage1_hierarchy_runner(
+                handoff=handoff,
+                options=options,
+                endpoint=endpoint,
+            )
         )
         hierarchy_runner = production_runner.hierarchical_discovery_runner
         if production_runner.hierarchical_discovery_approved_batch_sha256 is not None:
@@ -357,13 +444,30 @@ def run_canary(options: ProductionStage1HierarchyOneShotOptions) -> Mapping[str,
             runner_identity,
             endpoint=endpoint,
             model_name=model_name,
+            generation_policy=options.stage2_protocol.generation_policy,
+            model_context_window_tokens=(
+                options.model_context_window_tokens
+            ),
         )
         config = production_runner.config
+        proposal_generation = (
+            options.stage2_protocol.generation_policy.feature_proposal_review
+        )
+        patient_generation = (
+            options.stage2_protocol.generation_policy.patient_feature_extraction
+        )
         if (
-            config.fusion_enable_thinking is not True
-            or config.fusion_thinking_token_budget != SELECTOR_THINKING_TOKEN_BUDGET
-            or config.fusion_max_tokens != EXACT_MAX_TOKENS
-            or config.extraction_enable_thinking is not False
+            config.fusion_enable_thinking
+            != proposal_generation.thinking_enabled
+            or config.fusion_thinking_token_budget
+            != proposal_generation.thinking_token_budget
+            or config.fusion_max_tokens != proposal_generation.max_tokens
+            or config.extraction_enable_thinking
+            != patient_generation.thinking_enabled
+            or config.post_extraction_review_config
+            != options.post_extraction_review_config
+            or config.post_extraction_scientific_policy
+            != options.post_extraction_scientific_policy
         ):
             raise ValueError("production fusion/extraction settings differ from canary contract")
 
@@ -452,25 +556,110 @@ def run_canary(options: ProductionStage1HierarchyOneShotOptions) -> Mapping[str,
             raise RuntimeError("canary unexpectedly constructed prediction outputs")
 
         contract_hashes = _response_contract_hashes(selected.job)
+        stage1_reference = (
+            {
+                "manifest_path": str(options.bundle_manifest_path),
+                "handoff_kind": getattr(handoff, "handoff_kind", None),
+                "bundle_sha256": getattr(handoff, "bundle_sha256", None),
+                "handoff_content_sha256": getattr(
+                    handoff,
+                    "handoff_scientific_content_sha256",
+                    None,
+                ),
+                "source_execution_content_sha256": getattr(
+                    handoff,
+                    "source_role_neutral_execution_content_sha256",
+                    None,
+                ),
+                "provider_identity_sha256": handoff.stage2_provider.identity()[
+                    "identity_sha256"
+                ],
+                "reference_only_all_ten": True,
+                "legacy_stage1_loader_invoked": False,
+                "independent_stage1_refit_performed": False,
+            }
+            if reference_only_mode
+            else {
+                "manifest_path": str(options.bundle_manifest_path),
+                "bundle_sha256": handoff.inputs.bundle_sha256,
+                "handoff_content_sha256": handoff_before["content_sha256"],
+            }
+        )
         body = {
             "status": "accepted",
             "canary_kind": "one_real_architecture_pure_initial_interpretation_job",
             "authorization_role": "non_authorizing_operational_runtime_check",
-            "stage1_bundle": {
-                "manifest_path": str(options.bundle_manifest_path),
-                "bundle_sha256": handoff.inputs.bundle_sha256,
-                "handoff_content_sha256": handoff_before["content_sha256"],
-            },
+            "stage1_bundle": stage1_reference,
             "endpoint": endpoint,
             "model": model_name,
             "runner_identity_sha256": runner_identity["identity_sha256"],
             "settings": {
-                "max_tokens": EXACT_MAX_TOKENS,
-                "transport_retries": EXACT_TRANSPORT_RETRIES,
-                "selector_thinking_enabled": True,
-                "selector_thinking_token_budget": SELECTOR_THINKING_TOKEN_BUDGET,
-                "extraction_thinking_enabled": False,
-                "maximum_schema_repairs": EXACT_SCHEMA_REPAIR_ATTEMPTS,
+                "proposal_max_tokens": options.proposal_max_tokens,
+                "extraction_max_tokens": options.extraction_max_tokens,
+                "stage2_hierarchy_prompt_protocol": (
+                    options.stage2_protocol.as_dict()
+                ),
+                "stage2_hierarchy_prompt_protocol_sha256": (
+                    options.stage2_protocol.content_sha256
+                ),
+                "stage2_generation_policy": (
+                    options.stage2_protocol.generation_policy.as_dict()
+                ),
+                "stage2_generation_policy_sha256": (
+                    options.stage2_protocol.generation_policy.content_sha256
+                ),
+                "post_extraction_causal_review": asdict(
+                    options.post_extraction_review_config
+                ),
+                "post_extraction_causal_review_sha256": content_sha256(
+                    asdict(options.post_extraction_review_config)
+                ),
+                "post_extraction_scientific_policy": (
+                    options.post_extraction_scientific_policy.as_dict()
+                ),
+                "post_extraction_scientific_policy_sha256": content_sha256(
+                    options.post_extraction_scientific_policy.as_dict()
+                ),
+                "prompt_nontruncation_guard_identity_sha256": (
+                    runner_identity["prompt_nontruncation_guard"][
+                        "identity_sha256"
+                    ]
+                ),
+                "transport_retries": (
+                    options.stage2_protocol.generation_policy
+                    .interpret_architecture_chunk.transport_max_retries
+                ),
+                "selector_thinking_enabled": (
+                    options.stage2_protocol.generation_policy
+                    .interpret_architecture_chunk.thinking_enabled
+                ),
+                "selector_thinking_token_budget": (
+                    options.stage2_protocol.generation_policy
+                    .interpret_architecture_chunk.thinking_token_budget
+                ),
+                "max_rendered_discovery_prompt_bytes": (
+                    options.max_rendered_discovery_prompt_bytes
+                ),
+                "final_upstream_max_orphan_features": (
+                    options.final_upstream_max_orphan_features
+                ),
+                "review_neural_query_nuisance_folds": (
+                    options.review_neural_query_nuisance_folds
+                ),
+                "final_upstream_meta_inner_folds": (
+                    options.final_upstream_meta_inner_folds
+                ),
+                "final_upstream_head_regularization": (
+                    options.final_upstream_head_regularization
+                ),
+                "extraction_thinking_enabled": (
+                    options.stage2_protocol.generation_policy
+                    .patient_feature_extraction.thinking_enabled
+                ),
+                "maximum_schema_repairs": (
+                    options.stage2_protocol.generation_policy
+                    .interpret_architecture_chunk.schema_repair_attempts
+                ),
             },
             "selected_job": {
                 "selection_order": [
@@ -516,12 +705,33 @@ def run_canary(options: ProductionStage1HierarchyOneShotOptions) -> Mapping[str,
             "prediction_path_constructed": False,
             "oracle_path_constructed": False,
             "full_fusion_runner_executed": False,
+            "reference_only_role_neutral_stage1": reference_only_mode,
+            "legacy_stage1_loader_invoked": False
+            if reference_only_mode
+            else None,
+            "independent_stage1_refit_performed": False
+            if reference_only_mode
+            else None,
             "canary_implementation_file_sha256": implementation_sha256,
         }
         _assert_hash_metadata_only(body)
-        report_path = _publish_report(target=options.attestation_dir, body=body)
+        report_schema = (
+            ROLE_NEUTRAL_STAGE2_CANARY_REPORT_SCHEMA
+            if reference_only_mode
+            else CANARY_REPORT_SCHEMA
+        )
+        report_path = _publish_report(
+            target=options.attestation_dir,
+            body=body,
+            schema_version=report_schema,
+            filename=(
+                ROLE_NEUTRAL_STAGE2_CANARY_REPORT_FILENAME
+                if reference_only_mode
+                else "production_stage1_hierarchy_runtime_canary.json"
+            ),
+        )
         result_summary = {
-            "schema_version": CANARY_REPORT_SCHEMA,
+            "schema_version": report_schema,
             "status": "accepted",
             "report_path": str(report_path),
             "report_content_sha256": content_sha256(body),
@@ -555,12 +765,86 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--stage2-tokenizer-locator", required=True, type=Path)
     parser.add_argument("--review-rounds", required=True, type=int)
+    parser.add_argument("--initial-training-partitions", required=True, type=int)
+    parser.add_argument(
+        "--source-text-temporally-valid-by-design",
+        action=argparse.BooleanOptionalAction,
+        required=True,
+    )
+    parser.add_argument("--max-candidate-variables", required=True, type=int)
+    parser.add_argument("--complete-page-core-chars", required=True, type=int)
+    parser.add_argument("--complete-page-context-chars", required=True, type=int)
+    parser.add_argument("--complete-page-max-chars", required=True, type=int)
+    parser.add_argument(
+        "--complete-reconciliation-fan-in",
+        required=True,
+        type=int,
+    )
+    parser.add_argument("--forest-n-estimators", required=True, type=int)
+    parser.add_argument(
+        "--forest-max-depth",
+        required=True,
+        type=_nullable_positive_int_argument,
+    )
+    parser.add_argument("--forest-min-samples-leaf", required=True, type=int)
+    parser.add_argument(
+        "--forest-max-features",
+        required=True,
+        type=_forest_max_features_argument,
+    )
+    parser.add_argument(
+        "--forest-honest",
+        required=True,
+        action=argparse.BooleanOptionalAction,
+    )
+    parser.add_argument(
+        "--forest-inference",
+        required=True,
+        action=argparse.BooleanOptionalAction,
+    )
+    parser.add_argument("--forest-subforest-size", required=True, type=int)
+    parser.add_argument(
+        "--forest-tune-model",
+        required=True,
+        action=argparse.BooleanOptionalAction,
+    )
+    parser.add_argument(
+        "--forest-nuisance-n-estimators",
+        required=True,
+        type=int,
+    )
+    parser.add_argument(
+        "--forest-nuisance-max-depth",
+        required=True,
+        type=_nullable_positive_int_argument,
+    )
+    parser.add_argument(
+        "--forest-nuisance-min-samples-leaf",
+        required=True,
+        type=int,
+    )
+    parser.add_argument(
+        "--forest-nuisance-treatment-max-features",
+        required=True,
+        type=_forest_max_features_argument,
+    )
+    parser.add_argument(
+        "--forest-nuisance-outcome-max-features",
+        required=True,
+        type=_forest_max_features_argument,
+    )
+    parser.add_argument("--forest-random-seed", required=True, type=int)
+    parser.add_argument("--forest-n-jobs", required=True, type=int)
     parser.add_argument("--interaction-inner-folds", type=int, default=3)
     parser.add_argument("--tfidf-nested-calibration-folds", type=int, default=3)
-    parser.add_argument("--review-stage1-device", default="cuda:0")
-    parser.add_argument("--review-neural-query-device", action="append", default=[])
-    parser.add_argument("--review-neural-query-nuisance-folds", type=int, default=3)
+    parser.add_argument("--review-stage1-device", required=True)
+    parser.add_argument(
+        "--review-neural-query-device",
+        action="append",
+        required=True,
+    )
     parser.add_argument("--review-stage1-bow-fold-parallelism", type=int, default=1)
     parser.add_argument(
         "--review-stage1-bow-parallel-backend",
@@ -568,6 +852,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="threads",
     )
     parser.add_argument("--request-timeout", type=float, default=1_800.0)
+    add_stage2_hierarchy_prompt_protocol_arguments(parser)
+    add_post_extraction_causal_review_arguments(parser)
+    parser.add_argument(
+        "--post-extraction-scientific-policy",
+        required=True,
+        type=Path,
+    )
     return parser
 
 
@@ -576,6 +867,13 @@ def options_from_args(args: argparse.Namespace) -> ProductionStage1HierarchyOneS
     model = str(args.model)
     if not model or model != model.strip():
         raise ValueError("--model must be one explicit nonempty canonical name")
+    scientific_policy = PostExtractionScientificPolicy.from_mapping(
+        json.loads(
+            Path(args.post_extraction_scientific_policy).read_text(
+                encoding="utf-8"
+            )
+        )
+    )
     options = ProductionStage1HierarchyOneShotOptions(
         bundle_manifest_path=args.bundle_manifest,
         output_dir=args.scratch_output_dir,
@@ -584,18 +882,59 @@ def options_from_args(args: argparse.Namespace) -> ProductionStage1HierarchyOneS
         endpoint=endpoint,
         model_name=model,
         review_rounds=int(args.review_rounds),
+        initial_training_partitions=int(args.initial_training_partitions),
+        stage2_protocol=stage2_hierarchy_prompt_protocol_from_namespace(args),
+        stage2_tokenizer_locator=args.stage2_tokenizer_locator,
+        post_extraction_review_config=(
+            post_extraction_causal_review_from_namespace(
+                args,
+                scientific_policy=scientific_policy,
+            )
+        ),
+        post_extraction_scientific_policy=scientific_policy,
+        source_text_temporally_valid_by_design=(
+            args.source_text_temporally_valid_by_design
+        ),
         interaction_inner_folds=int(args.interaction_inner_folds),
         tfidf_nested_calibration_folds=int(args.tfidf_nested_calibration_folds),
         review_stage1_device=str(args.review_stage1_device),
-        review_neural_query_devices=tuple(args.review_neural_query_device or ("cuda:0",)),
-        review_neural_query_nuisance_folds=int(args.review_neural_query_nuisance_folds),
+        review_neural_query_devices=tuple(args.review_neural_query_device),
         review_stage1_bow_fold_parallelism=int(args.review_stage1_bow_fold_parallelism),
         review_stage1_bow_parallel_backend=str(args.review_stage1_bow_parallel_backend),
-        proposal_max_tokens=EXACT_MAX_TOKENS,
-        extraction_max_tokens=EXACT_MAX_TOKENS,
+        max_candidates=int(args.max_candidate_variables),
+        forest_n_estimators=int(args.forest_n_estimators),
+        forest_max_depth=args.forest_max_depth,
+        forest_min_samples_leaf=int(args.forest_min_samples_leaf),
+        forest_max_features=args.forest_max_features,
+        forest_honest=bool(args.forest_honest),
+        forest_inference=bool(args.forest_inference),
+        forest_subforest_size=int(args.forest_subforest_size),
+        forest_tune_model=bool(args.forest_tune_model),
+        forest_nuisance_n_estimators=int(
+            args.forest_nuisance_n_estimators
+        ),
+        forest_nuisance_max_depth=args.forest_nuisance_max_depth,
+        forest_nuisance_min_samples_leaf=int(
+            args.forest_nuisance_min_samples_leaf
+        ),
+        forest_nuisance_treatment_max_features=(
+            args.forest_nuisance_treatment_max_features
+        ),
+        forest_nuisance_outcome_max_features=(
+            args.forest_nuisance_outcome_max_features
+        ),
+        forest_random_seed=int(args.forest_random_seed),
+        forest_n_jobs=int(args.forest_n_jobs),
         proposal_schema_repair_attempts=EXACT_SCHEMA_REPAIR_ATTEMPTS,
         request_max_retries=EXACT_TRANSPORT_RETRIES,
         request_timeout=float(args.request_timeout),
+        extraction_max_text_length=int(args.complete_page_max_chars),
+        complete_page_core_chars=int(args.complete_page_core_chars),
+        complete_page_context_chars=int(args.complete_page_context_chars),
+        complete_page_max_chars=int(args.complete_page_max_chars),
+        complete_reconciliation_fan_in=int(
+            args.complete_reconciliation_fan_in
+        ),
     )
     _validate_options(options)
     return options

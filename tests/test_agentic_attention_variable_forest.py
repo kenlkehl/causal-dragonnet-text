@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
 import numpy as np
@@ -2441,6 +2442,30 @@ def test_fold_parallelism_auto_is_conservative_on_cuda(tmp_path):
     assert cuda_runner._fold_n_jobs(4) == 1
 
 
+def test_data_loader_workers_disable_nested_processes_in_fold_thread(tmp_path):
+    df = pd.DataFrame(
+        {
+            "clinical_text": ["a", "b", "c", "d"],
+            "treatment_indicator": [0, 1, 0, 1],
+            "outcome_indicator": [0, 1, 0, 1],
+        }
+    )
+    config = AppliedInferenceConfig(dataset_path=str(tmp_path / "dataset.parquet"))
+    runner = AgenticAttentionVariableForestRunner(
+        dataset=df,
+        config=config,
+        output_path=tmp_path / "predictions.parquet",
+        device=torch.device("cpu"),
+        num_workers=3,
+        proposal_agent=FakeAttentionAgent(),
+        extraction_provider=FakeExtractionProvider(),
+    )
+
+    assert runner._data_loader_workers() == 3
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="avf-fold") as executor:
+        assert executor.submit(runner._data_loader_workers).result() == 0
+
+
 def test_explicit_fold_parallelism_overrides_cuda_serial_default(tmp_path):
     df = pd.DataFrame(
         {
@@ -2847,7 +2872,7 @@ def test_oracle_agentic_attention_script_builds_configs(tmp_path):
     )
     assert (
         applied.architecture.agentic_attention_variable_forest.nuisance_weight_decay
-        == pytest.approx(0.05)
+        == pytest.approx(0.01)
     )
     assert (
         applied.architecture.agentic_attention_variable_forest
@@ -2874,8 +2899,9 @@ def test_applied_router_dispatches_agentic_attention_variable_forest(monkeypatch
     )
     called = {}
 
-    def fake_runner(dataset, config, output_path, device, num_workers):
+    def fake_runner(dataset, config, output_path, device, num_workers, gpu_ids):
         called["model_type"] = config.architecture.model_type
+        assert gpu_ids is None
         output_path.parent.mkdir(parents=True, exist_ok=True)
         dataset.assign(pred_ite_prob=0.0).to_parquet(output_path, index=False)
 

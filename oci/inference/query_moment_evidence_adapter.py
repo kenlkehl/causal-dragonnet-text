@@ -114,23 +114,23 @@ class QueryMomentEvidenceAdapterConfig:
     max_ngram_tokens: int = 6
 
     def validate(self) -> None:
-        if not 1 <= int(self.max_queries) <= 64:
-            raise ValueError("max_queries must be in [1, 64]")
-        if not 1 <= int(self.max_terms_per_query) <= 64:
-            raise ValueError("max_terms_per_query must be in [1, 64]")
-        if not 1 <= int(self.max_chunks_per_query) <= 64:
-            raise ValueError("max_chunks_per_query must be in [1, 64]")
+        if int(self.max_queries) < 1:
+            raise ValueError("max_queries must be positive")
+        if int(self.max_terms_per_query) < 1:
+            raise ValueError("max_terms_per_query must be positive")
+        if int(self.max_chunks_per_query) < 1:
+            raise ValueError("max_chunks_per_query must be positive")
         if not 1 <= int(self.fallback_chunks_per_query) <= int(self.max_chunks_per_query):
             raise ValueError(
                 "fallback_chunks_per_query must be positive and no larger than "
                 "max_chunks_per_query"
             )
-        if not 80 <= int(self.max_excerpt_chars) <= 4000:
-            raise ValueError("max_excerpt_chars must be in [80, 4000]")
-        if not 8 <= int(self.max_term_chars) <= 500:
-            raise ValueError("max_term_chars must be in [8, 500]")
-        if not 1 <= int(self.max_ngram_tokens) <= 10:
-            raise ValueError("max_ngram_tokens must be in [1, 10]")
+        if int(self.max_excerpt_chars) < 1:
+            raise ValueError("max_excerpt_chars must be positive")
+        if int(self.max_term_chars) < 1:
+            raise ValueError("max_term_chars must be positive")
+        if int(self.max_ngram_tokens) < 1:
+            raise ValueError("max_ngram_tokens must be positive")
 
 
 @dataclass(frozen=True)
@@ -930,13 +930,10 @@ def _extract_sparse_query_definitions(
     definitions: list[_SparseQueryDefinition] = []
     seen: set[tuple[str, tuple[tuple[str, float], ...]]] = set()
     skipped_terms = 0
-    truncated_definitions = 0
+    rejected_over_capacity_definitions = 0
 
     def add(bank: str, raw_terms: Any) -> None:
-        nonlocal skipped_terms, truncated_definitions
-        if len(definitions) >= int(config.max_queries):
-            truncated_definitions += 1
-            return
+        nonlocal skipped_terms, rejected_over_capacity_definitions
         terms = _definition_terms(raw_terms, config=config)
         if terms is None:
             skipped_terms += 1
@@ -944,6 +941,12 @@ def _extract_sparse_query_definitions(
         key = (bank, terms)
         if key in seen:
             return
+        if len(definitions) >= int(config.max_queries):
+            rejected_over_capacity_definitions += 1
+            raise ValueError(
+                "sparse query definitions exceed configured max_queries; "
+                "refusing silent definition omission"
+            )
         seen.add(key)
         definitions.append(_SparseQueryDefinition(bank=bank, terms=terms))
 
@@ -979,7 +982,10 @@ def _extract_sparse_query_definitions(
     return definitions, {
         "usable_definition_count": len(definitions),
         "skipped_or_empty_definition_count": int(skipped_terms),
-        "definition_limit_reached_count": int(truncated_definitions),
+        "definition_limit_reached_count": int(
+            rejected_over_capacity_definitions
+        ),
+        "definitions_truncated": False,
         "uses_supplied_terms_only": True,
         "uses_fixed_domain_vocabulary": False,
         "uses_label_scores_as_query_weights": False,
@@ -993,8 +999,13 @@ def _definition_terms(
 ) -> tuple[tuple[str, float], ...] | None:
     if not isinstance(raw_terms, (list, tuple)):
         return None
+    if len(raw_terms) > int(config.max_terms_per_query):
+        raise ValueError(
+            "sparse query definition exceeds configured max_terms_per_query; "
+            "refusing silent term omission"
+        )
     weights: dict[str, float] = {}
-    for raw_term in raw_terms[: int(config.max_terms_per_query)]:
+    for raw_term in raw_terms:
         row = raw_term if isinstance(raw_term, Mapping) else {"term": raw_term}
         term = _canonical_term(row.get("term") or row.get("feature") or row.get("ngram"))
         if (

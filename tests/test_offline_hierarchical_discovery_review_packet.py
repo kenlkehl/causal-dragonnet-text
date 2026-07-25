@@ -672,7 +672,7 @@ def test_complete_packet_combines_exact_controls_real_prompts_and_all_audits(
         row["thinking_token_budget"] == 5000
         for row in (audit["settings"] for audit in context["initial_job_audits"])
     )
-    assert context["every_reviewed_job_within_fixed_guard"] is True
+    assert context["every_reviewed_job_within_configured_guard"] is True
     assert context["every_initial_job_within_semantic_member_bound"] is True
     assert all(
         row["semantic_member_id_count"] == 1
@@ -1017,7 +1017,7 @@ def test_phased_review_policy_rejects_rehashed_global_or_weakened_policy(
                 ]["stages"][0]["settings"].update({"thinking_token_budget": 4999}),
                 _rehash_adaptive_prompt_contract(packet),
             ),
-            "must use exactly 5000 tokens",
+            "differs from its authenticated config",
         ),
         (
             lambda packet: (
@@ -1115,7 +1115,7 @@ def test_phased_review_policy_rejects_rehashed_global_or_weakened_policy(
                 ]["phased_stage_variants"][0]["settings"].update({"thinking_token_budget": 4999}),
                 _rehash_adaptive_prompt_contract(packet),
             ),
-            "must use exactly 5000 tokens",
+            "differs from its authenticated config",
         ),
         (
             lambda packet: (
@@ -1554,7 +1554,7 @@ def test_context_audit_fails_before_persistence_for_oversized_prompt(tmp_path: P
         wrapper["hierarchy_precommit"]["precommit_sha256"] = content_sha256(inner)
 
     batch, evidence, jobs = _batch_precommit(tmp_path, mutate=mutate)
-    with pytest.raises(ValueError, match="exceeds the fixed byte guard"):
+    with pytest.raises(ValueError, match="exceeds its configured byte guard"):
         compose_offline_hierarchical_discovery_review_packet(
             batch_precommit=batch,
             representative_outer_fold=1,

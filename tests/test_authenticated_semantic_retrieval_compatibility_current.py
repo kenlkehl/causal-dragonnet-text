@@ -26,7 +26,7 @@ from oci.inference.review_spent_evidence_provider import (
     SpentDiscoveryEvidence,
 )
 
-_PROVIDER_CODE_SHA256 = "de11740a862c13d59d340e1dba26fb1202820dec4a0055c49819b7e01eccc1f1"
+_PROVIDER_CODE_SHA256 = "6978aa0419a89a0b74a7c187ef1580bfc857ace49159726d2681fc1f0a2d5916"
 _CONCEPT_PROJECTION = (
     "short_bow_terms_htr_tokens_or_per_row_chunk_attention_contrast_" "embedding_tail_ngrams_v2"
 )

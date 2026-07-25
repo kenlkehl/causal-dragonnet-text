@@ -12,6 +12,8 @@ from typing import Dict, List, Optional, Tuple, Any
 
 import torch
 
+from .lossless_tokenization import SemanticTruncationError
+
 logger = logging.getLogger(__name__)
 
 # Special tokens
@@ -98,18 +100,27 @@ class LearnedTokenizer:
 
         Args:
             text: Input text string.
-            max_length: Maximum number of tokens (truncates if longer).
+            max_length: Configured token capacity. Inputs that exceed it are
+                rejected; text is never truncated.
 
         Returns:
             List of integer token IDs.
         """
         if not self._fitted:
             raise RuntimeError("Tokenizer not fitted. Call fit() first.")
+        if isinstance(max_length, bool) or not isinstance(max_length, int) or max_length < 1:
+            raise ValueError("max_length must be a positive integer")
 
         tokens = _tokenize(text)
+        if len(tokens) > max_length:
+            raise SemanticTruncationError(
+                "LearnedTokenizer input exceeds configured max_length; "
+                "semantic truncation is forbidden "
+                f"({len(tokens)} > {max_length})"
+            )
         ids = [
             self._word2idx.get(t, self.unk_token_id)
-            for t in tokens[:max_length]
+            for t in tokens
         ]
         return ids
 
@@ -142,8 +153,8 @@ class LearnedTokenizer:
         attention_mask = torch.zeros(len(texts), max_len)
 
         for i, ids in enumerate(encoded):
-            length = min(len(ids), max_len)
-            input_ids[i, :length] = torch.tensor(ids[:length], dtype=torch.long)
+            length = len(ids)
+            input_ids[i, :length] = torch.tensor(ids, dtype=torch.long)
             attention_mask[i, :length] = 1.0
 
         return input_ids, attention_mask

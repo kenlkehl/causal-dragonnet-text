@@ -61,6 +61,7 @@ from .authenticated_semantic_retrieval_compatibility import (
     restore_current_spent_projection_semantic_retrieval_view,
 )
 from .approved_hierarchical_discovery_agent import (
+    AuthenticatedReferenceOnlyDirectNumericalContract,
     ApprovedHierarchicalDiscoveryAgent,
     MetadataJsonDiscoveryJobRunner,
 )
@@ -73,6 +74,8 @@ from .approved_hierarchical_discovery_batch import (
 from .all_evidence_post_extraction_review import (
     AppliedReviewOperations,
     CausalReviewConfig,
+    CONDITIONAL_CONTEXT_AND_GATE_REVIEW_POLICY,
+    GATE_ONLY_REFERENCE_PRESERVATION_REVIEW_POLICY,
     GateAcceptanceDecision,
     GateFeatureBankView,
     GateSourceSignalView,
@@ -95,6 +98,7 @@ from .all_evidence_post_extraction_review import (
     extraction_semantics_sha256,
     validate_post_extraction_review_response,
 )
+from .fold_honest_r_stack import FitRowProvenance
 from .final_context_fit_upstream_bank import (
     AuthenticatedFinalContextFitUpstreamBank,
     FinalContextFitUpstreamProducer,
@@ -126,6 +130,9 @@ from .context_fit_upstream_cache_overlay import (
 from .extraction_grounding_diagnostics import (
     EXTRACTION_GROUNDING_DIAGNOSTIC_VERSION,
     build_extraction_grounding_diagnostics,
+)
+from .post_extraction_scientific_policy import (
+    PostExtractionScientificPolicy,
 )
 from .frozen_extraction_cache_overlay import (
     CacheOverlayReport,
@@ -201,7 +208,14 @@ POST_EXTRACTION_REVIEW_FAILURE_SCHEMA_VERSION = (
     "all_evidence_post_extraction_review_response_failure_v3"
 )
 ADAPTIVE_HIERARCHICAL_REVIEW_EXECUTION_SCHEMA_VERSION = (
-    "authenticated_adaptive_hierarchical_review_execution_v1"
+    "authenticated_adaptive_hierarchical_review_execution_v2"
+)
+ADAPTIVE_DIAGNOSTIC_ADAPTER_AUDIT_SCHEMA_VERSION = "adaptive_diagnostic_adapter_audit_v2"
+ADAPTIVE_DIAGNOSTIC_METRIC_COVERAGE_SCHEMA_VERSION = (
+    "adaptive_diagnostic_metric_coverage_v1"
+)
+ADAPTIVE_DIAGNOSTIC_METRIC_PATH_ENCODING_VERSION = (
+    "lossless_utf8_hex_reserved_segment_encoding_v1"
 )
 ADAPTIVE_PRE_GATE_CANDIDATE_FREEZE_SCHEMA_VERSION = (
     "adaptive_pre_gate_executable_and_provenance_freeze_v1"
@@ -242,10 +256,12 @@ FINAL_FOREST_POTENTIAL_OUTCOME_POLICY_VERSION = (
     "exact_nuisance_mean_feasible_potential_outcome_projection_v2"
 )
 DEFAULT_POST_EXTRACTION_REVIEW_ROUNDS = 2
-_MAX_EXACT_INNER_RECURRENCE_TERMS_PER_GROUP = 24
 
 _FORBIDDEN_NAME = re.compile(r"(?:^|_)(?:true|oracle|ground_truth)(?:_|$)", flags=re.IGNORECASE)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_ADAPTIVE_METRIC_IDENTIFIER = re.compile(r"[a-z][a-z0-9_.:-]*\Z")
+_ADAPTIVE_METRIC_SAFE_PATH_SEGMENT = re.compile(r"[a-z][a-z0-9_:-]*\Z")
+_ADAPTIVE_METRIC_ESCAPED_SEGMENT_PREFIX = "escaped_"
 _STAGED_AUDIT_CACHE_STATUSES = {
     "captured_and_request_bound",
     "unavailable_not_exposed_by_agent",
@@ -462,6 +478,205 @@ def _content_sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _numerical_array_sha256(value: Any) -> str:
+    """Hash one finite float64 array with explicit shape and byte order."""
+
+    array = np.asarray(value, dtype="<f8", order="C")
+    if not np.isfinite(array).all():
+        raise ValueError("authenticated numerical array contains non-finite values")
+    digest = hashlib.sha256()
+    digest.update(
+        _canonical_json(
+            {
+                "schema_version": "ordered_float64_array_sha256_v1",
+                "shape": list(array.shape),
+                "dtype": "<f8",
+            }
+        ).encode("utf-8")
+    )
+    digest.update(b"\0")
+    digest.update(array.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _encode_adaptive_metric_path_segment(value: str) -> str:
+    """Encode one mapping key injectively into an adaptive metric identifier segment."""
+
+    if not isinstance(value, str):
+        raise TypeError("adaptive diagnostic mapping keys must be strings")
+    if (
+        _ADAPTIVE_METRIC_SAFE_PATH_SEGMENT.fullmatch(value) is not None
+        and not value.startswith(_ADAPTIVE_METRIC_ESCAPED_SEGMENT_PREFIX)
+    ):
+        return value
+    return f"{_ADAPTIVE_METRIC_ESCAPED_SEGMENT_PREFIX}{value.encode('utf-8').hex()}"
+
+
+def _validate_adaptive_diagnostic_metric_coverage_proof(
+    proof: Mapping[str, Any],
+) -> None:
+    """Fail closed unless one diagnostic's metric proof is exact and self-consistent."""
+
+    expected_fields = {
+        "schema_version",
+        "diagnostic_id",
+        "path_encoding_version",
+        "aggregate_metrics",
+        "ordered_metric_keys",
+        "eligible_metric_count",
+        "emitted_metric_count",
+        "eligible_metric_inventory_sha256",
+        "emitted_metrics_sha256",
+        "metric_names_unique",
+        "every_eligible_metric_emitted_once",
+        "coverage_proof_sha256",
+    }
+    if not isinstance(proof, Mapping) or set(proof) != expected_fields:
+        raise ValueError("adaptive diagnostic metric coverage proof violates its closed schema")
+    if proof.get("schema_version") != ADAPTIVE_DIAGNOSTIC_METRIC_COVERAGE_SCHEMA_VERSION:
+        raise ValueError("adaptive diagnostic metric coverage proof schema is invalid")
+    diagnostic_id = proof.get("diagnostic_id")
+    if not isinstance(diagnostic_id, str) or not diagnostic_id:
+        raise ValueError("adaptive diagnostic metric coverage proof has an invalid diagnostic ID")
+    if (
+        proof.get("path_encoding_version")
+        != ADAPTIVE_DIAGNOSTIC_METRIC_PATH_ENCODING_VERSION
+    ):
+        raise ValueError("adaptive diagnostic metric path encoding version is invalid")
+
+    metrics = proof.get("aggregate_metrics")
+    ordered_keys = proof.get("ordered_metric_keys")
+    if not isinstance(metrics, Mapping) or not isinstance(ordered_keys, list):
+        raise ValueError("adaptive diagnostic metric coverage inventory is malformed")
+    if not all(
+        isinstance(key, str) and _ADAPTIVE_METRIC_IDENTIFIER.fullmatch(key) is not None
+        for key in ordered_keys
+    ):
+        raise ValueError("adaptive diagnostic metric coverage keys are invalid")
+    if len(set(ordered_keys)) != len(ordered_keys):
+        raise ValueError("adaptive diagnostic metric coverage keys contain duplicates")
+    if set(metrics) != set(ordered_keys) or tuple(metrics) != tuple(ordered_keys):
+        raise ValueError("adaptive diagnostic metric coverage key order is inconsistent")
+    for key, value in metrics.items():
+        if value is not None and not isinstance(value, (bool, int, float)):
+            raise ValueError(f"adaptive diagnostic metric {key!r} is not a scalar")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"adaptive diagnostic metric {key!r} is not finite")
+
+    for count_name in ("eligible_metric_count", "emitted_metric_count"):
+        count = proof.get(count_name)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(f"adaptive diagnostic {count_name} is invalid")
+        if count != len(ordered_keys):
+            raise ValueError(f"adaptive diagnostic {count_name} is inconsistent")
+    if proof.get("metric_names_unique") is not True:
+        raise ValueError("adaptive diagnostic metric uniqueness proof is false")
+    if proof.get("every_eligible_metric_emitted_once") is not True:
+        raise ValueError("adaptive diagnostic metric coverage proof is incomplete")
+
+    inventory = [
+        {"metric_key": key, "value": metrics[key]}
+        for key in ordered_keys
+    ]
+    if proof.get("eligible_metric_inventory_sha256") != _content_sha256(inventory):
+        raise ValueError("adaptive diagnostic eligible metric inventory hash is invalid")
+    if proof.get("emitted_metrics_sha256") != _content_sha256(dict(metrics)):
+        raise ValueError("adaptive diagnostic emitted metric hash is invalid")
+    identity = {
+        key: proof[key] for key in expected_fields if key != "coverage_proof_sha256"
+    }
+    if proof.get("coverage_proof_sha256") != _content_sha256(identity):
+        raise ValueError("adaptive diagnostic metric coverage proof hash is invalid")
+
+
+def _validate_adaptive_diagnostic_adapter_audit(audit: Mapping[str, Any]) -> None:
+    """Authenticate lossless metric coverage for every adapted diagnostic."""
+
+    expected_fields = {
+        "schema_version",
+        "input_diagnostic_count",
+        "adapted_diagnostic_count",
+        "every_diagnostic_id_represented_once",
+        "excluded_historical_target_count",
+        "excluded_historical_targets_by_diagnostic",
+        "unknown_current_diagnostic_targets_fail_closed",
+        "model_context_contains_excluded_historical_names",
+        "metric_coverage_proof_count",
+        "total_eligible_metric_count",
+        "total_emitted_metric_count",
+        "metric_names_unique_within_each_diagnostic",
+        "every_eligible_metric_emitted_once",
+        "metric_coverage_proofs",
+        "audit_sha256",
+    }
+    if not isinstance(audit, Mapping) or set(audit) != expected_fields:
+        raise ValueError("adaptive diagnostic adapter audit violates its closed schema")
+    if audit.get("schema_version") != ADAPTIVE_DIAGNOSTIC_ADAPTER_AUDIT_SCHEMA_VERSION:
+        raise ValueError("adaptive diagnostic adapter audit schema is invalid")
+    proofs = audit.get("metric_coverage_proofs")
+    if not isinstance(proofs, list):
+        raise ValueError("adaptive diagnostic metric coverage proofs are malformed")
+    for proof in proofs:
+        _validate_adaptive_diagnostic_metric_coverage_proof(proof)
+    diagnostic_ids = [str(proof["diagnostic_id"]) for proof in proofs]
+    if len(set(diagnostic_ids)) != len(diagnostic_ids):
+        raise ValueError("adaptive diagnostic adapter audit repeats a diagnostic ID")
+
+    for count_name in (
+        "input_diagnostic_count",
+        "adapted_diagnostic_count",
+        "metric_coverage_proof_count",
+        "total_eligible_metric_count",
+        "total_emitted_metric_count",
+        "excluded_historical_target_count",
+    ):
+        count = audit.get(count_name)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(f"adaptive diagnostic adapter {count_name} is invalid")
+    if not (
+        audit["input_diagnostic_count"]
+        == audit["adapted_diagnostic_count"]
+        == audit["metric_coverage_proof_count"]
+        == len(proofs)
+    ):
+        raise ValueError("adaptive diagnostic adapter diagnostic coverage is inconsistent")
+    eligible_total = sum(int(proof["eligible_metric_count"]) for proof in proofs)
+    emitted_total = sum(int(proof["emitted_metric_count"]) for proof in proofs)
+    if audit["total_eligible_metric_count"] != eligible_total:
+        raise ValueError("adaptive diagnostic adapter eligible metric total is inconsistent")
+    if audit["total_emitted_metric_count"] != emitted_total:
+        raise ValueError("adaptive diagnostic adapter emitted metric total is inconsistent")
+    for flag_name, expected in (
+        ("every_diagnostic_id_represented_once", True),
+        ("unknown_current_diagnostic_targets_fail_closed", True),
+        ("model_context_contains_excluded_historical_names", False),
+        ("metric_names_unique_within_each_diagnostic", True),
+        ("every_eligible_metric_emitted_once", True),
+    ):
+        if audit.get(flag_name) is not expected:
+            raise ValueError(f"adaptive diagnostic adapter flag {flag_name} is invalid")
+
+    exclusions = audit.get("excluded_historical_targets_by_diagnostic")
+    if not isinstance(exclusions, Mapping):
+        raise ValueError("adaptive diagnostic historical-target exclusions are malformed")
+    exclusion_count = 0
+    for diagnostic_id, names in exclusions.items():
+        if diagnostic_id not in set(diagnostic_ids) or not isinstance(names, list):
+            raise ValueError("adaptive diagnostic historical-target exclusion is invalid")
+        if (
+            not all(isinstance(name, str) and name for name in names)
+            or names != sorted(set(names))
+        ):
+            raise ValueError("adaptive diagnostic historical-target names are invalid")
+        exclusion_count += len(names)
+    if exclusion_count != audit["excluded_historical_target_count"]:
+        raise ValueError("adaptive diagnostic historical-target count is inconsistent")
+
+    identity = {key: audit[key] for key in expected_fields if key != "audit_sha256"}
+    if audit.get("audit_sha256") != _content_sha256(identity):
+        raise ValueError("adaptive diagnostic adapter audit hash is invalid")
+
+
 def _read_path_snapshot(path: Path) -> tuple[bytes, str]:
     """Return one immutable byte snapshot and the digest of those exact bytes."""
 
@@ -672,6 +887,7 @@ def _load_request_bound_adaptive_execution(
     request_sha256: str,
     review_round: int,
     review_attempt: int,
+    expected_diagnostic_adapter_audit: Mapping[str, Any] | None = None,
 ) -> tuple[Mapping[str, Any], AppliedReviewOperations, Mapping[str, Any]] | None:
     """Replay one locally validated, hash-wrapped adaptive execution without model work."""
 
@@ -722,6 +938,22 @@ def _load_request_bound_adaptive_execution(
     ):
         if body.get(field_name) is not expected:
             raise RuntimeError(f"adaptive execution cache has unsafe flag {field_name}: {path}")
+    diagnostic_adapter_audit = body.get("diagnostic_adapter_audit")
+    try:
+        _validate_adaptive_diagnostic_adapter_audit(diagnostic_adapter_audit)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"adaptive diagnostic adapter audit is invalid: {path}") from exc
+    if expected_diagnostic_adapter_audit is not None:
+        try:
+            _validate_adaptive_diagnostic_adapter_audit(expected_diagnostic_adapter_audit)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("expected adaptive diagnostic adapter audit is invalid") from exc
+        if _canonical_json(diagnostic_adapter_audit) != _canonical_json(
+            expected_diagnostic_adapter_audit
+        ):
+            raise RuntimeError(
+                f"adaptive diagnostic adapter audit differs from fresh extraction: {path}"
+            )
     execution = body.get("authenticated_execution")
     if not isinstance(execution, Mapping):
         raise RuntimeError(f"adaptive execution cache lacks an execution object: {path}")
@@ -1014,7 +1246,15 @@ def _load_request_bound_review_failure(
     ):
         raise RuntimeError(f"post-extraction review failure audit has unsafe flags: {path}")
     completion_attempts = body.get("completion_attempts")
-    if not isinstance(completion_attempts, list) or not 1 <= len(completion_attempts) <= 16:
+    if not isinstance(completion_attempts, list) or len(completion_attempts) > 16:
+        raise RuntimeError(f"post-extraction review failure audit lacks attempt metadata: {path}")
+    if failure_type == "adaptive_hierarchy_or_executable_validation":
+        if completion_attempts:
+            raise RuntimeError(
+                "adaptive post-extraction review failure audit contains legacy "
+                f"completion attempts: {path}"
+            )
+    elif not completion_attempts:
         raise RuntimeError(f"post-extraction review failure audit lacks attempt metadata: {path}")
     attempt_fields = {
         "attempt",
@@ -2258,7 +2498,10 @@ def _build_exact_inner_recurrence(
     groups: list[dict[str, Any]] = []
     for (family, role), rows in sorted(by_group.items()):
         ranked = sorted(rows, key=lambda row: (-row[1], row[0]))
-        retained = ranked[:_MAX_EXACT_INNER_RECURRENCE_TERMS_PER_GROUP]
+        # Recurrence is evidence production, not a ranking gate. Preserve
+        # every recurrent term; downstream architecture paging is responsible
+        # for bounded model requests with exact coverage.
+        retained = ranked
         groups.append(
             {
                 "source_family": family,
@@ -3191,6 +3434,21 @@ class ReviewGateFeatureBankProvider(Protocol):
     def identity(self) -> Mapping[str, Any]: ...
 
 
+class GateOnlyReviewNumericalProvider(Protocol):
+    """Open prefit cumulative transforms for diagnostics on one exact gate."""
+
+    def get_gate_only_view(
+        self,
+        *,
+        outer_fold: int,
+        context_epoch: int,
+        exact_spent_row_ids: tuple[int, ...],
+        exact_gate_row_ids: tuple[int, ...],
+    ) -> Any: ...
+
+    def identity(self) -> Mapping[str, Any]: ...
+
+
 class BindableReviewGateSourceProvider(Protocol):
     """Fit calibrated sources on spent labels and a label-free exact gate."""
 
@@ -3315,7 +3573,7 @@ class AllEvidenceFusionRunnerConfig:
     extraction_grouping_version: str = "explicit_feature_request_grouping_v2"
     extraction_context_strategy: str = "tail"
     extraction_context_compactor_version: str = "contract_lexical_rag_v1"
-    extraction_max_text_length: int = 400000
+    extraction_max_text_length: int | None = None
     extraction_batch_size: int = 32
     max_variables_per_extraction_request: int = 10
     post_extraction_review_rounds: int = DEFAULT_POST_EXTRACTION_REVIEW_ROUNDS
@@ -3323,6 +3581,8 @@ class AllEvidenceFusionRunnerConfig:
     post_extraction_review_max_quality_retries: int = 2
     post_extraction_review_min_partition_rows: int = 8
     post_extraction_review_config: CausalReviewConfig = field(default_factory=CausalReviewConfig)
+    post_extraction_scientific_policy: PostExtractionScientificPolicy | None = None
+    upstream_review_policy: str = CONDITIONAL_CONTEXT_AND_GATE_REVIEW_POLICY
     require_review_source_signals: bool = False
     require_review_feature_banks: bool = False
     require_final_upstream_inputs: bool = False
@@ -3405,6 +3665,28 @@ class AllEvidenceFusionRunnerConfig:
             object.__setattr__(self, name, normalized)
         if not isinstance(self.post_extraction_review_config, CausalReviewConfig):
             raise TypeError("post_extraction_review_config must be CausalReviewConfig")
+        if self.post_extraction_scientific_policy is not None:
+            if not isinstance(
+                self.post_extraction_scientific_policy,
+                PostExtractionScientificPolicy,
+            ):
+                raise TypeError(
+                    "post_extraction_scientific_policy must be "
+                    "PostExtractionScientificPolicy"
+                )
+            if (
+                self.post_extraction_review_config.estimator_policy
+                != self.post_extraction_scientific_policy.review_estimator
+            ):
+                raise ValueError(
+                    "post-extraction causal-review estimator policy differs "
+                    "from the configured scientific policy"
+                )
+        if self.upstream_review_policy not in {
+            CONDITIONAL_CONTEXT_AND_GATE_REVIEW_POLICY,
+            GATE_ONLY_REFERENCE_PRESERVATION_REVIEW_POLICY,
+        }:
+            raise ValueError("upstream_review_policy is not a registered review policy")
         for name in (
             "require_review_source_signals",
             "require_review_feature_banks",
@@ -3843,20 +4125,60 @@ class ReviewPartitionSchedule:
     attempt: int
     initial_spent_fold_ids: tuple[int, ...]
     gate_fold_ids: tuple[int, ...]
+    outer_train_row_ids: tuple[int, ...] = field(repr=False)
     row_ids_by_fold: Mapping[int, tuple[int, ...]] = field(repr=False)
     audit: Mapping[str, Any] = field(repr=False)
+
+    def __post_init__(self) -> None:
+        canonical_rows = tuple(map(int, self.outer_train_row_ids))
+        if (
+            not canonical_rows
+            or len(canonical_rows) != len(set(canonical_rows))
+            or any(row_id < 0 for row_id in canonical_rows)
+        ):
+            raise ValueError(
+                "review schedule canonical outer-training rows must be "
+                "nonempty unique nonnegative integers"
+            )
+        partition_ids = set(map(int, self.row_ids_by_fold))
+        scheduled_fold_ids = tuple(
+            map(int, (*self.initial_spent_fold_ids, *self.gate_fold_ids))
+        )
+        if (
+            len(scheduled_fold_ids) != len(set(scheduled_fold_ids))
+            or set(scheduled_fold_ids) != partition_ids
+        ):
+            raise ValueError(
+                "review schedule fold sequence must cover each partition exactly once"
+            )
+        partition_rows = tuple(
+            int(row_id)
+            for rows in self.row_ids_by_fold.values()
+            for row_id in rows
+        )
+        if (
+            len(partition_rows) != len(set(partition_rows))
+            or set(partition_rows) != set(canonical_rows)
+        ):
+            raise ValueError(
+                "review schedule partitions must cover the canonical "
+                "outer-training rows exactly once"
+            )
 
     def row_ids(self, fold_ids: Sequence[int]) -> tuple[int, ...]:
         requested = tuple(int(value) for value in fold_ids)
         unknown = set(requested) - set(self.row_ids_by_fold)
         if unknown:
             raise ValueError(f"unknown review partition IDs: {sorted(unknown)}")
-        selected = set(requested)
+        selected_rows = {
+            int(row_id)
+            for fold_id in set(requested)
+            for row_id in self.row_ids_by_fold[fold_id]
+        }
         return tuple(
             row_id
-            for fold_id, rows in sorted(self.row_ids_by_fold.items())
-            if fold_id in selected
-            for row_id in rows
+            for row_id in self.outer_train_row_ids
+            if row_id in selected_rows
         )
 
 
@@ -4068,6 +4390,7 @@ def _build_review_partition_schedule(
         attempt=attempt,
         initial_spent_fold_ids=(1, 2, 3),
         gate_fold_ids=tuple(range(4, partition_count + 1)),
+        outer_train_row_ids=tuple(map(int, row_ids)),
         row_ids_by_fold=rows_by_fold,
         audit=json.loads(_canonical_json(audit)),
     )
@@ -4095,10 +4418,10 @@ def _build_injected_review_partition_schedule(
     gate_count = int(review_rounds)
     partition_count = len(raw)
     initial_spent_count = partition_count - gate_count
-    if initial_spent_count < 3:
+    if initial_spent_count < 1:
         raise ValueError(
-            "authenticated review assignments must contain at least three initial "
-            "spent folds plus one gate per round; "
+            "authenticated review assignments must contain at least one initial "
+            "spent fold plus one gate per round; "
             f"rounds={gate_count} partitions={partition_count}"
         )
     normalized_raw: list[tuple[int, tuple[int, ...]]] = []
@@ -4189,6 +4512,7 @@ def _build_injected_review_partition_schedule(
         attempt=0,
         initial_spent_fold_ids=ordered_fold_ids[:initial_spent_count],
         gate_fold_ids=ordered_fold_ids[initial_spent_count:],
+        outer_train_row_ids=exact_train_ids,
         row_ids_by_fold=rows_by_fold,
         audit=json.loads(_canonical_json(audit)),
     )
@@ -4371,7 +4695,12 @@ class PreparedHierarchicalDiscoveryFold:
     initial_spent_evidence_audit: Mapping[str, Any] = field(repr=False)
     catalog: RoleNeutralEvidenceCatalog = field(repr=False)
     chunk_plan: ArchitectureChunkPlan = field(repr=False)
-    first_gate_materialization_intent: FirstGateMaterializationIntent = field(repr=False)
+    first_gate_materialization_intent: FirstGateMaterializationIntent | None = field(
+        repr=False
+    )
+    reference_only_direct_numerical_contract: (
+        AuthenticatedReferenceOnlyDirectNumericalContract | None
+    ) = field(repr=False)
     first_gate_materialization_intent_path: Path
     first_gate_materialization_intent_file_sha256: str
     agent: ApprovedHierarchicalDiscoveryAgent = field(repr=False)
@@ -4388,13 +4717,44 @@ class PreparedHierarchicalDiscoveryFold:
             raise ValueError("prepared hierarchical agent cites a different catalog")
         if self.agent.chunk_plan.plan_sha256 != self.chunk_plan.plan_sha256:
             raise ValueError("prepared hierarchical agent cites a different chunk plan")
-        self.first_gate_materialization_intent.verify()
-        agent_intent = getattr(self.agent, "first_gate_materialization_intent", None)
         if (
-            not isinstance(agent_intent, FirstGateMaterializationIntent)
-            or agent_intent.content_sha256 != self.first_gate_materialization_intent.content_sha256
-        ):
-            raise ValueError("prepared hierarchical agent cites a different materialization intent")
+            self.first_gate_materialization_intent is None
+        ) == (self.reference_only_direct_numerical_contract is None):
+            raise ValueError(
+                "prepared hierarchy requires exactly one numerical contract"
+            )
+        agent_intent = getattr(self.agent, "first_gate_materialization_intent", None)
+        agent_reference = getattr(
+            self.agent,
+            "reference_only_direct_numerical_contract",
+            None,
+        )
+        if self.first_gate_materialization_intent is not None:
+            self.first_gate_materialization_intent.verify()
+            if (
+                not isinstance(agent_intent, FirstGateMaterializationIntent)
+                or agent_reference is not None
+                or agent_intent.content_sha256
+                != self.first_gate_materialization_intent.content_sha256
+            ):
+                raise ValueError(
+                    "prepared hierarchical agent cites a different materialization intent"
+                )
+        else:
+            assert self.reference_only_direct_numerical_contract is not None
+            self.reference_only_direct_numerical_contract.verify(
+                catalog=self.catalog
+            )
+            if (
+                agent_intent is not None
+                or type(agent_reference)
+                is not AuthenticatedReferenceOnlyDirectNumericalContract
+                or agent_reference.content_sha256
+                != self.reference_only_direct_numerical_contract.content_sha256
+            ):
+                raise ValueError(
+                    "prepared hierarchical agent cites a different reference contract"
+                )
         if (
             not self.first_gate_materialization_intent_path.is_file()
             or not _SHA256.fullmatch(self.first_gate_materialization_intent_file_sha256)
@@ -4714,9 +5074,18 @@ class PreparedHierarchicalDiscoveryBatch:
         from .production_stage1_hierarchy_handoff import (
             AuthenticatedProductionStage1HierarchyExecutionAuthorization,
         )
+        from .production_role_neutral_stage2_handoff import (
+            AuthenticatedRoleNeutralHierarchyExecutionAuthorization,
+        )
 
-        if type(authorization) is not AuthenticatedProductionStage1HierarchyExecutionAuthorization:
-            raise TypeError("production hierarchy execution requires the exact typed authorization")
+        if type(authorization) not in {
+            AuthenticatedProductionStage1HierarchyExecutionAuthorization,
+            AuthenticatedRoleNeutralHierarchyExecutionAuthorization,
+        }:
+            raise TypeError(
+                "production hierarchy execution requires one exact typed "
+                "authorization from a registered provider"
+            )
         result = authorization._execute_for_prepared_batch(
             prepared_batch=self,
             runner=runner,
@@ -4731,8 +5100,8 @@ class AllEvidenceFusionRunner:
         self,
         *,
         dataset_path: Path | str,
-        legacy_handoff_path: Path | str,
-        tfidf_handoff_path: Path | str,
+        legacy_handoff_path: Path | str | None,
+        tfidf_handoff_path: Path | str | None,
         output_dir: Path | str,
         fusion_agent: Callable[[Any], Mapping[str, Any]] | Any | None,
         extraction_provider: Any,
@@ -4740,10 +5109,16 @@ class AllEvidenceFusionRunner:
         review_spent_evidence_provider: ReviewSpentEvidenceProvider | None = None,
         review_partition_provider: ReviewPartitionProvider | None = None,
         review_gate_source_provider: (
-            ReviewGateSourceProvider | BindableReviewGateSourceProvider | None
+            ReviewGateSourceProvider
+            | BindableReviewGateSourceProvider
+            | GateOnlyReviewNumericalProvider
+            | None
         ) = None,
         review_gate_feature_bank_provider: (
-            ReviewGateFeatureBankProvider | BindableReviewGateFeatureBankProvider | None
+            ReviewGateFeatureBankProvider
+            | BindableReviewGateFeatureBankProvider
+            | GateOnlyReviewNumericalProvider
+            | None
         ) = None,
         final_upstream_producer: FinalUpstreamProducer | None = None,
         raw_final_upstream_producer: FinalContextFitUpstreamProducer | None = None,
@@ -4773,10 +5148,45 @@ class AllEvidenceFusionRunner:
         hierarchical_max_semantic_member_ids_per_chunk: int = (
             DEFAULT_MAX_SEMANTIC_MEMBER_IDS_PER_ARCHITECTURE_CHUNK
         ),
+        reference_only_stage1_provider: Any | None = None,
+        reference_only_stage1_runtime_binding: Any | None = None,
+        reference_only_numerical_bank: Any | None = None,
     ) -> None:
         self.dataset_path = Path(dataset_path).resolve()
-        self.legacy_handoff_path = Path(legacy_handoff_path).resolve()
-        self.tfidf_handoff_path = Path(tfidf_handoff_path).resolve()
+        self.reference_only_stage1_provider = reference_only_stage1_provider
+        self.reference_only_stage1_runtime_binding = (
+            reference_only_stage1_runtime_binding
+        )
+        self.reference_only_numerical_bank = reference_only_numerical_bank
+        direct_values = (
+            self.reference_only_stage1_provider,
+            self.reference_only_stage1_runtime_binding,
+            self.reference_only_numerical_bank,
+        )
+        self.reference_only_stage1_mode = any(
+            value is not None for value in direct_values
+        )
+        if self.reference_only_stage1_mode and not all(
+            value is not None for value in direct_values
+        ):
+            raise ValueError(
+                "reference-only Stage 1 provider, runtime binding, and numerical "
+                "bank must be supplied together"
+            )
+        if self.reference_only_stage1_mode:
+            if legacy_handoff_path is not None or tfidf_handoff_path is not None:
+                raise ValueError(
+                    "reference-only Stage 2 forbids legacy and TF-IDF handoff paths"
+                )
+            self.legacy_handoff_path = None
+            self.tfidf_handoff_path = None
+        else:
+            if legacy_handoff_path is None or tfidf_handoff_path is None:
+                raise ValueError(
+                    "historical Stage 2 requires both legacy and TF-IDF handoff paths"
+                )
+            self.legacy_handoff_path = Path(legacy_handoff_path).resolve()
+            self.tfidf_handoff_path = Path(tfidf_handoff_path).resolve()
         self.output_dir = Path(output_dir)
         self.fusion_agent = fusion_agent
         self.extraction_provider = extraction_provider
@@ -4793,6 +5203,72 @@ class AllEvidenceFusionRunner:
             else tuple(str(value).strip() for value in coordinate_preserving_nuisance_view_names)
         )
         self.config = config
+        self.gate_only_reference_review = (
+            self.config.upstream_review_policy
+            == GATE_ONLY_REFERENCE_PRESERVATION_REVIEW_POLICY
+        )
+        if self.reference_only_stage1_mode:
+            from .direct_upstream_numerical_reference_bank import (
+                AuthenticatedRoleNeutralDirectNumericalBank,
+            )
+            from .production_role_neutral_stage2_handoff import (
+                AuthenticatedRoleNeutralStage2Provider,
+                AuthenticatedRoleNeutralStage2RuntimeBinding,
+                validate_authenticated_role_neutral_stage2_runtime_binding,
+            )
+
+            if type(self.reference_only_stage1_provider) is not (
+                AuthenticatedRoleNeutralStage2Provider
+            ):
+                raise TypeError(
+                    "reference-only Stage 2 requires the exact authenticated "
+                    "role-neutral provider"
+                )
+            if type(self.reference_only_stage1_runtime_binding) is not (
+                AuthenticatedRoleNeutralStage2RuntimeBinding
+            ):
+                raise TypeError(
+                    "reference-only Stage 2 requires the exact provider-issued "
+                    "runtime binding"
+                )
+            if type(self.reference_only_numerical_bank) is not (
+                AuthenticatedRoleNeutralDirectNumericalBank
+            ):
+                raise TypeError(
+                    "reference-only Stage 2 requires the exact direct numerical bank"
+                )
+            plan = self.reference_only_stage1_provider.authenticated_scope_plan()
+            direct_runtime_payload = dict(
+                validate_authenticated_role_neutral_stage2_runtime_binding(
+                    self.reference_only_stage1_runtime_binding,
+                    expected_plan_scientific_content_sha256=(
+                        plan.scientific_content_sha256
+                    ),
+                    expected_source_execution_content_sha256=(
+                        self.reference_only_numerical_bank.manifest[
+                            "source_execution_content_sha256"
+                        ]
+                    ),
+                )
+            )
+            if (
+                self.reference_only_numerical_bank.plan is not plan
+                or self.reference_only_numerical_bank.identity()[
+                    "plan_scientific_content_sha256"
+                ]
+                != plan.scientific_content_sha256
+                or direct_runtime_payload["provider_identity_sha256"]
+                != self.reference_only_stage1_provider.identity()[
+                    "identity_sha256"
+                ]
+            ):
+                raise ValueError(
+                    "reference-only Stage 2 inputs belong to different "
+                    "authenticated Stage 1 graphs"
+                )
+            self.reference_only_stage1_runtime_payload = direct_runtime_payload
+        else:
+            self.reference_only_stage1_runtime_payload = None
         self.hierarchical_discovery_runner = hierarchical_discovery_runner
         self.hierarchical_discovery_config = hierarchical_discovery_config
         self.hierarchical_discovery_job_cache_root = (
@@ -4932,13 +5408,28 @@ class AllEvidenceFusionRunner:
                 raise ValueError(
                     "hierarchical production discovery requires at least one untouched review gate"
                 )
+            shared_gate_provider = self.review_gate_source_provider
             if (
-                self.review_gate_source_provider is None
-                or self.review_gate_source_provider is not self.review_gate_feature_bank_provider
-                or not callable(getattr(self.review_gate_source_provider, "bind_fold", None))
+                shared_gate_provider is None
+                or shared_gate_provider is not self.review_gate_feature_bank_provider
             ):
                 raise ValueError(
-                    "hierarchical production discovery requires one shared bindable "
+                    "hierarchical production discovery requires one shared "
+                    "source/feature gate provider"
+                )
+            if self.gate_only_reference_review:
+                if not callable(getattr(shared_gate_provider, "get_gate_only_view", None)):
+                    raise ValueError(
+                        "gate-only hierarchical review requires a prefit cumulative "
+                        "get_gate_only_view provider"
+                    )
+                if callable(getattr(shared_gate_provider, "bind_fold", None)):
+                    raise ValueError(
+                        "gate-only hierarchical review rejects bind_fold providers"
+                    )
+            elif not callable(getattr(shared_gate_provider, "bind_fold", None)):
+                raise ValueError(
+                    "conditional hierarchical review requires one shared bindable "
                     "source/feature gate provider"
                 )
             if self.review_spent_evidence_provider is None:
@@ -4964,12 +5455,20 @@ class AllEvidenceFusionRunner:
             raise ValueError(
                 "the exact raw final upstream runtime requires a final package producer"
             )
-        if self.config.require_final_causal_forest and self.raw_final_upstream_producer is None:
+        if (
+            self.config.require_final_causal_forest
+            and self.raw_final_upstream_producer is None
+            and not self.reference_only_stage1_mode
+        ):
             raise ValueError(
                 "the required final causal forest needs the exact raw "
                 "FinalContextFitUpstreamProducer runtime"
             )
-        if final_causal_forest_backend is not None and self.raw_final_upstream_producer is None:
+        if (
+            final_causal_forest_backend is not None
+            and self.raw_final_upstream_producer is None
+            and not self.reference_only_stage1_mode
+        ):
             raise ValueError(
                 "a final causal-forest backend may be injected only with the exact raw runtime"
             )
@@ -4980,13 +5479,19 @@ class AllEvidenceFusionRunner:
             raise ValueError(
                 "coordinate-preserving nuisance views require the exact raw final runtime"
             )
-        self.final_causal_forest_backend_was_injected = final_causal_forest_backend is not None
+        self.final_causal_forest_backend_was_injected = (
+            final_causal_forest_backend is not None
+            and type(final_causal_forest_backend) is not FixedCausalForestHeadBackend
+        )
         self.final_causal_forest_backend = (
             final_causal_forest_backend
             if final_causal_forest_backend is not None
             else (
                 FixedCausalForestHeadBackend(random_state=int(self.config.random_state))
-                if self.raw_final_upstream_producer is not None
+                if (
+                    self.raw_final_upstream_producer is not None
+                    or self.reference_only_stage1_mode
+                )
                 else None
             )
         )
@@ -5032,8 +5537,17 @@ class AllEvidenceFusionRunner:
                 "review feature banks are required but no gate-local provider was injected"
             )
         if (
+            self.gate_only_reference_review
+            and self.config.post_extraction_review_rounds > 0
+            and self.review_partition_provider is None
+        ):
+            raise ValueError(
+                "gate-only review requires authenticated precommitted review partitions"
+            )
+        if (
             self.config.require_review_feature_banks
             and self.review_partition_provider is None
+            and not self.gate_only_reference_review
             and not callable(getattr(self.review_gate_feature_bank_provider, "bind_fold", None))
         ):
             raise ValueError(
@@ -5043,6 +5557,7 @@ class AllEvidenceFusionRunner:
         if (
             self.config.post_extraction_review_rounds > 1
             and self.review_gate_feature_bank_provider is not None
+            and not self.gate_only_reference_review
             and not callable(getattr(self.review_gate_feature_bank_provider, "bind_fold", None))
         ):
             raise ValueError(
@@ -5052,7 +5567,7 @@ class AllEvidenceFusionRunner:
         if (
             self.config.require_final_upstream_inputs
             or self.config.require_final_upstream_neural_query_inputs
-        ) and self.final_upstream_producer is None:
+        ) and self.final_upstream_producer is None and not self.reference_only_stage1_mode:
             raise ValueError(
                 "final upstream model inputs are required but no post-registry producer "
                 "was injected"
@@ -5175,6 +5690,195 @@ class AllEvidenceFusionRunner:
             label="cache_overlay",
         )
         self.tfidf_validator = tfidf_validator
+        if self.reference_only_stage1_mode:
+            if (
+                self.review_spent_evidence_provider
+                is not self.reference_only_stage1_provider
+                or self.review_partition_provider
+                is not self.reference_only_stage1_provider
+                or self.review_gate_source_provider
+                is not self.reference_only_numerical_bank
+                or self.review_gate_feature_bank_provider
+                is not self.reference_only_numerical_bank
+            ):
+                raise ValueError(
+                    "reference-only Stage 2 must use its authenticated provider "
+                    "for spent evidence/partitions and its direct numerical bank "
+                    "for both gate channels"
+                )
+            if (
+                self.final_upstream_producer is not None
+                or self.raw_final_upstream_producer is not None
+                or self.legacy_primary_predictions_path is not None
+                or self.tfidf_validator is not None
+                or self.candidate_pool_paths
+                or self.query_evidence_by_fold
+                or self.tfidf_orphan_artifacts_by_fold
+            ):
+                raise ValueError(
+                    "reference-only Stage 2 forbids historical final producers, "
+                    "split artifacts, TF-IDF validators, and auxiliary legacy "
+                    "evidence registrations"
+                )
+            if not self.gate_only_reference_review:
+                raise ValueError(
+                    "reference-only Stage 2 requires the explicit gate-only "
+                    "upstream review policy"
+                )
+
+    @classmethod
+    def from_reference_only_role_neutral_stage1(
+        cls,
+        *,
+        handoff: Any,
+        direct_inputs: Any,
+        options: Any,
+        endpoint: str,
+    ) -> "AllEvidenceFusionRunner":
+        """Construct the portable runtime through its production client factory."""
+
+        from .production_stage1_hierarchy_one_shot import (
+            _construct_reference_only_role_neutral_stage2_runner,
+        )
+
+        runner = _construct_reference_only_role_neutral_stage2_runner(
+            runner_type=cls,
+            handoff=handoff,
+            direct_inputs=direct_inputs,
+            options=options,
+            endpoint=endpoint,
+        )
+        if type(runner) is not cls:
+            raise TypeError(
+                "reference-only Stage 2 factory returned a substituted runner"
+            )
+        return runner
+
+    def _reference_only_outer_split_rows(
+        self,
+    ) -> tuple[tuple[int, ...], dict[int, dict[str, tuple[int, ...]]]]:
+        """Return plan-derived direct folds after rechecking retained identities."""
+
+        if not self.reference_only_stage1_mode:
+            raise RuntimeError("runner is not in reference-only Stage 1 mode")
+        provider = self.reference_only_stage1_provider
+        current_provider_identity = provider.identity()
+        if (
+            self.reference_only_stage1_runtime_payload is None
+            or current_provider_identity["identity_sha256"]
+            != self.reference_only_stage1_runtime_payload[
+                "provider_identity_sha256"
+            ]
+        ):
+            raise RuntimeError(
+                "reference-only Stage 1 provider identity changed after construction"
+            )
+        assignments = provider.get_outer_fold_assignments()
+        folds = tuple(sorted(assignments))
+        if not folds or folds != tuple(range(1, len(folds) + 1)):
+            raise ValueError(
+                "reference-only outer folds must be complete one-based contiguous folds"
+            )
+        rows: dict[int, dict[str, tuple[int, ...]]] = {}
+        for outer_fold in folds:
+            assignment = assignments[outer_fold]
+            if set(assignment) != {"fit_row_ids", "heldout_row_ids"}:
+                raise ValueError(
+                    "reference-only outer-fold assignment schema changed"
+                )
+            fit_rows = tuple(map(int, assignment["fit_row_ids"]))
+            heldout_rows = tuple(map(int, assignment["heldout_row_ids"]))
+            if (
+                not fit_rows
+                or not heldout_rows
+                or len(fit_rows) != len(set(fit_rows))
+                or len(heldout_rows) != len(set(heldout_rows))
+                or set(fit_rows) & set(heldout_rows)
+            ):
+                raise ValueError(
+                    "reference-only outer-fold row assignments are malformed"
+                )
+            rows[outer_fold] = {
+                "fit_row_ids": fit_rows,
+                "heldout_row_ids": heldout_rows,
+            }
+        return folds, rows
+
+    def _reference_only_source_identity(self) -> Mapping[str, Any]:
+        if not self.reference_only_stage1_mode:
+            raise RuntimeError("runner is not in reference-only Stage 1 mode")
+        provider_identity = self.reference_only_stage1_provider.identity()
+        numerical_identity = self.reference_only_numerical_bank.identity()
+        runtime_payload = dict(self.reference_only_stage1_runtime_payload or {})
+        return {
+            "mode": "authenticated_role_neutral_all_ten_reference_only_v1",
+            "provider_identity_sha256": provider_identity["identity_sha256"],
+            "plan_scientific_content_sha256": runtime_payload[
+                "plan_scientific_content_sha256"
+            ],
+            "source_execution_content_sha256": runtime_payload[
+                "source_execution_content_sha256"
+            ],
+            "runtime_binding_content_sha256": runtime_payload["content_sha256"],
+            "prepared_projection_binding_content_sha256": runtime_payload[
+                "prepared_projection_binding_content_sha256"
+            ],
+            "prepared_cohort_artifact_sha256": runtime_payload[
+                "runner_dataset_artifact_sha256"
+            ],
+            "row_map_sha256": runtime_payload["row_map_sha256"],
+            "direct_numerical_bank_manifest_content_sha256": numerical_identity[
+                "manifest_content_sha256"
+            ],
+            "legacy_stage1_loader_invoked": False,
+            "tfidf_handoff_loader_invoked": False,
+            "independent_stage1_refit_performed": False,
+            "text_truncation_applied": False,
+        }
+
+    def run_reference_only_role_neutral_one_shot(
+        self,
+        *,
+        handoff: Any,
+    ) -> AllEvidenceFusionRunResult:
+        """Prepare, authorize, and execute one direct run without a user digest."""
+
+        from .production_role_neutral_stage2_handoff import (
+            ROLE_NEUTRAL_STAGE1_REFERENCE_HANDOFF_KIND,
+            authorize_reference_only_role_neutral_hierarchy_execution,
+        )
+
+        if not self.reference_only_stage1_mode:
+            raise RuntimeError(
+                "runner was not constructed for reference-only Stage 1"
+            )
+        if (
+            getattr(handoff, "handoff_kind", None)
+            != ROLE_NEUTRAL_STAGE1_REFERENCE_HANDOFF_KIND
+            or getattr(handoff, "stage2_provider", None)
+            is not self.reference_only_stage1_provider
+            or getattr(handoff, "legacy_bundle_build_invoked", None) is not False
+        ):
+            raise ValueError(
+                "direct one-shot handoff differs from the retained Stage 1 provider"
+            )
+        if self.hierarchical_discovery_approved_batch_sha256 is not None:
+            raise ValueError(
+                "direct one-shot execution cannot accept a caller-supplied digest"
+            )
+        prepared = self.prepare_hierarchical_discovery_batch()
+        authorization = (
+            authorize_reference_only_role_neutral_hierarchy_execution(
+                provider=self.reference_only_stage1_provider,
+                runtime_binding=self.reference_only_stage1_runtime_binding,
+                prepared_batch=prepared,
+                runner=self,
+            )
+        )
+        return self.run(
+            prepared_hierarchical_batch=prepared,
+            hierarchy_execution_authorization=authorization,
+        )
 
     def _assert_raw_final_upstream_producer_identity(self) -> str:
         if (
@@ -5264,25 +5968,66 @@ class AllEvidenceFusionRunner:
             outcome_column=self.config.outcome_column,
         )
         external_validation: Mapping[str, Any] | None = None
-        if self.tfidf_validator is not None:
-            external_validation = self.tfidf_validator(
-                dataset=data.drop(columns=["_oci_row_id"]),
-                handoff_path=self.tfidf_handoff_path,
+        legacy = None
+        tfidf = None
+        reference_source: Mapping[str, Any] | None = None
+        if self.reference_only_stage1_mode:
+            folds, split_rows = self._reference_only_outer_split_rows()
+            reference_source = self._reference_only_source_identity()
+            if dataset_sha256 != reference_source[
+                "prepared_cohort_artifact_sha256"
+            ]:
+                raise ValueError(
+                    "runner dataset differs from the provider-authenticated "
+                    "prepared cohort artifact"
+                )
+        else:
+            assert self.tfidf_handoff_path is not None
+            assert self.legacy_handoff_path is not None
+            if self.tfidf_validator is not None:
+                external_validation = self.tfidf_validator(
+                    dataset=data.drop(columns=["_oci_row_id"]),
+                    handoff_path=self.tfidf_handoff_path,
+                )
+                if (
+                    not isinstance(external_validation, Mapping)
+                    or external_validation.get("status") != "passed"
+                ):
+                    raise RuntimeError(
+                        "external TF-IDF handoff validation did not pass"
+                    )
+            legacy = load_legacy_full_outer_evidence(self.legacy_handoff_path)
+            tfidf = load_resealed_tfidf_handoff(
+                self.tfidf_handoff_path,
+                dataset_row_count=len(data),
+                require_registry_seal=self.config.require_registry_seal,
             )
-            if (
-                not isinstance(external_validation, Mapping)
-                or external_validation.get("status") != "passed"
-            ):
-                raise RuntimeError("external TF-IDF handoff validation did not pass")
-        legacy = load_legacy_full_outer_evidence(self.legacy_handoff_path)
-        tfidf = load_resealed_tfidf_handoff(
-            self.tfidf_handoff_path,
-            dataset_row_count=len(data),
-            require_registry_seal=self.config.require_registry_seal,
-        )
-        folds = tuple(sorted(tfidf.full_rows_by_outer_fold))
-        if set(legacy.rows_by_outer_fold) != set(folds):
-            raise ValueError("legacy and TF-IDF full-outer fold sets do not match exactly")
+            folds = tuple(sorted(tfidf.full_rows_by_outer_fold))
+            if set(legacy.rows_by_outer_fold) != set(folds):
+                raise ValueError(
+                    "legacy and TF-IDF full-outer fold sets do not match exactly"
+                )
+            split_rows = {
+                outer_fold: {
+                    "fit_row_ids": tuple(
+                        map(
+                            int,
+                            tfidf.full_rows_by_outer_fold[outer_fold][
+                                "fit_row_ids"
+                            ],
+                        )
+                    ),
+                    "heldout_row_ids": tuple(
+                        map(
+                            int,
+                            tfidf.full_rows_by_outer_fold[outer_fold][
+                                "heldout_row_ids"
+                            ],
+                        )
+                    ),
+                }
+                for outer_fold in folds
+            }
         if folds != tuple(range(1, len(folds) + 1)):
             raise ValueError(
                 "hierarchical batch approval requires complete one-based contiguous folds"
@@ -5297,6 +6042,7 @@ class AllEvidenceFusionRunner:
             )
         legacy_split_audit: Mapping[str, Any] | None = None
         if self.legacy_primary_predictions_path is not None:
+            assert tfidf is not None
             legacy_heldout, legacy_primary_sha256 = (
                 _load_outer_splits_from_primary_predictions_snapshot(
                     self.legacy_primary_predictions_path,
@@ -5378,29 +6124,42 @@ class AllEvidenceFusionRunner:
                     text_column=self.config.text_column,
                 ),
             },
-            "legacy_handoff": {
-                "path": legacy.artifact_path,
-                "sha256": legacy.artifact_sha256,
-                "primary_split_audit": legacy_split_audit,
-            },
-            "tfidf_handoff": {
-                "path": tfidf.artifact_path,
-                "sha256": tfidf.artifact_sha256,
-                "split_registry_content_hash": tfidf.split_registry_content_hash,
-                "external_validation": external_validation,
-            },
+            "stage1_reference_source": reference_source,
+            "legacy_handoff": (
+                None
+                if legacy is None
+                else {
+                    "path": legacy.artifact_path,
+                    "sha256": legacy.artifact_sha256,
+                    "primary_split_audit": legacy_split_audit,
+                }
+            ),
+            "tfidf_handoff": (
+                None
+                if tfidf is None
+                else {
+                    "path": tfidf.artifact_path,
+                    "sha256": tfidf.artifact_sha256,
+                    "split_registry_content_hash": (
+                        tfidf.split_registry_content_hash
+                    ),
+                    "external_validation": external_validation,
+                }
+            ),
             "outer_folds": [
                 {
                     "outer_fold": outer_fold,
                     "fit_row_fingerprint": row_set_fingerprint(
-                        tfidf.full_rows_by_outer_fold[outer_fold]["fit_row_ids"]
+                        split_rows[outer_fold]["fit_row_ids"]
                     ),
                     "heldout_row_fingerprint": row_set_fingerprint(
-                        tfidf.full_rows_by_outer_fold[outer_fold]["heldout_row_ids"]
+                        split_rows[outer_fold]["heldout_row_ids"]
                     ),
-                    "fit_row_count": len(tfidf.full_rows_by_outer_fold[outer_fold]["fit_row_ids"]),
+                    "fit_row_count": len(
+                        split_rows[outer_fold]["fit_row_ids"]
+                    ),
                     "heldout_row_count": len(
-                        tfidf.full_rows_by_outer_fold[outer_fold]["heldout_row_ids"]
+                        split_rows[outer_fold]["heldout_row_ids"]
                     ),
                 }
                 for outer_fold in folds
@@ -5451,7 +6210,7 @@ class AllEvidenceFusionRunner:
         family_explanations = production_stage1_family_explanations()
         for outer_fold in folds:
             fold_dir = preparation_dir / f"outer_fold_{outer_fold:03d}"
-            full = tfidf.full_rows_by_outer_fold[outer_fold]
+            full = split_rows[outer_fold]
             train_ids = tuple(map(int, full["fit_row_ids"]))
             outer_train = indexed.loc[list(train_ids)].reset_index(drop=True)
             schedule = self._review_schedule(
@@ -5481,48 +6240,118 @@ class AllEvidenceFusionRunner:
 
             spent_ids = schedule.row_ids(schedule.initial_spent_fold_ids)
             first_gate_ids = schedule.row_ids((schedule.gate_fold_ids[0],))
-            spent_frame = indexed.loc[list(spent_ids)]
-            fold_by_row = {
-                row_id: fold_id
-                for fold_id, rows in schedule.row_ids_by_fold.items()
-                for row_id in rows
-            }
-            spent_texts = tuple(spent_frame[self.config.text_column].astype(str).tolist())
-            gate_texts = tuple(
-                label_free.set_index("_oci_row_id", drop=False)
-                .loc[list(first_gate_ids)][self.config.text_column]
-                .astype(str)
-                .tolist()
-            )
-            first_gate_intent = prepare_first_gate_materialization_intent(
-                outer_fold=outer_fold,
-                initial_spent_row_ids=spent_ids,
-                initial_spent_texts=spent_texts,
-                initial_spent_treatment=spent_frame[self.config.treatment_column].to_numpy(
-                    dtype=float
-                ),
-                initial_spent_outcome=spent_frame[self.config.outcome_column].to_numpy(dtype=float),
-                initial_spent_inner_fold_ids=tuple(fold_by_row[row_id] for row_id in spent_ids),
-                first_gate_row_ids=first_gate_ids,
-                first_gate_texts=gate_texts,
-                catalog=catalog,
-                provider=shared_provider,
-            )
-            first_gate_intent.verify()
-            first_gate_intent_path = fold_dir / "first_gate_materialization_intent.json"
+            first_gate_intent: FirstGateMaterializationIntent | None = None
+            reference_contract: (
+                AuthenticatedReferenceOnlyDirectNumericalContract | None
+            ) = None
+            if self.gate_only_reference_review:
+                prepare_reference_contract = getattr(
+                    shared_provider,
+                    "prepare_hierarchy_gate_contract",
+                    None,
+                )
+                if not callable(prepare_reference_contract):
+                    raise RuntimeError(
+                        "gate-only numerical provider lacks its hierarchy "
+                        "reference-contract boundary"
+                    )
+                reference_contract = prepare_reference_contract(
+                    outer_fold=outer_fold,
+                    context_epoch=0,
+                    exact_spent_row_ids=spent_ids,
+                    exact_gate_row_ids=first_gate_ids,
+                    catalog=catalog,
+                )
+                if type(reference_contract) is not (
+                    AuthenticatedReferenceOnlyDirectNumericalContract
+                ):
+                    raise TypeError(
+                        "gate-only hierarchy returned a substituted numerical contract"
+                    )
+                reference_contract.verify(catalog=catalog)
+                numerical_contract = reference_contract
+                numerical_contract_kind = (
+                    "authenticated_reference_only_direct_numerical_contract"
+                )
+                first_gate_intent_path = (
+                    fold_dir / "reference_only_direct_numerical_contract.json"
+                )
+                numerical_source_cache_key = None
+            else:
+                spent_frame = indexed.loc[list(spent_ids)]
+                fold_by_row = {
+                    row_id: fold_id
+                    for fold_id, rows in schedule.row_ids_by_fold.items()
+                    for row_id in rows
+                }
+                spent_texts = tuple(
+                    spent_frame[self.config.text_column].astype(str).tolist()
+                )
+                gate_texts = tuple(
+                    label_free.set_index("_oci_row_id", drop=False)
+                    .loc[list(first_gate_ids)][self.config.text_column]
+                    .astype(str)
+                    .tolist()
+                )
+                first_gate_intent = prepare_first_gate_materialization_intent(
+                    outer_fold=outer_fold,
+                    initial_spent_row_ids=spent_ids,
+                    initial_spent_texts=spent_texts,
+                    initial_spent_treatment=spent_frame[
+                        self.config.treatment_column
+                    ].to_numpy(dtype=float),
+                    initial_spent_outcome=spent_frame[
+                        self.config.outcome_column
+                    ].to_numpy(dtype=float),
+                    initial_spent_inner_fold_ids=tuple(
+                        fold_by_row[row_id] for row_id in spent_ids
+                    ),
+                    first_gate_row_ids=first_gate_ids,
+                    first_gate_texts=gate_texts,
+                    catalog=catalog,
+                    provider=shared_provider,
+                )
+                first_gate_intent.verify()
+                numerical_contract = first_gate_intent
+                numerical_contract_kind = "first_gate_materialization_intent"
+                first_gate_intent_path = (
+                    fold_dir / "first_gate_materialization_intent.json"
+                )
+                numerical_source_cache_key = first_gate_intent.body[
+                    "source_cache_key"
+                ]
             first_gate_intent_file_sha256 = _write_immutable_plain_json(
                 first_gate_intent_path,
-                first_gate_intent.as_dict(),
+                numerical_contract.as_dict(),
             )
             first_gate_intent_index_entries.append(
                 {
                     "outer_fold": outer_fold,
-                    "intent_path": str(first_gate_intent_path),
-                    "intent_file_sha256": first_gate_intent_file_sha256,
-                    "intent_content_sha256": first_gate_intent.content_sha256,
-                    "source_cache_key": first_gate_intent.body["source_cache_key"],
+                    "contract_kind": numerical_contract_kind,
+                    "contract_path": str(first_gate_intent_path),
+                    "contract_file_sha256": first_gate_intent_file_sha256,
+                    "contract_content_sha256": (
+                        numerical_contract.content_sha256
+                    ),
+                    "source_cache_key": numerical_source_cache_key,
                     "materialization_deferred_until_after_exact_approval_and_proposal_freeze": (
-                        True
+                        not self.gate_only_reference_review
+                    ),
+                    "already_fit_stage1_reference_projection": (
+                        self.gate_only_reference_review
+                    ),
+                    **(
+                        {}
+                        if self.gate_only_reference_review
+                        else {
+                            "intent_path": str(first_gate_intent_path),
+                            "intent_file_sha256": (
+                                first_gate_intent_file_sha256
+                            ),
+                            "intent_content_sha256": (
+                                numerical_contract.content_sha256
+                            ),
+                        }
                     ),
                 }
             )
@@ -5546,6 +6375,7 @@ class AllEvidenceFusionRunner:
                 chunk_plan=chunk_plan,
                 family_explanations=family_explanations,
                 first_gate_materialization_intent=first_gate_intent,
+                reference_only_direct_numerical_contract=reference_contract,
                 runner=self.hierarchical_discovery_runner,
                 config=self.hierarchical_discovery_config,
                 job_cache=job_cache,
@@ -5572,19 +6402,46 @@ class AllEvidenceFusionRunner:
                     "chunk_plan_path": str(chunk_path),
                     "chunk_plan_envelope_content_sha256": chunk_file_sha256,
                     "chunk_plan_sha256": chunk_plan.plan_sha256,
-                    "first_gate_materialization_intent_path": str(first_gate_intent_path),
-                    "first_gate_materialization_intent_file_sha256": (
+                    "first_gate_direct_numerical_contract_kind": (
+                        numerical_contract_kind
+                    ),
+                    "first_gate_direct_numerical_contract_path": str(
+                        first_gate_intent_path
+                    ),
+                    "first_gate_direct_numerical_contract_file_sha256": (
                         first_gate_intent_file_sha256
                     ),
-                    "first_gate_materialization_intent_content_sha256": (
-                        first_gate_intent.content_sha256
+                    "first_gate_direct_numerical_contract_content_sha256": (
+                        numerical_contract.content_sha256
+                    ),
+                    **(
+                        {}
+                        if self.gate_only_reference_review
+                        else {
+                            "first_gate_materialization_intent_path": str(
+                                first_gate_intent_path
+                            ),
+                            "first_gate_materialization_intent_file_sha256": (
+                                first_gate_intent_file_sha256
+                            ),
+                            "first_gate_materialization_intent_content_sha256": (
+                                numerical_contract.content_sha256
+                            ),
+                        }
                     ),
                     "first_gate_source_cache_key_precommitted": (
-                        first_gate_intent.body["source_cache_key"]
+                        numerical_source_cache_key
                     ),
-                    "first_gate_cache_materialized_before_discovery": False,
-                    "first_gate_cache_materialization_deferred_until_after_exact_approval": True,
-                    "first_gate_cache_materialization_deferred_until_after_proposal_freeze": True,
+                    "first_gate_cache_materialized_before_discovery": (
+                        self.gate_only_reference_review
+                    ),
+                    "first_gate_cache_materialization_deferred_until_after_exact_approval": (
+                        not self.gate_only_reference_review
+                    ),
+                    "first_gate_cache_materialization_deferred_until_after_proposal_freeze": (
+                        not self.gate_only_reference_review
+                    ),
+                    "first_gate_reference_projection_fit_or_refit_performed": False,
                     "first_gate_labels_supplied_to_provider": False,
                     "first_gate_views_exposed_to_discovery": False,
                     "wrapper_precommit_path": str(wrapper_path),
@@ -5602,6 +6459,7 @@ class AllEvidenceFusionRunner:
                 catalog=catalog,
                 chunk_plan=chunk_plan,
                 first_gate_materialization_intent=first_gate_intent,
+                reference_only_direct_numerical_contract=reference_contract,
                 first_gate_materialization_intent_path=first_gate_intent_path,
                 first_gate_materialization_intent_file_sha256=(first_gate_intent_file_sha256),
                 agent=agent,
@@ -5612,9 +6470,18 @@ class AllEvidenceFusionRunner:
 
         _assert_semantic_compatibility_identity_current(semantic_compatibility_identity)
         first_gate_intent_index_content = {
-            "schema_version": "first_gate_materialization_intent_index_v1",
+            "schema_version": (
+                "first_gate_direct_numerical_contract_index_v2"
+                if self.gate_only_reference_review
+                else "first_gate_materialization_intent_index_v1"
+            ),
             "entries": first_gate_intent_index_entries,
-            "all_first_gate_materializations_deferred": True,
+            "all_first_gate_materializations_deferred": (
+                not self.gate_only_reference_review
+            ),
+            "all_gate_only_references_already_fit": (
+                self.gate_only_reference_review
+            ),
             "gate_labels_in_intents": False,
         }
         first_gate_intent_index_payload = {
@@ -6345,13 +7212,11 @@ class AllEvidenceFusionRunner:
         )
 
         def safe_concept_phrase(value: Any) -> str | None:
-            if not isinstance(value, str) or "\n" in value or "\r" in value:
+            if not isinstance(value, str):
                 return None
             phrase = " ".join(value.split())
             if (
                 not phrase
-                or len(phrase) > 160
-                or len(phrase.split()) > 24
                 or identifier_like_phrase.search(phrase)
             ):
                 return None
@@ -6399,7 +7264,7 @@ class AllEvidenceFusionRunner:
                     for item in value
                 ):
                     return None
-                cleaned = [clean(item, parent_key=parent_key) for item in value[:32]]
+                cleaned = [clean(item, parent_key=parent_key) for item in value]
                 return [item for item in cleaned if item not in (None, [], {})]
             if isinstance(value, np.generic):
                 return clean(value.item(), parent_key=parent_key)
@@ -6417,7 +7282,7 @@ class AllEvidenceFusionRunner:
                     "summaries",
                 }:
                     return safe_concept_phrase(value)
-                return value[:320]
+                return value
             return None
 
         sanitized: list[dict[str, Any]] = []
@@ -6474,6 +7339,11 @@ class AllEvidenceFusionRunner:
             spent.extracted,
             specs,
             fold_ids=spent.inner_fold_ids or (),
+            policy=(
+                None
+                if self.config.post_extraction_scientific_policy is None
+                else self.config.post_extraction_scientific_policy.extraction_quality
+            ),
         )
         quality_rows = list(quality["features"])
         grounding_start = len(quality_rows) + 1
@@ -6482,6 +7352,11 @@ class AllEvidenceFusionRunner:
             spent_texts,
             specs,
             diagnostic_start=grounding_start,
+            policy=(
+                None
+                if self.config.post_extraction_scientific_policy is None
+                else self.config.post_extraction_scientific_policy.extraction_grounding
+            ),
         )
         blocking_grounding_failures = {"alternative_category_only_value_support"}
         required_safety_remediation = [
@@ -6504,6 +7379,11 @@ class AllEvidenceFusionRunner:
             spent.extracted,
             specs,
             diagnostic_start=redundancy_start,
+            policy=(
+                None
+                if self.config.post_extraction_scientific_policy is None
+                else self.config.post_extraction_scientific_policy.extraction_redundancy
+            ),
         )
         causal_start = redundancy_start + len(redundancy)
         causal = build_causal_review_diagnostics(
@@ -6744,12 +7624,18 @@ class AllEvidenceFusionRunner:
         *,
         spent_texts: Sequence[str],
         extraction_changed_names: Sequence[str],
+        scientific_policy: PostExtractionScientificPolicy | None,
     ) -> Mapping[str, Any]:
         changed = tuple(map(str, extraction_changed_names))
         quality = build_extraction_quality_diagnostics(
             candidate_spent.extracted,
             candidate_specs,
             fold_ids=candidate_spent.inner_fold_ids or (),
+            policy=(
+                None
+                if scientific_policy is None
+                else scientific_policy.extraction_quality
+            ),
         )
         quality_rows = list(quality["features"])
         grounding_rows = build_extraction_grounding_diagnostics(
@@ -6757,6 +7643,11 @@ class AllEvidenceFusionRunner:
             spent_texts,
             candidate_specs,
             diagnostic_start=len(quality_rows) + 1,
+            policy=(
+                None
+                if scientific_policy is None
+                else scientific_policy.extraction_grounding
+            ),
         )
         retained_ontology = AllEvidenceFusionRunner._retained_registry_ontology_from_grounding(
             candidate_specs,
@@ -6824,6 +7715,7 @@ class AllEvidenceFusionRunner:
         retained_specs: Sequence[Mapping[str, Any]],
         *,
         spent_texts: Sequence[str],
+        scientific_policy: PostExtractionScientificPolicy | None,
     ) -> Mapping[str, Any]:
         """Fail only on locally grounded categorical-ontology hazards.
 
@@ -6841,6 +7733,11 @@ class AllEvidenceFusionRunner:
             retained_spent.extracted,
             spent_texts,
             canonical_specs,
+            policy=(
+                None
+                if scientific_policy is None
+                else scientific_policy.extraction_grounding
+            ),
         )
         return AllEvidenceFusionRunner._retained_registry_ontology_from_grounding(
             canonical_specs,
@@ -7011,6 +7908,128 @@ class AllEvidenceFusionRunner:
             outcome_type=self.config.outcome_type,
         )
 
+    def _gate_only_reference_views(
+        self,
+        *,
+        outer_fold: int,
+        context_epoch: int,
+        gate_row_ids: tuple[int, ...],
+        context: ObservableCausalRows,
+    ) -> tuple[GateSourceSignalView, GateFeatureBankView, Mapping[str, Any]]:
+        """Adapt one authenticated cumulative numerical view to diagnostics.
+
+        No text, treatment, outcome, conditional-context matrix, or fit API is
+        passed to the provider.  The returned Gate* views intentionally have
+        empty context halves and exact complete-spent provenance.
+        """
+
+        if not self.gate_only_reference_review:
+            raise RuntimeError("gate-only reference views require the gate-only policy")
+        provider = self.review_gate_source_provider
+        if (
+            provider is None
+            or provider is not self.review_gate_feature_bank_provider
+            or not callable(getattr(provider, "get_gate_only_view", None))
+        ):
+            raise RuntimeError("gate-only review lost its shared cumulative numerical provider")
+        if callable(getattr(provider, "bind_fold", None)):
+            raise RuntimeError("gate-only review must never expose bind_fold")
+        current = _review_provider_identity(
+            provider,
+            label="gate_only_shared_numerical_provider",
+        )
+        if (
+            current != self.review_gate_source_provider_identity
+            or current != self.review_gate_feature_bank_provider_identity
+        ):
+            raise RuntimeError("gate-only cumulative numerical provider identity changed")
+
+        from .direct_upstream_numerical_reference_bank import (
+            CALIBRATED_SOURCE_BANK,
+            RAW_FEATURE_BANK,
+            MaterializedRoleNeutralNumericalMatrix,
+            RoleNeutralGateOnlyNumericalView,
+        )
+
+        opened = provider.get_gate_only_view(
+            outer_fold=int(outer_fold),
+            context_epoch=int(context_epoch),
+            exact_spent_row_ids=tuple(map(int, context.row_ids)),
+            exact_gate_row_ids=gate_row_ids,
+        )
+        if type(opened) is not RoleNeutralGateOnlyNumericalView:
+            raise TypeError(
+                "gate-only provider must return RoleNeutralGateOnlyNumericalView"
+            )
+        identity = opened.identity()
+        if (
+            tuple(opened.spent_row_ids) != tuple(context.row_ids)
+            or tuple(opened.gate_row_ids) != gate_row_ids
+            or identity.get("gate_fit_row_provenance") != list(context.row_ids)
+            or identity.get("context_oof_available") is not False
+            or identity.get("conditional_context_gate_view_claimed") is not False
+            or identity.get("fit_or_refit_performed") is not False
+            or identity.get("registered_gate_labels_accessed") is not False
+        ):
+            raise ValueError("gate-only numerical view identity or lineage changed")
+        calibrated = opened.materialize(bank_kinds=(CALIBRATED_SOURCE_BANK,))
+        raw = opened.materialize(bank_kinds=(RAW_FEATURE_BANK,))
+        if type(calibrated) is not MaterializedRoleNeutralNumericalMatrix or type(
+            raw
+        ) is not MaterializedRoleNeutralNumericalMatrix:
+            raise TypeError("gate-only numerical materialization returned an invalid matrix")
+        if calibrated.row_ids != gate_row_ids or raw.row_ids != gate_row_ids:
+            raise ValueError("gate-only numerical materialization changed gate row order")
+        if set(calibrated.bank_kinds) != {CALIBRATED_SOURCE_BANK} or set(
+            raw.bank_kinds
+        ) != {RAW_FEATURE_BANK}:
+            raise ValueError("gate-only numerical materialization mixed bank roles")
+
+        lineage = FitRowProvenance(fit_row_ids=frozenset(context.row_ids))
+        source = GateSourceSignalView(
+            row_ids=gate_row_ids,
+            source_names=tuple(
+                f"{family}__{coordinate_id}"
+                for family, coordinate_id in zip(
+                    calibrated.source_families,
+                    calibrated.coordinate_ids,
+                )
+            ),
+            source_kinds=tuple(
+                f"{family}__calibrated_effect"
+                for family in calibrated.source_families
+            ),
+            values=calibrated.values,
+            fit_row_provenance=(lineage,) * len(calibrated.coordinate_ids),
+        )
+        features = GateFeatureBankView(
+            row_ids=gate_row_ids,
+            feature_names=tuple(
+                f"{family}__{coordinate_id}"
+                for family, coordinate_id in zip(
+                    raw.source_families,
+                    raw.coordinate_ids,
+                )
+            ),
+            source_kinds=raw.source_kinds,
+            consumer_roles=raw.consumer_roles,
+            values=raw.values,
+            fit_row_provenance=(lineage,) * len(raw.coordinate_ids),
+        )
+        for view in (source, features):
+            view.aligned_values(gate_row_ids)
+            self._gate_view_lineage_audit(view, context=context)
+        return source, features, {
+            "policy": GATE_ONLY_REFERENCE_PRESERVATION_REVIEW_POLICY,
+            "context_epoch": int(context_epoch),
+            "view_identity": json.loads(_canonical_json(identity)),
+            "source_coordinate_count": len(calibrated.coordinate_ids),
+            "feature_coordinate_count": len(raw.coordinate_ids),
+            "conditional_context_values_accessed": False,
+            "bind_fold_called": False,
+            "fit_or_refit_performed": False,
+        }
+
     def _gate_source_view(
         self,
         *,
@@ -7110,6 +8129,7 @@ class AllEvidenceFusionRunner:
         context_texts: Sequence[str],
         gate_texts: Sequence[str],
         prebound_provider: Any | None,
+        context_epoch: int | None = None,
     ) -> tuple[GateSourceSignalView, GateFeatureBankView, bool]:
         """Bind after proposal freeze, or consume that boundary's verified provider.
 
@@ -7117,6 +8137,19 @@ class AllEvidenceFusionRunner:
         bound provider from the just-verified first-gate realization.  It never
         means that numerical values existed during discovery preparation.
         """
+
+        if getattr(self, "gate_only_reference_review", False):
+            if prebound_provider is not None:
+                raise ValueError("gate-only review rejects a prebound fit provider")
+            if context_epoch is None:
+                raise ValueError("gate-only review requires the cumulative context epoch")
+            source, features, _audit = self._gate_only_reference_views(
+                outer_fold=outer_fold,
+                context_epoch=context_epoch,
+                gate_row_ids=gate_row_ids,
+                context=context,
+            )
+            return source, features, False
 
         provider = self.review_gate_source_provider
         if (
@@ -7172,8 +8205,8 @@ class AllEvidenceFusionRunner:
             )
         return source, features, prebound_provider_used
 
-    @staticmethod
     def _gate_view_lineage_audit(
+        self,
         view: GateSourceSignalView | GateFeatureBankView | None,
         *,
         context: ObservableCausalRows,
@@ -7197,6 +8230,38 @@ class AllEvidenceFusionRunner:
                 if fitted & gate:
                     raise ValueError("gate source/feature lineage includes the current gate")
                 union.update(fitted)
+        if getattr(self, "gate_only_reference_review", False):
+            if any(
+                fitted.recursive_fit_row_ids() != allowed
+                for source_lineages in view.fit_row_provenance
+                for fitted in source_lineages
+            ):
+                raise ValueError(
+                    "gate-only source/feature lineage must equal the exact complete spent context"
+                )
+            if (
+                view.context_row_ids
+                or view.context_inner_fold_ids
+                or view.context_fit_row_provenance
+                or np.asarray(view.context_values).size
+            ):
+                raise ValueError(
+                    "gate-only source/feature views must not contain context-side values"
+                )
+            ordered = sorted(map(int, union))
+            return {
+                "lineage_count": lineage_count,
+                "recursive_fit_row_count": len(ordered),
+                "recursive_fit_row_fingerprint": row_set_fingerprint(ordered),
+                "all_recursive_fit_rows_equal_complete_spent_context": True,
+                "all_recursive_fit_rows_disjoint_from_current_gate": True,
+                "context_oof_lineage_count": 0,
+                "context_oof_recursive_fit_row_count": 0,
+                "context_oof_recursive_fit_row_fingerprint": None,
+                "context_values_cross_fitted_by_exact_inner_fold": False,
+                "context_values_unavailable_by_design": True,
+                "upstream_values_used_as_training_covariates": False,
+            }
         context_lineage_count = 0
         context_union: set[Any] = set()
         context_ids = tuple(view.context_row_ids)
@@ -8016,7 +9081,7 @@ class AllEvidenceFusionRunner:
         *,
         current_registry: Sequence[AdaptiveCurrentFeature],
     ) -> tuple[tuple[AdaptiveDiagnostic, ...], dict[str, Any]]:
-        """Convert every real legacy diagnostic to a bounded semantic scalar row."""
+        """Convert every real legacy diagnostic to a lossless semantic scalar row."""
 
         kind_map = {
             "feature_quality": "extraction_missingness",
@@ -8071,42 +9136,92 @@ class AllEvidenceFusionRunner:
             flags=re.IGNORECASE,
         )
 
-        def scalar_metrics(row: Mapping[str, Any]) -> dict[str, int | float | bool | None]:
-            found: dict[str, int | float | bool | None] = {}
+        def scalar_metrics(
+            row: Mapping[str, Any],
+            *,
+            diagnostic_id: str,
+        ) -> tuple[
+            dict[str, int | float | bool | None],
+            dict[str, Any],
+        ]:
+            eligible: list[tuple[str, int | float | bool | None]] = []
+            emitted_names: set[str] = set()
 
             def visit(value: Any, path: tuple[str, ...]) -> None:
-                if len(found) >= 32:
-                    return
                 if isinstance(value, Mapping):
-                    for key, child in value.items():
-                        lowered = str(key).strip().lower()
+                    items = list(value.items())
+                    raw_keys = [key for key, _child in items]
+                    if not all(isinstance(key, str) for key in raw_keys):
+                        raise TypeError("adaptive diagnostic mapping keys must be strings")
+                    if len(set(raw_keys)) != len(raw_keys):
+                        raise ValueError("adaptive diagnostic mapping contains duplicate keys")
+                    for key, child in sorted(items, key=lambda item: item[0].encode("utf-8")):
+                        lowered = key.strip().lower()
                         if lowered in {"diagnostic_id", "kind"}:
                             continue
-                        visit(child, (*path, lowered))
+                        visit(child, (*path, key))
                     return
                 if isinstance(value, (list, tuple)):
+                    joined = "_".join(part.strip().lower() for part in path)
+                    if (
+                        joined
+                        and not forbidden_path.search(joined)
+                        and metric_key.search(joined)
+                    ):
+                        raise ValueError(
+                            "adaptive diagnostic metric-like collections must be "
+                            "pre-aggregated to scalar values"
+                        )
                     return
                 if value is not None and not isinstance(value, (bool, int, float, np.generic)):
                     return
                 if isinstance(value, np.generic):
                     value = value.item()
+                if value is not None and not isinstance(value, (bool, int, float)):
+                    return
                 if isinstance(value, float) and not math.isfinite(value):
                     return
-                joined = "_".join(path)
+                joined = "_".join(part.strip().lower() for part in path)
                 if not joined or forbidden_path.search(joined) or not metric_key.search(joined):
                     return
-                key = re.sub(r"[^a-z0-9_.:-]+", "_", joined).strip("_")
-                if not key or not key[0].isalpha():
-                    key = f"metric_{key}"
-                key = key[:96].rstrip("_")
-                if key in found:
+                key = ".".join(_encode_adaptive_metric_path_segment(part) for part in path)
+                if _ADAPTIVE_METRIC_IDENTIFIER.fullmatch(key) is None:
+                    raise ValueError("adaptive diagnostic metric path encoding is invalid")
+                if key in emitted_names:
                     raise ValueError("adaptive diagnostic metric paths collide")
-                found[key] = value
+                emitted_names.add(key)
+                eligible.append((key, value))
 
             visit(row, ())
-            return found
+            eligible.sort(key=lambda item: item[0])
+            metrics = {key: value for key, value in eligible}
+            ordered_keys = list(metrics)
+            inventory = [
+                {"metric_key": key, "value": metrics[key]}
+                for key in ordered_keys
+            ]
+            proof_identity = {
+                "schema_version": ADAPTIVE_DIAGNOSTIC_METRIC_COVERAGE_SCHEMA_VERSION,
+                "diagnostic_id": diagnostic_id,
+                "path_encoding_version": ADAPTIVE_DIAGNOSTIC_METRIC_PATH_ENCODING_VERSION,
+                "aggregate_metrics": metrics,
+                "ordered_metric_keys": ordered_keys,
+                "eligible_metric_count": len(eligible),
+                "emitted_metric_count": len(metrics),
+                "eligible_metric_inventory_sha256": _content_sha256(inventory),
+                "emitted_metrics_sha256": _content_sha256(metrics),
+                "metric_names_unique": len(metrics) == len(emitted_names),
+                "every_eligible_metric_emitted_once": len(eligible) == len(metrics),
+            }
+            proof = {
+                **proof_identity,
+                "coverage_proof_sha256": _content_sha256(proof_identity),
+            }
+            _validate_adaptive_diagnostic_metric_coverage_proof(proof)
+            return metrics, proof
 
         adapted: list[AdaptiveDiagnostic] = []
+        metric_coverage_proofs: list[dict[str, Any]] = []
         historical_kinds = {
             "prior_gate_feedback",
             "candidate_quality_retry_feedback",
@@ -8134,18 +9249,24 @@ class AllEvidenceFusionRunner:
                 excluded_historical_targets[diagnostic_id] = sorted(unknown)
                 targets = tuple(target for target in targets if target in registry_names)
             diagnostic_kind = kind_map[kind]
+            aggregate_metrics, metric_coverage_proof = scalar_metrics(
+                row,
+                diagnostic_id=diagnostic_id,
+            )
             adapted.append(
                 AdaptiveDiagnostic(
                     diagnostic_id=diagnostic_id,
                     diagnostic_kind=diagnostic_kind,
                     affected_features=targets,
                     summary=summaries[diagnostic_kind],
-                    aggregate_metrics=scalar_metrics(row),
+                    aggregate_metrics=aggregate_metrics,
                 )
             )
+            metric_coverage_proofs.append(metric_coverage_proof)
         if not adapted:
             raise ValueError("adaptive reconsideration requires observable diagnostics")
-        audit = {
+        audit_identity = {
+            "schema_version": ADAPTIVE_DIAGNOSTIC_ADAPTER_AUDIT_SCHEMA_VERSION,
             "input_diagnostic_count": len(rows_by_id),
             "adapted_diagnostic_count": len(adapted),
             "every_diagnostic_id_represented_once": len(rows_by_id) == len(adapted),
@@ -8155,7 +9276,24 @@ class AllEvidenceFusionRunner:
             "excluded_historical_targets_by_diagnostic": excluded_historical_targets,
             "unknown_current_diagnostic_targets_fail_closed": True,
             "model_context_contains_excluded_historical_names": False,
+            "metric_coverage_proof_count": len(metric_coverage_proofs),
+            "total_eligible_metric_count": sum(
+                int(proof["eligible_metric_count"]) for proof in metric_coverage_proofs
+            ),
+            "total_emitted_metric_count": sum(
+                int(proof["emitted_metric_count"]) for proof in metric_coverage_proofs
+            ),
+            "metric_names_unique_within_each_diagnostic": all(
+                proof["metric_names_unique"] is True for proof in metric_coverage_proofs
+            ),
+            "every_eligible_metric_emitted_once": all(
+                proof["every_eligible_metric_emitted_once"] is True
+                for proof in metric_coverage_proofs
+            ),
+            "metric_coverage_proofs": metric_coverage_proofs,
         }
+        audit = {**audit_identity, "audit_sha256": _content_sha256(audit_identity)}
+        _validate_adaptive_diagnostic_adapter_audit(audit)
         return tuple(adapted), audit
 
     def _run_post_extraction_review(
@@ -8186,22 +9324,29 @@ class AllEvidenceFusionRunner:
         if hierarchical_review:
             assert frozen_hierarchical_review_evidence is not None
             frozen_hierarchical_review_evidence.__post_init__()
-            if not isinstance(
-                hierarchical_first_gate_materialization_intent,
-                FirstGateMaterializationIntent,
-            ) or not isinstance(hierarchical_first_gate_catalog, RoleNeutralEvidenceCatalog):
-                raise ValueError(
-                    "hierarchical review requires the approved first-gate materialization "
-                    "intent and its exact semantic catalog"
-                )
-            hierarchical_first_gate_materialization_intent.verify()
-            if (
-                hierarchical_first_gate_materialization_intent.body["semantic_catalog"][
-                    "catalog_sha256"
-                ]
-                != hierarchical_first_gate_catalog.catalog_sha256
-            ):
-                raise ValueError("hierarchical first-gate intent cites a different catalog")
+            if self.gate_only_reference_review:
+                if hierarchical_first_gate_materialization_intent is not None:
+                    raise ValueError(
+                        "gate-only review rejects a conditional first-gate "
+                        "materialization intent"
+                    )
+            else:
+                if not isinstance(
+                    hierarchical_first_gate_materialization_intent,
+                    FirstGateMaterializationIntent,
+                ) or not isinstance(hierarchical_first_gate_catalog, RoleNeutralEvidenceCatalog):
+                    raise ValueError(
+                        "hierarchical review requires the approved first-gate "
+                        "materialization intent and its exact semantic catalog"
+                    )
+                hierarchical_first_gate_materialization_intent.verify()
+                if (
+                    hierarchical_first_gate_materialization_intent.body["semantic_catalog"][
+                        "catalog_sha256"
+                    ]
+                    != hierarchical_first_gate_catalog.catalog_sha256
+                ):
+                    raise ValueError("hierarchical first-gate intent cites a different catalog")
             if not isinstance(hierarchical_approved_runner_identity, Mapping) or not isinstance(
                 hierarchical_approved_cache_identity, Mapping
             ):
@@ -8738,6 +9883,7 @@ class AllEvidenceFusionRunner:
                             request_sha256=request_sha256,
                             review_round=round_index,
                             review_attempt=attempt_index,
+                            expected_diagnostic_adapter_audit=adaptive_diagnostic_audit,
                         )
                         if prior_adaptive_artifact is None:
                             _write_immutable_json(
@@ -9315,6 +10461,9 @@ class AllEvidenceFusionRunner:
                         accepted_round_specs,
                         candidate_specs,
                     ),
+                    scientific_policy=(
+                        self.config.post_extraction_scientific_policy
+                    ),
                 )
                 candidate_ontology = dict(candidate_quality["retained_registry_ontology_guard"])
                 candidate_extraction_sha256 = self._extraction_projection_sha256(
@@ -9600,7 +10749,7 @@ class AllEvidenceFusionRunner:
                 prebound_gate_provider: Any | None = None
                 prebound_gate_provider_used = False
                 if hierarchical_review:
-                    if round_index == 1:
+                    if round_index == 1 and not self.gate_only_reference_review:
                         assert isinstance(
                             hierarchical_first_gate_materialization_intent,
                             FirstGateMaterializationIntent,
@@ -9683,16 +10832,37 @@ class AllEvidenceFusionRunner:
                             "verified_before_first_gate_evaluation": True,
                             "gate_labels_supplied_to_provider": False,
                         }
-                    source_view, feature_bank_view, prebound_gate_provider_used = (
-                        self._hierarchical_gate_views(
+                    if self.gate_only_reference_review:
+                        (
+                            source_view,
+                            feature_bank_view,
+                            gate_only_reference_audit,
+                        ) = self._gate_only_reference_views(
                             outer_fold=outer_fold,
+                            context_epoch=round_index - 1,
                             gate_row_ids=gate_ids,
                             context=accepted_round_spent,
-                            context_texts=context_texts,
-                            gate_texts=gate_texts,
-                            prebound_provider=prebound_gate_provider,
                         )
-                    )
+                        if round_index == 1:
+                            first_gate_materialization_record = {
+                                **dict(gate_only_reference_audit),
+                                "materialized_after_exact_approval": True,
+                                "materialized_after_review_proposal_freeze": True,
+                                "verified_before_first_gate_evaluation": True,
+                                "gate_labels_supplied_to_provider": False,
+                                "reference_only_existing_stage1_values": True,
+                            }
+                    else:
+                        source_view, feature_bank_view, prebound_gate_provider_used = (
+                            self._hierarchical_gate_views(
+                                outer_fold=outer_fold,
+                                gate_row_ids=gate_ids,
+                                context=accepted_round_spent,
+                                context_texts=context_texts,
+                                gate_texts=gate_texts,
+                                prebound_provider=prebound_gate_provider,
+                            )
+                        )
                 else:
                     source_view = self._gate_source_view(
                         outer_fold=outer_fold,
@@ -9726,6 +10896,7 @@ class AllEvidenceFusionRunner:
                     candidate_context=candidate_spent,
                     candidate_gate=candidate_gate,
                     config=self.config.post_extraction_review_config,
+                    upstream_review_policy=self.config.upstream_review_policy,
                 )
                 if not isinstance(decision, GateAcceptanceDecision):
                     raise TypeError("review acceptance evaluator returned an invalid decision")
@@ -9855,11 +11026,15 @@ class AllEvidenceFusionRunner:
                                 bool(prebound_gate_provider_used)
                             ),
                             "first_gate_materialization_intent_applicable": bool(
-                                hierarchical_review and round_index == 1
+                                hierarchical_review
+                                and round_index == 1
+                                and not self.gate_only_reference_review
                             ),
                             "first_gate_materialization": first_gate_materialization_record,
                             "provider_bind_input_contract": (
-                                "spent_observable_rows_plus_exact_gate_ids_and_text_only_v1"
+                                "prefit_cumulative_exact_spent_and_gate_row_ids_only_v1"
+                                if self.gate_only_reference_review
+                                else "spent_observable_rows_plus_exact_gate_ids_and_text_only_v1"
                             ),
                             "gate_treatment_or_outcome_supplied_to_gate_providers": False,
                             "consumed_after_gate_evaluation": True,
@@ -9931,6 +11106,7 @@ class AllEvidenceFusionRunner:
             final_spent,
             current_specs,
             spent_texts=tuple(final_spent_label_free[self.config.text_column].astype(str).tolist()),
+            scientific_policy=self.config.post_extraction_scientific_policy,
         )
         if not bool(final_ontology["passed"]):
             failure_path = (
@@ -10358,43 +11534,104 @@ class AllEvidenceFusionRunner:
         ):
             raise RuntimeError("dataset differs from the production runtime authorization")
         external_validation: Mapping[str, Any] | None = None
-        if self.tfidf_validator is not None:
-            external_validation = self.tfidf_validator(
-                dataset=data.drop(columns=["_oci_row_id"]),
-                handoff_path=self.tfidf_handoff_path,
-            )
-            if (
-                not isinstance(external_validation, Mapping)
-                or external_validation.get("status") != "passed"
+        legacy = None
+        tfidf = None
+        reference_source: Mapping[str, Any] | None = None
+        if self.reference_only_stage1_mode:
+            direct_folds, split_rows = self._reference_only_outer_split_rows()
+            folds = list(direct_folds)
+            reference_source = self._reference_only_source_identity()
+            if dataset_sha256 != reference_source[
+                "prepared_cohort_artifact_sha256"
+            ]:
+                raise RuntimeError(
+                    "dataset differs from the reference-only runtime binding"
+                )
+            if production_runtime_binding is not None and (
+                production_runtime_binding.get(
+                    "reference_only_runtime_binding_content_sha256"
+                )
+                != reference_source["runtime_binding_content_sha256"]
             ):
-                raise RuntimeError("external TF-IDF handoff validation did not pass")
-        legacy = load_legacy_full_outer_evidence(self.legacy_handoff_path)
-        tfidf = load_resealed_tfidf_handoff(
-            self.tfidf_handoff_path,
-            dataset_row_count=len(data),
-            require_registry_seal=self.config.require_registry_seal,
-        )
-        if production_runtime_binding is not None and (
-            legacy.artifact_sha256
-            != production_runtime_binding["legacy_handoff_artifact"]["sha256"]
-            or tfidf.artifact_sha256
-            != production_runtime_binding["tfidf_handoff_artifact"]["sha256"]
-        ):
-            raise RuntimeError(
-                "legacy or TF-IDF handoff differs from the production runtime authorization"
+                raise RuntimeError(
+                    "reference-only hierarchy authorization belongs to another "
+                    "provider runtime"
+                )
+        else:
+            assert self.tfidf_handoff_path is not None
+            assert self.legacy_handoff_path is not None
+            if self.tfidf_validator is not None:
+                external_validation = self.tfidf_validator(
+                    dataset=data.drop(columns=["_oci_row_id"]),
+                    handoff_path=self.tfidf_handoff_path,
+                )
+                if (
+                    not isinstance(external_validation, Mapping)
+                    or external_validation.get("status") != "passed"
+                ):
+                    raise RuntimeError(
+                        "external TF-IDF handoff validation did not pass"
+                    )
+            legacy = load_legacy_full_outer_evidence(self.legacy_handoff_path)
+            tfidf = load_resealed_tfidf_handoff(
+                self.tfidf_handoff_path,
+                dataset_row_count=len(data),
+                require_registry_seal=self.config.require_registry_seal,
             )
-        folds = sorted(tfidf.full_rows_by_outer_fold)
-        if set(legacy.rows_by_outer_fold) != set(folds):
-            raise ValueError("legacy and TF-IDF full-outer fold sets do not match exactly")
+            if production_runtime_binding is not None and (
+                legacy.artifact_sha256
+                != production_runtime_binding[
+                    "legacy_handoff_artifact"
+                ]["sha256"]
+                or tfidf.artifact_sha256
+                != production_runtime_binding[
+                    "tfidf_handoff_artifact"
+                ]["sha256"]
+            ):
+                raise RuntimeError(
+                    "legacy or TF-IDF handoff differs from the production "
+                    "runtime authorization"
+                )
+            folds = sorted(tfidf.full_rows_by_outer_fold)
+            if set(legacy.rows_by_outer_fold) != set(folds):
+                raise ValueError(
+                    "legacy and TF-IDF full-outer fold sets do not match exactly"
+                )
+            split_rows = {
+                outer_fold: {
+                    "fit_row_ids": tuple(
+                        map(
+                            int,
+                            tfidf.full_rows_by_outer_fold[outer_fold][
+                                "fit_row_ids"
+                            ],
+                        )
+                    ),
+                    "heldout_row_ids": tuple(
+                        map(
+                            int,
+                            tfidf.full_rows_by_outer_fold[outer_fold][
+                                "heldout_row_ids"
+                            ],
+                        )
+                    ),
+                }
+                for outer_fold in folds
+            }
         legacy_split_audit: Mapping[str, Any] | None = None
-        if production_runtime_binding is not None and (
+        if (
+            not self.reference_only_stage1_mode
+            and production_runtime_binding is not None
+            and (
             (production_runtime_binding["legacy_primary_predictions_artifact"] is None)
             != (self.legacy_primary_predictions_path is None)
+            )
         ):
             raise RuntimeError(
                 "legacy primary split registration changed after production authorization"
             )
         if self.legacy_primary_predictions_path is not None:
+            assert tfidf is not None
             legacy_heldout, legacy_primary_sha256 = (
                 _load_outer_splits_from_primary_predictions_snapshot(
                     self.legacy_primary_predictions_path,
@@ -10555,15 +11792,24 @@ class AllEvidenceFusionRunner:
                 "schema_version": FINAL_ITE_ESTIMATOR_AUDIT_SCHEMA_VERSION,
                 "mode": (
                     FINAL_CONTEXT_FIT_CAUSAL_FOREST_ADAPTER_ID
-                    if self.raw_final_upstream_producer is not None
+                    if (
+                        self.raw_final_upstream_producer is not None
+                        or self.reference_only_stage1_mode
+                    )
                     else "structured_interaction_head_degraded_fallback"
                 ),
-                "strict_causal_forest_active": (self.raw_final_upstream_producer is not None),
+                "strict_causal_forest_active": (
+                    self.raw_final_upstream_producer is not None
+                    or self.reference_only_stage1_mode
+                ),
                 "strict_causal_forest_required": self.config.require_final_causal_forest,
                 "exact_raw_runtime_producer": self.raw_final_upstream_producer_identity,
                 "forest_backend": self.final_causal_forest_backend_identity,
                 "fixed_prior_working_backend_active": bool(
-                    self.raw_final_upstream_producer is not None
+                    (
+                        self.raw_final_upstream_producer is not None
+                        or self.reference_only_stage1_mode
+                    )
                     and type(self.final_causal_forest_backend) is FixedCausalForestHeadBackend
                     and not self.final_causal_forest_backend_was_injected
                 ),
@@ -10584,28 +11830,47 @@ class AllEvidenceFusionRunner:
                 data,
                 text_column=self.config.text_column,
             ),
-            "legacy_handoff_path": legacy.artifact_path,
-            "legacy_handoff_sha256": legacy.artifact_sha256,
+            "stage1_reference_source": reference_source,
+            "legacy_handoff_path": (
+                None if legacy is None else legacy.artifact_path
+            ),
+            "legacy_handoff_sha256": (
+                None if legacy is None else legacy.artifact_sha256
+            ),
             "legacy_non_full_contexts_reduced_not_exposed_raw": (
-                legacy.ignored_non_full_context_count
+                None if legacy is None else legacy.ignored_non_full_context_count
             ),
             "legacy_exact_inner_contexts_validated_and_used_for_recurrence": (
-                legacy.validated_inner_context_count
+                None if legacy is None else legacy.validated_inner_context_count
             ),
-            "legacy_inner_contexts_per_outer": legacy.inner_contexts_per_outer,
+            "legacy_inner_contexts_per_outer": (
+                None if legacy is None else legacy.inner_contexts_per_outer
+            ),
             "legacy_exact_inner_recurrence_schema_version": (EXACT_INNER_RECURRENCE_VERSION),
             "legacy_exact_inner_recurrence_group_count": (
-                legacy.exact_inner_recurrence_group_count
+                None
+                if legacy is None
+                else legacy.exact_inner_recurrence_group_count
             ),
-            "legacy_exact_inner_recurrent_term_count": (legacy.exact_inner_recurrent_term_count),
+            "legacy_exact_inner_recurrent_term_count": (
+                None
+                if legacy is None
+                else legacy.exact_inner_recurrent_term_count
+            ),
             "legacy_diagnostic_fields_removed_before_fusion": (
-                legacy.dropped_diagnostic_field_count
+                None if legacy is None else legacy.dropped_diagnostic_field_count
             ),
             "legacy_primary_prediction_split_audit": legacy_split_audit,
-            "tfidf_handoff_path": tfidf.artifact_path,
-            "tfidf_handoff_sha256": tfidf.artifact_sha256,
-            "tfidf_split_registry_content_hash": tfidf.split_registry_content_hash,
-            "tfidf_structural_validation": tfidf.structural_validation,
+            "tfidf_handoff_path": None if tfidf is None else tfidf.artifact_path,
+            "tfidf_handoff_sha256": (
+                None if tfidf is None else tfidf.artifact_sha256
+            ),
+            "tfidf_split_registry_content_hash": (
+                None if tfidf is None else tfidf.split_registry_content_hash
+            ),
+            "tfidf_structural_validation": (
+                None if tfidf is None else tfidf.structural_validation
+            ),
             "tfidf_external_validation": external_validation,
             "tfidf_orphan_ngram_evidence": {
                 "enabled": self.config.include_tfidf_orphan_ngrams,
@@ -10685,9 +11950,14 @@ class AllEvidenceFusionRunner:
         label_free = data[["_oci_row_id", self.config.text_column]].copy()
         for outer_fold in folds:
             fold_dir = self.output_dir / f"outer_fold_{outer_fold:03d}"
-            full = tfidf.full_rows_by_outer_fold[outer_fold]
-            train_ids = tuple(map(int, full["fit_row_ids"]))
-            heldout_ids = tuple(map(int, full["heldout_row_ids"]))
+            split_row = split_rows[outer_fold]
+            full = (
+                split_row
+                if self.reference_only_stage1_mode
+                else tfidf.full_rows_by_outer_fold[outer_fold]
+            )
+            train_ids = tuple(map(int, split_row["fit_row_ids"]))
+            heldout_ids = tuple(map(int, split_row["heldout_row_ids"]))
             provenance = FoldEvidenceProvenance(
                 outer_fold=outer_fold,
                 train_row_ids=train_ids,
@@ -10695,9 +11965,17 @@ class AllEvidenceFusionRunner:
                 scope="outer_train",
                 artifact_id=f"all-evidence-outer-{outer_fold}",
             )
-            legacy_row = legacy.rows_by_outer_fold[outer_fold]
-            if int(legacy_row.get("n_rows", 0)) not in {0, len(train_ids)}:
-                raise ValueError(f"legacy full-outer row count mismatch for fold {outer_fold}")
+            legacy_row = (
+                None
+                if legacy is None
+                else legacy.rows_by_outer_fold[outer_fold]
+            )
+            if legacy_row is not None and int(
+                legacy_row.get("n_rows", 0)
+            ) not in {0, len(train_ids)}:
+                raise ValueError(
+                    f"legacy full-outer row count mismatch for fold {outer_fold}"
+                )
             review_schedule: ReviewPartitionSchedule | None = None
             initial_selector_evidence_audit: Mapping[str, Any] | None = None
             query_audit: Mapping[str, Any] | None = None
@@ -10707,6 +11985,9 @@ class AllEvidenceFusionRunner:
             frozen_hierarchical_review: FrozenHierarchicalReviewEvidence | None = None
             hierarchical_first_gate_materialization_intent: (
                 FirstGateMaterializationIntent | None
+            ) = None
+            hierarchical_reference_numerical_contract: (
+                AuthenticatedReferenceOnlyDirectNumericalContract | None
             ) = None
             hierarchical_first_gate_catalog: RoleNeutralEvidenceCatalog | None = None
             if hierarchical_runtime is not None:
@@ -10718,6 +11999,9 @@ class AllEvidenceFusionRunner:
                 review_schedule = prepared_hierarchical_fold.schedule
                 hierarchical_first_gate_materialization_intent = (
                     prepared_hierarchical_fold.first_gate_materialization_intent
+                )
+                hierarchical_reference_numerical_contract = (
+                    prepared_hierarchical_fold.reference_only_direct_numerical_contract
                 )
                 hierarchical_first_gate_catalog = prepared_hierarchical_fold.catalog
                 if set(
@@ -11041,8 +12325,72 @@ class AllEvidenceFusionRunner:
             head_regularization_grid = self.config.regularization_grid
             package: AuthenticatedFinalContextFitUpstreamBank | None = None
             upstream: _FinalUpstreamHeadInputs | None = None
-            causal_forest_active = self.raw_final_upstream_producer is not None
-            if self.final_upstream_producer is not None:
+            direct_fold_view: Any | None = None
+            causal_forest_active = (
+                self.raw_final_upstream_producer is not None
+                or self.reference_only_stage1_mode
+            )
+            if self.reference_only_stage1_mode:
+                bank = self.reference_only_numerical_bank
+                meta_inner_fold_ids = bank.get_meta_inner_fold_ids(
+                    outer_fold=outer_fold,
+                    exact_outer_train_row_ids=train_ids,
+                )
+                direct_fold_view = bank.produce(
+                    outer_fold=outer_fold,
+                    outer_train_row_ids=train_ids,
+                    outer_train_texts=tuple(
+                        train[self.config.text_column].tolist()
+                    ),
+                    outer_train_treatment=train[
+                        self.config.treatment_column
+                    ].to_numpy(dtype=float),
+                    outer_train_outcome=train[
+                        self.config.outcome_column
+                    ].to_numpy(dtype=float),
+                    outer_heldout_row_ids=heldout_ids,
+                    outer_heldout_texts=tuple(
+                        heldout[self.config.text_column].tolist()
+                    ),
+                    meta_inner_fold_ids=meta_inner_fold_ids,
+                )
+                direct_fold_view.verify_authenticated_content()
+                final_upstream_audit = {
+                    "enabled": True,
+                    "required": self.config.require_final_upstream_inputs,
+                    "neural_query_inputs_required": (
+                        self.config.require_final_upstream_neural_query_inputs
+                    ),
+                    "mode": (
+                        "authenticated_role_neutral_direct_numerical_references"
+                    ),
+                    "reference_manifest_content_sha256": (
+                        bank.manifest["content_sha256"]
+                    ),
+                    "runtime_binding_content_sha256": (
+                        self.reference_only_stage1_runtime_payload[
+                            "content_sha256"
+                        ]
+                    ),
+                    "meta_inner_fold_ids_source": (
+                        "authenticated_exact_inner_scope_plan"
+                    ),
+                    "meta_inner_fold_count": len(
+                        set(map(int, meta_inner_fold_ids))
+                    ),
+                    "post_extraction_registry_frozen_before_production": True,
+                    "activation_boundary": (
+                        "after_post_extraction_registry_freeze"
+                    ),
+                    "direct_upstream_numerical_signals_used_as_final_model_inputs": (
+                        True
+                    ),
+                    "combined_numerical_payload_persisted": False,
+                    "fit_or_refit_performed": False,
+                    "outer_heldout_labels_passed_to_producer": False,
+                    "row_level_numerical_vectors_persisted_in_runner_audit": False,
+                }
+            elif self.final_upstream_producer is not None:
                 producer_identity_sha256 = self._assert_final_upstream_producer_identity()
                 if causal_forest_active:
                     raw_runtime_identity_sha256 = (
@@ -11133,7 +12481,276 @@ class AllEvidenceFusionRunner:
                     )
 
             head_tuning_audit: Mapping[str, Any] | None = None
-            if causal_forest_active:
+            if causal_forest_active and direct_fold_view is not None:
+                if self.final_causal_forest_backend is None:
+                    raise RuntimeError(
+                        "reference-only Stage 2 has no strict causal-forest backend"
+                    )
+                current_backend_identity = _review_provider_identity(
+                    self.final_causal_forest_backend,
+                    label="final_causal_forest_backend",
+                )
+                if (
+                    current_backend_identity
+                    != self.final_causal_forest_backend_identity
+                ):
+                    raise ValueError(
+                        "final causal-forest backend identity changed"
+                    )
+                direct_blocks = direct_fold_view.forest_blocks()
+                if (
+                    direct_blocks.train_row_ids != train_ids
+                    or direct_blocks.heldout_row_ids != heldout_ids
+                ):
+                    raise ValueError(
+                        "direct numerical forest blocks changed fold row order"
+                    )
+                spec_roles = {
+                    str(spec["name"]): frozenset(
+                        map(str, spec.get("roles") or ())
+                    )
+                    for spec in specs
+                }
+                encoded_spec_names = tuple(
+                    map(str, encoder.feature_spec_names_)
+                )
+                if len(encoded_spec_names) != explicit_train_x.shape[1]:
+                    raise RuntimeError(
+                        "explicit encoder lost its per-column feature lineage"
+                    )
+                explicit_effect_indices = tuple(
+                    index
+                    for index, name in enumerate(encoded_spec_names)
+                    if "effect_modifier" in spec_roles.get(name, frozenset())
+                )
+                explicit_control_indices = tuple(
+                    index
+                    for index, name in enumerate(encoded_spec_names)
+                    if "confounder" in spec_roles.get(name, frozenset())
+                )
+
+                def append_columns(
+                    base: np.ndarray,
+                    explicit: np.ndarray,
+                    indices: tuple[int, ...],
+                ) -> np.ndarray:
+                    if not indices:
+                        return np.asarray(base, dtype=np.float64)
+                    return np.column_stack(
+                        (
+                            np.asarray(base, dtype=np.float64),
+                            np.asarray(
+                                explicit[:, list(indices)],
+                                dtype=np.float64,
+                            ),
+                        )
+                    )
+
+                effect_train = append_columns(
+                    direct_blocks.effect_train_values,
+                    explicit_train_x,
+                    explicit_effect_indices,
+                )
+                effect_heldout = append_columns(
+                    direct_blocks.effect_heldout_values,
+                    explicit_heldout_x,
+                    explicit_effect_indices,
+                )
+                control_train = append_columns(
+                    direct_blocks.control_train_values,
+                    explicit_train_x,
+                    explicit_control_indices,
+                )
+                control_heldout = append_columns(
+                    direct_blocks.control_heldout_values,
+                    explicit_heldout_x,
+                    explicit_control_indices,
+                )
+                if effect_train.shape[1] < 1 or control_train.shape[1] < 1:
+                    raise ValueError(
+                        "strict direct causal forest requires nonempty effect "
+                        "and control feature blocks"
+                    )
+                raw_tau = self.final_causal_forest_backend.fit_predict(
+                    effect_train=np.array(effect_train, copy=True),
+                    control_train=np.array(control_train, copy=True),
+                    treatment=train[
+                        self.config.treatment_column
+                    ].to_numpy(dtype=float),
+                    outcome=train[
+                        self.config.outcome_column
+                    ].to_numpy(dtype=float),
+                    effect_heldout=np.array(effect_heldout, copy=True),
+                    control_heldout=np.array(control_heldout, copy=True),
+                )
+                if (
+                    _review_provider_identity(
+                        self.final_causal_forest_backend,
+                        label="final_causal_forest_backend",
+                    )
+                    != current_backend_identity
+                ):
+                    raise ValueError(
+                        "final causal-forest backend identity changed during fit"
+                    )
+                pred_ite = np.asarray(raw_tau, dtype=np.float64)
+                if (
+                    pred_ite.shape != (len(heldout_ids),)
+                    or not np.isfinite(pred_ite).all()
+                ):
+                    raise ValueError(
+                        "strict direct causal forest returned malformed treatment effects"
+                    )
+                probability_difference_tolerance = float(
+                    64 * np.finfo(np.float64).eps
+                )
+                if (
+                    np.any(
+                        pred_ite
+                        < (-1.0 - probability_difference_tolerance)
+                    )
+                    or np.any(
+                        pred_ite
+                        > (1.0 + probability_difference_tolerance)
+                    )
+                ):
+                    raise ValueError(
+                        "strict direct causal forest returned a treatment effect "
+                        "outside the binary probability-difference estimand bounds"
+                    )
+                pred_y0 = None
+                pred_y1 = None
+                backend_fit_audit_method = getattr(
+                    self.final_causal_forest_backend,
+                    "fit_audit",
+                    None,
+                )
+                backend_fit_audit = (
+                    None
+                    if not callable(backend_fit_audit_method)
+                    else json.loads(
+                        _canonical_json(backend_fit_audit_method())
+                    )
+                )
+                final_model_input_names = [
+                    *direct_blocks.effect_names,
+                    *(
+                        f"explicit_effect__{index:06d}"
+                        for index in explicit_effect_indices
+                    ),
+                    *direct_blocks.control_names,
+                    *(
+                        f"explicit_control__{index:06d}"
+                        for index in explicit_control_indices
+                    ),
+                ]
+                forest_receipt = {
+                    "schema_version": (
+                        "role_neutral_direct_strict_causal_forest_receipt_v1"
+                    ),
+                    "outer_fold": outer_fold,
+                    "backend_identity": current_backend_identity,
+                    "backend_fit_audit": backend_fit_audit,
+                    "reference_manifest_content_sha256": (
+                        direct_blocks.reference_manifest_content_sha256
+                    ),
+                    "effect_train_sha256": _numerical_array_sha256(
+                        effect_train
+                    ),
+                    "effect_heldout_sha256": _numerical_array_sha256(
+                        effect_heldout
+                    ),
+                    "control_train_sha256": _numerical_array_sha256(
+                        control_train
+                    ),
+                    "control_heldout_sha256": _numerical_array_sha256(
+                        control_heldout
+                    ),
+                    "treatment_sha256": _numerical_array_sha256(
+                        train[self.config.treatment_column].to_numpy(
+                            dtype=float
+                        )
+                    ),
+                    "outcome_sha256": _numerical_array_sha256(
+                        train[self.config.outcome_column].to_numpy(dtype=float)
+                    ),
+                    "tau_sha256": _numerical_array_sha256(pred_ite),
+                    "probability_difference_bounds": [-1.0, 1.0],
+                    "probability_difference_validation_tolerance": (
+                        probability_difference_tolerance
+                    ),
+                    "probability_difference_bounds_validated": True,
+                    "probability_difference_values_clipped": False,
+                    "effect_column_count": int(effect_train.shape[1]),
+                    "control_column_count": int(control_train.shape[1]),
+                    "explicit_effect_column_count": len(
+                        explicit_effect_indices
+                    ),
+                    "explicit_control_column_count": len(
+                        explicit_control_indices
+                    ),
+                    "fit_row_count": len(train_ids),
+                    "prediction_row_count": len(heldout_ids),
+                    "strict_causal_forest_only": True,
+                    "structured_or_nonforest_fallback_used": False,
+                    "outer_heldout_labels_used": False,
+                    "potential_outcome_columns_emitted": False,
+                }
+                forest_receipt["content_sha256"] = _content_sha256(
+                    forest_receipt
+                )
+                final_upstream_audit.update(
+                    {
+                        "model_input_schema": {
+                            "estimator": (
+                                FINAL_CONTEXT_FIT_CAUSAL_FOREST_ADAPTER_ID
+                            ),
+                            "effect_x_column_count": int(
+                                effect_train.shape[1]
+                            ),
+                            "control_w_column_count": int(
+                                control_train.shape[1]
+                            ),
+                            "column_count": len(final_model_input_names),
+                            "schema_sha256": _content_sha256(
+                                final_model_input_names
+                            ),
+                        },
+                        "causal_forest_role_routing": {
+                            "native_effect_columns": len(
+                                direct_blocks.effect_names
+                            ),
+                            "native_control_columns": len(
+                                direct_blocks.control_names
+                            ),
+                            "explicit_effect_columns": len(
+                                explicit_effect_indices
+                            ),
+                            "explicit_control_columns": len(
+                                explicit_control_indices
+                            ),
+                        },
+                        "structured_interaction_head_used": False,
+                    }
+                )
+                final_estimator_audit = {
+                    "schema_version": FINAL_ITE_ESTIMATOR_AUDIT_SCHEMA_VERSION,
+                    "mode": FINAL_CONTEXT_FIT_CAUSAL_FOREST_ADAPTER_ID,
+                    "strict_causal_forest_active": True,
+                    "strict_causal_forest_required": (
+                        self.config.require_final_causal_forest
+                    ),
+                    "reference_only_role_neutral_runtime": True,
+                    "forest_backend_identity": current_backend_identity,
+                    "forest_receipt": forest_receipt,
+                    "potential_outcome_reconstruction": (
+                        "not_emitted_direct_cate_estimand_only"
+                    ),
+                    "structured_interaction_head_constructed": False,
+                    "outer_heldout_labels_used": False,
+                    "row_level_numerical_values_persisted": False,
+                }
+            elif causal_forest_active:
                 if package is None or upstream is None:
                     raise RuntimeError(
                         "exact raw runtime was active without an authenticated final package"
@@ -11310,15 +12927,23 @@ class AllEvidenceFusionRunner:
                     "structured_interaction_head_constructed": True,
                     "outer_heldout_labels_used": False,
                 }
-            prediction = pd.DataFrame(
-                {
-                    "_oci_row_id": np.asarray(heldout_ids, dtype=int),
-                    "outer_fold": int(outer_fold),
-                    "pred_y0_prob": pred_y0,
-                    "pred_y1_prob": pred_y1,
-                    "pred_ite_prob": pred_ite,
-                }
-            )
+            prediction_columns: dict[str, Any] = {
+                "_oci_row_id": np.asarray(heldout_ids, dtype=int),
+                "outer_fold": int(outer_fold),
+                "pred_ite_prob": pred_ite,
+            }
+            if pred_y0 is not None or pred_y1 is not None:
+                if pred_y0 is None or pred_y1 is None:
+                    raise RuntimeError(
+                        "potential-outcome predictions must be emitted as a pair"
+                    )
+                prediction_columns.update(
+                    {
+                        "pred_y0_prob": pred_y0,
+                        "pred_y1_prob": pred_y1,
+                    }
+                )
+            prediction = pd.DataFrame(prediction_columns)
             _reject_forbidden_columns(prediction.columns, source="frozen prediction")
             fold_prediction_path = fold_dir / "frozen_predictions.parquet"
             fold_prediction_sha = _write_immutable_parquet(fold_prediction_path, prediction)
@@ -11333,8 +12958,13 @@ class AllEvidenceFusionRunner:
                 "heldout_row_fingerprint": row_set_fingerprint(heldout_ids),
                 "train_row_count": len(train_ids),
                 "heldout_row_count": len(heldout_ids),
-                "legacy_handoff_sha256": legacy.artifact_sha256,
-                "tfidf_handoff_sha256": tfidf.artifact_sha256,
+                "stage1_reference_source": reference_source,
+                "legacy_handoff_sha256": (
+                    None if legacy is None else legacy.artifact_sha256
+                ),
+                "tfidf_handoff_sha256": (
+                    None if tfidf is None else tfidf.artifact_sha256
+                ),
                 "tfidf_orphan_ngram_evidence": orphan_audit,
                 "query_evidence": query_audit,
                 "candidate_pool": candidate_audit,
@@ -11378,11 +13008,35 @@ class AllEvidenceFusionRunner:
                             frozen_hierarchical_review.binding_sha256
                         ),
                         "all_fold_discovery_completed_before_this_fold_modeling": True,
-                        "first_gate_materialization_intent_sha256": (
-                            hierarchical_first_gate_materialization_intent.content_sha256
+                        "first_gate_direct_numerical_contract_kind": (
+                            "authenticated_reference_only_direct_numerical_contract"
+                            if hierarchical_reference_numerical_contract
+                            is not None
+                            else "first_gate_materialization_intent"
                         ),
-                        "first_gate_label_free_cache_materialized_before_discovery": False,
-                        "first_gate_cache_materialization_deferred_until_proposal_freeze": True,
+                        "first_gate_direct_numerical_contract_sha256": (
+                            hierarchical_reference_numerical_contract.content_sha256
+                            if hierarchical_reference_numerical_contract
+                            is not None
+                            else (
+                                hierarchical_first_gate_materialization_intent.content_sha256
+                            )
+                        ),
+                        "first_gate_materialization_intent_sha256": (
+                            None
+                            if hierarchical_first_gate_materialization_intent
+                            is None
+                            else hierarchical_first_gate_materialization_intent.content_sha256
+                        ),
+                        "first_gate_label_free_cache_materialized_before_discovery": (
+                            hierarchical_reference_numerical_contract is not None
+                        ),
+                        "first_gate_cache_materialization_deferred_until_proposal_freeze": (
+                            hierarchical_reference_numerical_contract is None
+                        ),
+                        "first_gate_reference_projection_already_fit": (
+                            hierarchical_reference_numerical_contract is not None
+                        ),
                         "first_gate_values_or_coordinate_metadata_exposed_to_discovery": False,
                     }
                 ),
@@ -11473,17 +13127,27 @@ class AllEvidenceFusionRunner:
                 "schema_version": FINAL_ITE_ESTIMATOR_AUDIT_SCHEMA_VERSION,
                 "mode": (
                     FINAL_CONTEXT_FIT_CAUSAL_FOREST_ADAPTER_ID
-                    if self.raw_final_upstream_producer is not None
+                    if (
+                        self.raw_final_upstream_producer is not None
+                        or self.reference_only_stage1_mode
+                    )
                     else "structured_interaction_head_degraded_fallback"
                 ),
                 "strict_causal_forest_active_for_every_fold": (
                     self.raw_final_upstream_producer is not None
+                    or self.reference_only_stage1_mode
                 ),
                 "strict_causal_forest_required": self.config.require_final_causal_forest,
                 "fixed_prior_working_backend_active": bool(
-                    self.raw_final_upstream_producer is not None
+                    (
+                        self.raw_final_upstream_producer is not None
+                        or self.reference_only_stage1_mode
+                    )
                     and type(self.final_causal_forest_backend) is FixedCausalForestHeadBackend
                     and not self.final_causal_forest_backend_was_injected
+                ),
+                "reference_only_role_neutral_runtime": (
+                    self.reference_only_stage1_mode
                 ),
             },
             "oracle_columns_written": False,

@@ -11,6 +11,13 @@ import pytest
 
 from oci.inference import all_evidence_fusion_cli as cli
 from oci.inference.neural_query_signal_artifact import query_signal_columns
+from oci.inference.shared_tfidf_context_fit_service import (
+    SHARED_TFIDF_FIT_SERVICE_ID,
+)
+from tests.semantic_witness_test_support import (
+    semantic_witness_config,
+    semantic_witness_mapping,
+)
 
 
 def _all_architecture_applied_config_payload():
@@ -46,6 +53,11 @@ def _args(
             json.dumps({"config": _all_architecture_applied_config_payload()}),
             encoding="utf-8",
         )
+        semantic_witness_path = tmp_path / "semantic_witness.json"
+        semantic_witness_path.write_text(
+            json.dumps(semantic_witness_mapping()),
+            encoding="utf-8",
+        )
         embedding_cache = tmp_path / "frozen_embeddings"
         embedding_cache.mkdir(exist_ok=True)
         (embedding_cache / "metadata.json").write_text(
@@ -57,6 +69,8 @@ def _args(
         review_values = [
             "--review-stage1-config",
             str(stage1_config),
+            "--review-semantic-witness-scientific-config",
+            str(semantic_witness_path),
             "--review-embedding-cache-dir",
             str(embedding_cache),
         ]
@@ -81,6 +95,8 @@ def _args(
         "remote/model",
         "--expected-outer-folds",
         "2",
+        "--extraction-max-text-length",
+        "400000",
         *review_values,
         *extra,
     ]
@@ -418,6 +434,31 @@ def test_cli_fails_closed_when_default_adaptive_review_lacks_context_fit_inputs(
         cli.validate_benchmark_inputs(args)
 
 
+def test_cli_requires_and_strictly_parses_semantic_witness_profile(tmp_path):
+    args = _args(tmp_path)
+    args.review_semantic_witness_scientific_config = None
+    with pytest.raises(
+        ValueError,
+        match="--review-semantic-witness-scientific-config is required",
+    ):
+        cli.validate_benchmark_inputs(args)
+
+    path = tmp_path / "strict-semantic-witness.json"
+    missing = semantic_witness_mapping()
+    missing["retrieval_vectorizer"].pop("token_pattern")
+    path.write_text(json.dumps(missing), encoding="utf-8")
+    with pytest.raises(ValueError, match="missing=.*token_pattern"):
+        cli._load_semantic_witness_scientific_config(path)
+
+    path.write_text('{"duplicate":1,"duplicate":2}', encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate key"):
+        cli._load_semantic_witness_scientific_config(path)
+
+    path.write_text('{"not_finite":NaN}', encoding="utf-8")
+    with pytest.raises(ValueError, match="non-finite JSON value"):
+        cli._load_semantic_witness_scientific_config(path)
+
+
 def test_cli_rejects_unbounded_review_quality_retries(tmp_path):
     args = _args(tmp_path, "--post-extraction-review-max-quality-retries", "9")
     with pytest.raises(ValueError, match="max-quality-retries"):
@@ -489,6 +530,11 @@ def _review_dependency_args(
         json.dumps({"config": _all_architecture_applied_config_payload()}),
         encoding="utf-8",
     )
+    semantic_witness_path = tmp_path / "semantic_witness.json"
+    semantic_witness_path.write_text(
+        json.dumps(semantic_witness_mapping()),
+        encoding="utf-8",
+    )
     embedding_cache = tmp_path / "frozen_embeddings"
     embedding_cache.mkdir(exist_ok=True)
     (embedding_cache / "metadata.json").write_text(
@@ -506,6 +552,8 @@ def _review_dependency_args(
             "1",
             "--review-stage1-config",
             str(stage1_config),
+            "--review-semantic-witness-scientific-config",
+            str(semantic_witness_path),
             "--review-embedding-cache-dir",
             str(embedding_cache),
             "--review-stage1-device",
@@ -1091,6 +1139,12 @@ def test_dry_run_validates_without_constructing_remote_dependencies(tmp_path, mo
     assert result["post_extraction_review_agent_is_base_reasoning_agent"] is True
     assert result["post_extraction_review_source_signals_required"] is True
     assert result["post_extraction_review_feature_banks_required"] is True
+    assert result["review_semantic_witness_scientific_config"] == (
+        semantic_witness_mapping()
+    )
+    assert result[
+        "review_semantic_witness_scientific_config_sha256"
+    ] == semantic_witness_config().identity_sha256
     assert result["precomputed_recursive_review_feature_banks_enabled"] is False
     assert result["post_extraction_review_spent_discovery_families"] == sorted(
         cli._REQUIRED_REVIEW_DISCOVERY_FAMILIES
@@ -1408,14 +1462,21 @@ def test_adaptive_review_dry_run_validates_context_fit_dependencies_only(
     forest_backend = dict(result["final_causal_forest_backend"])
     runtime = forest_backend.pop("repository_runtime")
     assert forest_backend == {
-        "backend": "repository_causal_forest_prior_working_path_v2",
+        "backend": "repository_strict_causal_forest_path_v3",
+        "configuration_mode": "legacy_compatibility_shim_v1",
         "n_estimators": 200,
         "max_depth": None,
         "min_samples_leaf": 10,
         "max_features": "sqrt",
         "honest": True,
         "inference": True,
+        "subforest_size": 4,
         "tune_model": True,
+        "nuisance_n_estimators": 100,
+        "nuisance_max_depth": None,
+        "nuisance_min_samples_leaf": 10,
+        "nuisance_treatment_max_features": "sqrt",
+        "nuisance_outcome_max_features": 1.0,
         "random_state": 42,
         "exact_nuisance_used_as_fixed_internal_predictions": False,
         "tuning_labels": "outer_train_only",
@@ -1523,7 +1584,7 @@ def _attested_context_fit_source(kind: str, *, wrapped: bool):
         {
             "backend": cli.SHARED_TFIDF_CONTEXT_BACKEND_ID,
             "delegate": {"backend": cli.TFIDF_CONTEXT_BACKEND_ID},
-            "service": {"service": "in_memory_shared_tfidf_context_fit_service_v1"},
+            "service": {"service": SHARED_TFIDF_FIT_SERVICE_ID},
         }
         if wrapped
         else {"backend": cli.TFIDF_CONTEXT_BACKEND_ID}

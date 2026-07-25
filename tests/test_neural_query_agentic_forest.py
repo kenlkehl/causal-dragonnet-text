@@ -1,12 +1,16 @@
 import inspect
 import json
 import re
+from dataclasses import replace
 
 import numpy as np
 
 import oci.inference.neural_query_agentic_forest as neural_query_module
 from oci.inference.neural_query_agentic_forest import (
     NeuralQueryAgenticForestConfig,
+    NeuralQueryEvidenceCapacityOverflowError,
+    NeuralQueryEvidenceVocabularyOverflowError,
+    _contrastive_ngrams,
     apply_review_candidates_to_registry,
     build_query_evidence,
     build_query_feature_context,
@@ -113,6 +117,32 @@ def test_one_query_prompt_allows_multiple_traceable_features_without_gate():
     assert all(candidate["roles"] == ["effect_modifier"] for candidate in candidates)
 
 
+def test_field_cue_capacity_fails_closed_instead_of_slicing_evidence():
+    config = replace(
+        NeuralQueryAgenticForestConfig(),
+        evidence_top_ngrams=1,
+    )
+    evidence = {
+        "query_id": "effect_query_001",
+        "bank": "effect",
+        "top_contrastive_ngrams": [
+            {"term": "marker alpha"},
+            {"term": "marker beta"},
+        ],
+        "top_chunks": [
+            {
+                "evidence_id": "training_evidence_001",
+                "text": "Marker alpha: 6.0; Marker beta: 11.2.",
+            }
+        ],
+    }
+    with np.testing.assert_raises_regex(
+        NeuralQueryEvidenceCapacityOverflowError,
+        "no cues were silently discarded",
+    ):
+        build_query_feature_context(evidence, config=config)
+
+
 def test_feature_prompt_has_no_fixed_hidden_variable_seed_vocabulary():
     source = inspect.getsource(neural_query_module)
     prompt = render_query_feature_prompt(
@@ -193,6 +223,169 @@ def test_query_evidence_and_prompt_context_isolate_heldout_and_oracle_payloads()
     assert context["field_cue_policy"]["forwards_unlisted_evidence_metadata"] is False
 
 
+def test_query_evidence_includes_discriminative_second_ranked_chunk():
+    config = NeuralQueryAgenticForestConfig(
+        evidence_top_patients=1,
+        evidence_background_patients=1,
+        evidence_chunks_per_patient_per_query=2,
+        evidence_ngram_range_min=1,
+        evidence_ngram_range_max=2,
+        evidence_ngram_stop_words=None,
+    )
+    evidence = build_query_evidence(
+        bank="effect",
+        queries=np.array([[1.0, 0.0]], dtype=np.float32),
+        query_records=[{"query_id": "effect_query_001", "member_count": 2}],
+        row_ids=[0, 1],
+        chunk_matrices=[
+            np.array([[1.0, 0.0], [0.8, 0.6]], dtype=np.float32),
+            np.array([[0.0, 1.0], [-0.2, 0.98]], dtype=np.float32),
+        ],
+        all_chunk_texts=[
+            ["shared baseline text", "secondrank biomarker"],
+            ["shared baseline text", "background finding"],
+        ],
+        config=config,
+        device="cpu",
+        seed=3,
+    )[0]
+
+    assert {row["chunk_index"] for row in evidence["top_chunks"]} == {0, 1}
+    assert "secondrank biomarker" in {
+        row["term"] for row in evidence["top_contrastive_ngrams"]
+    }
+
+
+def test_query_evidence_vocabulary_cap_fails_instead_of_clipping_terms():
+    config = NeuralQueryAgenticForestConfig(
+        evidence_top_patients=1,
+        evidence_background_patients=1,
+        evidence_chunks_per_patient_per_query=None,
+        evidence_ngram_range_min=1,
+        evidence_ngram_range_max=1,
+        evidence_ngram_stop_words=None,
+        evidence_ngram_vocabulary_max_features=1,
+    )
+    kwargs = {
+        "bank": "effect",
+        "queries": np.array([[1.0, 0.0]], dtype=np.float32),
+        "query_records": [{"query_id": "effect_query_001", "member_count": 1}],
+        "row_ids": [0, 1],
+        "chunk_matrices": [
+            np.array([[1.0, 0.0]], dtype=np.float32),
+            np.array([[0.0, 1.0]], dtype=np.float32),
+        ],
+        # "ordinary" has the highest document frequency; a lossy max_features=1
+        # fit can therefore erase the foreground-only discriminative term.
+        "all_chunk_texts": [["ordinary zulu_signal"], ["ordinary"]],
+        "device": "cpu",
+        "seed": 5,
+    }
+    exhaustive = build_query_evidence(
+        **kwargs,
+        config=replace(config, evidence_ngram_vocabulary_max_features=None),
+    )[0]
+    assert "zulu_signal" in {
+        row["term"] for row in exhaustive["top_contrastive_ngrams"]
+    }
+    with np.testing.assert_raises_regex(
+        NeuralQueryEvidenceVocabularyOverflowError,
+        "no terms were silently discarded",
+    ):
+        build_query_evidence(**kwargs, config=config)
+
+
+def test_explicit_null_evidence_allocations_are_lossless() -> None:
+    config = NeuralQueryAgenticForestConfig(
+        evidence_top_patients=1,
+        evidence_background_patients=None,
+        evidence_top_ngrams=None,
+        evidence_ngram_range_min=1,
+        evidence_ngram_range_max=1,
+        evidence_ngram_stop_words=None,
+        rag_chunks_per_query=1,
+        rag_max_chunks_per_patient=None,
+        rag_excerpt_chars=None,
+    )
+    config.validate()
+
+    terms = _contrastive_ngrams(
+        ["alpha beta gamma"],
+        ["background"],
+        limit=None,
+        config=config,
+    )
+    assert {row["term"] for row in terms} == {"alpha", "beta", "gamma"}
+
+    evidence = build_query_evidence(
+        bank="effect",
+        queries=np.asarray([[1.0, 0.0]], dtype=np.float32),
+        query_records=[{"query_id": "effect_query_001"}],
+        row_ids=[0, 1, 2],
+        chunk_matrices=[
+            np.asarray([[1.0, 0.0]], dtype=np.float32),
+            np.asarray([[0.2, 0.8]], dtype=np.float32),
+            np.asarray([[0.0, 1.0]], dtype=np.float32),
+        ],
+        all_chunk_texts=[
+            ["alpha beta gamma"],
+            ["background one"],
+            ["background two"],
+        ],
+        config=config,
+        device="cpu",
+        seed=7,
+    )[0]
+    assert len(evidence["top_chunks"]) == 1
+    assert {row["term"] for row in evidence["top_contrastive_ngrams"]} >= {
+        "alpha",
+        "beta",
+        "gamma",
+    }
+
+    long_text = "z" * 2_501
+    documents = build_query_rag_documents(
+        row_ids=[0],
+        chunk_matrices=[
+            np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+        ],
+        all_chunk_texts=[[long_text, "second complete chunk"]],
+        queries=np.asarray(
+            [[1.0, 0.0], [0.0, 1.0]],
+            dtype=np.float32,
+        ),
+        query_ids=["treatment_query_001", "effect_query_001"],
+        query_banks=["treatment", "effect"],
+        config=config,
+        device="cpu",
+    )
+    assert long_text in documents[0]
+    assert "second complete chunk" in documents[0]
+
+
+def test_query_evidence_excerpt_bound_fails_instead_of_truncating_text():
+    config = NeuralQueryAgenticForestConfig(
+        evidence_top_patients=1,
+        evidence_background_patients=1,
+        evidence_excerpt_chars=5,
+    )
+    with np.testing.assert_raises_regex(ValueError, "refusing silent text truncation"):
+        build_query_evidence(
+            bank="effect",
+            queries=np.array([[1.0, 0.0]], dtype=np.float32),
+            query_records=[{"query_id": "effect_query_001"}],
+            row_ids=[0, 1],
+            chunk_matrices=[
+                np.array([[1.0, 0.0]], dtype=np.float32),
+                np.array([[0.0, 1.0]], dtype=np.float32),
+            ],
+            all_chunk_texts=[["long evidence"], ["other evidence"]],
+            config=config,
+            device="cpu",
+            seed=7,
+        )
+
+
 def test_registry_role_union_and_extraction_group_cap():
     config = NeuralQueryAgenticForestConfig(
         max_canonical_features=4,
@@ -250,6 +443,37 @@ def test_registry_role_union_and_extraction_group_cap():
     assert extraction_request_groups(registry * 10, maximum=10) == [
         ["baseline_histology"] * 10
     ]
+
+
+def test_registry_context_preserves_full_phrases_and_fails_on_candidate_overflow():
+    long_phrase = "baseline phrase " + ("x" * 500)
+    candidate = {
+        "candidate_id": "effect_query_001__candidate_01",
+        "name": "complete_phrase_feature",
+        "type": "binary",
+        "categories": None,
+        "roles": ["effect_modifier"],
+        "description": "Complete phrase feature.",
+        "clinical_domain": "test",
+        "parent_object": "test object",
+        "supporting_phrases": [long_phrase],
+        "provenance": [{"query_id": "effect_query_001"}],
+    }
+    config = NeuralQueryAgenticForestConfig(
+        max_raw_feature_candidates=1,
+        max_canonical_features=1,
+    )
+    context = build_query_registry_context([candidate], config=config)
+    assert context["candidates"][0]["supporting_phrases"] == [long_phrase]
+
+    with np.testing.assert_raises_regex(
+        NeuralQueryEvidenceCapacityOverflowError,
+        "no candidates were silently discarded",
+    ):
+        build_query_registry_context(
+            [candidate, {**candidate, "candidate_id": "effect_query_002__candidate_01"}],
+            config=config,
+        )
 
 
 def test_query_rag_document_reads_all_selected_chunks_and_deduplicates():

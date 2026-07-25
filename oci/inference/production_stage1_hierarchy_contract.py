@@ -95,7 +95,7 @@ _REQUIRED_VERSION_ROWS = (
     (
         "response_contract",
         "HIERARCHICAL_DISCOVERY_RESPONSE_CONTRACT_VERSION",
-        "hierarchical_discovery_dynamic_response_contract_v8",
+        "hierarchical_discovery_dynamic_response_contract_v9",
     ),
     (
         "response_contract",
@@ -168,7 +168,11 @@ _REQUIRED_VERSION_ROWS = (
         "HIERARCHICAL_DISCOVERY_CACHE_RESPONSE_TRACE_VERSION",
         "authenticated_cache_response_attempt_trace_v2",
     ),
-    ("json_runner", "OPENAI_JSON_DISCOVERY_RUNNER_VERSION", "openai_json_discovery_job_runner_v8"),
+    (
+        "json_runner",
+        "OPENAI_JSON_DISCOVERY_RUNNER_VERSION",
+        "openai_json_discovery_job_runner_v13",
+    ),
     (
         "approved_agent",
         "APPROVED_HIERARCHICAL_DISCOVERY_AGENT_VERSION",
@@ -324,24 +328,6 @@ _ADAPTIVE_BUNDLE_FILES = frozenset(
     }
 )
 
-_REQUIRED_HIERARCHY_CONFIG = {
-    "max_rendered_prompt_bytes": 220_000,
-    "max_semantic_member_ids_per_chunk": 3,
-    "max_cross_architecture_lookback_ids_per_group": 8,
-    "max_cross_architecture_lookback_bytes_per_group": 96_000,
-    "max_extraction_lookback_ids_per_feature": 8,
-    "max_extraction_lookback_bytes_per_feature": 96_000,
-    "max_rejection_lookback_ids_per_candidate": 24,
-    "max_rejection_lookback_bytes_per_candidate": 48_000,
-    "max_integrated_features": 16,
-    "legacy_lookback_and_feature_cap_fields_apply_semantic_truncation": False,
-    "selector_thinking_enabled": True,
-    "selector_thinking_token_budget": 5_000,
-    "extraction_definition_thinking_enabled": False,
-    "extraction_definition_thinking_token_budget": 0,
-}
-
-
 def _canonical_json(value: Any) -> str:
     return json.dumps(
         value,
@@ -487,9 +473,18 @@ def current_production_stage1_hierarchy_contract_identity() -> dict[str, Any]:
     if not isinstance(adaptive_bundle.get("local_json_schema_validator"), Mapping):
         raise RuntimeError("adaptive hierarchy bundle lacks its local schema validator identity")
 
-    hierarchy_config = orchestrator.HierarchicalDiscoveryConfig().as_dict()
-    if hierarchy_config != _REQUIRED_HIERARCHY_CONFIG:
-        raise RuntimeError("production hierarchy default bounds changed from the wrapper contract")
+    hierarchy_config = {
+        "schema_version": (
+            "production_hierarchical_discovery_configuration_contract_v1"
+        ),
+        "required_constructor_fields": sorted(
+            orchestrator.HierarchicalDiscoveryConfig.__dataclass_fields__
+        ),
+        "production_values_supplied_by_authenticated_scientific_protocol": True,
+        "component_defaults_are_production_scientific_values": False,
+        "wire_budget_is_required_scientific_configuration": True,
+        "configured_capacities_may_page_or_fail_closed_but_never_truncate": True,
+    }
 
     module_files = {
         role: {
@@ -534,8 +529,10 @@ def current_production_stage1_hierarchy_contract_identity() -> dict[str, Any]:
             "resolver": "exact_authenticated_catalog_evidence_id_only",
             "model_written_or_unknown_ids_allowed": False,
             "one_raw_evidence_item_per_page": True,
-            "maximum_fold_inputs": 8,
-            "maximum_fresh_inputs_after_first_fold": 7,
+            "maximum_fold_inputs_configured_by_hierarchy_wire_budget": True,
+            "maximum_fresh_inputs_after_first_fold_derived_from_configured_fan_in": (
+                True
+            ),
             "integration_rejection_and_extraction_all_use_pages_and_folds": True,
             "every_input_receives_an_explicit_disposition": True,
             "semantic_sampling_or_truncation": False,

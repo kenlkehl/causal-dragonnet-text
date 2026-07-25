@@ -22,12 +22,41 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .gated_attention_pooling import GatedAttentionPooling, MultiHeadGatedAttentionPooling
+from .lossless_tokenization import SemanticTruncationError
 
 logger = logging.getLogger(__name__)
 _TRANSFORMERS_ENCODER_INIT_LOCK = threading.Lock()
 _SENTENCE_TRANSFORMER_INIT_LOCK = threading.Lock()
 _LEGACY_BERT_MODEL_PREFIXES = ("prajjwal1/bert-",)
 HTR_SENTENCE_ENCODER_TRAINING_AUDIT_SCHEMA = "htr_sentence_encoder_training_state_v1"
+_HTR_ENVIRONMENT_OVERRIDES = (
+    "OCI_HTR_ENCODER_BATCH_SIZE",
+    "OCI_HTR_CHUNK_CACHE_MAX_ENTRIES",
+    "OCI_HTR_TOKEN_CACHE_MAX_ENTRIES",
+)
+
+
+def _configured_activation(name: str) -> nn.Module:
+    """Return one closed activation implementation.
+
+    The exact GELU approximation is part of the name so a scientific
+    constructor never inherits a framework default that could later change.
+    """
+
+    implementations = {
+        "gelu_exact": lambda: nn.GELU(approximate="none"),
+        "gelu_tanh": lambda: nn.GELU(approximate="tanh"),
+        "relu": lambda: nn.ReLU(inplace=False),
+        "silu": lambda: nn.SiLU(inplace=False),
+        "tanh": nn.Tanh,
+    }
+    key = str(name)
+    if key not in implementations:
+        raise ValueError(
+            "HTR activation must be one of: "
+            + ", ".join(sorted(implementations))
+        )
+    return implementations[key]()
 
 
 def split_text_into_word_chunks(
@@ -38,14 +67,15 @@ def split_text_into_word_chunks(
 ) -> List[str]:
     """Split text into short overlapping word chunks.
 
-    If the text is too long for ``max_chunks``, keep the tail of the note. In
-    longitudinal clinical notes, the most recent information is usually at the
-    end of the concatenated history.
+    ``max_chunks`` is a configured capacity.  If it would bind, fail closed
+    rather than selecting a prefix or tail of the clinical note.
     """
     if chunk_size_words <= 0:
         raise ValueError("chunk_size_words must be positive")
     if max_chunks <= 0:
         raise ValueError("max_chunks must be positive")
+    if chunk_overlap_words < 0:
+        raise ValueError("chunk_overlap_words must be nonnegative")
     if chunk_overlap_words >= chunk_size_words:
         raise ValueError("chunk_overlap_words must be smaller than chunk_size_words")
     words = re.findall(r"\S+", str(text or ""))
@@ -53,18 +83,24 @@ def split_text_into_word_chunks(
         return [""]
 
     stride = chunk_size_words - chunk_overlap_words
-    max_window_words = chunk_size_words + (max_chunks - 1) * stride
-    if len(words) > max_window_words:
-        words = words[-max_window_words:]
 
     chunks = []
     start = 0
-    while start < len(words) and len(chunks) < max_chunks:
+    while start < len(words):
         chunk_words = words[start : start + chunk_size_words]
         if chunk_words:
             chunks.append(" ".join(chunk_words))
         start += stride
-    return chunks or [" ".join(words[-chunk_size_words:])]
+    if len(chunks) > max_chunks:
+        raise SemanticTruncationError(
+            "HierarchicalTransformer note requires "
+            f"{len(chunks)} chunks but configured max_chunks={max_chunks}; "
+            "semantic truncation is forbidden. Increase max_chunks so the "
+            "capacity is nonbinding."
+        )
+    if not chunks:
+        raise RuntimeError("HierarchicalTransformer chunk planner produced no chunks")
+    return chunks
 
 
 class HierarchicalTransformerBatchPreprocessor:
@@ -211,20 +247,57 @@ def _find_overlapping_word(
 class _InterpretableTransformerLayer(nn.Module):
     """Transformer encoder layer that can return self-attention weights."""
 
-    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float):
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        activation: str,
+        norm_style: str,
+        layer_norm_eps: float,
+        layer_norm_elementwise_affine: bool,
+        layer_norm_bias: bool,
+        attention_dropout: float,
+        residual_dropout: float,
+        feedforward_dropout: float,
+        attention_bias: bool,
+        feedforward_bias: bool,
+    ):
         super().__init__()
+        if norm_style not in {"pre_norm", "post_norm"}:
+            raise ValueError("HTR transformer norm_style must be pre_norm or post_norm")
+        self.norm_style = str(norm_style)
         self.self_attn = nn.MultiheadAttention(
             d_model,
             nhead,
-            dropout=dropout,
+            dropout=attention_dropout,
+            bias=attention_bias,
             batch_first=True,
         )
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
-        self.activation = nn.GELU()
+        self.linear1 = nn.Linear(
+            d_model,
+            dim_feedforward,
+            bias=feedforward_bias,
+        )
+        self.linear2 = nn.Linear(
+            dim_feedforward,
+            d_model,
+            bias=feedforward_bias,
+        )
+        norm_kwargs = {
+            "eps": float(layer_norm_eps),
+            "elementwise_affine": bool(layer_norm_elementwise_affine),
+            "bias": bool(layer_norm_bias),
+        }
+        self.norm1 = nn.LayerNorm(d_model, **norm_kwargs)
+        self.norm2 = nn.LayerNorm(d_model, **norm_kwargs)
+        self.residual_dropout = nn.Dropout(residual_dropout, inplace=False)
+        self.feedforward_dropout = nn.Dropout(
+            feedforward_dropout,
+            inplace=False,
+        )
+        self.activation = _configured_activation(activation)
 
     def forward(
         self,
@@ -232,17 +305,38 @@ class _InterpretableTransformerLayer(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         return_attention: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        attn_output, attn_weights = self.self_attn(
-            x,
-            x,
-            x,
-            key_padding_mask=key_padding_mask,
-            need_weights=return_attention,
-            average_attn_weights=True,
-        )
-        x = self.norm1(x + self.dropout(attn_output))
-        ff_output = self.linear2(self.dropout(self.activation(self.linear1(x))))
-        x = self.norm2(x + self.dropout(ff_output))
+        if self.norm_style == "pre_norm":
+            attention_input = self.norm1(x)
+            attn_output, attn_weights = self.self_attn(
+                attention_input,
+                attention_input,
+                attention_input,
+                key_padding_mask=key_padding_mask,
+                need_weights=return_attention,
+                average_attn_weights=True,
+            )
+            x = x + self.residual_dropout(attn_output)
+            feedforward_input = self.norm2(x)
+            ff_output = self.linear2(
+                self.feedforward_dropout(
+                    self.activation(self.linear1(feedforward_input))
+                )
+            )
+            x = x + self.residual_dropout(ff_output)
+        else:
+            attn_output, attn_weights = self.self_attn(
+                x,
+                x,
+                x,
+                key_padding_mask=key_padding_mask,
+                need_weights=return_attention,
+                average_attn_weights=True,
+            )
+            x = self.norm1(x + self.residual_dropout(attn_output))
+            ff_output = self.linear2(
+                self.feedforward_dropout(self.activation(self.linear1(x)))
+            )
+            x = self.norm2(x + self.residual_dropout(ff_output))
         return x, attn_weights
 
 
@@ -287,6 +381,27 @@ class HierarchicalTransformerExtractor(nn.Module):
         role_attention: bool = False,
         w_attention_heads: int = 1,
         x_attention_heads: int = 1,
+        transformer_feedforward_dim: Optional[int] = None,
+        transformer_activation: str = "gelu_exact",
+        transformer_norm_style: str = "post_norm",
+        transformer_layer_norm_eps: float = 1e-5,
+        transformer_layer_norm_elementwise_affine: bool = True,
+        transformer_layer_norm_bias: bool = True,
+        transformer_attention_dropout: Optional[float] = None,
+        transformer_residual_dropout: Optional[float] = None,
+        transformer_feedforward_dropout: Optional[float] = None,
+        transformer_attention_bias: bool = True,
+        transformer_feedforward_bias: bool = True,
+        output_projection_depth: int = 1,
+        output_projection_hidden_dim: Optional[int] = None,
+        output_projection_activation: str = "gelu_exact",
+        output_projection_dropout: Optional[float] = None,
+        output_projection_hidden_layer_norm: bool = True,
+        output_projection_final_layer_norm: bool = True,
+        output_projection_bias: bool = True,
+        pool_token_init_std: float = 0.02,
+        positional_encoding_base: float = 10_000.0,
+        environment_override_policy: str = "legacy_allow",
         device: Optional[torch.device] = None,
     ):
         super().__init__()
@@ -294,6 +409,12 @@ class HierarchicalTransformerExtractor(nn.Module):
             raise ValueError("chunk_size_words must be positive")
         if max_chunks <= 0:
             raise ValueError("max_chunks must be positive")
+        if chunk_overlap_words < 0:
+            raise ValueError("chunk_overlap_words must be nonnegative")
+        if chunk_overlap_words >= chunk_size_words:
+            raise ValueError("chunk_overlap_words must be smaller than chunk_size_words")
+        if max_chunk_length <= 0:
+            raise ValueError("max_chunk_length must be positive")
 
         self._device = device or torch.device("cpu")
         self._sentence_encoder_model = sentence_encoder_model
@@ -308,9 +429,26 @@ class HierarchicalTransformerExtractor(nn.Module):
         self._dropout = float(transformer_dropout)
         self._projection_dim = int(projection_dim)
         self._hash_embedding_dim = int(hash_embedding_dim)
-        env_batch_size = os.environ.get("OCI_HTR_ENCODER_BATCH_SIZE")
-        if env_batch_size:
-            sentence_encoder_batch_size = int(env_batch_size)
+        environment_override_policy = str(environment_override_policy)
+        if environment_override_policy not in {"forbid", "legacy_allow"}:
+            raise ValueError(
+                "environment_override_policy must be forbid or legacy_allow"
+            )
+        observed_environment_overrides = tuple(
+            name for name in _HTR_ENVIRONMENT_OVERRIDES if name in os.environ
+        )
+        if (
+            environment_override_policy == "forbid"
+            and observed_environment_overrides
+        ):
+            raise RuntimeError(
+                "typed HTR execution forbids environment overrides; unset "
+                + ", ".join(observed_environment_overrides)
+            )
+        if environment_override_policy == "legacy_allow":
+            env_batch_size = os.environ.get("OCI_HTR_ENCODER_BATCH_SIZE")
+            if env_batch_size:
+                sentence_encoder_batch_size = int(env_batch_size)
         if sentence_encoder_batch_size <= 0:
             raise ValueError("sentence_encoder_batch_size must be positive")
         sentence_encoder_backend = str(sentence_encoder_backend or "auto").lower()
@@ -330,6 +468,84 @@ class HierarchicalTransformerExtractor(nn.Module):
             raise ValueError("w_attention_heads must be >= 1")
         if x_attention_heads < 1:
             raise ValueError("x_attention_heads must be >= 1")
+        feedforward_dim = (
+            int(transformer_dim) * 4
+            if transformer_feedforward_dim is None
+            else int(transformer_feedforward_dim)
+        )
+        output_hidden_dim = (
+            int(transformer_dim)
+            if output_projection_hidden_dim is None
+            else int(output_projection_hidden_dim)
+        )
+        attention_dropout = (
+            float(transformer_dropout)
+            if transformer_attention_dropout is None
+            else float(transformer_attention_dropout)
+        )
+        residual_dropout = (
+            float(transformer_dropout)
+            if transformer_residual_dropout is None
+            else float(transformer_residual_dropout)
+        )
+        feedforward_dropout = (
+            float(transformer_dropout)
+            if transformer_feedforward_dropout is None
+            else float(transformer_feedforward_dropout)
+        )
+        output_dropout = (
+            float(transformer_dropout)
+            if output_projection_dropout is None
+            else float(output_projection_dropout)
+        )
+        if feedforward_dim < 1 or output_hidden_dim < 1:
+            raise ValueError("HTR feedforward/output hidden dimensions must be positive")
+        if int(output_projection_depth) < 0:
+            raise ValueError("HTR output_projection_depth must be nonnegative")
+        if str(transformer_norm_style) not in {"pre_norm", "post_norm"}:
+            raise ValueError("HTR transformer norm style is unsupported")
+        _configured_activation(str(transformer_activation))
+        _configured_activation(str(output_projection_activation))
+        if (
+            not math.isfinite(float(transformer_layer_norm_eps))
+            or float(transformer_layer_norm_eps) <= 0.0
+        ):
+            raise ValueError("HTR layer-norm epsilon must be finite and positive")
+        for name, value in (
+            ("transformer_attention_dropout", attention_dropout),
+            ("transformer_residual_dropout", residual_dropout),
+            ("transformer_feedforward_dropout", feedforward_dropout),
+            ("output_projection_dropout", output_dropout),
+        ):
+            if not math.isfinite(value) or not 0.0 <= value < 1.0:
+                raise ValueError(f"HTR {name} must be in [0, 1)")
+        if (
+            not math.isfinite(float(pool_token_init_std))
+            or float(pool_token_init_std) < 0.0
+        ):
+            raise ValueError("HTR pool-token initialization std must be nonnegative")
+        if (
+            not math.isfinite(float(positional_encoding_base))
+            or float(positional_encoding_base) <= 1.0
+        ):
+            raise ValueError("HTR positional-encoding base must exceed one")
+        boolean_topology = {
+            "transformer_layer_norm_elementwise_affine": (
+                transformer_layer_norm_elementwise_affine
+            ),
+            "transformer_layer_norm_bias": transformer_layer_norm_bias,
+            "transformer_attention_bias": transformer_attention_bias,
+            "transformer_feedforward_bias": transformer_feedforward_bias,
+            "output_projection_hidden_layer_norm": (
+                output_projection_hidden_layer_norm
+            ),
+            "output_projection_final_layer_norm": (
+                output_projection_final_layer_norm
+            ),
+            "output_projection_bias": output_projection_bias,
+        }
+        if any(type(value) is not bool for value in boolean_topology.values()):
+            raise TypeError("HTR topology Boolean settings must be exact booleans")
         self._sentence_encoder_batch_size = int(sentence_encoder_batch_size)
         self._sentence_encoder_backend = sentence_encoder_backend
         self._sentence_pooling = sentence_pooling
@@ -338,6 +554,33 @@ class HierarchicalTransformerExtractor(nn.Module):
         self._role_attention = bool(role_attention)
         self._w_attention_heads = int(w_attention_heads)
         self._x_attention_heads = int(x_attention_heads)
+        self._transformer_feedforward_dim = feedforward_dim
+        self._transformer_activation = str(transformer_activation)
+        self._transformer_norm_style = str(transformer_norm_style)
+        self._transformer_layer_norm_eps = float(transformer_layer_norm_eps)
+        self._transformer_layer_norm_elementwise_affine = bool(
+            transformer_layer_norm_elementwise_affine
+        )
+        self._transformer_layer_norm_bias = bool(transformer_layer_norm_bias)
+        self._transformer_attention_dropout = attention_dropout
+        self._transformer_residual_dropout = residual_dropout
+        self._transformer_feedforward_dropout = feedforward_dropout
+        self._transformer_attention_bias = bool(transformer_attention_bias)
+        self._transformer_feedforward_bias = bool(transformer_feedforward_bias)
+        self._output_projection_depth = int(output_projection_depth)
+        self._output_projection_hidden_dim = output_hidden_dim
+        self._output_projection_activation = str(output_projection_activation)
+        self._output_projection_dropout = output_dropout
+        self._output_projection_hidden_layer_norm = bool(
+            output_projection_hidden_layer_norm
+        )
+        self._output_projection_final_layer_norm = bool(
+            output_projection_final_layer_norm
+        )
+        self._output_projection_bias = bool(output_projection_bias)
+        self._pool_token_init_std = float(pool_token_init_std)
+        self._positional_encoding_base = float(positional_encoding_base)
+        self._environment_override_policy = environment_override_policy
         self._encoder_has_trainable_params = False
         self._hash_backend = str(sentence_encoder_model).lower() in {
             "hash",
@@ -363,9 +606,13 @@ class HierarchicalTransformerExtractor(nn.Module):
         self._tokenization_cache: Dict[str, Tuple[Tuple[int, ...], Tuple[int, ...]]] = {}
         self._chunk_cache_max_entries = int(
             os.environ.get("OCI_HTR_CHUNK_CACHE_MAX_ENTRIES", "100000")
+            if environment_override_policy == "legacy_allow"
+            else 100000
         )
         self._tokenization_cache_max_entries = int(
             os.environ.get("OCI_HTR_TOKEN_CACHE_MAX_ENTRIES", "200000")
+            if environment_override_policy == "legacy_allow"
+            else 200000
         )
 
         self._input_projection = nn.Linear(
@@ -376,30 +623,83 @@ class HierarchicalTransformerExtractor(nn.Module):
             # Replaced lazily once the encoder hidden size is known.
             self._input_projection = None
 
-        self._pool_token = nn.Parameter(torch.randn(1, transformer_dim) * 0.02)
+        self._pool_token = nn.Parameter(
+            torch.randn(1, transformer_dim) * self._pool_token_init_std
+        )
         self.register_buffer(
             "_positional_encoding",
-            self._make_positional_encoding(max_chunks + 1, transformer_dim),
+            self._make_positional_encoding(
+                max_chunks + 1,
+                transformer_dim,
+                base=self._positional_encoding_base,
+            ),
         )
         self._transformer_layers = nn.ModuleList(
             [
                 _InterpretableTransformerLayer(
                     d_model=transformer_dim,
                     nhead=num_attention_heads,
-                    dim_feedforward=transformer_dim * 4,
-                    dropout=transformer_dropout,
+                    dim_feedforward=self._transformer_feedforward_dim,
+                    activation=self._transformer_activation,
+                    norm_style=self._transformer_norm_style,
+                    layer_norm_eps=self._transformer_layer_norm_eps,
+                    layer_norm_elementwise_affine=(
+                        self._transformer_layer_norm_elementwise_affine
+                    ),
+                    layer_norm_bias=self._transformer_layer_norm_bias,
+                    attention_dropout=self._transformer_attention_dropout,
+                    residual_dropout=self._transformer_residual_dropout,
+                    feedforward_dropout=self._transformer_feedforward_dropout,
+                    attention_bias=self._transformer_attention_bias,
+                    feedforward_bias=self._transformer_feedforward_bias,
                 )
                 for _ in range(num_transformer_layers)
             ]
         )
-        self._output_projection = nn.Sequential(
-            nn.Linear(transformer_dim, transformer_dim),
-            nn.LayerNorm(transformer_dim),
-            nn.GELU(),
-            nn.Dropout(transformer_dropout),
-            nn.Linear(transformer_dim, projection_dim),
-            nn.LayerNorm(projection_dim),
+        output_layers: List[nn.Module] = []
+        output_input_dim = int(transformer_dim)
+        output_norm_kwargs = {
+            "eps": self._transformer_layer_norm_eps,
+            "elementwise_affine": self._transformer_layer_norm_elementwise_affine,
+            "bias": self._transformer_layer_norm_bias,
+        }
+        for _ in range(self._output_projection_depth):
+            output_layers.append(
+                nn.Linear(
+                    output_input_dim,
+                    self._output_projection_hidden_dim,
+                    bias=self._output_projection_bias,
+                )
+            )
+            if self._output_projection_hidden_layer_norm:
+                output_layers.append(
+                    nn.LayerNorm(
+                        self._output_projection_hidden_dim,
+                        **output_norm_kwargs,
+                    )
+                )
+            output_layers.append(
+                _configured_activation(self._output_projection_activation)
+            )
+            output_layers.append(
+                nn.Dropout(
+                    self._output_projection_dropout,
+                    inplace=False,
+                )
+            )
+            output_input_dim = self._output_projection_hidden_dim
+        output_layers.append(
+            nn.Linear(
+                output_input_dim,
+                projection_dim,
+                bias=self._output_projection_bias,
+            )
         )
+        if self._output_projection_final_layer_norm:
+            output_layers.append(
+                nn.LayerNorm(projection_dim, **output_norm_kwargs)
+            )
+        self._output_projection = nn.Sequential(*output_layers)
         if self._role_attention:
             self._w_chunk_pooling = MultiHeadGatedAttentionPooling(
                 hidden_dim=transformer_dim,
@@ -430,10 +730,18 @@ class HierarchicalTransformerExtractor(nn.Module):
         return self._role_attention
 
     @staticmethod
-    def _make_positional_encoding(max_len: int, d_model: int) -> torch.Tensor:
+    def _make_positional_encoding(
+        max_len: int,
+        d_model: int,
+        *,
+        base: float = 10_000.0,
+    ) -> torch.Tensor:
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float()
+            * (-math.log(float(base)) / d_model)
+        )
         pe[:, 0::2] = torch.sin(position * div_term)
         if d_model % 2:
             pe[:, 1::2] = torch.cos(position * div_term[:-1])
@@ -1844,12 +2152,18 @@ class HierarchicalTransformerExtractor(nn.Module):
             encoded = self._tokenizer(
                 chunk,
                 padding=False,
-                truncation=True,
-                max_length=self._max_chunk_length,
+                truncation=False,
                 return_offsets_mapping=True,
             )
         except Exception:
             return self._top_token_strings(token_weights, chunk, top_n=top_n)
+        input_ids = encoded.get("input_ids") or []
+        if len(input_ids) > self._max_chunk_length:
+            raise ValueError(
+                "HTR evidence tokenizer input exceeds max_chunk_length; "
+                "semantic truncation is forbidden "
+                f"({len(input_ids)} > {self._max_chunk_length})"
+            )
         offsets = encoded.get("offset_mapping")
         if offsets is None:
             return self._top_token_strings(token_weights, chunk, top_n=top_n)
@@ -1864,7 +2178,6 @@ class HierarchicalTransformerExtractor(nn.Module):
         max_len = min(len(offsets), int(token_weights.numel()))
         weights = token_weights.detach().cpu().numpy().tolist()
         special_ids = set(getattr(self._tokenizer, "all_special_ids", []) or [])
-        input_ids = encoded.get("input_ids") or []
         for token_idx in range(max_len):
             start, end = offsets[token_idx]
             start = int(start)
@@ -1920,10 +2233,18 @@ class HierarchicalTransformerExtractor(nn.Module):
             encoded = self._tokenizer(
                 chunk,
                 padding=False,
-                truncation=True,
-                max_length=self._max_chunk_length,
+                truncation=False,
             )
             input_ids = encoded.get("input_ids") or []
+        except Exception:
+            return []
+        if len(input_ids) > self._max_chunk_length:
+            raise ValueError(
+                "HTR evidence tokenizer input exceeds max_chunk_length; "
+                "semantic truncation is forbidden "
+                f"({len(input_ids)} > {self._max_chunk_length})"
+            )
+        try:
             tokens = self._tokenizer.convert_ids_to_tokens(input_ids)
         except Exception:
             return []

@@ -80,6 +80,7 @@ from .hierarchical_all_architecture_discovery import (
     LOCAL_JSON_SCHEMA_VALIDATION_FAILURE,
     MAX_RENDERED_DISCOVERY_PROMPT_BYTES,
     RAW_TRANSPORT_BUDGET_FAILURE,
+    SELECTOR_THINKING_TOKEN_BUDGET,
     STRICT_JSON_PARSE_FAILURE,
     VALIDATED_RESPONSE,
     DiscoveryResponseRepairExhausted,
@@ -111,12 +112,8 @@ from .hierarchical_discovery_job_cache import (
     AuthenticatedHierarchicalDiscoveryJobCache,
 )
 from .hierarchical_discovery_response_contract import (
-    HIERARCHICAL_DISCOVERY_MAX_ADAPTIVE_REVIEW_TARGETS,
-    HIERARCHICAL_DISCOVERY_MAX_ATOMS_PER_INTERPRET_JOB,
-    HIERARCHICAL_DISCOVERY_MAX_FINDINGS_PER_ATOMIC_REVIEW,
-    HIERARCHICAL_DISCOVERY_MAX_DEFINITION_FOLD_MEMBERS,
-    HIERARCHICAL_DISCOVERY_MAX_GENERATED_NAME_LENGTH,
-    HIERARCHICAL_DISCOVERY_MAX_MEMBERS_PER_INTERPRET_JOB,
+    HierarchyWireBudget,
+    LEGACY_HIERARCHY_WIRE_BUDGET,
     attach_hierarchical_discovery_response_contract,
     build_hierarchical_discovery_response_contract,
 )
@@ -361,6 +358,7 @@ _USER_PAYLOAD_TOP_LEVEL_KEYS = {
         "job",
         "family_explanation",
         "evidence",
+        "hierarchy_wire_budget",
         "identifier_ownership",
         "output_schema",
     ),
@@ -368,6 +366,7 @@ _USER_PAYLOAD_TOP_LEVEL_KEYS = {
         "job",
         "source_family",
         "candidates",
+        "hierarchy_wire_budget",
         "identifier_ownership",
         "output_schema",
     ),
@@ -377,6 +376,7 @@ _USER_PAYLOAD_TOP_LEVEL_KEYS = {
         "evidence",
         "chunk_interpretation",
         "family_consolidation",
+        "hierarchy_wire_budget",
         "identifier_ownership",
         "output_schema",
     ),
@@ -386,6 +386,7 @@ _USER_PAYLOAD_TOP_LEVEL_KEYS = {
         "current_registry",
         "diagnostics",
         "lookback_bounds",
+        "hierarchy_wire_budget",
         "identifier_ownership",
         "output_schema",
     ),
@@ -397,6 +398,7 @@ _USER_PAYLOAD_TOP_LEVEL_KEYS = {
         "review_plan",
         "requested_evidence",
         "maximum_operations",
+        "hierarchy_wire_budget",
         "identifier_ownership",
         "output_schema",
     ),
@@ -408,6 +410,7 @@ _USER_PAYLOAD_TOP_LEVEL_KEYS = {
         "evidence",
         "planner_lookback_constraints",
         "vocabulary_grounding_policy",
+        "hierarchy_wire_budget",
         "identifier_ownership",
         "output_schema",
     ),
@@ -632,6 +635,7 @@ def _compiler_unique_feature_name(
     *,
     unavailable: set[str],
     suffix: str,
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> str:
     """Return a bounded lower-snake-case name outside ``unavailable``."""
 
@@ -642,7 +646,12 @@ def _compiler_unique_feature_name(
     ordinal = 1
     while True:
         ending = f"_{suffix}" if ordinal == 1 else f"_{suffix}_{ordinal:03d}"
-        prefix_limit = HIERARCHICAL_DISCOVERY_MAX_GENERATED_NAME_LENGTH - len(ending)
+        prefix_limit = wire_budget.max_generated_name_chars - len(ending)
+        if prefix_limit < 1:
+            raise ValueError(
+                "generated-name wire budget cannot encode the required "
+                "compiler-owned suffix"
+            )
         prefix = proposed[:prefix_limit].rstrip("_")
         if not prefix:
             prefix = "feature"
@@ -1123,6 +1132,7 @@ def _render_adaptive_proposal_judgment_messages(
     proposal_id: str,
     proposal: Mapping[str, Any],
     requested_raw_evidence_lookback: Sequence[Mapping[str, Any]],
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> tuple[dict[str, str], ...]:
     request = attach_hierarchical_discovery_response_contract(
         job_kind=CROSS_ARCHITECTURE_INTEGRATION_JOB,
@@ -1140,6 +1150,7 @@ def _render_adaptive_proposal_judgment_messages(
                 _clone(item) for item in requested_raw_evidence_lookback
             ],
         },
+        wire_budget=wire_budget,
     )
     return (
         {"role": "system", "content": _ADAPTIVE_PROPOSAL_JUDGE_SYSTEM},
@@ -1376,8 +1387,14 @@ class AdaptiveReconsiderationConfig:
     max_total_lookback_bytes: int = 96_000
     max_operations: int = 4
     max_rendered_prompt_bytes: int = MAX_RENDERED_DISCOVERY_PROMPT_BYTES
+    selector_thinking_token_budget: int = SELECTOR_THINKING_TOKEN_BUDGET
+    wire_budget: HierarchyWireBudget = field(
+        default_factory=lambda: LEGACY_HIERARCHY_WIRE_BUDGET
+    )
 
     def __post_init__(self) -> None:
+        if not isinstance(self.wire_budget, HierarchyWireBudget):
+            raise TypeError("wire_budget must be a HierarchyWireBudget")
         for label in (
             "max_atoms_per_chunk",
             "max_bytes_per_chunk",
@@ -1387,21 +1404,20 @@ class AdaptiveReconsiderationConfig:
             "max_total_lookback_bytes",
             "max_operations",
             "max_rendered_prompt_bytes",
+            "selector_thinking_token_budget",
         ):
             _positive_integer(getattr(self, label), label=label)
         if self.max_lookback_ids_per_target > self.max_total_lookback_ids:
             raise ValueError("per-target lookback limit cannot exceed the total limit")
-        if self.max_operations > HIERARCHICAL_DISCOVERY_MAX_ADAPTIVE_REVIEW_TARGETS:
+        if self.max_operations > self.wire_budget.max_adaptive_review_targets:
             raise ValueError(
                 "adaptive operation limit exceeds the fixed review-target response budget"
             )
-        if self.max_rendered_prompt_bytes > MAX_RENDERED_DISCOVERY_PROMPT_BYTES:
-            raise ValueError("adaptive prompt guard cannot exceed the immutable global guard")
-        if self.max_atoms_per_chunk > HIERARCHICAL_DISCOVERY_MAX_ATOMS_PER_INTERPRET_JOB:
+        if self.max_atoms_per_chunk > self.wire_budget.max_interpret_atoms_per_job:
             raise ValueError("adaptive atom chunk bound exceeds the interpret response budget")
         if (
             self.max_semantic_member_ids_per_chunk
-            > HIERARCHICAL_DISCOVERY_MAX_MEMBERS_PER_INTERPRET_JOB
+            > self.wire_budget.max_interpret_members_per_job
         ):
             raise ValueError("adaptive member chunk bound exceeds the interpret response budget")
 
@@ -1415,13 +1431,49 @@ class AdaptiveReconsiderationConfig:
             "max_total_lookback_bytes": self.max_total_lookback_bytes,
             "max_operations": self.max_operations,
             "max_rendered_prompt_bytes": self.max_rendered_prompt_bytes,
+            "selector_thinking_token_budget": self.selector_thinking_token_budget,
+            "hierarchy_wire_budget": self.wire_budget.as_dict(),
         }
 
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any],
+    ) -> "AdaptiveReconsiderationConfig":
+        if not isinstance(value, Mapping):
+            raise TypeError("adaptive reconsideration config must be one object")
+        row = dict(value)
+        expected = {
+            "max_atoms_per_chunk",
+            "max_bytes_per_chunk",
+            "max_semantic_member_ids_per_chunk",
+            "max_lookback_ids_per_target",
+            "max_total_lookback_ids",
+            "max_total_lookback_bytes",
+            "max_operations",
+            "max_rendered_prompt_bytes",
+            "selector_thinking_token_budget",
+            "hierarchy_wire_budget",
+        }
+        if set(row) != expected:
+            raise ValueError(
+                "adaptive reconsideration config keys differ; "
+                f"missing={sorted(expected - set(row))}, "
+                f"extra={sorted(set(row) - expected)}"
+            )
+        row["wire_budget"] = HierarchyWireBudget.from_mapping(
+            row.pop("hierarchy_wire_budget")
+        )
+        return cls(**row)
 
-def adaptive_hierarchical_stage1_prompt_contract() -> dict[str, Any]:
+
+def adaptive_hierarchical_stage1_prompt_contract(
+    *,
+    selector_thinking_token_budget: int = SELECTOR_THINKING_TOKEN_BUDGET,
+) -> dict[str, Any]:
     """Expose the exact static model-call contract; dynamic fold content is absent."""
 
-    selector = DiscoveryJobSettings.selector().as_dict()
+    selector = DiscoveryJobSettings.selector(selector_thinking_token_budget).as_dict()
     extraction = DiscoveryJobSettings.extraction().as_dict()
     stages = [
         {
@@ -1579,6 +1631,7 @@ def adaptive_hierarchical_stage1_prompt_contract() -> dict[str, Any]:
         stage["static_user_payload_literals"] = static_literals
         stage["dynamic_user_payload_paths"] = [
             *_DYNAMIC_USER_PAYLOAD_PATHS[job_kind],
+            "hierarchy_wire_budget",
             "identifier_ownership",
             "output_schema",
         ]
@@ -1946,6 +1999,21 @@ def adaptive_hierarchical_stage1_prompt_contract() -> dict[str, Any]:
             ],
         },
     ]
+    # Every renderer attaches the configured, versioned wire budget before
+    # deriving its response schema.  Declare that exact authenticated field in
+    # every phased prompt variant as well; it remains closed-schema input and is
+    # re-parsed by ``build_hierarchical_discovery_response_contract`` below.
+    for stage in phased_stage_variants:
+        top_level_keys = stage["user_payload_top_level_keys"]
+        top_level_keys.insert(
+            top_level_keys.index("identifier_ownership"),
+            "hierarchy_wire_budget",
+        )
+        dynamic_paths = stage["dynamic_user_payload_paths"]
+        dynamic_paths.insert(
+            dynamic_paths.index("identifier_ownership"),
+            "hierarchy_wire_budget",
+        )
     body = {
         "schema_version": ADAPTIVE_PROMPT_CONTRACT_VERSION,
         "stage_order": [row["stage"] for row in stages],
@@ -1968,7 +2036,9 @@ def adaptive_hierarchical_stage1_reconsideration_identity(
     if not isinstance(chosen, AdaptiveReconsiderationConfig):
         raise TypeError("config has the wrong type")
     config_dict = chosen.as_dict()
-    prompt_contract = adaptive_hierarchical_stage1_prompt_contract()
+    prompt_contract = adaptive_hierarchical_stage1_prompt_contract(
+        selector_thinking_token_budget=chosen.selector_thinking_token_budget
+    )
     return {
         "schema_version": ADAPTIVE_HIERARCHY_VERSION,
         "authenticated_execution_version": ADAPTIVE_AUTHENTICATED_EXECUTION_VERSION,
@@ -2010,10 +2080,13 @@ def _assert_adaptive_job_prompt_contract(
     job_kind: str,
     messages: Sequence[Mapping[str, str]],
     settings: DiscoveryJobSettings,
+    selector_thinking_token_budget: int,
 ) -> None:
     """Authenticate one rendered job against the exact static payload contract."""
 
-    contract = adaptive_hierarchical_stage1_prompt_contract()
+    contract = adaptive_hierarchical_stage1_prompt_contract(
+        selector_thinking_token_budget=selector_thinking_token_budget
+    )
     if len(messages) != 2 or messages[1].get("role") != "user":
         raise ValueError(f"{job_kind} must contain exactly one JSON user payload")
     try:
@@ -3027,11 +3100,16 @@ class AdaptiveHierarchicalStage1Reconsideration:
         bindings[HIERARCHICAL_DISCOVERY_IMPLEMENTATION_BUNDLE_BINDING] = (
             hierarchical_discovery_implementation_bundle()["implementation_bundle_sha256"]
         )
-        chosen_settings = settings or DiscoveryJobSettings.selector()
+        chosen_settings = settings or DiscoveryJobSettings.selector(
+            self.config.selector_thinking_token_budget
+        )
         _assert_adaptive_job_prompt_contract(
             job_kind=job_kind,
             messages=messages,
             settings=chosen_settings,
+            selector_thinking_token_budget=(
+                self.config.selector_thinking_token_budget
+            ),
         )
         job = DiscoveryJsonJob.create(
             job_kind=job_kind,
@@ -3042,7 +3120,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
             input_bindings=bindings,
         )
         if len(job.rendered_messages_bytes) > self.config.max_rendered_prompt_bytes:
-            raise ValueError("adaptive model prompt exceeds its fixed byte guard")
+            raise ValueError("adaptive model prompt exceeds its configured byte guard")
         return job
 
     def _build_interpret_job(self, chunk: ArchitectureEvidenceChunk) -> DiscoveryJsonJob:
@@ -3052,6 +3130,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
         messages = render_interpret_evidence_chunk_messages(
             family_explanation=self.family_explanations[chunk.source_family],
             evidence=evidence,
+            wire_budget=self.config.wire_budget,
         )
         if messages[0] != {"role": "system", "content": _ADAPTIVE_INTERPRET_SYSTEM}:
             raise ValueError("interpretation system prompt differs from the approved contract")
@@ -3139,11 +3218,13 @@ class AdaptiveHierarchicalStage1Reconsideration:
                 validated[job.job_id] = revalidate_normalized_interpret_evidence_chunk_response(
                     response,
                     evidence=evidence,
+                    wire_budget=self.config.wire_budget,
                 )
             else:
                 validated[job.job_id] = validate_interpret_evidence_chunk_response(
                     response,
                     evidence=evidence,
+                    wire_budget=self.config.wire_budget,
                 )
         return validated
 
@@ -3165,7 +3246,11 @@ class AdaptiveHierarchicalStage1Reconsideration:
         evidence = tuple(
             self._atom_by_id[str(row["evidence_id"])].as_discovery_item() for row in chunk.evidence
         )
-        return validate_interpret_evidence_chunk_response(response, evidence=evidence)
+        return validate_interpret_evidence_chunk_response(
+            response,
+            evidence=evidence,
+            wire_budget=self.config.wire_budget,
+        )
 
     def _interpret_candidates(
         self, responses: Mapping[str, Mapping[str, Any]]
@@ -3215,7 +3300,10 @@ class AdaptiveHierarchicalStage1Reconsideration:
 
     @staticmethod
     def _render_consolidation_messages(
-        *, source_family: str, candidates: Sequence[DiscoveryCandidate]
+        *,
+        source_family: str,
+        candidates: Sequence[DiscoveryCandidate],
+        wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
     ) -> tuple[dict[str, str], ...]:
         request = attach_hierarchical_discovery_response_contract(
             job_kind=CONSOLIDATE_ARCHITECTURE_JOB,
@@ -3224,6 +3312,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                 "source_family": source_family,
                 "candidates": [candidate.as_prompt_item() for candidate in candidates],
             },
+            wire_budget=wire_budget,
         )
         return (
             {"role": "system", "content": _ADAPTIVE_CONSOLIDATE_SYSTEM},
@@ -3249,6 +3338,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                     messages=self._render_consolidation_messages(
                         source_family=family,
                         candidates=candidates[family],
+                        wire_budget=self.config.wire_budget,
                     ),
                     input_bindings={
                         "adaptive_hierarchy_version": ADAPTIVE_HIERARCHY_VERSION,
@@ -3265,20 +3355,23 @@ class AdaptiveHierarchicalStage1Reconsideration:
             )
         return tuple(jobs)
 
-    @staticmethod
-    def _validate_empty_consolidation_wire(response: Any) -> dict[str, Any]:
+    def _validate_empty_consolidation_wire(self, response: Any) -> dict[str, Any]:
         return validate_consolidation_response(
             response,
             source_family=ACTIVE_STAGE1_CONCEPT_FAMILIES[0],
             candidates=(),
+            wire_budget=self.config.wire_budget,
         )
 
-    @staticmethod
-    def _revalidate_empty_consolidation_projection(response: Any) -> dict[str, Any]:
+    def _revalidate_empty_consolidation_projection(
+        self,
+        response: Any,
+    ) -> dict[str, Any]:
         return revalidate_normalized_consolidation_response(
             response,
             source_family=ACTIVE_STAGE1_CONCEPT_FAMILIES[0],
             candidates=(),
+            wire_budget=self.config.wire_budget,
         )
 
     def validate_consolidation_responses(
@@ -3303,12 +3396,14 @@ class AdaptiveHierarchicalStage1Reconsideration:
                         response,
                         source_family=family,
                         candidates=candidates[family],
+                        wire_budget=self.config.wire_budget,
                     )
                 else:
                     validated[job.job_id] = validate_consolidation_response(
                         response,
                         source_family=family,
                         candidates=candidates[family],
+                        wire_budget=self.config.wire_budget,
                     )
             else:
                 response = supplied[job.job_id]
@@ -3340,6 +3435,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                 response,
                 source_family=family,
                 candidates=candidates,
+                wire_budget=self.config.wire_budget,
             )
         return self._validate_empty_consolidation_wire(response)
 
@@ -3406,7 +3502,10 @@ class AdaptiveHierarchicalStage1Reconsideration:
             interpretation_sha256s = tuple(
                 _sha(interpretations[job.job_id]) for job in interpretation_jobs
             )
-            schedule = bounded_candidate_relation_pages(candidates)
+            schedule = bounded_candidate_relation_pages(
+                candidates,
+                wire_budget=self.config.wire_budget,
+            )
             normalized_pages: list[dict[str, Any]] = []
             relation_job_ids: list[str] = []
             relation_audits: list[dict[str, Any]] = []
@@ -3419,6 +3518,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                     source_family=family,
                     anchor=by_id[anchor_id],
                     peers=tuple(by_id[peer_id] for peer_id in peer_ids),
+                    wire_budget=self.config.wire_budget,
                 )
                 relation_job = self._create_job(
                     job_kind=CONSOLIDATE_ARCHITECTURE_JOB,
@@ -3449,6 +3549,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                             raw,
                             anchor_candidate_id=anchor_id,
                             peer_candidate_ids=peer_ids,
+                            wire_budget=self.config.wire_budget,
                         )
                     ),
                 )
@@ -3488,6 +3589,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                 for fold in candidate_definition_fold_batches(
                     group_id=group_id,
                     member_candidate_ids=member_ids,
+                    wire_budget=self.config.wire_budget,
                 ):
                     fresh_ids = tuple(str(value) for value in fold["member_candidate_ids"])
                     dependencies = (
@@ -3501,6 +3603,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                         fold_index=fold_index,
                         candidates=tuple(by_id[value] for value in fresh_ids),
                         prior_accumulator=prior,
+                        wire_budget=self.config.wire_budget,
                     )
                     fold_job = self._create_job(
                         job_kind=CONSOLIDATE_ARCHITECTURE_JOB,
@@ -3549,6 +3652,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                 candidates=candidates,
                 grouped=grouped,
                 definitions_by_group_id=definitions,
+                wire_budget=self.config.wire_budget,
             )
             terminal_dependency_ids = (
                 tuple(terminal_fold_job_ids) or tuple(relation_job_ids) or interpretation_job_ids
@@ -3590,6 +3694,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
         evidence: Sequence[DiscoveryEvidenceItem],
         interpretation_response: Mapping[str, Any],
         consolidation_response: Mapping[str, Any],
+        wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
     ) -> tuple[dict[str, str], ...]:
         request = attach_hierarchical_discovery_response_contract(
             job_kind=COVERAGE_CRITIC_JOB,
@@ -3600,6 +3705,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                 "chunk_interpretation": interpretation_model_view(interpretation_response),
                 "family_consolidation": consolidation_response,
             },
+            wire_budget=wire_budget,
         )
         return (
             {"role": "system", "content": _ADAPTIVE_COVERAGE_SYSTEM},
@@ -3615,6 +3721,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
         consolidation_response: Mapping[str, Any],
         canonical_names: Sequence[str],
         page_index: int,
+        wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
     ) -> tuple[dict[str, str], ...]:
         atomic_review_id = f"coverage_review_{_sha({'evidence_id': evidence.evidence_id, 'page_index': page_index, 'canonical_names': list(canonical_names)})}"
         request = attach_hierarchical_discovery_response_contract(
@@ -3629,6 +3736,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                 "chunk_interpretation": interpretation_model_view(interpretation_response),
                 "consolidation_page": _clone(consolidation_response),
             },
+            wire_budget=wire_budget,
         )
         return (
             {"role": "system", "content": _ADAPTIVE_ATOMIC_COVERAGE_SYSTEM},
@@ -3739,6 +3847,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                         evidence=evidence,
                         interpretation_response=interpretations[interpret_job.job_id],
                         consolidation_response=scoped_consolidation,
+                        wire_budget=self.config.wire_budget,
                     ),
                     input_bindings={
                         "adaptive_hierarchy_version": ADAPTIVE_HIERARCHY_VERSION,
@@ -3953,7 +4062,10 @@ class AdaptiveHierarchicalStage1Reconsideration:
             findings: list[dict[str, Any]] = []
             coverage_job_ids: list[str] = []
             page_audits: list[dict[str, Any]] = []
-            if len(canonical_names) <= HIERARCHICAL_DISCOVERY_MAX_FINDINGS_PER_ATOMIC_REVIEW:
+            if (
+                len(canonical_names)
+                <= self.config.wire_budget.max_findings_per_atomic_review
+            ):
                 coverage_job = self._create_job(
                     job_kind=COVERAGE_CRITIC_JOB,
                     scope=f"adaptive.{family}.coverage_{chunk.chunk_index:03d}",
@@ -3963,6 +4075,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                         evidence=evidence,
                         interpretation_response=interpretation,
                         consolidation_response=scoped,
+                        wire_budget=self.config.wire_budget,
                     ),
                     input_bindings={
                         **common_bindings,
@@ -4001,12 +4114,13 @@ class AdaptiveHierarchicalStage1Reconsideration:
                     )
                     name_pages = tuple(
                         relevant_names[
-                            offset : offset + HIERARCHICAL_DISCOVERY_MAX_FINDINGS_PER_ATOMIC_REVIEW
+                            offset
+                            : offset + self.config.wire_budget.max_findings_per_atomic_review
                         ]
                         for offset in range(
                             0,
                             len(relevant_names),
-                            HIERARCHICAL_DISCOVERY_MAX_FINDINGS_PER_ATOMIC_REVIEW,
+                            self.config.wire_budget.max_findings_per_atomic_review,
                         )
                     ) or ((),)
                     for page_index, names in enumerate(name_pages):
@@ -4037,6 +4151,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                                 consolidation_response=page_consolidation,
                                 canonical_names=names,
                                 page_index=page_index,
+                                wire_budget=self.config.wire_budget,
                             ),
                             input_bindings={
                                 **common_bindings,
@@ -4305,6 +4420,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                     "max_total_bytes": self.config.max_total_lookback_bytes,
                 },
             },
+            wire_budget=self.config.wire_budget,
         )
         return (
             {"role": "system", "content": _ADAPTIVE_PLANNER_SYSTEM},
@@ -4445,6 +4561,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                 for fold in candidate_definition_fold_batches(
                     group_id=group_id,
                     member_candidate_ids=tuple(by_id),
+                    wire_budget=self.config.wire_budget,
                 ):
                     fold_index = int(fold["fold_index"])
                     fresh = tuple(by_id[str(value)] for value in fold["member_candidate_ids"])
@@ -4467,6 +4584,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                             fold_index=fold_index,
                             candidates=fresh,
                             prior_accumulator=prior,
+                            wire_budget=self.config.wire_budget,
                         ),
                         input_bindings={
                             "adaptive_hierarchy_version": ADAPTIVE_HIERARCHY_VERSION,
@@ -4665,6 +4783,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                 "requested_evidence": requested_evidence,
                 "maximum_operations": 1,
             },
+            wire_budget=self.config.wire_budget,
         )
         return (
             {"role": "system", "content": _ADAPTIVE_PROPOSER_SYSTEM},
@@ -4849,6 +4968,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                     proposal_id=proposal["proposal_id"],
                     proposal=operation,
                     requested_raw_evidence_lookback=evidence,
+                    wire_budget=self.config.wire_budget,
                 ),
                 input_bindings={
                     "adaptive_hierarchy_version": ADAPTIVE_HIERARCHY_VERSION,
@@ -4972,7 +5092,10 @@ class AdaptiveHierarchicalStage1Reconsideration:
                 )
                 candidates.append(candidate)
                 record_by_candidate[candidate.candidate_id] = record
-            relation_pages = bounded_candidate_relation_pages(candidates)
+            relation_pages = bounded_candidate_relation_pages(
+                candidates,
+                wire_budget=self.config.wire_budget,
+            )
             relation_responses: dict[str, dict[str, Any]] = {}
             candidate_by_id = {candidate.candidate_id: candidate for candidate in candidates}
             for page_index, page in enumerate(relation_pages, start=1):
@@ -4996,6 +5119,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                         source_family=None,
                         anchor=anchor,
                         peers=peers,
+                        wire_budget=self.config.wire_budget,
                     ),
                     input_bindings={
                         "adaptive_hierarchy_version": ADAPTIVE_HIERARCHY_VERSION,
@@ -5012,6 +5136,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                             raw,
                             anchor=anchor,
                             peers=peers,
+                            wire_budget=self.config.wire_budget,
                         )
                     ),
                 )
@@ -5049,6 +5174,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                     for fold in candidate_definition_fold_batches(
                         group_id=group_id,
                         member_candidate_ids=member_ids,
+                        wire_budget=self.config.wire_budget,
                     ):
                         fold_index = int(fold["fold_index"])
                         fresh = tuple(
@@ -5076,6 +5202,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                                 fold_index=fold_index,
                                 candidates=fresh,
                                 prior_accumulator=prior,
+                                wire_budget=self.config.wire_budget,
                             ),
                             input_bindings={
                                 "adaptive_hierarchy_version": ADAPTIVE_HIERARCHY_VERSION,
@@ -5405,6 +5532,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                     "max_total_bytes": self.config.max_total_lookback_bytes,
                 },
             },
+            wire_budget=self.config.wire_budget,
         )
         messages = (
             {"role": "system", "content": _ADAPTIVE_PLANNER_SYSTEM},
@@ -5466,6 +5594,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
             "current_registry",
             "diagnostics",
             "lookback_bounds",
+            "hierarchy_wire_budget",
             "identifier_ownership",
             "output_schema",
         }
@@ -5883,6 +6012,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                 ],
                 "maximum_operations": self.config.max_operations,
             },
+            wire_budget=self.config.wire_budget,
         )
         return (
             {"role": "system", "content": _ADAPTIVE_PROPOSER_SYSTEM},
@@ -6007,6 +6137,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
             "review_plan",
             "requested_evidence",
             "maximum_operations",
+            "hierarchy_wire_budget",
             "identifier_ownership",
             "output_schema",
         }
@@ -6234,6 +6365,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                     str(proposed["feature_name"]),
                     unavailable=unavailable,
                     suffix=f"adaptive_add_{index + 1:03d}",
+                    wire_budget=self.config.wire_budget,
                 )
                 if result_name != proposed["feature_name"]:
                     record_event(
@@ -6335,6 +6467,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                             proposed_name,
                             unavailable=unavailable,
                             suffix=f"adaptive_{kind}_{index + 1:03d}",
+                            wire_budget=self.config.wire_budget,
                         )
                     if result_name != proposed_name:
                         record_event(
@@ -6591,7 +6724,10 @@ class AdaptiveHierarchicalStage1Reconsideration:
                 evidence=evidence,
                 supporting_evidence_ids=support,
             )
-            definition_messages = _render_extraction_messages(request=request)
+            definition_messages = _render_extraction_messages(
+                request=request,
+                wire_budget=self.config.wire_budget,
+            )
             if definition_messages[0] != {
                 "role": "system",
                 "content": _ADAPTIVE_DEFINITION_SYSTEM,
@@ -6700,6 +6836,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                         request=request,
                         evidence=evidence_item,
                         review_id=review_id,
+                        wire_budget=self.config.wire_budget,
                     ),
                     input_bindings={
                         "adaptive_hierarchy_version": ADAPTIVE_HIERARCHY_VERSION,
@@ -6764,9 +6901,9 @@ class AdaptiveHierarchicalStage1Reconsideration:
             fold_records: list[dict[str, Any]] = []
             while consumed < len(page_rows):
                 fresh_capacity = (
-                    HIERARCHICAL_DISCOVERY_MAX_DEFINITION_FOLD_MEMBERS
+                    self.config.wire_budget.max_definition_fold_inputs
                     if accumulator_wire is None
-                    else HIERARCHICAL_DISCOVERY_MAX_DEFINITION_FOLD_MEMBERS - 1
+                    else self.config.wire_budget.max_definition_fold_inputs - 1
                 )
                 fresh = page_rows[consumed : consumed + fresh_capacity]
                 review_inputs: list[tuple[str, Mapping[str, Any]]] = []
@@ -6791,6 +6928,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                         request=request,
                         fold_index=fold_index,
                         review_inputs=review_inputs,
+                        wire_budget=self.config.wire_budget,
                     ),
                     input_bindings={
                         "adaptive_hierarchy_version": ADAPTIVE_HIERARCHY_VERSION,
@@ -7471,7 +7609,7 @@ class AdaptiveHierarchicalStage1Reconsideration:
                         > self.config.max_rendered_prompt_bytes
                     ):
                         raise ValueError(
-                            "adaptive response-repair prompt exceeds its fixed byte guard"
+                            "adaptive response-repair prompt exceeds its configured byte guard"
                         )
                     try:
                         repaired_wire, repaired_metadata = (

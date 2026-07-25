@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 
 import pytest
 
@@ -28,6 +29,7 @@ from oci.inference.all_evidence_discovery_interfaces import (
     cross_architecture_planner_context,
     render_cross_architecture_planner_messages,
     render_interpret_evidence_chunk_messages,
+    revalidate_normalized_consolidation_response,
     revalidate_normalized_extraction_definition_response,
     resolve_raw_evidence_lookback,
     route_concept_roles,
@@ -37,6 +39,9 @@ from oci.inference.all_evidence_discovery_interfaces import (
     validate_extraction_definition_response,
     validate_interpret_evidence_chunk_response,
     canonical_json,
+)
+from oci.inference.hierarchical_discovery_response_contract import (
+    LEGACY_HIERARCHY_WIRE_BUDGET,
 )
 
 
@@ -406,6 +411,61 @@ def test_within_architecture_consolidation_preserves_candidates_evidence_and_fam
         )
 
 
+def test_normalized_consolidation_revalidation_requires_configured_name_budget():
+    candidates = (
+        _candidate(BOW_NUISANCE, 1),
+        _candidate(BOW_NUISANCE, 2),
+    )
+    proposed_name = "patient_treatment_response_measure"
+    wire_response = {
+        "candidate_assignments": {
+            "candidate_001": {
+                "cluster_slot": "consolidation_slot_001",
+                "reason": "Keep the first measurement.",
+            },
+            "candidate_002": {
+                "cluster_slot": "consolidation_slot_002",
+                "reason": "Keep the second measurement distinct.",
+            },
+        },
+        "slot_definitions": {
+            slot: {
+                "canonical_name": proposed_name,
+                "description": f"Definition for {slot}.",
+                "unresolved_ambiguity": "",
+            }
+            for slot in ("consolidation_slot_001", "consolidation_slot_002")
+        },
+    }
+    wire_budget = replace(
+        LEGACY_HIERARCHY_WIRE_BUDGET,
+        max_generated_name_chars=40,
+        max_interpret_name_chars=40,
+    )
+    normalized = validate_consolidation_response(
+        wire_response,
+        source_family=BOW_NUISANCE,
+        candidates=candidates,
+        wire_budget=wire_budget,
+    )
+
+    revalidated = revalidate_normalized_consolidation_response(
+        normalized,
+        source_family=BOW_NUISANCE,
+        candidates=candidates,
+        wire_budget=wire_budget,
+    )
+    assert revalidated == normalized
+    assert len(revalidated["canonical_concepts"][1]["canonical_name"]) == 40
+    with pytest.raises(ValueError, match="deterministic projection"):
+        revalidate_normalized_consolidation_response(
+            normalized,
+            source_family=BOW_NUISANCE,
+            candidates=candidates,
+            wire_budget=LEGACY_HIERARCHY_WIRE_BUDGET,
+        )
+
+
 def test_architecture_dossier_fails_if_any_raw_atom_lacks_a_disposition():
     with pytest.raises(ValueError, match="disposition for every catalog atom"):
         ArchitectureDossier(
@@ -670,7 +730,7 @@ def test_extraction_reserved_mechanics_are_executable_but_not_clinical_ontology(
     assert normalized_mixed["representation"]["kind"] == "unresolved"
 
 
-def test_extraction_clinical_categories_require_two_to_eight_literal_values():
+def test_extraction_clinical_categories_require_two_or_more_literal_values():
     evidence = (
         _evidence(
             BOW_NUISANCE,
@@ -705,10 +765,51 @@ def test_extraction_clinical_categories_require_two_to_eight_literal_values():
         "supporting_evidence_ids"
     ] == ["evidence_001"]
 
+    expanded_categories = [f"state {index}" for index in range(12)]
+    expanded_evidence = (
+        _evidence(
+            BOW_NUISANCE,
+            1,
+            axes=(EXTRACTION_SUPPORT_AXIS,),
+            raw_marker="; ".join(expanded_categories),
+        ),
+    )
+    expanded_request = ExtractionDefinitionRequest(
+        canonical_name="detailed_biomarker_result",
+        evidence=expanded_evidence,
+        supporting_evidence_ids=("evidence_001",),
+        value_shape_hypothesis="categorical",
+    )
+    expanded = {
+        **response,
+        "feature_name": "detailed_biomarker_result",
+        "representation": {
+            "kind": "categorical",
+            "unit": "",
+            "categories": expanded_categories,
+        },
+    }
+
+    validated_expanded = validate_extraction_definition_response(
+        expanded,
+        request=expanded_request,
+    )
+
+    assert validated_expanded["representation"]["categories"] == expanded_categories
+
     too_few = deepcopy(response)
     too_few["representation"]["categories"] = ["positive"]
-    with pytest.raises(ValueError, match="2-8"):
+    with pytest.raises(ValueError, match="at least two"):
         validate_extraction_definition_response(too_few, request=request)
+
+    duplicate = deepcopy(response)
+    duplicate["representation"]["categories"] = [
+        "negative",
+        "Positive",
+        "positive",
+    ]
+    with pytest.raises(ValueError, match="distinct after case/spacing normalization"):
+        validate_extraction_definition_response(duplicate, request=request)
 
     wrong_shape = deepcopy(response)
     wrong_shape["representation"] = {

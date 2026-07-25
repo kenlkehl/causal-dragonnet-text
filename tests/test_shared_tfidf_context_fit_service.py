@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
-import joblib
 import numpy as np
 import pandas as pd
 import pytest
@@ -27,6 +26,7 @@ from oci.inference.shared_tfidf_context_fit_service import (
     build_shared_tfidf_context_fit_backends,
 )
 from oci.inference.tfidf_topic_discovery import FittedTopicContext
+from oci.inference.tfidf_safe_artifacts import write_named_array_bank
 from oci.inference.tfidf_upstream_gate_backend import TfidfTopicOrphanContextBackend
 import oci.inference.review_spent_evidence_provider as spent_module
 import oci.inference.shared_tfidf_context_fit_service as shared_module
@@ -89,6 +89,22 @@ def shared_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     )
 
     calls: list[dict] = []
+    fitted_by_token: dict[str, FittedTopicContext] = {}
+
+    def fake_safe_context_loader(path):
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        return fitted_by_token[value["token"]]
+
+    monkeypatch.setattr(
+        shared_module,
+        "load_fitted_topic_context",
+        fake_safe_context_loader,
+    )
+    monkeypatch.setattr(
+        context_module,
+        "load_fitted_topic_context",
+        fake_safe_context_loader,
+    )
 
     def fake_fit_tfidf_topic_context(**kwargs):
         fit_df = kwargs["fit_df"]
@@ -114,8 +130,24 @@ def shared_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             },
             config_hash="test-fit-config-v1",
         )
-        fitted_path = output / "fitted_context.joblib"
-        joblib.dump(fitted, fitted_path)
+        fitted_root = output / "fitted_context"
+        fitted_root.mkdir()
+        fitted_path = fitted_root / "index.json"
+        fitted_token = hashlib.sha256(
+            json.dumps(
+                {
+                    "scope_id": kwargs["scope_id"],
+                    "fit_ids": fit_df["_oci_row_id"].astype(int).tolist(),
+                    "heldout_ids": heldout_df["_oci_row_id"].astype(int).tolist(),
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        fitted_by_token[fitted_token] = fitted
+        fitted_path.write_text(
+            json.dumps({"token": fitted_token}),
+            encoding="utf-8",
+        )
         topic_metadata = {
             "treatment": _topic_metadata("treatment", "baseline"),
             "outcome": _topic_metadata("outcome", "risk"),
@@ -133,8 +165,11 @@ def shared_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             }
         ).to_parquet(scores_path, index=False)
         transformed = fitted.transform_topics(heldout_texts)
-        heldout_topic_path = output / "heldout_topic_values.npz"
-        np.savez(heldout_topic_path, **transformed)
+        heldout_topic_path = write_named_array_bank(
+            transformed,
+            output / "heldout_topic_values",
+            row_count=len(heldout_df),
+        )
         treatment_values, treatment_views = fitted.treatment_stack.predict(heldout_texts)
         outcome_values, outcome_views = fitted.outcome_stack.predict(heldout_texts)
         nuisance_path = output / "nuisance_predictions.parquet"

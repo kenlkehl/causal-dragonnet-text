@@ -51,6 +51,13 @@ from oci.inference.production_stage1_bundle import (
     _validate_cumulative_spent_embedding_index,
     _write_cumulative_spent_embedding_index,
 )
+from tests.semantic_witness_test_support import semantic_witness_config
+from tests.cluster_local_embedding_test_support import (
+    cluster_local_embedding_config,
+)
+
+
+_SEMANTIC_WITNESS_CONFIG = semantic_witness_config()
 
 
 def _write_cache(path: Path, texts: tuple[str, ...], embeddings: np.ndarray) -> None:
@@ -186,6 +193,21 @@ def _live_case(
     embedding_config.cluster_contrast_max_components = 3
     embedding_config.cluster_contrast_top_loadings = 4
     embedding_config.cluster_contrast_kmeans_n_init = 3
+    embedding_config.cluster_local_scientific = cluster_local_embedding_config(
+        requested_cluster_count=4,
+        maximum_components_per_family=3,
+        minimum_cluster_size=4,
+        minimum_group_size=2,
+        minimum_cell_size=1,
+        kmeans_batch_size_lower_bound=128,
+        kmeans_n_init=3,
+        kmeans_max_iter=300,
+        computation_dtype="float32",
+        svd_rank_tolerance_dtype="float32",
+    )
+    config.architecture.multi_model_agentic_forest.embedding_contrast.cluster_local_scientific = (
+        embedding_config.cluster_local_scientific
+    )
     embedding_config.residualize_columns = (
         ["unregistered_cohort_column"] if extra_discovery_column else []
     )
@@ -231,10 +253,15 @@ def _live_case(
         outcome_type=config.outcome_type,
         embedding_provider=provider,
         embedding_config=generator.embedding_config,
+        semantic_witness_scientific_config=_SEMANTIC_WITNESS_CONFIG,
         tfidf_nested_calibration_folds=5,
         seed=917,
     )
     generator._native_embedding_proof_observer = sink
+    generator.bind_cluster_physical_fit_authority(
+        ordered_fit_row_ids=row_ids,
+        canonical_group_seed=917,
+    )
     sink.record_registered_fit_outputs(
         fit_row_ids=row_ids,
         treatment=treatment,

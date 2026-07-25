@@ -69,7 +69,7 @@ class ExplicitConfounderValue:
 def build_extraction_prompt(
     clinical_text: str,
     specs: List[ExplicitConfounderSpec],
-    max_text_length: int = 400000
+    max_text_length: Optional[int] = None
 ) -> str:
     """Build prompt for confounder extraction.
 

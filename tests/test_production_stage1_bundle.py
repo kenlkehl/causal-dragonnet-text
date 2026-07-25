@@ -31,6 +31,9 @@ from oci.inference.all_evidence_fusion import (
 from oci.inference.lossless_stage1_evidence_catalog import (
     build_role_neutral_evidence_catalog,
 )
+from oci.inference.embedding_contrast_discovery import (
+    _embedding_cluster_kmeans_parameters,
+)
 from oci.inference.neural_query_agentic_forest import NeuralQueryAgenticForestConfig
 from oci.inference.production_stage1_bundle import (
     PRODUCTION_BOW_REGISTERED_NATIVE_FAMILY_ADAPTERS,
@@ -50,6 +53,7 @@ from oci.inference.production_stage1_bundle import (
     _build_htr_input_nontruncation_audit,
     _component_file_registration,
     _component_native_artifact_registration,
+    _embedding_cluster_feasibility_scopes,
     _matched_pair_subproducer_proofs,
     _read_stable_sha256,
     _registry_scopes,
@@ -82,6 +86,36 @@ from oci.inference.stage1_exact_inner_evidence import CanonicalStage1SplitRegist
 from oci.inference.tfidf_topic_split_registry import (
     TFIDF_TOPIC_SPLIT_REGISTRY_SCHEMA_VERSION,
 )
+from tests.cluster_local_embedding_test_support import (
+    cluster_local_embedding_config,
+)
+from tests.semantic_witness_test_support import semantic_witness_config
+
+
+_SEMANTIC_WITNESS_CONFIG = semantic_witness_config()
+
+
+def _embedding_cache_configuration(config: AppliedInferenceConfig) -> dict:
+    embedding = config.architecture.multi_model_forest.embedding_contrast
+    return {
+        "chunk_size_words": embedding.chunk_size_words,
+        "chunk_overlap_words": embedding.chunk_overlap_words,
+        "max_chunks": embedding.max_chunks,
+        "chunk_selection": "last",
+        "normalize_embeddings": embedding.normalize_embeddings,
+        "max_seq_length": embedding.max_seq_length,
+        "prompt_policy": "disabled",
+        "prompt_name": None,
+        "output_value": "sentence_embedding",
+        "precision": "float32",
+        "convert_to_numpy": True,
+        "convert_to_tensor": False,
+        "truncate_dim": None,
+        "pooling_output_policy": "single_process_sentence_embedding_v1",
+        "model_dtype": "float32",
+        "stored_array_dtype": "float32",
+        "zero_vector_policy": "reject",
+    }
 
 
 def _valid_config(tmp_path: Path) -> tuple[AppliedInferenceConfig, Path]:
@@ -138,6 +172,12 @@ def _valid_config(tmp_path: Path) -> tuple[AppliedInferenceConfig, Path]:
     forest.candidate_consistency_inner_folds = 4
     forest.embedding_contrast.enabled = True
     forest.embedding_contrast.include_cluster_contrast_vectors = True
+    forest.embedding_contrast.cluster_local_scientific = (
+        cluster_local_embedding_config()
+    )
+    architecture.multi_model_agentic_forest.embedding_contrast.cluster_local_scientific = (
+        copy.deepcopy(forest.embedding_contrast.cluster_local_scientific)
+    )
     return config, model_dir
 
 
@@ -173,6 +213,9 @@ def _write_cluster_preflight_cache(
 
 def _cluster_preflight_case(tmp_path: Path) -> dict[str, object]:
     config = AppliedInferenceConfig(cv_folds=2)
+    # The compatibility object predates the portable workflow seed.  Bind it
+    # explicitly so the preflight never falls back to an implicit seed.
+    config.seed = 42
     forest = config.architecture.multi_model_forest
     forest.candidate_consistency_inner_folds = 4
     embedding = forest.embedding_contrast
@@ -195,6 +238,19 @@ def _cluster_preflight_case(tmp_path: Path) -> dict[str, object]:
     embedding.cluster_contrast_top_loadings = 4
     embedding.cluster_contrast_random_state = 42
     embedding.cluster_contrast_kmeans_n_init = 3
+    embedding.cluster_local_scientific = cluster_local_embedding_config(
+        requested_cluster_count=8,
+        maximum_components_per_family=3,
+        minimum_cluster_size=10,
+        minimum_group_size=5,
+        minimum_cell_size=2,
+        kmeans_n_init=3,
+        computation_dtype="float32",
+        svd_rank_tolerance_dtype="float32",
+    )
+    config.architecture.multi_model_agentic_forest.embedding_contrast.cluster_local_scientific = (
+        copy.deepcopy(embedding.cluster_local_scientific)
+    )
 
     rows: list[dict[str, object]] = []
     vectors: list[np.ndarray] = []
@@ -388,6 +444,10 @@ def test_cli_is_one_command_and_has_no_digest_approval_option():
             "bundle",
             "--unit-id-column",
             "person_key",
+            "--initial-training-partitions",
+            "3",
+            "--query-config",
+            "query.json",
             "--dry-run",
         ]
     )
@@ -409,6 +469,10 @@ def test_cli_supports_one_command_fresh_cache_build_and_rejects_write_on_dry_run
         "bundle",
         "--unit-id-column",
         "person_key",
+        "--initial-training-partitions",
+        "3",
+        "--query-config",
+        "query.json",
     ]
     options = options_from_args(parser.parse_args(values))
     assert options.embedding_cache_dir is None
@@ -431,6 +495,10 @@ def test_cli_rejects_incomplete_or_resume_fresh_cache_modes():
         "bundle",
         "--unit-id-column",
         "person_key",
+        "--initial-training-partitions",
+        "3",
+        "--query-config",
+        "query.json",
     ]
     with pytest.raises(ValueError, match="local-model-path is required"):
         options_from_args(parser.parse_args(base))
@@ -458,6 +526,7 @@ def test_prepare_rejects_output_root_symlink_before_resolution(tmp_path: Path):
             embedding_cache_dir=cache,
             output_dir=linked_output,
             unit_id_column="person_key",
+            initial_training_partitions=3,
         )
     )
     with pytest.raises(ValueError, match="output directory cannot be a symlink"):
@@ -488,6 +557,7 @@ def test_prepare_rejects_overlapping_cache_and_output_trees(
             embedding_cache_dir=cache,
             output_dir=output,
             unit_id_column="person_key",
+            initial_training_partitions=3,
         )
     )
     with pytest.raises(ValueError, match="must be disjoint"):
@@ -523,6 +593,10 @@ def test_cli_returns_nonzero_when_readiness_preflight_is_blocked(
                 "bundle",
                 "--unit-id-column",
                 "person_key",
+                "--initial-training-partitions",
+                "3",
+                "--query-config",
+                "query.json",
                 "--dry-run",
             ]
         )
@@ -548,6 +622,33 @@ def test_query_config_scientific_identity_is_content_addressed(tmp_path):
     assert _scientific_query_config_identity(first) == (
         _scientific_query_config_identity(second)
     )
+    assert "path" not in _scientific_query_config_identity(first)
+
+    relocated = tmp_path / "relocated" / "different-name.json"
+    relocated.parent.mkdir()
+    relocated.write_text(payload, encoding="utf-8")
+    _config, third = ProductionStage1BundleBuilder._load_query_config(relocated)
+    assert first["path"] != third["path"]
+    assert _scientific_query_config_identity(first) == (
+        _scientific_query_config_identity(third)
+    )
+
+
+def test_production_query_config_is_required_in_direct_api():
+    with pytest.raises(ValueError, match="no implicit defaults"):
+        ProductionStage1BundleBuilder._load_query_config(None)
+
+
+def test_production_query_config_rejects_implicit_dataclass_defaults(
+    tmp_path,
+):
+    path = tmp_path / "partial_query.json"
+    path.write_text(
+        json.dumps({"treatment_query_count": 5}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="complete closed schema"):
+        ProductionStage1BundleBuilder._load_query_config(path)
 
 
 def test_candidate_bundle_build_is_enabled_without_claiming_e2e_certification():
@@ -740,7 +841,9 @@ def _write_genuine_neural_query_native_scope(root: Path) -> dict[str, object]:
             "sha256": model_registration["sha256"],
         },
         "heldout_moment_artifact": {
-            "relative_path": (model_root / "heldout_moments.npz").relative_to(root).as_posix(),
+            "relative_path": (
+                model_root / "heldout_moments.arrays"
+            ).relative_to(root).as_posix(),
             "sha256": moment_metadata["arrays_sha256"],
             "content_sha256": moment_metadata["content_sha256"],
         },
@@ -864,18 +967,38 @@ def test_neural_query_native_registration_binds_real_arrays_moments_and_index(tm
     assert family_row["proof"]["model_artifact_sha256"] == (family_row["model_artifact"]["sha256"])
     assert family_row["proof"]["source_artifact_sha256"] == _sha256_file(built["source_path"])
     assert not list(Path(built["root"]).rglob("*.joblib"))
-    with np.load(Path(built["model_root"]) / "heldout_moments.npz", allow_pickle=False) as data:
-        assert tuple(map(int, data["heldout_row_ids"].tolist())) == built["heldout_rows"]
-        assert data["feature_values"].shape == (2, 3)
+    arrays_root = Path(built["model_root"]) / "heldout_moments.arrays"
+    row_ids = np.load(
+        arrays_root / "000_heldout_row_ids.npy",
+        mmap_mode="r",
+        allow_pickle=False,
+    )
+    values = np.load(
+        arrays_root / "001_feature_values.npy",
+        mmap_mode="r",
+        allow_pickle=False,
+    )
+    assert isinstance(values, np.memmap)
+    assert tuple(map(int, row_ids.tolist())) == built["heldout_rows"]
+    assert values.shape == (2, 3)
 
 
 @pytest.mark.parametrize("tamper_target", ["owned_queries", "heldout_moments", "source"])
 def test_neural_query_native_registration_rejects_tamper(tmp_path, tamper_target):
     built = _write_genuine_neural_query_native_scope(tmp_path / tamper_target / "query")
     if tamper_target == "owned_queries":
-        target = Path(built["model_root"]) / "owned_snapshot" / "arrays.npz"
+        target = (
+            Path(built["model_root"])
+            / "owned_snapshot"
+            / "arrays"
+            / "000_treatment_queries.npy"
+        )
     elif tamper_target == "heldout_moments":
-        target = Path(built["model_root"]) / "heldout_moments.npz"
+        target = (
+            Path(built["model_root"])
+            / "heldout_moments.arrays"
+            / "001_feature_values.npy"
+        )
     else:
         target = Path(built["source_path"])
     target.write_bytes(target.read_bytes() + b"tamper")
@@ -1066,7 +1189,10 @@ def test_query_component_emits_owned_snapshots_exact_moments_and_native_proofs(
     )
     monkeypatch.setattr(
         "oci.inference.production_stage1_bundle._canonical_cumulative_spent_schedule",
-        lambda _registry: SimpleNamespace(scopes=(), schedule_sha256="7" * 64),
+        lambda _registry, *, initial_training_partitions: SimpleNamespace(
+            scopes=(),
+            schedule_sha256="7" * 64,
+        ),
     )
     exact = CanonicalStage1SplitRegistry.build(
         dataset_row_ids=tuple(range(12)),
@@ -1130,6 +1256,7 @@ def test_query_component_emits_owned_snapshots_exact_moments_and_native_proofs(
         ),
         options=SimpleNamespace(
             dataset_path=tmp_path / "cohort.parquet",
+            initial_training_partitions=3,
             query_nuisance_folds=2,
             query_devices=("cpu",),
             seed=23,
@@ -1145,6 +1272,7 @@ def test_query_component_emits_owned_snapshots_exact_moments_and_native_proofs(
             embedding_cache_dir=tmp_path / "embedding_cache",
             output_dir=output,
             unit_id_column="unit_id",
+            initial_training_partitions=3,
         )
     )
     builder._run_query_component(root, output, prepared)
@@ -1158,7 +1286,7 @@ def test_query_component_emits_owned_snapshots_exact_moments_and_native_proofs(
     assert query_index["executable_checkpoint_files_retained"] is False
     assert not list(root.rglob("*.joblib"))
     assert all(
-        (root / row["heldout_moment_arrays"]["relative_path"]).is_file()
+        (root / row["heldout_moment_arrays"]["relative_path"]).is_dir()
         for row in query_index["scopes"]
     )
 
@@ -1190,8 +1318,8 @@ def test_effective_config_requires_every_legacy_architecture(tmp_path: Path):
     too_few_hierarchy_partitions = copy.deepcopy(config)
     (
         too_few_hierarchy_partitions.architecture.multi_model_forest.candidate_consistency_inner_folds
-    ) = 3
-    with pytest.raises(ValueError, match="at least four"):
+    ) = 1
+    with pytest.raises(ValueError, match="at least two"):
         _validate_effective_config(
             too_few_hierarchy_partitions,
             dataset_path=tmp_path / "cohort.parquet",
@@ -1201,8 +1329,10 @@ def test_effective_config_requires_every_legacy_architecture(tmp_path: Path):
         )
 
     one_cluster_component = copy.deepcopy(config)
-    one_cluster_component.architecture.multi_model_forest.embedding_contrast.cluster_contrast_max_components = (
-        1
+    object.__setattr__(
+        one_cluster_component.architecture.multi_model_forest.embedding_contrast.cluster_local_scientific,
+        "maximum_components_per_family",
+        1,
     )
     with pytest.raises(ValueError, match="at least two emitted components"):
         _validate_effective_config(
@@ -1307,8 +1437,8 @@ def test_htr_input_audit_rejects_tokenizer_overflow(
         )
 
 
-@pytest.mark.parametrize("chunk_selection", [None, "first"])
-def test_cache_configuration_requires_explicit_last_chunk_selection(
+@pytest.mark.parametrize("chunk_selection", [None, "middle"])
+def test_cache_configuration_requires_explicit_supported_chunk_selection(
     tmp_path: Path,
     chunk_selection: str | None,
 ):
@@ -1334,8 +1464,44 @@ def test_cache_configuration_requires_explicit_last_chunk_selection(
 
 def test_embedding_cluster_preflight_enumerates_all_native_scopes_with_real_catalogs(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     case = _cluster_preflight_case(tmp_path)
+    planned_scopes = _embedding_cluster_feasibility_scopes(
+        case["registry"],
+        initial_training_partitions=3,
+        global_seed=42,
+    )
+    canonical_state_scope_ids = []
+    seen_fit_sets = set()
+    for scope in planned_scopes:
+        fit_set = (
+            tuple(map(int, scope["fit_row_ids"])),
+            int(scope["scope_seed"]),
+        )
+        if fit_set not in seen_fit_sets:
+            seen_fit_sets.add(fit_set)
+            canonical_state_scope_ids.append(scope["scope_id"])
+    import oci.inference.production_stage1_bundle as bundle_module
+
+    original_build_evidence = (
+        bundle_module._FrozenCacheEmbeddingEvidenceGenerator.build_cluster_only_evidence
+    )
+    fitted_row_orders = []
+
+    def counted_build_evidence(self, *args, **kwargs):
+        discovery = kwargs.get("discovery_df")
+        if discovery is None and args:
+            discovery = args[0]
+        fitted_row_orders.append(tuple(map(int, discovery.index.tolist())))
+        return original_build_evidence(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        bundle_module._FrozenCacheEmbeddingEvidenceGenerator,
+        "build_cluster_only_evidence",
+        counted_build_evidence,
+    )
+    captured_states = {}
     audit = build_embedding_cluster_feasibility_audit(
         modeling_data=case["modeling_data"],
         config=case["config"],
@@ -1343,7 +1509,13 @@ def test_embedding_cluster_preflight_enumerates_all_native_scopes_with_real_cata
         embedding_cache_identity=case["cache_identity"],
         registry=case["registry"],
         registry_content_sha256=case["registry_sha256"],
+        initial_training_partitions=3,
+        semantic_witness_scientific_config=_SEMANTIC_WITNESS_CONFIG,
+        _operational_canonical_scope_states=captured_states,
+        _canonical_state_scope_ids=canonical_state_scope_ids,
     )
+    assert len(fitted_row_orders) == len(canonical_state_scope_ids) == 10
+    assert len(set(fitted_row_orders)) == 10
     repeated_audit = build_embedding_cluster_feasibility_audit(
         modeling_data=case["modeling_data"],
         config=case["config"],
@@ -1351,10 +1523,29 @@ def test_embedding_cluster_preflight_enumerates_all_native_scopes_with_real_cata
         embedding_cache_identity=case["cache_identity"],
         registry=case["registry"],
         registry_content_sha256=case["registry_sha256"],
+        initial_training_partitions=3,
+        semantic_witness_scientific_config=_SEMANTIC_WITNESS_CONFIG,
         preflight_workers=2,
     )
     assert repeated_audit == audit
     assert repeated_audit["content_sha256"] == audit["content_sha256"]
+    assert set(captured_states) == set(canonical_state_scope_ids)
+    assert len(captured_states) < audit["scope_count"]
+    assert all(
+            state["schema_version"]
+            == "production_stage1_cluster_preflight_scope_state_capture_v2"
+        and state["scope_id"] == scope_id
+        and state["captured_from_canonical_preflight_fit"] is True
+        and state["refit_performed_for_state_capture"] is False
+        and len(state["svd_states"]) == 2
+        and state["cluster_fit_identity_content_sha256"]
+        == next(
+            row["cluster_fit_identity"]["content_sha256"]
+            for row in audit["scopes"]
+            if row["scope_id"] == scope_id
+        )
+        for scope_id, state in captured_states.items()
+    )
 
     assert audit["schema_version"] == STAGE1_EMBEDDING_CLUSTER_FEASIBILITY_AUDIT_SCHEMA
     assert audit["scope_count"] == 12
@@ -1362,6 +1553,115 @@ def test_embedding_cluster_preflight_enumerates_all_native_scopes_with_real_cata
     assert audit["exact_inner_scope_count"] == 8
     assert audit["cumulative_spent_scope_count"] == 2
     assert audit["scope_order"] == [row["scope_id"] for row in audit["scopes"]]
+    assert audit["physical_fit_count"] == len(canonical_state_scope_ids) == 10
+    assert audit["deduplicated_fit_count"] == 2
+    assert audit["physical_scope_order"] == canonical_state_scope_ids
+    assert (
+        audit["physical_fit_execution_policy"]
+        == "fit_each_exact_order_seed_equivalent_group_once_earliest_owner_v2"
+    )
+    assert audit["all_logical_scopes_bound_to_physical_fit"] is True
+    aliases = [
+        row
+        for row in audit["scopes"]
+        if row["physical_fit_binding"]["reuses_physical_fit"]
+    ]
+    assert len(aliases) == 2
+    by_scope = {row["scope_id"]: row for row in audit["scopes"]}
+    for alias in aliases:
+        binding = alias["physical_fit_binding"]
+        owner = by_scope[binding["physical_owner_scope_id"]]
+        assert binding["logical_scope_id"] == alias["scope_id"]
+        assert binding["same_ordered_fit_rows_and_seed_proved"] is True
+        assert binding["logical_alias_refit_performed"] is False
+        assert alias["cluster_fit_identity"] == owner["cluster_fit_identity"]
+        assert (
+            binding[
+                "canonical_cluster_fit_identity_content_sha256"
+            ]
+            == owner["cluster_fit_identity"]["content_sha256"]
+        )
+    legacy_audit = copy.deepcopy(audit)
+    for field in (
+        "physical_fit_count",
+        "deduplicated_fit_count",
+        "physical_scope_order",
+        "physical_fit_execution_policy",
+        "all_logical_scopes_bound_to_physical_fit",
+    ):
+        legacy_audit.pop(field)
+    planned_by_scope = {
+        str(scope["scope_id"]): scope for scope in planned_scopes
+    }
+    for row in legacy_audit["scopes"]:
+        row.pop("physical_fit_binding")
+        logical = planned_by_scope[row["scope_id"]]
+        fit_identity = row["cluster_fit_identity"]
+        fit_identity["scope_id"] = row["scope_id"]
+        fit_identity["fit_row_ids"] = list(logical["fit_row_ids"])
+        fit_identity["fit_row_order_fingerprint"] = (
+            row["fit_row_order_fingerprint"]
+        )
+        fit_body = {
+            key: value
+            for key, value in fit_identity.items()
+            if key != "content_sha256"
+        }
+        fit_identity["content_sha256"] = _sha256_json(fit_body)
+    legacy_body = {
+        key: value
+        for key, value in legacy_audit.items()
+        if key != "content_sha256"
+    }
+    legacy_audit["content_sha256"] = _sha256_json(legacy_body)
+    # A pre-dedup audit is migration input, not a directly reusable current
+    # checkpoint.  The current validator must require its exact-order/seed
+    # physical bindings.
+    with pytest.raises(ValueError, match="invalid closed envelope"):
+        validate_embedding_cluster_feasibility_audit(
+            legacy_audit,
+            config=case["config"],
+            registry=case["registry"],
+            registry_content_sha256=case["registry_sha256"],
+            embedding_cache_identity=case["cache_identity"],
+            initial_training_partitions=3,
+        )
+    substituted = copy.deepcopy(audit)
+    substituted_alias = next(
+        row
+        for row in substituted["scopes"]
+        if row["physical_fit_binding"]["reuses_physical_fit"]
+    )
+    substituted_binding = substituted_alias["physical_fit_binding"]
+    substituted_binding["physical_owner_scope_id"] = (
+        substituted["physical_scope_order"][0]
+    )
+    substituted_binding_body = {
+        key: value
+        for key, value in substituted_binding.items()
+        if key != "content_sha256"
+    }
+    substituted_binding["content_sha256"] = _sha256_json(
+        substituted_binding_body
+    )
+    substituted_body = {
+        key: value
+        for key, value in substituted.items()
+        if key != "content_sha256"
+    }
+    substituted["content_sha256"] = _sha256_json(substituted_body)
+    with pytest.raises(
+        ValueError,
+        match="logical-to-physical binding",
+    ):
+        validate_embedding_cluster_feasibility_audit(
+            substituted,
+            config=case["config"],
+            registry=case["registry"],
+            registry_content_sha256=case["registry_sha256"],
+            embedding_cache_identity=case["cache_identity"],
+            initial_training_partitions=3,
+        )
     assert audit["token_bounded_row_count"] == 0
     assert audit["token_bounded_row_ids_sha256"] == _sha256_json([])
     assert all(row["catalog_atom_count"] > 0 for row in audit["scopes"])
@@ -1380,13 +1680,15 @@ def test_embedding_cluster_preflight_enumerates_all_native_scopes_with_real_cata
         row["token_bounded_row_count"] == 0
         and row["token_bounded_row_ids_sha256"] == _sha256_json([])
         and row["cluster_support_contract"]["kmeans_parameters"]
-        == {
-            "n_clusters": audit["configured_cluster_count"],
-            "random_state": 42,
-            "batch_size": max(128, min(1024, row["fit_row_count"])),
-            "n_init": 3,
-            "max_iter": 300,
-        }
+        == _embedding_cluster_kmeans_parameters(
+            case[
+                "config"
+            ].architecture.multi_model_forest.embedding_contrast,
+            n_usable=sum(
+                row["cluster_support_contract"]["kmeans_cluster_counts"]
+            ),
+            canonical_group_seed=row["canonical_group_seed"],
+        )
         for row in audit["scopes"]
     )
     for scope in audit["scopes"]:
@@ -1448,6 +1750,7 @@ def test_embedding_cluster_preflight_enumerates_all_native_scopes_with_real_cata
             registry=case["registry"],
             registry_content_sha256=case["registry_sha256"],
             embedding_cache_identity=case["cache_identity"],
+            initial_training_partitions=3,
         )
         == audit
     )
@@ -1464,6 +1767,7 @@ def test_embedding_cluster_preflight_enumerates_all_native_scopes_with_real_cata
             registry=case["registry"],
             registry_content_sha256=case["registry_sha256"],
             embedding_cache_identity=case["cache_identity"],
+            initial_training_partitions=3,
         )
 
     wrong_effective_k = copy.deepcopy(audit)
@@ -1480,6 +1784,7 @@ def test_embedding_cluster_preflight_enumerates_all_native_scopes_with_real_cata
             registry=case["registry"],
             registry_content_sha256=case["registry_sha256"],
             embedding_cache_identity=case["cache_identity"],
+            initial_training_partitions=3,
         )
 
     tamper_cases = []
@@ -1512,6 +1817,7 @@ def test_embedding_cluster_preflight_enumerates_all_native_scopes_with_real_cata
                 registry=case["registry"],
                 registry_content_sha256=case["registry_sha256"],
                 embedding_cache_identity=case["cache_identity"],
+                initial_training_partitions=3,
             )
 
 
@@ -1539,6 +1845,8 @@ def test_embedding_cluster_preflight_rejects_token_bounded_cache_binding(
             embedding_cache_identity=case["cache_identity"],
             registry=case["registry"],
             registry_content_sha256=case["registry_sha256"],
+            initial_training_partitions=3,
+            semantic_witness_scientific_config=_SEMANTIC_WITNESS_CONFIG,
         )
 
 
@@ -1547,8 +1855,10 @@ def test_embedding_cluster_preflight_reports_first_infeasible_ordered_scope(
 ):
     case = _cluster_preflight_case(tmp_path)
     failing_config = copy.deepcopy(case["config"])
-    failing_config.architecture.multi_model_forest.embedding_contrast.cluster_contrast_min_cluster_size = (
-        200
+    object.__setattr__(
+        failing_config.architecture.multi_model_forest.embedding_contrast.cluster_local_scientific,
+        "minimum_cluster_size",
+        200,
     )
     with pytest.raises(
         ValueError,
@@ -1561,6 +1871,8 @@ def test_embedding_cluster_preflight_reports_first_infeasible_ordered_scope(
             embedding_cache_identity=case["cache_identity"],
             registry=case["registry"],
             registry_content_sha256=case["registry_sha256"],
+            initial_training_partitions=3,
+            semantic_witness_scientific_config=_SEMANTIC_WITNESS_CONFIG,
         )
 
 
@@ -1570,8 +1882,16 @@ def test_embedding_cluster_preflight_rejects_later_exact_scope_with_kmeans_but_n
     case = _cluster_preflight_case(tmp_path)
     config = copy.deepcopy(case["config"])
     embedding = config.architecture.multi_model_forest.embedding_contrast
-    embedding.cluster_contrast_min_group_size = 2
-    embedding.cluster_contrast_min_cell_size = 1
+    object.__setattr__(
+        embedding.cluster_local_scientific,
+        "minimum_group_size",
+        2,
+    )
+    object.__setattr__(
+        embedding.cluster_local_scientific,
+        "minimum_cell_size",
+        1,
+    )
     modeling_data = case["modeling_data"].copy(deep=True)
     outer = case["registry"]["outer_folds"][1]
     target_partition = set(outer["inner_folds"][3]["heldout_row_ids"])
@@ -1599,6 +1919,8 @@ def test_embedding_cluster_preflight_rejects_later_exact_scope_with_kmeans_but_n
             embedding_cache_identity=case["cache_identity"],
             registry=case["registry"],
             registry_content_sha256=case["registry_sha256"],
+            initial_training_partitions=3,
+            semantic_witness_scientific_config=_SEMANTIC_WITNESS_CONFIG,
         )
     message = str(captured.value)
     assert "infeasible in outer_002_inner_004" in message
@@ -1619,6 +1941,7 @@ def test_builder_does_not_initialize_output_when_preflight_prepare_fails(
             embedding_cache_dir=tmp_path / "unused_cache",
             output_dir=output_dir,
             unit_id_column="person_key",
+            initial_training_partitions=3,
         )
     )
     initialized = False
@@ -1651,6 +1974,11 @@ def test_prepare_projects_only_id_text_treatment_and_observed_outcome(
     dataset_path.write_bytes(b"authenticated parquet container placeholder")
     config_path = tmp_path / "stage1.json"
     config_path.write_text(json.dumps({"applied_inference": asdict(config)}), encoding="utf-8")
+    query_config_path = tmp_path / "query.json"
+    query_config_path.write_text(
+        json.dumps(asdict(NeuralQueryAgenticForestConfig()), sort_keys=True),
+        encoding="utf-8",
+    )
     cache_dir = tmp_path / "embedding_cache"
     cache_dir.mkdir()
     rows = []
@@ -1681,6 +2009,9 @@ def test_prepare_projects_only_id_text_treatment_and_observed_outcome(
             "normalize_embeddings": config.architecture.multi_model_forest.embedding_contrast.normalize_embeddings,
             "chunk_selection": "last",
             "max_seq_length": config.architecture.multi_model_forest.embedding_contrast.max_seq_length,
+            "production_provenance": {
+                "chunk_configuration": _embedding_cache_configuration(config),
+            },
         }
 
         def __init__(self, path):
@@ -1718,6 +2049,11 @@ def test_prepare_projects_only_id_text_treatment_and_observed_outcome(
             embedding_cache_dir=cache_dir,
             output_dir=tmp_path / "output",
             unit_id_column="person_key",
+            initial_training_partitions=3,
+            query_config_path=query_config_path,
+            embedding_cache_configuration=(
+                _embedding_cache_configuration(config)
+            ),
             dry_run=True,
         )
     )
@@ -1822,7 +2158,7 @@ def test_prepare_projects_only_id_text_treatment_and_observed_outcome(
     assert architecture_contract["exact_coordinator_precommit_and_result_types_required"] is True
 
 
-def test_prepare_builds_fresh_arbitrary_cohort_cache_before_provider_use(
+def test_prepare_accepts_selected_x2_concurrency_before_provider_use(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     config, _htr_model = _valid_config(tmp_path)
@@ -1834,6 +2170,8 @@ def test_prepare_builds_fresh_arbitrary_cohort_cache_before_provider_use(
     embedding_model.mkdir()
     (embedding_model / "weights.safetensors").write_bytes(b"local weights")
     cache_target = tmp_path / "fresh-cache"
+    embedding = config.architecture.multi_model_forest.embedding_contrast
+    cache_configuration = _embedding_cache_configuration(config)
     rows = pd.DataFrame(
         {
             "person_key": ["p0", "p1", "p2", "p3"],
@@ -1880,24 +2218,20 @@ def test_prepare_builds_fresh_arbitrary_cohort_cache_before_provider_use(
             embedding_local_model_path=embedding_model,
             output_dir=tmp_path / "bundle",
             unit_id_column="person_key",
+            initial_training_partitions=3,
+            embedding_cache_configuration=cache_configuration,
+            scope_workers_per_gpu=2,
         )
     )
+    assert builder.options.scope_workers_per_gpu == 2
     with pytest.raises(ProviderReached, match="provider boundary"):
         builder.prepare()
-    embedding = config.architecture.multi_model_forest.embedding_contrast
     assert observed == {
         "dataset_path": dataset_path,
         "text_column": "clinical_text",
         "local_model_path": embedding_model,
         "sentence_model_name": embedding.model_name,
-        "chunk_configuration": {
-            "chunk_size_words": embedding.chunk_size_words,
-            "chunk_overlap_words": embedding.chunk_overlap_words,
-            "max_chunks": embedding.max_chunks,
-            "chunk_selection": "last",
-            "normalize_embeddings": embedding.normalize_embeddings,
-            "max_seq_length": embedding.max_seq_length,
-        },
+        "chunk_configuration": cache_configuration,
         "target_dir": cache_target,
         "device": "cpu",
         "batch_size": embedding.batch_size,
@@ -2147,6 +2481,7 @@ def test_partial_tfidf_component_reuse_is_disabled(tmp_path: Path):
             embedding_cache_dir=Path("cache"),
             output_dir=Path("output"),
             unit_id_column="unit_id",
+            initial_training_partitions=3,
         )
     )
     with pytest.raises(RuntimeError, match="partial checkpoint reuse is disabled"):
@@ -2219,7 +2554,9 @@ def test_every_scope_must_have_all_ten_catalog_families(
                 "sha256": "n" * 64,
             },
             "heldout_moment_artifact": {
-                "relative_path": (f"native_models/{scope['scope_id']}/heldout_moments.npz"),
+                "relative_path": (
+                    f"native_models/{scope['scope_id']}/heldout_moments.arrays"
+                ),
                 "sha256": "m" * 64,
             },
             "query_evidence": [],
@@ -2249,7 +2586,7 @@ def test_every_scope_must_have_all_ten_catalog_families(
                 },
                 "owned_snapshot_arrays": {
                     "relative_path": (
-                        f"native_models/{scope['scope_id']}/owned_snapshot/arrays.npz"
+                        f"native_models/{scope['scope_id']}/owned_snapshot/arrays"
                     )
                 },
                 "heldout_moment_metadata": {
@@ -2258,7 +2595,9 @@ def test_every_scope_must_have_all_ten_catalog_families(
                     )
                 },
                 "heldout_moment_arrays": {
-                    "relative_path": (f"native_models/{scope['scope_id']}/heldout_moments.npz")
+                    "relative_path": (
+                        f"native_models/{scope['scope_id']}/heldout_moments.arrays"
+                    )
                 },
                 "native_family_proof_registration": (
                     None if scope["inner_fold"] is None else {"relative_path": "proof.json"}
@@ -2358,6 +2697,7 @@ def test_every_scope_must_have_all_ten_catalog_families(
             embedding_cache_dir=Path("cache"),
             output_dir=Path("output"),
             unit_id_column="unit_id",
+            initial_training_partitions=3,
         )
     )
     legacy_root = tmp_path / "legacy"

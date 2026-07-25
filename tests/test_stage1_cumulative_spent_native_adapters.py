@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import pandas as pd
@@ -300,7 +301,10 @@ def _capture(tmp_path: Path):
         e_clip=config.architecture.multi_model_forest.e_clip,
         nuisance_folds=2,
         effect_folds=2,
-        view_configs=[vars(view) for view in config.architecture.multi_model_forest.bow_views],
+        view_configs=[
+            asdict(view)
+            for view in config.architecture.multi_model_forest.bow_views
+        ],
     )
     runner = MultiModelForestStage1Runner(
         dataset=frame,
@@ -484,7 +488,7 @@ def test_htr_and_matched_captures_replay_on_spent_alias_without_sealed_text(
         e_clip=float(pair_config.e_clip),
         nuisance_folds=2,
         effect_folds=2,
-        view_configs=[vars(view) for view in pair_config.bow_views],
+        view_configs=[asdict(view) for view in pair_config.bow_views],
     )
     htr_path = tmp_path / "native_htr_capture"
     htr_config = config.architecture.agentic_attention_variable_forest
@@ -520,7 +524,7 @@ def test_htr_and_matched_captures_replay_on_spent_alias_without_sealed_text(
         heldout_texts=normalized_canary_texts,
         text_column="clinical_text",
         effect_folds=2,
-        view_configs=[vars(view) for view in pair_config.bow_views],
+        view_configs=[asdict(view) for view in pair_config.bow_views],
         propensity_caliper=1.0,
         outcome_caliper=1.0,
         max_controls_per_candidate=2,

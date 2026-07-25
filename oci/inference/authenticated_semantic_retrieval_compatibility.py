@@ -69,10 +69,10 @@ CURRENT_SPENT_CACHE_LOCATOR_POLICY = (
 # must carry the provenance fields directly or this compatibility path must be
 # reviewed and versioned again.
 _ALLOWED_CURRENT_SPENT_PROVIDER_CODE_SHA256 = (
-    "de11740a862c13d59d340e1dba26fb1202820dec4a0055c49819b7e01eccc1f1"
+    "6978aa0419a89a0b74a7c187ef1580bfc857ace49159726d2681fc1f0a2d5916"
 )
 _ALLOWED_LEGACY_GROUPING_HELPER_SHA256 = (
-    "a46b801fc7a6f7dc66c42dc91a1bda9ddd93a79d871b9649aa89e25877ef633c"
+    "de7a2c5a22fd5253bff4e7157c589ed09631c1cf34b9e6e9fa5ae46fec62c530"
 )
 _ALLOWED_CACHE_OVERLAY_CODE_SHA256 = (
     "821ceb6780dce1ab9c83d524c00d7ef3253afcf0a5fb824fc50046522c217599"

@@ -20,6 +20,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
 
+from ..config import TfidfNuisanceStackScientificConfig
 from .neural_cohort_witness import (
     NeuralCohortWitnessConfig,
     build_ungated_consensus_query_bank,
@@ -38,8 +39,8 @@ from .tfidf_topic_discovery import (
 
 LOGGER = logging.getLogger(__name__)
 
-NEURAL_QUERY_DISCOVERY_RUNTIME_ID = "neural_query_in_memory_discovery_runtime_v1"
-NEURAL_QUERY_DISCOVERY_SUBFOLD_SCHEMA = "neural_query_in_memory_subfold_v1"
+NEURAL_QUERY_DISCOVERY_RUNTIME_ID = "neural_query_in_memory_discovery_runtime_v2"
+NEURAL_QUERY_DISCOVERY_SUBFOLD_SCHEMA = "neural_query_in_memory_subfold_v2"
 
 BANKS = ("treatment", "outcome", "effect")
 
@@ -83,10 +84,34 @@ def _witness_config(
             if final_refit
             else float(config.max_query_drift)
         ),
+        query_diversity_weight=float(config.query_diversity_weight),
+        activation_diversity_weight=float(config.activation_diversity_weight),
+        anchor_weight=float(config.anchor_weight),
+        min_activation_sd=float(config.min_activation_sd),
+        activation_scale_weight=float(config.activation_scale_weight),
         kmeans_iterations=int(config.kmeans_iterations),
         kmeans_sample_chunks=int(config.kmeans_sample_chunks),
+        initialization_max_cosine=float(config.initialization_max_cosine),
         consensus_min_prototypes=config.query_count(bank),
         consensus_max_prototypes=config.query_count(bank),
+        epsilon=float(config.witness_epsilon),
+        optimizer_beta1=float(config.optimizer_beta1),
+        optimizer_beta2=float(config.optimizer_beta2),
+        optimizer_epsilon=float(config.optimizer_epsilon),
+        optimizer_weight_decay=float(config.optimizer_weight_decay),
+        optimizer_amsgrad=bool(config.optimizer_amsgrad),
+        optimizer_maximize=bool(config.optimizer_maximize),
+        optimizer_foreach=bool(config.optimizer_foreach),
+        optimizer_capturable=bool(config.optimizer_capturable),
+        optimizer_differentiable=bool(config.optimizer_differentiable),
+        optimizer_fused=bool(config.optimizer_fused),
+        gradient_clip_norm=float(config.gradient_clip_norm),
+        consensus_kmeans_init=str(config.consensus_kmeans_init),
+        consensus_kmeans_n_init=int(config.consensus_kmeans_n_init),
+        consensus_kmeans_max_iter=int(config.consensus_kmeans_max_iter),
+        consensus_kmeans_tolerance=float(config.consensus_kmeans_tolerance),
+        consensus_kmeans_copy_x=bool(config.consensus_kmeans_copy_x),
+        consensus_kmeans_algorithm=str(config.consensus_kmeans_algorithm),
     )
 
 
@@ -103,6 +128,7 @@ def _fit_subfold(
     outcome_binary: bool,
     nuisance_views: Sequence[Any],
     nuisance_folds: int,
+    nuisance_stack_config: TfidfNuisanceStackScientificConfig,
     config: NeuralQueryAgenticForestConfig,
     seed: int,
     device: str,
@@ -127,6 +153,7 @@ def _fit_subfold(
         "outcome_binary": bool(outcome_binary),
         "parent_input_binding_sha256": str(parent_input_binding_sha256),
         "nuisance_folds": int(nuisance_folds),
+        "nuisance_stack_scientific": asdict(nuisance_stack_config),
         "nuisance_views_sha256": _stable_hash(list(nuisance_views)),
         "query_config": config.to_dict(),
         "seed": int(seed),
@@ -157,6 +184,7 @@ def _fit_subfold(
         views=nuisance_views,
         folds=int(nuisance_folds),
         random_state=int(seed + 10_000),
+        nuisance_stack_config=nuisance_stack_config,
     )
     validation_e, _ = nuisance["treatment"]["fitted"].predict(validation_texts)
     validation_m, _ = nuisance["outcome"]["fitted"].predict(validation_texts)
@@ -221,6 +249,7 @@ def _fit_subfold(
             result["queries"],
             temperature=float(config.temperature),
             device=device,
+            patient_batch_size=int(config.retrieval_patient_batch_size),
         )
         if bank == "treatment":
             audit = standardized_direct_target_contrasts(
@@ -298,6 +327,7 @@ def fit_in_memory_query_discovery(
     fit_e: np.ndarray,
     fit_m: np.ndarray,
     nuisance_views: Sequence[Any],
+    nuisance_stack_config: TfidfNuisanceStackScientificConfig,
     config: NeuralQueryAgenticForestConfig,
     nuisance_folds: int,
     devices: Sequence[str],
@@ -308,6 +338,11 @@ def fit_in_memory_query_discovery(
     device_names = tuple(str(device) for device in devices)
     if not device_names:
         raise ValueError("neural-query discovery requires at least one device")
+    if type(nuisance_stack_config) is not TfidfNuisanceStackScientificConfig:
+        raise TypeError(
+            "neural-query discovery requires an explicit "
+            "TfidfNuisanceStackScientificConfig"
+        )
     row_ids = tuple(int(row_id) for row_id in fit_ids)
     texts = tuple(fit_texts)
     chunks = tuple(fit_chunks)
@@ -339,6 +374,7 @@ def fit_in_memory_query_discovery(
             "fit_m": fit_m_values.tolist(),
             "outcome_binary": bool(outcome_binary),
             "nuisance_views_sha256": _stable_hash(list(nuisance_views)),
+            "nuisance_stack_scientific": asdict(nuisance_stack_config),
             "query_config": config.to_dict(),
         }
     )
@@ -371,6 +407,7 @@ def fit_in_memory_query_discovery(
                 "outcome_binary": bool(outcome_binary),
                 "nuisance_views": nuisance_views,
                 "nuisance_folds": int(nuisance_folds),
+                "nuisance_stack_config": nuisance_stack_config,
                 "config": config,
                 "seed": int(seed + fold),
                 "parent_input_binding_sha256": parent_binding,
@@ -404,6 +441,12 @@ def fit_in_memory_query_discovery(
             candidate_queries,
             temperature=float(config.temperature),
             device=device_names[bank_index % len(device_names)],
+            patient_batch_size=int(config.retrieval_patient_batch_size),
+        )
+        consensus_config = _witness_config(
+            config,
+            bank,
+            final_refit=False,
         )
         consensus = build_ungated_consensus_query_bank(
             candidates,
@@ -411,6 +454,7 @@ def fit_in_memory_query_discovery(
             n_queries=config.query_count(bank),
             bank=bank,
             seed=int(seed + 1000 + bank_index),
+            config=consensus_config,
         )
         initial_queries = np.asarray(consensus.pop("queries"), dtype=np.float32)
         refit_config = _witness_config(config, bank, final_refit=True)

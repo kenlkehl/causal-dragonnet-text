@@ -897,12 +897,14 @@ def test_conditional_upstream_design_routes_each_role_without_raw_tau_misuse(mon
     continuous_predict_columns: list[np.ndarray] = []
     effect_upstream_widths: list[tuple[int, int]] = []
 
-    def binary(x_fit, y_fit, x_predict, *, alpha):
+    def binary(x_fit, y_fit, x_predict, *, alpha, policy):
+        assert policy is not None
         binary_widths.append(x_fit.shape[1])
         binary_predict_columns.append(np.asarray(x_predict[:, -1]).copy())
         return np.full(len(x_predict), float(np.mean(y_fit)))
 
-    def continuous(x_fit, y_fit, x_predict, *, alpha):
+    def continuous(x_fit, y_fit, x_predict, *, alpha, policy):
+        assert policy is not None
         continuous_widths.append(x_fit.shape[1])
         continuous_predict_columns.append(np.asarray(x_predict[:, -1]).copy())
         return np.full(len(x_predict), float(np.mean(y_fit)))

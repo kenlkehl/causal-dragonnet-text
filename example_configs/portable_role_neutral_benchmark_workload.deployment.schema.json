@@ -1,0 +1,67 @@
+{
+  "$id": "portable_role_neutral_benchmark_workload_deployment_v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "expected_benchmark_config_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "expected_workflow_request_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "prepared_context_root": {
+      "pattern": "^/",
+      "type": "string"
+    },
+    "representative_scope_selectors": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "logical_scope_kind": {
+            "enum": [
+              "full_outer",
+              "exact_inner",
+              "cumulative_spent"
+            ]
+          },
+          "ordinal": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "scope_label": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope_label",
+          "logical_scope_kind",
+          "ordinal"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "schema_version": {
+      "const": "portable_role_neutral_benchmark_workload_deployment_v1"
+    },
+    "workflow_root": {
+      "pattern": "^/",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "workflow_root",
+    "expected_workflow_request_sha256",
+    "prepared_context_root",
+    "expected_benchmark_config_sha256",
+    "representative_scope_selectors"
+  ],
+  "title": "Portable role-neutral benchmark workload deployment",
+  "type": "object"
+}

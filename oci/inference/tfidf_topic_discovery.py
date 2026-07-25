@@ -11,11 +11,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import stat
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-import joblib
 import numpy as np
 import pandas as pd
 from scipy import sparse
@@ -38,16 +39,36 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import KFold, StratifiedKFold
 
-from ..config import BoWViewConfig, TfidfTopicDiscoveryConfig
+from ..config import (
+    BoWViewConfig,
+    LogisticRegressionScientificConfig,
+    NuisanceCalibrationScientificConfig,
+    RidgeScientificConfig,
+    TfidfNuisanceStackScientificConfig,
+    TfidfTopicDiscoveryConfig,
+)
+from .multi_model_agentic_forest import (
+    _bow_model_params,
+    _bow_vectorizer_params,
+    _make_bow_classifier,
+    _make_bow_regressor,
+    _make_bow_vectorizer,
+)
 from .tfidf_topic_score_selection import (
     TOPIC_SCORE_TEST_SCHEMA_VERSION,
     score_topic_banks,
+)
+from .tfidf_safe_artifacts import (
+    safe_artifact_content_sha256,
+    write_fitted_topic_context,
+    write_named_array_bank,
 )
 
 logger = logging.getLogger(__name__)
 
 HANDOFF_SCHEMA_VERSION = "multi_model_forest_handoff_v2"
-DISCOVERY_SCHEMA_VERSION = "tfidf_topic_discovery_v2"
+DISCOVERY_SCHEMA_VERSION = "tfidf_topic_discovery_v3_safe_arrays"
+TFIDF_CONTEXT_ARTIFACT_INVENTORY_SCHEMA = "tfidf_context_artifact_inventory_v1"
 
 
 def stable_hash(value: Any) -> str:
@@ -61,8 +82,93 @@ def row_set_fingerprint(row_ids: Sequence[Any]) -> str:
     return stable_hash(values)
 
 
+def _registered_regular_file(path: Path | str, *, logical_name: str) -> Dict[str, Any]:
+    requested = Path(os.path.abspath(Path(path)))
+    try:
+        resolved = requested.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise ValueError(f"TF-IDF artifact {logical_name} is missing") from exc
+    if resolved != requested or requested.is_symlink():
+        raise ValueError(f"TF-IDF artifact {logical_name} traverses a symlink")
+    file_stat = requested.lstat()
+    if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
+        raise ValueError(f"TF-IDF artifact {logical_name} must be one unlinked regular file")
+    digest = hashlib.sha256()
+    size = 0
+    with requested.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            size += len(chunk)
+            digest.update(chunk)
+    return {
+        "logical_name": logical_name,
+        "size_bytes": int(size),
+        "sha256": digest.hexdigest(),
+    }
+
+
+def tfidf_context_artifact_inventory(artifacts: Mapping[str, Any]) -> Dict[str, Any]:
+    """Authenticate the complete native context registry without path identity."""
+
+    if set(artifacts) != {
+        "fitted_context",
+        "ngram_scores",
+        "fit_topic_values",
+        "heldout_topic_values",
+        "nuisance_predictions",
+        "topic_score_tests",
+    }:
+        raise ValueError("TF-IDF native artifact registry is not closed")
+    ngram_scores = artifacts.get("ngram_scores")
+    if not isinstance(ngram_scores, Mapping) or set(ngram_scores) != {
+        "treatment",
+        "outcome",
+        "effect",
+    }:
+        raise ValueError("TF-IDF native n-gram artifact registry is not closed")
+    entries: List[Dict[str, Any]] = []
+    for logical_name in ("fitted_context", "fit_topic_values", "heldout_topic_values"):
+        path = artifacts.get(logical_name)
+        entry = _registered_regular_file(path, logical_name=logical_name)
+        entry.update(
+            {
+                "artifact_layout": "closed_json_and_per_array_npy_v1",
+                "transitive_content_sha256": safe_artifact_content_sha256(path),
+            }
+        )
+        entries.append(entry)
+    for bank in ("treatment", "outcome", "effect"):
+        entries.append(
+            _registered_regular_file(
+                ngram_scores[bank],
+                logical_name=f"ngram_scores.{bank}",
+            )
+        )
+    entries.append(
+        _registered_regular_file(
+            artifacts["nuisance_predictions"],
+            logical_name="nuisance_predictions",
+        )
+    )
+    if artifacts.get("topic_score_tests") is not None:
+        entries.append(
+            _registered_regular_file(
+                artifacts["topic_score_tests"],
+                logical_name="topic_score_tests",
+            )
+        )
+    body = {
+        "schema_version": TFIDF_CONTEXT_ARTIFACT_INVENTORY_SCHEMA,
+        "entries": entries,
+        "topic_score_tests_present": artifacts.get("topic_score_tests") is not None,
+    }
+    return {**body, "content_sha256": stable_hash(body)}
+
+
 def _normalize_texts(values: Sequence[Any]) -> List[str]:
-    return [str(value or "").lower() for value in values]
+    # Case/token handling belongs exclusively to the authenticated vectorizer
+    # contract. Consuming the complete supplied string here avoids a second,
+    # hidden normalization path that differs from role-neutral BoW execution.
+    return [str(value or "") for value in values]
 
 
 def _bounded_folds(requested: int, labels: np.ndarray, *, stratified: bool) -> int:
@@ -78,56 +184,46 @@ def _bounded_folds(requested: int, labels: np.ndarray, *, stratified: bool) -> i
     return max(2, min(int(requested), upper, n_rows // 2))
 
 
-def _splitter(labels: np.ndarray, folds: int, *, stratified: bool, seed: int):
+def _splitter(
+    labels: np.ndarray,
+    folds: int,
+    *,
+    stratified: bool,
+    seed: int,
+    shuffle: bool,
+):
     counts = np.unique(labels.astype(int), return_counts=True)[1] if stratified else []
+    random_state = int(seed) if bool(shuffle) else None
     if stratified and len(counts) >= 2 and int(np.min(counts)) >= int(folds):
-        return StratifiedKFold(n_splits=folds, shuffle=True, random_state=seed).split(
+        return StratifiedKFold(
+            n_splits=folds,
+            shuffle=bool(shuffle),
+            random_state=random_state,
+        ).split(
             np.zeros(len(labels)), labels.astype(int)
         )
-    return KFold(n_splits=folds, shuffle=True, random_state=seed).split(np.zeros(len(labels)))
+    return KFold(
+        n_splits=folds,
+        shuffle=bool(shuffle),
+        random_state=random_state,
+    ).split(np.zeros(len(labels)))
 
 
 def _vectorizer(view: BoWViewConfig) -> TfidfVectorizer:
-    return TfidfVectorizer(
-        lowercase=False,
-        token_pattern=r"(?u)[a-z0-9%<>+=-]+",
-        ngram_range=(int(view.ngram_range_min), int(view.ngram_range_max)),
-        min_df=int(view.min_df),
-        max_df=float(view.max_df),
-        sublinear_tf=bool(view.sublinear_tf),
-        max_features=int(view.max_features),
-        dtype=np.float32,
-    )
+    return _make_bow_vectorizer(_bow_vectorizer_params(view))
 
 
 def _classifier(view: BoWViewConfig, seed: int):
-    if view.bow_model == "linear":
-        return LogisticRegression(
-            C=float(view.logistic_c),
-            solver="liblinear",
-            max_iter=int(view.logistic_max_iter),
-            random_state=seed,
-        )
-    cls = ExtraTreesClassifier if view.bow_model == "extratrees" else RandomForestClassifier
-    return cls(
-        n_estimators=300,
-        min_samples_leaf=2,
-        max_features="sqrt",
-        random_state=seed,
-        n_jobs=1,
+    return _make_bow_classifier(
+        _bow_model_params(view),
+        random_state=int(seed),
     )
 
 
 def _regressor(view: BoWViewConfig, seed: int):
-    if view.bow_model == "linear":
-        return Ridge(alpha=float(view.ridge_alpha))
-    cls = ExtraTreesRegressor if view.bow_model == "extratrees" else RandomForestRegressor
-    return cls(
-        n_estimators=300,
-        min_samples_leaf=2,
-        max_features="sqrt",
-        random_state=seed,
-        n_jobs=1,
+    return _make_bow_regressor(
+        _bow_model_params(view),
+        random_state=int(seed),
     )
 
 
@@ -150,7 +246,11 @@ def _fit_base_predict(
     vectorizer = _vectorizer(view)
     try:
         x_fit = vectorizer.fit_transform(fit_texts)
-    except ValueError:
+    except ValueError as exc:
+        if view.empty_vocabulary_policy == "fail_closed":
+            raise ValueError(
+                f"BoW view {view.name!r} could not fit its configured vocabulary"
+            ) from exc
         return _constant_prediction(fit_values, len(predict_texts)), None, None
     model = _classifier(view, seed) if binary else _regressor(view, seed)
     model.fit(x_fit, fit_values.astype(int) if binary else fit_values)
@@ -200,15 +300,75 @@ class CrossFittedStack:
         return np.asarray(stacked, dtype=float), by_view
 
 
-def _fit_stack(meta: np.ndarray, values: np.ndarray, *, binary: bool, seed: int):
+def _configured_logistic_regression(
+    *,
+    c: float,
+    max_iter: int,
+    config: LogisticRegressionScientificConfig,
+    seed: int,
+) -> LogisticRegression:
+    return LogisticRegression(
+        penalty=config.penalty,
+        dual=bool(config.dual),
+        tol=float(config.tol),
+        C=float(c),
+        fit_intercept=bool(config.fit_intercept),
+        intercept_scaling=float(config.intercept_scaling),
+        class_weight=config.class_weight,
+        random_state=int(seed),
+        solver=str(config.solver),
+        max_iter=int(max_iter),
+        multi_class=str(config.multi_class),
+        verbose=0,
+        warm_start=bool(config.warm_start),
+        n_jobs=1,
+        l1_ratio=config.l1_ratio,
+    )
+
+
+def _configured_ridge(
+    *,
+    alpha: float,
+    config: RidgeScientificConfig,
+    seed: int,
+) -> Ridge:
+    return Ridge(
+        alpha=float(alpha),
+        fit_intercept=bool(config.fit_intercept),
+        copy_X=True,
+        max_iter=config.max_iter,
+        tol=float(config.tol),
+        solver=str(config.solver),
+        positive=bool(config.positive),
+        random_state=int(seed),
+    )
+
+
+def _fit_stack(
+    meta: np.ndarray,
+    values: np.ndarray,
+    *,
+    binary: bool,
+    seed: int,
+    config: TfidfNuisanceStackScientificConfig,
+):
     constant = float(np.mean(values))
     if meta.shape[1] == 0 or (binary and len(np.unique(values.astype(int))) < 2):
         return None, constant
     if binary:
-        model = LogisticRegression(C=1.0, solver="lbfgs", max_iter=1000, random_state=seed)
+        model = _configured_logistic_regression(
+            c=config.meta_logistic_c,
+            max_iter=config.meta_logistic_max_iter,
+            config=config.meta_logistic,
+            seed=seed,
+        )
         model.fit(meta, values.astype(int))
     else:
-        model = Ridge(alpha=1.0)
+        model = _configured_ridge(
+            alpha=config.meta_ridge_alpha,
+            config=config.meta_ridge,
+            seed=seed,
+        )
         model.fit(meta, values)
     return model, constant
 
@@ -221,6 +381,7 @@ def fit_cross_fitted_nuisance_stack(
     folds: int,
     binary: bool,
     random_state: int,
+    nuisance_stack_config: TfidfNuisanceStackScientificConfig,
 ) -> Dict[str, Any]:
     """Fit a two-level honest OOF stack within one analysis context.
 
@@ -228,6 +389,8 @@ def fit_cross_fitted_nuisance_stack(
     fitted without that fold.  The stack for that fold is itself trained on
     sub-inner OOF predictions from only the top-level fitting portion.
     """
+    if type(nuisance_stack_config) is not TfidfNuisanceStackScientificConfig:
+        raise TypeError("nuisance_stack_config must be explicitly typed")
     texts = _normalize_texts(texts)
     values = np.asarray(values, dtype=float)
     views = list(views)
@@ -239,7 +402,14 @@ def fit_cross_fitted_nuisance_stack(
     fit_ids_by_row: List[List[int]] = [[] for _ in range(n_rows)]
 
     for fold, (fit_pos, heldout_pos) in enumerate(
-        _splitter(values, fold_count, stratified=binary, seed=random_state), start=1
+        _splitter(
+            values,
+            fold_count,
+            stratified=binary,
+            seed=random_state,
+            shuffle=nuisance_stack_config.split_shuffle,
+        ),
+        start=1,
     ):
         fit_pos = np.asarray(fit_pos, dtype=int)
         heldout_pos = np.asarray(heldout_pos, dtype=int)
@@ -255,6 +425,7 @@ def fit_cross_fitted_nuisance_stack(
                     sub_folds,
                     stratified=binary,
                     seed=random_state + 1000 * fold + view_index,
+                    shuffle=nuisance_stack_config.split_shuffle,
                 ),
                 start=1,
             ):
@@ -281,7 +452,11 @@ def fit_cross_fitted_nuisance_stack(
         if not np.isfinite(meta_fit).all():
             raise RuntimeError("Nested nuisance meta-features are incomplete")
         stack_model, stack_constant = _fit_stack(
-            meta_fit, sub_values, binary=binary, seed=random_state + 30_000 + fold
+            meta_fit,
+            sub_values,
+            binary=binary,
+            seed=random_state + 30_000 + fold,
+            config=nuisance_stack_config,
         )
         held_meta = base_oof[heldout_pos]
         if stack_model is None:
@@ -299,7 +474,11 @@ def fit_cross_fitted_nuisance_stack(
         raise RuntimeError("Cross-fitted nuisance predictions are incomplete")
 
     complete_stack, complete_constant = _fit_stack(
-        base_oof, values, binary=binary, seed=random_state + 40_000
+        base_oof,
+        values,
+        binary=binary,
+        seed=random_state + 40_000,
+        config=nuisance_stack_config,
     )
     complete_bases: List[Tuple[Optional[TfidfVectorizer], Optional[Any], float]] = []
     for view_index, view in enumerate(views):
@@ -324,6 +503,7 @@ def fit_cross_fitted_nuisance_stack(
                 "folds": fold_count,
                 "binary": binary,
                 "random_state": random_state,
+                "nuisance_stack_scientific": asdict(nuisance_stack_config),
             }
         ),
     )
@@ -333,23 +513,26 @@ def fit_cross_fitted_nuisance_stack(
         "fold_ids": fold_ids,
         "fit_positions_by_row": fit_ids_by_row,
         "fitted": fitted,
-        "metrics": nuisance_metrics(values, stack_oof, binary=binary),
+        "metrics": nuisance_metrics(
+            values,
+            stack_oof,
+            binary=binary,
+            calibration_config=nuisance_stack_config.calibration,
+        ),
         "view_metrics": {
-            view.name: nuisance_metrics(values, base_oof[:, index], binary=binary)
+            view.name: nuisance_metrics(
+                values,
+                base_oof[:, index],
+                binary=binary,
+                calibration_config=nuisance_stack_config.calibration,
+            )
             for index, view in enumerate(views)
         },
     }
 
 
 def _vectorizer_key(view: BoWViewConfig) -> Tuple[Any, ...]:
-    return (
-        int(view.max_features),
-        int(view.min_df),
-        float(view.max_df),
-        int(view.ngram_range_min),
-        int(view.ngram_range_max),
-        bool(view.sublinear_tf),
-    )
+    return (stable_hash(_bow_vectorizer_params(view)),)
 
 
 def _matrix_model_prediction(
@@ -381,8 +564,11 @@ def fit_joint_cross_fitted_nuisance_stacks(
     views: Sequence[BoWViewConfig],
     folds: int,
     random_state: int,
+    nuisance_stack_config: TfidfNuisanceStackScientificConfig,
 ) -> Dict[str, Dict[str, Any]]:
     """Fit treatment/outcome stacks while sharing every label-free TF-IDF fit."""
+    if type(nuisance_stack_config) is not TfidfNuisanceStackScientificConfig:
+        raise TypeError("nuisance_stack_config must be explicitly typed")
     texts = _normalize_texts(texts)
     targets = {
         "treatment": (np.asarray(treatment, dtype=float), True),
@@ -401,7 +587,14 @@ def fit_joint_cross_fitted_nuisance_stacks(
         grouped.setdefault(_vectorizer_key(view), []).append((index, view))
 
     for fold, (fit_pos, heldout_pos) in enumerate(
-        _splitter(split_labels, fold_count, stratified=True, seed=random_state), start=1
+        _splitter(
+            split_labels,
+            fold_count,
+            stratified=True,
+            seed=random_state,
+            shuffle=nuisance_stack_config.split_shuffle,
+        ),
+        start=1,
     ):
         fit_pos = np.asarray(fit_pos, dtype=int)
         heldout_pos = np.asarray(heldout_pos, dtype=int)
@@ -416,6 +609,7 @@ def fit_joint_cross_fitted_nuisance_stacks(
                 sub_folds,
                 stratified=True,
                 seed=random_state + 1000 * fold,
+                shuffle=nuisance_stack_config.split_shuffle,
             ),
             start=1,
         ):
@@ -428,7 +622,12 @@ def fit_joint_cross_fitted_nuisance_stacks(
                 try:
                     x_sub_fit = vectorizer.fit_transform([texts[index] for index in sub_fit_pos])
                     x_sub_hold = vectorizer.transform([texts[index] for index in sub_hold_pos])
-                except ValueError:
+                except ValueError as exc:
+                    if group_views[0][1].empty_vocabulary_policy == "fail_closed":
+                        raise ValueError(
+                            "joint nuisance subfold could not fit the configured "
+                            f"vocabulary for view {group_views[0][1].name!r}"
+                        ) from exc
                     x_sub_fit = x_sub_hold = None
                 for view_index, view in group_views:
                     for target_index, (target, (values, binary)) in enumerate(targets.items()):
@@ -459,7 +658,12 @@ def fit_joint_cross_fitted_nuisance_stacks(
             try:
                 x_fit = vectorizer.fit_transform([texts[index] for index in fit_pos])
                 x_heldout = vectorizer.transform([texts[index] for index in heldout_pos])
-            except ValueError:
+            except ValueError as exc:
+                if group_views[0][1].empty_vocabulary_policy == "fail_closed":
+                    raise ValueError(
+                        "joint nuisance fold could not fit the configured "
+                        f"vocabulary for view {group_views[0][1].name!r}"
+                    ) from exc
                 x_fit = x_heldout = None
             for view_index, view in group_views:
                 for target_index, (target, (values, binary)) in enumerate(targets.items()):
@@ -490,6 +694,7 @@ def fit_joint_cross_fitted_nuisance_stacks(
                 values[fit_pos],
                 binary=binary,
                 seed=random_state + 40_000 + 10 * fold + target_index,
+                config=nuisance_stack_config,
             )
             held_meta = base_oof[target][heldout_pos]
             if stack_model is None:
@@ -511,7 +716,12 @@ def fit_joint_cross_fitted_nuisance_stacks(
         vectorizer = _vectorizer(group_views[0][1])
         try:
             x_full = vectorizer.fit_transform(texts)
-        except ValueError:
+        except ValueError as exc:
+            if group_views[0][1].empty_vocabulary_policy == "fail_closed":
+                raise ValueError(
+                    "joint nuisance full fit could not fit the configured "
+                    f"vocabulary for view {group_views[0][1].name!r}"
+                ) from exc
             vectorizer = None
             x_full = None
         for view_index, view in group_views:
@@ -545,6 +755,7 @@ def fit_joint_cross_fitted_nuisance_stacks(
             values,
             binary=binary,
             seed=random_state + 60_000 + target_index,
+            config=nuisance_stack_config,
         )
         fitted = CrossFittedStack(
             views=views,
@@ -559,6 +770,9 @@ def fit_joint_cross_fitted_nuisance_stacks(
                     "target": target,
                     "joint_label_free_vectorization": True,
                     "random_state": random_state,
+                    "nuisance_stack_scientific": asdict(
+                        nuisance_stack_config
+                    ),
                 }
             ),
         )
@@ -568,22 +782,85 @@ def fit_joint_cross_fitted_nuisance_stacks(
             "fold_ids": fold_ids.copy(),
             "fit_positions_by_row": [list(values) for values in fit_positions_by_row],
             "fitted": fitted,
-            "metrics": nuisance_metrics(values, stack_oof[target], binary=binary),
+            "metrics": nuisance_metrics(
+                values,
+                stack_oof[target],
+                binary=binary,
+                calibration_config=nuisance_stack_config.calibration,
+            ),
             "view_metrics": {
-                view.name: nuisance_metrics(values, base_oof[target][:, index], binary=binary)
+                view.name: nuisance_metrics(
+                    values,
+                    base_oof[target][:, index],
+                    binary=binary,
+                    calibration_config=nuisance_stack_config.calibration,
+                )
                 for index, view in enumerate(views)
             },
         }
     return output
 
 
-def calibration_intercept_slope(labels: np.ndarray, probabilities: np.ndarray) -> Tuple[Any, Any]:
+def legacy_tfidf_nuisance_stack_v1() -> TfidfNuisanceStackScientificConfig:
+    """Historical stack/constant behavior for explicitly legacy callers only."""
+
+    return TfidfNuisanceStackScientificConfig(
+        empty_vocabulary_policy="empirical_mean_constant",
+    )
+
+
+def legacy_tfidf_views_with_screening_v1(
+    views: Sequence[BoWViewConfig],
+    *,
+    config: TfidfTopicDiscoveryConfig,
+) -> tuple[BoWViewConfig, ...]:
+    """Add the historical implicit screen view for named legacy callers only."""
+
+    copied = tuple(views)
+    source = config.screening_scientific.model_source_view_name
+    if any(view.name == source for view in copied):
+        return copied
+    return (
+        *copied,
+        BoWViewConfig(
+            name=source,
+            max_features=config.max_features,
+            min_df=config.min_df,
+            max_df=config.max_df,
+            ngram_range_min=1,
+            ngram_range_max=3,
+            sublinear_tf=config.sublinear_tf,
+            bow_model="linear",
+            empty_vocabulary_policy="empirical_mean_constant",
+            unsupported_sample_weight_policy=(
+                "unweighted_legacy_compatibility"
+            ),
+        ),
+    )
+
+
+def calibration_intercept_slope(
+    labels: np.ndarray,
+    probabilities: np.ndarray,
+    *,
+    config: NuisanceCalibrationScientificConfig,
+) -> Tuple[Any, Any]:
     labels = np.asarray(labels, dtype=int)
-    probabilities = np.clip(np.asarray(probabilities, dtype=float), 1e-6, 1.0 - 1e-6)
+    epsilon = float(config.probability_clip_epsilon)
+    probabilities = np.clip(
+        np.asarray(probabilities, dtype=float),
+        epsilon,
+        1.0 - epsilon,
+    )
     if len(np.unique(labels)) < 2:
         return None, None
     logits = np.log(probabilities / (1.0 - probabilities)).reshape(-1, 1)
-    model = LogisticRegression(C=1e6, solver="lbfgs", max_iter=1000)
+    model = _configured_logistic_regression(
+        c=config.logistic_c,
+        max_iter=config.logistic_max_iter,
+        config=config.logistic,
+        seed=0,
+    )
     try:
         model.fit(logits, labels)
     except ValueError:
@@ -592,10 +869,16 @@ def calibration_intercept_slope(labels: np.ndarray, probabilities: np.ndarray) -
 
 
 def expected_calibration_error(
-    labels: np.ndarray, probabilities: np.ndarray, *, n_bins: int = 10
+    labels: np.ndarray,
+    probabilities: np.ndarray,
+    *,
+    config: NuisanceCalibrationScientificConfig,
 ) -> float:
     labels = np.asarray(labels, dtype=float)
     probabilities = np.clip(np.asarray(probabilities, dtype=float), 0.0, 1.0)
+    if config.ece_strategy != "uniform_width":
+        raise ValueError("unsupported ECE strategy")
+    n_bins = int(config.ece_bins)
     edges = np.linspace(0.0, 1.0, int(n_bins) + 1)
     bins = np.minimum(np.digitize(probabilities, edges[1:-1]), n_bins - 1)
     error = 0.0
@@ -609,7 +892,11 @@ def expected_calibration_error(
 
 
 def nuisance_metrics(
-    values: np.ndarray, predictions: np.ndarray, *, binary: bool
+    values: np.ndarray,
+    predictions: np.ndarray,
+    *,
+    binary: bool,
+    calibration_config: NuisanceCalibrationScientificConfig,
 ) -> Dict[str, Any]:
     values = np.asarray(values, dtype=float)
     predictions = np.asarray(predictions, dtype=float)
@@ -618,19 +905,28 @@ def nuisance_metrics(
             "rmse": float(np.sqrt(mean_squared_error(values, predictions))),
             "mae": float(mean_absolute_error(values, predictions)),
         }
-    probabilities = np.clip(predictions, 1e-6, 1.0 - 1e-6)
+    epsilon = float(calibration_config.probability_clip_epsilon)
+    probabilities = np.clip(predictions, epsilon, 1.0 - epsilon)
     try:
         auroc = float(roc_auc_score(values.astype(int), probabilities))
     except ValueError:
         auroc = None
-    intercept, slope = calibration_intercept_slope(values, probabilities)
+    intercept, slope = calibration_intercept_slope(
+        values,
+        probabilities,
+        config=calibration_config,
+    )
     return {
         "auroc": auroc,
         "brier": float(brier_score_loss(values.astype(int), probabilities)),
         "log_loss": float(log_loss(values.astype(int), probabilities, labels=[0, 1])),
         "calibration_intercept": intercept,
         "calibration_slope": slope,
-        "ece": expected_calibration_error(values, probabilities),
+        "ece": expected_calibration_error(
+            values,
+            probabilities,
+            config=calibration_config,
+        ),
     }
 
 
@@ -691,26 +987,25 @@ def unsigned_linear_screen(
     values: Sequence[float],
     *,
     binary: bool,
-    logistic_c: float = 1.0,
-    ridge_alpha: float = 10.0,
-    random_state: int = 42,
+    view: BoWViewConfig,
+    random_state: int,
 ) -> pd.DataFrame:
     """Return unsigned selection importance while preserving coefficient sign."""
+    if type(view) is not BoWViewConfig or view.bow_model != "linear":
+        raise ValueError("linear screen requires an explicit configured linear view")
     x = sparse.csr_matrix(matrix)
     values = np.asarray(values, dtype=float)
     if binary:
         if len(np.unique(values.astype(int))) < 2:
             coefficients = np.zeros(x.shape[1], dtype=float)
         else:
-            model = LogisticRegression(
-                C=float(logistic_c),
-                solver="liblinear",
-                max_iter=1000,
-                random_state=random_state,
-            ).fit(x, values.astype(int))
+            model = _classifier(view, random_state).fit(
+                x,
+                values.astype(int),
+            )
             coefficients = np.asarray(model.coef_).reshape(-1)
     else:
-        model = Ridge(alpha=float(ridge_alpha)).fit(x, values)
+        model = _regressor(view, random_state).fit(x, values)
         coefficients = np.asarray(model.coef_).reshape(-1)
     frame = pd.DataFrame(
         {
@@ -721,6 +1016,37 @@ def unsigned_linear_screen(
     )
     return frame.sort_values(
         ["unsigned_score", "feature"], ascending=[False, True], ignore_index=True
+    )
+
+
+def legacy_unsigned_linear_screen_v1(
+    matrix: Any,
+    feature_names: Sequence[str],
+    values: Sequence[float],
+    *,
+    binary: bool,
+    logistic_c: float = 1.0,
+    ridge_alpha: float = 10.0,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Historical direct screen for explicitly non-production callers."""
+
+    view = BoWViewConfig(
+        name="legacy_unsigned_linear_screen_v1",
+        bow_model="linear",
+        logistic_c=float(logistic_c),
+        logistic_max_iter=1000,
+        ridge_alpha=float(ridge_alpha),
+        empty_vocabulary_policy="empirical_mean_constant",
+        unsupported_sample_weight_policy="unweighted_legacy_compatibility",
+    )
+    return unsigned_linear_screen(
+        matrix,
+        feature_names,
+        values,
+        binary=binary,
+        view=view,
+        random_state=int(random_state),
     )
 
 
@@ -741,8 +1067,7 @@ def add_linear_stability(
     binary: bool,
     strata: np.ndarray,
     config: TfidfTopicDiscoveryConfig,
-    logistic_c: float,
-    ridge_alpha: float,
+    view: BoWViewConfig,
     random_state: int,
 ) -> pd.DataFrame:
     result = screen.copy()
@@ -761,8 +1086,7 @@ def add_linear_stability(
             result["feature"].tolist(),
             values[positions],
             binary=binary,
-            logistic_c=logistic_c,
-            ridge_alpha=ridge_alpha,
+            view=view,
             random_state=random_state + repeat + 1,
         )
         for rank, row in sample.iterrows():
@@ -775,8 +1099,13 @@ def add_linear_stability(
     result["selection_stability"] = selection / divisor
     result["rank_stability"] = rank_score / divisor
     result["sign_stability"] = np.abs(signs) / divisor
+    screening = config.screening_scientific
     result["combined_importance"] = result["unsigned_score"] * (
-        0.5 + 0.25 * result["selection_stability"] + 0.25 * result["rank_stability"]
+        float(screening.linear_base_weight)
+        + float(screening.linear_selection_stability_weight)
+        * result["selection_stability"]
+        + float(screening.linear_rank_stability_weight)
+        * result["rank_stability"]
     )
     return result.sort_values(
         ["combined_importance", "unsigned_score", "feature"],
@@ -863,11 +1192,15 @@ def add_effect_stability(
         & (result["subsample_selection_stability"] >= config.minimum_subsample_selection_fraction)
         & (result["tail_contrast_sign_agreement"] >= config.minimum_tail_sign_agreement)
     )
+    screening = config.screening_scientific
     result["combined_importance"] = result["unsigned_score"] * (
-        0.4
-        + 0.2 * result["nuisance_source_agreement"]
-        + 0.2 * result["subsample_selection_stability"]
-        + 0.2 * result["subsample_sign_agreement"]
+        float(screening.effect_base_weight)
+        + float(screening.effect_nuisance_agreement_weight)
+        * result["nuisance_source_agreement"]
+        + float(screening.effect_selection_stability_weight)
+        * result["subsample_selection_stability"]
+        + float(screening.effect_sign_stability_weight)
+        * result["subsample_sign_agreement"]
     )
     return result.sort_values(
         ["eligible", "combined_importance", "unsigned_score", "feature"],
@@ -905,6 +1238,7 @@ class ConsensusNMFTopicBank:
     topic_terms: List[List[Dict[str, Any]]]
     requested_components: int
     actual_components: int
+    terms_per_topic: int
     seeds: List[int]
     reduction_reason: Optional[str] = None
 
@@ -951,7 +1285,13 @@ class ConsensusNMFTopicBank:
         positive = importance[np.isfinite(importance) & (importance > 0.0)]
         median = float(np.median(positive)) if len(positive) else 1.0
         weights = np.clip(
-            np.sqrt(np.maximum(importance, 0.0) / max(median, 1e-12)),
+            np.sqrt(
+                np.maximum(importance, 0.0)
+                / max(
+                    median,
+                    float(config.nmf_scientific.importance_scale_epsilon),
+                )
+            ),
             config.importance_weight_min,
             config.importance_weight_max,
         )
@@ -978,6 +1318,11 @@ class ConsensusNMFTopicBank:
                 max_iter=config.nmf_max_iter,
                 tol=config.nmf_tol,
                 random_state=int(seed),
+                alpha_W=float(config.nmf_scientific.alpha_w),
+                alpha_H=config.nmf_scientific.alpha_h,
+                l1_ratio=float(config.nmf_scientific.l1_ratio),
+                verbose=0,
+                shuffle=bool(config.nmf_scientific.shuffle),
             )
             w = model.fit_transform(weighted)
             h = np.asarray(model.components_, dtype=float)
@@ -1019,8 +1364,9 @@ class ConsensusNMFTopicBank:
                 )
                 if len(topic_rows) == config.terms_per_topic:
                     break
-            # A tiny selected set can still yield a traceable 15-term label
-            # prompt by appending the highest-ranked zero-loading vocabulary.
+            # A selected set smaller than the configured evidence capacity can
+            # still yield a complete traceable prompt by appending the
+            # highest-ranked zero-loading vocabulary.
             for name in all_ranked_names:
                 if len(topic_rows) == config.terms_per_topic:
                     break
@@ -1035,6 +1381,13 @@ class ConsensusNMFTopicBank:
                         "signed_score": float(score_by_name.loc[name, "signed_score"]),
                     }
                 )
+            if len(topic_rows) != int(config.terms_per_topic):
+                raise ValueError(
+                    f"{bank_name} topic {topic_index + 1} could account for only "
+                    f"{len(topic_rows)} of configured terms_per_topic="
+                    f"{int(config.terms_per_topic)}; refusing a partial topic "
+                    "evidence record"
+                )
             terms.append(topic_rows)
         bank = cls(
             bank_name=bank_name,
@@ -1048,6 +1401,7 @@ class ConsensusNMFTopicBank:
             topic_terms=terms,
             requested_components=int(config.topic_count),
             actual_components=int(actual),
+            terms_per_topic=int(config.terms_per_topic),
             seeds=list(config.topic_seeds),
             reduction_reason=reason,
         )
@@ -1063,10 +1417,22 @@ class ConsensusNMFTopicBank:
         return np.mean(np.stack(aligned), axis=0)
 
     def metadata(self) -> Dict[str, Any]:
+        if (
+            int(self.terms_per_topic) < 1
+            or any(
+                len(topic_terms) != int(self.terms_per_topic)
+                for topic_terms in self.topic_terms
+            )
+        ):
+            raise RuntimeError(
+                "fitted topic bank does not contain the configured complete "
+                "term evidence"
+            )
         return {
             "bank": self.bank_name,
             "requested_topic_count": self.requested_components,
             "actual_topic_count": self.actual_components,
+            "terms_per_topic": int(self.terms_per_topic),
             "component_reduction_reason": self.reduction_reason,
             "seeds": self.seeds,
             "selected_term_count": int(len(self.selected_indices)),
@@ -1077,6 +1443,7 @@ class ConsensusNMFTopicBank:
                 {
                     "topic_id": f"{self.bank_name}_topic_{index + 1:03d}",
                     "bank": self.bank_name,
+                    "terms_per_topic": int(self.terms_per_topic),
                     "terms": topic_terms,
                 }
                 for index, topic_terms in enumerate(self.topic_terms)
@@ -1098,16 +1465,7 @@ class FittedTopicContext:
 
 
 def _common_vectorizer(config: TfidfTopicDiscoveryConfig) -> TfidfVectorizer:
-    return TfidfVectorizer(
-        lowercase=False,
-        token_pattern=r"(?u)[a-z0-9%<>+=-]+",
-        ngram_range=(config.ngram_range_min, config.ngram_range_max),
-        min_df=config.min_df,
-        max_df=config.max_df,
-        sublinear_tf=config.sublinear_tf,
-        max_features=config.max_features,
-        dtype=np.float32,
-    )
+    return _make_bow_vectorizer(asdict(config.vectorizer_scientific))
 
 
 def _strata(treatment: np.ndarray, outcome: np.ndarray, *, outcome_binary: bool) -> np.ndarray:
@@ -1132,6 +1490,7 @@ def compact_topic_score_tests(score_tests: Mapping[str, Any]) -> Dict[str, Any]:
         "schema_version": score_tests.get("schema_version", TOPIC_SCORE_TEST_SCHEMA_VERSION),
         "status": score_tests.get("status", "not_run"),
         "reason": score_tests.get("reason"),
+        "terms_per_topic": score_tests.get("terms_per_topic"),
         "uses_heldout_treatment_and_outcome": bool(
             score_tests.get("uses_heldout_treatment_and_outcome", False)
         ),
@@ -1257,6 +1616,7 @@ def fit_tfidf_topic_context(
         views=views,
         folds=nuisance_folds,
         random_state=config.random_state + 101,
+        nuisance_stack_config=config.nuisance_stack_scientific,
     )
     treatment_result = joint_nuisance["treatment"]
     outcome_result = joint_nuisance["outcome"]
@@ -1268,32 +1628,31 @@ def fit_tfidf_topic_context(
     common_heldout = vectorizer.transform(heldout_texts)
     feature_names = vectorizer.get_feature_names_out()
 
-    linear_view = next(
-        (
-            view
-            for view in views
-            if view.bow_model == "linear"
-            and view.ngram_range_min == 1
-            and view.ngram_range_max == 3
-        ),
-        BoWViewConfig(
-            name="linear_1_3_topic_basis",
-            max_features=config.max_features,
-            min_df=config.min_df,
-            max_df=config.max_df,
-            ngram_range_min=1,
-            ngram_range_max=3,
-            sublinear_tf=config.sublinear_tf,
-            bow_model="linear",
-        ),
-    )
+    screening_view_name = config.screening_scientific.model_source_view_name
+    matching_views = [
+        view for view in views if view.name == screening_view_name
+    ]
+    if len(matching_views) != 1:
+        raise ValueError(
+            "TF-IDF screening requires exactly one explicitly configured "
+            f"BoW view named {screening_view_name!r}"
+        )
+    linear_view = matching_views[0]
+    if (
+        linear_view.bow_model != "linear"
+        or linear_view.ngram_range_min != 1
+        or linear_view.ngram_range_max != 3
+    ):
+        raise ValueError(
+            "TF-IDF screening source must be a configured linear 1-3-gram view"
+        )
     treatment_scores = add_linear_stability(
         unsigned_linear_screen(
             common_fit,
             feature_names,
             treatment,
             binary=True,
-            logistic_c=linear_view.logistic_c,
+            view=linear_view,
             random_state=config.random_state + 301,
         ),
         common_fit,
@@ -1301,8 +1660,7 @@ def fit_tfidf_topic_context(
         binary=True,
         strata=strata,
         config=config,
-        logistic_c=linear_view.logistic_c,
-        ridge_alpha=linear_view.ridge_alpha,
+        view=linear_view,
         random_state=config.random_state + 311,
     )
     treatment_scores["eligible"] = True
@@ -1312,8 +1670,7 @@ def fit_tfidf_topic_context(
             feature_names,
             outcome,
             binary=outcome_binary,
-            logistic_c=linear_view.logistic_c,
-            ridge_alpha=linear_view.ridge_alpha,
+            view=linear_view,
             random_state=config.random_state + 401,
         ),
         common_fit,
@@ -1321,8 +1678,7 @@ def fit_tfidf_topic_context(
         binary=outcome_binary,
         strata=strata,
         config=config,
-        logistic_c=linear_view.logistic_c,
-        ridge_alpha=linear_view.ridge_alpha,
+        view=linear_view,
         random_state=config.random_state + 411,
     )
     outcome_scores["eligible"] = True
@@ -1364,6 +1720,11 @@ def fit_tfidf_topic_context(
     bank_metadata: Dict[str, Dict[str, Any]] = {}
     score_paths: Dict[str, str] = {}
     for bank_name, score_frame in score_frames.items():
+        eligible_count = int(
+            score_frame["eligible"].astype(bool).sum()
+            if "eligible" in score_frame
+            else len(score_frame)
+        )
         score_path = artifact_dir / f"{bank_name}_ngram_scores.parquet"
         score_frame.to_parquet(score_path, index=False)
         score_paths[bank_name] = str(score_path)
@@ -1379,7 +1740,14 @@ def fit_tfidf_topic_context(
                 "bank": bank_name,
                 "requested_topic_count": config.topic_count,
                 "actual_topic_count": 0,
+                "terms_per_topic": int(config.terms_per_topic),
                 "weak_or_unstable_raw_evidence": bank_name == "effect",
+                "eligible_candidate_count": eligible_count,
+                "selected_candidate_count": 0,
+                "discarded_candidate_count": eligible_count,
+                "selection_rule": (
+                    "eligible_combined_importance_then_configured_top_fraction"
+                ),
                 "topics": [],
             }
             continue
@@ -1388,11 +1756,26 @@ def fit_tfidf_topic_context(
         heldout_topic_values[bank_name] = bank.transform(common_heldout)
         bank_metadata[bank_name] = bank.metadata()
         bank_metadata[bank_name]["weak_or_unstable_raw_evidence"] = False
+        selected_count = int(len(bank.selected_indices))
+        bank_metadata[bank_name].update(
+            {
+                "eligible_candidate_count": eligible_count,
+                "selected_candidate_count": selected_count,
+                "discarded_candidate_count": max(
+                    0,
+                    eligible_count - selected_count,
+                ),
+                "selection_rule": (
+                    "eligible_combined_importance_then_configured_top_fraction"
+                ),
+            }
+        )
 
     topic_score_tests: Dict[str, Any] = {
         "schema_version": TOPIC_SCORE_TEST_SCHEMA_VERSION,
         "status": "not_run",
         "reason": "heldout_labels_reserved_or_score_tests_disabled",
+        "terms_per_topic": int(config.terms_per_topic),
         "uses_heldout_treatment_and_outcome": False,
         "banks": {},
     }
@@ -1435,12 +1818,20 @@ def fit_tfidf_topic_context(
         topic_banks=topic_banks,
         config_hash=stable_hash(asdict(config)),
     )
-    model_path = artifact_dir / "fitted_context.joblib"
-    joblib.dump(fitted, model_path)
-    fit_topics_path = artifact_dir / "fit_topic_values.npz"
-    heldout_topics_path = artifact_dir / "heldout_topic_values.npz"
-    np.savez_compressed(fit_topics_path, **fit_topic_values)
-    np.savez_compressed(heldout_topics_path, **heldout_topic_values)
+    model_path = write_fitted_topic_context(
+        fitted,
+        artifact_dir / "fitted_context",
+    )
+    fit_topics_path = write_named_array_bank(
+        fit_topic_values,
+        artifact_dir / "fit_topic_values",
+        row_count=len(fit_df),
+    )
+    heldout_topics_path = write_named_array_bank(
+        heldout_topic_values,
+        artifact_dir / "heldout_topic_values",
+        row_count=len(heldout_df),
+    )
 
     fit_row_ids = fit_df["_oci_row_id"].astype(int).tolist()
     heldout_row_ids = heldout_df["_oci_row_id"].astype(int).tolist()
@@ -1489,6 +1880,19 @@ def fit_tfidf_topic_context(
         "config_hash": fitted.config_hash,
         "common_vocabulary_size": int(len(feature_names)),
         "common_vocabulary": feature_names.astype(str).tolist(),
+        "common_vocabulary_selection": {
+            "selected_term_count": int(len(feature_names)),
+            "configured_max_features": int(config.max_features),
+            "selection_rule": (
+                config.vectorizer_scientific.feature_selection_rule
+            ),
+            "complete_input_text_consumed": True,
+        },
+        "nuisance_stack_scientific": asdict(
+            config.nuisance_stack_scientific
+        ),
+        "screening_scientific": asdict(config.screening_scientific),
+        "nmf_scientific": asdict(config.nmf_scientific),
         "nuisance": {
             "treatment": {
                 "stacked_metrics": treatment_result["metrics"],
@@ -1515,6 +1919,9 @@ def fit_tfidf_topic_context(
             ),
         },
     }
+    metadata["artifact_inventory"] = tfidf_context_artifact_inventory(
+        metadata["artifacts"]
+    )
     metadata_path = artifact_dir / "context_metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
     return metadata

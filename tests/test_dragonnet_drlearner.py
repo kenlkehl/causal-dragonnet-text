@@ -175,7 +175,7 @@ def test_htr_role_attention_oneoff_defaults_are_not_tiny(monkeypatch):
     assert config.htr_role_attention is True
     assert config.htr_w_attention_heads == 4
     assert config.htr_x_attention_heads == 4
-    assert config.htr_max_chunks == 256
+    assert config.htr_max_chunks == 512
     assert config.htr_chunk_size_words == 128
     assert config.htr_max_chunk_length == 192
     assert _effective_word_capacity(

@@ -41,6 +41,7 @@ import torch.nn as nn
 
 from .gated_attention_pooling import GatedAttentionPooling
 from .gpu_hidden_state_store import _get_hidden_size
+from .lossless_tokenization import tokenize_losslessly
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,9 @@ class FrozenLLMPoolerExtractor(nn.Module):
         self._downprojection_dim = downprojection_dim
         self._skip_llm = skip_llm
         self._chat_template_prompt = chat_template_prompt
+
+        if isinstance(max_length, bool) or not isinstance(max_length, int) or max_length < 1:
+            raise ValueError("max_length must be a positive integer")
 
         if skip_llm:
             # Cached mode: no LLM loaded, use provided hidden_size
@@ -299,12 +303,13 @@ class FrozenLLMPoolerExtractor(nn.Module):
         # Apply chat template if configured
         texts = self._prepare_texts(texts)
 
-        # Tokenize with right padding
-        encoding = self._tokenizer(
+        # The configured maximum is a capacity check, not a truncation policy.
+        encoding = tokenize_losslessly(
+            self._tokenizer,
             texts,
+            configured_max_length=self._max_length,
+            context="FrozenLLMPoolerExtractor input",
             padding=True,
-            truncation=True,
-            max_length=self._max_length,
             return_tensors="pt",
         )
 
@@ -485,10 +490,11 @@ class FrozenLLMPoolerExtractor(nn.Module):
 
         prepared_texts = self._prepare_texts(texts)
         for i, text in enumerate(prepared_texts):
-            encoding = self._tokenizer(
+            encoding = tokenize_losslessly(
+                self._tokenizer,
                 text,
-                truncation=True,
-                max_length=self._max_length,
+                configured_max_length=self._max_length,
+                context="FrozenLLMPoolerExtractor attention input",
                 return_tensors="pt",
             )
             tokens = self._tokenizer.convert_ids_to_tokens(encoding['input_ids'][0])

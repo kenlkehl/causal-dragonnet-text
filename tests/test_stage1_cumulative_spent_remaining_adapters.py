@@ -214,7 +214,13 @@ def tfidf_case(tmp_path_factory):
 def _clone_tfidf_component(case, target: Path):
     native = target / "native"
     first = case["emissions"][TFIDF_TOPICS]
-    shutil.copytree(Path(first.native_metadata_path).parent, native)
+    source_native = Path(first.native_metadata_path).parent.resolve(strict=True)
+    shutil.copytree(source_native, native)
+
+    def relocated(value: str) -> str:
+        relative = Path(value).resolve(strict=True).relative_to(source_native)
+        return str(native / relative)
+
     metadata_path = native / "context_metadata.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     artifacts = metadata["artifacts"]
@@ -226,9 +232,9 @@ def _clone_tfidf_component(case, target: Path):
         "topic_score_tests",
     ):
         if artifacts.get(key):
-            artifacts[key] = str(native / Path(artifacts[key]).name)
+            artifacts[key] = relocated(artifacts[key])
     artifacts["ngram_scores"] = {
-        key: str(native / Path(value).name) for key, value in artifacts["ngram_scores"].items()
+        key: relocated(value) for key, value in artifacts["ngram_scores"].items()
     }
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     metadata_sha256 = remaining_module.native_artifact_sha256(metadata_path)
@@ -246,8 +252,8 @@ def _clone_tfidf_component(case, target: Path):
         output[family] = replace(
             emission,
             native_metadata_path=str(metadata_path),
-            model_artifact_path=str(native / Path(emission.model_artifact_path).name),
-            source_artifact_path=str(native / Path(emission.source_artifact_path).name),
+            model_artifact_path=relocated(emission.model_artifact_path),
+            source_artifact_path=relocated(emission.source_artifact_path),
             execution_record_path=str(record_path),
             execution_artifact_sha256=execution_sha256,
         )
@@ -405,7 +411,7 @@ def test_tfidf_catalog_provenance_uses_canonical_sealed_rows(
         ("label", "scope or labels|partition labels"),
         ("schema", "closed schema|scope or labels"),
         ("fingerprint", "scope or labels"),
-        ("cluster", "malformed cluster"),
+        ("cluster", "artifact inventory|malformed cluster"),
         ("duplicate_record", "duplicate JSON key"),
     ),
 )

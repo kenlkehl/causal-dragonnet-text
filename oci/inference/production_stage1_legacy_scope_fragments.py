@@ -30,6 +30,13 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from .all_evidence_discovery_interfaces import (
+    ACTIVE_STAGE1_CONCEPT_FAMILIES,
+    ACTIVE_STAGE1_CONCEPT_FAMILY_SET,
+)
+from .lossless_stage1_evidence_catalog import (
+    NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION,
+)
 from .production_stage1_scope_scheduler import Stage1ScopePlan, Stage1ScopeSpec
 
 LEGACY_STAGE1_SCOPE_ACCUMULATOR_SCHEMA = "production_legacy_stage1_scope_accumulator_v1"
@@ -38,12 +45,36 @@ LEGACY_STAGE1_FRAGMENT_MERGE_SCHEMA = "production_legacy_stage1_fragment_merge_v
 LEGACY_STAGE1_FRAGMENT_MERGE_ACCUMULATORS_SCHEMA = (
     "production_legacy_stage1_fragment_merge_accumulators_v1"
 )
+LEGACY_STAGE1_ROLE_NEUTRAL_PHYSICAL_FIT_SCHEMA = (
+    "production_legacy_stage1_role_neutral_physical_fit_v2"
+)
+LEGACY_STAGE1_LOGICAL_EVIDENCE_VIEW_SCHEMA = (
+    "production_legacy_stage1_logical_evidence_view_v2"
+)
+LEGACY_STAGE1_ROLE_NEUTRAL_BINDING_SET_SCHEMA = (
+    "production_legacy_stage1_role_neutral_binding_set_v2"
+)
+LEGACY_STAGE1_ROLE_NEUTRAL_PHYSICAL_PAYLOAD_SCHEMA = (
+    "production_legacy_stage1_role_neutral_physical_payload_v2"
+)
+LEGACY_STAGE1_LOGICAL_VIEW_ARTIFACT_SCHEMA = (
+    "production_legacy_stage1_logical_view_artifact_v2"
+)
+LEGACY_STAGE1_ROLE_NEUTRAL_PERSISTED_SET_SCHEMA = (
+    "production_legacy_stage1_role_neutral_persisted_set_v2"
+)
+LEGACY_STAGE1_FIT_ONLY_FAMILY_SEAL_SCHEMA = (
+    "production_legacy_stage1_fit_only_family_seal_v2"
+)
 
 _FRAGMENT_MANIFEST_NAME = "fragment_manifest.json"
 _ACCUMULATOR_NAME = "scope_accumulator.json"
 _ARTIFACT_DIRECTORY_NAME = "artifacts"
 _MERGE_MANIFEST_NAME = "merge_manifest.json"
 _MERGE_ACCUMULATORS_NAME = "scope_accumulators.json"
+_ROLE_NEUTRAL_MANIFEST_NAME = "role_neutral_binding_set.json"
+_ROLE_NEUTRAL_PHYSICAL_DIRECTORY = "physical_fit_payloads"
+_ROLE_NEUTRAL_LOGICAL_DIRECTORY = "logical_views"
 _HEX = frozenset("0123456789abcdef")
 
 
@@ -420,6 +451,1095 @@ class LegacyStage1ScopeFragment:
         }
 
 
+def build_role_neutral_fit_only_family_seal(
+    *,
+    plan: Stage1ScopePlan,
+    physical_owner_scope_id: str,
+    family: str,
+    evidence_payload: Mapping[str, Any],
+    producer_identity_sha256: str,
+    configuration_identity_sha256: str,
+    fit_state_artifact_sha256: str,
+) -> dict[str, Any]:
+    """Seal one family's fit-only result before any logical-view transform.
+
+    This is the worker-facing contract. A native producer must call it only
+    after its fit-side state and evidence payload are immutable and before it
+    receives registered held-out text. The parent accepts only the resulting
+    closed record; an opaque audit digest is insufficient.
+    """
+
+    if not isinstance(plan, Stage1ScopePlan):
+        raise TypeError("plan must be a Stage1ScopePlan")
+    owner = plan.scope(str(physical_owner_scope_id))
+    if plan.physical_owner(owner.scope_id).scope_id != owner.scope_id:
+        raise ValueError("fit-only family seal must belong to a physical owner")
+    family_name = str(family)
+    if family_name not in ACTIVE_STAGE1_CONCEPT_FAMILY_SET:
+        raise ValueError("fit-only family seal names an inactive family")
+    closed = _closed_json(
+        dict(evidence_payload),
+        path=f"{owner.scope_id}.{family_name}.evidence_payload",
+    )
+    if (
+        not isinstance(closed, dict)
+        or set(closed)
+        != {"schema_version", "family", "architecture_evidence"}
+        or closed.get("schema_version")
+        != NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION
+        or closed.get("family") != family_name
+        or not isinstance(closed.get("architecture_evidence"), list)
+        or not closed["architecture_evidence"]
+    ):
+        raise ValueError("fit-only family seal requires one nonempty native payload")
+    producer_id = _require_sha256(
+        producer_identity_sha256,
+        label=f"{family_name} producer identity SHA-256",
+    )
+    configuration_id = _require_sha256(
+        configuration_identity_sha256,
+        label=f"{family_name} configuration identity SHA-256",
+    )
+    fit_state_id = _require_sha256(
+        fit_state_artifact_sha256,
+        label=f"{family_name} fit-state artifact SHA-256",
+    )
+    payload_id = _sha256_json(closed)
+    scope = owner.as_dict()
+    events = [
+        {
+            "sequence": 1,
+            "event": "fit_completed",
+            "fit_state_artifact_sha256": fit_state_id,
+            "registered_heldout_text_accessed": False,
+            "registered_heldout_labels_accessed": False,
+            "oracle_fields_accessed": False,
+        },
+        {
+            "sequence": 2,
+            "event": "fit_family_artifact_sealed",
+            "fit_state_artifact_sha256": fit_state_id,
+            "evidence_payload_sha256": payload_id,
+            "registered_heldout_text_accessed": False,
+            "registered_heldout_labels_accessed": False,
+            "oracle_fields_accessed": False,
+        },
+    ]
+    body = {
+        "schema_version": LEGACY_STAGE1_FIT_ONLY_FAMILY_SEAL_SCHEMA,
+        "plan_scientific_content_sha256": plan.scientific_content_sha256,
+        "physical_owner_scope_id": owner.scope_id,
+        "physical_owner_scope_sha256": scope["scope_sha256"],
+        "family": family_name,
+        "fit_row_ids": list(owner.fit_row_ids),
+        "fit_row_order_fingerprint": scope["fit_row_order_fingerprint"],
+        "canonical_group_seed": int(owner.scope_seed),
+        "producer_identity_sha256": producer_id,
+        "configuration_identity_sha256": configuration_id,
+        "fit_state_artifact_sha256": fit_state_id,
+        "evidence_payload_sha256": payload_id,
+        "evidence_payload": closed,
+        "event_order": events,
+        "logical_view_transform_started": False,
+        "registered_heldout_text_accessed": False,
+        "registered_heldout_labels_accessed": False,
+        "oracle_fields_accessed": False,
+    }
+    return {**body, "content_sha256": _sha256_json(body)}
+
+
+def _validate_role_neutral_fit_only_family_seal(
+    value: Mapping[str, Any],
+    *,
+    plan: Stage1ScopePlan,
+    owner: Stage1ScopeSpec,
+    family: str,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError("fit-only family seal must be a mapping")
+    seal = copy.deepcopy(dict(value))
+    expected = build_role_neutral_fit_only_family_seal(
+        plan=plan,
+        physical_owner_scope_id=owner.scope_id,
+        family=family,
+        evidence_payload=seal.get("evidence_payload") or {},
+        producer_identity_sha256=seal.get("producer_identity_sha256"),
+        configuration_identity_sha256=seal.get(
+            "configuration_identity_sha256"
+        ),
+        fit_state_artifact_sha256=seal.get("fit_state_artifact_sha256"),
+    )
+    if seal != expected:
+        raise ValueError(
+            f"fit-only family seal has an invalid event binding: "
+            f"{owner.scope_id}/{family}"
+        )
+    return seal
+
+
+def build_role_neutral_physical_fit_artifact(
+    *,
+    plan: Stage1ScopePlan,
+    physical_owner_scope_id: str,
+    fit_artifact_sha256: str,
+    family_fit_artifact_sha256: Mapping[str, str],
+) -> dict[str, Any]:
+    """Describe the smallest reusable scientific result of one physical fit.
+
+    This record deliberately excludes a logical scope's held-out transformation
+    and evidence-view bytes.  Those differ between exact-inner and
+    cumulative-review purposes even when their fitted rows and seed are
+    identical.  A producer may publish this record only when every one of the
+    ten family artifacts is derived from fit rows alone.
+    """
+
+    if not isinstance(plan, Stage1ScopePlan):
+        raise TypeError("plan must be a Stage1ScopePlan")
+    owner = plan.scope(str(physical_owner_scope_id))
+    if plan.physical_owner(owner.scope_id).scope_id != owner.scope_id:
+        raise ValueError("role-neutral fit artifact must belong to a physical owner")
+    fit_sha = _require_sha256(
+        fit_artifact_sha256,
+        label="role-neutral fit artifact SHA-256",
+    )
+    if (
+        not isinstance(family_fit_artifact_sha256, Mapping)
+        or set(family_fit_artifact_sha256) != ACTIVE_STAGE1_CONCEPT_FAMILY_SET
+    ):
+        missing = sorted(
+            ACTIVE_STAGE1_CONCEPT_FAMILY_SET
+            - set(family_fit_artifact_sha256 or {})
+        )
+        extra = sorted(
+            set(family_fit_artifact_sha256 or {})
+            - ACTIVE_STAGE1_CONCEPT_FAMILY_SET
+        )
+        raise ValueError(
+            "role-neutral physical fit must register exactly all ten evidence "
+            f"families; missing={missing}, extra={extra}"
+        )
+    family_ids = {
+        family: _require_sha256(
+            family_fit_artifact_sha256[family],
+            label=f"{family} fit artifact SHA-256",
+        )
+        for family in ACTIVE_STAGE1_CONCEPT_FAMILIES
+    }
+    scope = owner.as_dict()
+    body = {
+        "schema_version": LEGACY_STAGE1_ROLE_NEUTRAL_PHYSICAL_FIT_SCHEMA,
+        "plan_scientific_content_sha256": plan.scientific_content_sha256,
+        "physical_owner_scope_id": owner.scope_id,
+        "physical_owner_scope_sha256": scope["scope_sha256"],
+        "fit_row_order_fingerprint": scope["fit_row_order_fingerprint"],
+        "fit_row_set_fingerprint": _sha256_json(sorted(owner.fit_row_ids)),
+        "fit_row_count": owner.fit_row_count,
+        "canonical_group_seed": int(owner.scope_seed),
+        "fit_artifact_sha256": fit_sha,
+        "family_fit_artifact_sha256": family_ids,
+        "fit_input_policy": "fit_row_id_text_treatment_outcome_only_v1",
+        "heldout_text_accessed_during_fit": False,
+        "heldout_labels_accessed_during_fit": False,
+        "oracle_fields_accessed_during_fit": False,
+        "logical_view_bytes_included": False,
+    }
+    return {**body, "content_sha256": _sha256_json(body)}
+
+
+def _validate_role_neutral_physical_fit_artifact(
+    value: Mapping[str, Any],
+    *,
+    plan: Stage1ScopePlan,
+    owner: Stage1ScopeSpec,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError("role-neutral physical fit artifact must be a mapping")
+    artifact = copy.deepcopy(dict(value))
+    expected_fields = {
+        "schema_version",
+        "plan_scientific_content_sha256",
+        "physical_owner_scope_id",
+        "physical_owner_scope_sha256",
+        "fit_row_order_fingerprint",
+        "fit_row_set_fingerprint",
+        "fit_row_count",
+        "canonical_group_seed",
+        "fit_artifact_sha256",
+        "family_fit_artifact_sha256",
+        "fit_input_policy",
+        "heldout_text_accessed_during_fit",
+        "heldout_labels_accessed_during_fit",
+        "oracle_fields_accessed_during_fit",
+        "logical_view_bytes_included",
+        "content_sha256",
+    }
+    body = {
+        key: copy.deepcopy(child)
+        for key, child in artifact.items()
+        if key != "content_sha256"
+    }
+    scope = owner.as_dict()
+    families = artifact.get("family_fit_artifact_sha256")
+    if (
+        set(artifact) != expected_fields
+        or artifact.get("schema_version")
+        != LEGACY_STAGE1_ROLE_NEUTRAL_PHYSICAL_FIT_SCHEMA
+        or artifact.get("plan_scientific_content_sha256")
+        != plan.scientific_content_sha256
+        or artifact.get("physical_owner_scope_id") != owner.scope_id
+        or artifact.get("physical_owner_scope_sha256") != scope["scope_sha256"]
+        or artifact.get("fit_row_order_fingerprint")
+        != scope["fit_row_order_fingerprint"]
+        or artifact.get("fit_row_set_fingerprint")
+        != _sha256_json(sorted(owner.fit_row_ids))
+        or artifact.get("fit_row_count") != owner.fit_row_count
+        or artifact.get("canonical_group_seed") != owner.scope_seed
+        or artifact.get("fit_input_policy")
+        != "fit_row_id_text_treatment_outcome_only_v1"
+        or artifact.get("heldout_text_accessed_during_fit") is not False
+        or artifact.get("heldout_labels_accessed_during_fit") is not False
+        or artifact.get("oracle_fields_accessed_during_fit") is not False
+        or artifact.get("logical_view_bytes_included") is not False
+        or not isinstance(families, Mapping)
+        or set(families) != ACTIVE_STAGE1_CONCEPT_FAMILY_SET
+        or artifact.get("content_sha256") != _sha256_json(body)
+    ):
+        raise ValueError("role-neutral physical fit artifact has an invalid binding")
+    _require_sha256(
+        artifact.get("fit_artifact_sha256"),
+        label="role-neutral fit artifact SHA-256",
+    )
+    for family in ACTIVE_STAGE1_CONCEPT_FAMILIES:
+        _require_sha256(
+            families[family],
+            label=f"{family} fit artifact SHA-256",
+        )
+    return artifact
+
+
+def build_role_neutral_logical_evidence_bindings(
+    *,
+    plan: Stage1ScopePlan,
+    physical_fit_artifacts_by_owner: Mapping[str, Mapping[str, Any]],
+    logical_view_artifact_sha256_by_scope: Mapping[str, str],
+) -> dict[str, Any]:
+    """Bind distinct logical evidence views to shared all-ten physical fits.
+
+    Equality is asserted only for the fit-side family artifacts.  Each logical
+    context must supply its own view artifact identity, and cross-purpose
+    aliases are forbidden from claiming the same view bytes.
+    """
+
+    if not isinstance(plan, Stage1ScopePlan):
+        raise TypeError("plan must be a Stage1ScopePlan")
+    owner_ids = tuple(scope.scope_id for scope in plan.physical_scopes)
+    logical_ids = tuple(scope.scope_id for scope in plan.scopes)
+    if set(physical_fit_artifacts_by_owner) != set(owner_ids):
+        raise ValueError("role-neutral physical fit coverage is incomplete")
+    if set(logical_view_artifact_sha256_by_scope) != set(logical_ids):
+        raise ValueError("logical evidence-view artifact coverage is incomplete")
+
+    physical_rows: list[dict[str, Any]] = []
+    physical_by_owner: dict[str, dict[str, Any]] = {}
+    for owner in plan.physical_scopes:
+        physical = _validate_role_neutral_physical_fit_artifact(
+            physical_fit_artifacts_by_owner[owner.scope_id],
+            plan=plan,
+            owner=owner,
+        )
+        physical_rows.append(physical)
+        physical_by_owner[owner.scope_id] = physical
+
+    view_ids = {
+        scope_id: _require_sha256(
+            logical_view_artifact_sha256_by_scope[scope_id],
+            label=f"{scope_id} logical evidence-view SHA-256",
+        )
+        for scope_id in logical_ids
+    }
+    logical_rows: list[dict[str, Any]] = []
+    for logical in plan.scopes:
+        owner = plan.physical_owner(logical.scope_id)
+        physical = physical_by_owner[owner.scope_id]
+        if (
+            tuple(logical.fit_row_ids)
+            != tuple(owner.fit_row_ids)
+            or logical.scope_seed != owner.scope_seed
+        ):
+            raise RuntimeError("logical context no longer matches its physical fit")
+        if logical.scope_kind == "cumulative_spent":
+            view_input_policy = "sealed_row_ids_only_no_sealed_text_or_labels_v1"
+        elif logical.scope_kind in {"exact_inner", "full_outer"}:
+            view_input_policy = "heldout_row_id_and_text_no_labels_v1"
+        else:  # pragma: no cover - Stage1ScopeSpec is already closed.
+            raise ValueError("unsupported logical Stage 1 purpose")
+        if (
+            logical.scope_id != owner.scope_id
+            and logical.scope_kind != owner.scope_kind
+            and view_ids[logical.scope_id] == view_ids[owner.scope_id]
+        ):
+            raise ValueError(
+                "cross-purpose logical views cannot claim byte-identical artifacts"
+            )
+        logical_scope = logical.as_dict()
+        body = {
+            "schema_version": LEGACY_STAGE1_LOGICAL_EVIDENCE_VIEW_SCHEMA,
+            "plan_scientific_content_sha256": plan.scientific_content_sha256,
+            "logical_scope_id": logical.scope_id,
+            "logical_scope_sha256": logical_scope["scope_sha256"],
+            "logical_purpose": logical.scope_kind,
+            "logical_heldout_row_order_fingerprint": logical_scope[
+                "heldout_row_order_fingerprint"
+            ],
+            "view_input_policy": view_input_policy,
+            "logical_view_artifact_sha256": view_ids[logical.scope_id],
+            "physical_owner_scope_id": owner.scope_id,
+            "physical_fit_content_sha256": physical["content_sha256"],
+            "family_fit_artifact_sha256": copy.deepcopy(
+                physical["family_fit_artifact_sha256"]
+            ),
+            "reuses_physical_fit": logical.scope_id != owner.scope_id,
+            "logical_view_artifact_claimed_equal_to_owner": (
+                view_ids[logical.scope_id] == view_ids[owner.scope_id]
+            ),
+            "heldout_labels_supplied_to_view": False,
+        }
+        logical_rows.append({**body, "content_sha256": _sha256_json(body)})
+
+    top_body = {
+        "schema_version": LEGACY_STAGE1_ROLE_NEUTRAL_BINDING_SET_SCHEMA,
+        "plan_scientific_content_sha256": plan.scientific_content_sha256,
+        "canonical_logical_scope_order": list(logical_ids),
+        "physical_owner_scope_order": list(owner_ids),
+        "logical_scope_count": len(logical_rows),
+        "physical_fit_count": len(physical_rows),
+        "deduplicated_fit_count": len(logical_rows) - len(physical_rows),
+        "physical_fits": physical_rows,
+        "logical_views": logical_rows,
+        "all_ten_family_fit_artifact_ids_equal_within_group": True,
+        "cross_purpose_logical_view_equality_claimed": False,
+        "heldout_labels_supplied": False,
+    }
+    return {**top_body, "content_sha256": _sha256_json(top_body)}
+
+
+def validate_role_neutral_logical_evidence_bindings(
+    value: Mapping[str, Any],
+    *,
+    plan: Stage1ScopePlan,
+) -> dict[str, Any]:
+    """Freshly validate the closed physical-fit/logical-view binding set."""
+
+    if not isinstance(value, Mapping):
+        raise TypeError("role-neutral binding set must be a mapping")
+    manifest = copy.deepcopy(dict(value))
+    body = {
+        key: copy.deepcopy(child)
+        for key, child in manifest.items()
+        if key != "content_sha256"
+    }
+    expected_fields = {
+        "schema_version",
+        "plan_scientific_content_sha256",
+        "canonical_logical_scope_order",
+        "physical_owner_scope_order",
+        "logical_scope_count",
+        "physical_fit_count",
+        "deduplicated_fit_count",
+        "physical_fits",
+        "logical_views",
+        "all_ten_family_fit_artifact_ids_equal_within_group",
+        "cross_purpose_logical_view_equality_claimed",
+        "heldout_labels_supplied",
+        "content_sha256",
+    }
+    physical_rows = manifest.get("physical_fits")
+    logical_rows = manifest.get("logical_views")
+    if (
+        set(manifest) != expected_fields
+        or manifest.get("schema_version")
+        != LEGACY_STAGE1_ROLE_NEUTRAL_BINDING_SET_SCHEMA
+        or manifest.get("plan_scientific_content_sha256")
+        != plan.scientific_content_sha256
+        or manifest.get("canonical_logical_scope_order")
+        != [scope.scope_id for scope in plan.scopes]
+        or manifest.get("physical_owner_scope_order")
+        != [scope.scope_id for scope in plan.physical_scopes]
+        or manifest.get("logical_scope_count") != len(plan.scopes)
+        or manifest.get("physical_fit_count") != len(plan.physical_scopes)
+        or manifest.get("deduplicated_fit_count")
+        != len(plan.scopes) - len(plan.physical_scopes)
+        or manifest.get("all_ten_family_fit_artifact_ids_equal_within_group")
+        is not True
+        or manifest.get("cross_purpose_logical_view_equality_claimed") is not False
+        or manifest.get("heldout_labels_supplied") is not False
+        or not isinstance(physical_rows, list)
+        or not isinstance(logical_rows, list)
+        or manifest.get("content_sha256") != _sha256_json(body)
+    ):
+        raise ValueError("role-neutral binding set has an invalid envelope")
+
+    physical_by_owner: dict[str, dict[str, Any]] = {}
+    for owner, physical in zip(plan.physical_scopes, physical_rows, strict=True):
+        validated = _validate_role_neutral_physical_fit_artifact(
+            physical,
+            plan=plan,
+            owner=owner,
+        )
+        physical_by_owner[owner.scope_id] = validated
+    if len(physical_rows) != len(plan.physical_scopes):
+        raise ValueError("role-neutral physical fit coverage changed")
+
+    expected_view_fields = {
+        "schema_version",
+        "plan_scientific_content_sha256",
+        "logical_scope_id",
+        "logical_scope_sha256",
+        "logical_purpose",
+        "logical_heldout_row_order_fingerprint",
+        "view_input_policy",
+        "logical_view_artifact_sha256",
+        "physical_owner_scope_id",
+        "physical_fit_content_sha256",
+        "family_fit_artifact_sha256",
+        "reuses_physical_fit",
+        "logical_view_artifact_claimed_equal_to_owner",
+        "heldout_labels_supplied_to_view",
+        "content_sha256",
+    }
+    view_by_scope: dict[str, Mapping[str, Any]] = {}
+    for logical, row in zip(plan.scopes, logical_rows, strict=True):
+        if not isinstance(row, Mapping):
+            raise ValueError("logical evidence view is malformed")
+        row_body = {
+            key: copy.deepcopy(child)
+            for key, child in row.items()
+            if key != "content_sha256"
+        }
+        owner = plan.physical_owner(logical.scope_id)
+        physical = physical_by_owner[owner.scope_id]
+        expected_policy = (
+            "sealed_row_ids_only_no_sealed_text_or_labels_v1"
+            if logical.scope_kind == "cumulative_spent"
+            else "heldout_row_id_and_text_no_labels_v1"
+        )
+        scope = logical.as_dict()
+        if (
+            set(row) != expected_view_fields
+            or row.get("schema_version")
+            != LEGACY_STAGE1_LOGICAL_EVIDENCE_VIEW_SCHEMA
+            or row.get("plan_scientific_content_sha256")
+            != plan.scientific_content_sha256
+            or row.get("logical_scope_id") != logical.scope_id
+            or row.get("logical_scope_sha256") != scope["scope_sha256"]
+            or row.get("logical_purpose") != logical.scope_kind
+            or row.get("logical_heldout_row_order_fingerprint")
+            != scope["heldout_row_order_fingerprint"]
+            or row.get("view_input_policy") != expected_policy
+            or row.get("physical_owner_scope_id") != owner.scope_id
+            or row.get("physical_fit_content_sha256")
+            != physical["content_sha256"]
+            or row.get("family_fit_artifact_sha256")
+            != physical["family_fit_artifact_sha256"]
+            or row.get("reuses_physical_fit")
+            is not (logical.scope_id != owner.scope_id)
+            or row.get("heldout_labels_supplied_to_view") is not False
+            or row.get("content_sha256") != _sha256_json(row_body)
+        ):
+            raise ValueError(
+                f"logical evidence view has an invalid binding: {logical.scope_id}"
+            )
+        _require_sha256(
+            row.get("logical_view_artifact_sha256"),
+            label=f"{logical.scope_id} logical evidence-view SHA-256",
+        )
+        view_by_scope[logical.scope_id] = row
+    if len(logical_rows) != len(plan.scopes):
+        raise ValueError("logical evidence-view coverage changed")
+    for owner, members in plan.physical_scope_groups:
+        owner_view = view_by_scope[owner.scope_id]
+        for logical in members:
+            view = view_by_scope[logical.scope_id]
+            if (
+                view["family_fit_artifact_sha256"]
+                != owner_view["family_fit_artifact_sha256"]
+            ):
+                raise ValueError("logical alias changed a family fit artifact")
+            claimed_equal = (
+                view["logical_view_artifact_sha256"]
+                == owner_view["logical_view_artifact_sha256"]
+            )
+            if view.get("logical_view_artifact_claimed_equal_to_owner") is not claimed_equal:
+                raise ValueError("logical view equality claim differs from its bytes")
+            if (
+                logical.scope_kind != owner.scope_kind
+                and logical.scope_id != owner.scope_id
+                and claimed_equal
+            ):
+                raise ValueError(
+                    "cross-purpose logical views cannot share one artifact identity"
+                )
+    return manifest
+
+
+def persist_role_neutral_logical_evidence_bindings(
+    *,
+    root: Path | str,
+    plan: Stage1ScopePlan,
+    family_fit_seal_by_physical_owner: Mapping[
+        str,
+        Mapping[str, Mapping[str, Any]],
+    ],
+    logical_source_artifact_sha256_by_scope: Mapping[str, str],
+) -> dict[str, Any]:
+    """Persist fit-side payloads once and publish authenticated logical views.
+
+    The caller supplies exactly one closed fit-only family seal for every
+    family of every physical owner. No alias payload is accepted: equivalent
+    logical scopes prove equality by referencing the same immutable physical
+    family artifacts. Logical views contain only purpose-specific metadata and
+    references.
+    """
+
+    if not isinstance(plan, Stage1ScopePlan):
+        raise TypeError("plan must be a Stage1ScopePlan")
+    destination = Path(root)
+    if not destination.is_absolute():
+        raise ValueError("role-neutral binding root must be absolute")
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError("role-neutral binding root must be fresh")
+    parent = _regular_directory(
+        destination.parent,
+        label="role-neutral binding parent",
+    )
+    if parent != destination.parent:
+        raise ValueError("role-neutral binding parent must be canonical")
+    owner_ids = tuple(scope.scope_id for scope in plan.physical_scopes)
+    logical_ids = tuple(scope.scope_id for scope in plan.scopes)
+    expected_owners = set(owner_ids)
+    expected_logical = set(logical_ids)
+    if (
+        not isinstance(family_fit_seal_by_physical_owner, Mapping)
+        or set(family_fit_seal_by_physical_owner) != expected_owners
+    ):
+        raise ValueError(
+            "physical-owner fit-only family-seal coverage differs from the "
+            "physical plan"
+        )
+    if (
+        not isinstance(logical_source_artifact_sha256_by_scope, Mapping)
+        or set(logical_source_artifact_sha256_by_scope) != expected_logical
+    ):
+        raise ValueError(
+            "logical source artifact coverage differs from the logical plan"
+        )
+
+    normalized_seals: dict[str, dict[str, dict[str, Any]]] = {}
+    source_ids: dict[str, str] = {}
+    for owner in plan.physical_scopes:
+        owner_id = owner.scope_id
+        raw_seals = family_fit_seal_by_physical_owner[owner_id]
+        if (
+            not isinstance(raw_seals, Mapping)
+            or set(raw_seals) != ACTIVE_STAGE1_CONCEPT_FAMILY_SET
+        ):
+            raise ValueError(
+                f"{owner_id} does not contain exactly ten fit-only family seals"
+            )
+        normalized_seals[owner_id] = {
+            family: _validate_role_neutral_fit_only_family_seal(
+                raw_seals[family],
+                plan=plan,
+                owner=owner,
+                family=family,
+            )
+            for family in ACTIVE_STAGE1_CONCEPT_FAMILIES
+        }
+    for scope_id in logical_ids:
+        source_ids[scope_id] = _require_sha256(
+            logical_source_artifact_sha256_by_scope[scope_id],
+            label=f"{scope_id} logical source artifact SHA-256",
+        )
+
+    temporary = Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.name}.role-neutral-",
+            dir=parent,
+        )
+    )
+    try:
+        physical_dir = temporary / _ROLE_NEUTRAL_PHYSICAL_DIRECTORY
+        logical_dir = temporary / _ROLE_NEUTRAL_LOGICAL_DIRECTORY
+        physical_dir.mkdir(parents=False, exist_ok=False)
+        logical_dir.mkdir(parents=False, exist_ok=False)
+        physical_artifacts: dict[str, Mapping[str, Any]] = {}
+        physical_registrations: list[dict[str, Any]] = []
+        logical_view_hashes: dict[str, str] = {}
+        logical_registrations: list[dict[str, Any]] = []
+
+        for owner, _members in plan.physical_scope_groups:
+            owner_seals = normalized_seals[owner.scope_id]
+            family_payload_ids = {
+                family: owner_seals[family]["evidence_payload_sha256"]
+                for family in ACTIVE_STAGE1_CONCEPT_FAMILIES
+            }
+            family_fit_ids = {
+                family: owner_seals[family]["content_sha256"]
+                for family in ACTIVE_STAGE1_CONCEPT_FAMILIES
+            }
+            owner_scope = owner.as_dict()
+            physical_body = {
+                "schema_version": (
+                    LEGACY_STAGE1_ROLE_NEUTRAL_PHYSICAL_PAYLOAD_SCHEMA
+                ),
+                "plan_scientific_content_sha256": (
+                    plan.scientific_content_sha256
+                ),
+                "physical_owner_scope_id": owner.scope_id,
+                "physical_owner_scope_sha256": owner_scope["scope_sha256"],
+                "fit_row_ids": list(owner.fit_row_ids),
+                "fit_row_order_fingerprint": owner_scope[
+                    "fit_row_order_fingerprint"
+                ],
+                "fit_row_set_fingerprint": _sha256_json(
+                    sorted(owner.fit_row_ids)
+                ),
+                "canonical_group_seed": int(owner.scope_seed),
+                "architecture_order": list(ACTIVE_STAGE1_CONCEPT_FAMILIES),
+                "family_evidence_payload_sha256": family_payload_ids,
+                "family_fit_artifact_sha256": family_fit_ids,
+                "family_fit_seals": owner_seals,
+                "heldout_text_included": False,
+                "heldout_labels_included": False,
+                "logical_view_metadata_included": False,
+            }
+            physical_payload = {
+                **physical_body,
+                "content_sha256": _sha256_json(physical_body),
+            }
+            physical_path = physical_dir / f"{owner.scope_id}.json"
+            _write_new_json(physical_path, physical_payload)
+            physical_sha, physical_size = _sha256_file(physical_path)
+            physical_artifacts[owner.scope_id] = (
+                build_role_neutral_physical_fit_artifact(
+                    plan=plan,
+                    physical_owner_scope_id=owner.scope_id,
+                    fit_artifact_sha256=physical_sha,
+                    family_fit_artifact_sha256=family_fit_ids,
+                )
+            )
+            physical_registrations.append(
+                {
+                    "physical_owner_scope_id": owner.scope_id,
+                    "relative_path": physical_path.relative_to(
+                        temporary
+                    ).as_posix(),
+                    "sha256": physical_sha,
+                    "size_bytes": physical_size,
+                    "content_sha256": physical_payload["content_sha256"],
+                }
+            )
+
+        physical_registration_by_owner = {
+            row["physical_owner_scope_id"]: row
+            for row in physical_registrations
+        }
+        for logical in plan.scopes:
+            owner = plan.physical_owner(logical.scope_id)
+            source_id = source_ids[logical.scope_id]
+            physical_payload = physical_registration_by_owner[owner.scope_id]
+            family_fit_ids = physical_artifacts[owner.scope_id][
+                "family_fit_artifact_sha256"
+            ]
+            policy = (
+                "sealed_row_ids_only_no_sealed_text_or_labels_v1"
+                if logical.scope_kind == "cumulative_spent"
+                else "heldout_row_id_and_text_no_labels_v1"
+            )
+            scope = logical.as_dict()
+            view_body = {
+                "schema_version": LEGACY_STAGE1_LOGICAL_VIEW_ARTIFACT_SCHEMA,
+                "plan_scientific_content_sha256": (
+                    plan.scientific_content_sha256
+                ),
+                "logical_scope_id": logical.scope_id,
+                "logical_scope_sha256": scope["scope_sha256"],
+                "logical_purpose": logical.scope_kind,
+                "logical_heldout_row_ids": list(logical.heldout_row_ids),
+                "logical_heldout_row_order_fingerprint": scope[
+                    "heldout_row_order_fingerprint"
+                ],
+                "view_input_policy": policy,
+                "logical_source_artifact_sha256": source_id,
+                "physical_owner_scope_id": owner.scope_id,
+                "physical_payload": copy.deepcopy(physical_payload),
+                "family_fit_artifact_sha256": copy.deepcopy(family_fit_ids),
+                "event": "logical_view_reference_published",
+                "published_after_all_family_fit_seals": True,
+                "logical_view_transform_performed": False,
+                "registered_heldout_text_accessed": False,
+                "reuses_physical_fit": logical.scope_id != owner.scope_id,
+                "heldout_labels_supplied": False,
+            }
+            view = {**view_body, "content_sha256": _sha256_json(view_body)}
+            view_path = logical_dir / f"{logical.scope_id}.json"
+            _write_new_json(view_path, view)
+            view_sha, view_size = _sha256_file(view_path)
+            logical_view_hashes[logical.scope_id] = view_sha
+            logical_registrations.append(
+                {
+                    "logical_scope_id": logical.scope_id,
+                    "relative_path": view_path.relative_to(temporary).as_posix(),
+                    "sha256": view_sha,
+                    "size_bytes": view_size,
+                    "content_sha256": view["content_sha256"],
+                }
+            )
+
+        scientific_bindings = build_role_neutral_logical_evidence_bindings(
+            plan=plan,
+            physical_fit_artifacts_by_owner=physical_artifacts,
+            logical_view_artifact_sha256_by_scope=logical_view_hashes,
+        )
+        terminal_body = {
+            "schema_version": LEGACY_STAGE1_ROLE_NEUTRAL_PERSISTED_SET_SCHEMA,
+            "status": "complete",
+            "plan_scientific_content_sha256": (
+                plan.scientific_content_sha256
+            ),
+            "logical_scope_count": len(plan.scopes),
+            "physical_fit_count": len(plan.physical_scopes),
+            "deduplicated_fit_count": (
+                len(plan.scopes) - len(plan.physical_scopes)
+            ),
+            "physical_payloads": physical_registrations,
+            "logical_views": logical_registrations,
+            "scientific_bindings": scientific_bindings,
+            "payload_bytes_persisted_once_per_physical_fit": True,
+            "logical_views_are_reference_only": True,
+        }
+        terminal = {
+            **terminal_body,
+            "content_sha256": _sha256_json(terminal_body),
+        }
+        durably_sync_legacy_stage1_tree(temporary)
+        _write_new_json(temporary / _ROLE_NEUTRAL_MANIFEST_NAME, terminal)
+        os.replace(temporary, destination)
+        _fsync_directory(destination.parent)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    return validate_persisted_role_neutral_logical_evidence_bindings(
+        root=destination,
+        plan=plan,
+    )
+
+
+def validate_persisted_role_neutral_logical_evidence_bindings(
+    *,
+    root: Path | str,
+    plan: Stage1ScopePlan,
+) -> dict[str, Any]:
+    """Reopen every persisted payload and logical view from a fresh path."""
+
+    tree = _regular_directory(
+        Path(root),
+        label="persisted role-neutral binding root",
+    )
+    terminal = _read_json(
+        tree / _ROLE_NEUTRAL_MANIFEST_NAME,
+        label="persisted role-neutral binding manifest",
+    )
+    body = {
+        key: copy.deepcopy(value)
+        for key, value in terminal.items()
+        if key != "content_sha256"
+    }
+    expected_fields = {
+        "schema_version",
+        "status",
+        "plan_scientific_content_sha256",
+        "logical_scope_count",
+        "physical_fit_count",
+        "deduplicated_fit_count",
+        "physical_payloads",
+        "logical_views",
+        "scientific_bindings",
+        "payload_bytes_persisted_once_per_physical_fit",
+        "logical_views_are_reference_only",
+        "content_sha256",
+    }
+    physical_rows = terminal.get("physical_payloads")
+    logical_rows = terminal.get("logical_views")
+    if (
+        set(terminal) != expected_fields
+        or terminal.get("schema_version")
+        != LEGACY_STAGE1_ROLE_NEUTRAL_PERSISTED_SET_SCHEMA
+        or terminal.get("status") != "complete"
+        or terminal.get("plan_scientific_content_sha256")
+        != plan.scientific_content_sha256
+        or terminal.get("logical_scope_count") != len(plan.scopes)
+        or terminal.get("physical_fit_count") != len(plan.physical_scopes)
+        or terminal.get("deduplicated_fit_count")
+        != len(plan.scopes) - len(plan.physical_scopes)
+        or terminal.get("payload_bytes_persisted_once_per_physical_fit")
+        is not True
+        or terminal.get("logical_views_are_reference_only") is not True
+        or not isinstance(physical_rows, list)
+        or not isinstance(logical_rows, list)
+        or terminal.get("content_sha256") != _sha256_json(body)
+    ):
+        raise ValueError("persisted role-neutral binding manifest is invalid")
+
+    physical_artifacts: dict[str, Mapping[str, Any]] = {}
+    expected_files = {_ROLE_NEUTRAL_MANIFEST_NAME}
+    expected_physical_fields = {
+        "physical_owner_scope_id",
+        "relative_path",
+        "sha256",
+        "size_bytes",
+        "content_sha256",
+    }
+    for owner, registration in zip(
+        plan.physical_scopes,
+        physical_rows,
+        strict=True,
+    ):
+        if (
+            not isinstance(registration, Mapping)
+            or set(registration) != expected_physical_fields
+            or registration.get("physical_owner_scope_id") != owner.scope_id
+        ):
+            raise ValueError("persisted physical payload registration is invalid")
+        relative = _canonical_relative_path(
+            str(registration["relative_path"]),
+            label="persisted physical payload path",
+        )
+        if relative != f"{_ROLE_NEUTRAL_PHYSICAL_DIRECTORY}/{owner.scope_id}.json":
+            raise ValueError("persisted physical payload path is noncanonical")
+        path = tree / relative
+        digest, size = _sha256_file(path)
+        payload = _read_json(path, label=f"{owner.scope_id} physical payload")
+        payload_body = {
+            key: copy.deepcopy(value)
+            for key, value in payload.items()
+            if key != "content_sha256"
+        }
+        expected_payload_fields = {
+            "schema_version",
+            "plan_scientific_content_sha256",
+            "physical_owner_scope_id",
+            "physical_owner_scope_sha256",
+            "fit_row_ids",
+            "fit_row_order_fingerprint",
+            "fit_row_set_fingerprint",
+            "canonical_group_seed",
+            "architecture_order",
+            "family_evidence_payload_sha256",
+            "family_fit_artifact_sha256",
+            "family_fit_seals",
+            "heldout_text_included",
+            "heldout_labels_included",
+            "logical_view_metadata_included",
+            "content_sha256",
+        }
+        seals = payload.get("family_fit_seals")
+        family_payload_ids = payload.get("family_evidence_payload_sha256")
+        family_fit_ids = payload.get("family_fit_artifact_sha256")
+        scope = owner.as_dict()
+        if (
+            set(payload) != expected_payload_fields
+            or payload.get("schema_version")
+            != LEGACY_STAGE1_ROLE_NEUTRAL_PHYSICAL_PAYLOAD_SCHEMA
+            or payload.get("plan_scientific_content_sha256")
+            != plan.scientific_content_sha256
+            or payload.get("physical_owner_scope_id") != owner.scope_id
+            or payload.get("physical_owner_scope_sha256")
+            != scope["scope_sha256"]
+            or payload.get("fit_row_ids") != list(owner.fit_row_ids)
+            or payload.get("fit_row_order_fingerprint")
+            != scope["fit_row_order_fingerprint"]
+            or payload.get("fit_row_set_fingerprint")
+            != _sha256_json(sorted(owner.fit_row_ids))
+            or payload.get("canonical_group_seed") != owner.scope_seed
+            or payload.get("architecture_order")
+            != list(ACTIVE_STAGE1_CONCEPT_FAMILIES)
+            or not isinstance(seals, Mapping)
+            or set(seals) != ACTIVE_STAGE1_CONCEPT_FAMILY_SET
+            or not isinstance(family_payload_ids, Mapping)
+            or set(family_payload_ids) != ACTIVE_STAGE1_CONCEPT_FAMILY_SET
+            or not isinstance(family_fit_ids, Mapping)
+            or set(family_fit_ids) != ACTIVE_STAGE1_CONCEPT_FAMILY_SET
+            or any(
+                family_payload_ids[family]
+                != _validate_role_neutral_fit_only_family_seal(
+                    seals[family],
+                    plan=plan,
+                    owner=owner,
+                    family=family,
+                )["evidence_payload_sha256"]
+                for family in ACTIVE_STAGE1_CONCEPT_FAMILIES
+            )
+            or any(
+                family_fit_ids[family]
+                != seals[family].get("content_sha256")
+                for family in ACTIVE_STAGE1_CONCEPT_FAMILIES
+            )
+            or payload.get("heldout_text_included") is not False
+            or payload.get("heldout_labels_included") is not False
+            or payload.get("logical_view_metadata_included") is not False
+            or payload.get("content_sha256") != _sha256_json(payload_body)
+            or dict(registration)
+            != {
+                "physical_owner_scope_id": owner.scope_id,
+                "relative_path": relative,
+                "sha256": digest,
+                "size_bytes": size,
+                "content_sha256": payload.get("content_sha256"),
+            }
+        ):
+            raise ValueError(f"persisted physical payload changed: {owner.scope_id}")
+        physical_artifacts[owner.scope_id] = (
+            build_role_neutral_physical_fit_artifact(
+                plan=plan,
+                physical_owner_scope_id=owner.scope_id,
+                fit_artifact_sha256=digest,
+                family_fit_artifact_sha256=family_fit_ids,
+            )
+        )
+        expected_files.add(relative)
+    if len(physical_rows) != len(plan.physical_scopes):
+        raise ValueError("persisted physical payload coverage changed")
+
+    logical_view_hashes: dict[str, str] = {}
+    expected_logical_fields = {
+        "logical_scope_id",
+        "relative_path",
+        "sha256",
+        "size_bytes",
+        "content_sha256",
+    }
+    physical_registration_by_owner = {
+        str(row["physical_owner_scope_id"]): row for row in physical_rows
+    }
+    for logical, registration in zip(plan.scopes, logical_rows, strict=True):
+        if (
+            not isinstance(registration, Mapping)
+            or set(registration) != expected_logical_fields
+            or registration.get("logical_scope_id") != logical.scope_id
+        ):
+            raise ValueError("persisted logical view registration is invalid")
+        relative = _canonical_relative_path(
+            str(registration["relative_path"]),
+            label="persisted logical view path",
+        )
+        if relative != f"{_ROLE_NEUTRAL_LOGICAL_DIRECTORY}/{logical.scope_id}.json":
+            raise ValueError("persisted logical view path is noncanonical")
+        path = tree / relative
+        digest, size = _sha256_file(path)
+        view = _read_json(path, label=f"{logical.scope_id} logical view")
+        view_body = {
+            key: copy.deepcopy(value)
+            for key, value in view.items()
+            if key != "content_sha256"
+        }
+        expected_view_fields = {
+            "schema_version",
+            "plan_scientific_content_sha256",
+            "logical_scope_id",
+            "logical_scope_sha256",
+            "logical_purpose",
+            "logical_heldout_row_ids",
+            "logical_heldout_row_order_fingerprint",
+            "view_input_policy",
+            "logical_source_artifact_sha256",
+            "physical_owner_scope_id",
+            "physical_payload",
+            "family_fit_artifact_sha256",
+            "event",
+            "published_after_all_family_fit_seals",
+            "logical_view_transform_performed",
+            "registered_heldout_text_accessed",
+            "reuses_physical_fit",
+            "heldout_labels_supplied",
+            "content_sha256",
+        }
+        owner = plan.physical_owner(logical.scope_id)
+        physical_path = tree / str(
+            physical_registration_by_owner[owner.scope_id]["relative_path"]
+        )
+        physical_payload = _read_json(
+            physical_path,
+            label=f"{owner.scope_id} physical payload for logical view",
+        )
+        expected_policy = (
+            "sealed_row_ids_only_no_sealed_text_or_labels_v1"
+            if logical.scope_kind == "cumulative_spent"
+            else "heldout_row_id_and_text_no_labels_v1"
+        )
+        scope = logical.as_dict()
+        if (
+            set(view) != expected_view_fields
+            or view.get("schema_version")
+            != LEGACY_STAGE1_LOGICAL_VIEW_ARTIFACT_SCHEMA
+            or view.get("plan_scientific_content_sha256")
+            != plan.scientific_content_sha256
+            or view.get("logical_scope_id") != logical.scope_id
+            or view.get("logical_scope_sha256") != scope["scope_sha256"]
+            or view.get("logical_purpose") != logical.scope_kind
+            or view.get("logical_heldout_row_ids")
+            != list(logical.heldout_row_ids)
+            or view.get("logical_heldout_row_order_fingerprint")
+            != scope["heldout_row_order_fingerprint"]
+            or view.get("view_input_policy") != expected_policy
+            or _require_sha256(
+                view.get("logical_source_artifact_sha256"),
+                label=f"{logical.scope_id} logical source SHA-256",
+            )
+            != view.get("logical_source_artifact_sha256")
+            or view.get("physical_owner_scope_id") != owner.scope_id
+            or view.get("physical_payload")
+            != physical_registration_by_owner[owner.scope_id]
+            or view.get("family_fit_artifact_sha256")
+            != physical_payload["family_fit_artifact_sha256"]
+            or view.get("event") != "logical_view_reference_published"
+            or view.get("published_after_all_family_fit_seals") is not True
+            or view.get("logical_view_transform_performed") is not False
+            or view.get("registered_heldout_text_accessed") is not False
+            or view.get("reuses_physical_fit")
+            is not (logical.scope_id != owner.scope_id)
+            or view.get("heldout_labels_supplied") is not False
+            or view.get("content_sha256") != _sha256_json(view_body)
+            or dict(registration)
+            != {
+                "logical_scope_id": logical.scope_id,
+                "relative_path": relative,
+                "sha256": digest,
+                "size_bytes": size,
+                "content_sha256": view.get("content_sha256"),
+            }
+        ):
+            raise ValueError(f"persisted logical view changed: {logical.scope_id}")
+        logical_view_hashes[logical.scope_id] = digest
+        expected_files.add(relative)
+    if len(logical_rows) != len(plan.scopes):
+        raise ValueError("persisted logical view coverage changed")
+
+    expected_scientific = build_role_neutral_logical_evidence_bindings(
+        plan=plan,
+        physical_fit_artifacts_by_owner=physical_artifacts,
+        logical_view_artifact_sha256_by_scope=logical_view_hashes,
+    )
+    if terminal.get("scientific_bindings") != expected_scientific:
+        raise ValueError("persisted scientific role-neutral bindings changed")
+    observed_files, observed_directories = _root_tree_inventory(tree)
+    if observed_files != expected_files or observed_directories != _parent_directories(
+        tuple(expected_files)
+    ):
+        raise ValueError("persisted role-neutral binding tree has unregistered entries")
+    return copy.deepcopy(dict(terminal))
+
+
 def _resolve_fragment_scope_authority(
     *,
     plan: Stage1ScopePlan | None,
@@ -688,12 +1808,30 @@ def _fragment_identity_rows(
             kind: sum(scope.scope_kind == kind for scope in plan.scopes)
             for kind in ("full_outer", "exact_inner", "cumulative_spent")
         }
-        if kind_counts != {
-            "full_outer": 5,
-            "exact_inner": 25,
-            "cumulative_spent": 10,
-        }:
-            raise ValueError("production legacy fragment merge requires exact 5/25/10 coverage")
+        outer_folds = {scope.outer_fold for scope in plan.scopes}
+        outer_count = len(outer_folds)
+        exact_counts = {
+            outer_fold: sum(
+                scope.scope_kind == "exact_inner"
+                and scope.outer_fold == outer_fold
+                for scope in plan.scopes
+            )
+            for outer_fold in outer_folds
+        }
+        if (
+            outer_count < 2
+            or kind_counts["full_outer"] != outer_count
+            or not exact_counts
+            or len(set(exact_counts.values())) != 1
+            or next(iter(exact_counts.values())) < 2
+            or kind_counts["exact_inner"] != sum(exact_counts.values())
+            or kind_counts["cumulative_spent"]
+            != outer_count * int(plan.review_rounds)
+        ):
+            raise ValueError(
+                "production legacy fragment merge coverage does not match "
+                "the authenticated fold/review plan"
+            )
     fragments: list[LegacyStage1ScopeFragment] = []
     identities: list[dict[str, Any]] = []
     artifact_rows: list[tuple[str, Mapping[str, Any]]] = []
@@ -1050,13 +2188,26 @@ def validate_legacy_stage1_fragment_merge_from_path(
 __all__ = [
     "LEGACY_STAGE1_FRAGMENT_MERGE_ACCUMULATORS_SCHEMA",
     "LEGACY_STAGE1_FRAGMENT_MERGE_SCHEMA",
+    "LEGACY_STAGE1_FIT_ONLY_FAMILY_SEAL_SCHEMA",
+    "LEGACY_STAGE1_LOGICAL_EVIDENCE_VIEW_SCHEMA",
+    "LEGACY_STAGE1_LOGICAL_VIEW_ARTIFACT_SCHEMA",
+    "LEGACY_STAGE1_ROLE_NEUTRAL_BINDING_SET_SCHEMA",
+    "LEGACY_STAGE1_ROLE_NEUTRAL_PERSISTED_SET_SCHEMA",
+    "LEGACY_STAGE1_ROLE_NEUTRAL_PHYSICAL_PAYLOAD_SCHEMA",
+    "LEGACY_STAGE1_ROLE_NEUTRAL_PHYSICAL_FIT_SCHEMA",
     "LEGACY_STAGE1_SCOPE_ACCUMULATOR_SCHEMA",
     "LEGACY_STAGE1_SCOPE_FRAGMENT_SCHEMA",
     "LegacyStage1ScopeFragment",
+    "build_role_neutral_fit_only_family_seal",
+    "build_role_neutral_logical_evidence_bindings",
+    "build_role_neutral_physical_fit_artifact",
     "durably_sync_legacy_stage1_tree",
     "merge_legacy_stage1_scope_fragments",
+    "persist_role_neutral_logical_evidence_bindings",
     "seal_legacy_stage1_scope_fragment",
     "validate_legacy_stage1_fragment_merge",
     "validate_legacy_stage1_fragment_merge_from_path",
+    "validate_persisted_role_neutral_logical_evidence_bindings",
+    "validate_role_neutral_logical_evidence_bindings",
     "validate_legacy_stage1_scope_fragment",
 ]

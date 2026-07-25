@@ -242,3 +242,43 @@ def test_validated_exact_inner_recurrence_is_visible_as_support_evidence():
             ],
         }
     ]
+
+
+def test_validated_exact_inner_recurrence_never_applies_a_hidden_term_cap():
+    terms = {
+        (TFIDF_TOPICS, "effect_modifier", f"recurrent term {index:03d}")
+        for index in range(41)
+    }
+    recurrence = _build_exact_inner_recurrence(
+        {inner_fold: set(terms) for inner_fold in (1, 2, 3)}
+    )
+    payload = {
+        "outer_fold": 1,
+        "scope": "full_outer_train",
+        "discovery": {
+            "topic_banks": {
+                "effect": {
+                    "topics": [
+                        {
+                            "topic_id": "outer_only",
+                            "terms": [{"term": "outer term"}],
+                        }
+                    ]
+                }
+            },
+            "exact_inner_recurrence": recurrence,
+        },
+    }
+
+    request = prepare_all_evidence_fusion(
+        [FoldEvidenceInput(TFIDF_TOPIC_SOURCE, payload, _provenance())]
+    )
+    recurrence_block = next(
+        block.content
+        for block in request.evidence_blocks
+        if block.content.get("kind") == "exact_inner_normalized_term_recurrence"
+    )
+
+    assert recurrence_block["discovered_recurrent_term_count"] == 41
+    assert recurrence_block["retained_term_count"] == 41
+    assert len(recurrence_block["terms"]) == 41

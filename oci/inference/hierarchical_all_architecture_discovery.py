@@ -78,12 +78,9 @@ from .hierarchical_discovery_job_cache import (
 )
 from .hierarchical_discovery_response_contract import (
     HIERARCHICAL_DISCOVERY_EXACT_COVERAGE_REPRESENTATION,
-    HIERARCHICAL_DISCOVERY_MAX_ATOMS_PER_INTERPRET_JOB,
-    HIERARCHICAL_DISCOVERY_MAX_DEFINITION_FOLD_MEMBERS,
-    HIERARCHICAL_DISCOVERY_MAX_FINDINGS_PER_ATOMIC_REVIEW,
-    HIERARCHICAL_DISCOVERY_MAX_GENERATED_NAME_LENGTH,
-    HIERARCHICAL_DISCOVERY_MAX_MEMBERS_PER_INTERPRET_JOB,
     HIERARCHICAL_DISCOVERY_RESPONSE_CONTRACT_VERSION,
+    HierarchyWireBudget,
+    LEGACY_HIERARCHY_WIRE_BUDGET,
     attach_hierarchical_discovery_response_contract,
     build_hierarchical_discovery_response_contract,
 )
@@ -202,6 +199,9 @@ EXTRACTION_DEFINITION_SYSTEM_PROMPT = (
     "and must not be repeated. Return JSON only."
 )
 
+# Backward-compatible generic component defaults.  Production entry points
+# bind both values from the required scientific Stage-2 protocol and do not
+# treat either value as an engine ceiling.
 SELECTOR_THINKING_TOKEN_BUDGET = 5_000
 MAX_RENDERED_DISCOVERY_PROMPT_BYTES = 220_000
 AUTHENTICATED_MESSAGE_ENVELOPE_BINDING = "authenticated_model_message_envelope"
@@ -512,7 +512,7 @@ def _authenticated_message_envelope(
         "serialization": "canonical_json_utf8_message_array_v1",
         "sha256": content_sha256(list(messages)),
         "byte_count": len(rendered),
-        "max_byte_count": MAX_RENDERED_DISCOVERY_PROMPT_BYTES,
+        "byte_limit_binding": "content_addressed_orchestrator_runtime_config_v1",
     }
 
 
@@ -603,8 +603,10 @@ def discovery_response_repair_policy_identity() -> dict[str, Any]:
         "repair_assistant_placeholders": dict(_RESPONSE_REPAIR_ASSISTANT_PLACEHOLDERS),
         "diagnostic_policy": ("fixed_category_only_no_exception_text_no_model_identifiers_v1"),
         "repair_prompts": dict(_RESPONSE_REPAIR_PROMPTS),
-        "context_guard_bytes": MAX_RENDERED_DISCOVERY_PROMPT_BYTES,
-        "selector_thinking_token_budget": SELECTOR_THINKING_TOKEN_BUDGET,
+        "context_guard_source": "content_addressed_orchestrator_runtime_config_v1",
+        "selector_thinking_token_budget_source": (
+            "authenticated_discovery_job_settings_v1"
+        ),
         "extraction_thinking_enabled": False,
         "cache_policy": "validated_final_response_only_with_attempt_trace_v1",
     }
@@ -681,10 +683,13 @@ class DiscoveryJobSettings:
             raise ValueError("response_format must be json")
 
     @classmethod
-    def selector(cls) -> "DiscoveryJobSettings":
+    def selector(
+        cls,
+        thinking_token_budget: int = SELECTOR_THINKING_TOKEN_BUDGET,
+    ) -> "DiscoveryJobSettings":
         return cls(
             thinking_enabled=True,
-            thinking_token_budget=SELECTOR_THINKING_TOKEN_BUDGET,
+            thinking_token_budget=thinking_token_budget,
         )
 
     @classmethod
@@ -693,10 +698,11 @@ class DiscoveryJobSettings:
 
     def validate_for(self, job_kind: str) -> None:
         if job_kind in _SELECTOR_JOB_KINDS:
-            if not self.thinking_enabled or (
-                self.thinking_token_budget != SELECTOR_THINKING_TOKEN_BUDGET
-            ):
-                raise ValueError("selector jobs require thinking enabled with exactly 5000 tokens")
+            if not self.thinking_enabled or self.thinking_token_budget < 1:
+                raise ValueError(
+                    "selector jobs require thinking enabled with a positive "
+                    "authenticated token budget"
+                )
         elif job_kind == EXTRACTION_DEFINITION_JOB:
             if self.thinking_enabled or self.thinking_token_budget != 0:
                 raise ValueError("extraction-definition jobs require thinking disabled")
@@ -1183,9 +1189,8 @@ def _validated_response_attempt_trace(
             isinstance(byte_count, bool)
             or not isinstance(byte_count, int)
             or byte_count < 1
-            or byte_count > MAX_RENDERED_DISCOVERY_PROMPT_BYTES
         ):
-            raise ValueError("response attempt violates the fixed context guard")
+            raise ValueError("response attempt carries an invalid rendered byte count")
         if item["validation_outcome"] not in {
             *_REPAIRABLE_RESPONSE_FAILURES,
             VALIDATED_RESPONSE,
@@ -1448,6 +1453,7 @@ class DirectNumericalDossierBinding:
 @dataclass(frozen=True)
 class HierarchicalDiscoveryConfig:
     max_rendered_prompt_bytes: int = MAX_RENDERED_DISCOVERY_PROMPT_BYTES
+    selector_thinking_token_budget: int = SELECTOR_THINKING_TOKEN_BUDGET
     max_semantic_member_ids_per_chunk: int = DEFAULT_MAX_SEMANTIC_MEMBER_IDS_PER_ARCHITECTURE_CHUNK
     max_cross_architecture_lookback_ids_per_group: int = 8
     max_cross_architecture_lookback_bytes_per_group: int = 96_000
@@ -1456,21 +1462,20 @@ class HierarchicalDiscoveryConfig:
     max_rejection_lookback_ids_per_candidate: int = 24
     max_rejection_lookback_bytes_per_candidate: int = 48_000
     max_integrated_features: int = 16
+    wire_budget: HierarchyWireBudget = field(
+        default_factory=lambda: LEGACY_HIERARCHY_WIRE_BUDGET
+    )
 
     def __post_init__(self) -> None:
-        if (
-            isinstance(self.max_rendered_prompt_bytes, bool)
-            or not isinstance(self.max_rendered_prompt_bytes, int)
-            or self.max_rendered_prompt_bytes != MAX_RENDERED_DISCOVERY_PROMPT_BYTES
-        ):
-            raise ValueError(
-                f"max_rendered_prompt_bytes is fixed at {MAX_RENDERED_DISCOVERY_PROMPT_BYTES}"
-            )
+        if not isinstance(self.wire_budget, HierarchyWireBudget):
+            raise TypeError("wire_budget must be a HierarchyWireBudget")
         nonnegative = (
             "max_cross_architecture_lookback_ids_per_group",
             "max_rejection_lookback_ids_per_candidate",
         )
         positive = (
+            "max_rendered_prompt_bytes",
+            "selector_thinking_token_budget",
             "max_semantic_member_ids_per_chunk",
             "max_cross_architecture_lookback_bytes_per_group",
             "max_extraction_lookback_ids_per_feature",
@@ -1488,7 +1493,7 @@ class HierarchicalDiscoveryConfig:
                 raise ValueError(f"{name} must be positive")
         if (
             self.max_semantic_member_ids_per_chunk
-            > HIERARCHICAL_DISCOVERY_MAX_MEMBERS_PER_INTERPRET_JOB
+            > self.wire_budget.max_interpret_members_per_job
         ):
             raise ValueError(
                 "max_semantic_member_ids_per_chunk exceeds the authenticated "
@@ -1518,9 +1523,10 @@ class HierarchicalDiscoveryConfig:
                 self.max_rejection_lookback_bytes_per_candidate
             ),
             "max_integrated_features": self.max_integrated_features,
+            "hierarchy_wire_budget": self.wire_budget.as_dict(),
             "legacy_lookback_and_feature_cap_fields_apply_semantic_truncation": False,
             "selector_thinking_enabled": True,
-            "selector_thinking_token_budget": SELECTOR_THINKING_TOKEN_BUDGET,
+            "selector_thinking_token_budget": self.selector_thinking_token_budget,
             "extraction_definition_thinking_enabled": False,
             "extraction_definition_thinking_token_budget": 0,
         }
@@ -1793,7 +1799,10 @@ def _candidate_from_consolidation(*, family: str, concept: Mapping[str, Any]) ->
 
 
 def _render_consolidation_messages(
-    *, source_family: str, candidates: Sequence[DiscoveryCandidate]
+    *,
+    source_family: str,
+    candidates: Sequence[DiscoveryCandidate],
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> tuple[dict[str, str], ...]:
     if candidates:
         context = consolidate_candidate_context(
@@ -1810,6 +1819,7 @@ def _render_consolidation_messages(
     request = attach_hierarchical_discovery_response_contract(
         job_kind=CONSOLIDATE_ARCHITECTURE_JOB,
         request=context,
+        wire_budget=wire_budget,
     )
     return (
         {
@@ -1849,6 +1859,7 @@ def _render_candidate_relation_page_messages(
     source_family: str | None,
     anchor: DiscoveryCandidate,
     peers: Sequence[DiscoveryCandidate],
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> tuple[dict[str, str], ...]:
     peer_tuple = tuple(peers)
     request: dict[str, Any] = {
@@ -1863,6 +1874,7 @@ def _render_candidate_relation_page_messages(
     payload = attach_hierarchical_discovery_response_contract(
         job_kind=job_kind,
         request=request,
+        wire_budget=wire_budget,
     )
     return (
         {
@@ -1888,6 +1900,7 @@ def _render_candidate_definition_fold_messages(
     fold_index: int,
     candidates: Sequence[DiscoveryCandidate],
     prior_accumulator: Mapping[str, Any] | None,
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> tuple[dict[str, str], ...]:
     candidate_tuple = tuple(candidates)
     request = attach_hierarchical_discovery_response_contract(
@@ -1902,6 +1915,7 @@ def _render_candidate_definition_fold_messages(
             ),
             "fresh_candidates": [_bounded_candidate_projection(item) for item in candidate_tuple],
         },
+        wire_budget=wire_budget,
     )
     return (
         {
@@ -1950,6 +1964,7 @@ def _compile_bounded_consolidation(
     candidates: Sequence[DiscoveryCandidate],
     grouped: Mapping[str, Any],
     definitions_by_group_id: Mapping[str, Mapping[str, Any]],
+    wire_budget: HierarchyWireBudget,
 ) -> dict[str, Any]:
     items = tuple(candidates)
     by_id = {item.candidate_id: item for item in items}
@@ -1979,6 +1994,7 @@ def _compile_bounded_consolidation(
             proposed=proposed,
             slot=f"group_{_sha(group_id)[:8]}",
             used=used_names,
+            wire_budget=wire_budget,
         )
         if event is not None:
             disambiguations.append(
@@ -2048,6 +2064,7 @@ def _compile_bounded_cross_architecture_plan(
     grouped: Mapping[str, Any],
     definitions_by_group_id: Mapping[str, Mapping[str, Any]],
     evidence_by_id: Mapping[str, DiscoveryEvidenceItem],
+    wire_budget: HierarchyWireBudget,
 ) -> tuple[dict[str, Any], dict[str, tuple[str, ...]]]:
     items = tuple(candidates)
     by_id = {item.candidate_id: item for item in items}
@@ -2078,6 +2095,7 @@ def _compile_bounded_cross_architecture_plan(
             proposed=proposed,
             slot=f"group_{_sha(group_id)[:8]}",
             used=used_names,
+            wire_budget=wire_budget,
         )
         used_names.add(name)
         if event is not None:
@@ -2161,6 +2179,7 @@ def _render_bounded_group_integration_messages(
     definition: Mapping[str, Any],
     members: Sequence[DiscoveryCandidate],
     lookback: Sequence[Mapping[str, Any]],
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> tuple[dict[str, str], ...]:
     member_tuple = tuple(members)
     source_families = tuple(
@@ -2188,6 +2207,7 @@ def _render_bounded_group_integration_messages(
             },
             "requested_raw_evidence_lookback": list(lookback),
         },
+        wire_budget=wire_budget,
     )
     return (
         {
@@ -2253,6 +2273,7 @@ def _render_integration_evidence_page_messages(
     members: Sequence[DiscoveryCandidate],
     evidence: DiscoveryEvidenceItem,
     review_id: str,
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> tuple[dict[str, str], ...]:
     request = attach_hierarchical_discovery_response_contract(
         job_kind=CROSS_ARCHITECTURE_INTEGRATION_JOB,
@@ -2270,6 +2291,7 @@ def _render_integration_evidence_page_messages(
                 "content": _clone(evidence.content),
             },
         },
+        wire_budget=wire_budget,
     )
     return (
         {
@@ -2343,6 +2365,7 @@ def _render_integration_evidence_fold_messages(
     fold_index: int,
     definition: Mapping[str, Any],
     review_inputs: Sequence[tuple[str, Mapping[str, Any]]],
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> tuple[dict[str, str], ...]:
     inputs = tuple(review_inputs)
     request = attach_hierarchical_discovery_response_contract(
@@ -2358,6 +2381,7 @@ def _render_integration_evidence_fold_messages(
                 for review_id, review in inputs
             ],
         },
+        wire_budget=wire_budget,
     )
     return (
         {
@@ -2448,6 +2472,7 @@ def _render_rejection_evidence_page_messages(
     integration_disposition: Mapping[str, Any],
     evidence: DiscoveryEvidenceItem,
     review_id: str,
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> tuple[dict[str, str], ...]:
     request = attach_hierarchical_discovery_response_contract(
         job_kind=REJECTION_CRITIC_JOB,
@@ -2465,6 +2490,7 @@ def _render_rejection_evidence_page_messages(
                 "content": _clone(evidence.content),
             },
         },
+        wire_budget=wire_budget,
     )
     return (
         {
@@ -2530,6 +2556,7 @@ def _render_rejection_evidence_fold_messages(
     candidate: DiscoveryCandidate,
     fold_index: int,
     review_inputs: Sequence[tuple[str, Mapping[str, Any]]],
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> tuple[dict[str, str], ...]:
     inputs = tuple(review_inputs)
     request = attach_hierarchical_discovery_response_contract(
@@ -2545,6 +2572,7 @@ def _render_rejection_evidence_fold_messages(
                 for review_id, review in inputs
             ],
         },
+        wire_budget=wire_budget,
     )
     return (
         {
@@ -2630,6 +2658,7 @@ def _render_extraction_evidence_page_messages(
     request: ExtractionDefinitionRequest,
     evidence: DiscoveryEvidenceItem,
     review_id: str,
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> tuple[dict[str, str], ...]:
     payload = attach_hierarchical_discovery_response_contract(
         job_kind=EXTRACTION_DEFINITION_JOB,
@@ -2646,6 +2675,7 @@ def _render_extraction_evidence_page_messages(
                 "content": _clone(evidence.content),
             },
         },
+        wire_budget=wire_budget,
     )
     return (
         {
@@ -2739,6 +2769,7 @@ def _render_extraction_evidence_fold_messages(
     request: ExtractionDefinitionRequest,
     fold_index: int,
     review_inputs: Sequence[tuple[str, Mapping[str, Any]]],
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> tuple[dict[str, str], ...]:
     inputs = tuple(review_inputs)
     vocabulary_grounding_policy = extraction_vocabulary_grounding_policy()
@@ -2763,6 +2794,7 @@ def _render_extraction_evidence_fold_messages(
             },
             "vocabulary_grounding_policy": vocabulary_grounding_policy,
         },
+        wire_budget=wire_budget,
     )
     return (
         {
@@ -2837,11 +2869,13 @@ def _validate_consolidation_allowing_empty(
     *,
     source_family: str,
     candidates: Sequence[DiscoveryCandidate],
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> dict[str, Any]:
     return validate_consolidation_response(
         response,
         source_family=source_family,
         candidates=candidates,
+        wire_budget=wire_budget,
     )
 
 
@@ -2851,6 +2885,7 @@ def _render_coverage_messages(
     evidence: Sequence[DiscoveryEvidenceItem],
     interpretation_responses: Sequence[Mapping[str, Any]],
     consolidation_response: Mapping[str, Any],
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> tuple[dict[str, str], ...]:
     request = attach_hierarchical_discovery_response_contract(
         job_kind=COVERAGE_CRITIC_JOB,
@@ -2863,6 +2898,7 @@ def _render_coverage_messages(
             ],
             "consolidation": consolidation_response,
         },
+        wire_budget=wire_budget,
     )
     return (
         {
@@ -2891,6 +2927,7 @@ def _render_atomic_coverage_messages(
     consolidation_response: Mapping[str, Any],
     canonical_names: Sequence[str],
     page_index: int,
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> tuple[dict[str, str], ...]:
     atomic_review_id = f"coverage_review_{_sha({'evidence_id': evidence.evidence_id, 'page_index': page_index, 'canonical_names': list(canonical_names)})}"
     request = attach_hierarchical_discovery_response_contract(
@@ -2905,6 +2942,7 @@ def _render_atomic_coverage_messages(
             "chunk_interpretation": interpretation_model_view(interpretation_response),
             "consolidation_page": _clone(consolidation_response),
         },
+        wire_budget=wire_budget,
     )
     return (
         {
@@ -3029,6 +3067,7 @@ def _compile_coverage_revision_findings(
     findings: Sequence[Mapping[str, Any]],
     source_family: str,
     candidates: Sequence[DiscoveryCandidate],
+    wire_budget: HierarchyWireBudget,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Apply one bounded critic revision deterministically without another selector."""
 
@@ -3068,6 +3107,7 @@ def _compile_coverage_revision_findings(
             proposed=proposed,
             slot=f"coverage_{finding_index + 1:03d}",
             used=used_names,
+            wire_budget=wire_budget,
         )
         used_names.add(derived)
         if action == "split_concept":
@@ -3132,6 +3172,7 @@ def _render_integration_messages(
     planner_response: Mapping[str, Any],
     lookback: Sequence[Mapping[str, Any]],
     maximum_integrated_features: int,
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> tuple[dict[str, str], ...]:
     architecture_context = cross_architecture_planner_context(dossiers)
     architecture_context.pop("schema_version")
@@ -3147,6 +3188,7 @@ def _render_integration_messages(
             "requested_raw_evidence_lookback": list(lookback),
             "maximum_integrated_features": maximum_integrated_features,
         },
+        wire_budget=wire_budget,
     )
     return (
         {
@@ -3168,16 +3210,29 @@ def _render_integration_messages(
 
 
 def _derive_unique_integration_name(
-    *, proposed: str, slot: str, used: set[str]
+    *,
+    proposed: str,
+    slot: str,
+    used: set[str],
+    wire_budget: HierarchyWireBudget,
 ) -> tuple[str, dict[str, str] | None]:
     """Preserve distinct active slots under a bounded deterministic name."""
 
+    if not isinstance(wire_budget, HierarchyWireBudget):
+        raise TypeError(
+            "duplicate-name compilation requires an explicit HierarchyWireBudget"
+        )
     if proposed not in used:
         return proposed, None
     ordinal = 1
     while True:
         suffix = f"_{slot}" if ordinal == 1 else f"_{slot}_{ordinal}"
-        available = HIERARCHICAL_DISCOVERY_MAX_GENERATED_NAME_LENGTH - len(suffix)
+        available = wire_budget.max_generated_name_chars - len(suffix)
+        if available < 1:
+            raise ValueError(
+                "generated-name wire budget cannot encode the required "
+                "compiler-owned suffix"
+            )
         prefix = proposed[:available].rstrip("_") or "feature"
         derived = f"{prefix}{suffix}"
         if derived not in used:
@@ -3196,6 +3251,7 @@ def validate_cross_architecture_integration_response(
     dossiers: Sequence[ArchitectureDossier],
     lookback: Sequence[Mapping[str, Any]],
     maximum_integrated_features: int,
+    wire_budget: HierarchyWireBudget,
 ) -> tuple[dict[str, Any], tuple[IntegratedCanonicalFeature, ...]]:
     """Compile exact candidate routes into lossless integrated features."""
 
@@ -3291,6 +3347,7 @@ def validate_cross_architecture_integration_response(
             proposed=definitions[slot]["canonical_name"],
             slot=slot,
             used=used_names,
+            wire_budget=wire_budget,
         )
         used_names.add(name)
         name_by_slot[slot] = name
@@ -3395,6 +3452,7 @@ def _render_rejection_critic_messages(
     candidates: Mapping[str, DiscoveryCandidate],
     integration_response: Mapping[str, Any],
     lookback: Sequence[Mapping[str, Any]],
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> tuple[dict[str, str], ...]:
     disposition_by_id = {
         row["candidate_id"]: row for row in integration_response["candidate_dispositions"]
@@ -3430,6 +3488,7 @@ def _render_rejection_critic_messages(
                 }
             ],
         },
+        wire_budget=wire_budget,
     )
     return (
         {
@@ -3454,6 +3513,7 @@ def _compile_rejection_reconsideration(
     reconsideration: Mapping[str, Any],
     evidence_by_id: Mapping[str, DiscoveryEvidenceItem],
     maximum_integrated_features: int,
+    wire_budget: HierarchyWireBudget,
 ) -> tuple[dict[str, Any], tuple[IntegratedCanonicalFeature, ...], dict[str, Any]]:
     """Compile one restore/split critic decision into the frozen integration state."""
 
@@ -3472,6 +3532,7 @@ def _compile_rejection_reconsideration(
         proposed=str(reconsideration["proposed_name"]),
         slot=f"rejection_{_sha(candidate.candidate_id)[:8]}",
         used=used_names,
+        wire_budget=wire_budget,
     )
     families = tuple(candidate.source_families)
     feature = IntegratedCanonicalFeature(
@@ -3546,6 +3607,7 @@ def _render_extraction_messages(
     *,
     request: ExtractionDefinitionRequest,
     model_evidence: Sequence[DiscoveryEvidenceItem] | None = None,
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> tuple[dict[str, str], ...]:
     visible_evidence = tuple(request.evidence if model_evidence is None else model_evidence)
     visible_ids = tuple(item.evidence_id for item in visible_evidence)
@@ -3577,6 +3639,7 @@ def _render_extraction_messages(
             },
             "vocabulary_grounding_policy": vocabulary_grounding_policy,
         },
+        wire_budget=wire_budget,
     )
     return (
         {
@@ -3657,7 +3720,10 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
             raise ValueError(
                 "chunk plan max_semantic_member_ids_per_chunk differs from the " "hierarchy config"
             )
-        if self.chunk_plan.max_atoms_per_chunk > HIERARCHICAL_DISCOVERY_MAX_ATOMS_PER_INTERPRET_JOB:
+        if (
+            self.chunk_plan.max_atoms_per_chunk
+            > self.config.wire_budget.max_interpret_atoms_per_job
+        ):
             raise ValueError(
                 "chunk plan max_atoms_per_chunk exceeds the authenticated interpret "
                 "response budget"
@@ -3757,17 +3823,23 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
             input_bindings=bindings,
         )
 
+    def _selector_settings(self) -> DiscoveryJobSettings:
+        return DiscoveryJobSettings.selector(
+            self.config.selector_thinking_token_budget
+        )
+
     def _build_interpret_job(self, chunk: ArchitectureEvidenceChunk) -> DiscoveryJsonJob:
         evidence = tuple(self._evidence_by_id[str(row["evidence_id"])] for row in chunk.evidence)
         messages = render_interpret_evidence_chunk_messages(
             family_explanation=self.family_explanations[chunk.source_family],
             evidence=evidence,
+            wire_budget=self.config.wire_budget,
         )
         return self._create_job(
             job_kind=INTERPRET_CHUNK_JOB,
             scope=f"{chunk.source_family}.chunk_{chunk.chunk_index:03d}",
             dependencies=(),
-            settings=DiscoveryJobSettings.selector(),
+            settings=self._selector_settings(),
             messages=messages,
             input_bindings={
                 "catalog_sha256": self.catalog.catalog_sha256,
@@ -3861,9 +3933,11 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
                 },
                 "lossless_raw_evidence_hierarchy": {
                     "one_raw_evidence_item_per_page": True,
-                    "maximum_fold_inputs": (HIERARCHICAL_DISCOVERY_MAX_DEFINITION_FOLD_MEMBERS),
+                    "maximum_fold_inputs": (
+                        self.config.wire_budget.max_definition_fold_inputs
+                    ),
                     "maximum_fresh_inputs_after_first_fold": (
-                        HIERARCHICAL_DISCOVERY_MAX_DEFINITION_FOLD_MEMBERS - 1
+                        self.config.wire_budget.max_definition_fold_inputs - 1
                     ),
                     "every_input_receives_an_explicit_disposition": True,
                     "semantic_sampling_or_truncation": False,
@@ -3877,7 +3951,7 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
                     "one_accepted_feature_per_exhaustive_page_and_fold_hierarchy"
                 ),
                 "extraction_vocabulary_grounding": (extraction_vocabulary_grounding_policy()),
-                "selector_settings": DiscoveryJobSettings.selector().as_dict(),
+                "selector_settings": self._selector_settings().as_dict(),
                 "extraction_settings": DiscoveryJobSettings.extraction().as_dict(),
             },
             "assurances": {
@@ -3919,7 +3993,7 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
         rendered_byte_count = len(job.rendered_messages_bytes)
         if rendered_byte_count > self.config.max_rendered_prompt_bytes:
             raise ValueError(
-                "rendered discovery prompt exceeds the fixed "
+                "rendered discovery prompt exceeds the configured "
                 f"{self.config.max_rendered_prompt_bytes}-byte guard"
             )
         self._assert_runner_identity(runner)
@@ -4018,7 +4092,7 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
             )
             if len(repair_job.rendered_messages_bytes) > self.config.max_rendered_prompt_bytes:
                 raise ValueError(
-                    "cumulative response-repair prompt exceeds the fixed "
+                    "cumulative response-repair prompt exceeds the configured "
                     f"{self.config.max_rendered_prompt_bytes}-byte guard"
                 )
             self._assert_runner_identity(runner)
@@ -4137,17 +4211,18 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
             "chunk_consolidation_sha256": _sha(chunk_consolidation),
             "consolidation_response_sha256": _sha(consolidation),
         }
-        if len(canonical_names) <= HIERARCHICAL_DISCOVERY_MAX_FINDINGS_PER_ATOMIC_REVIEW:
+        if len(canonical_names) <= self.config.wire_budget.max_findings_per_atomic_review:
             coverage_job = self._create_job(
                 job_kind=COVERAGE_CRITIC_JOB,
                 scope=f"{family}.chunk_{chunk.chunk_index:03d}",
                 dependencies=(interpret_job_id, *consolidation_dependency_ids),
-                settings=DiscoveryJobSettings.selector(),
+                settings=self._selector_settings(),
                 messages=_render_coverage_messages(
                     family=family,
                     evidence=evidence_tuple,
                     interpretation_responses=(interpretation,),
                     consolidation_response=coverage_consolidation,
+                    wire_budget=self.config.wire_budget,
                 ),
                 input_bindings={
                     **common_bindings,
@@ -4184,12 +4259,13 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
         for evidence in evidence_tuple:
             name_pages = tuple(
                 canonical_names[
-                    offset : offset + HIERARCHICAL_DISCOVERY_MAX_FINDINGS_PER_ATOMIC_REVIEW
+                    offset
+                    : offset + self.config.wire_budget.max_findings_per_atomic_review
                 ]
                 for offset in range(
                     0,
                     len(canonical_names),
-                    HIERARCHICAL_DISCOVERY_MAX_FINDINGS_PER_ATOMIC_REVIEW,
+                    self.config.wire_budget.max_findings_per_atomic_review,
                 )
             ) or ((),)
             for page_index, names in enumerate(name_pages):
@@ -4213,7 +4289,7 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
                         f"{evidence.evidence_id}.page_{page_index:06d}"
                     ),
                     dependencies=(interpret_job_id, *consolidation_dependency_ids),
-                    settings=DiscoveryJobSettings.selector(),
+                    settings=self._selector_settings(),
                     messages=_render_atomic_coverage_messages(
                         family=family,
                         evidence=evidence,
@@ -4221,6 +4297,7 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
                         consolidation_response=page_consolidation,
                         canonical_names=names,
                         page_index=page_index,
+                        wire_budget=self.config.wire_budget,
                     ),
                     input_bindings={
                         **common_bindings,
@@ -4282,7 +4359,10 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
 
         items = tuple(candidates)
         by_id = {item.candidate_id: item for item in items}
-        schedule = bounded_candidate_relation_pages(items)
+        schedule = bounded_candidate_relation_pages(
+            items,
+            wire_budget=self.config.wire_budget,
+        )
         normalized_pages: list[dict[str, Any]] = []
         relation_job_ids: list[str] = []
         for page_index, page in enumerate(schedule):
@@ -4292,13 +4372,14 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
                 job_kind=CONSOLIDATE_ARCHITECTURE_JOB,
                 scope=f"{source_family}.relation_page_{page_index:06d}",
                 dependencies=tuple(interpretation_job_ids),
-                settings=DiscoveryJobSettings.selector(),
+                settings=self._selector_settings(),
                 messages=_render_candidate_relation_page_messages(
                     job="compare_consolidation_candidate_relations",
                     job_kind=CONSOLIDATE_ARCHITECTURE_JOB,
                     source_family=source_family,
                     anchor=by_id[anchor_id],
                     peers=tuple(by_id[peer_id] for peer_id in peer_ids),
+                    wire_budget=self.config.wire_budget,
                 ),
                 input_bindings={
                     "catalog_sha256": self.catalog.catalog_sha256,
@@ -4322,6 +4403,7 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
                         raw,
                         anchor_candidate_id=anchor_id,
                         peer_candidate_ids=peer_ids,
+                        wire_budget=self.config.wire_budget,
                     )
                 ),
             )
@@ -4353,6 +4435,7 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
             for fold in candidate_definition_fold_batches(
                 group_id=group_id,
                 member_candidate_ids=member_ids,
+                wire_budget=self.config.wire_budget,
             ):
                 fresh_ids = tuple(str(value) for value in fold["member_candidate_ids"])
                 dependencies = (
@@ -4363,7 +4446,7 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
                     job_kind=CONSOLIDATE_ARCHITECTURE_JOB,
                     scope=(f"{source_family}.{group_id}.definition_fold_{fold_index:06d}"),
                     dependencies=dependencies,
-                    settings=DiscoveryJobSettings.selector(),
+                    settings=self._selector_settings(),
                     messages=_render_candidate_definition_fold_messages(
                         job="fold_consolidation_group_definition",
                         job_kind=CONSOLIDATE_ARCHITECTURE_JOB,
@@ -4371,6 +4454,7 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
                         fold_index=fold_index,
                         candidates=tuple(by_id[value] for value in fresh_ids),
                         prior_accumulator=prior,
+                        wire_budget=self.config.wire_budget,
                     ),
                     input_bindings={
                         "catalog_sha256": self.catalog.catalog_sha256,
@@ -4400,6 +4484,7 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
             candidates=items,
             grouped=grouped,
             definitions_by_group_id=definitions,
+            wire_budget=self.config.wire_budget,
         )
         if not terminal_job_ids:
             terminal_job_ids.extend(relation_job_ids or interpretation_job_ids)
@@ -4458,20 +4543,26 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
         dossier_sha256 = [_sha(dossier.as_authenticated_dict()) for dossier in dossier_tuple]
         normalized_pages: list[dict[str, Any]] = []
         relation_job_ids: list[str] = []
-        for page_index, page in enumerate(bounded_candidate_relation_pages(candidates)):
+        for page_index, page in enumerate(
+            bounded_candidate_relation_pages(
+                candidates,
+                wire_budget=self.config.wire_budget,
+            )
+        ):
             anchor_id = str(page["anchor_candidate_id"])
             peer_ids = tuple(str(value) for value in page["peer_candidate_ids"])
             relation_job = self._create_job(
                 job_kind=CROSS_ARCHITECTURE_PLANNER_JOB,
                 scope=f"all_architectures.relation_page_{page_index:06d}",
                 dependencies=tuple(coverage_job_ids),
-                settings=DiscoveryJobSettings.selector(),
+                settings=self._selector_settings(),
                 messages=_render_candidate_relation_page_messages(
                     job="compare_cross_architecture_candidate_relations",
                     job_kind=CROSS_ARCHITECTURE_PLANNER_JOB,
                     source_family=None,
                     anchor=by_id[anchor_id],
                     peers=tuple(by_id[value] for value in peer_ids),
+                    wire_budget=self.config.wire_budget,
                 ),
                 input_bindings={
                     "dossier_sha256": dossier_sha256,
@@ -4493,6 +4584,7 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
                         raw,
                         anchor_candidate_id=anchor_id,
                         peer_candidate_ids=peer_ids,
+                        wire_budget=self.config.wire_budget,
                     )
                 ),
             )
@@ -4527,6 +4619,7 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
             for fold in candidate_definition_fold_batches(
                 group_id=group_id,
                 member_candidate_ids=member_ids,
+                wire_budget=self.config.wire_budget,
             ):
                 fold_index = int(fold["fold_index"])
                 fresh_ids = tuple(str(value) for value in fold["member_candidate_ids"])
@@ -4536,7 +4629,7 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
                     dependencies=(
                         (prior_job_id,) if prior_job_id is not None else tuple(relation_job_ids)
                     ),
-                    settings=DiscoveryJobSettings.selector(),
+                    settings=self._selector_settings(),
                     messages=_render_candidate_definition_fold_messages(
                         job="fold_cross_architecture_group_definition",
                         job_kind=CROSS_ARCHITECTURE_PLANNER_JOB,
@@ -4544,6 +4637,7 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
                         fold_index=fold_index,
                         candidates=tuple(by_id[value] for value in fresh_ids),
                         prior_accumulator=prior,
+                        wire_budget=self.config.wire_budget,
                     ),
                     input_bindings={
                         "dossier_sha256": dossier_sha256,
@@ -4572,6 +4666,7 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
             grouped=grouped,
             definitions_by_group_id=definitions,
             evidence_by_id=self._evidence_by_id,
+            wire_budget=self.config.wire_budget,
         )
         requested_ids = tuple(
             dict.fromkeys(
@@ -4605,13 +4700,14 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
                     job_kind=CROSS_ARCHITECTURE_INTEGRATION_JOB,
                     scope=f"{group_id}.evidence_page_{evidence_index:06d}",
                     dependencies=tuple(dict.fromkeys(dependencies)),
-                    settings=DiscoveryJobSettings.selector(),
+                    settings=self._selector_settings(),
                     messages=_render_integration_evidence_page_messages(
                         group_id=group_id,
                         definition=definitions[group_id],
                         members=members,
                         evidence=evidence,
                         review_id=review_id,
+                        wire_budget=self.config.wire_budget,
                     ),
                     input_bindings={
                         "dossier_sha256": dossier_sha256,
@@ -4646,9 +4742,9 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
             fold_audits: list[dict[str, Any]] = []
             while consumed < len(page_rows):
                 fresh_capacity = (
-                    HIERARCHICAL_DISCOVERY_MAX_DEFINITION_FOLD_MEMBERS
+                    self.config.wire_budget.max_definition_fold_inputs
                     if accumulator_response is None
-                    else HIERARCHICAL_DISCOVERY_MAX_DEFINITION_FOLD_MEMBERS - 1
+                    else self.config.wire_budget.max_definition_fold_inputs - 1
                 )
                 fresh = page_rows[consumed : consumed + fresh_capacity]
                 review_inputs: list[tuple[str, Mapping[str, Any]]] = []
@@ -4664,12 +4760,13 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
                     job_kind=CROSS_ARCHITECTURE_INTEGRATION_JOB,
                     scope=f"{group_id}.evidence_fold_{fold_index:06d}",
                     dependencies=tuple(dict.fromkeys(dependencies)),
-                    settings=DiscoveryJobSettings.selector(),
+                    settings=self._selector_settings(),
                     messages=_render_integration_evidence_fold_messages(
                         group_id=group_id,
                         fold_index=fold_index,
                         definition=definitions[group_id],
                         review_inputs=review_inputs,
+                        wire_budget=self.config.wire_budget,
                     ),
                     input_bindings={
                         "dossier_sha256": dossier_sha256,
@@ -4767,6 +4864,7 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
                 proposed=wire["canonical_name"],
                 slot=f"group_{_sha(group_id)[:8]}",
                 used=used_names,
+                wire_budget=self.config.wire_budget,
             )
             used_names.add(name)
             if event is not None:
@@ -4894,7 +4992,11 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
                     runner=runner,
                     job=job,
                     validator=lambda raw, evidence=evidence: (
-                        validate_interpret_evidence_chunk_response(raw, evidence=evidence)
+                        validate_interpret_evidence_chunk_response(
+                            raw,
+                            evidence=evidence,
+                            wire_budget=self.config.wire_budget,
+                        )
                     ),
                 )
                 results.append(result)
@@ -4919,10 +5021,11 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
                     job_kind=CONSOLIDATE_ARCHITECTURE_JOB,
                     scope=family,
                     dependencies=interpretation_job_ids,
-                    settings=DiscoveryJobSettings.selector(),
+                    settings=self._selector_settings(),
                     messages=_render_consolidation_messages(
                         source_family=family,
                         candidates=chunk_candidate_tuple,
+                        wire_budget=self.config.wire_budget,
                     ),
                     input_bindings={
                         "catalog_sha256": self.catalog.catalog_sha256,
@@ -4940,6 +5043,7 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
                         raw,
                         source_family=family,
                         candidates=candidates,
+                        wire_budget=self.config.wire_budget,
                     ),
                 )
                 results.append(consolidation_result)
@@ -5006,6 +5110,7 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
                         findings=unresolved,
                         source_family=family,
                         candidates=chunk_candidate_tuple,
+                        wire_budget=self.config.wire_budget,
                     )
                     corrected_chunk_consolidation = _chunk_scoped_consolidation_view(
                         consolidation_response=consolidation,
@@ -5182,12 +5287,13 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
                     job_kind=REJECTION_CRITIC_JOB,
                     scope=f"{candidate_id}.evidence_page_{evidence_index:06d}",
                     dependencies=(last_selector_job_id,),
-                    settings=DiscoveryJobSettings.selector(),
+                    settings=self._selector_settings(),
                     messages=_render_rejection_evidence_page_messages(
                         candidate=candidate,
                         integration_disposition=disposition_by_candidate_id[candidate_id],
                         evidence=evidence,
                         review_id=review_id,
+                        wire_budget=self.config.wire_budget,
                     ),
                     input_bindings={
                         "integration_response_sha256": _sha(integration),
@@ -5221,9 +5327,9 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
             fold_audits: list[dict[str, Any]] = []
             while consumed < len(page_rows):
                 fresh_capacity = (
-                    HIERARCHICAL_DISCOVERY_MAX_DEFINITION_FOLD_MEMBERS
+                    self.config.wire_budget.max_definition_fold_inputs
                     if accumulator_response is None
-                    else HIERARCHICAL_DISCOVERY_MAX_DEFINITION_FOLD_MEMBERS - 1
+                    else self.config.wire_budget.max_definition_fold_inputs - 1
                 )
                 fresh = page_rows[consumed : consumed + fresh_capacity]
                 review_inputs: list[tuple[str, Mapping[str, Any]]] = []
@@ -5239,11 +5345,12 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
                     job_kind=REJECTION_CRITIC_JOB,
                     scope=f"{candidate_id}.evidence_fold_{fold_index:06d}",
                     dependencies=tuple(dict.fromkeys(dependencies)),
-                    settings=DiscoveryJobSettings.selector(),
+                    settings=self._selector_settings(),
                     messages=_render_rejection_evidence_fold_messages(
                         candidate=candidate,
                         fold_index=fold_index,
                         review_inputs=review_inputs,
+                        wire_budget=self.config.wire_budget,
                     ),
                     input_bindings={
                         "integration_response_sha256": _sha(integration),
@@ -5316,6 +5423,7 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
                     reconsideration=reconsideration,
                     evidence_by_id=self._evidence_by_id,
                     maximum_integrated_features=self.config.max_integrated_features,
+                    wire_budget=self.config.wire_budget,
                 )
             rejection["reconsiderations"].append(reconsideration)
             rejection["lossless_review_audits"].append(
@@ -5382,6 +5490,7 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
                         request=request,
                         evidence=evidence_item,
                         review_id=review_id,
+                        wire_budget=self.config.wire_budget,
                     ),
                     input_bindings={
                         "integration_response_sha256": _sha(integration),
@@ -5432,9 +5541,9 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
             terminal_definition: dict[str, Any] | None = None
             while consumed < len(page_rows):
                 fresh_capacity = (
-                    HIERARCHICAL_DISCOVERY_MAX_DEFINITION_FOLD_MEMBERS
+                    self.config.wire_budget.max_definition_fold_inputs
                     if accumulator_wire is None
-                    else HIERARCHICAL_DISCOVERY_MAX_DEFINITION_FOLD_MEMBERS - 1
+                    else self.config.wire_budget.max_definition_fold_inputs - 1
                 )
                 fresh = page_rows[consumed : consumed + fresh_capacity]
                 review_inputs: list[tuple[str, Mapping[str, Any]]] = []
@@ -5455,6 +5564,7 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
                         request=request,
                         fold_index=fold_index,
                         review_inputs=review_inputs,
+                        wire_budget=self.config.wire_budget,
                     ),
                     input_bindings={
                         "integration_response_sha256": _sha(integration),

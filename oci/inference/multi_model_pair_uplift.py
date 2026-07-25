@@ -330,11 +330,55 @@ class OffsetLogitBoWPairModel:
         l2_alpha: float,
         max_iter: int,
         random_state: int,
+        optimizer_method: str = "L-BFGS-B",
+        optimizer_ftol: float = 1e-8,
+        optimizer_gtol: float = 1e-5,
+        optimizer_maxls: int = 30,
+        optimizer_maxcor: int = 10,
+        optimizer_maxfun: int = 15_000,
+        optimizer_tol: Optional[float] = None,
+        optimizer_initialization: str = "zeros",
+        require_optimizer_success: bool = False,
     ) -> None:
         del random_state
         self.vectorizer_params = dict(vectorizer_params)
         self.l2_alpha = float(l2_alpha)
         self.max_iter = int(max_iter)
+        self.optimizer_method = str(optimizer_method)
+        self.optimizer_ftol = float(optimizer_ftol)
+        self.optimizer_gtol = float(optimizer_gtol)
+        self.optimizer_maxls = int(optimizer_maxls)
+        self.optimizer_maxcor = int(optimizer_maxcor)
+        self.optimizer_maxfun = int(optimizer_maxfun)
+        self.optimizer_tol = (
+            None if optimizer_tol is None else float(optimizer_tol)
+        )
+        self.optimizer_initialization = str(optimizer_initialization)
+        self.require_optimizer_success = bool(require_optimizer_success)
+        if self.optimizer_method != "L-BFGS-B":
+            raise ValueError("offset-logit pair model supports only L-BFGS-B")
+        if self.optimizer_initialization != "zeros":
+            raise ValueError("offset-logit pair model supports only zero initialization")
+        if (
+            self.max_iter < 1
+            or self.optimizer_maxls < 1
+            or self.optimizer_maxcor < 1
+            or self.optimizer_maxfun < 1
+            or not np.isfinite(
+                [
+                    self.optimizer_ftol,
+                    self.optimizer_gtol,
+                    0.0 if self.optimizer_tol is None else self.optimizer_tol,
+                ]
+            ).all()
+            or self.optimizer_ftol < 0.0
+            or self.optimizer_gtol < 0.0
+            or (
+                self.optimizer_tol is not None
+                and self.optimizer_tol < 0.0
+            )
+        ):
+            raise ValueError("offset-logit L-BFGS-B configuration is invalid")
         self.vectorizer = None
         self.coef_: Optional[np.ndarray] = None
         self.intercept_: float = 0.0
@@ -384,11 +428,24 @@ class OffsetLogitBoWPairModel:
         result = minimize(
             objective,
             np.zeros(n_features + 1, dtype=float),
-            method="L-BFGS-B",
+            method=self.optimizer_method,
             jac=True,
-            options={"maxiter": self.max_iter, "ftol": 1e-8, "gtol": 1e-5, "maxls": 30},
+            tol=self.optimizer_tol,
+            options={
+                "maxiter": self.max_iter,
+                "ftol": self.optimizer_ftol,
+                "gtol": self.optimizer_gtol,
+                "maxls": self.optimizer_maxls,
+                "maxcor": self.optimizer_maxcor,
+                "maxfun": self.optimizer_maxfun,
+            },
         )
         if not result.success:
+            if self.require_optimizer_success:
+                raise RuntimeError(
+                    "BoW pair uplift L-BFGS-B did not converge: "
+                    f"{result.message}"
+                )
             logger.warning("BoW pair uplift optimizer ended with: %s", result.message)
         self.intercept_ = float(result.x[0])
         self.coef_ = np.asarray(result.x[1:], dtype=float)
@@ -459,7 +516,14 @@ class RidgeDeltaBoWPairModel:
             + pairs["treated_text"].astype(str).tolist()
         )
         y = pairs["label"].to_numpy(dtype=float) - pairs["base_prob"].to_numpy(dtype=float)
-        _fit_regressor(self.model, self._matrix(pairs), y)
+        _fit_regressor(
+            self.model,
+            self._matrix(pairs),
+            y,
+            unsupported_sample_weight_policy=str(
+                self.model_params["unsupported_sample_weight_policy"]
+            ),
+        )
         return self
 
     def predict_delta_prob(self, pairs: pd.DataFrame) -> np.ndarray:
@@ -741,19 +805,59 @@ def fit_bow_pair_uplift_train_test(
 
 
 class HTRPairUpliftNet(nn.Module):
-    def __init__(self, extractor: nn.Module, hidden_dim: int, dropout: float = 0.1):
+    def __init__(
+        self,
+        extractor: nn.Module,
+        hidden_dim: int,
+        dropout: float = 0.1,
+        *,
+        head_depth: int = 2,
+        head_activation: str = "relu",
+        head_layer_norm: bool = False,
+        head_bias: bool = True,
+    ):
         super().__init__()
         self.extractor = extractor
         dim = int(extractor.output_dim)
-        self.fusion = nn.Sequential(
-            nn.Linear(4 * dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-        )
+        if isinstance(head_depth, bool) or int(head_depth) < 1:
+            raise ValueError("HTR pair head depth must be positive")
+        if int(hidden_dim) < 1 or not 0.0 <= float(dropout) < 1.0:
+            raise ValueError("HTR pair head dimension/dropout is invalid")
+        if type(head_layer_norm) is not bool or type(head_bias) is not bool:
+            raise TypeError("HTR pair head norm/bias must be exact booleans")
+        activation_factories = {
+            "gelu_exact": lambda: nn.GELU(approximate="none"),
+            "gelu_tanh": lambda: nn.GELU(approximate="tanh"),
+            "relu": lambda: nn.ReLU(inplace=False),
+            "silu": lambda: nn.SiLU(inplace=False),
+            "tanh": nn.Tanh,
+        }
+        if str(head_activation) not in activation_factories:
+            raise ValueError("HTR pair head activation is unsupported")
+        self._head_configuration = {
+            "hidden_dim": int(hidden_dim),
+            "depth": int(head_depth),
+            "activation": str(head_activation),
+            "dropout": float(dropout),
+            "layer_norm": head_layer_norm,
+            "bias": head_bias,
+        }
+        layers: list[nn.Module] = []
+        source_dim = 4 * dim
+        for _ in range(int(head_depth)):
+            layers.append(
+                nn.Linear(source_dim, int(hidden_dim), bias=head_bias)
+            )
+            if head_layer_norm:
+                layers.append(nn.LayerNorm(int(hidden_dim)))
+            layers.append(activation_factories[str(head_activation)]())
+            layers.append(nn.Dropout(float(dropout), inplace=False))
+            source_dim = int(hidden_dim)
+        layers.append(nn.Linear(source_dim, 1, bias=head_bias))
+        self.fusion = nn.Sequential(*layers)
+
+    def head_configuration(self) -> Dict[str, Any]:
+        return dict(self._head_configuration)
 
     def forward(self, control_texts: Sequence[str], treated_texts: Sequence[str]) -> torch.Tensor:
         control = self.extractor(list(control_texts))

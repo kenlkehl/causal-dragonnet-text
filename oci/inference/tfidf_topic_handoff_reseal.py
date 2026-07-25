@@ -19,6 +19,7 @@ from .tfidf_topic_discovery import (
     stable_hash,
 )
 from .tfidf_topic_score_selection import TOPIC_SCORE_TEST_SCHEMA_VERSION
+from .tfidf_safe_artifacts import load_named_array_bank
 from .tfidf_topic_split_registry import (
     TFIDF_TOPIC_SPLIT_REGISTRY_SCHEMA_VERSION,
     load_tfidf_topic_split_registry,
@@ -311,29 +312,32 @@ def _verify_and_absolutize_artifacts(
     }
 
     topic_banks = discovery.get("topic_banks") or {}
-    with np.load(fit_topics) as fit_archive, np.load(heldout_topics) as heldout_archive:
-        for bank in ("treatment", "outcome", "effect"):
-            topics = list((topic_banks.get(bank) or {}).get("topics") or [])
-            fit_values = (
-                np.asarray(fit_archive[bank])
-                if bank in fit_archive.files
-                else np.zeros((len(fit_ids), 0))
+    fit_archive = load_named_array_bank(
+        fit_topics,
+        expected_row_count=len(fit_ids),
+    )
+    heldout_archive = load_named_array_bank(
+        heldout_topics,
+        expected_row_count=len(heldout_ids),
+    )
+    for bank in ("treatment", "outcome", "effect"):
+        topics = list((topic_banks.get(bank) or {}).get("topics") or [])
+        fit_values = np.asarray(
+            fit_archive.get(bank, np.zeros((len(fit_ids), 0)))
+        )
+        heldout_values = np.asarray(
+            heldout_archive.get(bank, np.zeros((len(heldout_ids), 0)))
+        )
+        if fit_values.shape != (len(fit_ids), len(topics)):
+            raise RuntimeError(
+                f"Fit topic matrix split mismatch for {bank} in "
+                f"fold_key={row.get('fold_key')}"
             )
-            heldout_values = (
-                np.asarray(heldout_archive[bank])
-                if bank in heldout_archive.files
-                else np.zeros((len(heldout_ids), 0))
+        if heldout_values.shape != (len(heldout_ids), len(topics)):
+            raise RuntimeError(
+                f"Held-out topic matrix split mismatch for {bank} in "
+                f"fold_key={row.get('fold_key')}"
             )
-            if fit_values.shape != (len(fit_ids), len(topics)):
-                raise RuntimeError(
-                    f"Fit topic matrix split mismatch for {bank} in "
-                    f"fold_key={row.get('fold_key')}"
-                )
-            if heldout_values.shape != (len(heldout_ids), len(topics)):
-                raise RuntimeError(
-                    f"Held-out topic matrix split mismatch for {bank} in "
-                    f"fold_key={row.get('fold_key')}"
-                )
 
     nuisance = pd.read_parquet(nuisance_path)
     required = {"_oci_row_id", "prediction_scope", "fit_row_ids"}

@@ -81,7 +81,7 @@ def _row(score_path, *, digest: str | None = None) -> dict:
     if digest is not None:
         reference["sha256"] = digest
     discovery = {
-        "schema_version": "tfidf_topic_discovery_v2",
+        "schema_version": "tfidf_topic_discovery_v3_safe_arrays",
         "scope_id": "outer_002_full_train",
         "fit_row_ids": fit_ids,
         "heldout_row_ids": heldout_ids,

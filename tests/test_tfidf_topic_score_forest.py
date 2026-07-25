@@ -1,11 +1,14 @@
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
+from oci.config import TfidfNuisanceStackScientificConfig
 from oci.inference.tfidf_topic_discovery import row_set_fingerprint
+from oci.inference.tfidf_safe_artifacts import write_named_array_bank
 from oci.inference.tfidf_topic_score_forest import (
     TopicScoreForestConfig,
     prepare_topic_score_matrices,
@@ -86,8 +89,16 @@ def _write_fake_handoff(tmp_path: Path, dataset: pd.DataFrame) -> Path:
                 "effect": np.column_stack([1.0 + base, 1.0 + (base % 3)]),
             }
 
-        np.savez_compressed(context_dir / "fit.npz", **scores(fit_ids))
-        np.savez_compressed(context_dir / "heldout.npz", **scores(heldout_ids))
+        fit_topic_path = write_named_array_bank(
+            scores(fit_ids),
+            context_dir / "fit_topics",
+            row_count=len(fit_ids),
+        )
+        heldout_topic_path = write_named_array_bank(
+            scores(heldout_ids),
+            context_dir / "heldout_topics",
+            row_count=len(heldout_ids),
+        )
         nuisance_rows = []
         for scope, row_ids in (("fit_oof", fit_ids), ("external_heldout", heldout_ids)):
             for row_id in row_ids:
@@ -107,9 +118,12 @@ def _write_fake_handoff(tmp_path: Path, dataset: pd.DataFrame) -> Path:
             "fit_row_fingerprint": fit_fingerprint,
             "heldout_row_fingerprint": heldout_fingerprint,
             "topic_banks": _topic_metadata(),
+            "nuisance_stack_scientific": asdict(
+                TfidfNuisanceStackScientificConfig()
+            ),
             "artifacts": {
-                "fit_topic_values": str(context_dir / "fit.npz"),
-                "heldout_topic_values": str(context_dir / "heldout.npz"),
+                "fit_topic_values": str(fit_topic_path),
+                "heldout_topic_values": str(heldout_topic_path),
                 "nuisance_predictions": str(context_dir / "nuisance.parquet"),
             },
         }

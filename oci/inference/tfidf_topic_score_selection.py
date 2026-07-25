@@ -3,8 +3,8 @@
 The score layer is deliberately upstream of agents and CATE models.  Its
 primary topic hypothesis asks whether each fitted one-dimensional NMF
 patient-topic score has held-out association with the bank-specific target.
-It also tests the topic's fifteen supplied TF-IDF terms jointly and tests every
-supplied n-gram individually:
+It also tests the topic's configured complete set of supplied TF-IDF terms
+jointly and tests every supplied n-gram individually:
 
 * treatment: treatment minus the fit prevalence;
 * outcome: outcome minus the fit mean;
@@ -21,19 +21,20 @@ from __future__ import annotations
 
 import copy
 import re
+from dataclasses import asdict
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import numpy as np
 from scipy import sparse
 from scipy.stats import chi2, norm
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import normalize
 
 from ..config import TfidfTopicDiscoveryConfig
+from .multi_model_agentic_forest import _make_bow_vectorizer
 
 
-TOPIC_SCORE_TEST_SCHEMA_VERSION = "tfidf_topic_and_ngram_score_test_v5"
+TOPIC_SCORE_TEST_SCHEMA_VERSION = "tfidf_topic_and_ngram_score_test_v6"
 _BANKS = ("treatment", "outcome", "effect")
 
 _ORPHAN_STOPWORDS = {
@@ -144,11 +145,20 @@ def _bank_contribution(
 def _topic_columns(
     topic: Mapping[str, Any],
     vocabulary: Mapping[str, int],
+    *,
+    terms_per_topic: int,
 ) -> Tuple[List[Dict[str, Any]], List[int]]:
     records = [dict(record) for record in topic.get("terms", [])]
-    if len(records) != 15:
+    if int(terms_per_topic) < 1:
+        raise ValueError("terms_per_topic must be positive")
+    if int(topic.get("terms_per_topic", terms_per_topic)) != int(terms_per_topic):
         raise ValueError(
-            f"Topic {topic.get('topic_id')} must contain exactly 15 term records"
+            f"Topic {topic.get('topic_id')} changed its configured term capacity"
+        )
+    if len(records) != int(terms_per_topic):
+        raise ValueError(
+            f"Topic {topic.get('topic_id')} must contain exactly "
+            f"{int(terms_per_topic)} configured term records"
         )
     missing = [str(record.get("term")) for record in records if str(record.get("term")) not in vocabulary]
     if missing:
@@ -258,7 +268,13 @@ def build_fit_side_orphan_ngram_clusters(
                 or _is_contiguous_subsequence(owner_tokens, tokens)
             ):
                 continue
-            if _presence_jaccard(csc, column, int(owner["column_index"])) < 0.80:
+            if _presence_jaccard(
+                csc,
+                column,
+                int(owner["column_index"]),
+            ) < float(
+                config.orphan_semantic_clustering_scientific.alias_jaccard_threshold
+            ):
                 continue
             alias_owner = kept_index
             break
@@ -300,24 +316,38 @@ def build_fit_side_orphan_ngram_clusters(
         clusters = [{"members": [kept[0]], "within_seed_similarity": [1.0]}]
     else:
         terms = [str(record["term"]) for record in kept]
-        word = TfidfVectorizer(
-            analyzer="word",
-            ngram_range=(1, 2),
-            token_pattern=r"(?u)\b\w+\b",
-            lowercase=True,
+        semantic = config.orphan_semantic_clustering_scientific
+        word = _make_bow_vectorizer(
+            asdict(semantic.word_vectorizer)
         ).fit_transform(terms)
-        char = TfidfVectorizer(
-            analyzer="char_wb",
-            ngram_range=(3, 5),
-            lowercase=True,
+        char = _make_bow_vectorizer(
+            asdict(semantic.char_vectorizer)
         ).fit_transform(terms)
         occurrence = x[:, [int(record["column_index"]) for record in kept]].T.tocsr()
         occurrence.data = np.ones_like(occurrence.data)
         combined = sparse.hstack(
             [
-                np.sqrt(0.35) * normalize(word, norm="l2", axis=1),
-                np.sqrt(0.35) * normalize(char, norm="l2", axis=1),
-                np.sqrt(0.30) * normalize(occurrence, norm="l2", axis=1),
+                np.sqrt(float(semantic.word_similarity_weight))
+                * normalize(
+                    word,
+                    norm=semantic.row_normalization_norm,
+                    axis=1,
+                    copy=True,
+                ),
+                np.sqrt(float(semantic.char_similarity_weight))
+                * normalize(
+                    char,
+                    norm=semantic.row_normalization_norm,
+                    axis=1,
+                    copy=True,
+                ),
+                np.sqrt(float(semantic.occurrence_similarity_weight))
+                * normalize(
+                    occurrence,
+                    norm=semantic.row_normalization_norm,
+                    axis=1,
+                    copy=True,
+                ),
             ],
             format="csr",
         )
@@ -326,8 +356,13 @@ def build_fit_side_orphan_ngram_clusters(
         )
         distances, neighbors = NearestNeighbors(
             n_neighbors=neighbor_count,
-            metric="cosine",
-            algorithm="brute",
+            radius=1.0,
+            algorithm=semantic.neighbor_algorithm,
+            leaf_size=30,
+            metric=semantic.neighbor_metric,
+            p=2,
+            metric_params=None,
+            n_jobs=1,
         ).fit(combined).kneighbors(combined, return_distance=True)
         available = set(range(len(kept)))
         clusters = []
@@ -421,8 +456,13 @@ def _single_topic_score(
     vocabulary: Mapping[str, int],
     contribution: np.ndarray,
     centering_weights: np.ndarray,
+    terms_per_topic: int,
 ) -> Dict[str, Any]:
-    records, columns = _topic_columns(topic, vocabulary)
+    records, columns = _topic_columns(
+        topic,
+        vocabulary,
+        terms_per_topic=terms_per_topic,
+    )
     fit_topic = np.asarray(fit_topic_values, dtype=float).reshape(-1)
     heldout_topic = np.asarray(heldout_topic_values, dtype=float).reshape(-1)
     if fit_topic.shape[0] != fit_matrix.shape[0]:
@@ -1659,6 +1699,7 @@ def score_topic_banks(
     output: Dict[str, Any] = {
         "schema_version": TOPIC_SCORE_TEST_SCHEMA_VERSION,
         "scope_id": str(scope_id),
+        "terms_per_topic": int(config.terms_per_topic),
         "fit_n": int(fit_matrix.shape[0]),
         "heldout_n": int(heldout_matrix.shape[0]),
         "uses_heldout_treatment_and_outcome": True,
@@ -1717,6 +1758,7 @@ def score_topic_banks(
                 vocabulary=vocabulary,
                 contribution=contribution,
                 centering_weights=weights,
+                terms_per_topic=int(config.terms_per_topic),
             )
             for topic_index, topic in enumerate(topics)
         ]

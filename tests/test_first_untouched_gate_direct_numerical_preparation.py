@@ -45,6 +45,7 @@ from oci.inference.final_context_fit_upstream_bank import (
 )
 from oci.inference.lossless_stage1_evidence_catalog import (
     ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION,
+    SEMANTIC_MEMBER_BATCHING_SCHEMA_VERSION,
     RoleNeutralEvidenceCatalog,
     Stage1EvidenceAtom,
     validate_role_neutral_catalog,
@@ -61,6 +62,7 @@ _VIEWS = (
     "extratrees_1_3",
     "random_forest_1_2",
 )
+_SEMANTIC_MEMBER_BATCH_SIZE = 3
 
 
 def _catalog(*, outer_fold: int = 1, scope: str = "inner_train"):
@@ -105,8 +107,15 @@ def _catalog(*, outer_fold: int = 1, scope: str = "inner_train"):
             )
         )
     inner_fold = 1 if scope == "inner_train" else None
+    semantic_member_batching = {
+        "schema_version": SEMANTIC_MEMBER_BATCHING_SCHEMA_VERSION,
+        "semantic_member_batch_size": _SEMANTIC_MEMBER_BATCH_SIZE,
+        "selection_or_truncation_authorized": False,
+        "complete_member_coverage_required": True,
+    }
     identity = {
         "schema_version": ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION,
+        "semantic_member_batching": semantic_member_batching,
         "outer_fold": outer_fold,
         "scope": scope,
         "inner_fold": inner_fold,
@@ -122,7 +131,13 @@ def _catalog(*, outer_fold: int = 1, scope: str = "inner_train"):
         atoms=tuple(atoms),
         non_grounding_numerical_summaries=(),
         catalog_sha256=content_sha256(identity),
-        _audit_json="{}",
+        _audit_json=canonical_json(
+            {
+                "semantic_member_batching": semantic_member_batching,
+                "semantic_member_batch_size": _SEMANTIC_MEMBER_BATCH_SIZE,
+                "semantic_member_batches_truncated": False,
+            }
+        ),
     )
     validate_role_neutral_catalog(result)
     return result

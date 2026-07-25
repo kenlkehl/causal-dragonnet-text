@@ -21,6 +21,13 @@ from oci.inference.review_spent_evidence_provider import (
     SpentOnlyFrozenChunkEmbeddingCache,
     _FrozenCacheEmbeddingEvidenceGenerator,
 )
+from tests.semantic_witness_test_support import semantic_witness_config
+from tests.cluster_local_embedding_test_support import (
+    cluster_local_embedding_config,
+)
+
+
+_SEMANTIC_WITNESS_CONFIG = semantic_witness_config()
 
 
 def _cache(
@@ -59,6 +66,13 @@ def _cache(
 
 def _fixture(tmp_path: Path):
     config = AppliedInferenceConfig()
+    cluster_config = cluster_local_embedding_config()
+    config.architecture.multi_model_forest.embedding_contrast.cluster_local_scientific = (
+        cluster_config
+    )
+    config.architecture.multi_model_agentic_forest.embedding_contrast.cluster_local_scientific = (
+        copy.deepcopy(cluster_config)
+    )
     source = tmp_path / "prepared.parquet"
     pd.DataFrame({"placeholder": [1]}).to_parquet(source, index=False)
     config.dataset_path = str(source)
@@ -130,6 +144,7 @@ def test_scope_inputs_expose_only_fit_rows_and_refuse_nonfit_cache(
         scopes=scopes,
         source_dataset_path=source,
         global_embedding_cache_path=cache.cache_dir,
+        semantic_witness_scientific_config=_SEMANTIC_WITNESS_CONFIG,
     )
     assert [row["scope_id"] for row in published.worker_payloads()] == [
         scope["scope_id"] for scope in scopes
@@ -264,6 +279,7 @@ def test_full_production_config_alias_publishes_and_validates_one_scope(
         scopes=(scope,),
         source_dataset_path=source,
         global_embedding_cache_path=cache.cache_dir,
+        semantic_witness_scientific_config=_SEMANTIC_WITNESS_CONFIG,
     )
     child = published.scopes[scope["scope_id"]]
     payload = json.loads(
@@ -347,6 +363,7 @@ def test_nonfit_text_label_and_cache_mutation_leave_scope_content_unchanged(
         scopes=selected,
         source_dataset_path=source,
         global_embedding_cache_path=cache.cache_dir,
+        semantic_witness_scientific_config=_SEMANTIC_WITNESS_CONFIG,
     )
     changed = modeling.copy()
     nonfit = list(selected[0]["heldout_row_ids"])
@@ -382,6 +399,7 @@ def test_nonfit_text_label_and_cache_mutation_leave_scope_content_unchanged(
         scopes=selected,
         source_dataset_path=source,
         global_embedding_cache_path=changed_cache.cache_dir,
+        semantic_witness_scientific_config=_SEMANTIC_WITNESS_CONFIG,
     )
     first_scope = first.scopes[selected[0]["scope_id"]]
     second_scope = second.scopes[selected[0]["scope_id"]]
@@ -434,6 +452,7 @@ def test_interrupted_publication_reuses_completed_scope_views_byte_for_byte(
             scopes=scopes,
             source_dataset_path=source,
             global_embedding_cache_path=cache.cache_dir,
+            semantic_witness_scientific_config=_SEMANTIC_WITNESS_CONFIG,
         )
     first_manifest = root / scopes[0]["scope_id"] / "preflight_scope_input_manifest.json"
     before = (
@@ -457,6 +476,7 @@ def test_interrupted_publication_reuses_completed_scope_views_byte_for_byte(
         scopes=scopes,
         source_dataset_path=source,
         global_embedding_cache_path=cache.cache_dir,
+        semantic_witness_scientific_config=_SEMANTIC_WITNESS_CONFIG,
     )
     after = (
         first_manifest.read_bytes(),

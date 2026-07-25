@@ -43,6 +43,39 @@ def test_source_snapshot_is_closed_and_read_only(tmp_path: Path) -> None:
     assert not (target / "oci" / "module.py").stat().st_mode & stat.S_IWUSR
     manifest = json.loads((target / SOURCE_SNAPSHOT_MANIFEST).read_text())
     assert manifest["python_bytecode_writes_allowed"] is False
+    assert manifest["locator_attestation_sha256"]
+
+
+def test_source_snapshot_scientific_identity_is_repository_path_neutral(
+    tmp_path: Path,
+) -> None:
+    repository_a = _repository(tmp_path / "first")
+    repository_b = tmp_path / "second" / "relocated-repository"
+    shutil.copytree(repository_a, repository_b)
+    target_a = (tmp_path / "snapshot-a").resolve()
+    target_b = (tmp_path / "snapshot-b").resolve()
+
+    snapshot_a = create_production_source_snapshot(
+        repository_root=repository_a.resolve(),
+        target_dir=target_a,
+    )
+    snapshot_b = create_production_source_snapshot(
+        repository_root=repository_b.resolve(),
+        target_dir=target_b,
+    )
+    manifest_a = json.loads(
+        (target_a / SOURCE_SNAPSHOT_MANIFEST).read_text(encoding="utf-8")
+    )
+    manifest_b = json.loads(
+        (target_b / SOURCE_SNAPSHOT_MANIFEST).read_text(encoding="utf-8")
+    )
+
+    assert snapshot_a.content_sha256 == snapshot_b.content_sha256
+    assert manifest_a["source_repository"] != manifest_b["source_repository"]
+    assert (
+        manifest_a["locator_attestation_sha256"]
+        != manifest_b["locator_attestation_sha256"]
+    )
 
 
 def test_source_snapshot_rejects_changed_or_extra_files(tmp_path: Path) -> None:

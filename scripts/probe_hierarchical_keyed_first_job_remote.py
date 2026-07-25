@@ -41,9 +41,9 @@ from oci.inference.hierarchical_all_architecture_discovery import (
 from oci.inference.hierarchical_discovery_response_contract import (
     HIERARCHICAL_DISCOVERY_EXACT_COVERAGE_REPRESENTATION,
     HIERARCHICAL_DISCOVERY_RESPONSE_CONTRACT_VERSION,
+    HierarchyWireBudget,
 )
 from oci.inference.lossless_stage1_evidence_catalog import (
-    ARCHITECTURE_CHUNK_SCHEMA_VERSION,
     NON_GROUNDING_SUMMARY_SCHEMA_VERSION,
     ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION,
     ArchitectureChunkPlan,
@@ -52,6 +52,7 @@ from oci.inference.lossless_stage1_evidence_catalog import (
     RoleNeutralEvidenceCatalog,
     Stage1EvidenceAtom,
     audit_complete_architecture_delivery,
+    build_complete_architecture_chunks,
     validate_role_neutral_catalog,
 )
 from oci.inference.openai_compatible_json_discovery_job_runner import (
@@ -71,6 +72,40 @@ MAX_TOKENS = 25_000
 MAX_RETRIES = 0
 REQUEST_TIMEOUT_SECONDS = 900.0
 REQUIRED_INTERPRETER = "/home/klkehl/thisenv/bin/python"
+
+# This is an explicit compatibility profile for one authenticated retired
+# diagnostic target.  Production callers do not import or select it, and the
+# current 2-atom/3-member production profile continues to reject this old
+# 7-atom/61-member request.
+RETIRED_TARGET_DIAGNOSTIC_WIRE_BUDGET = HierarchyWireBudget(
+    max_opaque_identifier_chars=128,
+    max_generated_name_chars=1,
+    max_description_chars=1,
+    max_reason_chars=64,
+    max_ambiguity_chars=1,
+    max_free_text_chars=1,
+    max_generated_list_items=4,
+    max_feature_names_per_member=1,
+    max_findings_per_atomic_review=1,
+    max_pair_relation_peers_per_page=7,
+    max_definition_fold_inputs=8,
+    max_group_lookback_ids=8,
+    max_adaptive_review_targets=4,
+    max_interpret_atoms_per_job=7,
+    max_interpret_members_per_job=61,
+    max_interpret_name_chars=1,
+    max_interpret_description_chars=1,
+    max_interpret_ambiguity_chars=1,
+    max_interpret_reason_chars=64,
+    max_interpret_canonical_json_bytes=20_000,
+    max_interpret_transport_bytes=20_000,
+    interpret_generation_token_budget=20_000,
+    max_response_transport_bytes=20_000,
+    generation_token_budget=20_000,
+)
+EXPECTED_RETIRED_TARGET_DIAGNOSTIC_WIRE_BUDGET_SHA256 = (
+    "09fe08ebf047a7d98291f91b88c35453047099f5cddcd8531e303ff4f4c2e2c6"
+)
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 PREPARATION_ROOT = REPOSITORY_ROOT / (
@@ -96,10 +131,34 @@ EXPECTED_FILES = {
     },
 }
 
-EXPECTED_CATALOG_SHA256 = "24562e2b83fc3d9defbcaf4e3edbdf5f5748907d898ce5580b58b008befd86e4"
-EXPECTED_PLAN_SHA256 = "52cb8176f9c7b1e58036fa4b2bb73d17394b67cb66b74d06545e3bfd0bcb4c1f"
+RETIRED_CATALOG_SCHEMA_VERSION = "role_neutral_stage1_evidence_catalog_v1"
+RETIRED_CHUNK_SCHEMA_VERSION = "role_neutral_architecture_chunk_v1"
+RETIRED_CHUNK_PLAN_SCHEMA_VERSION = "complete_architecture_chunk_plan_v2"
+EXPECTED_RETIRED_CATALOG_SHA256 = (
+    "24562e2b83fc3d9defbcaf4e3edbdf5f5748907d898ce5580b58b008befd86e4"
+)
+EXPECTED_RETIRED_PLAN_SHA256 = (
+    "52cb8176f9c7b1e58036fa4b2bb73d17394b67cb66b74d06545e3bfd0bcb4c1f"
+)
+EXPECTED_CURRENT_CATALOG_SHA256 = (
+    "ac0877ac074af3c82c3204f016fa537892167c7088253b80a0b7252d6d5ba72e"
+)
+EXPECTED_CURRENT_CATALOG_CONTENT_SHA256 = (
+    "5539e3e3b042989f9fd65aafb4c378e793ff0c01abb1cb5d017a2e904119db26"
+)
+EXPECTED_CURRENT_PLAN_SHA256 = (
+    "d5762609bc1c0344fca6bd916ffcb53b58583321399bca4c4b8beb80e708e456"
+)
+EXPECTED_CURRENT_PLAN_CONTENT_SHA256 = (
+    "69fe952052833a89057ed37a1ce9855c2973e8dc98bff6a7ddae37057aa7f237"
+)
 EXPECTED_RETIRED_JOB_ID = "job_7096d1629cfff17c149963786b8bca5c58dbcf2bffcd57e80a173704c7ade598"
-EXPECTED_CHUNK_ID = "chunk_fe031c1020bb83a671460a0b2ccb9f32ff93152bd010fc9e63f469109f6cea0b"
+EXPECTED_RETIRED_CHUNK_ID = (
+    "chunk_fe031c1020bb83a671460a0b2ccb9f32ff93152bd010fc9e63f469109f6cea0b"
+)
+EXPECTED_CURRENT_CHUNK_ID = (
+    "chunk_ebcee66bf0eb9ccf6a3f391694393cc74c33be515afbf5440329e1b1efa1bbb3"
+)
 EXPECTED_OWNER_MEMBER_COUNTS = (11, 9, 6, 11, 7, 9, 8)
 EXPECTED_EVIDENCE_ID = "evidence_220e6715b7cc98d3780f023d6cf9b6df09f0a0e15cacc98a7bf437bfa845b13c"
 EXPECTED_TARGET_MEMBER_ID = (
@@ -153,12 +212,64 @@ def _authenticated_envelope(name: str) -> dict[str, Any]:
 
 
 def _catalog_from_authenticated_body(body: Mapping[str, Any]) -> RoleNeutralEvidenceCatalog:
+    _exact_keys(
+        body,
+        {
+            "schema_version",
+            "outer_fold",
+            "scope",
+            "inner_fold",
+            "split_fingerprint",
+            "catalog_sha256",
+            "atoms",
+            "non_grounding_numerical_summaries",
+            "audit",
+        },
+        label="retired catalog body",
+    )
+    if body.get("schema_version") != RETIRED_CATALOG_SCHEMA_VERSION:
+        raise ValueError("retired catalog body schema version differs")
+    retired_identity = {
+        key: body[key]
+        for key in (
+            "schema_version",
+            "outer_fold",
+            "scope",
+            "inner_fold",
+            "split_fingerprint",
+            "atoms",
+            "non_grounding_numerical_summaries",
+        )
+    }
+    if (
+        content_sha256(retired_identity) != EXPECTED_RETIRED_CATALOG_SHA256
+        or body.get("catalog_sha256") != EXPECTED_RETIRED_CATALOG_SHA256
+    ):
+        raise ValueError("retired catalog identity does not authenticate")
     atoms: list[Stage1EvidenceAtom] = []
     for row in body.get("atoms", []):
         if not isinstance(row, Mapping):
             raise TypeError("catalog atom must be one object")
-        if row.get("schema_version") != ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION:
-            raise ValueError("catalog atom schema version differs")
+        _exact_keys(
+            row,
+            {
+                "schema_version",
+                "evidence_id",
+                "atom_kind",
+                "source_kind",
+                "source_family",
+                "observable_axes",
+                "member_ids",
+                "split_fingerprint",
+                "origin_sha256",
+                "content_sha256",
+                "origin",
+                "content",
+            },
+            label="retired catalog atom",
+        )
+        if row.get("schema_version") != RETIRED_CATALOG_SCHEMA_VERSION:
+            raise ValueError("retired catalog atom schema version differs")
         atoms.append(
             Stage1EvidenceAtom(
                 evidence_id=str(row["evidence_id"]),
@@ -178,6 +289,20 @@ def _catalog_from_authenticated_body(body: Mapping[str, Any]) -> RoleNeutralEvid
     for row in body.get("non_grounding_numerical_summaries", []):
         if not isinstance(row, Mapping):
             raise TypeError("numerical summary must be one object")
+        _exact_keys(
+            row,
+            {
+                "schema_version",
+                "summary_id",
+                "source_kind",
+                "source_family",
+                "observable_axes",
+                "split_fingerprint",
+                "metrics",
+                "concept_grounding_allowed",
+            },
+            label="retired numerical summary",
+        )
         if row.get("schema_version") != NON_GROUNDING_SUMMARY_SCHEMA_VERSION:
             raise ValueError("numerical summary schema version differs")
         if row.get("concept_grounding_allowed") is not False:
@@ -192,6 +317,24 @@ def _catalog_from_authenticated_body(body: Mapping[str, Any]) -> RoleNeutralEvid
                 _metrics_json=canonical_json(row["metrics"]),
             )
         )
+    current_identity = {
+        "schema_version": ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION,
+        "outer_fold": int(body["outer_fold"]),
+        "scope": str(body["scope"]),
+        "inner_fold": (None if body["inner_fold"] is None else int(body["inner_fold"])),
+        "split_fingerprint": str(body["split_fingerprint"]),
+        "atoms": [atom.as_dict() for atom in atoms],
+        "non_grounding_numerical_summaries": [summary.as_dict() for summary in summaries],
+    }
+    current_catalog_sha256 = content_sha256(current_identity)
+    if current_catalog_sha256 != EXPECTED_CURRENT_CATALOG_SHA256:
+        raise ValueError("current catalog migration content differs")
+    retired_audit = body.get("audit")
+    if not isinstance(retired_audit, Mapping):
+        raise TypeError("retired catalog audit must be one object")
+    current_audit = json.loads(canonical_json(retired_audit))
+    current_audit["schema_version"] = ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION
+    current_audit["catalog_sha256"] = current_catalog_sha256
     catalog = RoleNeutralEvidenceCatalog(
         outer_fold=int(body["outer_fold"]),
         scope=str(body["scope"]),
@@ -199,43 +342,119 @@ def _catalog_from_authenticated_body(body: Mapping[str, Any]) -> RoleNeutralEvid
         split_fingerprint=str(body["split_fingerprint"]),
         atoms=tuple(atoms),
         non_grounding_numerical_summaries=tuple(summaries),
-        catalog_sha256=str(body["catalog_sha256"]),
-        _audit_json=canonical_json(body["audit"]),
+        catalog_sha256=current_catalog_sha256,
+        _audit_json=canonical_json(current_audit),
     )
     validate_role_neutral_catalog(catalog)
-    if canonical_json(catalog.as_dict()) != canonical_json(body):
-        raise ValueError("authenticated catalog is not its exact current typed projection")
+    if content_sha256(catalog.as_dict()) != EXPECTED_CURRENT_CATALOG_CONTENT_SHA256:
+        raise ValueError("migrated catalog is not its authenticated current typed projection")
     return catalog
 
 
-def _plan_from_authenticated_body(body: Mapping[str, Any]) -> ArchitectureChunkPlan:
-    chunks: list[ArchitectureEvidenceChunk] = []
-    for row in body.get("chunks", []):
+def _plan_from_authenticated_body(
+    body: Mapping[str, Any],
+    *,
+    catalog: RoleNeutralEvidenceCatalog,
+) -> ArchitectureChunkPlan:
+    _exact_keys(
+        body,
+        {
+            "schema_version",
+            "catalog_sha256",
+            "max_atoms_per_chunk",
+            "max_bytes_per_chunk",
+            "max_semantic_member_ids_per_chunk",
+            "plan_sha256",
+            "chunks",
+            "audit",
+        },
+        label="retired architecture chunk plan",
+    )
+    if body.get("schema_version") != RETIRED_CHUNK_PLAN_SCHEMA_VERSION:
+        raise ValueError("retired architecture chunk plan schema differs")
+    retired_identity = {
+        key: body[key]
+        for key in (
+            "schema_version",
+            "catalog_sha256",
+            "max_atoms_per_chunk",
+            "max_bytes_per_chunk",
+            "max_semantic_member_ids_per_chunk",
+            "chunks",
+        )
+    }
+    if (
+        content_sha256(retired_identity) != EXPECTED_RETIRED_PLAN_SHA256
+        or body.get("plan_sha256") != EXPECTED_RETIRED_PLAN_SHA256
+        or body.get("catalog_sha256") != EXPECTED_RETIRED_CATALOG_SHA256
+    ):
+        raise ValueError("retired architecture chunk plan identity does not authenticate")
+    retired_chunks = body.get("chunks")
+    if (
+        not isinstance(retired_chunks, list)
+        or not retired_chunks
+        or not isinstance(retired_chunks[0], Mapping)
+        or retired_chunks[0].get("chunk_id") != EXPECTED_RETIRED_CHUNK_ID
+    ):
+        raise ValueError("retired architecture chunk plan changed its designated first target")
+    retired_projection: list[dict[str, Any]] = []
+    for row in retired_chunks:
         if not isinstance(row, Mapping):
             raise TypeError("chunk must be one object")
-        if row.get("schema_version") != ARCHITECTURE_CHUNK_SCHEMA_VERSION:
-            raise ValueError("chunk schema version differs")
-        chunks.append(
-            ArchitectureEvidenceChunk(
-                source_family=str(row["source_family"]),
-                chunk_index=int(row["chunk_index"]),
-                chunk_count=int(row["chunk_count"]),
-                chunk_id=str(row["chunk_id"]),
-                canonical_size_bytes=len(canonical_json(row).encode("utf-8")),
-                _evidence_json=canonical_json(row["evidence"]),
-            )
+        _exact_keys(
+            row,
+            {
+                "schema_version",
+                "source_family",
+                "chunk_index",
+                "chunk_count",
+                "chunk_id",
+                "evidence",
+            },
+            label="retired architecture chunk",
         )
-    plan = ArchitectureChunkPlan(
-        catalog_sha256=str(body["catalog_sha256"]),
+        if row.get("schema_version") != RETIRED_CHUNK_SCHEMA_VERSION:
+            raise ValueError("retired architecture chunk schema differs")
+        chunk_identity = {
+            "schema_version": RETIRED_CHUNK_SCHEMA_VERSION,
+            "catalog_sha256": EXPECTED_RETIRED_CATALOG_SHA256,
+            "source_family": row["source_family"],
+            "chunk_index": row["chunk_index"],
+            "chunk_count": row["chunk_count"],
+            "evidence": row["evidence"],
+        }
+        if row.get("chunk_id") != f"chunk_{content_sha256(chunk_identity)}":
+            raise ValueError("retired architecture chunk identity does not authenticate")
+        retired_projection.append(
+            {
+                "source_family": row["source_family"],
+                "chunk_index": row["chunk_index"],
+                "chunk_count": row["chunk_count"],
+                "evidence": row["evidence"],
+            }
+        )
+    plan = build_complete_architecture_chunks(
+        catalog,
         max_atoms_per_chunk=int(body["max_atoms_per_chunk"]),
         max_bytes_per_chunk=int(body["max_bytes_per_chunk"]),
         max_semantic_member_ids_per_chunk=int(body["max_semantic_member_ids_per_chunk"]),
-        chunks=tuple(chunks),
-        plan_sha256=str(body["plan_sha256"]),
-        _audit_json=canonical_json(body["audit"]),
     )
-    if canonical_json(plan.as_dict()) != canonical_json(body):
-        raise ValueError("authenticated chunk plan is not its exact current typed projection")
+    current_projection = [
+        {
+            "source_family": row.source_family,
+            "chunk_index": row.chunk_index,
+            "chunk_count": row.chunk_count,
+            "evidence": row.evidence,
+        }
+        for row in plan.chunks
+    ]
+    if canonical_json(current_projection) != canonical_json(retired_projection):
+        raise ValueError("current chunk migration changed evidence ownership or grouping")
+    if (
+        plan.plan_sha256 != EXPECTED_CURRENT_PLAN_SHA256
+        or content_sha256(plan.as_dict()) != EXPECTED_CURRENT_PLAN_CONTENT_SHA256
+    ):
+        raise ValueError("migrated chunk plan is not its authenticated current projection")
     return plan
 
 
@@ -319,10 +538,10 @@ def _authenticate_retired_target(
 def _target_chunk(
     *, catalog: RoleNeutralEvidenceCatalog, plan: ArchitectureChunkPlan
 ) -> tuple[ArchitectureEvidenceChunk, tuple[DiscoveryEvidenceItem, ...]]:
-    if catalog.catalog_sha256 != EXPECTED_CATALOG_SHA256:
-        raise ValueError("catalog is not the authenticated v5 target")
-    if plan.plan_sha256 != EXPECTED_PLAN_SHA256:
-        raise ValueError("chunk plan is not the authenticated v5 target")
+    if catalog.catalog_sha256 != EXPECTED_CURRENT_CATALOG_SHA256:
+        raise ValueError("catalog is not the authenticated current migration")
+    if plan.plan_sha256 != EXPECTED_CURRENT_PLAN_SHA256:
+        raise ValueError("chunk plan is not the authenticated current migration")
     if (catalog.outer_fold, catalog.scope, catalog.inner_fold) != (1, "inner_train", 1):
         raise ValueError("catalog fold scope is not outer-1 inner-train inner-1")
     audit = audit_complete_architecture_delivery(catalog, plan)
@@ -334,7 +553,7 @@ def _target_chunk(
         chunk.chunk_index,
         chunk.chunk_count,
         chunk.chunk_id,
-    ) != (BOW_NUISANCE, 1, 5, EXPECTED_CHUNK_ID):
+    ) != (BOW_NUISANCE, 1, 5, EXPECTED_CURRENT_CHUNK_ID):
         raise ValueError("first chunk is not the authenticated failing target")
     if len(chunk.evidence) != 7:
         raise ValueError("target chunk must contain exactly seven evidence owners")
@@ -372,6 +591,7 @@ def _compile_current_job(
     messages = render_interpret_evidence_chunk_messages(
         family_explanation=production_stage1_family_explanations()[BOW_NUISANCE],
         evidence=evidence,
+        wire_budget=RETIRED_TARGET_DIAGNOSTIC_WIRE_BUDGET,
     )
     job = DiscoveryJsonJob.create(
         job_kind=INTERPRET_CHUNK_JOB,
@@ -403,6 +623,10 @@ def _compile_current_job(
         HIERARCHICAL_DISCOVERY_EXACT_COVERAGE_REPRESENTATION
     ):
         raise ValueError("fresh job does not use keyed exact coverage")
+    if response_contract.get("hierarchy_wire_budget") != (
+        RETIRED_TARGET_DIAGNOSTIC_WIRE_BUDGET.as_dict()
+    ):
+        raise ValueError("fresh diagnostic job does not bind its explicit wire profile")
     _assert_exact_keyed_target_schema(job.response_schema, evidence=evidence)
     return job
 
@@ -414,14 +638,14 @@ def _assert_exact_keyed_target_schema(
 
     if schema.get("type") != "object" or schema.get("additionalProperties") is not False:
         raise ValueError("current response schema root is not one closed object")
-    if schema.get("required") != ["concepts", "evidence_dispositions"]:
+    if schema.get("required") != ["evidence_dispositions"]:
         raise ValueError("current response schema root requirements differ")
     properties = schema.get("properties")
     if not isinstance(properties, Mapping):
         raise TypeError("current response schema properties are malformed")
     _exact_keys(
         properties,
-        {"concepts", "evidence_dispositions"},
+        {"evidence_dispositions"},
         label="current response schema properties",
     )
     dispositions = properties["evidence_dispositions"]
@@ -446,6 +670,17 @@ def _assert_exact_keyed_target_schema(
         disposition_fields = disposition.get("properties")
         if not isinstance(disposition_fields, Mapping):
             raise TypeError("one evidence disposition field schema is malformed")
+        _exact_keys(
+            disposition_fields,
+            {"evidence_findings", "member_dispositions", "reason"},
+            label="one evidence disposition fields",
+        )
+        if disposition.get("required") != [
+            "evidence_findings",
+            "member_dispositions",
+            "reason",
+        ]:
+            raise ValueError("one evidence disposition requirements differ")
         members = disposition_fields.get("member_dispositions")
         if not isinstance(members, Mapping):
             raise TypeError("one member disposition schema is malformed")
@@ -460,6 +695,15 @@ def _assert_exact_keyed_target_schema(
             item.member_ids
         ):
             raise ValueError("member disposition schema keys differ from owner membership")
+        for member_id in item.member_ids:
+            member = member_properties.get(member_id)
+            if (
+                not isinstance(member, Mapping)
+                or member.get("additionalProperties") is not False
+                or member.get("required") != ["findings"]
+                or set(member.get("properties") or {}) != {"findings"}
+            ):
+                raise ValueError("member disposition value schema is not current and closed")
 
 
 def _build_preflight() -> tuple[
@@ -472,11 +716,15 @@ def _build_preflight() -> tuple[
         raise ValueError("diagnostic requires the exact production Python interpreter")
     if sys.dont_write_bytecode is not True:
         raise ValueError("diagnostic requires PYTHONDONTWRITEBYTECODE=1")
+    if RETIRED_TARGET_DIAGNOSTIC_WIRE_BUDGET.content_sha256 != (
+        EXPECTED_RETIRED_TARGET_DIAGNOSTIC_WIRE_BUDGET_SHA256
+    ):
+        raise ValueError("explicit retired-target diagnostic wire profile differs")
     catalog_body = _authenticated_envelope("role_neutral_evidence_catalog.json")
     plan_body = _authenticated_envelope("architecture_chunk_plan.json")
     wrapper_body = _authenticated_envelope("approved_hierarchical_wrapper_precommit.json")
     catalog = _catalog_from_authenticated_body(catalog_body)
-    plan = _plan_from_authenticated_body(plan_body)
+    plan = _plan_from_authenticated_body(plan_body, catalog=catalog)
     chunk, evidence = _target_chunk(catalog=catalog, plan=plan)
     retired = _authenticate_retired_target(
         wrapper_body=wrapper_body,
@@ -541,6 +789,19 @@ def _build_preflight() -> tuple[
             }
             for name, values in EXPECTED_FILES.items()
         },
+        "current_schema_migration": {
+            "retired_catalog_schema_version": RETIRED_CATALOG_SCHEMA_VERSION,
+            "retired_catalog_sha256": EXPECTED_RETIRED_CATALOG_SHA256,
+            "current_catalog_schema_version": ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION,
+            "current_catalog_sha256": catalog.catalog_sha256,
+            "current_catalog_content_sha256": content_sha256(catalog.as_dict()),
+            "retired_chunk_plan_schema_version": RETIRED_CHUNK_PLAN_SCHEMA_VERSION,
+            "retired_chunk_plan_sha256": EXPECTED_RETIRED_PLAN_SHA256,
+            "current_chunk_plan_schema_version": plan.as_dict()["schema_version"],
+            "current_chunk_plan_sha256": plan.plan_sha256,
+            "current_chunk_plan_content_sha256": content_sha256(plan.as_dict()),
+            "evidence_ownership_and_grouping_preserved": True,
+        },
         "retired_target_authentication": retired,
         "fresh_current_job_id": job.job_id,
         "fresh_current_job_sha256": content_sha256(job.as_dict()),
@@ -555,6 +816,9 @@ def _build_preflight() -> tuple[
         "contract_version": HIERARCHICAL_DISCOVERY_RESPONSE_CONTRACT_VERSION,
         "exact_coverage_representation": (HIERARCHICAL_DISCOVERY_EXACT_COVERAGE_REPRESENTATION),
         "wire_normalization_version": DISCOVERY_WIRE_NORMALIZATION_VERSION,
+        "diagnostic_wire_budget_sha256": (
+            RETIRED_TARGET_DIAGNOSTIC_WIRE_BUDGET.content_sha256
+        ),
         "endpoint": ENDPOINT,
         "model": MODEL,
         "max_tokens": MAX_TOKENS,
@@ -675,6 +939,7 @@ def _execute(
         validated = validate_interpret_evidence_chunk_response(
             response,
             evidence=evidence,
+            wire_budget=RETIRED_TARGET_DIAGNOSTIC_WIRE_BUDGET,
         )
         raw_wire_sha256 = content_sha256(response)
         if metadata.get("parsed_response_sha256") != raw_wire_sha256:

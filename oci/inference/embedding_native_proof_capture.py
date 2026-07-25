@@ -28,21 +28,27 @@ from typing import Any, Callable, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-from oci.config import EmbeddingContrastDiscoveryConfig
+from oci.config import (
+    ClusterLocalEmbeddingScientificConfig,
+    EmbeddingContrastDiscoveryConfig,
+)
 
 from .embedding_contrast_discovery import (
+    _canonicalize_svd_component_signs,
+    _cluster_local_scientific_config,
     _embedding_cluster_kmeans_parameters,
     _named_pseudo_targets,
 )
 from .review_spent_evidence_provider import (
     BoundSpentFrozenChunkEmbeddingProvider,
+    SemanticWitnessScientificConfig,
     _FrozenCacheEmbeddingEvidenceGenerator,
     _embedding_concepts_only,
 )
 
-EMBEDDING_NATIVE_CAPTURE_SCHEMA = "production_embedding_native_capture_v2"
+EMBEDDING_NATIVE_CAPTURE_SCHEMA = "production_embedding_native_capture_v4"
 EMBEDDING_NATIVE_ARRAY_SCHEMA = "production_embedding_native_capture_array_v1"
-EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA = "production_embedding_cluster_support_contract_v1"
+EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA = "production_embedding_cluster_support_contract_v2"
 SEMANTIC_RETRIEVAL_TRAINING_ONLY_SCHEMA = (
     "semantic_retrieval_training_only_exhaustive_no_selection_v1"
 )
@@ -264,6 +270,9 @@ def validate_embedding_cluster_support_state(
     required_kmeans_fields = {
         "fit_row_ids",
         "parameters",
+        "scientific_configuration",
+        "canonical_group_seed",
+        "ordered_fit_row_seed_policy",
         "usable_mask",
         "cluster_labels",
         "cluster_centers",
@@ -281,19 +290,34 @@ def validate_embedding_cluster_support_state(
     centers = np.asarray(resolve(kmeans_state["cluster_centers"]), dtype=np.float64)
     counts = np.asarray(resolve(kmeans_state["cluster_counts"]), dtype=np.int64)
     parameters = kmeans_state.get("parameters")
+    scientific_configuration = kmeans_state.get("scientific_configuration")
+    canonical_group_seed = kmeans_state.get("canonical_group_seed")
+    ordered_seed_policy = kmeans_state.get("ordered_fit_row_seed_policy")
     required_kmeans_parameters = {
         "n_clusters",
-        "random_state",
-        "batch_size",
-        "n_init",
+        "init",
         "max_iter",
+        "batch_size",
+        "verbose",
+        "compute_labels",
+        "random_state",
+        "tol",
+        "max_no_improvement",
+        "init_size",
+        "n_init",
+        "reassignment_ratio",
     }
     expected_parameters = None
+    cluster_config: ClusterLocalEmbeddingScientificConfig | None = None
     if expected_kmeans_configuration is not None:
         try:
+            cluster_config = _cluster_local_scientific_config(
+                expected_kmeans_configuration
+            )
             expected_parameters = _embedding_cluster_kmeans_parameters(
                 expected_kmeans_configuration,
                 n_usable=int(np.sum(usable)),
+                canonical_group_seed=int(canonical_group_seed),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("clustered embedding KMeans configuration is invalid") from exc
@@ -310,19 +334,28 @@ def validate_embedding_cluster_support_state(
         or centers.shape[0] != len(counts)
         or not np.isfinite(centers).all()
         or np.any(counts < 0)
+        or not isinstance(scientific_configuration, Mapping)
+        or (
+            expected_kmeans_configuration is not None
+            and dict(scientific_configuration)
+            != _cluster_local_scientific_config(
+                expected_kmeans_configuration
+            ).as_dict()
+        )
+        or isinstance(canonical_group_seed, bool)
+        or not isinstance(canonical_group_seed, int)
+        or not 0 <= canonical_group_seed < 2**31
+        or ordered_seed_policy
+        != "canonical_ordered_fit_rows_group_seed_v1"
         or not isinstance(parameters, Mapping)
         or set(parameters) != required_kmeans_parameters
-        or any(
-            isinstance(parameters.get(field), bool) or not isinstance(parameters.get(field), int)
-            for field in required_kmeans_parameters
-        )
         or int(parameters.get("n_clusters", -1)) != len(counts)
+        or parameters.get("random_state") != canonical_group_seed
         or (
             expected_cluster_count is not None
             and int(parameters.get("n_clusters", -1)) != int(expected_cluster_count)
         )
         or int(parameters.get("batch_size", 0)) < 1
-        or int(parameters.get("n_init", 0)) < 1
         or int(parameters.get("max_iter", 0)) < 1
         or (expected_parameters is not None and dict(parameters) != expected_parameters)
     ):
@@ -354,6 +387,16 @@ def validate_embedding_cluster_support_state(
         "weighted_matrix",
         "singular_values",
         "components",
+        "parameters",
+        "sign_canonicalization_policy",
+        "rank_tolerance_policy",
+        "rank_tolerance_dtype",
+        "rank_tolerance_multiplier",
+        "rank_tolerance",
+        "numerical_rank",
+        "replay_comparison_policy",
+        "replay_relative_tolerance",
+        "replay_absolute_tolerance",
     }
     for raw in svd_states:
         if not isinstance(raw, Mapping) or set(raw) != required_svd_fields:
@@ -374,7 +417,28 @@ def validate_embedding_cluster_support_state(
         matrix = np.asarray(resolve(state["weighted_matrix"]), dtype=np.float64)
         singular_values = np.asarray(resolve(state["singular_values"]), dtype=np.float64)
         components = np.asarray(resolve(state["components"]), dtype=np.float64)
+        svd_parameters = state.get("parameters")
         width = min(matrix.shape) if matrix.ndim == 2 else 0
+        if cluster_config is None:
+            try:
+                cluster_config = ClusterLocalEmbeddingScientificConfig.from_mapping(
+                    scientific_configuration
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "clustered embedding state lacks its closed scientific configuration"
+                ) from exc
+        expected_svd_parameters = {
+            "full_matrices": bool(cluster_config.svd_full_matrices),
+            "compute_uv": bool(cluster_config.svd_compute_uv),
+            "hermitian": bool(cluster_config.svd_hermitian),
+        }
+        expected_component_rows = (
+            matrix.shape[1]
+            if bool(cluster_config.svd_full_matrices)
+            and matrix.shape[0] < matrix.shape[1]
+            else width
+        )
         if (
             len(cluster_ids) < 2
             or len(cluster_ids) != len(set(cluster_ids))
@@ -385,31 +449,69 @@ def validate_embedding_cluster_support_state(
             or singular_values.ndim != 1
             or singular_values.shape != (width,)
             or components.ndim != 2
-            or components.shape != (width, matrix.shape[1])
+            or components.shape != (expected_component_rows, matrix.shape[1])
             or width < 2
             or not np.isfinite(matrix).all()
             or not np.isfinite(singular_values).all()
             or not np.isfinite(components).all()
+            or svd_parameters != expected_svd_parameters
+            or state.get("sign_canonicalization_policy")
+            != cluster_config.svd_sign_canonicalization_policy
+            or state.get("rank_tolerance_policy")
+            != cluster_config.svd_rank_tolerance_policy
+            or state.get("rank_tolerance_dtype")
+            != cluster_config.svd_rank_tolerance_dtype
+            or float(state.get("rank_tolerance_multiplier", -1.0))
+            != float(cluster_config.svd_rank_tolerance_multiplier)
+            or state.get("replay_comparison_policy")
+            != cluster_config.replay_comparison_policy
+            or float(state.get("replay_relative_tolerance", -1.0))
+            != float(cluster_config.replay_relative_tolerance)
+            or float(state.get("replay_absolute_tolerance", -1.0))
+            != float(cluster_config.replay_absolute_tolerance)
         ):
             raise ValueError(f"clustered embedding {family} SVD state is invalid")
-        actual_singular_values = np.linalg.svd(matrix, compute_uv=False)
+        _left, actual_singular_values, actual_components = np.linalg.svd(
+            np.asarray(matrix, dtype=np.dtype(cluster_config.computation_dtype)),
+            **expected_svd_parameters,
+        )
+        actual_components = _canonicalize_svd_component_signs(
+            actual_components,
+            policy=cluster_config.svd_sign_canonicalization_policy,
+        )
         rank_tolerance = float(
-            np.finfo(np.float32).eps * max(matrix.shape) * float(actual_singular_values[0])
+            float(cluster_config.svd_rank_tolerance_multiplier)
+            * np.finfo(np.dtype(cluster_config.svd_rank_tolerance_dtype)).eps
+            * max(matrix.shape)
+            * float(actual_singular_values[0])
         )
         numerical_rank = int(np.sum(actual_singular_values > rank_tolerance))
         second_singular_value = float(actual_singular_values[1])
         if (
-            numerical_rank < 2
+            numerical_rank < int(cluster_config.minimum_numerical_rank_per_family)
             or not np.allclose(
                 singular_values,
                 actual_singular_values,
-                rtol=2e-6,
-                atol=2e-7,
+                rtol=float(cluster_config.replay_relative_tolerance),
+                atol=float(cluster_config.replay_absolute_tolerance),
+            )
+            or not np.allclose(
+                components,
+                actual_components,
+                rtol=float(cluster_config.replay_relative_tolerance),
+                atol=float(cluster_config.replay_absolute_tolerance),
             )
             or any(int(counts[cluster_id]) < 1 for cluster_id in cluster_ids)
             or float(actual_singular_values[0]) <= 0.0
             or not np.isfinite(second_singular_value)
             or second_singular_value <= rank_tolerance
+            or not np.isclose(
+                float(state.get("rank_tolerance")),
+                rank_tolerance,
+                rtol=float(cluster_config.replay_relative_tolerance),
+                atol=float(cluster_config.replay_absolute_tolerance),
+            )
+            or int(state.get("numerical_rank", -1)) != numerical_rank
         ):
             raise ValueError(f"clustered embedding {family} SVD must have genuine rank-two support")
         family_summaries.append(
@@ -422,17 +524,44 @@ def validate_embedding_cluster_support_state(
                 "singular_value_count": len(singular_values),
                 "singular_values_sha256": _array_sha256(singular_values),
                 "second_singular_value": second_singular_value,
-                "numerical_rank_tolerance_float32": rank_tolerance,
+                "numerical_rank_tolerance": rank_tolerance,
                 "numerical_rank": numerical_rank,
                 "components_shape": list(components.shape),
                 "components_sha256": _array_sha256(components),
+                "svd_parameters": expected_svd_parameters,
+                "sign_canonicalization_policy": (
+                    cluster_config.svd_sign_canonicalization_policy
+                ),
+                "rank_tolerance_policy": (
+                    cluster_config.svd_rank_tolerance_policy
+                ),
+                "rank_tolerance_dtype": cluster_config.svd_rank_tolerance_dtype,
+                "rank_tolerance_multiplier": float(
+                    cluster_config.svd_rank_tolerance_multiplier
+                ),
+                "replay_comparison_policy": (
+                    cluster_config.replay_comparison_policy
+                ),
+                "replay_relative_tolerance": float(
+                    cluster_config.replay_relative_tolerance
+                ),
+                "replay_absolute_tolerance": float(
+                    cluster_config.replay_absolute_tolerance
+                ),
             }
         )
     contract = {
         "schema_version": EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA,
         "required_svd_families": list(_REQUIRED_CLUSTER_SVD_FAMILIES),
-        "minimum_distinct_local_clusters_per_family": 2,
-        "minimum_numerical_rank_per_family": 2,
+        "scientific_configuration": cluster_config.as_dict(),
+        "canonical_group_seed": int(canonical_group_seed),
+        "ordered_fit_row_seed_policy": str(ordered_seed_policy),
+        "minimum_distinct_local_clusters_per_family": int(
+            cluster_config.minimum_distinct_local_clusters_per_family
+        ),
+        "minimum_numerical_rank_per_family": int(
+            cluster_config.minimum_numerical_rank_per_family
+        ),
         "kmeans_cluster_count": len(counts),
         "kmeans_parameters": dict(parameters),
         "kmeans_cluster_counts": counts.tolist(),
@@ -458,6 +587,9 @@ def validate_embedding_cluster_support_contract(
     fields = {
         "schema_version",
         "required_svd_families",
+        "scientific_configuration",
+        "canonical_group_seed",
+        "ordered_fit_row_seed_policy",
         "minimum_distinct_local_clusters_per_family",
         "minimum_numerical_rank_per_family",
         "kmeans_cluster_count",
@@ -476,20 +608,44 @@ def validate_embedding_cluster_support_contract(
         "singular_value_count",
         "singular_values_sha256",
         "second_singular_value",
-        "numerical_rank_tolerance_float32",
+        "numerical_rank_tolerance",
         "numerical_rank",
         "components_shape",
         "components_sha256",
+        "svd_parameters",
+        "sign_canonicalization_policy",
+        "rank_tolerance_policy",
+        "rank_tolerance_dtype",
+        "rank_tolerance_multiplier",
+        "replay_comparison_policy",
+        "replay_relative_tolerance",
+        "replay_absolute_tolerance",
     }
     if not isinstance(contract, Mapping) or set(contract) != fields:
         raise ValueError("embedding cluster support contract has an invalid closed schema")
+    scientific_configuration = contract.get("scientific_configuration")
+    try:
+        cluster_config = ClusterLocalEmbeddingScientificConfig.from_mapping(
+            scientific_configuration
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "embedding cluster support contract has invalid scientific configuration"
+        ) from exc
     counts_raw = contract.get("kmeans_cluster_counts")
     families = contract.get("svd_families")
     if (
         contract.get("schema_version") != EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA
         or contract.get("required_svd_families") != list(_REQUIRED_CLUSTER_SVD_FAMILIES)
-        or contract.get("minimum_distinct_local_clusters_per_family") != 2
-        or contract.get("minimum_numerical_rank_per_family") != 2
+        or contract.get("canonical_group_seed") != contract.get(
+            "kmeans_parameters", {}
+        ).get("random_state")
+        or contract.get("ordered_fit_row_seed_policy")
+        != cluster_config.kmeans_seed_derivation_policy
+        or contract.get("minimum_distinct_local_clusters_per_family")
+        != int(cluster_config.minimum_distinct_local_clusters_per_family)
+        or contract.get("minimum_numerical_rank_per_family")
+        != int(cluster_config.minimum_numerical_rank_per_family)
         or not isinstance(counts_raw, list)
         or not isinstance(families, list)
         or len(families) != len(_REQUIRED_CLUSTER_SVD_FAMILIES)
@@ -505,10 +661,17 @@ def validate_embedding_cluster_support_contract(
     n_iter = contract.get("kmeans_n_iter")
     required_kmeans_parameters = {
         "n_clusters",
-        "random_state",
-        "batch_size",
-        "n_init",
+        "init",
         "max_iter",
+        "batch_size",
+        "verbose",
+        "compute_labels",
+        "random_state",
+        "tol",
+        "max_no_improvement",
+        "init_size",
+        "n_init",
+        "reassignment_ratio",
     }
     expected_parameters = None
     if expected_kmeans_configuration is not None:
@@ -516,6 +679,7 @@ def validate_embedding_cluster_support_contract(
             expected_parameters = _embedding_cluster_kmeans_parameters(
                 expected_kmeans_configuration,
                 n_usable=int(usable_count),
+                canonical_group_seed=int(contract["canonical_group_seed"]),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("embedding cluster support has invalid KMeans configuration") from exc
@@ -530,14 +694,13 @@ def validate_embedding_cluster_support_contract(
         or cluster_count != len(counts_raw)
         or not isinstance(parameters, Mapping)
         or set(parameters) != required_kmeans_parameters
-        or any(
-            isinstance(parameters.get(field), bool) or not isinstance(parameters.get(field), int)
-            for field in required_kmeans_parameters
-        )
         or parameters.get("n_clusters") != cluster_count
         or int(parameters.get("batch_size", 0)) < 1
         or int(parameters.get("n_init", 0)) < 1
         or int(parameters.get("max_iter", 0)) < 1
+        or parameters.get("random_state") != contract.get(
+            "canonical_group_seed"
+        )
         or (expected_parameters is not None and dict(parameters) != expected_parameters)
         or (expected_cluster_count is not None and cluster_count != int(expected_cluster_count))
         or isinstance(usable_count, bool)
@@ -558,9 +721,19 @@ def validate_embedding_cluster_support_contract(
         singular_count = row.get("singular_value_count")
         components_shape = row.get("components_shape")
         numerical_rank = row.get("numerical_rank")
+        expected_component_rows = (
+            matrix_shape[1]
+            if (
+                isinstance(matrix_shape, list)
+                and len(matrix_shape) == 2
+                and bool(cluster_config.svd_full_matrices)
+                and matrix_shape[0] < matrix_shape[1]
+            )
+            else singular_count
+        )
         try:
             second_singular = float(row.get("second_singular_value"))
-            rank_tolerance = float(row.get("numerical_rank_tolerance_float32"))
+            rank_tolerance = float(row.get("numerical_rank_tolerance"))
         except (TypeError, ValueError) as exc:
             raise ValueError("embedding cluster support has invalid rank statistics") from exc
         if (
@@ -589,10 +762,12 @@ def validate_embedding_cluster_support_contract(
             or singular_count != min(matrix_shape)
             or singular_count < 2
             or not isinstance(components_shape, list)
-            or components_shape != [singular_count, matrix_shape[1]]
+            or components_shape != [expected_component_rows, matrix_shape[1]]
             or isinstance(numerical_rank, bool)
             or not isinstance(numerical_rank, int)
             or numerical_rank < 2
+            or numerical_rank
+            < int(cluster_config.minimum_numerical_rank_per_family)
             or numerical_rank > singular_count
             or not np.isfinite(second_singular)
             or not np.isfinite(rank_tolerance)
@@ -606,6 +781,26 @@ def validate_embedding_cluster_support_contract(
                     "components_sha256",
                 )
             )
+            or row.get("svd_parameters")
+            != {
+                "full_matrices": bool(cluster_config.svd_full_matrices),
+                "compute_uv": bool(cluster_config.svd_compute_uv),
+                "hermitian": bool(cluster_config.svd_hermitian),
+            }
+            or row.get("sign_canonicalization_policy")
+            != cluster_config.svd_sign_canonicalization_policy
+            or row.get("rank_tolerance_policy")
+            != cluster_config.svd_rank_tolerance_policy
+            or row.get("rank_tolerance_dtype")
+            != cluster_config.svd_rank_tolerance_dtype
+            or float(row.get("rank_tolerance_multiplier", -1.0))
+            != float(cluster_config.svd_rank_tolerance_multiplier)
+            or row.get("replay_comparison_policy")
+            != cluster_config.replay_comparison_policy
+            or float(row.get("replay_relative_tolerance", -1.0))
+            != float(cluster_config.replay_relative_tolerance)
+            or float(row.get("replay_absolute_tolerance", -1.0))
+            != float(cluster_config.replay_absolute_tolerance)
         ):
             raise ValueError(
                 f"embedding cluster support contract has invalid {expected_family} SVD support"
@@ -695,6 +890,7 @@ def canonical_logical_embedding_config(value: Any) -> dict[str, Any]:
 
 def _embedding_config_mapping(value: Any) -> dict[str, Any]:
     config = canonical_logical_embedding_config(value)
+    _cluster_local_scientific_config(config)
     # The frozen-cache generator deliberately disables every external or
     # language-model concept source.  Its native proof may not weaken that.
     if (
@@ -827,9 +1023,14 @@ def semantic_retrieval_projection_bundle(
     raw_evidence: Mapping[str, Any],
     *,
     policy: Mapping[str, Any],
+    scientific_config: SemanticWitnessScientificConfig,
 ) -> dict[str, dict[str, Any]]:
     """Replay full exhaustive projection plus non-selecting partition canaries."""
 
+    if type(scientific_config) is not SemanticWitnessScientificConfig:
+        raise TypeError(
+            "semantic retrieval projection requires a typed scientific config"
+        )
     if policy.get("schema_version") != SEMANTIC_RETRIEVAL_TRAINING_ONLY_SCHEMA:
         raise ValueError("semantic retrieval policy has another schema")
     if (
@@ -844,14 +1045,17 @@ def semantic_retrieval_projection_bundle(
     calibration_rows = set(map(int, policy.get("calibration_row_ids") or ()))
     if not model_rows or not calibration_rows or model_rows & calibration_rows:
         raise ValueError("semantic retrieval replay partitions are invalid")
-    full = _embedding_concepts_only(raw_evidence, contrastive_term_limit=None)
+    full = _embedding_concepts_only(
+        raw_evidence,
+        scientific_config=scientific_config,
+    )
     model = _embedding_concepts_only(
         _filter_retrieval_rows(raw_evidence, allowed_row_ids=model_rows),
-        contrastive_term_limit=None,
+        scientific_config=scientific_config,
     )
     calibration = _embedding_concepts_only(
         _filter_retrieval_rows(raw_evidence, allowed_row_ids=calibration_rows),
-        contrastive_term_limit=None,
+        scientific_config=scientific_config,
     )
     return {"full": full, "model_canary": model, "calibration_canary": calibration}
 
@@ -875,6 +1079,9 @@ class NativeEmbeddingProofCaptureSink:
         outcome_type: str,
         embedding_provider: BoundSpentFrozenChunkEmbeddingProvider,
         embedding_config: EmbeddingContrastDiscoveryConfig | Mapping[str, Any],
+        semantic_witness_scientific_config: (
+            SemanticWitnessScientificConfig | Mapping[str, Any]
+        ),
         tfidf_nested_calibration_folds: int,
         seed: int,
     ) -> None:
@@ -913,6 +1120,20 @@ class NativeEmbeddingProofCaptureSink:
             raise ValueError("embedding proof provider must be bound to fit rows only")
         self.embedding_provider = embedding_provider
         self.embedding_config = _embedding_config_mapping(embedding_config)
+        if isinstance(semantic_witness_scientific_config, Mapping):
+            semantic_witness_scientific_config = (
+                SemanticWitnessScientificConfig.from_mapping(
+                    semantic_witness_scientific_config
+                )
+            )
+        if type(semantic_witness_scientific_config) is not SemanticWitnessScientificConfig:
+            raise TypeError(
+                "embedding native capture requires a closed semantic-witness "
+                "scientific config"
+            )
+        self.semantic_witness_scientific_config = (
+            semantic_witness_scientific_config
+        )
         if isinstance(seed, bool):
             raise TypeError("embedding native capture seed must be an integer")
         self.seed = int(seed)
@@ -1026,6 +1247,9 @@ class NativeEmbeddingProofCaptureSink:
         n_iter: int,
         inertia: float,
         parameters: Mapping[str, Any],
+        scientific_configuration: Mapping[str, Any],
+        canonical_group_seed: int,
+        ordered_fit_row_seed_policy: str,
     ) -> None:
         if self._finalized or self._kmeans_state is not None:
             raise RuntimeError("embedding KMeans state was emitted twice or after finalization")
@@ -1042,6 +1266,11 @@ class NativeEmbeddingProofCaptureSink:
         self._kmeans_state = {
             "fit_row_ids": list(map(int, fit_row_ids)),
             "parameters": _clone(parameters),
+            "scientific_configuration": _clone(scientific_configuration),
+            "canonical_group_seed": int(canonical_group_seed),
+            "ordered_fit_row_seed_policy": str(
+                ordered_fit_row_seed_policy
+            ),
             "usable_mask": self._store.add("cluster_kmeans_usable_mask", usable),
             "cluster_labels": self._store.add("cluster_kmeans_labels", labels),
             "cluster_centers": self._store.add("cluster_kmeans_centers", centers),
@@ -1058,6 +1287,16 @@ class NativeEmbeddingProofCaptureSink:
         weighted_matrix: Any,
         singular_values: Any,
         components: Any,
+        parameters: Mapping[str, Any],
+        sign_canonicalization_policy: str,
+        rank_tolerance_policy: str,
+        rank_tolerance_dtype: str,
+        rank_tolerance_multiplier: float,
+        rank_tolerance: float,
+        numerical_rank: int,
+        replay_comparison_policy: str,
+        replay_relative_tolerance: float,
+        replay_absolute_tolerance: float,
     ) -> None:
         if self._finalized:
             raise RuntimeError("embedding SVD state was emitted after finalization")
@@ -1079,6 +1318,24 @@ class NativeEmbeddingProofCaptureSink:
                 "weighted_matrix": self._store.add(f"cluster_svd_{index}_matrix", matrix),
                 "singular_values": self._store.add(f"cluster_svd_{index}_values", values),
                 "components": self._store.add(f"cluster_svd_{index}_components", vectors),
+                "parameters": _clone(parameters),
+                "sign_canonicalization_policy": str(
+                    sign_canonicalization_policy
+                ),
+                "rank_tolerance_policy": str(rank_tolerance_policy),
+                "rank_tolerance_dtype": str(rank_tolerance_dtype),
+                "rank_tolerance_multiplier": float(
+                    rank_tolerance_multiplier
+                ),
+                "rank_tolerance": float(rank_tolerance),
+                "numerical_rank": int(numerical_rank),
+                "replay_comparison_policy": str(replay_comparison_policy),
+                "replay_relative_tolerance": float(
+                    replay_relative_tolerance
+                ),
+                "replay_absolute_tolerance": float(
+                    replay_absolute_tolerance
+                ),
             }
         )
 
@@ -1200,6 +1457,7 @@ class NativeEmbeddingProofCaptureSink:
         semantic_bundle = semantic_retrieval_projection_bundle(
             raw,
             policy=self.semantic_policy,
+            scientific_config=self.semantic_witness_scientific_config,
         )
         if not semantic_bundle["full"].get("contrasts"):
             raise ValueError("semantic retrieval emitted no exhaustive contrast evidence")
@@ -1229,13 +1487,16 @@ class NativeEmbeddingProofCaptureSink:
             raise RuntimeError("embedding proof capture observed no native build")
         cluster_support_contract = None
         if self.embedding_config.get("include_cluster_contrast_vectors") is True:
+            cluster_scientific = _cluster_local_scientific_config(
+                self.embedding_config
+            )
             try:
                 cluster_support_contract = validate_embedding_cluster_support_state(
                     kmeans_state=self._kmeans_state,
                     svd_states=self._svd_states,
                     array_resolver=lambda key: self._store.arrays[str(key)],
                     expected_cluster_count=int(
-                        self.embedding_config["cluster_contrast_n_clusters"]
+                        cluster_scientific.requested_cluster_count
                     ),
                     expected_kmeans_configuration=self.embedding_config,
                 )
@@ -1243,7 +1504,7 @@ class NativeEmbeddingProofCaptureSink:
                     raw_evidence=self._raw_evidence,
                     semantic_evidence=self._semantic_bundle["full"],
                     configured_max_components=int(
-                        self.embedding_config["cluster_contrast_max_components"]
+                        cluster_scientific.maximum_components_per_family
                     ),
                 )
             except (KeyError, TypeError, ValueError) as exc:
@@ -1289,6 +1550,12 @@ class NativeEmbeddingProofCaptureSink:
             "outcome_type": self.outcome_type,
             "seed": self.seed,
             "embedding_config": self.embedding_config,
+            "semantic_witness_scientific_config": (
+                self.semantic_witness_scientific_config.as_dict()
+            ),
+            "semantic_witness_scientific_config_sha256": (
+                self.semantic_witness_scientific_config.identity_sha256
+            ),
             "embedding_provider_identity": _clone(self.embedding_provider.identity()),
             "fit_cache_row_inventory": _cache_row_inventory(
                 self.embedding_provider,
@@ -1329,7 +1596,14 @@ class NativeEmbeddingProofCaptureSink:
 
 
 class _ReplayObserver:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        fit_row_ids: Sequence[int],
+        canonical_group_seed: int,
+    ) -> None:
+        self.fit_row_ids = tuple(map(int, fit_row_ids))
+        self.seed = int(canonical_group_seed)
         self.kmeans: dict[str, Any] | None = None
         self.svds: list[dict[str, Any]] = []
         self.evidence: dict[str, Any] | None = None
@@ -1340,6 +1614,13 @@ class _ReplayObserver:
         self.kmeans = {
             "fit_row_ids": list(map(int, kwargs["fit_row_ids"])),
             "parameters": _clone(kwargs["parameters"]),
+            "scientific_configuration": _clone(
+                kwargs["scientific_configuration"]
+            ),
+            "canonical_group_seed": int(kwargs["canonical_group_seed"]),
+            "ordered_fit_row_seed_policy": str(
+                kwargs["ordered_fit_row_seed_policy"]
+            ),
             "usable_mask": np.asarray(kwargs["usable_mask"], dtype=np.bool_),
             "cluster_labels": np.asarray(kwargs["cluster_labels"], dtype=np.int64),
             "cluster_centers": np.asarray(kwargs["cluster_centers"], dtype=np.float64),
@@ -1356,6 +1637,26 @@ class _ReplayObserver:
                 "weighted_matrix": np.asarray(kwargs["weighted_matrix"], dtype=np.float64),
                 "singular_values": np.asarray(kwargs["singular_values"], dtype=np.float64),
                 "components": np.asarray(kwargs["components"], dtype=np.float64),
+                "parameters": _clone(kwargs["parameters"]),
+                "sign_canonicalization_policy": str(
+                    kwargs["sign_canonicalization_policy"]
+                ),
+                "rank_tolerance_policy": str(kwargs["rank_tolerance_policy"]),
+                "rank_tolerance_dtype": str(kwargs["rank_tolerance_dtype"]),
+                "rank_tolerance_multiplier": float(
+                    kwargs["rank_tolerance_multiplier"]
+                ),
+                "rank_tolerance": float(kwargs["rank_tolerance"]),
+                "numerical_rank": int(kwargs["numerical_rank"]),
+                "replay_comparison_policy": str(
+                    kwargs["replay_comparison_policy"]
+                ),
+                "replay_relative_tolerance": float(
+                    kwargs["replay_relative_tolerance"]
+                ),
+                "replay_absolute_tolerance": float(
+                    kwargs["replay_absolute_tolerance"]
+                ),
             }
         )
 
@@ -1394,6 +1695,8 @@ def _load_capture(
         "outcome_type",
         "seed",
         "embedding_config",
+        "semantic_witness_scientific_config",
+        "semantic_witness_scientific_config_sha256",
         "embedding_provider_identity",
         "fit_cache_row_inventory",
         "tfidf_training_scope_policy",
@@ -1433,6 +1736,17 @@ def _load_capture(
         or metadata.get("joblib_or_pickle_used") is not False
     ):
         raise ValueError("embedding native capture has an invalid closed envelope")
+    semantic_witness_config = SemanticWitnessScientificConfig.from_mapping(
+        metadata.get("semantic_witness_scientific_config"),
+        label="embedding native capture semantic_witness_scientific_config",
+    )
+    if (
+        metadata.get("semantic_witness_scientific_config_sha256")
+        != semantic_witness_config.identity_sha256
+    ):
+        raise ValueError(
+            "embedding native capture semantic-witness scientific identity changed"
+        )
     arrays_path = root / str(metadata.get("array_file") or "")
     inventory = metadata.get("array_inventory")
     if (
@@ -1549,8 +1863,27 @@ def _replay_generator(
     generator._concept_probe_skip_reason = None
     generator._external_corpora = []
     generator._spent_provider = provider
-    observer = _ReplayObserver()
+    generator._cluster_fit_row_ids = None
+    generator._cluster_group_seed = None
+    cluster_config = _cluster_local_scientific_config(
+        generator.embedding_config
+    )
+    if cluster_config.kmeans_seed_derivation_policy != (
+        "canonical_ordered_fit_rows_group_seed_v1"
+    ):
+        raise ValueError("embedding replay has another cluster seed policy")
+    canonical_group_seed = int(
+        metadata["cluster_kmeans"]["canonical_group_seed"]
+    )
+    observer = _ReplayObserver(
+        fit_row_ids=fit_rows,
+        canonical_group_seed=canonical_group_seed,
+    )
     generator._native_embedding_proof_observer = observer
+    generator.bind_cluster_physical_fit_authority(
+        ordered_fit_row_ids=fit_rows,
+        canonical_group_seed=canonical_group_seed,
+    )
     build = metadata["build"]
     discovery_df = pd.DataFrame(copy.deepcopy(dict(build["discovery_projection"])))
     pseudo_targets = [arrays[str(key)] for key in build["pseudo_target_arrays"]]
@@ -1582,6 +1915,10 @@ def validate_embedding_native_capture(
     """Authenticate and numerically replay one closed embedding proof capture."""
 
     metadata, arrays, evidence = _load_capture(Path(artifact_dir))
+    semantic_witness_config = SemanticWitnessScientificConfig.from_mapping(
+        metadata["semantic_witness_scientific_config"],
+        label="embedding native replay semantic_witness_scientific_config",
+    )
     fit_rows = tuple(map(int, metadata.get("fit_row_ids") or ()))
     heldout_rows = tuple(map(int, metadata.get("heldout_row_ids") or ()))
     if (
@@ -1735,7 +2072,11 @@ def validate_embedding_native_capture(
     )
     if replayed != evidence["raw_embedding_evidence"] or observer.evidence != replayed:
         raise RuntimeError("embedding native generator output differs on replay")
-    semantic = semantic_retrieval_projection_bundle(replayed, policy=policy)
+    semantic = semantic_retrieval_projection_bundle(
+        replayed,
+        policy=policy,
+        scientific_config=semantic_witness_config,
+    )
     if (
         semantic["full"] != evidence["semantic_full_scope_evidence"]
         or semantic["model_canary"] != evidence["semantic_model_replay_canary"]
@@ -1746,7 +2087,9 @@ def validate_embedding_native_capture(
         raw_evidence=replayed,
         semantic_evidence=semantic["full"],
         configured_max_components=int(
-            metadata["embedding_config"]["cluster_contrast_max_components"]
+            _cluster_local_scientific_config(
+                metadata["embedding_config"]
+            ).maximum_components_per_family
         ),
     )
     captured_kmeans = metadata.get("cluster_kmeans")
@@ -1761,7 +2104,11 @@ def validate_embedding_native_capture(
         kmeans_state=captured_kmeans,
         svd_states=captured_svds,
         array_resolver=lambda key: arrays[str(key)],
-        expected_cluster_count=int(metadata["embedding_config"]["cluster_contrast_n_clusters"]),
+        expected_cluster_count=int(
+            _cluster_local_scientific_config(
+                metadata["embedding_config"]
+            ).requested_cluster_count
+        ),
         expected_kmeans_configuration=metadata["embedding_config"],
     )
     if metadata.get("cluster_support_contract") != captured_support:
@@ -1769,7 +2116,11 @@ def validate_embedding_native_capture(
     validate_embedding_cluster_support_state(
         kmeans_state=observer.kmeans,
         svd_states=observer.svds,
-        expected_cluster_count=int(metadata["embedding_config"]["cluster_contrast_n_clusters"]),
+        expected_cluster_count=int(
+            _cluster_local_scientific_config(
+                metadata["embedding_config"]
+            ).requested_cluster_count
+        ),
         expected_kmeans_configuration=metadata["embedding_config"],
     )
     if (

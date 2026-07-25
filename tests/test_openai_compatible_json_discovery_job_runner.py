@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,14 +23,21 @@ from oci.inference.hierarchical_discovery_response_contract import (
 from oci.inference.openai_compatible_json_discovery_job_runner import (
     MAX_AUTHENTICATED_RETRIES,
     MINIMUM_DISCOVERY_MAX_TOKENS,
+    HIERARCHICAL_GENERATION_JOB_KINDS,
     OpenAICompatibleJsonDiscoveryJobRunner,
     InvalidDiscoveryJsonResponse,
     InvalidDiscoveryTransportResponse,
+    Stage2GenerationParameters,
+    Stage2GenerationPolicy,
     parse_strict_json_object,
 )
 
 
-def _job(*, extraction: bool = False) -> DiscoveryJsonJob:
+def _job(
+    *,
+    extraction: bool = False,
+    selector_thinking_token_budget: int = 5_000,
+) -> DiscoveryJsonJob:
     job_kind = EXTRACTION_DEFINITION_JOB if extraction else INTERPRET_CHUNK_JOB
     request = attach_hierarchical_discovery_response_contract(
         job_kind=job_kind,
@@ -57,7 +65,9 @@ def _job(*, extraction: bool = False) -> DiscoveryJsonJob:
         scope="test_scope",
         dependencies=(),
         settings=(
-            DiscoveryJobSettings.extraction() if extraction else DiscoveryJobSettings.selector()
+            DiscoveryJobSettings.extraction()
+            if extraction
+            else DiscoveryJobSettings.selector(selector_thinking_token_budget)
         ),
         messages=(
             {"role": "system", "content": "Return exactly one JSON object."},
@@ -72,13 +82,15 @@ def _response(
     *,
     reasoning_content: str | None = None,
     reasoning: object | None = None,
+    model: str = "fixed-model-v3",
+    finish_reason: str = "stop",
 ) -> SimpleNamespace:
     message = SimpleNamespace(
         content=content,
         reasoning_content=reasoning_content,
         reasoning=reasoning,
     )
-    choice = SimpleNamespace(message=message, finish_reason="stop")
+    choice = SimpleNamespace(message=message, finish_reason=finish_reason)
     usage = SimpleNamespace(
         prompt_tokens=41,
         completion_tokens=19,
@@ -88,7 +100,7 @@ def _response(
     return SimpleNamespace(
         choices=[choice],
         id="response-1",
-        model="served-model",
+        model=model,
         usage=usage,
     )
 
@@ -145,17 +157,110 @@ class _SelfMutatingClientFactory(_ClientFactory):
         return client
 
 
+def _generation_parameters(
+    *,
+    max_tokens: int = MINIMUM_DISCOVERY_MAX_TOKENS,
+    thinking_enabled: bool,
+    thinking_token_budget: int,
+    temperature: float = 0.0,
+    transport_max_retries: int = 0,
+    schema_repair_attempts: int = 1,
+) -> Stage2GenerationParameters:
+    return Stage2GenerationParameters(
+        temperature=temperature,
+        top_p=1.0,
+        top_k=-1,
+        min_p=0.0,
+        seed=42,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        repetition_penalty=1.0,
+        max_tokens=max_tokens,
+        min_tokens=0,
+        ignore_eos=False,
+        stop_sequences=(),
+        stop_token_ids=(),
+        include_stop_str_in_output=False,
+        logit_bias=(),
+        allowed_token_ids=None,
+        bad_words=(),
+        n=1,
+        logprobs=False,
+        top_logprobs=0,
+        prompt_logprobs=None,
+        stream=False,
+        use_beam_search=False,
+        length_penalty=1.0,
+        skip_special_tokens=True,
+        spaces_between_special_tokens=True,
+        echo=False,
+        add_generation_prompt=True,
+        continue_final_message=False,
+        add_special_tokens=False,
+        include_reasoning=True,
+        reasoning_effort=None,
+        parallel_tool_calls=False,
+        tool_choice="none",
+        return_tokens_as_token_ids=False,
+        return_token_ids=False,
+        return_prompt_text=False,
+        thinking_enabled=thinking_enabled,
+        thinking_token_budget=thinking_token_budget,
+        transport_max_retries=transport_max_retries,
+        schema_repair_attempts=schema_repair_attempts,
+    )
+
+
+def _generation_policy(
+    *,
+    max_tokens: int = MINIMUM_DISCOVERY_MAX_TOKENS,
+    selector_thinking_token_budget: int = 5_000,
+    transport_max_retries: int = 0,
+) -> Stage2GenerationPolicy:
+    selector = _generation_parameters(
+        max_tokens=max_tokens,
+        thinking_enabled=True,
+        thinking_token_budget=selector_thinking_token_budget,
+        transport_max_retries=transport_max_retries,
+    )
+    extraction = _generation_parameters(
+        max_tokens=max_tokens,
+        thinking_enabled=False,
+        thinking_token_budget=0,
+        transport_max_retries=transport_max_retries,
+    )
+    return Stage2GenerationPolicy(
+        **{
+            job_kind: (
+                extraction
+                if job_kind == EXTRACTION_DEFINITION_JOB
+                else selector
+            )
+            for job_kind in HIERARCHICAL_GENERATION_JOB_KINDS
+        },
+        feature_proposal_review=selector,
+        patient_feature_extraction=extraction,
+    )
+
+
 def _runner(factory, **overrides):
+    max_retries = overrides.get("max_retries", 0)
+    max_tokens = overrides.pop("max_tokens", MINIMUM_DISCOVERY_MAX_TOKENS)
+    selector_budget = overrides.pop("selector_thinking_token_budget", 5_000)
     kwargs = {
         "server_urls": ["http://one.test/v1"],
         "model_name": "fixed-model-v3",
         "api_key": "test-secret-key",
         "request_timeout": 12.5,
-        "max_retries": 0,
+        "max_retries": max_retries,
         "retry_initial_delay": 0.0,
         "retry_max_delay": 0.0,
         "retry_jitter_fraction": 0.0,
-        "max_tokens": MINIMUM_DISCOVERY_MAX_TOKENS,
+        "generation_policy": _generation_policy(
+            max_tokens=max_tokens,
+            selector_thinking_token_budget=selector_budget,
+            transport_max_retries=max_retries,
+        ),
         "client_factory": factory,
     }
     kwargs.update(overrides)
@@ -181,7 +286,12 @@ def test_identity_is_stable_authenticated_secret_free_and_transport_is_lazy():
         "api_key_sha256": hashlib.sha256(b"test-secret-key").hexdigest(),
     }
     assert "test-secret-key" not in json.dumps(first)
-    assert first["max_tokens"] == MINIMUM_DISCOVERY_MAX_TOKENS
+    assert first["generation_policy"] == _generation_policy().as_dict()
+    assert (
+        first["generation_policy_sha256"]
+        == _generation_policy().content_sha256
+    )
+    assert first["generation_policy_resolution"] == "explicit_closed_policy"
     assert first["retry"]["max_attempts"] == 1
     source_path = Path(runner_module.__file__).resolve()
     assert (
@@ -248,6 +358,243 @@ def test_identity_recomputes_authenticated_llm_routing_hash(monkeypatch):
     assert first["implementation"]["dependencies"]["llm_routing"]["file_sha256"] == "1" * 64
     assert second["implementation"]["dependencies"]["llm_routing"]["file_sha256"] == "2" * 64
     assert first["identity_sha256"] != second["identity_sha256"]
+
+
+def test_generation_policy_closed_schema_rejects_missing_and_extra_fields():
+    policy = _generation_policy().as_dict()
+    missing_family = dict(policy)
+    missing_family.pop("feature_proposal_review")
+    with pytest.raises(ValueError, match="missing=.*feature_proposal_review"):
+        Stage2GenerationPolicy.from_mapping(missing_family)
+
+    extra_family = {**policy, "unregistered_job_family": {}}
+    with pytest.raises(ValueError, match="extra=.*unregistered_job_family"):
+        Stage2GenerationPolicy.from_mapping(extra_family)
+
+    missing_parameter = json.loads(json.dumps(policy))
+    missing_parameter[INTERPRET_CHUNK_JOB].pop("temperature")
+    with pytest.raises(ValueError, match="missing=.*temperature"):
+        Stage2GenerationPolicy.from_mapping(missing_parameter)
+
+    extra_parameter = json.loads(json.dumps(policy))
+    extra_parameter[INTERPRET_CHUNK_JOB]["unregistered_sampling_knob"] = 0.5
+    with pytest.raises(ValueError, match="extra=.*unregistered_sampling_knob"):
+        Stage2GenerationPolicy.from_mapping(extra_parameter)
+
+
+def test_completion_request_generation_schema_rejects_omission_substitution_and_extra():
+    parameters = _generation_policy().interpret_architecture_chunk
+    request = {
+        "model": "fixed-model-v3",
+        "messages": [{"role": "user", "content": "complete"}],
+        "response_format": {"type": "json_object"},
+        **parameters.request_generation_fields(),
+    }
+    parameters.validate_request_generation_fields(request)
+
+    omitted_null = dict(request)
+    omitted_null.pop("reasoning_effort")
+    with pytest.raises(ValueError, match="missing=.*reasoning_effort"):
+        parameters.validate_request_generation_fields(omitted_null)
+
+    substituted = json.loads(json.dumps(request))
+    substituted["extra_body"]["min_p"] = 0.25
+    with pytest.raises(ValueError, match="generation controls differ"):
+        parameters.validate_request_generation_fields(substituted)
+
+    extra = {**request, "best_of": 2}
+    with pytest.raises(ValueError, match="extra=.*best_of"):
+        parameters.validate_request_generation_fields(extra)
+
+    nested_extra = json.loads(json.dumps(request))
+    nested_extra["extra_body"]["unregistered_sampling_knob"] = True
+    with pytest.raises(ValueError, match="generation controls differ"):
+        parameters.validate_request_generation_fields(nested_extra)
+
+
+def test_inherited_internal_request_is_completed_before_closed_validation():
+    parameters = _generation_policy().interpret_architecture_chunk
+    partial = {
+        "model": "fixed-model-v3",
+        "messages": [{"role": "user", "content": "complete"}],
+        "temperature": parameters.temperature,
+        "max_tokens": parameters.max_tokens,
+        "extra_body": {
+            "chat_template_kwargs": {"enable_thinking": True},
+            "thinking_token_budget": parameters.thinking_token_budget,
+        },
+    }
+    completed = parameters.complete_inherited_request_generation_fields(partial)
+    parameters.validate_request_generation_fields(completed)
+    assert {
+        key: completed[key]
+        for key in parameters.request_generation_fields()
+    } == parameters.request_generation_fields()
+
+    substituted = dict(partial)
+    substituted["temperature"] = 0.25
+    with pytest.raises(ValueError, match="inherited completion request"):
+        parameters.complete_inherited_request_generation_fields(substituted)
+
+
+def test_every_generation_parameter_changes_policy_and_runner_identity():
+    base = _generation_policy()
+    base_selector = base.interpret_architecture_chunk
+    selector_mutations = (
+        replace(base_selector, temperature=0.25),
+        replace(base_selector, top_p=0.9),
+        replace(base_selector, top_k=20),
+        replace(base_selector, min_p=0.05),
+        replace(base_selector, seed=base_selector.seed + 1),
+        replace(base_selector, frequency_penalty=0.1),
+        replace(base_selector, presence_penalty=0.1),
+        replace(base_selector, repetition_penalty=1.1),
+        replace(base_selector, min_tokens=1),
+        replace(base_selector, ignore_eos=True),
+        replace(base_selector, stop_sequences=("END",)),
+        replace(base_selector, stop_token_ids=(7,)),
+        replace(base_selector, include_stop_str_in_output=True),
+        replace(base_selector, logit_bias=(("7", 1.0),)),
+        replace(base_selector, allowed_token_ids=(7, 8)),
+        replace(base_selector, bad_words=("forbidden",)),
+        replace(base_selector, length_penalty=1.1),
+        replace(base_selector, skip_special_tokens=False),
+        replace(base_selector, spaces_between_special_tokens=False),
+        replace(base_selector, include_reasoning=False),
+        replace(base_selector, reasoning_effort="low"),
+        replace(
+            base_selector,
+            thinking_enabled=False,
+            thinking_token_budget=0,
+        ),
+        replace(
+            base_selector,
+            max_tokens=base_selector.max_tokens + 1,
+        ),
+        replace(
+            base_selector,
+            thinking_token_budget=base_selector.thinking_token_budget + 1,
+        ),
+        replace(base_selector, schema_repair_attempts=0),
+    )
+    mutations = (
+        *(
+            replace(
+                base,
+                interpret_architecture_chunk=selector,
+            )
+            for selector in selector_mutations
+        ),
+        _generation_policy(transport_max_retries=1),
+    )
+    base_identity = _runner(
+        _ClientFactory([]),
+        generation_policy=base,
+    ).identity()["identity_sha256"]
+    for mutation in mutations:
+        assert mutation.content_sha256 != base.content_sha256
+        retries = mutation.interpret_architecture_chunk.transport_max_retries
+        if any(
+            mutation.for_hierarchical_job(kind).transport_max_retries != retries
+            for kind in HIERARCHICAL_GENERATION_JOB_KINDS
+        ):
+            # A runner has one transport retry loop, so a per-family retry
+            # mismatch is intentionally constructor-invalid.  The policy
+            # identity still changed above.
+            continue
+        observed = _runner(
+            _ClientFactory([]),
+            max_retries=retries,
+            generation_policy=mutation,
+        ).identity()["identity_sha256"]
+        assert observed != base_identity
+
+
+@pytest.mark.parametrize(
+    ("policy_overrides", "match"),
+    [
+        (
+            {
+                "thinking_enabled": False,
+                "thinking_token_budget": 1,
+            },
+            "disabled thinking",
+        ),
+        (
+            {
+                "thinking_enabled": True,
+                "thinking_token_budget": 0,
+            },
+            "enabled thinking",
+        ),
+        ({"transport_max_retries": 9}, "cannot exceed"),
+        ({"schema_repair_attempts": 2}, "cannot exceed one"),
+        ({"top_p": 0.0}, "top_p"),
+        ({"top_k": 0}, "top_k"),
+        ({"seed": -1}, "seed"),
+        ({"min_tokens": 20_001}, "min_tokens"),
+        ({"n": 2}, "n equal to one"),
+        ({"logprobs": True}, "logprobs disabled"),
+        ({"top_logprobs": 1}, "top_logprobs"),
+        ({"prompt_logprobs": 1}, "prompt_logprobs disabled"),
+        ({"stream": True}, "stream disabled"),
+        ({"use_beam_search": True}, "beam search disabled"),
+        ({"echo": True}, "echo disabled"),
+        ({"add_generation_prompt": False}, "add_generation_prompt enabled"),
+        ({"continue_final_message": True}, "continue_final_message disabled"),
+        ({"add_special_tokens": True}, "add_special_tokens disabled"),
+        ({"parallel_tool_calls": True}, "parallel_tool_calls disabled"),
+        ({"tool_choice": "auto"}, "tool_choice"),
+        ({"return_token_ids": True}, "return_token_ids disabled"),
+    ],
+)
+def test_generation_parameter_invariants_fail_closed(policy_overrides, match):
+    values = {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": -1,
+        "min_p": 0.0,
+        "seed": 42,
+        "frequency_penalty": 0.0,
+        "presence_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "max_tokens": 20_000,
+        "min_tokens": 0,
+        "ignore_eos": False,
+        "stop_sequences": (),
+        "stop_token_ids": (),
+        "include_stop_str_in_output": False,
+        "logit_bias": (),
+        "allowed_token_ids": None,
+        "bad_words": (),
+        "n": 1,
+        "logprobs": False,
+        "top_logprobs": 0,
+        "prompt_logprobs": None,
+        "stream": False,
+        "use_beam_search": False,
+        "length_penalty": 1.0,
+        "skip_special_tokens": True,
+        "spaces_between_special_tokens": True,
+        "echo": False,
+        "add_generation_prompt": True,
+        "continue_final_message": False,
+        "add_special_tokens": False,
+        "include_reasoning": True,
+        "reasoning_effort": None,
+        "parallel_tool_calls": False,
+        "tool_choice": "none",
+        "return_tokens_as_token_ids": False,
+        "return_token_ids": False,
+        "return_prompt_text": False,
+        "thinking_enabled": True,
+        "thinking_token_budget": 5_000,
+        "transport_max_retries": 0,
+        "schema_repair_attempts": 1,
+        **policy_overrides,
+    }
+    with pytest.raises(ValueError, match=match):
+        Stage2GenerationParameters(**values)
 
 
 def test_injected_factory_code_mutation_changes_identity_and_fails_before_transport(
@@ -326,6 +673,21 @@ def test_selector_request_preserves_messages_and_records_only_content_reasoning_
     assert request["messages"] == job.messages
     assert request["temperature"] == 0
     assert request["max_tokens"] == MINIMUM_DISCOVERY_MAX_TOKENS
+    expected_generation = (
+        _generation_policy()
+        .interpret_architecture_chunk
+        .request_generation_fields()
+    )
+    assert {
+        key: request[key]
+        for key in expected_generation
+    } == expected_generation
+    assert set(request) == {
+        "model",
+        "messages",
+        "response_format",
+        *expected_generation,
+    }
     assert request["response_format"] == {
         "type": "json_schema",
         "json_schema": {
@@ -334,10 +696,13 @@ def test_selector_request_preserves_messages_and_records_only_content_reasoning_
             "schema": job.response_schema,
         },
     }
-    assert request["extra_body"] == {
-        "chat_template_kwargs": {"enable_thinking": True},
-        "thinking_token_budget": job.settings.thinking_token_budget,
+    assert request["extra_body"]["chat_template_kwargs"] == {
+        "enable_thinking": True
     }
+    assert (
+        request["extra_body"]["thinking_token_budget"]
+        == job.settings.thinking_token_budget
+    )
     metadata = runner.last_execution_metadata
     assert metadata is not None
     attempt = metadata["attempts"][0]
@@ -362,6 +727,27 @@ def test_selector_request_preserves_messages_and_records_only_content_reasoning_
     }
 
 
+def test_selector_thinking_budget_is_configured_and_identity_bound():
+    factory = _ClientFactory(
+        [_response('{"concepts":[],"evidence_dispositions":[]}')]
+    )
+    runner = _runner(
+        factory,
+        selector_thinking_token_budget=6_000,
+        max_tokens=26_000,
+    )
+    job = _job(selector_thinking_token_budget=6_000)
+
+    runner.run_json(job=job)
+
+    identity = runner.identity()
+    configured = identity["generation_policy"][INTERPRET_CHUNK_JOB]
+    assert configured["thinking_enabled"] is True
+    assert configured["thinking_token_budget"] == 6_000
+    assert configured["max_tokens"] == 26_000
+    assert factory.calls[0]["extra_body"]["thinking_token_budget"] == 6_000
+
+
 def test_extraction_request_disables_thinking_and_omits_budget():
     factory = _ClientFactory([_response('{"feature_name":"age"}')])
     runner = _runner(factory)
@@ -371,8 +757,42 @@ def test_extraction_request_disables_thinking_and_omits_budget():
 
     request = factory.calls[0]
     assert request["messages"] == job.messages
-    assert request["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+    expected_generation = (
+        _generation_policy()
+        .define_one_extraction_feature
+        .request_generation_fields()
+    )
+    assert {
+        key: request[key]
+        for key in expected_generation
+    } == expected_generation
+    assert request["extra_body"]["chat_template_kwargs"] == {
+        "enable_thinking": False
+    }
     assert "thinking_token_budget" not in request["extra_body"]
+
+
+def test_job_settings_must_match_the_exact_generation_family():
+    runner = _runner(
+        _ClientFactory([]),
+        selector_thinking_token_budget=6_000,
+        max_tokens=26_000,
+    )
+    with pytest.raises(ValueError, match="thinking settings differ"):
+        runner._request_kwargs(_job(selector_thinking_token_budget=5_000))
+
+
+@pytest.mark.parametrize(
+    ("response", "match"),
+    [
+        (_response("{}", model="another-model"), "model differs"),
+        (_response("{}", finish_reason="length"), "finish_reason"),
+    ],
+)
+def test_response_requires_exact_model_and_stop_before_parsing(response, match):
+    runner = _runner(_ClientFactory([response]))
+    with pytest.raises(ValueError, match=match):
+        runner.run_json(job=_job())
 
 
 @pytest.mark.parametrize(
@@ -508,9 +928,9 @@ def test_model_must_be_a_string():
 
 @pytest.mark.parametrize(
     "max_tokens",
-    [0, 5000, 5001, MINIMUM_DISCOVERY_MAX_TOKENS - 1, True],
+    [0, 5000, True],
 )
-def test_max_tokens_must_cover_visible_response_and_selector_thinking_budget(max_tokens):
+def test_max_tokens_must_leave_a_visible_token_after_selector_thinking(max_tokens):
     exception = TypeError if max_tokens is True else ValueError
     with pytest.raises(exception, match="max_tokens"):
         OpenAICompatibleJsonDiscoveryJobRunner(
@@ -518,6 +938,16 @@ def test_max_tokens_must_cover_visible_response_and_selector_thinking_budget(max
             model_name="fixed-model",
             max_tokens=max_tokens,
         )
+
+
+def test_each_job_enforces_its_authenticated_dynamic_wire_budget():
+    runner = OpenAICompatibleJsonDiscoveryJobRunner(
+        server_urls="http://one.test/v1",
+        model_name="fixed-model",
+        max_tokens=5_001,
+    )
+    with pytest.raises(ValueError, match="authenticated visible-response"):
+        runner._request_kwargs(_job())
 
 
 def test_retry_count_has_a_hard_upper_bound():

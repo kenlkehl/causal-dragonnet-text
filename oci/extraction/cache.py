@@ -57,7 +57,7 @@ def _compute_config_hash(config: Dict[str, Any]) -> str:
         'extraction_max_tokens': config.get('extraction_max_tokens', 1024),
         'extraction_max_text_length': config.get(
             'extraction_max_text_length',
-            config.get('max_text_length', 400000),
+            config.get('max_text_length'),
         ),
         'extraction_grouping_strategy': config.get(
             'extraction_grouping_strategy', 'clinical_domain'

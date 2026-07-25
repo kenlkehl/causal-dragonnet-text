@@ -43,6 +43,10 @@ from ..utils.calibration import (
     BinaryProbabilityCalibrator,
     binary_calibration_metrics,
 )
+from .lossless_tokenization import (
+    require_nonbinding_chunk_capacity,
+    tokenize_losslessly,
+)
 
 logger = logging.getLogger(__name__)
 _LEGACY_BERT_MODEL_PREFIXES = ("prajjwal1/bert-",)
@@ -160,6 +164,12 @@ class NeuralCausalForestConfig:
         self.nuisance_calibration = calibration
         if self.max_chunks < 1:
             raise ValueError("max_chunks must be >= 1")
+        if self.max_length < 1:
+            raise ValueError("max_length must be >= 1")
+        if self.chunk_size_words < 1:
+            raise ValueError("chunk_size_words must be >= 1")
+        if self.chunk_overlap_words < 0:
+            raise ValueError("chunk_overlap_words must be >= 0")
         if self.chunk_overlap_words >= self.chunk_size_words:
             raise ValueError("chunk_overlap_words must be smaller than chunk_size_words")
         if not 0.0 < self.feature_subsample_fraction <= 1.0:
@@ -364,10 +374,15 @@ def split_text_into_word_span_chunks(
     if not words:
         return [ChunkInfo(text="", char_start=0, char_end=0, chunk_index=0)]
 
+    require_nonbinding_chunk_capacity(
+        len(words),
+        chunk_size=chunk_size_words,
+        chunk_overlap=chunk_overlap_words,
+        max_chunks=max_chunks,
+        context="NeuralCausalForest note",
+    )
     stride = chunk_size_words - chunk_overlap_words
-    max_window_words = chunk_size_words + (max_chunks - 1) * stride
-    first_word = max(0, len(words) - max_window_words)
-    window_words = words[first_word:]
+    window_words = words
 
     chunks: List[ChunkInfo] = []
     start_idx = 0
@@ -891,11 +906,12 @@ class HierarchicalTokenAttentionEncoder(nn.Module):
         assert self._tokenizer is not None and self._backbone is not None
         chunk_texts = [chunk.text for chunk in flat_chunks]
         use_offsets = bool(getattr(self._tokenizer, "is_fast", False))
-        encoded = self._tokenizer(
+        encoded = tokenize_losslessly(
+            self._tokenizer,
             chunk_texts,
+            configured_max_length=self.config.max_length,
+            context="NeuralCausalForest chunk",
             padding=True,
-            truncation=True,
-            max_length=self.config.max_length,
             return_tensors="pt",
             return_offsets_mapping=use_offsets,
         )
@@ -924,7 +940,13 @@ class HierarchicalTokenAttentionEncoder(nn.Module):
         token_rows: List[List[int]] = []
         offset_rows: List[List[Tuple[int, int]]] = []
         for chunk in flat_chunks:
-            tokens = list(re.finditer(r"\S+", chunk.text))[: self.config.max_length]
+            tokens = list(re.finditer(r"\S+", chunk.text))
+            if len(tokens) > self.config.max_length:
+                raise ValueError(
+                    "NeuralCausalForest hash chunk exceeds configured max_length; "
+                    "semantic truncation is forbidden "
+                    f"({len(tokens)} > {self.config.max_length})"
+                )
             if not tokens:
                 token_rows.append([0])
                 offset_rows.append([(0, 0)])

@@ -113,6 +113,7 @@ from .review_spent_evidence_provider import (
     ALL_NON_QUERY_DISCOVERY_FAMILIES,
     ContextFitReviewSpentEvidenceProvider,
     HistoricalStage1SpentDiscoveryBackend,
+    SemanticWitnessScientificConfig,
     SpentOnlyFrozenChunkEmbeddingCache,
     TfidfTopicOrphanSpentDiscoveryBackend,
 )
@@ -253,6 +254,9 @@ class ValidatedBenchmarkInputs:
         default_factory=dict
     )
     review_stage1_config_path: Path | None = None
+    review_semantic_witness_scientific_config: (
+        SemanticWitnessScientificConfig | None
+    ) = None
     review_embedding_cache_dir: Path | None = None
     review_neural_query_cache_dir: Path | None = None
     authenticated_review_spent_cache_sources: tuple[AuthenticatedReviewSpentCacheSource, ...] = ()
@@ -415,6 +419,11 @@ def _validate_numeric_configuration(args: argparse.Namespace) -> None:
         if args.review_stage1_config is None:
             raise ValueError(
                 "--review-stage1-config is required when post-extraction review is enabled"
+            )
+        if getattr(args, "review_semantic_witness_scientific_config", None) is None:
+            raise ValueError(
+                "--review-semantic-witness-scientific-config is required when "
+                "post-extraction review is enabled"
             )
         if args.review_embedding_cache_dir is None:
             raise ValueError(
@@ -795,6 +804,51 @@ def _required_file(path: Path | str, *, label: str) -> Path:
     if not resolved.is_file():
         raise FileNotFoundError(f"{label} does not exist or is not a file: {resolved}")
     return resolved
+
+
+def _load_semantic_witness_scientific_config(
+    path: Path | str,
+) -> SemanticWitnessScientificConfig:
+    requested = _required_file(
+        path,
+        label="review semantic-witness scientific config",
+    )
+    before = sha256_file(requested)
+
+    def reject_duplicates(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
+        output: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in output:
+                raise ValueError(
+                    f"review semantic-witness config contains duplicate key {key!r}"
+                )
+            output[key] = value
+        return output
+
+    try:
+        raw = json.loads(
+            requested.read_text(encoding="utf-8"),
+            object_pairs_hook=reject_duplicates,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(
+                    "review semantic-witness config contains non-finite "
+                    f"JSON value {token}"
+                )
+            ),
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "review semantic-witness scientific config is not strict JSON"
+        ) from exc
+    after = sha256_file(requested)
+    if before != after:
+        raise RuntimeError(
+            "review semantic-witness scientific config changed while being parsed"
+        )
+    return SemanticWitnessScientificConfig.from_mapping(
+        raw,
+        label="review semantic-witness scientific config",
+    )
 
 
 def _required_directory(path: Path | str, *, label: str) -> Path:
@@ -1310,6 +1364,7 @@ def validate_benchmark_inputs(args: argparse.Namespace) -> ValidatedBenchmarkInp
         label="old hierarchy prompt",
     )
     review_stage1_config_path = None
+    review_semantic_witness_scientific_config = None
     review_embedding_cache_dir = None
     review_neural_query_cache_dir = None
     if int(args.post_extraction_review_rounds) > 0:
@@ -1331,6 +1386,11 @@ def validate_benchmark_inputs(args: argparse.Namespace) -> ValidatedBenchmarkInp
         review_stage1_config_path = _required_file(
             args.review_stage1_config,
             label="historical Stage-1 review config",
+        )
+        review_semantic_witness_scientific_config = (
+            _load_semantic_witness_scientific_config(
+                args.review_semantic_witness_scientific_config
+            )
         )
         # Parse and validate any closed query override during dry-run, before
         # a service or model-bearing backend can be constructed.
@@ -1428,6 +1488,9 @@ def validate_benchmark_inputs(args: argparse.Namespace) -> ValidatedBenchmarkInp
         outer_folds=folds,
         neural_query_moment_artifacts_by_fold=neural_query_artifacts,
         review_stage1_config_path=review_stage1_config_path,
+        review_semantic_witness_scientific_config=(
+            review_semantic_witness_scientific_config
+        ),
         review_embedding_cache_dir=review_embedding_cache_dir,
         review_neural_query_cache_dir=review_neural_query_cache_dir,
         authenticated_review_spent_cache_sources=review_spent_cache_sources,
@@ -1657,6 +1720,16 @@ def _dry_run_summary(
         "precomputed_recursive_review_feature_banks_enabled": False,
         "review_stage1_config_path": (
             str(validated.review_stage1_config_path) if review_enabled else None
+        ),
+        "review_semantic_witness_scientific_config": (
+            None
+            if validated.review_semantic_witness_scientific_config is None
+            else validated.review_semantic_witness_scientific_config.as_dict()
+        ),
+        "review_semantic_witness_scientific_config_sha256": (
+            None
+            if validated.review_semantic_witness_scientific_config is None
+            else validated.review_semantic_witness_scientific_config.identity_sha256
         ),
         "review_embedding_cache_dir": (
             str(validated.review_embedding_cache_dir) if review_enabled else None
@@ -2013,6 +2086,9 @@ def run_benchmark(args: argparse.Namespace) -> Mapping[str, Any]:
                     stage1_config_snapshot=stage1_config_snapshot,
                     embedding_cache=shared_embedding_cache,
                     htr_model_snapshot=htr_model_snapshot,
+                    semantic_witness_scientific_config=(
+                        validated.review_semantic_witness_scientific_config
+                    ),
                     device=_review_stage1_device(args),
                     bow_fold_parallelism=int(args.review_stage1_bow_fold_parallelism),
                     bow_parallel_backend=str(args.review_stage1_bow_parallel_backend),
@@ -2550,6 +2626,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--review-semantic-witness-scientific-config",
+        type=Path,
+        help=(
+            "Closed JSON scientific configuration for spent-review embedding "
+            "retrieval and HTR semantic-witness TF-IDF projection. Required "
+            "when post-extraction review is enabled; no defaults are applied."
+        ),
+    )
+    parser.add_argument(
         "--review-embedding-cache-dir",
         type=Path,
         help=(
@@ -2641,7 +2726,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("tail", "contract_lexical_rag"),
         default="tail",
     )
-    parser.add_argument("--extraction-max-text-length", type=int, default=400000)
+    parser.add_argument(
+        "--extraction-max-text-length",
+        required=True,
+        type=int,
+        help="Explicit context bound for this legacy extraction mode.",
+    )
     parser.add_argument(
         "--extraction-prompt-version",
         default=EXTRACTION_PROMPT_VERSION,

@@ -692,6 +692,43 @@ class KeywordEmbeddingProvider:
 
 
 class KeywordSentenceTransformer:
+    class _WhitespaceTokenizer:
+        def __init__(self):
+            self._token_to_id = {}
+            self._id_to_token = {}
+
+        def encode(self, text, add_special_tokens=False):
+            del add_special_tokens
+            token_ids = []
+            for token in str(text).split():
+                token_id = self._token_to_id.get(token)
+                if token_id is None:
+                    token_id = len(self._token_to_id) + 1
+                    self._token_to_id[token] = token_id
+                    self._id_to_token[token_id] = token
+                token_ids.append(token_id)
+            return token_ids
+
+        def decode(
+            self,
+            token_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        ):
+            del skip_special_tokens, clean_up_tokenization_spaces
+            return " ".join(self._id_to_token[int(token_id)] for token_id in token_ids)
+
+        @staticmethod
+        def num_special_tokens_to_add(pair=False):
+            del pair
+            return 0
+
+    def __init__(self):
+        # The production cache must be able to audit and, if needed, split
+        # every model-bounded input.  Keep this test double subject to the
+        # same contract instead of relying on an implicit truncating encoder.
+        self.tokenizer = self._WhitespaceTokenizer()
+
     def encode(
         self,
         texts,
@@ -859,18 +896,22 @@ def test_embedding_contrast_retrieval_filters_low_content_chunks():
     assert _informative_chunk_text("Brain MRI shows enhancing metastases.")
 
 
-def test_embedding_contrast_chunk_selection_keeps_last_chunks():
+def test_embedding_contrast_chunk_capacity_fails_closed():
+    from oci.models.lossless_tokenization import SemanticTruncationError
+
     text = " ".join(f"w{i}" for i in range(1, 11))
-    first = chunk_text_words(text, chunk_size_words=3, chunk_overlap_words=0, max_chunks=2)
-    last = chunk_text_words(
-        text,
-        chunk_size_words=3,
-        chunk_overlap_words=0,
-        max_chunks=2,
-        chunk_selection="last",
-    )
-    assert first == ["w1 w2 w3", "w4 w5 w6"]
-    assert last == ["w7 w8 w9", "w10"]
+    for selection in ("first", "last"):
+        with pytest.raises(
+            SemanticTruncationError,
+            match=r"requires 4 chunks.*max_chunks=2",
+        ):
+            chunk_text_words(
+                text,
+                chunk_size_words=3,
+                chunk_overlap_words=0,
+                max_chunks=2,
+                chunk_selection=selection,
+            )
 
 
 def test_embedding_contrast_default_cache_dir_is_dataset_scoped(tmp_path: Path):

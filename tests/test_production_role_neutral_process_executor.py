@@ -1,0 +1,555 @@
+from __future__ import annotations
+
+import dataclasses
+import os
+import random
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+
+import oci.inference.prepared_stage1_context as prepared_context_module
+import oci.inference.production_stage1_role_neutral_execution as execution_module
+from oci.inference.production_role_neutral_process_executor import (
+    ProcessIsolatedRoleNeutralPhysicalOwnerExecutor,
+    _execute_production_role_neutral_owner,
+)
+from oci.inference.production_role_neutral_persistent_executor import (
+    PERSISTENT_ROLE_NEUTRAL_WORKER_MODE,
+    PersistentSpawnRoleNeutralPhysicalOwnerExecutor,
+)
+from oci.inference.production_stage1_role_neutral_execution import (
+    DISTINCT_RESOURCE_CANARY_REPLICA_POLICY,
+    EARLIEST_CANONICAL_OWNER_CANARY_SELECTION,
+    RoleNeutralComputeCanaryPolicy,
+    RoleNeutralPhysicalOwnerTask,
+    RoleNeutralStage1ExecutionPolicy,
+    _execute_one_owner,
+    _freshly_reauthenticate_owner_result,
+    execute_and_publish_role_neutral_stage1,
+)
+from oci.inference.role_neutral_all_ten_binding import (
+    validate_authenticated_role_neutral_component_receipt,
+)
+
+from tests.test_production_stage1_role_neutral_execution import (
+    _ProducerRecorder,
+    _plan,
+    _resource_plan,
+)
+
+
+def _fake_spawn_owner_worker(*, task, worker_parameters):
+    if worker_parameters != {"test_token": "mixed-seed-isolation"}:
+        raise ValueError("test worker parameters changed")
+    report = {
+        "pid": os.getpid(),
+        "python_hash_seed": os.environ.get("PYTHONHASHSEED"),
+        "native_thread_environment": {
+            name: os.environ.get(name)
+            for name in (
+                "OMP_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS",
+            )
+        },
+        "python_random": random.random(),
+        "numpy_random": float(np.random.random()),
+        "torch_random": float(torch.rand(1).item()),
+    }
+    result = _execute_one_owner(
+        task=task,
+        factories=_ProducerRecorder().factories().as_mapping(),
+    )
+    return dataclasses.replace(result, execution_telemetry=report)
+
+
+def _must_not_execute_in_parent(_task):
+    raise AssertionError("process executor invoked the parent worker closure")
+
+
+def _tasks(plan, parent: Path, count: int = 2):
+    parent.mkdir(parents=True, exist_ok=False)
+    groups = {
+        owner.scope_id: (owner, members)
+        for owner, members in plan.physical_scope_groups
+    }
+    return tuple(
+        RoleNeutralPhysicalOwnerTask(
+            plan=plan,
+            physical_owner=groups[owner.scope_id][0],
+            logical_members=groups[owner.scope_id][1],
+            component_parent=(parent / owner.scope_id).resolve(),
+            resource="cpu",
+        )
+        for owner in plan.physical_scopes[:count]
+    )
+
+
+def _scientific_by_owner(results):
+    return {
+        result.physical_owner_scope_id: tuple(
+            source.receipt.scientific_dict() for source in result.sources
+        )
+        for result in results
+    }
+
+
+def test_fresh_production_worker_reconstructs_sealed_context_without_prepare(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan(gpu_ids=())
+    task = _tasks(
+        plan,
+        (tmp_path / "fresh_context_components").resolve(),
+        count=1,
+    )[0]
+    factories = _ProducerRecorder().factories()
+    reconstruct_budgets: list[int] = []
+
+    class _Context:
+        def reconstruct(self, *, slot_cpu_budget):
+            reconstruct_budgets.append(int(slot_cpu_budget))
+            return (
+                type("_Prepared", (), {"stage1_scope_plan": plan})(),
+                factories,
+            )
+
+    monkeypatch.setattr(
+        prepared_context_module,
+        "load_prepared_stage1_context",
+        lambda _path: _Context(),
+    )
+    from oci.inference.production_stage1_bundle import (
+        ProductionStage1BundleBuilder,
+    )
+
+    monkeypatch.setattr(
+        ProductionStage1BundleBuilder,
+        "prepare",
+        lambda _self: (_ for _ in ()).throw(
+            AssertionError("fresh worker reran monolithic prepare")
+        ),
+    )
+    monkeypatch.setenv("OMP_NUM_THREADS", "3")
+
+    result = _execute_production_role_neutral_owner(
+        task=task,
+        worker_parameters={
+            "prepared_context_manifest_path": str(
+                (tmp_path / "prepared_stage1_context_manifest.json").resolve()
+            )
+        },
+    )
+
+    assert reconstruct_budgets == [3]
+    assert result.physical_owner_scope_id == task.physical_owner.scope_id
+    assert len(result.sources) == 6
+
+
+def test_mixed_owner_seeds_are_spawn_isolated_and_schedule_equal(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(gpu_ids=())
+    sequential_tasks = _tasks(
+        plan,
+        (tmp_path / "sequential_components").resolve(),
+    )
+    concurrent_tasks = _tasks(
+        plan,
+        (tmp_path / "concurrent_components").resolve(),
+    )
+    executor = ProcessIsolatedRoleNeutralPhysicalOwnerExecutor(
+        max_workers_per_resource=2,
+        worker_target=f"{__name__}:_fake_spawn_owner_worker",
+        worker_parameters={"test_token": "mixed-seed-isolation"},
+        production_worker_required=False,
+        poll_interval_seconds=0.01,
+    )
+
+    sequential = tuple(
+        executor.execute(
+            tasks=sequential_tasks,
+            worker=_must_not_execute_in_parent,
+            max_workers=1,
+            cpu_budget=2,
+        )
+    )
+    concurrent = tuple(
+        executor.execute(
+            tasks=concurrent_tasks,
+            worker=_must_not_execute_in_parent,
+            max_workers=2,
+            cpu_budget=2,
+        )
+    )
+
+    assert _scientific_by_owner(sequential) == _scientific_by_owner(concurrent)
+    sequential_by_owner = {
+        result.physical_owner_scope_id: result for result in sequential
+    }
+    concurrent_by_owner = {
+        result.physical_owner_scope_id: result for result in concurrent
+    }
+    probes = []
+    for task in sequential_tasks:
+        owner = task.physical_owner.scope_id
+        first = sequential_by_owner[owner].execution_telemetry
+        second = concurrent_by_owner[owner].execution_telemetry
+        assert first is not None and second is not None
+        first_report = first["worker_report"]
+        second_report = second["worker_report"]
+        for report in (first_report, second_report):
+            assert report["pid"] != os.getpid()
+            assert report["python_hash_seed"] == str(
+                task.physical_owner.scope_seed
+            )
+        assert set(first_report["native_thread_environment"].values()) == {
+            str(first["native_threads"])
+        }
+        assert set(second_report["native_thread_environment"].values()) == {
+            str(second["native_threads"])
+        }
+        assert (
+            first_report["python_random"],
+            first_report["numpy_random"],
+            first_report["torch_random"],
+        ) == (
+            second_report["python_random"],
+            second_report["numpy_random"],
+            second_report["torch_random"],
+        )
+        probes.append(
+            (
+                first_report["python_random"],
+                first_report["numpy_random"],
+                first_report["torch_random"],
+            )
+        )
+        _freshly_reauthenticate_owner_result(
+            task=task,
+            result=sequential_by_owner[owner],
+        )
+    assert len(set(probes)) == len(probes)
+    assert not tuple(
+        (tmp_path / "sequential_components").glob(".process-group-*.json")
+    )
+    assert not tuple(
+        (tmp_path / "concurrent_components").glob(".process-group-*.json")
+    )
+
+
+def test_persistent_slots_reseed_mixed_owners_and_cleanup(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(gpu_ids=())
+    sequential_tasks = _tasks(
+        plan,
+        (tmp_path / "persistent_sequential").resolve(),
+    )
+    concurrent_tasks = _tasks(
+        plan,
+        (tmp_path / "persistent_concurrent").resolve(),
+    )
+    executor = PersistentSpawnRoleNeutralPhysicalOwnerExecutor(
+        max_workers_per_resource=2,
+        worker_target=f"{__name__}:_fake_spawn_owner_worker",
+        worker_parameters={"test_token": "mixed-seed-isolation"},
+        production_worker_required=False,
+        poll_interval_seconds=0.01,
+    )
+
+    sequential = tuple(
+        executor.execute(
+            tasks=sequential_tasks,
+            worker=_must_not_execute_in_parent,
+            max_workers=1,
+            cpu_budget=2,
+        )
+    )
+    concurrent = tuple(
+        executor.execute(
+            tasks=concurrent_tasks,
+            worker=_must_not_execute_in_parent,
+            max_workers=2,
+            cpu_budget=2,
+        )
+    )
+
+    assert _scientific_by_owner(sequential) == _scientific_by_owner(concurrent)
+    sequential_by_owner = {
+        result.physical_owner_scope_id: result for result in sequential
+    }
+    concurrent_by_owner = {
+        result.physical_owner_scope_id: result for result in concurrent
+    }
+    assert len(
+        {
+            result.execution_telemetry["pid"]
+            for result in sequential
+        }
+    ) == 1
+    assert len(
+        {
+            result.execution_telemetry["pid"]
+            for result in concurrent
+        }
+    ) == 2
+    for task in sequential_tasks:
+        owner = task.physical_owner.scope_id
+        first = sequential_by_owner[owner].execution_telemetry
+        second = concurrent_by_owner[owner].execution_telemetry
+        assert first["worker_lifecycle_mode"] == (
+            PERSISTENT_ROLE_NEUTRAL_WORKER_MODE
+        )
+        assert first["host_cpu_budget"] == 2
+        assert first["slot_cpu_budget"] == 2
+        assert second["host_cpu_budget"] == 2
+        assert second["slot_cpu_budget"] == 1
+        first_report = first["worker_report"]
+        second_report = second["worker_report"]
+        assert (
+            first_report["python_random"],
+            first_report["numpy_random"],
+            first_report["torch_random"],
+        ) == (
+            second_report["python_random"],
+            second_report["numpy_random"],
+            second_report["torch_random"],
+        )
+        _freshly_reauthenticate_owner_result(
+            task=task,
+            result=sequential_by_owner[owner],
+        )
+    assert not tuple(
+        (tmp_path / "persistent_sequential").glob(
+            ".persistent-process-group-*.json"
+        )
+    )
+    assert not tuple(
+        (tmp_path / "persistent_concurrent").glob(
+            ".persistent-process-group-*.json"
+        )
+    )
+
+
+def test_persistent_session_reuses_one_slot_across_executor_calls(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(gpu_ids=())
+    tasks = _tasks(
+        plan,
+        (tmp_path / "persistent_session_components").resolve(),
+    )
+    marker_root = (tmp_path / "persistent_session_markers").resolve()
+    executor = PersistentSpawnRoleNeutralPhysicalOwnerExecutor(
+        max_workers_per_resource=1,
+        worker_target=f"{__name__}:_fake_spawn_owner_worker",
+        worker_parameters={"test_token": "mixed-seed-isolation"},
+        production_worker_required=False,
+        poll_interval_seconds=0.01,
+    )
+    with executor.open_session(
+        resources=("cpu",),
+        max_workers=1,
+        cpu_budget=2,
+        marker_root=marker_root,
+    ) as session:
+        first = session.execute(
+            tasks=(tasks[0],),
+            worker=_must_not_execute_in_parent,
+            max_workers=1,
+            cpu_budget=2,
+        )[0]
+        second = session.execute(
+            tasks=(tasks[1],),
+            worker=_must_not_execute_in_parent,
+            max_workers=1,
+            cpu_budget=2,
+        )[0]
+        assert first.execution_telemetry["pid"] == (
+            second.execution_telemetry["pid"]
+        )
+        assert first.execution_telemetry["slot_owner_ordinal"] == 1
+        assert second.execution_telemetry["slot_owner_ordinal"] == 2
+    assert not marker_root.exists()
+
+
+def test_parent_reauthentication_rejects_child_tree_mutation(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(gpu_ids=())
+    task = _tasks(
+        plan,
+        (tmp_path / "tamper_components").resolve(),
+        count=1,
+    )[0]
+    executor = ProcessIsolatedRoleNeutralPhysicalOwnerExecutor(
+        max_workers_per_resource=1,
+        worker_target=f"{__name__}:_fake_spawn_owner_worker",
+        worker_parameters={"test_token": "mixed-seed-isolation"},
+        production_worker_required=False,
+        poll_interval_seconds=0.01,
+    )
+    result = executor.execute(
+        tasks=(task,),
+        worker=_must_not_execute_in_parent,
+        max_workers=1,
+        cpu_budget=1,
+    )[0]
+    _freshly_reauthenticate_owner_result(task=task, result=result)
+
+    terminal = task.component_parent / "bow" / "execution_manifest.json"
+    terminal.write_bytes(terminal.read_bytes() + b" ")
+    with pytest.raises(ValueError, match="source tree changed"):
+        validate_authenticated_role_neutral_component_receipt(
+            root=task.component_parent / "bow",
+            plan=plan,
+            physical_owner_scope_id=task.physical_owner.scope_id,
+            receipt=result.sources[0].receipt,
+            expected_component="bow",
+        )
+
+
+class _CanaryRoutingExecutor:
+    process_isolated_physical_owners = True
+
+    def __init__(self, factories):
+        self.factories = factories.as_mapping()
+        self.calls = []
+
+    def execute(self, *, tasks, worker, max_workers, cpu_budget):
+        self.calls.append(
+            tuple(
+                (
+                    task.physical_owner.scope_id,
+                    task.component_parent,
+                    task.resource,
+                )
+                for task in tasks
+            )
+        )
+        return tuple(
+            _execute_one_owner(task=task, factories=self.factories)
+            for task in tasks
+        )
+
+
+def test_productive_canary_uses_isolated_executor_for_both_replicas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan(gpu_ids=())
+    factories = _ProducerRecorder().factories()
+    executor = _CanaryRoutingExecutor(factories)
+    reauthentication_calls = 0
+    original_reauthenticate = (
+        execution_module._freshly_reauthenticate_owner_result
+    )
+
+    def counted_reauthenticate(*, task, result):
+        nonlocal reauthentication_calls
+        reauthentication_calls += 1
+        return original_reauthenticate(task=task, result=result)
+
+    monkeypatch.setattr(
+        execution_module,
+        "_freshly_reauthenticate_owner_result",
+        counted_reauthenticate,
+    )
+    root = (tmp_path / "isolated_canary").resolve()
+    manifest = execute_and_publish_role_neutral_stage1(
+        root=root,
+        plan=plan,
+        producer_factories=factories,
+        policy=RoleNeutralStage1ExecutionPolicy(
+            resource_plan=_resource_plan(
+                devices=("cpu",),
+                cpu_budget=4,
+            ),
+            max_parallel_owners=2,
+            compute_canary=RoleNeutralComputeCanaryPolicy(
+                canonical_scope_selection=(
+                    EARLIEST_CANONICAL_OWNER_CANARY_SELECTION
+                ),
+                replica_resource_selection=(
+                    DISTINCT_RESOURCE_CANARY_REPLICA_POLICY
+                ),
+            ),
+        ),
+        executor=executor,
+    )
+
+    selected = min(
+        plan.physical_scopes,
+        key=lambda owner: owner.canonical_index,
+    )
+    assert len(executor.calls) == 3
+    assert executor.calls[0][0][0] == selected.scope_id
+    assert executor.calls[1][0][0] == selected.scope_id
+    assert executor.calls[0][0][1] != executor.calls[1][0][1]
+    assert {row[0] for row in executor.calls[2]} == {
+        owner.scope_id
+        for owner in plan.physical_scopes
+        if owner.scope_id != selected.scope_id
+    }
+    assert manifest["productive_compute_canary_completed"] is True
+    assert manifest["compute_canary_scientific_equality"] is True
+    # Every accepted physical owner plus the discarded canary replica crosses
+    # the parent trust boundary exactly once.
+    assert reauthentication_calls == len(plan.physical_scopes) + 1
+
+
+def test_productive_canary_and_production_share_persistent_session(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(gpu_ids=())
+    executor = PersistentSpawnRoleNeutralPhysicalOwnerExecutor(
+        max_workers_per_resource=2,
+        worker_target=f"{__name__}:_fake_spawn_owner_worker",
+        worker_parameters={"test_token": "mixed-seed-isolation"},
+        production_worker_required=False,
+        poll_interval_seconds=0.01,
+    )
+    root = (tmp_path / "persistent_productive_canary").resolve()
+    manifest = execute_and_publish_role_neutral_stage1(
+        root=root,
+        plan=plan,
+        producer_factories=_ProducerRecorder().factories(),
+        policy=RoleNeutralStage1ExecutionPolicy(
+            resource_plan=_resource_plan(
+                devices=("cpu",),
+                cpu_budget=4,
+            ),
+            max_parallel_owners=2,
+            compute_canary=RoleNeutralComputeCanaryPolicy(
+                canonical_scope_selection=(
+                    EARLIEST_CANONICAL_OWNER_CANARY_SELECTION
+                ),
+                replica_resource_selection=(
+                    DISTINCT_RESOURCE_CANARY_REPLICA_POLICY
+                ),
+            ),
+        ),
+        executor=executor,
+    )
+    telemetry = manifest["owner_execution_telemetry"]
+    owner_rows = telemetry["physical_owners"]
+    replica_rows = telemetry["compute_canary_replicas"]
+    all_rows = [*owner_rows, *replica_rows]
+    pids = {
+        row["telemetry"]["pid"]
+        for row in all_rows
+        if row["telemetry"] is not None
+    }
+    assert len(pids) <= 2
+    assert any(
+        row["telemetry"]["slot_owner_ordinal"] > 1
+        for row in all_rows
+        if row["telemetry"] is not None
+    )
+    assert manifest["productive_compute_canary_completed"] is True
+    assert not (root / ".persistent-owner-execution-session").exists()

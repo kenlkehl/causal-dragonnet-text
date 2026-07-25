@@ -44,7 +44,10 @@ from .embedding_native_proof_capture import (
     NativeEmbeddingProofCaptureSink,
     validate_embedding_native_capture,
 )
-from .review_spent_evidence_provider import BoundSpentFrozenChunkEmbeddingProvider
+from .review_spent_evidence_provider import (
+    BoundSpentFrozenChunkEmbeddingProvider,
+    SemanticWitnessScientificConfig,
+)
 from .lossless_stage1_evidence_catalog import build_role_neutral_evidence_catalog
 from .stage1_cumulative_spent_evidence import (
     CUMULATIVE_SPENT_FIT_AUDIT_SCHEMA,
@@ -415,13 +418,46 @@ def _capture_configuration(metadata: Mapping[str, Any]) -> dict[str, Any]:
         "outcome_type": metadata["outcome_type"],
         "seed": metadata["seed"],
         "embedding_config": copy.deepcopy(metadata["embedding_config"]),
+        "semantic_witness_scientific_config": copy.deepcopy(
+            metadata["semantic_witness_scientific_config"]
+        ),
+        "semantic_witness_scientific_config_sha256": str(
+            metadata["semantic_witness_scientific_config_sha256"]
+        ),
         "tfidf_nested_calibration_folds": int(
             metadata["tfidf_training_scope_policy"]["configured_fold_count"]
         ),
     }
 
 
-def _validate_semantic_source(value: Mapping[str, Any]) -> tuple[list[dict[str, Any]], int]:
+def _semantic_score_eligibility_policy(
+    metadata: Mapping[str, Any],
+) -> str:
+    raw = metadata.get("semantic_witness_scientific_config")
+    config = SemanticWitnessScientificConfig.from_mapping(
+        raw,
+        label="native capture semantic-witness scientific config",
+    )
+    if (
+        metadata.get("semantic_witness_scientific_config_sha256")
+        != config.identity_sha256
+    ):
+        raise ValueError(
+            "native capture semantic-witness configuration hash changed"
+        )
+    return config.retrieval_score_eligibility_policy
+
+
+def _validate_semantic_source(
+    value: Mapping[str, Any],
+    *,
+    score_eligibility_policy: str,
+) -> tuple[list[dict[str, Any]], int]:
+    if score_eligibility_policy != "all_finite_including_zero_v1":
+        raise ValueError(
+            "cumulative semantic adapter does not implement the configured "
+            "retrieval score-eligibility policy"
+        )
     if set(value) != set(_SEMANTIC_SOURCE_FIELDS):
         raise ValueError("semantic full-scope evidence is not a closed schema")
     if (
@@ -458,9 +494,10 @@ def _validate_semantic_source(value: Mapping[str, Any]) -> tuple[list[dict[str, 
                 or not score["concept"].strip()
                 or isinstance(numeric, bool)
                 or not math.isfinite(float(numeric))
-                or float(numeric) == 0.0
             ):
-                raise ValueError("semantic contrastive term is empty or lossy")
+                raise ValueError(
+                    "semantic contrastive term is empty or non-finite"
+                )
         member_count += len(scores)
         contrasts.append(contrast)
     if not contrasts or member_count < 1:
@@ -472,12 +509,18 @@ def _payloads_from_capture(
     capture_dir: Path,
     *,
     request: CumulativeSpentStage1FamilyRequest,
+    metadata: Mapping[str, Any],
 ) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
     source, _file_sha = _read_stable_json(
         capture_dir / "semantic_full_scope_evidence.json",
         field_name="semantic full-scope evidence",
     )
-    all_contrasts, _all_member_count = _validate_semantic_source(source)
+    all_contrasts, _all_member_count = _validate_semantic_source(
+        source,
+        score_eligibility_policy=_semantic_score_eligibility_policy(
+            metadata
+        ),
+    )
     expected_families = _WHOLE_CONTRAST_FAMILIES | _CLUSTER_CONTRAST_FAMILIES
     observed_families = {str(row["contrast_family"]) for row in all_contrasts}
     if not observed_families <= expected_families:
@@ -762,6 +805,7 @@ def emit_cumulative_spent_embedding_capture(
     payloads, counts = _payloads_from_capture(
         capture_sink.artifact_dir,
         request=request,
+        metadata=metadata,
     )
     configuration = _capture_configuration(metadata)
     record_root.mkdir(parents=True, exist_ok=False)
@@ -887,7 +931,11 @@ def validate_cumulative_spent_embedding_family_artifact(
         expected_heldout_row_ids=(replay_canary.alias_row_id,),
     )
     policy = _validate_policy(metadata.get("tfidf_training_scope_policy"), request=request)
-    payloads, counts = _payloads_from_capture(capture_dir, request=request)
+    payloads, counts = _payloads_from_capture(
+        capture_dir,
+        request=request,
+        metadata=metadata,
+    )
     regenerated_payload = payloads[request.family]
     regenerated_count = counts[request.family]
     if (
@@ -1034,7 +1082,11 @@ class NativeCumulativeSpentEmbeddingFamilyProducer:
         if _validate_identity(self._identity, family=self.family) != expected_identity:
             raise RuntimeError("cumulative embedding identity differs from native config")
         policy = _validate_policy(metadata.get("tfidf_training_scope_policy"), request=request)
-        payloads, counts = _payloads_from_capture(capture_dir, request=request)
+        payloads, counts = _payloads_from_capture(
+            capture_dir,
+            request=request,
+            metadata=metadata,
+        )
         if (
             payloads[self.family] != dict(self._evidence_payload)
             or counts[self.family] != self._evidence_item_count

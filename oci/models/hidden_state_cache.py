@@ -37,8 +37,13 @@ import numpy as np
 import torch
 
 from .gpu_hidden_state_store import _get_hidden_size, _get_model_dtype, _make_downprojection
+from .lossless_tokenization import (
+    require_nonbinding_chunk_capacity,
+    tokenize_losslessly,
+)
 
 logger = logging.getLogger(__name__)
+_TOKENIZATION_POLICY_VERSION = "lossless_nonbinding_limits_v1"
 
 
 def _sanitize_hidden_states(hidden_states: torch.Tensor, context: str = "") -> torch.Tensor:
@@ -144,6 +149,8 @@ class HiddenStateCache:
                 "Cannot use both random_projection_dim and downprojection_dim. "
                 "Use one or the other for dimensionality reduction."
             )
+        if isinstance(max_length, bool) or not isinstance(max_length, int) or max_length < 1:
+            raise ValueError("max_length must be a positive integer")
         self._cache_dir = Path(cache_dir)
         self._model_name = model_name
         self._max_length = max_length
@@ -184,7 +191,10 @@ class HiddenStateCache:
         max_chunks: Optional[int] = None,
     ) -> str:
         """Compute deterministic hash for cache identification."""
-        key = f"{model_name}|{max_length}|{os.path.abspath(dataset_path)}"
+        key = (
+            f"{model_name}|{max_length}|{os.path.abspath(dataset_path)}"
+            f"|tokenization_policy={_TOKENIZATION_POLICY_VERSION}"
+        )
         if random_projection_dim is not None:
             key += f"|rp{random_projection_dim}"
         if downprojection_dim is not None:
@@ -301,6 +311,13 @@ class HiddenStateCache:
 
             if self._metadata.get('cache_hash') != self._cache_hash:
                 logger.warning("Cache hash mismatch")
+                return False
+            if (
+                self._metadata.get('tokenization_policy_version')
+                != _TOKENIZATION_POLICY_VERSION
+                or self._metadata.get('semantic_truncation_allowed') is not False
+            ):
+                logger.warning("Cache predates fail-closed lossless tokenization")
                 return False
 
             # Verify offsets
@@ -451,10 +468,11 @@ class HiddenStateCache:
         sequence_lengths = []
         for i in range(0, num_samples, batch_size * 4):
             batch_texts = texts[i:i + batch_size * 4]
-            encodings = tokenizer(
+            encodings = tokenize_losslessly(
+                tokenizer,
                 batch_texts,
-                truncation=True,
-                max_length=self._max_length,
+                configured_max_length=self._max_length,
+                context="HiddenStateCache precompute",
                 padding=False,
                 return_length=True,
             )
@@ -553,11 +571,12 @@ class HiddenStateCache:
             batch_lengths = sequence_lengths[i:batch_end]
             batch_max_len = max(batch_lengths)
 
-            encoding = tokenizer(
+            encoding = tokenize_losslessly(
+                tokenizer,
                 batch_texts,
+                configured_max_length=batch_max_len,
+                context="HiddenStateCache precompute batch",
                 padding='max_length',
-                truncation=True,
-                max_length=batch_max_len,
                 return_tensors="pt",
             )
 
@@ -619,6 +638,8 @@ class HiddenStateCache:
             'storage_format': 'variable_length',
             'dataset_path': os.path.abspath(self._dataset_path),
             'cache_hash': self._cache_hash,
+            'tokenization_policy_version': _TOKENIZATION_POLICY_VERSION,
+            'semantic_truncation_allowed': False,
             'created_at': datetime.now().isoformat(),
             'dtype': 'float16',
         }
@@ -679,7 +700,6 @@ class HiddenStateCache:
             raise ValueError("chunk_size, chunk_overlap, max_chunks must be set for chunked precompute")
 
         num_samples = len(texts)
-        max_total_tokens = chunk_size * max_chunks
         logger.info(f"Pre-computing chunked hidden states for {num_samples} texts...")
         logger.info(f"  Model: {self._model_name}")
         logger.info(f"  Chunk: size={chunk_size}, overlap={chunk_overlap}, max={max_chunks}")
@@ -706,11 +726,21 @@ class HiddenStateCache:
         chunk_counts = []
         for i in range(0, num_samples, batch_size * 4):
             batch_texts = texts[i:i + batch_size * 4]
-            encodings = tokenizer(
-                batch_texts, truncation=True, max_length=max_total_tokens,
+            encodings = tokenize_losslessly(
+                tokenizer,
+                batch_texts,
+                configured_max_length=None,
+                context="HiddenStateCache chunked precompute",
                 padding=False,
             )
             for token_ids in encodings['input_ids']:
+                require_nonbinding_chunk_capacity(
+                    len(token_ids),
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    max_chunks=max_chunks,
+                    context="HiddenStateCache chunked document",
+                )
                 chunks = chunk_token_ids(token_ids, chunk_size, chunk_overlap, max_chunks)
                 all_sample_chunks.append(chunks)
                 chunk_counts.append(len(chunks))
@@ -854,6 +884,8 @@ class HiddenStateCache:
             'actual_max_len': max(n * chunk_size for n in chunk_counts),
             'dataset_path': os.path.abspath(self._dataset_path),
             'cache_hash': self._cache_hash,
+            'tokenization_policy_version': _TOKENIZATION_POLICY_VERSION,
+            'semantic_truncation_allowed': False,
             'created_at': datetime.now().isoformat(),
             'dtype': 'float16',
         }
@@ -901,7 +933,6 @@ class HiddenStateCache:
 
         num_samples = len(texts)
         num_devices = len(devices)
-        max_total_tokens = chunk_size * max_chunks
         logger.info(f"Pre-computing chunked hidden states for {num_samples} texts "
                      f"across {num_devices} GPUs...")
         logger.info(f"  Chunk: size={chunk_size}, overlap={chunk_overlap}, max={max_chunks}")
@@ -926,10 +957,21 @@ class HiddenStateCache:
         chunk_counts = []
         for i in range(0, num_samples, batch_size * 4):
             batch_texts = texts[i:i + batch_size * 4]
-            encodings = tokenizer(
-                batch_texts, truncation=True, max_length=max_total_tokens, padding=False,
+            encodings = tokenize_losslessly(
+                tokenizer,
+                batch_texts,
+                configured_max_length=None,
+                context="HiddenStateCache multi-GPU chunked precompute",
+                padding=False,
             )
             for token_ids in encodings['input_ids']:
+                require_nonbinding_chunk_capacity(
+                    len(token_ids),
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    max_chunks=max_chunks,
+                    context="HiddenStateCache multi-GPU chunked document",
+                )
                 chunks = chunk_token_ids(token_ids, chunk_size, chunk_overlap, max_chunks)
                 all_sample_chunks.append(chunks)
                 chunk_counts.append(len(chunks))
@@ -1090,6 +1132,8 @@ class HiddenStateCache:
             'actual_max_len': max(n * chunk_size for n in chunk_counts),
             'dataset_path': os.path.abspath(self._dataset_path),
             'cache_hash': self._cache_hash,
+            'tokenization_policy_version': _TOKENIZATION_POLICY_VERSION,
+            'semantic_truncation_allowed': False,
             'created_at': datetime.now().isoformat(),
             'dtype': 'float16',
             'num_gpus_used': len(shards),
@@ -1161,10 +1205,11 @@ class HiddenStateCache:
         sequence_lengths = []
         for i in range(0, num_samples, batch_size * 4):
             batch_texts = texts[i:i + batch_size * 4]
-            encodings = tokenizer(
+            encodings = tokenize_losslessly(
+                tokenizer,
                 batch_texts,
-                truncation=True,
-                max_length=self._max_length,
+                configured_max_length=self._max_length,
+                context="HiddenStateCache multi-GPU precompute",
                 padding=False,
                 return_length=True,
             )
@@ -1300,11 +1345,12 @@ class HiddenStateCache:
                 batch_lengths = shard_lengths[i:batch_end]
                 batch_max_len = max(batch_lengths)
 
-                encoding = tok(
+                encoding = tokenize_losslessly(
+                    tok,
                     batch_texts,
+                    configured_max_length=batch_max_len,
+                    context="HiddenStateCache multi-GPU precompute batch",
                     padding='max_length',
-                    truncation=True,
-                    max_length=batch_max_len,
                     return_tensors="pt",
                 )
                 input_ids = encoding['input_ids'].to(device)
@@ -1382,6 +1428,8 @@ class HiddenStateCache:
             'storage_format': 'variable_length',
             'dataset_path': os.path.abspath(self._dataset_path),
             'cache_hash': self._cache_hash,
+            'tokenization_policy_version': _TOKENIZATION_POLICY_VERSION,
+            'semantic_truncation_allowed': False,
             'created_at': datetime.now().isoformat(),
             'dtype': 'float16',
             'num_gpus_used': len(shards),

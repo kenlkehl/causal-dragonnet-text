@@ -8,6 +8,7 @@ import pytest
 from oci.inference.all_evidence_discovery_interfaces import (
     ACTIVE_STAGE1_CONCEPT_FAMILIES,
     BOW_NUISANCE,
+    BOW_R_LOSS,
     HTR_NEURAL,
     MATCHED_PAIR_UPLIFT,
     NEURAL_QUERY_MOMENTS,
@@ -155,10 +156,12 @@ def _tfidf_payload() -> dict:
         ("effect", "hemoglobin level"),
     ):
         banks[bank] = {
+            "terms_per_topic": 2,
             "topics": [
                 {
                     "topic_id": f"{bank}_topic_001",
                     "bank": bank,
+                    "terms_per_topic": 2,
                     "terms": [
                         {
                             "term": term,
@@ -260,7 +263,7 @@ def _inputs(*, reverse: bool = False) -> list[FoldEvidenceInput]:
 
 
 def _current_spent_provider_identity() -> dict:
-    provider_code_sha256 = "de11740a862c13d59d340e1dba26fb1202820dec4a0055c49819b7e01eccc1f1"
+    provider_code_sha256 = "6978aa0419a89a0b74a7c187ef1580bfc857ace49159726d2681fc1f0a2d5916"
     return {
         "provider": "context_fit_review_spent_evidence_provider_v3",
         "provider_code_sha256": provider_code_sha256,
@@ -357,6 +360,65 @@ def test_catalog_covers_every_active_architecture_without_role_first_fields():
     )
 
 
+def test_catalog_accepts_authenticated_configured_bow_view_names_without_source_allowlist():
+    inputs = _inputs()
+    legacy = inputs[0].payload["context"]["evidence_digest"]
+    nuisance = legacy["confounders"]["bow_blurbs"][0]
+    nuisance["view_name"] = "deployment_specific_word_view"
+    nuisance["source"] = "deployment_specific_word_view.treatment_positive"
+    r_loss = legacy["effect_modifiers"]["bow_blurbs"][0]
+    r_loss["view_name"] = "deployment_specific_word_view"
+    r_loss["source"] = "deployment_specific_word_view.pseudo_target_positive"
+    pair = legacy["effect_modifiers"]["bow_blurbs"][1]
+    pair["view_name"] = "pair_uplift__deployment_specific_word_view"
+    pair["source"] = (
+        "matched_pair_uplift."
+        "pair_uplift__deployment_specific_word_view.uplift_pair_features"
+    )
+
+    catalog = build_role_neutral_evidence_catalog(inputs)
+
+    assert catalog.family_atoms(BOW_NUISANCE)
+    assert catalog.family_atoms(BOW_R_LOSS)
+    assert catalog.family_atoms(MATCHED_PAIR_UPLIFT)
+    configured_views = {
+        atom.content["group"]["view_name"]
+        for family in (BOW_NUISANCE, BOW_R_LOSS, MATCHED_PAIR_UPLIFT)
+        for atom in catalog.family_atoms(family)
+        if atom.content.get("architecture_encoder") == "bow"
+    }
+    assert configured_views == {
+        "deployment_specific_word_view",
+        "pair_uplift__deployment_specific_word_view",
+    }
+
+
+def test_catalog_preserves_complete_long_concept_phrase_without_hidden_cap():
+    inputs = _inputs()
+    long_phrase = " ".join(f"semantic_marker_{index:02d}" for index in range(40))
+    assert len(long_phrase) > 160
+    assert len(long_phrase.split()) > 12
+    inputs[0].payload["context"]["evidence_digest"]["confounders"]["bow_blurbs"][0][
+        "rows"
+    ][0]["feature"] = long_phrase
+
+    catalog = build_role_neutral_evidence_catalog(inputs)
+
+    assert any(
+        long_phrase in str(atom.content)
+        for atom in catalog.family_atoms(BOW_NUISANCE)
+    )
+    plan = build_complete_architecture_chunks(
+        catalog,
+        max_atoms_per_chunk=2,
+        max_bytes_per_chunk=96_000,
+        max_semantic_member_ids_per_chunk=3,
+    )
+    assert audit_complete_architecture_delivery(catalog, plan)[
+        "all_catalog_semantic_member_ids_delivered_exactly_once"
+    ]
+
+
 def _cumulative_family_payloads(catalog):
     return {
         family: family_payload_from_catalog(catalog, family=family)[0]
@@ -371,7 +433,12 @@ def _cumulative_family_artifact_hashes():
     }
 
 
-def _assemble_cumulative_catalog(payloads, *, artifact_hashes=None):
+def _assemble_cumulative_catalog(
+    payloads,
+    *,
+    artifact_hashes=None,
+    semantic_member_batch_size=3,
+):
     return assemble_cumulative_spent_role_neutral_catalog(
         family_payload_by_family=payloads,
         family_artifact_sha256_by_family=(
@@ -382,6 +449,7 @@ def _assemble_cumulative_catalog(payloads, *, artifact_hashes=None):
         outer_fold=1,
         provider_inner_fold=1,
         split_fingerprint=_provenance().split_fingerprint,
+        semantic_member_batch_size=semantic_member_batch_size,
     )
 
 
@@ -483,23 +551,137 @@ def test_cumulative_ten_payload_assembler_rejects_a_missing_semantic_member_batc
         _assemble_cumulative_catalog(payloads)
 
 
-def test_empty_adapter_records_cannot_satisfy_strict_architecture_completeness():
+def test_configured_semantic_batching_above_three_is_lossless_and_identity_bound():
+    inputs = _inputs()
+    nuisance_rows = inputs[0].payload["context"]["evidence_digest"]["confounders"][
+        "bow_blurbs"
+    ][0]["rows"]
+    nuisance_rows.extend(
+        {
+            "feature": f"configured baseline concept {index}",
+            "score": float(index) / 10.0,
+        }
+        for index in range(6)
+    )
+    source = build_role_neutral_evidence_catalog(
+        inputs,
+        semantic_member_batch_size=4,
+    )
+    payloads = _cumulative_family_payloads(source)
+    assembled_four = _assemble_cumulative_catalog(
+        payloads,
+        semantic_member_batch_size=4,
+    )
+    assembled_five = _assemble_cumulative_catalog(
+        payloads,
+        semantic_member_batch_size=5,
+    )
+
+    nuisance = payloads[BOW_NUISANCE]["architecture_evidence"]
+    assert max(
+        len(item["content"]["terms"])
+        for item in nuisance
+    ) == 4
+    assert (
+        assembled_four.audit["semantic_member_count_by_family"]
+        == source.audit["semantic_member_count_by_family"]
+    )
+    assert assembled_four.catalog_sha256 != assembled_five.catalog_sha256
+    assert (
+        assembled_four.audit["semantic_member_batching"][
+            "semantic_member_batch_size"
+        ]
+        == 4
+    )
+    with pytest.raises(
+        ValueError,
+        match="semantic-member batch is invalid",
+    ):
+        _assemble_cumulative_catalog(
+            payloads,
+            semantic_member_batch_size=3,
+        )
+
+
+def test_partial_configured_topic_evidence_always_fails_closed():
     inputs = _inputs()
     tfidf = next(row for row in inputs if row.source_kind == TFIDF_TOPIC_SOURCE)
     for bank in tfidf.payload["discovery"]["topic_banks"].values():
         for topic in bank["topics"]:
             topic["terms"] = []
 
-    relaxed = build_role_neutral_evidence_catalog(
-        inputs,
-        require_all_architecture_families=False,
-    )
-    assert not relaxed.family_atoms(TFIDF_TOPICS)
-    assert all(atom.member_ids for atom in relaxed.atoms)
-    assert relaxed.audit["semantic_member_count_by_family"][TFIDF_TOPICS] == 0
+    with pytest.raises(ValueError, match="complete configured capacity"):
+        build_role_neutral_evidence_catalog(
+            inputs,
+            require_all_architecture_families=False,
+        )
 
-    with pytest.raises(ValueError, match="tfidf_topics"):
+    with pytest.raises(ValueError, match="complete configured capacity"):
         build_role_neutral_evidence_catalog(inputs)
+
+
+def test_nondefault_topic_capacity_is_paged_without_omission():
+    inputs = _inputs()
+    tfidf = next(row for row in inputs if row.source_kind == TFIDF_TOPIC_SOURCE)
+    expected: set[str] = set()
+    for bank_name, bank in tfidf.payload["discovery"]["topic_banks"].items():
+        bank["terms_per_topic"] = 7
+        topic = bank["topics"][0]
+        topic["terms_per_topic"] = 7
+        topic["terms"] = [
+            {
+                "term": f"{bank_name} configured evidence term {index}",
+                "loading": 1.0 / (index + 1),
+                "screen_rank": index + 1,
+                "signed_score": float(index - 3),
+            }
+            for index in range(7)
+        ]
+        expected.update(row["term"] for row in topic["terms"])
+
+    catalog = build_role_neutral_evidence_catalog(inputs)
+    atoms = catalog.family_atoms(TFIDF_TOPICS)
+    observed = {
+        row["term"]
+        for atom in atoms
+        for row in atom.content["terms"]
+    }
+
+    assert observed == expected
+    assert len(atoms) == 9
+    assert all(atom.content["full_member_count"] == 7 for atom in atoms)
+
+
+def test_tfidf_selection_accounting_fields_are_accepted_without_term_loss():
+    inputs = _inputs()
+    tfidf = next(row for row in inputs if row.source_kind == TFIDF_TOPIC_SOURCE)
+    for bank in tfidf.payload["discovery"]["topic_banks"].values():
+        bank.update(
+            {
+                "eligible_candidate_count": 11,
+                "selected_candidate_count": 2,
+                "discarded_candidate_count": 9,
+                "selection_rule": (
+                    "eligible_combined_importance_then_configured_top_fraction"
+                ),
+            }
+        )
+
+    catalog = build_role_neutral_evidence_catalog(inputs)
+
+    assert len(catalog.family_atoms(TFIDF_TOPICS)) == 3
+    assert {
+        row["term"]
+        for atom in catalog.family_atoms(TFIDF_TOPICS)
+        for row in atom.content["terms"]
+    } == {
+        "smoking history",
+        "smoking history secondary",
+        "performance status",
+        "performance status secondary",
+        "hemoglobin level",
+        "hemoglobin level secondary",
+    }
 
 
 def _walk_key_values(value):

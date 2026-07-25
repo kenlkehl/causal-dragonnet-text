@@ -18,6 +18,7 @@ from oci.config import (
     ExplicitFeatureSpec,
     ModelArchitectureConfig,
     MultiModelForestConfig,
+    TfidfNuisanceStackScientificConfig,
     TfidfTopicDiscoveryConfig,
     BoWViewConfig,
     normalize_tfidf_topic_feature_discovery_methods,
@@ -60,6 +61,7 @@ from oci.inference.tfidf_topic_discovery import (
     fit_cross_fitted_nuisance_stack,
     unsigned_linear_screen,
 )
+from oci.inference.tfidf_safe_artifacts import load_named_array_bank
 from oci.inference.tfidf_topic_score_selection import (
     benjamini_hochberg,
     build_fit_side_orphan_ngram_clusters,
@@ -131,7 +133,20 @@ def test_unsigned_screen_keeps_equal_positive_and_negative_coefficients():
         )
     )
     y = np.tile([0.0, 1.0], 80)
-    result = unsigned_linear_screen(x, ["positive", "negative", "zero"], y, binary=True)
+    result = unsigned_linear_screen(
+        x,
+        ["positive", "negative", "zero"],
+        y,
+        binary=True,
+        view=BoWViewConfig(
+            name="linear_1_3",
+            min_df=1,
+            max_df=1.0,
+            ngram_range_min=1,
+            ngram_range_max=3,
+        ),
+        random_state=42,
+    )
     by_name = result.set_index("feature")
     assert by_name.loc["positive", "signed_score"] > 0
     assert by_name.loc["negative", "signed_score"] < 0
@@ -919,7 +934,12 @@ def test_consensus_nmf_reduces_components_for_small_context():
         matrix=matrix,
         feature_names=names,
         scores=scores,
-        config=TfidfTopicDiscoveryConfig(min_df=1, topic_count=100, stability_repeats=0),
+        config=TfidfTopicDiscoveryConfig(
+            min_df=1,
+            topic_count=100,
+            terms_per_topic=6,
+            stability_repeats=0,
+        ),
     )
     assert bank.actual_components == 3
     assert bank.reduction_reason
@@ -928,6 +948,7 @@ def test_consensus_nmf_reduces_components_for_small_context():
 def test_topic_prompt_has_exact_terms_traceability_and_no_forbidden_language():
     topic = {
         "topic_id": "effect_topic_001",
+        "terms_per_topic": 15,
         "terms": [
             {"term": f"term {index}", "loading": 1 / (index + 1), "screen_rank": index + 1,
              "signed_score": (-1) ** index}
@@ -940,6 +961,7 @@ def test_topic_prompt_has_exact_terms_traceability_and_no_forbidden_language():
         inner_fold=None,
         bank="effect",
         topic=topic,
+        terms_per_topic=15,
         score_test_evidence={
             "source": "fixed_inner_score_test_policy_mapping",
             "uses_outer_heldout_labels": False,
@@ -964,6 +986,43 @@ def test_topic_prompt_has_exact_terms_traceability_and_no_forbidden_language():
     assert "fixed_inner_score_test_policy_mapping" in prompt
     assert "causal" not in prompt.lower()
     assert "administrative" in prompt.lower()
+
+
+def test_topic_term_evidence_capacity_is_configured_and_not_sliced():
+    configured_capacity = 7
+    topic = {
+        "topic_id": "effect_topic_configured_capacity",
+        "terms_per_topic": configured_capacity,
+        "terms": [
+            {
+                "term": f"configured term {index}",
+                "loading": 1.0 / (index + 1),
+                "screen_rank": index + 1,
+                "signed_score": float(index),
+            }
+            for index in range(configured_capacity)
+        ],
+    }
+    context = build_topic_label_context(
+        outer_fold=1,
+        scope="candidate_selection_inner_fit",
+        inner_fold=1,
+        bank="effect",
+        topic=topic,
+        terms_per_topic=configured_capacity,
+    )
+    prompt = render_topic_label_prompt(context)
+
+    assert context["terms_per_topic"] == configured_capacity
+    assert len(context["topic_terms"]) == configured_capacity
+    assert "configured term 6" in prompt
+    with pytest.raises(ValueError, match="complete configured term set"):
+        render_topic_label_prompt(
+            {
+                **context,
+                "topic_terms": context["topic_terms"][:-1],
+            }
+        )
 
 
 def test_orphan_ngram_prompt_is_bounded_traceable_and_not_a_topic_padding_hack():
@@ -2060,6 +2119,7 @@ def test_nested_nuisance_prediction_provenance_excludes_each_row():
         folds=3,
         binary=True,
         random_state=9,
+        nuisance_stack_config=TfidfNuisanceStackScientificConfig(),
     )
     assert np.isfinite(result["stacked_oof"]).all()
     for row_index, fit_positions in enumerate(result["fit_positions_by_row"]):
@@ -2512,10 +2572,16 @@ def test_heldout_phrase_and_labels_cannot_change_fitted_topic_artifacts(tmp_path
     assert "outersecretphrase" not in set(first["common_vocabulary"])
     assert first["common_vocabulary"] == second["common_vocabulary"]
     assert first["topic_banks"] == second["topic_banks"]
-    first_topics = np.load(first["artifacts"]["fit_topic_values"])
-    second_topics = np.load(second["artifacts"]["fit_topic_values"])
-    assert set(first_topics.files) == set(second_topics.files)
-    for bank in first_topics.files:
+    first_topics = load_named_array_bank(
+        first["artifacts"]["fit_topic_values"],
+        expected_row_count=len(fit_rows),
+    )
+    second_topics = load_named_array_bank(
+        second["artifacts"]["fit_topic_values"],
+        expected_row_count=len(fit_rows),
+    )
+    assert set(first_topics) == set(second_topics)
+    for bank in first_topics:
         np.testing.assert_allclose(first_topics[bank], second_topics[bank])
     prompt_text = json.dumps(first["topic_banks"])
     assert "outersecret" not in prompt_text

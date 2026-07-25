@@ -18,12 +18,14 @@ import torch
 
 from .concept_embedding_utils import chunk_text_words, split_text_to_token_chunks
 from .hidden_state_cache import VariableLengthArray, VariableLengthMaskArray
+from .lossless_tokenization import SemanticTruncationError
 
 
 logger = logging.getLogger(__name__)
 
 _SENTENCE_TRANSFORMER_CACHE = {}
 _CHUNK_TEXTS_FILENAME = "chunk_texts.jsonl"
+_CHUNKING_POLICY_VERSION = "word_then_token_bound_lossless_v2"
 
 
 def _is_cuda_oom(exc: BaseException) -> bool:
@@ -163,14 +165,14 @@ def _get_sentence_transformer_tokenizer(encoder):
 
 
 def _effective_max_seq_length(encoder, requested_max_seq_length: Optional[int]):
-    if requested_max_seq_length is None:
-        return None
-    requested = int(requested_max_seq_length)
     current = getattr(encoder, "max_seq_length", None)
     try:
         current_int = int(current) if current is not None else None
     except (TypeError, ValueError):
         current_int = None
+    if requested_max_seq_length is None:
+        return current_int if current_int is not None and current_int > 0 else None
+    requested = int(requested_max_seq_length)
     if current_int is not None and current_int > 0:
         return min(requested, current_int)
     return requested
@@ -246,7 +248,7 @@ class ConceptEmbeddingCache:
                 f"select{str(chunk_selection).strip().lower()}",
                 "tokmax"
                 f"{int(max_seq_length) if max_seq_length is not None else 'model'}",
-                "chunker_word_then_token_bound_v1",
+                _CHUNKING_POLICY_VERSION,
             ]
         )
         return hashlib.md5(key.encode()).hexdigest()[:12]
@@ -325,6 +327,12 @@ class ConceptEmbeddingCache:
                 return False
             if self._metadata.get("storage_format") != "variable_length_chunks":
                 return False
+            if (
+                self._metadata.get("chunking_policy_version")
+                != _CHUNKING_POLICY_VERSION
+                or self._metadata.get("semantic_truncation_allowed") is not False
+            ):
+                return False
 
             offsets = np.load(str(offsets_path))
             if len(offsets) != expected_num_samples + 1:
@@ -400,10 +408,12 @@ class ConceptEmbeddingCache:
                     )
                 )
             if len(split_chunks) > self._max_chunks:
-                if self._chunk_selection == "first":
-                    split_chunks = split_chunks[: self._max_chunks]
-                else:
-                    split_chunks = split_chunks[-self._max_chunks :]
+                raise SemanticTruncationError(
+                    "ConceptEmbeddingCache token-bounded chunk plan exceeds "
+                    "configured max_chunks; semantic truncation is forbidden "
+                    f"({len(split_chunks)} > {self._max_chunks}). Increase "
+                    "max_chunks so the cap is nonbinding."
+                )
             token_bounded_chunks.append(split_chunks or [""])
         return token_bounded_chunks
 
@@ -432,9 +442,9 @@ class ConceptEmbeddingCache:
             self._max_seq_length,
         )
         if effective_max_seq_length is not None and tokenizer is None:
-            logger.warning(
-                "No tokenizer found on sentence-transformer; embedding chunks "
-                "will remain whitespace-word chunks and rely on encoder truncation"
+            raise RuntimeError(
+                "Sentence-transformer exposes a finite sequence limit but no "
+                "auditable tokenizer; refusing possible semantic truncation"
             )
         sample_chunks = self._chunk_texts(
             texts,
@@ -553,6 +563,8 @@ class ConceptEmbeddingCache:
             "storage_format": "variable_length_chunks",
             "dataset_path": os.path.abspath(self._dataset_path),
             "cache_hash": self._cache_hash,
+            "chunking_policy_version": _CHUNKING_POLICY_VERSION,
+            "semantic_truncation_allowed": False,
             "created_at": datetime.now().isoformat(),
             "dtype": "float16",
             "precompute_batch_size": effective_batch_size,
@@ -611,9 +623,9 @@ class ConceptEmbeddingCache:
             self._max_seq_length,
         )
         if effective_max_seq_length is not None and tokenizer is None:
-            logger.warning(
-                "No tokenizer found on sentence-transformer; embedding chunks "
-                "will remain whitespace-word chunks and rely on encoder truncation"
+            raise RuntimeError(
+                "Sentence-transformer exposes a finite sequence limit but no "
+                "auditable tokenizer; refusing possible semantic truncation"
             )
         sample_chunks = self._chunk_texts(
             texts,
@@ -796,6 +808,8 @@ class ConceptEmbeddingCache:
             "storage_format": "variable_length_chunks",
             "dataset_path": os.path.abspath(self._dataset_path),
             "cache_hash": self._cache_hash,
+            "chunking_policy_version": _CHUNKING_POLICY_VERSION,
+            "semantic_truncation_allowed": False,
             "created_at": datetime.now().isoformat(),
             "dtype": "float16",
             "precompute_batch_size": max(final_batch_sizes)

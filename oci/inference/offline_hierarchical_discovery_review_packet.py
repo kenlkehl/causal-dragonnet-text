@@ -67,8 +67,6 @@ from .hierarchical_all_architecture_discovery import (
     DISCOVERY_JOB_LEDGER_VERSION,
     EXTRACTION_DEFINITION_JOB,
     INTERPRET_CHUNK_JOB,
-    MAX_RENDERED_DISCOVERY_PROMPT_BYTES,
-    SELECTOR_THINKING_TOKEN_BUDGET,
     DiscoveryJsonJob,
     DiscoveryJobSettings,
     _render_extraction_messages,
@@ -283,6 +281,8 @@ _ADAPTIVE_RECONSIDERATION_CONFIG_KEYS = frozenset(
         "max_total_lookback_bytes",
         "max_operations",
         "max_rendered_prompt_bytes",
+        "selector_thinking_token_budget",
+        "hierarchy_wire_budget",
     }
 )
 _ADAPTIVE_PHASE_POLICY_KEYS = frozenset(
@@ -659,6 +659,7 @@ def _validate_adaptive_prompt_stage(
     label: str,
     expected_stage: str | None = None,
     phased: bool = False,
+    expected_selector_thinking_token_budget: int,
 ) -> dict[str, Any]:
     stage = dict(_clone(_mapping(value, label=label)))
     expected_keys = _ADAPTIVE_PHASED_PROMPT_STAGE_KEYS if phased else _ADAPTIVE_PROMPT_STAGE_KEYS
@@ -700,6 +701,10 @@ def _validate_adaptive_prompt_stage(
     if user_payload_keys[0] != "job" or user_payload_keys[-1] != "output_schema":
         raise ValueError(
             "adaptive prompt stage user payload must begin with job and end with output_schema"
+        )
+    if "hierarchy_wire_budget" not in user_payload_keys:
+        raise ValueError(
+            "adaptive prompt stage omits its authenticated hierarchy wire budget"
         )
     dynamic_shapes = _mapping(
         stage["dynamic_payload_shapes"],
@@ -753,6 +758,10 @@ def _validate_adaptive_prompt_stage(
         raise ValueError(
             "adaptive prompt stage dynamic paths escape its authenticated user payload"
         )
+    if "hierarchy_wire_budget" not in top_level_dynamic_keys:
+        raise ValueError(
+            "adaptive prompt stage does not authenticate its hierarchy wire budget path"
+        )
     output_schema = _mapping(stage["output_schema"], label=f"{label} output schema")
     if not output_schema:
         raise ValueError("adaptive prompt stage output schema cannot be empty")
@@ -771,13 +780,20 @@ def _validate_adaptive_prompt_stage(
         if settings["thinking_enabled"] is not False or settings["thinking_token_budget"] != 0:
             raise ValueError("adaptive extraction-definition reasoning must be disabled")
     elif settings["thinking_enabled"] is not True or (
-        settings["thinking_token_budget"] != SELECTOR_THINKING_TOKEN_BUDGET
+        settings["thinking_token_budget"]
+        != expected_selector_thinking_token_budget
     ):
-        raise ValueError("adaptive selector reasoning must use exactly 5000 tokens")
+        raise ValueError(
+            "adaptive selector reasoning differs from its authenticated config"
+        )
     return stage
 
 
-def _validate_adaptive_prompt_contract(value: Any) -> dict[str, Any]:
+def _validate_adaptive_prompt_contract(
+    value: Any,
+    *,
+    expected_selector_thinking_token_budget: int,
+) -> dict[str, Any]:
     """Authenticate the exact static authorization envelope for later calls."""
 
     contract = dict(_clone(_mapping(value, label="adaptive prompt contract")))
@@ -802,6 +818,9 @@ def _validate_adaptive_prompt_contract(value: Any) -> dict[str, Any]:
             stage_value,
             label=f"adaptive prompt stage[{index}]",
             expected_stage=expected_stage,
+            expected_selector_thinking_token_budget=(
+                expected_selector_thinking_token_budget
+            ),
         )
     phased_variants = contract["phased_stage_variants"]
     if not isinstance(phased_variants, list) or not phased_variants:
@@ -812,6 +831,9 @@ def _validate_adaptive_prompt_contract(value: Any) -> dict[str, Any]:
             stage_value,
             label=f"adaptive phased prompt stage[{index}]",
             phased=True,
+            expected_selector_thinking_token_budget=(
+                expected_selector_thinking_token_budget
+            ),
         )
         identity = (stage["stage"], stage["request_job"])
         if identity in seen_variants:
@@ -825,7 +847,13 @@ def _validate_adaptive_prompt_contract(value: Any) -> dict[str, Any]:
     ):
         if contract[flag] is not False:
             raise ValueError(f"adaptive prompt contract does not close forbidden behavior: {flag}")
-    if canonical_json(contract) != canonical_json(adaptive_hierarchical_stage1_prompt_contract()):
+    if canonical_json(contract) != canonical_json(
+        adaptive_hierarchical_stage1_prompt_contract(
+            selector_thinking_token_budget=(
+                expected_selector_thinking_token_budget
+            )
+        )
+    ):
         raise ValueError("adaptive prompt contract differs from current production templates")
     return contract
 
@@ -908,14 +936,21 @@ def _validate_phased_review_policy(value: Any) -> dict[str, Any]:
         != adaptive_identity["implementation_file_sha256"]
     ):
         raise ValueError("adaptive primary implementation differs from its dependency bundle")
-    _validate_adaptive_prompt_contract(adaptive_identity["prompt_contract"])
+    selector_thinking_token_budget = _positive_int(
+        config.get("selector_thinking_token_budget"),
+        label="adaptive selector_thinking_token_budget",
+    )
+    _validate_adaptive_prompt_contract(
+        adaptive_identity["prompt_contract"],
+        expected_selector_thinking_token_budget=selector_thinking_token_budget,
+    )
     phase_policy = _mapping(adaptive_identity["phase_policy"], label="adaptive review phase policy")
     if set(phase_policy) != _ADAPTIVE_PHASE_POLICY_KEYS or any(
         phase_policy[key] is not True for key in _ADAPTIVE_PHASE_POLICY_KEYS
     ):
         raise ValueError("adaptive review phase policy does not close every required boundary")
     try:
-        adaptive_config = AdaptiveReconsiderationConfig(**config)
+        adaptive_config = AdaptiveReconsiderationConfig.from_mapping(config)
     except (TypeError, ValueError) as exc:
         raise ValueError("adaptive review config is invalid") from exc
     current_identity = adaptive_hierarchical_stage1_reconsideration_identity(config=adaptive_config)
@@ -1127,7 +1162,15 @@ def _audit_model_visible_messages(messages: Sequence[Mapping[str, Any]]) -> set[
     return observed_keys
 
 
-def _validate_message_envelope(job: Mapping[str, Any]) -> dict[str, Any]:
+def _validate_message_envelope(
+    job: Mapping[str, Any],
+    *,
+    max_rendered_prompt_bytes: int,
+) -> dict[str, Any]:
+    configured_limit = _positive_int(
+        max_rendered_prompt_bytes,
+        label="max_rendered_prompt_bytes",
+    )
     messages = job.get("messages")
     if not isinstance(messages, list):
         raise TypeError("discovery job messages must be a JSON list")
@@ -1137,7 +1180,13 @@ def _validate_message_envelope(job: Mapping[str, Any]) -> dict[str, Any]:
         bindings.get(AUTHENTICATED_MESSAGE_ENVELOPE_BINDING),
         label="authenticated message envelope",
     )
-    required = {"schema_version", "serialization", "sha256", "byte_count", "max_byte_count"}
+    required = {
+        "schema_version",
+        "serialization",
+        "sha256",
+        "byte_count",
+        "byte_limit_binding",
+    }
     if set(envelope) != required:
         raise ValueError("authenticated message envelope has an unexpected closed schema")
     rendered = canonical_json(messages).encode("utf-8")
@@ -1147,18 +1196,20 @@ def _validate_message_envelope(job: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("message envelope SHA-256 differs from exact messages")
     if envelope["byte_count"] != len(rendered):
         raise ValueError("message envelope byte count differs from exact messages")
-    if envelope["max_byte_count"] != MAX_RENDERED_DISCOVERY_PROMPT_BYTES:
-        raise ValueError("message envelope changed the fixed context byte guard")
-    if len(rendered) > MAX_RENDERED_DISCOVERY_PROMPT_BYTES:
-        raise ValueError("reviewed model-facing prompt exceeds the fixed byte guard")
+    if envelope["byte_limit_binding"] != (
+        "content_addressed_orchestrator_runtime_config_v1"
+    ):
+        raise ValueError("message envelope changed its runtime byte-limit binding")
+    if len(rendered) > configured_limit:
+        raise ValueError("reviewed model-facing prompt exceeds its configured byte guard")
     return {
         "messages_sha256": envelope["sha256"],
         "rendered_message_array_byte_count": len(rendered),
-        "fixed_max_rendered_prompt_bytes": MAX_RENDERED_DISCOVERY_PROMPT_BYTES,
-        "headroom_bytes": MAX_RENDERED_DISCOVERY_PROMPT_BYTES - len(rendered),
+        "configured_max_rendered_prompt_bytes": configured_limit,
+        "headroom_bytes": configured_limit - len(rendered),
         "system_content_utf8_bytes": len(messages[0]["content"].encode("utf-8")),
         "user_content_utf8_bytes": len(messages[1]["content"].encode("utf-8")),
-        "within_fixed_guard": True,
+        "within_configured_guard": True,
         "model_visible_json_keys": sorted(visible_keys),
     }
 
@@ -1167,6 +1218,8 @@ def _validate_job_dict(
     value: Any,
     *,
     expected_kind: str | None = None,
+    expected_selector_thinking_token_budget: int,
+    max_rendered_prompt_bytes: int,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     job = dict(_clone(_mapping(value, label="discovery job")))
     required = {
@@ -1205,10 +1258,16 @@ def _validate_job_dict(
             raise ValueError("extraction-definition reasoning must be disabled")
     else:
         if settings["thinking_enabled"] is not True or (
-            settings["thinking_token_budget"] != SELECTOR_THINKING_TOKEN_BUDGET
+            settings["thinking_token_budget"]
+            != expected_selector_thinking_token_budget
         ):
-            raise ValueError("selector reasoning must use exactly 5000 tokens")
-    audit = _validate_message_envelope(job)
+            raise ValueError(
+                "selector reasoning differs from its authenticated hierarchy config"
+            )
+    audit = _validate_message_envelope(
+        job,
+        max_rendered_prompt_bytes=max_rendered_prompt_bytes,
+    )
     return job, audit
 
 
@@ -1346,6 +1405,14 @@ def _fold_jobs_and_bindings(
             raise ValueError("wrapper and hierarchy configuration identities differ")
         if wrapper_config.get("max_semantic_member_ids_per_chunk") != semantic_member_cap:
             raise ValueError("chunk plan and hierarchy config semantic-member bounds differ")
+        max_rendered_prompt_bytes = _positive_int(
+            wrapper_config.get("max_rendered_prompt_bytes"),
+            label="hierarchy max_rendered_prompt_bytes",
+        )
+        selector_thinking_token_budget = _positive_int(
+            wrapper_config.get("selector_thinking_token_budget"),
+            label="hierarchy selector_thinking_token_budget",
+        )
 
         seen_evidence_ids: set[str] = set()
         seen_semantic_member_ids: set[str] = set()
@@ -1356,7 +1423,14 @@ def _fold_jobs_and_bindings(
         family_sequence: list[str] = []
         validated_jobs: list[dict[str, Any]] = []
         for raw_job in jobs:
-            job, _ = _validate_job_dict(raw_job, expected_kind=INTERPRET_CHUNK_JOB)
+            job, _ = _validate_job_dict(
+                raw_job,
+                expected_kind=INTERPRET_CHUNK_JOB,
+                expected_selector_thinking_token_budget=(
+                    selector_thinking_token_budget
+                ),
+                max_rendered_prompt_bytes=max_rendered_prompt_bytes,
+            )
             if job["dependencies"]:
                 raise ValueError(
                     "initial architecture interpretation jobs cannot have dependencies"
@@ -1447,12 +1521,10 @@ def _fold_jobs_and_bindings(
         )
         if canonical_json(inner.get("runner_identity")) != canonical_json(runner_identity):
             raise ValueError("wrapper and hierarchy runner identities differ")
-        if wrapper_config.get("max_rendered_prompt_bytes") != (MAX_RENDERED_DISCOVERY_PROMPT_BYTES):
-            raise ValueError("hierarchy configuration changed the fixed prompt byte guard")
         if (
             wrapper_config.get("selector_thinking_enabled") is not True
             or wrapper_config.get("selector_thinking_token_budget")
-            != SELECTOR_THINKING_TOKEN_BUDGET
+            != selector_thinking_token_budget
         ):
             raise ValueError("hierarchy configuration changed selector reasoning")
         if wrapper_config.get("extraction_definition_thinking_enabled") is not False or (
@@ -1708,11 +1780,20 @@ def _validate_extraction_preview(
     job: DiscoveryJsonJob,
     *,
     evidence_catalog: Mapping[str, Mapping[str, Any]],
+    expected_selector_thinking_token_budget: int,
+    max_rendered_prompt_bytes: int,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if not isinstance(job, DiscoveryJsonJob):
         raise TypeError("extraction_definition_preview must be one DiscoveryJsonJob")
     job.__post_init__()
-    value, audit = _validate_job_dict(job.as_dict(), expected_kind=EXTRACTION_DEFINITION_JOB)
+    value, audit = _validate_job_dict(
+        job.as_dict(),
+        expected_kind=EXTRACTION_DEFINITION_JOB,
+        expected_selector_thinking_token_budget=(
+            expected_selector_thinking_token_budget
+        ),
+        max_rendered_prompt_bytes=max_rendered_prompt_bytes,
+    )
     bindings = _mapping(value["input_bindings"], label="extraction preview input_bindings")
     if bindings.get("offline_review_preview") is not True or (
         bindings.get("preview_not_valid_for_execution") is not True
@@ -2097,11 +2178,34 @@ def compose_offline_hierarchical_discovery_review_packet(
     representative = _representative_job(
         by_fold[representative_outer_fold], family=representative_family
     )
+    hierarchy_config_by_fold = {
+        row["outer_fold"]: _mapping(
+            row["hierarchy_config_identity"],
+            label=f"fold {row['outer_fold']} hierarchy config",
+        )
+        for row in fold_identities
+    }
+    representative_config = hierarchy_config_by_fold[representative_outer_fold]
     representative_payload = _message_payload(representative["messages"])
-    representative_audit = _validate_message_envelope(representative)
+    representative_audit = _validate_message_envelope(
+        representative,
+        max_rendered_prompt_bytes=_positive_int(
+            representative_config.get("max_rendered_prompt_bytes"),
+            label="representative max_rendered_prompt_bytes",
+        ),
+    )
+    extraction_config = hierarchy_config_by_fold[extraction_preview_outer_fold]
     extraction_job, extraction_audit = _validate_extraction_preview(
         extraction_definition_preview,
         evidence_catalog=_evidence_catalog_from_jobs(by_fold[extraction_preview_outer_fold]),
+        expected_selector_thinking_token_budget=_positive_int(
+            extraction_config.get("selector_thinking_token_budget"),
+            label="extraction preview selector_thinking_token_budget",
+        ),
+        max_rendered_prompt_bytes=_positive_int(
+            extraction_config.get("max_rendered_prompt_bytes"),
+            label="extraction preview max_rendered_prompt_bytes",
+        ),
     )
 
     all_initial_audits: list[dict[str, Any]] = []
@@ -2111,7 +2215,14 @@ def compose_offline_hierarchical_discovery_review_packet(
     }
     for outer_fold, jobs in by_fold.items():
         for ordinal, job in enumerate(jobs, start=1):
-            audit = _validate_message_envelope(job)
+            fold_config = hierarchy_config_by_fold[outer_fold]
+            audit = _validate_message_envelope(
+                job,
+                max_rendered_prompt_bytes=_positive_int(
+                    fold_config.get("max_rendered_prompt_bytes"),
+                    label=f"fold {outer_fold} max_rendered_prompt_bytes",
+                ),
+            )
             payload = _message_payload(job["messages"])
             semantic_member_id_count = sum(
                 len(
@@ -2337,7 +2448,10 @@ def compose_offline_hierarchical_discovery_review_packet(
         },
         "context_size_audit": {
             "guard_serialization": "canonical_json_utf8_message_array_v1",
-            "fixed_max_rendered_prompt_bytes": MAX_RENDERED_DISCOVERY_PROMPT_BYTES,
+            "configured_max_rendered_prompt_bytes": _positive_int(
+                representative_config.get("max_rendered_prompt_bytes"),
+                label="review packet max_rendered_prompt_bytes",
+            ),
             "initial_job_audits": all_initial_audits,
             "extraction_preview_job_audit": extraction_context_audit,
             "audited_job_count": len(context_rows),
@@ -2346,7 +2460,7 @@ def compose_offline_hierarchical_discovery_review_packet(
                 "rendered_message_array_byte_count": largest["rendered_message_array_byte_count"],
                 "headroom_bytes": largest["headroom_bytes"],
             },
-            "every_reviewed_job_within_fixed_guard": True,
+            "every_reviewed_job_within_configured_guard": True,
             "every_initial_job_within_semantic_member_bound": True,
             "semantic_repair_prompt_implemented": True,
             "response_repair_policy": discovery_response_repair_policy_identity(),
@@ -2362,7 +2476,10 @@ def compose_offline_hierarchical_discovery_review_packet(
             "transport_retry_context_policy": (
                 "same_exact_authenticated_message_sequence_and_byte_count_on_every_attempt"
             ),
-            "selector_reasoning_tokens": SELECTOR_THINKING_TOKEN_BUDGET,
+            "selector_reasoning_tokens": _positive_int(
+                representative_config.get("selector_thinking_token_budget"),
+                label="review packet selector_thinking_token_budget",
+            ),
             "extraction_reasoning_enabled": False,
         },
         "adaptive_static_prompt_contract_audit": {
@@ -2372,7 +2489,13 @@ def compose_offline_hierarchical_discovery_review_packet(
             "stage_order": list(_ADAPTIVE_PROMPT_STAGE_ORDER),
             "stage_count": len(_ADAPTIVE_PROMPT_STAGE_ORDER),
             "selector_stage_count": len(_ADAPTIVE_PROMPT_STAGE_ORDER) - 1,
-            "selector_reasoning_tokens": SELECTOR_THINKING_TOKEN_BUDGET,
+            "selector_reasoning_tokens": _positive_int(
+                _mapping(
+                    adaptive_identity["config"],
+                    label="adaptive prompt audit config",
+                ).get("selector_thinking_token_budget"),
+                label="adaptive prompt audit selector_thinking_token_budget",
+            ),
             "extraction_definition_reasoning_enabled": False,
             "dynamic_fold_content_included": False,
             "future_gate_text_or_labels_included": False,
@@ -2711,7 +2834,9 @@ def _render_markdown(packet: OfflineHierarchicalDiscoveryReviewPacket) -> str:
             "",
             "## Exact context-size audit",
             "",
-            f"Fixed guard: `{contexts['fixed_max_rendered_prompt_bytes']}` canonical UTF-8 message-array bytes.",
+            "Configured guard: "
+            f"`{contexts['configured_max_rendered_prompt_bytes']}` canonical UTF-8 "
+            "message-array bytes.",
             "",
             "| Fold | Job | Family | Members | Member cap | Bytes | Byte headroom | Thinking |",
             "| ---: | --- | --- | ---: | ---: | ---: | ---: | --- |",

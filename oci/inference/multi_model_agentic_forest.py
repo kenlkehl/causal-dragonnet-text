@@ -10,6 +10,7 @@ import logging
 import re
 import unicodedata
 from collections import Counter
+from dataclasses import asdict, fields
 from itertools import combinations
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -43,6 +44,7 @@ from ..config import (
     ExplicitFeatureSpec,
     MultiModelAgenticForestConfig,
     load_explicit_feature_specs_json,
+    TfidfVectorizerScientificConfig,
 )
 from ..models.explicit_feature_featurizer import get_raw_explicit_features
 from .agentic_explicit_feature_forest import (
@@ -69,6 +71,7 @@ from .embedding_contrast_discovery import (
     EmbeddingContrastEvidenceGenerator,
     redact_embedding_contrast_evidence,
 )
+from .production_stage1_scope_scheduler import derive_stage1_group_seed
 from .agentic_attention_variable_forest import (
     AgenticAttentionVariableForestRunner,
     _attention_evidence_snippet,
@@ -1692,6 +1695,9 @@ class MultiModelAgenticForestRunner:
                 x_model,
                 pseudo_target,
                 sample_weight=pseudo_target_sample_weight,
+                unsupported_sample_weight_policy=(
+                    view.unsupported_sample_weight_policy
+                ),
             )
             return _model_feature_scores(effect_model, len(features))
 
@@ -2152,6 +2158,16 @@ class MultiModelAgenticForestRunner:
         try:
             generator = self._embedding_contrast_generator()
             generator.prepare(self.dataset)
+            ordered_fit_rows = tuple(
+                discovery_df["_oci_row_id"].astype(int).tolist()
+            )
+            generator.bind_cluster_physical_fit_authority(
+                ordered_fit_row_ids=ordered_fit_rows,
+                canonical_group_seed=derive_stage1_group_seed(
+                    int(self.config.seed),
+                    ordered_fit_rows,
+                ),
+            )
             return generator.build_evidence(
                 discovery_df=discovery_df,
                 y=y,
@@ -4938,22 +4954,10 @@ class MultiModelAgenticForestRunner:
         return _dedupe_specs(specs)
 
     def _vectorizer_params(self, view: BoWViewConfig) -> Dict[str, Any]:
-        return {
-            "ngram_range_min": int(view.ngram_range_min),
-            "ngram_range_max": int(view.ngram_range_max),
-            "min_df": int(view.min_df),
-            "max_df": float(view.max_df),
-            "sublinear_tf": bool(view.sublinear_tf),
-            "max_features": int(view.max_features),
-        }
+        return _bow_vectorizer_params(view)
 
     def _model_params(self, view: BoWViewConfig) -> Dict[str, Any]:
-        return {
-            "bow_model": str(view.bow_model).strip().lower(),
-            "logistic_c": float(view.logistic_c),
-            "logistic_max_iter": int(view.logistic_max_iter),
-            "ridge_alpha": float(view.ridge_alpha),
-        }
+        return _bow_model_params(view)
 
     def _make_vectorizer(self, view: BoWViewConfig) -> TfidfVectorizer:
         return _make_bow_vectorizer(self._vectorizer_params(view))
@@ -4969,15 +4973,20 @@ class MultiModelAgenticForestRunner:
         view: BoWViewConfig,
         random_state: int = 17,
     ) -> LogisticRegression:
-        return LogisticRegression(
-            C=float(view.logistic_c),
-            solver="liblinear",
-            max_iter=int(view.logistic_max_iter),
+        if view.bow_model != "linear":
+            raise ValueError("logistic helper requires a linear BoW view")
+        return _make_bow_classifier(
+            _bow_model_params(view),
             random_state=random_state,
         )
 
     def _make_ridge(self, view: BoWViewConfig) -> Ridge:
-        return Ridge(alpha=float(view.ridge_alpha), random_state=17)
+        if view.bow_model != "linear":
+            raise ValueError("ridge helper requires a linear BoW view")
+        return _make_bow_regressor(
+            _bow_model_params(view),
+            random_state=17,
+        )
 
     def _parallel_n_jobs(self, setting: Any, tasks: int, *, auto_workers: int) -> int:
         if tasks <= 0:
@@ -7067,6 +7076,7 @@ def _crossfit_explicit_regression(
             x_fit[finite],
             values[fit_pos][finite],
             sample_weight=None if fit_weight is None else fit_weight[finite],
+            unsupported_sample_weight_policy="fail_closed",
         )
         oof[heldout_pos] = model.predict(x_heldout)
     return _fill_nonfinite_predictions(oof, values)
@@ -8772,7 +8782,15 @@ def _fit_regression_bow_fold(
     if sample_weight is not None:
         weights = np.asarray(sample_weight, dtype=float)
         fold_weight = weights[fit_pos]
-    _fit_regressor(model, x_fit, values[fit_pos], sample_weight=fold_weight)
+    _fit_regressor(
+        model,
+        x_fit,
+        values[fit_pos],
+        sample_weight=fold_weight,
+        unsupported_sample_weight_policy=str(
+            model_params["unsupported_sample_weight_policy"]
+        ),
+    )
     return heldout_pos, model.predict(x_heldout)
 
 
@@ -8782,7 +8800,13 @@ def _fit_regressor(
     y: np.ndarray,
     *,
     sample_weight: Optional[np.ndarray] = None,
+    unsupported_sample_weight_policy: str,
 ) -> Any:
+    if unsupported_sample_weight_policy not in {
+        "fail_closed",
+        "unweighted_legacy_compatibility",
+    }:
+        raise ValueError("unsupported sample-weight policy")
     if sample_weight is None:
         return model.fit(x, y)
     weights = np.asarray(sample_weight, dtype=float)
@@ -8790,74 +8814,237 @@ def _fit_regressor(
         raise ValueError("sample_weight must have one value per training row")
     weights = np.where(np.isfinite(weights) & (weights > 0.0), weights, 0.0)
     if float(np.sum(weights)) <= 0.0:
+        if unsupported_sample_weight_policy == "fail_closed":
+            raise ValueError("sample_weight has no positive finite mass")
         return model.fit(x, y)
     try:
         return model.fit(x, y, sample_weight=weights)
-    except TypeError:
+    except TypeError as exc:
+        if unsupported_sample_weight_policy == "fail_closed":
+            raise TypeError(
+                f"BoW regressor {type(model).__name__} does not accept configured "
+                "sample weights"
+            ) from exc
         logger.warning(
-            "BoW regressor %s does not accept sample_weight; fitting unweighted",
+            "Legacy BoW compatibility: %s does not accept sample_weight; "
+            "fitting unweighted",
             type(model).__name__,
         )
         return model.fit(x, y)
 
 
+_BOW_VECTORIZER_PARAMETER_KEYS = frozenset(
+    field.name for field in fields(TfidfVectorizerScientificConfig)
+)
+_BOW_MODEL_PARAMETER_KEYS = frozenset(
+    {
+        "bow_model",
+        "logistic_c",
+        "logistic_max_iter",
+        "ridge_alpha",
+        "logistic_scientific",
+        "ridge_scientific",
+        "forest_scientific",
+        "xgboost_scientific",
+        "single_class_policy",
+        "empty_vocabulary_policy",
+        "unsupported_sample_weight_policy",
+    }
+)
+
+
+def _require_exact_constructor_mapping(
+    params: Dict[str, Any],
+    *,
+    expected: frozenset[str],
+    label: str,
+) -> Dict[str, Any]:
+    if not isinstance(params, dict):
+        raise TypeError(f"{label} parameters must be a plain mapping")
+    missing = sorted(expected - set(params))
+    extra = sorted(set(params) - expected)
+    if missing or extra:
+        raise ValueError(
+            f"{label} parameter mapping is not closed; "
+            f"missing={missing}, extra={extra}"
+        )
+    return params
+
+
+def _bow_vectorizer_params(view: BoWViewConfig) -> Dict[str, Any]:
+    if type(view) is not BoWViewConfig:
+        raise TypeError("BoW vectorizer parameters require BoWViewConfig")
+    return asdict(view.vectorizer_scientific)
+
+
+def _bow_model_params(view: BoWViewConfig) -> Dict[str, Any]:
+    if type(view) is not BoWViewConfig:
+        raise TypeError("BoW model parameters require BoWViewConfig")
+    return {
+        "bow_model": str(view.bow_model),
+        "logistic_c": float(view.logistic_c),
+        "logistic_max_iter": int(view.logistic_max_iter),
+        "ridge_alpha": float(view.ridge_alpha),
+        "logistic_scientific": asdict(view.logistic_scientific),
+        "ridge_scientific": asdict(view.ridge_scientific),
+        "forest_scientific": asdict(view.forest_scientific),
+        "xgboost_scientific": asdict(view.xgboost_scientific),
+        "single_class_policy": str(view.single_class_policy),
+        "empty_vocabulary_policy": str(view.empty_vocabulary_policy),
+        "unsupported_sample_weight_policy": str(
+            view.unsupported_sample_weight_policy
+        ),
+    }
+
+
 def _make_bow_vectorizer(params: Dict[str, Any]) -> TfidfVectorizer:
+    params = _require_exact_constructor_mapping(
+        params,
+        expected=_BOW_VECTORIZER_PARAMETER_KEYS,
+        label="BoW TF-IDF vectorizer",
+    )
+    if params["input_text_case_policy"] != "vectorizer_controls_complete_text_case_v1":
+        raise ValueError("BoW vectorizer input text policy is unsupported")
+    if params["preprocessor_policy"] != "none":
+        raise ValueError("BoW vectorizer preprocessor policy is unsupported")
+    if params["tokenizer_policy"] != "token_pattern":
+        raise ValueError("BoW vectorizer tokenizer policy is unsupported")
+    if params["vocabulary_policy"] != "fit_scope_only":
+        raise ValueError("BoW vectorizer vocabulary policy is unsupported")
+    if params["feature_selection_rule"] != "sklearn_term_frequency_rank_v1":
+        raise ValueError("BoW vectorizer feature-selection rule is unsupported")
+    dtype = {
+        "float32": np.float32,
+        "float64": np.float64,
+    }[str(params["dtype"])]
     return TfidfVectorizer(
-        lowercase=False,
-        token_pattern=r"(?u)[a-z0-9%<>+=-]+",
+        input=str(params["input"]),
+        encoding=str(params["encoding"]),
+        decode_error=str(params["decode_error"]),
+        strip_accents=params["strip_accents"],
+        lowercase=bool(params["lowercase"]),
+        preprocessor=None,
+        tokenizer=None,
+        analyzer=str(params["analyzer"]),
+        stop_words=params["stop_words"],
+        token_pattern=params["token_pattern"],
         ngram_range=(
             int(params["ngram_range_min"]),
             int(params["ngram_range_max"]),
         ),
         min_df=int(params["min_df"]),
         max_df=float(params["max_df"]),
+        max_features=(
+            None
+            if params["max_features"] is None
+            else int(params["max_features"])
+        ),
+        vocabulary=None,
+        binary=bool(params["binary"]),
+        dtype=dtype,
+        norm=params["norm"],
+        use_idf=bool(params["use_idf"]),
+        smooth_idf=bool(params["smooth_idf"]),
         sublinear_tf=bool(params["sublinear_tf"]),
-        max_features=int(params["max_features"]),
-        dtype=np.float32,
     )
 
 
 def _make_bow_classifier(params: Dict[str, Any], *, random_state: int = 17):
+    params = _require_exact_constructor_mapping(
+        params,
+        expected=_BOW_MODEL_PARAMETER_KEYS,
+        label="BoW classifier",
+    )
     model_name = str(params["bow_model"]).strip().lower()
     if model_name == "linear":
+        config = dict(params["logistic_scientific"])
         return LogisticRegression(
+            penalty=config["penalty"],
+            dual=bool(config["dual"]),
+            tol=float(config["tol"]),
             C=float(params["logistic_c"]),
-            solver="liblinear",
+            fit_intercept=bool(config["fit_intercept"]),
+            intercept_scaling=float(config["intercept_scaling"]),
+            class_weight=config["class_weight"],
+            solver=str(config["solver"]),
             max_iter=int(params["logistic_max_iter"]),
+            multi_class=str(config["multi_class"]),
+            verbose=0,
+            warm_start=bool(config["warm_start"]),
+            n_jobs=1,
+            l1_ratio=config["l1_ratio"],
             random_state=random_state,
         )
+    config = dict(params["forest_scientific"])
+    forest_kwargs = {
+        "n_estimators": int(config["n_estimators"]),
+        "criterion": str(config["classifier_criterion"]),
+        "max_depth": config["max_depth"],
+        "min_samples_split": config["min_samples_split"],
+        "min_samples_leaf": config["min_samples_leaf"],
+        "min_weight_fraction_leaf": float(config["min_weight_fraction_leaf"]),
+        "max_features": config["max_features"],
+        "max_leaf_nodes": config["max_leaf_nodes"],
+        "min_impurity_decrease": float(config["min_impurity_decrease"]),
+        "oob_score": bool(config["oob_score"]),
+        "n_jobs": 1,
+        "random_state": random_state,
+        "verbose": 0,
+        "warm_start": bool(config["warm_start"]),
+        "class_weight": config["class_weight"],
+        "ccp_alpha": float(config["ccp_alpha"]),
+        "max_samples": config["max_samples"],
+        "monotonic_cst": config["monotonic_cst"],
+    }
     if model_name == "extratrees":
         return ExtraTreesClassifier(
-            n_estimators=300,
-            max_depth=None,
-            min_samples_leaf=2,
-            max_features="sqrt",
-            random_state=random_state,
-            n_jobs=1,
+            **forest_kwargs,
+            bootstrap=bool(config["extra_trees_bootstrap"]),
         )
     if model_name == "random_forest":
         return RandomForestClassifier(
-            n_estimators=300,
-            max_depth=None,
-            min_samples_leaf=2,
-            max_features="sqrt",
-            random_state=random_state,
-            n_jobs=1,
+            **forest_kwargs,
+            bootstrap=bool(config["random_forest_bootstrap"]),
         )
     if model_name == "xgboost":
         try:
             from xgboost import XGBClassifier
         except ImportError as exc:
-            raise ImportError("bow_model='xgboost' requires the xgboost package") from exc
+            raise ImportError(
+                "bow_model='xgboost' requires xgboost; refusing learner substitution"
+            ) from exc
+        config = dict(params["xgboost_scientific"])
         return XGBClassifier(
-            n_estimators=300,
-            max_depth=3,
-            learning_rate=0.05,
-            subsample=0.9,
-            colsample_bytree=0.6,
-            objective="binary:logistic",
-            eval_metric="logloss",
-            tree_method="hist",
+            n_estimators=int(config["n_estimators"]),
+            max_depth=int(config["max_depth"]),
+            max_leaves=int(config["max_leaves"]),
+            max_bin=int(config["max_bin"]),
+            grow_policy=str(config["grow_policy"]),
+            learning_rate=float(config["learning_rate"]),
+            booster=str(config["booster"]),
+            tree_method=str(config["tree_method"]),
+            gamma=float(config["gamma"]),
+            min_child_weight=float(config["min_child_weight"]),
+            max_delta_step=float(config["max_delta_step"]),
+            subsample=float(config["subsample"]),
+            sampling_method=str(config["sampling_method"]),
+            colsample_bytree=float(config["colsample_bytree"]),
+            colsample_bylevel=float(config["colsample_bylevel"]),
+            colsample_bynode=float(config["colsample_bynode"]),
+            reg_alpha=float(config["reg_alpha"]),
+            reg_lambda=float(config["reg_lambda"]),
+            scale_pos_weight=float(config["scale_pos_weight"]),
+            base_score=float(config["base_score"]),
+            missing=np.nan,
+            num_parallel_tree=int(config["num_parallel_tree"]),
+            monotone_constraints=config["monotone_constraints"],
+            interaction_constraints=config["interaction_constraints"],
+            enable_categorical=bool(config["enable_categorical"]),
+            max_cat_to_onehot=int(config["max_cat_to_onehot"]),
+            max_cat_threshold=int(config["max_cat_threshold"]),
+            multi_strategy=str(config["multi_strategy"]),
+            objective=str(config["classifier_objective"]),
+            eval_metric=str(config["classifier_eval_metric"]),
             random_state=random_state,
             n_jobs=1,
         )
@@ -8865,40 +9052,92 @@ def _make_bow_classifier(params: Dict[str, Any], *, random_state: int = 17):
 
 
 def _make_bow_regressor(params: Dict[str, Any], *, random_state: int = 17):
+    params = _require_exact_constructor_mapping(
+        params,
+        expected=_BOW_MODEL_PARAMETER_KEYS,
+        label="BoW regressor",
+    )
     model_name = str(params["bow_model"]).strip().lower()
     if model_name == "linear":
-        return Ridge(alpha=float(params["ridge_alpha"]), random_state=random_state)
+        config = dict(params["ridge_scientific"])
+        return Ridge(
+            alpha=float(params["ridge_alpha"]),
+            fit_intercept=bool(config["fit_intercept"]),
+            copy_X=True,
+            max_iter=config["max_iter"],
+            tol=float(config["tol"]),
+            solver=str(config["solver"]),
+            positive=bool(config["positive"]),
+            random_state=random_state,
+        )
+    config = dict(params["forest_scientific"])
+    forest_kwargs = {
+        "n_estimators": int(config["n_estimators"]),
+        "criterion": str(config["regressor_criterion"]),
+        "max_depth": config["max_depth"],
+        "min_samples_split": config["min_samples_split"],
+        "min_samples_leaf": config["min_samples_leaf"],
+        "min_weight_fraction_leaf": float(config["min_weight_fraction_leaf"]),
+        "max_features": config["max_features"],
+        "max_leaf_nodes": config["max_leaf_nodes"],
+        "min_impurity_decrease": float(config["min_impurity_decrease"]),
+        "oob_score": bool(config["oob_score"]),
+        "n_jobs": 1,
+        "random_state": random_state,
+        "verbose": 0,
+        "warm_start": bool(config["warm_start"]),
+        "ccp_alpha": float(config["ccp_alpha"]),
+        "max_samples": config["max_samples"],
+        "monotonic_cst": config["monotonic_cst"],
+    }
     if model_name == "extratrees":
         return ExtraTreesRegressor(
-            n_estimators=300,
-            max_depth=None,
-            min_samples_leaf=2,
-            max_features="sqrt",
-            random_state=random_state,
-            n_jobs=1,
+            **forest_kwargs,
+            bootstrap=bool(config["extra_trees_bootstrap"]),
         )
     if model_name == "random_forest":
         return RandomForestRegressor(
-            n_estimators=300,
-            max_depth=None,
-            min_samples_leaf=2,
-            max_features="sqrt",
-            random_state=random_state,
-            n_jobs=1,
+            **forest_kwargs,
+            bootstrap=bool(config["random_forest_bootstrap"]),
         )
     if model_name == "xgboost":
         try:
             from xgboost import XGBRegressor
         except ImportError as exc:
-            raise ImportError("bow_model='xgboost' requires the xgboost package") from exc
+            raise ImportError(
+                "bow_model='xgboost' requires xgboost; refusing learner substitution"
+            ) from exc
+        config = dict(params["xgboost_scientific"])
         return XGBRegressor(
-            n_estimators=300,
-            max_depth=3,
-            learning_rate=0.05,
-            subsample=0.9,
-            colsample_bytree=0.6,
-            objective="reg:squarederror",
-            tree_method="hist",
+            n_estimators=int(config["n_estimators"]),
+            max_depth=int(config["max_depth"]),
+            max_leaves=int(config["max_leaves"]),
+            max_bin=int(config["max_bin"]),
+            grow_policy=str(config["grow_policy"]),
+            learning_rate=float(config["learning_rate"]),
+            booster=str(config["booster"]),
+            tree_method=str(config["tree_method"]),
+            gamma=float(config["gamma"]),
+            min_child_weight=float(config["min_child_weight"]),
+            max_delta_step=float(config["max_delta_step"]),
+            subsample=float(config["subsample"]),
+            sampling_method=str(config["sampling_method"]),
+            colsample_bytree=float(config["colsample_bytree"]),
+            colsample_bylevel=float(config["colsample_bylevel"]),
+            colsample_bynode=float(config["colsample_bynode"]),
+            reg_alpha=float(config["reg_alpha"]),
+            reg_lambda=float(config["reg_lambda"]),
+            base_score=float(config["base_score"]),
+            missing=np.nan,
+            num_parallel_tree=int(config["num_parallel_tree"]),
+            monotone_constraints=config["monotone_constraints"],
+            interaction_constraints=config["interaction_constraints"],
+            enable_categorical=bool(config["enable_categorical"]),
+            max_cat_to_onehot=int(config["max_cat_to_onehot"]),
+            max_cat_threshold=int(config["max_cat_threshold"]),
+            multi_strategy=str(config["multi_strategy"]),
+            objective=str(config["regressor_objective"]),
+            eval_metric=str(config["regressor_eval_metric"]),
             random_state=random_state,
             n_jobs=1,
         )
@@ -9203,19 +9442,9 @@ def _finite_or_none(value: Any) -> Optional[float]:
 
 
 def _bow_view_to_dict(view: BoWViewConfig) -> Dict[str, Any]:
-    return {
-        "name": str(view.name),
-        "bow_model": str(view.bow_model),
-        "ngram_range_min": int(view.ngram_range_min),
-        "ngram_range_max": int(view.ngram_range_max),
-        "min_df": int(view.min_df),
-        "max_df": float(view.max_df),
-        "max_features": int(view.max_features),
-        "sublinear_tf": bool(view.sublinear_tf),
-        "logistic_c": float(view.logistic_c),
-        "logistic_max_iter": int(view.logistic_max_iter),
-        "ridge_alpha": float(view.ridge_alpha),
-    }
+    if type(view) is not BoWViewConfig:
+        raise TypeError("BoW view serialization requires BoWViewConfig")
+    return asdict(view)
 
 
 def _build_evidence_digest_agent_context(

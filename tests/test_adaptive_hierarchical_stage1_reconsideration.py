@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import json
 
@@ -40,11 +41,15 @@ from oci.inference.hierarchical_all_architecture_discovery import (
 from oci.inference.hierarchical_discovery_job_cache import (
     AuthenticatedHierarchicalDiscoveryJobCache,
 )
+from oci.inference.hierarchical_discovery_response_contract import (
+    LEGACY_HIERARCHY_WIRE_BUDGET,
+)
 from oci.inference.openai_compatible_json_discovery_job_runner import (
     InvalidDiscoveryJsonResponse,
 )
 from oci.inference.lossless_stage1_evidence_catalog import (
     ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION,
+    SEMANTIC_MEMBER_BATCHING_SCHEMA_VERSION,
     RoleNeutralEvidenceCatalog,
     Stage1EvidenceAtom,
     validate_role_neutral_catalog,
@@ -55,6 +60,13 @@ def _catalog(
     *, first_family_atom_count: int = 2, outer_fold: int = 1
 ) -> RoleNeutralEvidenceCatalog:
     split_fingerprint = f"{outer_fold:x}" * 64
+    semantic_member_batch_size = 1
+    semantic_member_batching = {
+        "schema_version": SEMANTIC_MEMBER_BATCHING_SCHEMA_VERSION,
+        "semantic_member_batch_size": semantic_member_batch_size,
+        "selection_or_truncation_authorized": False,
+        "complete_member_coverage_required": True,
+    }
     atoms = []
     ordinal = 0
     for family_index, family in enumerate(ACTIVE_STAGE1_CONCEPT_FAMILIES, start=1):
@@ -100,6 +112,7 @@ def _catalog(
             )
     identity = {
         "schema_version": ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION,
+        "semantic_member_batching": semantic_member_batching,
         "outer_fold": outer_fold,
         "scope": "outer_train",
         "inner_fold": None,
@@ -115,7 +128,12 @@ def _catalog(
         atoms=tuple(atoms),
         non_grounding_numerical_summaries=(),
         catalog_sha256=content_sha256(identity),
-        _audit_json="{}",
+        _audit_json=canonical_json(
+            {
+                "semantic_member_batching": semantic_member_batching,
+                "semantic_member_batch_size": semantic_member_batch_size,
+            }
+        ),
     )
     validate_role_neutral_catalog(result)
     return result
@@ -345,6 +363,20 @@ def test_adaptive_semantic_member_bound_is_authenticated_and_applied_to_chunks()
         for chunk in builder.chunk_plan.chunks
     )
     assert builder.delivery_audit["all_catalog_semantic_member_ids_delivered_exactly_once"] is True
+    prompt_contract = identity["prompt_contract"]
+    assert all(
+        "hierarchy_wire_budget" in stage["user_payload_top_level_keys"]
+        and "hierarchy_wire_budget" in stage["dynamic_user_payload_paths"]
+        for stage in [
+            *prompt_contract["stages"],
+            *prompt_contract["phased_stage_variants"],
+        ]
+    )
+    assert all(
+        json.loads(job.messages[1]["content"])["hierarchy_wire_budget"]
+        == config.wire_budget.as_dict()
+        for job in builder.interpret_jobs
+    )
 
 
 def _interpretation_responses(builder):
@@ -979,7 +1011,10 @@ class _InvalidFirstAdaptiveRunner(_ConvergedAdaptiveRunner):
         raise InvalidDiscoveryJsonResponse(failed_response_content=content)
 
 
-def _executable_builder():
+def _executable_builder(
+    *,
+    config: AdaptiveReconsiderationConfig | None = None,
+):
     catalog = _catalog()
     first_family, second_family = ACTIVE_STAGE1_CONCEPT_FAMILIES[:2]
     first_atom = next(atom for atom in catalog.atoms if atom.source_family == first_family)
@@ -1022,7 +1057,8 @@ def _executable_builder():
                 aggregate_metrics={"missing_fraction": 0.31, "observed_count": 442},
             ),
         ),
-        config=AdaptiveReconsiderationConfig(
+        config=config
+        or AdaptiveReconsiderationConfig(
             max_atoms_per_chunk=1,
             max_bytes_per_chunk=20_000,
         ),
@@ -1166,8 +1202,12 @@ def _definition_response(request):
     }
 
 
-def _prepare_operation_case(operation_kind):
-    builder = _executable_builder()
+def _prepare_operation_case(
+    operation_kind,
+    *,
+    config: AdaptiveReconsiderationConfig | None = None,
+):
+    builder = _executable_builder(config=config)
     _, _, _, dossiers = _completed_hierarchy(builder)
     planner_response, proposer_response = _operation_plan_and_proposal(builder, operation_kind)
     planner_job = builder.build_planner_job(dossiers)
@@ -1557,9 +1597,11 @@ def test_planner_gets_only_ten_compact_dossiers_registry_and_diagnostics():
         "current_registry",
         "diagnostics",
         "lookback_bounds",
+        "hierarchy_wire_budget",
         "identifier_ownership",
         "output_schema",
     }
+    assert request["hierarchy_wire_budget"] == builder.config.wire_budget.as_dict()
     assert len(request["architecture_dossiers"]) == 10
     assert audit["raw_atom_count"] == 0
     assert audit["complete_catalog_dump_present"] is False
@@ -2246,6 +2288,35 @@ def test_all_six_operations_compile_into_frozen_executable_contracts(
         assert all(row["supported"] for row in operation_audit["evidence_contract_grounding"])
 
 
+def test_executable_definition_job_uses_configured_nonlegacy_response_contract():
+    wire_budget = replace(
+        LEGACY_HIERARCHY_WIRE_BUDGET,
+        max_generated_name_chars=40,
+        max_interpret_name_chars=40,
+        max_free_text_chars=73,
+    )
+    config = AdaptiveReconsiderationConfig(
+        max_atoms_per_chunk=1,
+        max_bytes_per_chunk=20_000,
+        wire_budget=wire_budget,
+    )
+    builder, _, _, _, definition_jobs = _prepare_operation_case(
+        "add",
+        config=config,
+    )
+
+    assert builder.config.wire_budget == wire_budget
+    assert len(definition_jobs) == 1
+    request = json.loads(definition_jobs[0][0].messages[1]["content"])
+    assert request["hierarchy_wire_budget"] == wire_budget.as_dict()
+    assert request["hierarchy_wire_budget"] != LEGACY_HIERARCHY_WIRE_BUDGET.as_dict()
+    assert request["output_schema"]["properties"]["measurement"]["maxLength"] == 73
+    assert (
+        request["output_schema"]["properties"]["aliases"]["items"]["maxLength"]
+        == 73
+    )
+
+
 def test_executable_freeze_revalidates_normalized_definition_without_weakening_wire_shape():
     builder, _, frozen_round, lookback, definition_jobs = _prepare_operation_case("add")
     job, request = definition_jobs[0]
@@ -2267,6 +2338,7 @@ def test_executable_freeze_revalidates_normalized_definition_without_weakening_w
 
 
 def test_empty_consolidation_keeps_wire_and_normalized_shapes_separate():
+    builder = _builder()
     wire = {"candidate_assignments": {}, "slot_definitions": {}}
     normalized = {
         "canonical_concepts": [],
@@ -2290,11 +2362,10 @@ def test_empty_consolidation_keeps_wire_and_normalized_shapes_separate():
         },
     }
     assert (
-        AdaptiveHierarchicalStage1Reconsideration._validate_empty_consolidation_wire(wire)
-        == normalized
+        builder._validate_empty_consolidation_wire(wire) == normalized
     )
     with pytest.raises(ValueError, match="consolidation response keys differ"):
-        AdaptiveHierarchicalStage1Reconsideration._validate_empty_consolidation_wire(normalized)
+        builder._validate_empty_consolidation_wire(normalized)
     assert (
         AdaptiveHierarchicalStage1Reconsideration._revalidate_empty_consolidation_projection(
             normalized
@@ -2382,6 +2453,7 @@ def test_definition_prompt_rejects_mutated_static_vocabulary_policy():
             job_kind=job.job_kind,
             messages=messages,
             settings=job.settings,
+            selector_thinking_token_budget=SELECTOR_THINKING_TOKEN_BUDGET,
         )
 
 

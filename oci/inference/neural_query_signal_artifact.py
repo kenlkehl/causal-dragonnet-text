@@ -97,6 +97,7 @@ def build_fold_honest_query_signals(
     query_discovery_checkpoint_path: Path | str,
     subfold_checkpoint_paths: Sequence[Path | str],
     temperature: float,
+    patient_batch_size: int,
     devices_by_bank: Mapping[str, str],
     expected_parent_input_binding_sha256: str,
     expected_query_discovery_identity: str,
@@ -127,6 +128,12 @@ def build_fold_honest_query_signals(
         raise ValueError("heldout chunk matrices do not match heldout row IDs")
     if not math.isfinite(float(temperature)) or float(temperature) <= 0.0:
         raise ValueError("query activation temperature must be positive and finite")
+    if (
+        isinstance(patient_batch_size, bool)
+        or not isinstance(patient_batch_size, int)
+        or patient_batch_size < 1
+    ):
+        raise ValueError("query activation patient_batch_size must be positive")
     missing_devices = set(QUERY_BANKS) - set(devices_by_bank)
     if missing_devices:
         raise ValueError(f"missing query devices for banks {sorted(missing_devices)}")
@@ -235,6 +242,7 @@ def build_fold_honest_query_signals(
                 queries,
                 temperature=float(temperature),
                 device=str(devices_by_bank[bank]),
+                patient_batch_size=int(patient_batch_size),
             )
             _append_activation_rows(
                 activation_rows,
@@ -283,6 +291,7 @@ def build_fold_honest_query_signals(
             final_queries,
             temperature=float(temperature),
             device=str(devices_by_bank[bank]),
+            patient_batch_size=int(patient_batch_size),
         )
         _append_activation_rows(
             activation_rows,

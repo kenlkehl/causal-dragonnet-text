@@ -35,6 +35,7 @@ from oci.inference.production_stage1_bundle import (
 )
 from oci.inference.review_spent_evidence_provider import _embedding_concepts_only
 from oci.inference.stage1_exact_inner_evidence import EXACT_SCOPE_CACHE_REPLAY
+from oci.inference.tfidf_safe_artifacts import load_named_array_bank
 from oci.inference.stage1_exact_inner_family_adapters import (
     bind_native_family_fit_proof,
     native_family_execution_record,
@@ -44,9 +45,14 @@ from oci.inference.tfidf_topic_agentic_forest import (
 )
 from oci.inference.tfidf_topic_stage1 import (
     _fit_tfidf_topic_context_nested_calibration,
+    _fit_tfidf_topic_stage1_spec_impl,
     _nested_calibration_plan,
     run_tfidf_topic_stage1,
 )
+from tests.semantic_witness_test_support import semantic_witness_config
+
+
+_SEMANTIC_WITNESS_CONFIG = semantic_witness_config()
 
 
 def _sha256(path: str | Path) -> str:
@@ -172,8 +178,13 @@ def _selected_evidence(metadata):
 
 
 def _heldout_features(metadata):
-    with np.load(metadata["artifacts"]["heldout_topic_values"]) as archive:
-        topics = {name: np.asarray(archive[name]) for name in archive.files}
+    topics = {
+        name: np.asarray(values)
+        for name, values in load_named_array_bank(
+            metadata["artifacts"]["heldout_topic_values"],
+            expected_row_count=len(metadata["heldout_row_ids"]),
+        ).items()
+    }
     nuisance = pd.read_parquet(metadata["artifacts"]["nuisance_predictions"])
     nuisance = nuisance.loc[
         nuisance["prediction_scope"] == "external_heldout",
@@ -465,10 +476,16 @@ def test_semantic_retrieval_tfidf_projection_is_label_free_after_fit_directions_
             }
         ]
     }
-    first = _embedding_concepts_only(frozen_retrieval, contrastive_term_limit=64)
+    first = _embedding_concepts_only(
+        frozen_retrieval,
+        scientific_config=_SEMANTIC_WITNESS_CONFIG,
+    )
     # An adversarial registered-heldout label object has nowhere to enter this
     # projection; repeating the frozen fit artifact is byte-semantically exact.
-    second = _embedding_concepts_only(frozen_retrieval, contrastive_term_limit=64)
+    second = _embedding_concepts_only(
+        frozen_retrieval,
+        scientific_config=_SEMANTIC_WITNESS_CONFIG,
+    )
     assert first == second
     assert first["concept_derivation"].startswith("tfidf_ngrams_contrasting")
     assert first["raw_retrieved_excerpts_retained"] is False
@@ -484,7 +501,7 @@ def test_semantic_retrieval_tfidf_projection_is_label_free_after_fit_directions_
     assert (
         _embedding_concepts_only(
             changed_fit_direction,
-            contrastive_term_limit=64,
+            scientific_config=_SEMANTIC_WITNESS_CONFIG,
         )
         != first
     )
@@ -529,4 +546,74 @@ def test_nested_policy_round_trips_through_full_stage1_and_stage2_validator(tmp_
             dataset=data,
             config=config,
             handoff_path=handoff_path,
+        )
+
+
+def test_exact_context_resume_authenticates_every_safe_payload_before_reuse(
+    tmp_path: Path,
+) -> None:
+    data = _data()
+    fit = data.iloc[:48].copy()
+    heldout = data.iloc[48:].copy()
+    scope_id = "outer_001_inner_001"
+    contexts = tmp_path / "contexts"
+    context_dir = contexts / scope_id
+    context_dir.mkdir(parents=True)
+    config = _config()
+    spec = {
+        "outer_fold": 1,
+        "inner_fold": 1,
+        "scope": "candidate_selection_inner_fit",
+        "scope_id": scope_id,
+        "fit_df": fit.copy(),
+        "heldout_df": heldout.loc[:, ["_oci_row_id", "clinical_text"]].copy(),
+    }
+    metadata = _fit_tfidf_topic_context_nested_calibration(
+        spec=spec,
+        config=config,
+        artifact_dir=context_dir,
+    )
+    dataset_identity = {
+        "content_fingerprint": "dataset-content",
+        "ordered_row_fingerprint": "dataset-order",
+    }
+    metadata.update(
+        {
+            "stage1_config_hash": "stage1-hash",
+            "dataset_content_fingerprint": dataset_identity["content_fingerprint"],
+            "dataset_ordered_row_fingerprint": dataset_identity[
+                "ordered_row_fingerprint"
+            ],
+            "split_semantics_hash": "split-hash",
+        }
+    )
+    (context_dir / "context_metadata.json").write_text(
+        json.dumps(metadata, indent=2),
+        encoding="utf-8",
+    )
+
+    _spec, reused = _fit_tfidf_topic_stage1_spec_impl(
+        spec,
+        contexts_dir=contexts,
+        config=config,
+        stage1_hash="stage1-hash",
+        dataset_identity=dataset_identity,
+        split_semantics_hash="split-hash",
+        split_schema_version="split-v1",
+    )
+    assert reused == metadata
+
+    model_index = Path(metadata["artifacts"]["fitted_context"])
+    model_manifest = json.loads(model_index.read_text(encoding="utf-8"))
+    payload = model_index.parent / model_manifest["payload_inventory"][0]["relative_path"]
+    payload.write_bytes(payload.read_bytes() + b"tamper")
+    with pytest.raises(RuntimeError, match="failed closed validation"):
+        _fit_tfidf_topic_stage1_spec_impl(
+            spec,
+            contexts_dir=contexts,
+            config=config,
+            stage1_hash="stage1-hash",
+            dataset_identity=dataset_identity,
+            split_semantics_hash="split-hash",
+            split_schema_version="split-v1",
         )

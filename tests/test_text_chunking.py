@@ -19,10 +19,10 @@ class TestChunkTokenIds:
         # Stride = 10 - 4 = 6, so chunk 0 = [0..9], chunk 1 = [6..15], chunk 2 = [12..19]
         assert chunks[0][-4:] == chunks[1][:4]  # overlap region
 
-    def test_max_chunks_truncation(self):
+    def test_binding_max_chunks_fails_closed(self):
         ids = list(range(100))
-        chunks = chunk_token_ids(ids, chunk_size=10, chunk_overlap=2, max_chunks=3)
-        assert len(chunks) == 3
+        with pytest.raises(ValueError, match="semantic truncation is forbidden"):
+            chunk_token_ids(ids, chunk_size=10, chunk_overlap=2, max_chunks=3)
 
     def test_short_text(self):
         ids = [1, 2, 3]

@@ -88,6 +88,12 @@ def test_ungated_consensus_assigns_every_candidate_without_score_filtering():
         n_queries=2,
         bank="effect",
         seed=3,
+        config=NeuralCohortWitnessConfig(
+            n_prototypes=2,
+            initial_pool_size=4,
+            consensus_min_prototypes=2,
+            consensus_max_prototypes=2,
+        ),
     )
     assert consensus["selected_count"] == 2
     assert consensus["statistical_gate_applied"] is False
@@ -118,7 +124,11 @@ def test_soft_retrieval_matches_log_mean_exp_over_all_chunks():
     query = np.array([[1.0, 0.0]], dtype=np.float32)
     temperature = 0.2
     observed = soft_retrieval_activations(
-        chunks, query, temperature=temperature, device="cpu"
+        chunks,
+        query,
+        temperature=temperature,
+        device="cpu",
+        patient_batch_size=2,
     ).ravel()
     expected = []
     for similarities in ([1.0, 0.8], [0.9, 0.9]):

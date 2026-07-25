@@ -1,0 +1,56 @@
+{
+  "cpu_budget": 8,
+  "dataset_path": "../synthetic_data/example_synthetic_datasets/one_confounder_one_effect_modifier_nsclc_with_structured/dataset.parquet",
+  "devices": [
+    "auto"
+  ],
+  "durable_artifact_root": "../artifacts/production_all_evidence_one_conf_one_mod_1000_v6_portable_acceptance",
+  "embedding_batch_size": 1,
+  "embedding_model_locator": "../artifacts/local_models/qwen3_embedding_8b_materialized",
+  "embedding_model_name": "Qwen/Qwen3-Embedding-8B",
+  "endpoint": "http://camus:8010/v1",
+  "endpoint_model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
+  "forest_operational": {
+    "ray_remote_func_options": null,
+    "requested_host_cpu_budget": 8,
+    "use_ray": false,
+    "verbose": 0
+  },
+  "htr_model_locator": "/home/klkehl/.cache/huggingface/hub/models--prajjwal1--bert-tiny/snapshots/6f75de8b60a9f8a2fdf7b69cbd86d9e64bcb3837",
+  "oracle_ite_column": "true_ite_prob",
+  "oracle_source": "../synthetic_data/example_synthetic_datasets/one_confounder_one_effect_modifier_nsclc_with_structured/dataset.parquet",
+  "oracle_unit_id_column": "patient_id",
+  "query_profile_locator": "production_all_evidence_neural_query_full.json",
+  "resource_performance_safety": {
+    "fail_on_external_gpu_occupants": true,
+    "gpu_max_allocation_fraction": 0.85,
+    "gpu_minimum_headroom_bytes": 6442450944,
+    "maximum_coordination_proof_overhead_ratio": 0.3,
+    "maximum_ordinary_read_amplification": 2.0,
+    "minimum_benchmark_repetitions_per_scope": 2,
+    "minimum_multi_device_throughput_ratio": 1.5,
+    "read_counter_source": "process_read_bytes",
+    "schema_version": "portable_resource_performance_safety_policy_v1"
+  },
+  "response_concurrency": 8,
+  "runtime_compatibility_class": "portable_python_posix_v1",
+  "schema_version": "portable_all_evidence_deployment_profile_v6",
+  "scratch_root": "/tmp/causal_dragonnet_nsclc_v6_acceptance",
+  "stage1_execution": {
+    "benchmark_result_sha256": null,
+    "benchmark_result_locator": null,
+    "benchmark_workload_deployment_sha256": null,
+    "benchmark_workload_deployment_locator": null,
+    "device_count": 2,
+    "executor_mode": "persistent_slots",
+    "resource_kind": "accelerator",
+    "schema_version": "portable_stage1_execution_profile_v3",
+    "selected_candidate": null,
+    "selection_method": "operator_configured",
+    "scope_workers_per_device": 1
+  },
+  "stage1_profile_locator": "production_all_evidence_stage1_full.json",
+  "stage2_tokenizer_locator": "/data1/ken/models/models--RedHatAI--Gemma-4-26B-A4B-it-FP8-Dynamic/snapshots/8edbb9269ec9c3faad538ee1208a07eb46051f34",
+  "storage_backend": "posix",
+  "cluster_preflight_parquet_compression": "zstd"
+}

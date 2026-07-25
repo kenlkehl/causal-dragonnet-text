@@ -47,6 +47,7 @@ import json
 import os
 import platform
 import re
+import stat
 import sys
 import tempfile
 import threading
@@ -102,7 +103,11 @@ from .embedding_native_proof_capture import (
     validate_embedding_cluster_support_state,
     validate_embedding_native_capture,
 )
-from .embedding_contrast_discovery import _embedding_cluster_kmeans_parameters
+from .embedding_contrast_discovery import (
+    ClusterLocalEmbeddingFeasibilityError,
+    _cluster_local_scientific_config,
+    _embedding_cluster_kmeans_parameters,
+)
 from .htr_native_proof_capture import (
     HTR_NATIVE_CAPTURE_SCHEMA,
     NativeHTRProofCaptureSink,
@@ -126,6 +131,11 @@ from .neural_query_context_backend import (
     NeuralQueryContextBackend,
     validate_owned_discovery_snapshot,
 )
+from .production_neural_query_binary_layout import (
+    numerical_array_sha256,
+    validate_npy_array_set,
+    write_npy_array_set,
+)
 from .lossless_stage1_evidence_catalog import (
     SEMANTIC_RETRIEVAL_DERIVATION,
     RoleNeutralEvidenceCatalog,
@@ -134,6 +144,7 @@ from .lossless_stage1_evidence_catalog import (
 )
 from .review_spent_evidence_provider import (
     BoundSpentFrozenChunkEmbeddingProvider,
+    SemanticWitnessScientificConfig,
     SpentOnlyFrozenChunkEmbeddingCache,
     _FrozenCacheEmbeddingEvidenceGenerator,
     _embedding_concepts_only,
@@ -208,8 +219,10 @@ from .production_embedding_cache_relocation import (
     validate_relocated_production_embedding_cache,
 )
 from .production_stage1_scope_scheduler import (
+    Stage1PhysicalFitIdentity,
     Stage1ScopePlan,
     build_canonical_stage1_scope_plan,
+    derive_stage1_group_seed,
     validate_stage1_scope_plan,
     write_stage1_scope_plan,
 )
@@ -222,6 +235,10 @@ from .stage1_upstream_gate_backend import (
 )
 from .tfidf_topic_agentic_forest import validate_tfidf_topic_stage2_handoff
 from .tfidf_topic_discovery import row_set_fingerprint
+from .tfidf_safe_artifacts import (
+    INDEX_FILENAME as TFIDF_SAFE_INDEX_FILENAME,
+    safe_artifact_content_sha256,
+)
 from .tfidf_topic_split_registry import (
     TFIDF_TOPIC_SPLIT_REGISTRY_SCHEMA_VERSION,
     load_tfidf_topic_split_registry,
@@ -238,7 +255,7 @@ STAGE1_COMPONENT_MANIFEST_SCHEMA = "production_all_evidence_stage1_component_v2"
 STAGE1_BUNDLE_MANIFEST_SCHEMA = "production_all_evidence_stage1_bundle_v3"
 STAGE1_SCOPE_INDEX_SCHEMA = "production_all_evidence_stage1_scope_index_v2"
 STAGE1_QUERY_ARTIFACT_SCHEMA = "production_neural_query_evidence_scope_v1"
-STAGE1_QUERY_MOMENT_ARTIFACT_SCHEMA = "production_neural_query_heldout_moments_v1"
+STAGE1_QUERY_MOMENT_ARTIFACT_SCHEMA = "production_neural_query_heldout_moments_v2"
 STAGE1_QUERY_NATIVE_FIT_METADATA_SCHEMA = "production_neural_query_native_fit_metadata_v1"
 STAGE1_BOW_NATIVE_FIT_METADATA_SCHEMA = "production_bow_native_fit_metadata_v1"
 STAGE1_EMBEDDING_NATIVE_FIT_METADATA_SCHEMA = "production_embedding_native_fit_metadata_v1"
@@ -272,9 +289,9 @@ STAGE1_EXACT_INNER_ROOT_INDEX_SCHEMA = "production_stage1_exact_inner_evidence_i
 STAGE1_TFIDF_RESUME_POLICY = "sealed_complete_component_only_no_partial_checkpoint_reuse_v1"
 STAGE1_HTR_INPUT_NONTRUNCATION_AUDIT_SCHEMA = "production_stage1_htr_input_nontruncation_audit_v1"
 STAGE1_EMBEDDING_CLUSTER_FEASIBILITY_AUDIT_SCHEMA = (
-    "production_stage1_embedding_cluster_feasibility_audit_v1"
+    "production_stage1_embedding_cluster_feasibility_audit_v2"
 )
-STAGE1_EMBEDDING_CLUSTER_FIT_IDENTITY_SCHEMA = "production_stage1_embedding_cluster_fit_identity_v1"
+STAGE1_EMBEDDING_CLUSTER_FIT_IDENTITY_SCHEMA = "production_stage1_embedding_cluster_fit_identity_v2"
 STAGE1_EMBEDDING_CLUSTER_FIT_INDEX_SCHEMA = "production_stage1_embedding_cluster_fit_index_v1"
 
 # These component-local tuples enumerate all ten families whose native producer
@@ -373,6 +390,21 @@ def _canonical_json(value: Any) -> str:
     return result
 
 
+def _sha256_json_streaming(value: Any) -> str:
+    """Hash canonical JSON without materializing a multi-gigabyte string."""
+
+    encoder = json.JSONEncoder(
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    digest = hashlib.sha256()
+    for chunk in encoder.iterencode(value):
+        digest.update(chunk.encode("utf-8"))
+    return digest.hexdigest()
+
+
 def _reject_duplicate_json_keys(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -448,19 +480,21 @@ def _scientific_query_config_identity(
     """Drop filesystem-instance metadata from a content-addressed request."""
 
     provided = identity.get("provided")
-    path = identity.get("path")
     digest = identity.get("sha256")
     if provided is True:
-        if not isinstance(path, str) or not path or not isinstance(digest, str):
+        if (
+            not isinstance(identity.get("path"), str)
+            or not identity.get("path")
+            or not isinstance(digest, str)
+            or _HEX_SHA256.fullmatch(digest) is None
+        ):
             raise ValueError("provided neural-query config identity is malformed")
-    elif provided is False:
-        if path is not None or digest is not None:
-            raise ValueError("default neural-query config identity is malformed")
     else:
-        raise ValueError("neural-query config identity lacks its provided flag")
+        raise ValueError(
+            "production requires an explicitly provided neural-query configuration"
+        )
     return {
-        "provided": provided,
-        "path": path,
+        "provided": True,
         "sha256": digest,
     }
 
@@ -1204,20 +1238,7 @@ def _component_native_artifact_registration(
 
 
 def _numerical_array_sha256(value: Any) -> str:
-    array = np.ascontiguousarray(np.asarray(value))
-    if array.dtype.hasobject:
-        raise ValueError("production neural-query numerical artifacts cannot contain objects")
-    header = _canonical_json(
-        {
-            "dtype": array.dtype.str,
-            "shape": [int(dimension) for dimension in array.shape],
-        }
-    ).encode("utf-8")
-    digest = hashlib.sha256()
-    digest.update(header)
-    digest.update(b"\0")
-    digest.update(memoryview(array).cast("B"))
-    return digest.hexdigest()
+    return numerical_array_sha256(value)
 
 
 def _validate_neural_query_moment_artifact(
@@ -1232,23 +1253,31 @@ def _validate_neural_query_moment_artifact(
     """Validate exact heldout moments without accepting executable array types."""
 
     metadata_path = Path(metadata_path)
-    if metadata_path.is_symlink() or not metadata_path.is_file():
+    if metadata_path.is_symlink():
         raise ValueError("neural-query moment metadata must be one regular file")
-    before = metadata_path.stat()
+    before = metadata_path.lstat()
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise ValueError(
+            "neural-query moment metadata must be one non-hard-linked regular file"
+        )
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("neural-query moment metadata is not valid JSON") from exc
-    after = metadata_path.stat()
+    after = metadata_path.lstat()
     if (
         int(before.st_dev),
         int(before.st_ino),
+        int(before.st_mode),
+        int(before.st_nlink),
         int(before.st_size),
         int(before.st_mtime_ns),
         int(before.st_ctime_ns),
     ) != (
         int(after.st_dev),
         int(after.st_ino),
+        int(after.st_mode),
+        int(after.st_nlink),
         int(after.st_size),
         int(after.st_mtime_ns),
         int(after.st_ctime_ns),
@@ -1270,8 +1299,10 @@ def _validate_neural_query_moment_artifact(
         "query_cache_key",
         "owned_snapshot_schema_version",
         "owned_snapshot_content_sha256",
-        "arrays_file",
+        "arrays_directory",
+        "arrays_index_sha256",
         "arrays_sha256",
+        "array_order",
         "array_inventory",
         "feature_count",
         "heldout_row_count",
@@ -1325,48 +1356,59 @@ def _validate_neural_query_moment_artifact(
         expected_snapshot_content_sha256
     ):
         raise ValueError("neural-query moments use another owned query snapshot")
-    arrays_path = metadata_path.parent / str(metadata.get("arrays_file") or "")
+    arrays_path = metadata_path.parent / str(metadata.get("arrays_directory") or "")
     if (
         arrays_path.parent != metadata_path.parent
         or arrays_path.is_symlink()
-        or not arrays_path.is_file()
+        or not arrays_path.is_dir()
+        or arrays_path.name != "heldout_moments.arrays"
     ):
-        raise ValueError("neural-query moment NPZ path is invalid")
-    if _sha256_file(arrays_path) != str(metadata.get("arrays_sha256") or ""):
-        raise RuntimeError("neural-query heldout moment NPZ changed after emission")
-    expected_keys = {
+        raise ValueError("neural-query moment NPY array directory is invalid")
+    expected_order = (
         "heldout_row_ids",
         "feature_values",
         "feature_names",
         "feature_kinds",
         "feature_roles",
-    }
+    )
+    expected_keys = set(expected_order)
     inventory = metadata.get("array_inventory")
     if not isinstance(inventory, Mapping) or set(inventory) != expected_keys:
         raise ValueError("neural-query moment array inventory is incomplete")
-    observed_inventory: dict[str, Any] = {}
-    before_npz = _sha256_file(arrays_path)
-    with np.load(arrays_path, allow_pickle=False) as archive:
-        if set(archive.files) != expected_keys:
-            raise ValueError("neural-query moment NPZ has unexpected arrays")
-        arrays = {key: np.asarray(archive[key]) for key in expected_keys}
-        for key, array in arrays.items():
-            if array.dtype.hasobject:
-                raise ValueError("neural-query moment NPZ contains executable object arrays")
-            observed_inventory[key] = {
-                "dtype": array.dtype.str,
-                "shape": [int(dimension) for dimension in array.shape],
-                "content_sha256": _numerical_array_sha256(array),
-            }
-    if _sha256_file(arrays_path) != before_npz:
-        raise RuntimeError("neural-query moment NPZ changed while validating")
-    if observed_inventory != dict(inventory):
-        raise RuntimeError("neural-query moment array inventory differs from its NPZ")
-    row_ids = np.asarray(arrays["heldout_row_ids"], dtype=np.int64)
-    values = np.asarray(arrays["feature_values"], dtype=float)
-    names = tuple(map(str, arrays["feature_names"].tolist()))
-    kinds = tuple(map(str, arrays["feature_kinds"].tolist()))
-    roles = tuple(map(str, arrays["feature_roles"].tolist()))
+    if metadata.get("array_order") != list(expected_order):
+        raise ValueError("neural-query moment array order is invalid")
+    descriptor, arrays = validate_npy_array_set(
+        arrays_path,
+        expected_order=expected_order,
+        expected_inventory=inventory,
+    )
+    if (
+        metadata.get("arrays_index_sha256") != descriptor["index_sha256"]
+        or metadata.get("arrays_sha256") != descriptor["content_sha256"]
+    ):
+        raise RuntimeError(
+            "neural-query heldout moment array index differs from its metadata"
+        )
+    raw_row_ids = arrays["heldout_row_ids"]
+    raw_values = arrays["feature_values"]
+    raw_names = arrays["feature_names"]
+    raw_kinds = arrays["feature_kinds"]
+    raw_roles = arrays["feature_roles"]
+    if (
+        raw_row_ids.dtype != np.dtype(np.int64)
+        or raw_values.dtype != np.dtype(np.float32)
+        or any(array.dtype.kind != "U" for array in (raw_names, raw_kinds, raw_roles))
+        or any(
+            not array.flags.c_contiguous
+            for array in (raw_row_ids, raw_values, raw_names, raw_kinds, raw_roles)
+        )
+    ):
+        raise ValueError("neural-query heldout moment arrays changed their semantic dtypes")
+    row_ids = np.asarray(raw_row_ids)
+    values = np.asarray(raw_values)
+    names = tuple(map(str, raw_names.tolist()))
+    kinds = tuple(map(str, raw_kinds.tolist()))
+    roles = tuple(map(str, raw_roles.tolist()))
     feature_count = int(metadata.get("feature_count", 0))
     if (
         row_ids.ndim != 1
@@ -1374,6 +1416,9 @@ def _validate_neural_query_moment_artifact(
         or values.shape != (len(heldout_rows), feature_count)
         or not np.isfinite(values).all()
         or feature_count < 1
+        or raw_names.ndim != 1
+        or raw_kinds.ndim != 1
+        or raw_roles.ndim != 1
         or len(names) != feature_count
         or len(kinds) != feature_count
         or len(roles) != feature_count
@@ -1434,11 +1479,10 @@ def _write_neural_query_moment_artifact(
     model_root = Path(model_artifact_dir)
     if model_root.is_symlink() or not model_root.is_dir():
         raise ValueError("neural-query native model artifact root must be a real directory")
-    arrays_path = model_root / "heldout_moments.npz"
+    arrays_path = model_root / "heldout_moments.arrays"
     metadata_path = model_root / "heldout_moments.metadata.json"
     if arrays_path.exists() or metadata_path.exists():
         raise RuntimeError("refusing to replace immutable neural-query heldout moments")
-    _atomic_write_npz(arrays_path, **arrays)
     inventory = {
         key: {
             "dtype": array.dtype.str,
@@ -1447,6 +1491,12 @@ def _write_neural_query_moment_artifact(
         }
         for key, array in arrays.items()
     }
+    array_order = tuple(arrays)
+    array_layout = write_npy_array_set(
+        arrays_path,
+        arrays,
+        ordered_names=array_order,
+    )
     body = {
         "schema_version": STAGE1_QUERY_MOMENT_ARTIFACT_SCHEMA,
         "scope_id": str(scope_id),
@@ -1461,8 +1511,10 @@ def _write_neural_query_moment_artifact(
         "query_cache_key": str(query_cache_key),
         "owned_snapshot_schema_version": NEURAL_QUERY_OWNED_SNAPSHOT_SCHEMA,
         "owned_snapshot_content_sha256": str(owned_snapshot_metadata["content_sha256"]),
-        "arrays_file": arrays_path.name,
-        "arrays_sha256": _sha256_file(arrays_path),
+        "arrays_directory": arrays_path.name,
+        "arrays_index_sha256": array_layout["index_sha256"],
+        "arrays_sha256": array_layout["content_sha256"],
+        "array_order": list(array_order),
         "array_inventory": inventory,
         "feature_count": len(names),
         "heldout_row_count": len(heldout_rows),
@@ -1574,7 +1626,7 @@ def _register_neural_query_native_family_proof(
         or declared_model.get("sha256") != model_registration["sha256"]
         or not isinstance(declared_moments, Mapping)
         or declared_moments.get("relative_path")
-        != (model_root / "heldout_moments.npz").relative_to(root).as_posix()
+        != (model_root / "heldout_moments.arrays").relative_to(root).as_posix()
         or declared_moments.get("sha256") != moment_metadata["arrays_sha256"]
     ):
         raise ValueError("neural-query safe evidence does not bind its native numerical artifacts")
@@ -2484,6 +2536,12 @@ def _embedding_capture_family_bindings(
         "schema_version": EMBEDDING_NATIVE_CAPTURE_SCHEMA,
         "family": family,
         "embedding_config": copy.deepcopy(capture.get("embedding_config")),
+        "semantic_witness_scientific_config": copy.deepcopy(
+            capture.get("semantic_witness_scientific_config")
+        ),
+        "semantic_witness_scientific_config_sha256": capture.get(
+            "semantic_witness_scientific_config_sha256"
+        ),
         "embedding_provider_identity": copy.deepcopy(capture.get("embedding_provider_identity")),
         "fit_cache_row_inventory": copy.deepcopy(capture.get("fit_cache_row_inventory")),
         "discovery_projection": copy.deepcopy(build.get("discovery_projection")),
@@ -2691,6 +2749,8 @@ def _register_embedding_native_family_proofs(
         "outcome_column",
         "outcome_type",
         "embedding_config",
+        "semantic_witness_scientific_config",
+        "semantic_witness_scientific_config_sha256",
         "capture_schema_version",
         "semantic_policy_schema_version",
         "tfidf_nested_calibration_folds",
@@ -2753,6 +2813,10 @@ def _register_embedding_native_family_proofs(
         is None
         or configuration.get("outcome_type") != capture.get("outcome_type")
         or configuration.get("embedding_config") != capture.get("embedding_config")
+        or configuration.get("semantic_witness_scientific_config")
+        != capture.get("semantic_witness_scientific_config")
+        or configuration.get("semantic_witness_scientific_config_sha256")
+        != capture.get("semantic_witness_scientific_config_sha256")
         or isinstance(configuration.get("seed"), bool)
         or configuration.get("seed") != capture.get("seed")
         or int(configuration.get("tfidf_nested_calibration_folds", 0))
@@ -3066,6 +3130,8 @@ def _validate_embedding_native_family_proof_index(
         "outcome_column",
         "outcome_type",
         "embedding_config",
+        "semantic_witness_scientific_config",
+        "semantic_witness_scientific_config_sha256",
         "capture_schema_version",
         "semantic_policy_schema_version",
         "tfidf_nested_calibration_folds",
@@ -3310,6 +3376,10 @@ def _validate_embedding_native_family_proof_index(
                 or configuration.get("seed") != capture.get("seed")
                 or configuration.get("outcome_type") != capture.get("outcome_type")
                 or configuration.get("embedding_config") != capture.get("embedding_config")
+                or configuration.get("semantic_witness_scientific_config")
+                != capture.get("semantic_witness_scientific_config")
+                or configuration.get("semantic_witness_scientific_config_sha256")
+                != capture.get("semantic_witness_scientific_config_sha256")
                 or int(configuration.get("tfidf_nested_calibration_folds", 0))
                 != int(
                     (capture.get("tfidf_training_scope_policy") or {}).get(
@@ -3461,15 +3531,20 @@ def _cumulative_request_for_family(
 
 def _canonical_cumulative_spent_schedule(
     registry: Mapping[str, Any],
+    *,
+    initial_training_partitions: int,
 ) -> Any:
     """Rebuild the one wrapper-authoritative hierarchy spent schedule."""
 
     exact_registry = _canonical_exact_registry_from_wrapper(registry)
-    review_rounds = int(exact_registry.inner_fold_count) - 3
+    initial_partitions = int(initial_training_partitions)
+    if initial_partitions < 1:
+        raise ValueError("initial_training_partitions must be at least one")
+    review_rounds = int(exact_registry.inner_fold_count) - initial_partitions
     if review_rounds < 1:
         raise ValueError(
-            "cumulative hierarchy emission requires at least four canonical inner "
-            "partitions: three initially spent plus one review gate"
+            "cumulative hierarchy emission requires at least one configured initial "
+            "training partition and one review gate"
         )
     # Imported lazily because the handoff module imports this module's stable
     # hashing helpers.  No wrapper-local partitioner is permitted here.
@@ -3478,6 +3553,7 @@ def _canonical_cumulative_spent_schedule(
     return CanonicalHierarchySpentSchedule.build(
         registry=exact_registry,
         review_rounds=review_rounds,
+        initial_training_partitions=initial_partitions,
     )
 
 
@@ -3485,6 +3561,7 @@ def _hierarchy_spent_evidence_contract(
     *,
     registry: Mapping[str, Any],
     config: AppliedInferenceConfig,
+    initial_training_partitions: int,
     hierarchical_discovery_contract_identity_sha256: str,
 ) -> Mapping[str, Any]:
     """Seal the one canonical hierarchy schedule into the immutable request."""
@@ -3493,7 +3570,10 @@ def _hierarchy_spent_evidence_contract(
         STAGE1_HIERARCHY_SPENT_CONTRACT_SCHEMA,
     )
 
-    schedule = _canonical_cumulative_spent_schedule(registry)
+    schedule = _canonical_cumulative_spent_schedule(
+        registry,
+        initial_training_partitions=initial_training_partitions,
+    )
     review_rounds = int(schedule.review_rounds)
     interaction_inner_folds = int(
         config.architecture.explicit_feature_forest.interaction_inner_folds
@@ -3509,8 +3589,10 @@ def _hierarchy_spent_evidence_contract(
         "schema_version": STAGE1_HIERARCHY_SPENT_CONTRACT_SCHEMA,
         "review_rounds": review_rounds,
         "partition_authority": ("canonical_stage1_inner_heldout_partitions_in_registry_order"),
-        "initial_spent_partition_count": 3,
-        "canonical_hierarchy_partition_count": review_rounds + 3,
+        "initial_spent_partition_count": int(initial_training_partitions),
+        "canonical_hierarchy_partition_count": (
+            review_rounds + int(initial_training_partitions)
+        ),
         "interaction_inner_folds": interaction_inner_folds,
         "tfidf_nested_calibration_folds": tfidf_nested_calibration_folds,
         "fold_domains_are_distinct": True,
@@ -3933,6 +4015,12 @@ def _validate_cumulative_spent_embedding_index(
                 "outcome_type": capture["outcome_type"],
                 "seed": capture["seed"],
                 "embedding_config": copy.deepcopy(capture["embedding_config"]),
+                "semantic_witness_scientific_config": copy.deepcopy(
+                    capture["semantic_witness_scientific_config"]
+                ),
+                "semantic_witness_scientific_config_sha256": str(
+                    capture["semantic_witness_scientific_config_sha256"]
+                ),
                 "tfidf_nested_calibration_folds": int(
                     capture["tfidf_training_scope_policy"]["configured_fold_count"]
                 ),
@@ -4481,7 +4569,8 @@ def _validate_cumulative_spent_remaining_index(
                 len(set(metadata_paths.values())) != 1
                 or len(set(model_paths.values())) != 1
                 or len(set(source_paths.values())) != 1
-                or metadata_path.parent != model_paths[TFIDF_TOPICS].parent
+                or model_paths[TFIDF_TOPICS]
+                != metadata_path.parent / "fitted_context" / "index.json"
                 or metadata_path != metadata_path.parent / "context_metadata.json"
             ):
                 raise ValueError("cumulative TF-IDF families do not share one native fit")
@@ -6185,6 +6274,13 @@ def _register_tfidf_native_family_proofs(
         str(artifacts.get("fitted_context") or ""),
         field_name="TF-IDF fitted context",
     )
+    if model_path.name != TFIDF_SAFE_INDEX_FILENAME:
+        raise ValueError(
+            "TF-IDF fitted context must use the closed JSON/NPY safe artifact schema"
+        )
+    # This authenticates every registered NPY payload and the closed directory,
+    # not only the small index bytes later bound by the native-family proof.
+    safe_artifact_content_sha256(model_path)
     source_path = _component_regular_file(
         root,
         str(artifacts.get("topic_score_tests") or ""),
@@ -6192,7 +6288,7 @@ def _register_tfidf_native_family_proofs(
     )
     metadata_path = _component_regular_file(
         root,
-        model_path.parent / "context_metadata.json",
+        model_path.parent.parent / "context_metadata.json",
         field_name="TF-IDF context metadata",
     )
     try:
@@ -6499,8 +6595,185 @@ def _load_serialized_mapping(path: Path) -> Mapping[str, Any]:
     return value
 
 
-def load_applied_stage1_config(path: Path | str) -> AppliedInferenceConfig:
-    """Load a raw, experiment, or historical Stage 1 config without its secrets."""
+_PRODUCTION_STAGE1_EXTERNALLY_OWNED_PATHS = (
+    "dataset_path",
+    "architecture.htr_require_live_unfrozen_encoder_attestation",
+    "architecture.agentic_feature_search.agent_enable_thinking",
+    "architecture.agentic_feature_search.agent_thinking_token_budget",
+    "architecture.multi_model_agentic_forest",
+    "architecture.multi_model_forest.split_registry_path",
+    "explicit_features",
+)
+
+
+def _validate_closed_explicit_config_tree(
+    provided: Any,
+    expected: Any,
+    *,
+    path: tuple[str, ...],
+    optional_keys: frozenset[str] = frozenset(),
+) -> None:
+    """Require every field in one scientifically active config subtree.
+
+    Values remain configurable; this checks only that production did not obtain
+    a scientific setting by silently instantiating a dataclass default.
+    """
+
+    dotted = ".".join(path)
+    if not isinstance(expected, Mapping):
+        if isinstance(expected, list) and expected and isinstance(expected[0], Mapping):
+            if not isinstance(provided, list):
+                raise ValueError(f"{dotted} must be an explicitly configured list")
+            for index, child in enumerate(provided):
+                _validate_closed_explicit_config_tree(
+                    child,
+                    expected[0],
+                    path=(*path, str(index)),
+                )
+        return
+    if not isinstance(provided, Mapping):
+        raise ValueError(f"{dotted} must be an explicitly configured object")
+    missing = sorted(set(expected) - set(provided) - set(optional_keys))
+    extra = sorted(set(provided) - set(expected))
+    if missing:
+        raise ValueError(
+            "production Stage 1 scientific profile would inherit dataclass defaults; "
+            f"{dotted} is missing: {', '.join(missing)}"
+        )
+    if extra:
+        raise ValueError(
+            "production Stage 1 scientific profile has unsupported fields; "
+            f"{dotted} contains: {', '.join(extra)}"
+        )
+    for key in sorted(set(expected) & set(provided)):
+        _validate_closed_explicit_config_tree(
+            provided[key],
+            expected[key],
+            path=(*path, str(key)),
+        )
+
+
+def validate_production_stage1_profile_explicitness(
+    applied: Mapping[str, Any],
+) -> None:
+    """Fail closed when an active Stage 1 setting is absent from its profile.
+
+    The generic experiment loader intentionally keeps backwards-compatible
+    dataclass defaults.  The production all-evidence builder cannot: a newly
+    added training, HTR, forest, TF-IDF, or evidence-family field must be
+    reviewed and written into the scientific profile before it can affect a
+    run.  Deployment-bound paths and the Stage 2 extraction protocol are
+    intentionally outside this Stage 1 profile contract.
+    """
+
+    if not isinstance(applied, Mapping):
+        raise ValueError("production Stage 1 profile must contain one config object")
+    template = asdict(AppliedInferenceConfig())
+    architecture = applied.get("architecture")
+    expected_architecture = template["architecture"]
+    if not isinstance(architecture, Mapping):
+        raise ValueError("production Stage 1 profile has no architecture object")
+
+    required_root_fields = {
+        "clinical_question",
+        "outcome_type",
+        "text_column",
+        "outcome_column",
+        "treatment_column",
+        "cv_folds",
+        "training",
+    }
+    missing_root = sorted(required_root_fields - set(applied))
+    if missing_root:
+        raise ValueError(
+            "production Stage 1 scientific profile would inherit dataclass defaults; "
+            "config is missing: " + ", ".join(missing_root)
+        )
+
+    required_architecture_fields = {
+        "model_type",
+        "feature_extractor_type",
+        "causal_head_representation_dim",
+        "causal_head_hidden_outcome_dim",
+        "causal_head_dropout",
+        *(
+            key
+            for key in expected_architecture
+            if key.startswith("htr_")
+        ),
+    }
+    missing_architecture = sorted(required_architecture_fields - set(architecture))
+    if missing_architecture:
+        raise ValueError(
+            "production Stage 1 scientific profile would inherit dataclass defaults; "
+            "architecture is missing: " + ", ".join(missing_architecture)
+        )
+
+    _validate_closed_explicit_config_tree(
+        applied["training"],
+        template["training"],
+        path=("training",),
+    )
+    for section in (
+        "agentic_attention_variable_forest",
+        "explicit_feature_forest",
+        "multi_model_forest",
+    ):
+        if section not in architecture:
+            raise ValueError(
+                "production Stage 1 scientific profile would inherit dataclass defaults; "
+                f"architecture is missing: {section}"
+            )
+        _validate_closed_explicit_config_tree(
+            architecture[section],
+            expected_architecture[section],
+            path=("architecture", section),
+            optional_keys=(
+                frozenset({"split_registry_path"})
+                if section == "multi_model_forest"
+                else frozenset()
+            ),
+        )
+        if section == "multi_model_forest":
+            configured_views = architecture[section].get("bow_views")
+            if architecture[section].get("bow_discovery_enabled") is True and (
+                not isinstance(configured_views, list) or not configured_views
+            ):
+                raise ValueError(
+                    "production Stage 1 requires an explicitly configured nonempty "
+                    "architecture.multi_model_forest.bow_views list when BoW "
+                    "discovery is enabled; refusing the legacy implicit view grid"
+                )
+
+    search = architecture.get("agentic_feature_search")
+    if not isinstance(search, Mapping):
+        raise ValueError(
+            "production Stage 1 scientific profile has no "
+            "architecture.agentic_feature_search object"
+        )
+    required_search_fields = {
+        "clinical_text_examples_per_prompt",
+        "clinical_text_example_chars",
+    }
+    missing_search = sorted(required_search_fields - set(search))
+    if missing_search:
+        raise ValueError(
+            "production Stage 1 scientific profile would inherit dataclass defaults; "
+            "architecture.agentic_feature_search is missing: "
+            + ", ".join(missing_search)
+        )
+
+
+def load_applied_stage1_config(
+    path: Path | str,
+    *,
+    require_explicit_scientific_fields: bool = False,
+) -> AppliedInferenceConfig:
+    """Load a raw, experiment, or historical Stage 1 config without its secrets.
+
+    ``require_explicit_scientific_fields`` is reserved for production builds.
+    Generic and legacy readers retain their backwards-compatible behavior.
+    """
 
     requested = Path(path).resolve(strict=True)
     payload = copy.deepcopy(dict(_load_serialized_mapping(requested)))
@@ -6510,6 +6783,8 @@ def load_applied_stage1_config(path: Path | str) -> AppliedInferenceConfig:
         applied = copy.deepcopy(dict(payload["applied_inference"]))
     else:
         applied = payload
+    if require_explicit_scientific_fields:
+        validate_production_stage1_profile_explicitness(applied)
     architecture = applied.get("architecture")
     if not isinstance(architecture, Mapping):
         raise ValueError("Stage 1 config has no architecture object")
@@ -6987,13 +7262,15 @@ def _validate_effective_config(
     embedding = nn_config.embedding_contrast
     if not embedding.enabled or not embedding.include_cluster_contrast_vectors:
         raise ValueError("production Stage 1 requires whole-cohort and clustered embeddings")
-    if int(embedding.cluster_contrast_max_components) < 2:
+    cluster_scientific = _cluster_local_scientific_config(embedding)
+    if int(cluster_scientific.maximum_components_per_family) < 2:
         raise ValueError(
             "production clustered embeddings require at least two emitted components per SVD family"
         )
-    if str(embedding.chunk_selection).strip().lower() != "last":
+    if str(embedding.chunk_selection).strip().lower() not in {"first", "last"}:
         raise ValueError(
-            "the authenticated production embedding cache requires last-chunk selection"
+            "the authenticated production embedding cache requires an explicit "
+            "first/last chunk-selection policy"
         )
     if list(embedding.residualize_columns):
         raise ValueError(
@@ -7003,10 +7280,10 @@ def _validate_effective_config(
         raise ValueError("multi_model_forest.require_honest_outer_split must be true")
     if not nn_config.candidate_consistency_enabled:
         raise ValueError("exact-inner candidate-consistency evidence must be enabled")
-    if int(nn_config.candidate_consistency_inner_folds) < 4:
+    if int(nn_config.candidate_consistency_inner_folds) < 2:
         raise ValueError(
-            "hierarchical Stage 1 requires at least four candidate-consistency inner "
-            "folds: three initially spent partitions and at least one review gate"
+            "hierarchical Stage 1 requires at least two candidate-consistency "
+            "inner folds so configured initial training has a review gate"
         )
     if str(nn_config.structured_effect_estimator).strip().lower() != "causal_forest":
         raise ValueError("the structured effect estimator must remain causal_forest")
@@ -7068,6 +7345,8 @@ def _embedding_chunk_configuration(config: AppliedInferenceConfig) -> Mapping[st
 def _validate_cache_configuration(
     cache: SpentOnlyFrozenChunkEmbeddingCache,
     config: AppliedInferenceConfig,
+    *,
+    cache_configuration: Mapping[str, Any] | None = None,
 ) -> None:
     metadata = cache.metadata
     embedding = config.architecture.multi_model_forest.embedding_contrast
@@ -7088,6 +7367,18 @@ def _validate_cache_configuration(
             "frozen embedding cache does not match effective Stage 1 config: "
             + _canonical_json(mismatches)
         )
+    if cache_configuration is not None:
+        provenance = metadata.get("production_provenance")
+        observed_configuration = (
+            provenance.get("chunk_configuration")
+            if isinstance(provenance, Mapping)
+            else None
+        )
+        if observed_configuration != dict(cache_configuration):
+            raise ValueError(
+                "frozen embedding cache does not match the typed scientific "
+                "encoder/output configuration"
+            )
 
 
 def build_canonical_split_registry(
@@ -7264,7 +7555,21 @@ def _registry_scopes(registry: Mapping[str, Any]) -> tuple[Mapping[str, Any], ..
 class _EmbeddingClusterPreflightObserver:
     """Retain only the native KMeans/SVD state needed by readiness preflight."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        fit_row_ids: Sequence[int],
+        canonical_group_seed: int,
+    ) -> None:
+        self.fit_row_ids = tuple(map(int, fit_row_ids))
+        self.seed = int(canonical_group_seed)
+        if (
+            not self.fit_row_ids
+            or len(self.fit_row_ids) != len(set(self.fit_row_ids))
+            or isinstance(canonical_group_seed, bool)
+            or not 0 <= self.seed < 2**31
+        ):
+            raise ValueError("cluster preflight observer authority is invalid")
         self.kmeans: dict[str, Any] | None = None
         self.svds: list[dict[str, Any]] = []
         self.evidence: Mapping[str, Any] | None = None
@@ -7275,6 +7580,13 @@ class _EmbeddingClusterPreflightObserver:
         self.kmeans = {
             "fit_row_ids": list(map(int, kwargs["fit_row_ids"])),
             "parameters": copy.deepcopy(dict(kwargs["parameters"])),
+            "scientific_configuration": copy.deepcopy(
+                dict(kwargs["scientific_configuration"])
+            ),
+            "canonical_group_seed": int(kwargs["canonical_group_seed"]),
+            "ordered_fit_row_seed_policy": str(
+                kwargs["ordered_fit_row_seed_policy"]
+            ),
             "usable_mask": np.asarray(kwargs["usable_mask"], dtype=np.bool_).copy(),
             "cluster_labels": np.asarray(kwargs["cluster_labels"], dtype=np.int64).copy(),
             "cluster_centers": np.asarray(kwargs["cluster_centers"], dtype=np.float64).copy(),
@@ -7294,8 +7606,38 @@ class _EmbeddingClusterPreflightObserver:
                 "weighted_matrix": np.asarray(kwargs["weighted_matrix"], dtype=np.float64).copy(),
                 "singular_values": np.asarray(kwargs["singular_values"], dtype=np.float64).copy(),
                 "components": np.asarray(kwargs["components"], dtype=np.float64).copy(),
+                "parameters": copy.deepcopy(dict(kwargs["parameters"])),
+                "sign_canonicalization_policy": str(
+                    kwargs["sign_canonicalization_policy"]
+                ),
+                "rank_tolerance_policy": str(kwargs["rank_tolerance_policy"]),
+                "rank_tolerance_dtype": str(kwargs["rank_tolerance_dtype"]),
+                "rank_tolerance_multiplier": float(
+                    kwargs["rank_tolerance_multiplier"]
+                ),
+                "rank_tolerance": float(kwargs["rank_tolerance"]),
+                "numerical_rank": int(kwargs["numerical_rank"]),
+                "replay_comparison_policy": str(
+                    kwargs["replay_comparison_policy"]
+                ),
+                "replay_relative_tolerance": float(
+                    kwargs["replay_relative_tolerance"]
+                ),
+                "replay_absolute_tolerance": float(
+                    kwargs["replay_absolute_tolerance"]
+                ),
             }
         )
+
+    def record_cluster_only_build(self, **kwargs: Any) -> None:
+        if self.evidence is not None:
+            raise RuntimeError("embedding cluster preflight observed evidence twice")
+        evidence = kwargs.get("evidence")
+        if not isinstance(evidence, Mapping):
+            raise TypeError("embedding cluster preflight received malformed evidence")
+        if evidence.get("execution_mode") != "cluster_only_no_probe_or_whole_cohort_v1":
+            raise ValueError("embedding cluster preflight executed another evidence mode")
+        self.evidence = evidence
 
     def record_build(self, **kwargs: Any) -> None:
         if self.evidence is not None:
@@ -7308,12 +7650,16 @@ class _EmbeddingClusterPreflightObserver:
 
 def _embedding_cluster_feasibility_scopes(
     registry: Mapping[str, Any],
+    *,
+    initial_training_partitions: int,
+    global_seed: int,
 ) -> tuple[Mapping[str, Any], ...]:
     """Enumerate every native embedding fit in its authoritative row order."""
 
     rows: list[dict[str, Any]] = []
     for scope in _registry_scopes(registry):
         inner_fold = scope.get("inner_fold")
+        fit_rows = tuple(map(int, scope["fit_row_ids"]))
         rows.append(
             {
                 "scope_id": str(scope["scope_id"]),
@@ -7322,12 +7668,17 @@ def _embedding_cluster_feasibility_scopes(
                 "inner_fold": None if inner_fold is None else int(inner_fold),
                 "context_epoch": None,
                 "provider_inner_fold": None,
-                "fit_row_ids": tuple(map(int, scope["fit_row_ids"])),
+                "fit_row_ids": fit_rows,
                 "heldout_row_ids": tuple(map(int, scope["heldout_row_ids"])),
+                "scope_seed": derive_stage1_group_seed(global_seed, fit_rows),
             }
         )
-    schedule = _canonical_cumulative_spent_schedule(registry)
+    schedule = _canonical_cumulative_spent_schedule(
+        registry,
+        initial_training_partitions=initial_training_partitions,
+    )
     for scope in schedule.scopes:
+        fit_rows = tuple(map(int, scope.spent_row_ids))
         rows.append(
             {
                 "scope_id": str(scope.scope_id),
@@ -7338,8 +7689,9 @@ def _embedding_cluster_feasibility_scopes(
                 "provider_inner_fold": int(scope.provider_inner_fold),
                 # Do not sort or set-normalize these rows. MiniBatchKMeans and
                 # the cumulative schedule both bind the supplied order.
-                "fit_row_ids": tuple(map(int, scope.spent_row_ids)),
+                "fit_row_ids": fit_rows,
                 "heldout_row_ids": tuple(map(int, scope.sealed_row_ids)),
+                "scope_seed": derive_stage1_group_seed(global_seed, fit_rows),
             }
         )
     scope_ids = [row["scope_id"] for row in rows]
@@ -7364,7 +7716,131 @@ def _embedding_cluster_scope_binding(scope: Mapping[str, Any]) -> dict[str, Any]
         "heldout_row_count": len(heldout_rows),
         "fit_row_order_fingerprint": row_order_fingerprint(fit_rows),
         "heldout_row_order_fingerprint": row_order_fingerprint(heldout_rows),
+        "canonical_group_seed": int(scope["scope_seed"]),
     }
+
+
+def _embedding_cluster_physical_scope_groups(
+    scopes: Sequence[Mapping[str, Any]],
+) -> tuple[tuple[Mapping[str, Any], tuple[Mapping[str, Any], ...]], ...]:
+    """Group scopes only by exact ordered rows and canonical group seed."""
+
+    groups: dict[tuple[tuple[int, ...], int], list[Mapping[str, Any]]] = {}
+    scope_ids: set[str] = set()
+    for raw in scopes:
+        scope = copy.deepcopy(dict(raw))
+        scope_id = str(scope.get("scope_id") or "")
+        fit_rows = tuple(map(int, scope.get("fit_row_ids") or ()))
+        scope_seed = scope.get("scope_seed")
+        if (
+            not scope_id
+            or scope_id in scope_ids
+            or not fit_rows
+            or len(fit_rows) != len(set(fit_rows))
+            or isinstance(scope_seed, bool)
+            or not isinstance(scope_seed, int)
+        ):
+            raise ValueError(
+                "cluster preflight cannot group malformed logical scopes"
+            )
+        scope_ids.add(scope_id)
+        groups.setdefault((fit_rows, int(scope_seed)), []).append(scope)
+    output: list[
+        tuple[Mapping[str, Any], tuple[Mapping[str, Any], ...]]
+    ] = []
+    for members in groups.values():
+        owner = members[0]
+        owner_rows = tuple(map(int, owner["fit_row_ids"]))
+        owner_seed = int(owner["scope_seed"])
+        if any(
+            tuple(map(int, member["fit_row_ids"])) != owner_rows
+            or int(member["scope_seed"]) != owner_seed
+            or int(member["outer_fold"]) != int(owner["outer_fold"])
+            for member in members
+        ):
+            raise RuntimeError(
+                "cluster preflight physical equivalence changed"
+            )
+        output.append((owner, tuple(members)))
+    return tuple(output)
+
+
+def _embedding_cluster_physical_fit_binding(
+    *,
+    logical_scope: Mapping[str, Any],
+    physical_owner: Mapping[str, Any],
+    cluster_fit_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    logical_id = str(logical_scope["scope_id"])
+    owner_id = str(physical_owner["scope_id"])
+    logical_rows = tuple(map(int, logical_scope["fit_row_ids"]))
+    owner_rows = tuple(map(int, physical_owner["fit_row_ids"]))
+    if (
+        logical_rows != owner_rows
+        or int(logical_scope["scope_seed"]) != int(physical_owner["scope_seed"])
+        or cluster_fit_identity.get("scope_id") != owner_id
+        or cluster_fit_identity.get("fit_row_ids") != list(owner_rows)
+        or cluster_fit_identity.get("canonical_group_seed")
+        != int(physical_owner["scope_seed"])
+    ):
+        raise ValueError(
+            "cluster preflight logical scope differs from its physical fit"
+        )
+    body = {
+        "schema_version": (
+            "production_stage1_cluster_preflight_physical_binding_v2"
+        ),
+        "logical_scope_id": logical_id,
+        "physical_owner_scope_id": owner_id,
+        "reuses_physical_fit": logical_id != owner_id,
+        "fit_row_order_sha256": _sha256_json(list(logical_rows)),
+        "logical_fit_row_order_fingerprint": row_order_fingerprint(
+            logical_rows
+        ),
+        "canonical_fit_row_order_fingerprint": row_order_fingerprint(
+            owner_rows
+        ),
+        "canonical_group_seed": int(physical_owner["scope_seed"]),
+        "canonical_cluster_fit_identity_content_sha256": (
+            cluster_fit_identity["content_sha256"]
+        ),
+        "same_ordered_fit_rows_and_seed_proved": True,
+        "logical_alias_refit_performed": False,
+    }
+    return {**body, "content_sha256": _sha256_json(body)}
+
+
+def _bind_embedding_cluster_scope_to_physical_fit(
+    *,
+    logical_scope: Mapping[str, Any],
+    physical_owner: Mapping[str, Any],
+    physical_audit: Mapping[str, Any],
+    copy_physical_payload: bool = True,
+) -> dict[str, Any]:
+    """Emit one logical record that references one canonical fitted result."""
+
+    fit_identity = physical_audit.get("cluster_fit_identity")
+    if not isinstance(fit_identity, Mapping):
+        raise ValueError("physical cluster preflight result has no fit identity")
+    output = (
+        copy.deepcopy(dict(physical_audit))
+        if copy_physical_payload
+        else dict(physical_audit)
+    )
+    output.update(_embedding_cluster_scope_binding(logical_scope))
+    output["cluster_fit_identity"] = (
+        copy.deepcopy(dict(fit_identity))
+        if copy_physical_payload
+        else fit_identity
+    )
+    output["physical_fit_binding"] = (
+        _embedding_cluster_physical_fit_binding(
+            logical_scope=logical_scope,
+            physical_owner=physical_owner,
+            cluster_fit_identity=fit_identity,
+        )
+    )
+    return output
 
 
 def _embedding_cluster_configuration(
@@ -7377,10 +7853,23 @@ def _embedding_cluster_configuration(
             raise ValueError("Stage 1 request lacks its clustered embedding configuration") from exc
         if not isinstance(embedding, Mapping):
             raise ValueError("Stage 1 request has a malformed clustered embedding configuration")
-        return canonical_logical_embedding_config(embedding)
-    return canonical_logical_embedding_config(
+        logical = canonical_logical_embedding_config(embedding)
+        _cluster_local_scientific_config(logical)
+        return logical
+    logical = canonical_logical_embedding_config(
         config.architecture.multi_model_forest.embedding_contrast
     )
+    _cluster_local_scientific_config(logical)
+    return logical
+
+
+def _embedding_cluster_global_seed(
+    config: AppliedInferenceConfig | Mapping[str, Any],
+) -> int:
+    raw = config.get("seed") if isinstance(config, Mapping) else config.seed
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        raise ValueError("Stage 1 clustered embedding requires a nonnegative global seed")
+    return int(raw)
 
 
 _EMBEDDING_CLUSTER_CONTRAST_FAMILIES = (
@@ -7620,6 +8109,9 @@ def _embedding_cluster_fit_identity(
     required_kmeans = {
         "fit_row_ids",
         "parameters",
+        "scientific_configuration",
+        "canonical_group_seed",
+        "ordered_fit_row_seed_policy",
         "usable_mask",
         "cluster_labels",
         "cluster_centers",
@@ -7637,6 +8129,16 @@ def _embedding_cluster_fit_identity(
             "weighted_matrix",
             "singular_values",
             "components",
+            "parameters",
+            "sign_canonicalization_policy",
+            "rank_tolerance_policy",
+            "rank_tolerance_dtype",
+            "rank_tolerance_multiplier",
+            "rank_tolerance",
+            "numerical_rank",
+            "replay_comparison_policy",
+            "replay_relative_tolerance",
+            "replay_absolute_tolerance",
         }:
             raise ValueError("cluster fit identity received incomplete SVD state")
         normalized_svds.append(
@@ -7646,6 +8148,26 @@ def _embedding_cluster_fit_identity(
                 "weighted_matrix": _cluster_array_identity(resolve(state["weighted_matrix"])),
                 "singular_values": _cluster_array_identity(resolve(state["singular_values"])),
                 "components": _cluster_array_identity(resolve(state["components"])),
+                "parameters": copy.deepcopy(dict(state["parameters"])),
+                "sign_canonicalization_policy": str(
+                    state["sign_canonicalization_policy"]
+                ),
+                "rank_tolerance_policy": str(state["rank_tolerance_policy"]),
+                "rank_tolerance_dtype": str(state["rank_tolerance_dtype"]),
+                "rank_tolerance_multiplier_hex": float(
+                    state["rank_tolerance_multiplier"]
+                ).hex(),
+                "rank_tolerance_hex": float(state["rank_tolerance"]).hex(),
+                "numerical_rank": int(state["numerical_rank"]),
+                "replay_comparison_policy": str(
+                    state["replay_comparison_policy"]
+                ),
+                "replay_relative_tolerance_hex": float(
+                    state["replay_relative_tolerance"]
+                ).hex(),
+                "replay_absolute_tolerance_hex": float(
+                    state["replay_absolute_tolerance"]
+                ).hex(),
             }
         )
     if [row["family_key"] for row in normalized_svds] != [
@@ -7677,6 +8199,16 @@ def _embedding_cluster_fit_identity(
         "scope_id": str(scope_id),
         "fit_row_ids": list(rows),
         "fit_row_order_fingerprint": row_order_fingerprint(rows),
+        "canonical_group_seed": int(kmeans_state["canonical_group_seed"]),
+        "ordered_fit_row_seed_policy": str(
+            kmeans_state["ordered_fit_row_seed_policy"]
+        ),
+        "cluster_scientific_configuration": copy.deepcopy(
+            dict(kmeans_state["scientific_configuration"])
+        ),
+        "cluster_scientific_configuration_sha256": _sha256_json(
+            kmeans_state["scientific_configuration"]
+        ),
         "kmeans": {
             "parameters": copy.deepcopy(dict(kmeans_state["parameters"])),
             "usable_mask": _cluster_array_identity(resolve(kmeans_state["usable_mask"])),
@@ -7688,13 +8220,17 @@ def _embedding_cluster_fit_identity(
         },
         "svd_families": normalized_svds,
         "raw_cluster_concepts": raw_rows,
-        "raw_cluster_concepts_sha256": _sha256_json(raw_rows),
+        "raw_cluster_concepts_sha256": _sha256_json_streaming(raw_rows),
         "semantic_cluster_concepts": semantic_rows,
-        "semantic_cluster_concepts_sha256": _sha256_json(semantic_rows),
+        "semantic_cluster_concepts_sha256": _sha256_json_streaming(
+            semantic_rows
+        ),
         "final_catalog_concepts": catalog_concepts,
-        "final_catalog_concepts_sha256": _sha256_json(catalog_concepts),
+        "final_catalog_concepts_sha256": _sha256_json_streaming(
+            catalog_concepts
+        ),
     }
-    return {**body, "content_sha256": _sha256_json(body)}
+    return {**body, "content_sha256": _sha256_json_streaming(body)}
 
 
 def _embedding_only_cluster_catalog(
@@ -7756,12 +8292,17 @@ def _validate_embedding_cluster_fit_identity(
     *,
     scope_id: str,
     fit_row_ids: Sequence[int],
+    copy_result: bool = True,
 ) -> dict[str, Any]:
     fields = {
         "schema_version",
         "scope_id",
         "fit_row_ids",
         "fit_row_order_fingerprint",
+        "canonical_group_seed",
+        "ordered_fit_row_seed_policy",
+        "cluster_scientific_configuration",
+        "cluster_scientific_configuration_sha256",
         "kmeans",
         "svd_families",
         "raw_cluster_concepts",
@@ -7774,20 +8315,31 @@ def _validate_embedding_cluster_fit_identity(
     }
     if not isinstance(value, Mapping) or set(value) != fields:
         raise ValueError("cluster fit identity has an invalid closed schema")
-    body = {key: copy.deepcopy(child) for key, child in value.items() if key != "content_sha256"}
+    body = {
+        key: child
+        for key, child in value.items()
+        if key != "content_sha256"
+    }
     rows = list(map(int, fit_row_ids))
     if (
         value.get("schema_version") != STAGE1_EMBEDDING_CLUSTER_FIT_IDENTITY_SCHEMA
         or value.get("scope_id") != str(scope_id)
         or value.get("fit_row_ids") != rows
         or value.get("fit_row_order_fingerprint") != row_order_fingerprint(rows)
-        or value.get("content_sha256") != _sha256_json(body)
+        or isinstance(value.get("canonical_group_seed"), bool)
+        or not isinstance(value.get("canonical_group_seed"), int)
+        or value.get("ordered_fit_row_seed_policy")
+        != "canonical_ordered_fit_rows_group_seed_v1"
+        or not isinstance(value.get("cluster_scientific_configuration"), Mapping)
+        or value.get("cluster_scientific_configuration_sha256")
+        != _sha256_json(value.get("cluster_scientific_configuration"))
+        or value.get("content_sha256") != _sha256_json_streaming(body)
         or value.get("raw_cluster_concepts_sha256")
-        != _sha256_json(value.get("raw_cluster_concepts"))
+        != _sha256_json_streaming(value.get("raw_cluster_concepts"))
         or value.get("semantic_cluster_concepts_sha256")
-        != _sha256_json(value.get("semantic_cluster_concepts"))
+        != _sha256_json_streaming(value.get("semantic_cluster_concepts"))
         or value.get("final_catalog_concepts_sha256")
-        != _sha256_json(value.get("final_catalog_concepts"))
+        != _sha256_json_streaming(value.get("final_catalog_concepts"))
         or not isinstance(value.get("kmeans"), Mapping)
         or not isinstance(value.get("svd_families"), list)
         or len(value["svd_families"]) != 2
@@ -7812,7 +8364,7 @@ def _validate_embedding_cluster_fit_identity(
             or _HEX_SHA256.fullmatch(str(array.get("sha256") or "")) is None
         ):
             raise ValueError("cluster fit identity has an invalid array binding")
-    return copy.deepcopy(dict(value))
+    return copy.deepcopy(dict(value)) if copy_result else dict(value)
 
 
 def _validate_embedding_cluster_component_coverage_audit(
@@ -7945,20 +8497,25 @@ def validate_embedding_cluster_feasibility_audit(
     registry: Mapping[str, Any],
     registry_content_sha256: str,
     embedding_cache_identity: Mapping[str, Any],
+    initial_training_partitions: int,
+    copy_result: bool = True,
+    verify_aggregate_content_hash: bool = True,
 ) -> Mapping[str, Any]:
     """Validate the closed, input-bound all-scope clustered-embedding audit."""
 
     if not isinstance(audit, Mapping):
         raise ValueError("embedding cluster feasibility audit must be one mapping")
     embedding_configuration = _embedding_cluster_configuration(config)
-    try:
-        configured_cluster_count = int(embedding_configuration["cluster_contrast_n_clusters"])
-        configured_max_components = int(embedding_configuration["cluster_contrast_max_components"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("clustered embedding configuration lacks its fixed architecture") from exc
+    cluster_scientific = _cluster_local_scientific_config(
+        embedding_configuration
+    )
+    configured_cluster_count = int(cluster_scientific.requested_cluster_count)
+    configured_max_components = int(
+        cluster_scientific.maximum_components_per_family
+    )
     if configured_cluster_count < 2 or configured_max_components < 2:
         raise ValueError("clustered embedding configuration cannot emit two-family rank-two proof")
-    fields = {
+    legacy_fields = {
         "schema_version",
         "split_registry_content_sha256",
         "embedding_configuration_sha256",
@@ -7986,14 +8543,55 @@ def validate_embedding_cluster_feasibility_audit(
         "semantic_member_limit",
         "content_sha256",
     }
-    body = {key: copy.deepcopy(value) for key, value in audit.items() if key != "content_sha256"}
-    expected_scopes = _embedding_cluster_feasibility_scopes(registry)
+    physical_fields = {
+        "physical_fit_count",
+        "deduplicated_fit_count",
+        "physical_scope_order",
+        "physical_fit_execution_policy",
+        "all_logical_scopes_bound_to_physical_fit",
+    }
+    body = {
+        key: value
+        for key, value in audit.items()
+        if key != "content_sha256"
+    }
+    initial_partitions = int(initial_training_partitions)
+    if initial_partitions < 1:
+        raise ValueError("initial_training_partitions must be at least one")
+    expected_scopes = _embedding_cluster_feasibility_scopes(
+        registry,
+        initial_training_partitions=initial_partitions,
+        global_seed=_embedding_cluster_global_seed(config),
+    )
+    physical_groups = _embedding_cluster_physical_scope_groups(
+        expected_scopes
+    )
+    physical_owner_by_scope = {
+        str(member["scope_id"]): owner
+        for owner, members in physical_groups
+        for member in members
+    }
+    physical_scope_order = [
+        str(owner["scope_id"]) for owner, _members in physical_groups
+    ]
     expected_bindings = [_embedding_cluster_scope_binding(scope) for scope in expected_scopes]
     observed_scopes = audit.get("scopes")
+    observed_fields = set(audit)
+    is_physical_deduplicated = observed_fields == (
+        legacy_fields | physical_fields
+    )
     if (
-        set(audit) != fields
+        frozenset(observed_fields) != frozenset(legacy_fields | physical_fields)
         or audit.get("schema_version") != STAGE1_EMBEDDING_CLUSTER_FEASIBILITY_AUDIT_SCHEMA
-        or audit.get("content_sha256") != _sha256_json(body)
+        or _HEX_SHA256.fullmatch(
+            str(audit.get("content_sha256") or "")
+        )
+        is None
+        or (
+            verify_aggregate_content_hash
+            and audit.get("content_sha256")
+            != _sha256_json_streaming(body)
+        )
         or audit.get("split_registry_content_sha256") != str(registry_content_sha256)
         or audit.get("embedding_configuration_sha256") != _sha256_json(embedding_configuration)
         or audit.get("embedding_cache_identity_sha256")
@@ -8003,7 +8601,8 @@ def validate_embedding_cluster_feasibility_audit(
         or audit.get("required_svd_families") != ["treatment", "residualized_interaction"]
         or audit.get("configured_cluster_count") != configured_cluster_count
         or audit.get("configured_max_components") != configured_max_components
-        or audit.get("minimum_grounded_components_per_svd_family") != 2
+        or audit.get("minimum_grounded_components_per_svd_family")
+        != int(cluster_scientific.minimum_numerical_rank_per_family)
         or audit.get("token_bounded_row_count") != 0
         or audit.get("token_bounded_row_ids_sha256") != _sha256_json([])
         or not isinstance(observed_scopes, list)
@@ -8024,9 +8623,25 @@ def validate_embedding_cluster_feasibility_audit(
         or audit.get("fallback_used") is not False
         or audit.get("rank_one_support_allowed") is not False
         or audit.get("semantic_member_limit") is not None
+        or (
+            is_physical_deduplicated
+            and (
+                audit.get("physical_fit_count") != len(physical_groups)
+                or audit.get("deduplicated_fit_count")
+                != len(expected_scopes) - len(physical_groups)
+                or audit.get("physical_scope_order")
+                != physical_scope_order
+                or audit.get("physical_fit_execution_policy")
+                != "fit_each_exact_order_seed_equivalent_group_once_earliest_owner_v2"
+                or audit.get(
+                    "all_logical_scopes_bound_to_physical_fit"
+                )
+                is not True
+            )
+        )
     ):
         raise ValueError("embedding cluster feasibility audit has an invalid closed envelope")
-    scope_fields = {
+    legacy_scope_fields = {
         *set(expected_bindings[0]),
         "cluster_fit_identity",
         "cluster_support_contract",
@@ -8045,17 +8660,27 @@ def validate_embedding_cluster_feasibility_audit(
         "component_coverage_by_family",
         "uncapped_semantic_projection",
     }
+    physical_scope_fields = legacy_scope_fields | {"physical_fit_binding"}
     required_families = {
         "cluster_local_treatment_contrast_basis",
         "cluster_local_residualized_interaction_contrast_basis",
     }
+    validated_fit_identity_by_scope: dict[str, Mapping[str, Any]] = {}
     for expected_scope, expected, observed in zip(
         expected_scopes,
         expected_bindings,
         observed_scopes,
         strict=True,
     ):
-        if not isinstance(observed, Mapping) or set(observed) != scope_fields:
+        expected_scope_fields = (
+            physical_scope_fields
+            if is_physical_deduplicated
+            else legacy_scope_fields
+        )
+        if (
+            not isinstance(observed, Mapping)
+            or set(observed) != expected_scope_fields
+        ):
             raise ValueError("embedding cluster feasibility scope has an invalid schema")
         if any(observed.get(key) != value for key, value in expected.items()):
             raise ValueError("embedding cluster feasibility scope order or binding changed")
@@ -8064,6 +8689,9 @@ def validate_embedding_cluster_feasibility_audit(
             expected_kmeans_parameters = _embedding_cluster_kmeans_parameters(
                 embedding_configuration,
                 n_usable=int(observed.get("fit_row_count", 0)),
+                canonical_group_seed=int(
+                    expected.get("canonical_group_seed")
+                ),
             )
             validated_support = validate_embedding_cluster_support_contract(
                 support,
@@ -8074,18 +8702,46 @@ def validate_embedding_cluster_feasibility_audit(
                 observed.get("component_coverage_by_family"),
                 configured_max_components=configured_max_components,
             )
+            fit_authority = (
+                physical_owner_by_scope[str(expected["scope_id"])]
+                if is_physical_deduplicated
+                else expected_scope
+            )
             fitted_identity = _validate_embedding_cluster_fit_identity(
                 observed.get("cluster_fit_identity"),
-                scope_id=str(expected["scope_id"]),
-                fit_row_ids=expected_scope["fit_row_ids"],
+                scope_id=str(fit_authority["scope_id"]),
+                fit_row_ids=fit_authority["fit_row_ids"],
+                copy_result=copy_result,
             )
         except (TypeError, ValueError) as exc:
             raise ValueError(
                 f"embedding clustered architecture is infeasible in {expected['scope_id']}"
             ) from exc
+        if is_physical_deduplicated:
+            expected_physical_binding = (
+                _embedding_cluster_physical_fit_binding(
+                    logical_scope=expected_scope,
+                    physical_owner=fit_authority,
+                    cluster_fit_identity=fitted_identity,
+                )
+            )
+            if (
+                observed.get("physical_fit_binding")
+                != expected_physical_binding
+            ):
+                raise ValueError(
+                    "embedding cluster logical-to-physical binding changed"
+                )
+        validated_fit_identity_by_scope[str(expected["scope_id"])] = (
+            fitted_identity
+        )
         if (
             validated_support != support
             or fitted_identity != observed.get("cluster_fit_identity")
+            or fitted_identity.get("canonical_group_seed")
+            != expected.get("canonical_group_seed")
+            or fitted_identity.get("cluster_scientific_configuration")
+            != cluster_scientific.as_dict()
             or not isinstance(support, Mapping)
             or support.get("schema_version") != EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA
             or support.get("required_svd_families") != ["treatment", "residualized_interaction"]
@@ -8093,13 +8749,21 @@ def validate_embedding_cluster_feasibility_audit(
             or support.get("kmeans_usable_row_count") != observed.get("fit_row_count")
             or observed.get("token_bounded_row_count") != 0
             or observed.get("token_bounded_row_ids_sha256") != _sha256_json([])
-            or int(support.get("minimum_distinct_local_clusters_per_family", 0)) < 2
-            or int(support.get("minimum_numerical_rank_per_family", 0)) < 2
+            or support.get("minimum_distinct_local_clusters_per_family")
+            != int(
+                cluster_scientific.minimum_distinct_local_clusters_per_family
+            )
+            or support.get("minimum_numerical_rank_per_family")
+            != int(cluster_scientific.minimum_numerical_rank_per_family)
             or {row.get("family_key") for row in support.get("svd_families") or ()}
             != {"treatment", "residualized_interaction"}
             or any(
-                int(row.get("local_contrast_count", 0)) < 2
-                or int(row.get("numerical_rank", 0)) < 2
+                int(row.get("local_contrast_count", 0))
+                < int(
+                    cluster_scientific.minimum_distinct_local_clusters_per_family
+                )
+                or int(row.get("numerical_rank", 0))
+                < int(cluster_scientific.minimum_numerical_rank_per_family)
                 or float(row.get("second_singular_value", 0.0)) <= 0.0
                 for row in support.get("svd_families") or ()
             )
@@ -8128,7 +8792,21 @@ def validate_embedding_cluster_feasibility_audit(
             raise ValueError(
                 f"embedding clustered architecture is infeasible in {expected['scope_id']}"
             )
-    return copy.deepcopy(dict(audit))
+    if is_physical_deduplicated:
+        for owner, members in physical_groups:
+            canonical = validated_fit_identity_by_scope[
+                str(owner["scope_id"])
+            ]
+            if any(
+                validated_fit_identity_by_scope[str(member["scope_id"])]
+                != canonical
+                for member in members
+            ):
+                raise ValueError(
+                    "equivalent logical cluster scopes do not reference "
+                    "the same canonical fitted result"
+                )
+    return copy.deepcopy(dict(audit)) if copy_result else audit
 
 
 def _embedding_cluster_preflight_loky_scope(
@@ -8145,6 +8823,7 @@ def _embedding_cluster_preflight_loky_scope(
         "scope_id",
         "manifest_path",
         "manifest_content_sha256",
+        "initial_training_partitions",
     }
     if (
         not isinstance(payload, Mapping)
@@ -8165,14 +8844,28 @@ def _embedding_cluster_preflight_loky_scope(
         embedding_cache_identity=private.manifest["embedding_cache"]["logical_identity"],
         registry=private.scope_authority,
         registry_content_sha256=str(private.manifest["registry_content_sha256"]),
+        initial_training_partitions=int(payload["initial_training_partitions"]),
         preflight_workers=1,
+        semantic_witness_scientific_config=(
+            private.semantic_witness_scientific_config
+        ),
         _scope_subset=(copy.deepcopy(dict(private.scope)),),
         _return_scope_audits=True,
     )
     rows = result.get("_scope_audits") if isinstance(result, Mapping) else None
-    if not isinstance(rows, list) or len(rows) != 1 or rows[0].get("scope_id") != scope_id:
+    states = result.get("_scope_states") if isinstance(result, Mapping) else None
+    if (
+        not isinstance(rows, list)
+        or len(rows) != 1
+        or rows[0].get("scope_id") != scope_id
+        or not isinstance(states, Mapping)
+        or set(states) != {scope_id}
+    ):
         raise RuntimeError("loky preflight worker returned another scope")
-    return copy.deepcopy(dict(rows[0]))
+    return {
+        "scope_audit": copy.deepcopy(dict(rows[0])),
+        "scope_state": copy.deepcopy(dict(states[scope_id])),
+    }
 
 
 def build_embedding_cluster_feasibility_audit(
@@ -8183,12 +8876,17 @@ def build_embedding_cluster_feasibility_audit(
     embedding_cache_identity: Mapping[str, Any],
     registry: Mapping[str, Any],
     registry_content_sha256: str,
+    initial_training_partitions: int,
+    semantic_witness_scientific_config: SemanticWitnessScientificConfig,
     preflight_workers: int = 1,
     preflight_scope_input_root: Path | None = None,
     _operational_scope_input_identity: dict[str, Any] | None = None,
+    _operational_canonical_scope_states: dict[str, Any] | None = None,
+    _canonical_state_scope_ids: Sequence[str] | None = None,
     _scope_subset: Sequence[Mapping[str, Any]] | None = None,
     _return_scope_audits: bool = False,
     _thread_limits_active: bool = False,
+    _copy_validation_result: bool = True,
 ) -> Mapping[str, Any]:
     """Run the actual frozen-cache clustered architecture before costly fits."""
 
@@ -8201,12 +8899,21 @@ def build_embedding_cluster_feasibility_audit(
                 embedding_cache_identity=embedding_cache_identity,
                 registry=registry,
                 registry_content_sha256=registry_content_sha256,
+                initial_training_partitions=initial_training_partitions,
+                semantic_witness_scientific_config=(
+                    semantic_witness_scientific_config
+                ),
                 preflight_workers=preflight_workers,
                 preflight_scope_input_root=preflight_scope_input_root,
                 _operational_scope_input_identity=(_operational_scope_input_identity),
+                _operational_canonical_scope_states=(
+                    _operational_canonical_scope_states
+                ),
+                _canonical_state_scope_ids=_canonical_state_scope_ids,
                 _scope_subset=_scope_subset,
                 _return_scope_audits=_return_scope_audits,
                 _thread_limits_active=True,
+                _copy_validation_result=_copy_validation_result,
             )
 
     required_columns = {
@@ -8216,24 +8923,46 @@ def build_embedding_cluster_feasibility_audit(
     }
     if set(modeling_data.columns) != required_columns:
         raise ValueError("embedding cluster preflight received another modeling projection")
+    if (
+        type(semantic_witness_scientific_config)
+        is not SemanticWitnessScientificConfig
+    ):
+        raise TypeError(
+            "cluster preflight requires one closed semantic-witness "
+            "scientific config"
+        )
     identity_frame = pd.DataFrame({"_oci_row_id": np.arange(len(modeling_data), dtype=np.int64)})
     raw_family_names = (
         "cluster_local_treatment_contrast_basis",
         "cluster_local_residualized_interaction_contrast_basis",
     )
     embedding_configuration = _embedding_cluster_configuration(config)
-    configured_cluster_count = int(embedding_configuration["cluster_contrast_n_clusters"])
-    if int(embedding_configuration["cluster_contrast_max_components"]) < 2:
+    cluster_scientific = _cluster_local_scientific_config(
+        embedding_configuration
+    )
+    configured_cluster_count = int(cluster_scientific.requested_cluster_count)
+    if int(cluster_scientific.maximum_components_per_family) < 2:
         raise ValueError(
             "embedding cluster preflight requires at least two components per SVD family"
         )
     workers = int(preflight_workers)
+    initial_partitions = int(initial_training_partitions)
+    if initial_partitions < 1:
+        raise ValueError("initial_training_partitions must be at least one")
     if workers < 1:
         raise ValueError("embedding cluster preflight worker count must be positive")
     if _scope_subset is not None and workers != 1:
         raise ValueError("internal preflight scope subsets must execute in one worker")
     if _scope_subset is None:
-        canonical_scopes = _embedding_cluster_feasibility_scopes(registry)
+        canonical_scopes = _embedding_cluster_feasibility_scopes(
+            registry,
+            initial_training_partitions=initial_partitions,
+            global_seed=_embedding_cluster_global_seed(config),
+        )
+        physical_groups = _embedding_cluster_physical_scope_groups(
+            canonical_scopes
+        )
+        physical_scopes = tuple(owner for owner, _members in physical_groups)
         from .production_stage1_preflight_scope_inputs import (
             publish_preflight_scope_inputs,
         )
@@ -8257,19 +8986,31 @@ def build_embedding_cluster_feasibility_audit(
                 embedding_cache_identity=embedding_cache_identity,
                 registry=registry,
                 registry_content_sha256=registry_content_sha256,
-                scopes=canonical_scopes,
+                scopes=physical_scopes,
                 source_dataset_path=Path(str(config.dataset_path)),
                 global_embedding_cache_path=Path(embedding_cache.cache_dir),
+                semantic_witness_scientific_config=(
+                    semantic_witness_scientific_config
+                ),
             )
-            payloads = private_inputs.worker_payloads()
+            payloads = tuple(
+                {
+                    **dict(payload),
+                    "initial_training_partitions": initial_partitions,
+                }
+                for payload in private_inputs.worker_payloads()
+            )
             if _operational_scope_input_identity is not None:
                 _operational_scope_input_identity.clear()
                 _operational_scope_input_identity.update(private_inputs.identity())
-            if len(payloads) != len(canonical_scopes):
-                raise RuntimeError("preflight publisher returned incomplete scope coverage")
+            if len(payloads) != len(physical_scopes):
+                raise RuntimeError(
+                    "preflight publisher returned incomplete physical scope "
+                    "coverage"
+                )
             with parallel_config(backend="loky", inner_max_num_threads=1):
                 isolated_results = Parallel(
-                    n_jobs=min(workers, len(canonical_scopes)),
+                    n_jobs=min(workers, len(physical_scopes)),
                     batch_size=1,
                     pre_dispatch="all",
                 )(delayed(_embedding_cluster_preflight_loky_scope)(payload) for payload in payloads)
@@ -8277,15 +9018,81 @@ def build_embedding_cluster_feasibility_audit(
             if cleanup is not None:
                 cleanup.cleanup()
         by_scope: dict[str, dict[str, Any]] = {}
-        for row in isolated_results:
+        states_by_scope: dict[str, dict[str, Any]] = {}
+        for returned in isolated_results:
+            if (
+                isinstance(returned, Mapping)
+                and isinstance(returned.get("scope_audit"), Mapping)
+                and isinstance(returned.get("scope_state"), Mapping)
+            ):
+                if _copy_validation_result:
+                    row = copy.deepcopy(dict(returned["scope_audit"]))
+                    state = copy.deepcopy(dict(returned["scope_state"]))
+                else:
+                    row = dict(returned["scope_audit"])
+                    state = dict(returned["scope_state"])
+            elif _operational_canonical_scope_states is None:
+                # Retain the narrow historical test seam for audit-only
+                # callers. Production state publication always supplies the
+                # collector and therefore requires the closed worker envelope.
+                row = copy.deepcopy(dict(returned))
+                state = None
+            else:
+                raise RuntimeError(
+                    "loky preflight worker omitted its canonical fitted state"
+                )
             scope_id = str(row.get("scope_id") or "")
             if scope_id in by_scope:
                 raise RuntimeError("loky preflight returned a duplicate scope")
             by_scope[scope_id] = row
-        expected_scope_ids = [str(scope["scope_id"]) for scope in canonical_scopes]
+            if state is not None:
+                if state.get("scope_id") != scope_id or scope_id in states_by_scope:
+                    raise RuntimeError(
+                        "loky preflight returned a substituted fitted state"
+                    )
+                states_by_scope[scope_id] = state
+        expected_scope_ids = [
+            str(scope["scope_id"]) for scope in physical_scopes
+        ]
         if set(by_scope) != set(expected_scope_ids):
-            raise RuntimeError("loky preflight returned incomplete scope coverage")
-        scope_audits = [by_scope[scope_id] for scope_id in expected_scope_ids]
+            raise RuntimeError(
+                "loky preflight returned incomplete physical scope coverage"
+            )
+        scope_states = states_by_scope
+        if states_by_scope:
+            logical_by_scope: dict[str, dict[str, Any]] = {}
+            for owner, members in physical_groups:
+                owner_id = str(owner["scope_id"])
+                physical_audit = by_scope[owner_id]
+                for logical_scope in members:
+                    logical_id = str(logical_scope["scope_id"])
+                    logical_by_scope[logical_id] = (
+                        _bind_embedding_cluster_scope_to_physical_fit(
+                            logical_scope=logical_scope,
+                            physical_owner=owner,
+                            physical_audit=physical_audit,
+                            copy_physical_payload=(
+                                _copy_validation_result
+                            ),
+                        )
+                    )
+            logical_ids = [
+                str(scope["scope_id"]) for scope in canonical_scopes
+            ]
+            if set(logical_by_scope) != set(logical_ids):
+                raise RuntimeError(
+                    "cluster preflight omitted a logical-to-physical binding"
+                )
+            scope_audits = [
+                logical_by_scope[scope_id] for scope_id in logical_ids
+            ]
+        else:
+            # Audit-only unit seams receive only the actually executed
+            # physical results. Production always returns fitted states and
+            # therefore must publish all logical bindings above.
+            scope_audits = [
+                by_scope[scope_id] for scope_id in expected_scope_ids
+            ]
         scopes_to_run: Sequence[Mapping[str, Any]] = ()
     else:
         from .production_stage1_preflight_scope_inputs import (
@@ -8349,6 +9156,7 @@ def build_embedding_cluster_feasibility_audit(
         ):
             raise ValueError("internal preflight scope authority has invalid row identities")
         scope_audits = []
+        scope_states: dict[str, dict[str, Any]] = {}
         scopes_to_run = selected
     for scope in scopes_to_run:
         binding = _embedding_cluster_scope_binding(scope)
@@ -8369,18 +9177,44 @@ def build_embedding_cluster_feasibility_audit(
             output_dir=Path("."),
         )
         generator.prepare(identity_frame)
-        observer = _EmbeddingClusterPreflightObserver()
-        generator._native_embedding_proof_observer = observer
-        discovery_frame = identity_frame.iloc[list(fit_rows)].copy()
-        evidence = generator.build_evidence(
-            discovery_df=discovery_frame,
-            y=modeling_data.iloc[list(fit_rows)][config.outcome_column].to_numpy(dtype=float),
-            t=modeling_data.iloc[list(fit_rows)][config.treatment_column].to_numpy(dtype=float),
-            pseudo_target=None,
-            t_resid=None,
-            pseudo_target_names=None,
-            importance={},
+        observer = _EmbeddingClusterPreflightObserver(
+            fit_row_ids=fit_rows,
+            canonical_group_seed=int(scope["scope_seed"]),
         )
+        generator._native_embedding_proof_observer = observer
+        generator.bind_cluster_physical_fit_authority(
+            ordered_fit_row_ids=fit_rows,
+            canonical_group_seed=int(scope["scope_seed"]),
+        )
+        discovery_frame = identity_frame.iloc[list(fit_rows)].copy()
+        try:
+            evidence = generator.build_cluster_only_evidence(
+                discovery_df=discovery_frame,
+                y=modeling_data.iloc[list(fit_rows)][config.outcome_column].to_numpy(
+                    dtype=float
+                ),
+                t=modeling_data.iloc[list(fit_rows)][config.treatment_column].to_numpy(
+                    dtype=float
+                ),
+            )
+        except ClusterLocalEmbeddingFeasibilityError as exc:
+            raise ValueError(
+                "embedding clustered architecture is infeasible in "
+                f"{scope['scope_id']}; observed_cluster_summary="
+                f"{_canonical_json(exc.summary)}"
+            ) from exc
+        except (TypeError, ValueError) as exc:
+            failure_summary = {
+                "n_clusters": configured_cluster_count,
+                "fit_row_count": len(fit_rows),
+                "failure_type": type(exc).__name__,
+                "failure_message": str(exc),
+            }
+            raise ValueError(
+                "embedding clustered architecture is infeasible in "
+                f"{scope['scope_id']}; observed_cluster_summary="
+                f"{_canonical_json(failure_summary)}"
+            ) from exc
         if observer.evidence is not evidence:
             raise RuntimeError("embedding cluster preflight observer changed native evidence")
         cluster_summary = evidence.get("cluster_contrast_vectors")
@@ -8413,7 +9247,7 @@ def build_embedding_cluster_feasibility_audit(
         }
         semantic = _embedding_concepts_only(
             {"enabled": True, "contrasts": raw_cluster},
-            contrastive_term_limit=None,
+            scientific_config=semantic_witness_scientific_config,
         )
         semantic_rows = list(semantic.get("contrasts") or ())
         semantic_counts = {
@@ -8471,7 +9305,7 @@ def build_embedding_cluster_feasibility_audit(
                     semantic_rows=semantic_rows,
                     catalog=catalog,
                     configured_max_components=int(
-                        embedding_configuration["cluster_contrast_max_components"]
+                        cluster_scientific.maximum_components_per_family
                     ),
                 )
             )
@@ -8501,6 +9335,23 @@ def build_embedding_cluster_feasibility_audit(
             semantic_evidence=semantic,
             catalog=catalog,
         )
+        if observer.kmeans is None or len(observer.svds) != 2:
+            raise RuntimeError(
+                "embedding cluster preflight omitted its fitted numerical state"
+            )
+        scope_states[str(scope["scope_id"])] = {
+            "schema_version": (
+                "production_stage1_cluster_preflight_scope_state_capture_v2"
+            ),
+            "scope_id": str(scope["scope_id"]),
+            "cluster_fit_identity_content_sha256": (
+                cluster_fit_identity["content_sha256"]
+            ),
+            "kmeans_state": copy.deepcopy(dict(observer.kmeans)),
+            "svd_states": copy.deepcopy(list(observer.svds)),
+            "captured_from_canonical_preflight_fit": True,
+            "refit_performed_for_state_capture": False,
+        }
         scope_audits.append(
             {
                 **binding,
@@ -8525,7 +9376,41 @@ def build_embedding_cluster_feasibility_audit(
             }
         )
     if _return_scope_audits:
-        return {"_scope_audits": scope_audits}
+        return {
+            "_scope_audits": scope_audits,
+            "_scope_states": scope_states,
+        }
+    if _operational_canonical_scope_states is not None:
+        required_state_ids = tuple(
+            str(value)
+            for value in (
+                _canonical_state_scope_ids
+                if _canonical_state_scope_ids is not None
+                else tuple(
+                    owner["scope_id"]
+                    for owner, _members in physical_groups
+                )
+            )
+        )
+        if (
+            not required_state_ids
+            or len(required_state_ids) != len(set(required_state_ids))
+            or not set(required_state_ids).issubset(set(scope_states))
+        ):
+            raise RuntimeError(
+                "cluster preflight did not capture every canonical fitted state"
+            )
+        _operational_canonical_scope_states.clear()
+        _operational_canonical_scope_states.update(
+            {
+                scope_id: (
+                    dict(scope_states[scope_id])
+                    if not _copy_validation_result
+                    else copy.deepcopy(scope_states[scope_id])
+                )
+                for scope_id in required_state_ids
+            }
+        )
     body = {
         "schema_version": STAGE1_EMBEDDING_CLUSTER_FEASIBILITY_AUDIT_SCHEMA,
         "split_registry_content_sha256": str(registry_content_sha256),
@@ -8535,9 +9420,11 @@ def build_embedding_cluster_feasibility_audit(
         "required_svd_families": ["treatment", "residualized_interaction"],
         "configured_cluster_count": configured_cluster_count,
         "configured_max_components": int(
-            embedding_configuration["cluster_contrast_max_components"]
+            cluster_scientific.maximum_components_per_family
         ),
-        "minimum_grounded_components_per_svd_family": 2,
+        "minimum_grounded_components_per_svd_family": int(
+            cluster_scientific.minimum_numerical_rank_per_family
+        ),
         "token_bounded_row_count": sum(int(row["token_bounded_row_count"]) for row in scope_audits),
         "token_bounded_row_ids_sha256": _sha256_json([]),
         "scope_count": len(scope_audits),
@@ -8548,6 +9435,15 @@ def build_embedding_cluster_feasibility_audit(
         ),
         "scope_order": [row["scope_id"] for row in scope_audits],
         "scopes": scope_audits,
+        "physical_fit_count": len(physical_groups),
+        "deduplicated_fit_count": len(scope_audits) - len(physical_groups),
+        "physical_scope_order": [
+            str(owner["scope_id"]) for owner, _members in physical_groups
+        ],
+        "physical_fit_execution_policy": (
+            "fit_each_exact_order_seed_equivalent_group_once_earliest_owner_v2"
+        ),
+        "all_logical_scopes_bound_to_physical_fit": True,
         "all_required_scopes_passed": True,
         "heldout_text_accessed": False,
         "heldout_labels_accessed": False,
@@ -8557,6 +9453,7 @@ def build_embedding_cluster_feasibility_audit(
             != _embedding_cluster_kmeans_parameters(
                 embedding_configuration,
                 n_usable=int(row["fit_row_count"]),
+                canonical_group_seed=int(row["canonical_group_seed"]),
             )
             for row in scope_audits
         ),
@@ -8564,13 +9461,18 @@ def build_embedding_cluster_feasibility_audit(
         "rank_one_support_allowed": False,
         "semantic_member_limit": None,
     }
-    audit = {**body, "content_sha256": _sha256_json(body)}
+    audit = {
+        **body,
+        "content_sha256": _sha256_json_streaming(body),
+    }
     return validate_embedding_cluster_feasibility_audit(
         audit,
         config=config,
         registry=registry,
         registry_content_sha256=registry_content_sha256,
         embedding_cache_identity=embedding_cache_identity,
+        initial_training_partitions=initial_partitions,
+        copy_result=_copy_validation_result,
     )
 
 
@@ -8875,6 +9777,8 @@ class Stage1BundleBuildOptions:
     embedding_cache_dir: Path | None
     output_dir: Path
     unit_id_column: str
+    initial_training_partitions: int
+    physical_fit_identity: Stage1PhysicalFitIdentity | Mapping[str, Any]
     embedding_local_model_path: Path | None = None
     embedding_cache_output_dir: Path | None = None
     seed: int = 42
@@ -8889,12 +9793,30 @@ class Stage1BundleBuildOptions:
     resume: bool = False
     dry_run: bool = False
     embedding_cache_relocation: ProductionEmbeddingCacheRelocationOptions | None = None
+    embedding_cache_configuration: Mapping[str, Any] | None = None
+    semantic_witness_scientific_config: (
+        SemanticWitnessScientificConfig | Mapping[str, Any] | None
+    ) = None
     scope_workers_per_gpu: int = 1
     preflight_workers: int = 1
+    # The portable workflow stores clustered concepts once per physical fit
+    # and places only a closed content-addressed reference in the request.
+    # ``False`` retains the historical inline-audit seam for generic callers.
+    portable_cluster_preflight_v2: bool = False
     cluster_preflight_manifest_path: Path | None = None
+    cluster_preflight_state_bundle_manifest_path: Path | None = None
     stage1_scope_descriptor_root: Path | None = None
     stage1_scope_attempt_root: Path | None = None
     stage1_scope_progress_path: Path | None = None
+
+    def __post_init__(self) -> None:
+        value = self.physical_fit_identity
+        identity = (
+            Stage1PhysicalFitIdentity.from_mapping(value.as_dict())
+            if isinstance(value, Stage1PhysicalFitIdentity)
+            else Stage1PhysicalFitIdentity.from_mapping(value)
+        )
+        object.__setattr__(self, "physical_fit_identity", identity)
 
 
 @dataclass
@@ -8908,9 +9830,12 @@ class _PreparedBuild:
     htr_model_sha256: str
     htr_input_nontruncation_audit: Mapping[str, Any]
     embedding_cluster_feasibility_audit: Mapping[str, Any]
+    cluster_preflight_canonical_scope_states: Mapping[str, Any] | None
     cluster_preflight_scope_input_set_identity: Mapping[str, Any] | None
     cluster_preflight_manifest_path: Path | None
     cluster_preflight_artifact_identity: Mapping[str, Any] | None
+    cluster_preflight_artifact_handle: Any | None
+    cluster_preflight_state_bundle: Any | None
     embedding_cache_path: Path
     embedding_cache: SpentOnlyFrozenChunkEmbeddingCache
     embedding_cache_identity: Mapping[str, Any]
@@ -8925,11 +9850,24 @@ class _PreparedBuild:
     exact_inner_contract_status: Mapping[str, Any]
     query_config: NeuralQueryAgenticForestConfig
     query_config_identity: Mapping[str, Any]
+    semantic_witness_scientific_config: SemanticWitnessScientificConfig | None
     input_file_identities: Mapping[str, Mapping[str, Any]]
     behavior_identity: Mapping[str, Any]
     hierarchical_discovery_contract_identity: Mapping[str, Any]
     request: Mapping[str, Any]
     request_sha256: str
+
+
+def _require_semantic_witness_scientific_config(
+    prepared: _PreparedBuild,
+) -> SemanticWitnessScientificConfig:
+    value = prepared.semantic_witness_scientific_config
+    if type(value) is not SemanticWitnessScientificConfig:
+        raise RuntimeError(
+            "semantic-witness evidence requires an authenticated closed "
+            "scientific config; no production defaults are permitted"
+        )
+    return value
 
 
 class ProductionStage1BundleBuilder:
@@ -8940,6 +9878,23 @@ class ProductionStage1BundleBuilder:
 
     def prepare(self) -> _PreparedBuild:
         options = self.options
+        semantic_witness_scientific_config = (
+            options.semantic_witness_scientific_config
+        )
+        if isinstance(semantic_witness_scientific_config, Mapping):
+            semantic_witness_scientific_config = (
+                SemanticWitnessScientificConfig.from_mapping(
+                    semantic_witness_scientific_config
+                )
+            )
+        if semantic_witness_scientific_config is not None and (
+            type(semantic_witness_scientific_config)
+            is not SemanticWitnessScientificConfig
+        ):
+            raise TypeError(
+                "semantic_witness_scientific_config must be one closed typed "
+                "config or explicit mapping"
+            )
         dataset_path = options.dataset_path.resolve(strict=True)
         config_path = options.config_path.resolve(strict=True)
         if options.cluster_preflight_manifest_path is None:
@@ -8955,6 +9910,28 @@ class ProductionStage1BundleBuilder:
                     "cluster_preflight_manifest_path must be one absolute " "non-symlink file"
                 )
             cluster_preflight_manifest_path = supplied_preflight_manifest
+        if options.cluster_preflight_state_bundle_manifest_path is None:
+            cluster_preflight_state_bundle_manifest_path = None
+        else:
+            supplied_state_bundle_manifest = Path(
+                options.cluster_preflight_state_bundle_manifest_path
+            )
+            if (
+                cluster_preflight_manifest_path is None
+                or not supplied_state_bundle_manifest.is_absolute()
+                or supplied_state_bundle_manifest.is_symlink()
+                or not supplied_state_bundle_manifest.is_file()
+                or supplied_state_bundle_manifest.name
+                != "cluster_state_bundle_manifest.json"
+            ):
+                raise ValueError(
+                    "cluster_preflight_state_bundle_manifest_path requires "
+                    "one canonical preflight manifest and one absolute "
+                    "non-symlink state-bundle manifest"
+                )
+            cluster_preflight_state_bundle_manifest_path = (
+                supplied_state_bundle_manifest
+            )
         relocation: AuthenticatedProductionEmbeddingCacheRelocation | None = None
         if options.embedding_cache_relocation is not None:
             if (
@@ -9072,8 +10049,16 @@ class ProductionStage1BundleBuilder:
             raise ValueError("worker counts must be positive")
         if options.preflight_workers < 1:
             raise ValueError("preflight_workers must be positive")
-        if options.scope_workers_per_gpu != 1:
-            raise ValueError("production Stage 1 currently requires one scope worker per GPU")
+        if type(options.portable_cluster_preflight_v2) is not bool:
+            raise TypeError(
+                "portable_cluster_preflight_v2 must be an explicit boolean"
+            )
+        if (
+            isinstance(options.scope_workers_per_gpu, bool)
+            or not isinstance(options.scope_workers_per_gpu, int)
+            or options.scope_workers_per_gpu < 1
+        ):
+            raise ValueError("scope_workers_per_gpu must be a positive integer")
         if any(gpu_id < 0 for gpu_id in options.gpu_ids) or len(options.gpu_ids) != len(
             set(options.gpu_ids)
         ):
@@ -9090,7 +10075,10 @@ class ProductionStage1BundleBuilder:
 
         dataset_sha, dataset_stat = _read_stable_sha256(dataset_path)
         config_sha, config_stat = _read_stable_sha256(config_path)
-        source_config = load_applied_stage1_config(config_path)
+        source_config = load_applied_stage1_config(
+            config_path,
+            require_explicit_scientific_fields=True,
+        )
         config_sha_after_parse, config_stat_after_parse = _read_stable_sha256(config_path)
         if (config_sha_after_parse, config_stat_after_parse) != (config_sha, config_stat):
             raise RuntimeError("Stage 1 config changed while it was being parsed")
@@ -9156,6 +10144,11 @@ class ProductionStage1BundleBuilder:
         fresh_result_identity: Mapping[str, Any] | None = None
         if build_fresh_cache:
             assert fresh_model_path is not None
+            if options.embedding_cache_configuration is None:
+                raise ValueError(
+                    "fresh embedding-cache construction requires the complete typed "
+                    "scientific encoder/output configuration"
+                )
             result = build_production_embedding_cache(
                 dataset_path=dataset_path,
                 text_column=config.text_column,
@@ -9163,7 +10156,9 @@ class ProductionStage1BundleBuilder:
                 sentence_model_name=str(
                     config.architecture.multi_model_forest.embedding_contrast.model_name
                 ),
-                chunk_configuration=_embedding_chunk_configuration(config),
+                chunk_configuration=copy.deepcopy(
+                    dict(options.embedding_cache_configuration)
+                ),
                 target_dir=cache_dir,
                 device=options.device,
                 batch_size=int(
@@ -9175,7 +10170,27 @@ class ProductionStage1BundleBuilder:
         embedding_cache = SpentOnlyFrozenChunkEmbeddingCache(cache_dir)
         if embedding_cache.row_count != len(modeling_data):
             raise ValueError("embedding cache row count does not match the cohort")
-        _validate_cache_configuration(embedding_cache, config)
+        if options.embedding_cache_configuration is None:
+            cache_provenance = embedding_cache.metadata.get("production_provenance")
+            cache_configuration = (
+                cache_provenance.get("chunk_configuration")
+                if isinstance(cache_provenance, Mapping)
+                else None
+            )
+            if not isinstance(cache_configuration, Mapping):
+                raise ValueError(
+                    "embedding cache lacks its closed scientific encoder/output configuration"
+                )
+            cache_configuration = copy.deepcopy(dict(cache_configuration))
+        else:
+            cache_configuration = copy.deepcopy(
+                dict(options.embedding_cache_configuration)
+            )
+        _validate_cache_configuration(
+            embedding_cache,
+            config,
+            cache_configuration=cache_configuration,
+        )
         all_rows = tuple(range(len(modeling_data)))
         all_texts = tuple(modeling_data[config.text_column].tolist())
         # This binds every cache row to the exact projected cohort text without
@@ -9194,7 +10209,7 @@ class ProductionStage1BundleBuilder:
                 sentence_model_name=str(
                     config.architecture.multi_model_forest.embedding_contrast.model_name
                 ),
-                chunk_configuration=_embedding_chunk_configuration(config),
+                chunk_configuration=cache_configuration,
                 expected_local_model_path=(fresh_model_path if build_fresh_cache else None),
             )
         else:
@@ -9217,9 +10232,18 @@ class ProductionStage1BundleBuilder:
             seed=options.seed,
         )
         registry_sha = _sha256_json(registry)
+        initial_training_partitions = int(options.initial_training_partitions)
+        if initial_training_partitions < 1:
+            raise ValueError("initial_training_partitions must be at least one")
         review_rounds = (
-            int(config.architecture.multi_model_forest.candidate_consistency_inner_folds) - 3
+            int(config.architecture.multi_model_forest.candidate_consistency_inner_folds)
+            - initial_training_partitions
         )
+        if review_rounds < 1:
+            raise ValueError(
+                "candidate-consistency inner folds must leave at least one review "
+                "partition after initial_training_partitions"
+            )
         scheduler_gpu_ids = tuple(options.gpu_ids)
         if not scheduler_gpu_ids and options.device.startswith("cuda:"):
             scheduler_gpu_ids = (int(options.device.split(":", 1)[1]),)
@@ -9227,8 +10251,10 @@ class ProductionStage1BundleBuilder:
             registry=registry,
             registry_content_sha256=registry_sha,
             global_seed=options.seed,
+            physical_fit_identity=options.physical_fit_identity,
             gpu_ids=scheduler_gpu_ids,
             review_rounds=review_rounds,
+            initial_training_partitions=initial_training_partitions,
             scope_workers_per_gpu=options.scope_workers_per_gpu,
             expected_outer_fold_count=int(config.cv_folds),
             expected_inner_fold_count=int(
@@ -9236,9 +10262,12 @@ class ProductionStage1BundleBuilder:
             ),
         )
         cluster_preflight_artifact = None
+        cluster_preflight_state_bundle = None
+        cluster_preflight_canonical_scope_states: Mapping[str, Any] | None = None
         cluster_preflight_scope_input_set_identity: Mapping[str, Any] | None = None
         if cluster_preflight_manifest_path is None:
             operational_scope_input_identity: dict[str, Any] = {}
+            operational_canonical_scope_states: dict[str, Any] = {}
             embedding_cluster_feasibility_audit = build_embedding_cluster_feasibility_audit(
                 modeling_data=modeling_data,
                 config=config,
@@ -9246,31 +10275,88 @@ class ProductionStage1BundleBuilder:
                 embedding_cache_identity=cache_identity,
                 registry=registry,
                 registry_content_sha256=registry_sha,
+                initial_training_partitions=options.initial_training_partitions,
+                semantic_witness_scientific_config=(
+                    semantic_witness_scientific_config
+                ),
                 preflight_workers=options.preflight_workers,
                 preflight_scope_input_root=(
                     scope_descriptor_root.parent / "cluster_preflight_scope_inputs"
                 ).resolve(),
                 _operational_scope_input_identity=(operational_scope_input_identity),
+                _operational_canonical_scope_states=(
+                    operational_canonical_scope_states
+                ),
+                _canonical_state_scope_ids=tuple(
+                    scope.scope_id for scope in stage1_scope_plan.physical_scopes
+                ),
+                _copy_validation_result=(
+                    not options.portable_cluster_preflight_v2
+                ),
             )
             if operational_scope_input_identity:
                 cluster_preflight_scope_input_set_identity = copy.deepcopy(
                     operational_scope_input_identity
                 )
+            if operational_canonical_scope_states:
+                if set(operational_canonical_scope_states) != {
+                    scope.scope_id for scope in stage1_scope_plan.physical_scopes
+                }:
+                    raise RuntimeError(
+                        "cluster preflight omitted a canonical "
+                        "physical-owner state"
+                    )
+                cluster_preflight_canonical_scope_states = (
+                    dict(operational_canonical_scope_states)
+                    if options.portable_cluster_preflight_v2
+                    else copy.deepcopy(operational_canonical_scope_states)
+                )
         else:
-            from .production_stage1_cluster_preflight_artifact import (
-                load_production_stage1_cluster_preflight_artifact,
-            )
+            if options.portable_cluster_preflight_v2:
+                from .production_stage1_cluster_preflight_artifact_v2 import (
+                    load_portable_production_stage1_cluster_preflight_artifact,
+                )
 
-            cluster_preflight_artifact = load_production_stage1_cluster_preflight_artifact(
-                manifest_path=cluster_preflight_manifest_path,
-                config=config,
-                registry=registry,
-                registry_content_sha256=registry_sha,
-                embedding_cache_identity=cache_identity,
-            )
+                cluster_preflight_artifact = (
+                    load_portable_production_stage1_cluster_preflight_artifact(
+                        manifest_path=cluster_preflight_manifest_path,
+                        config=config,
+                        registry=registry,
+                        registry_content_sha256=registry_sha,
+                        embedding_cache_identity=cache_identity,
+                    )
+                )
+            else:
+                from .production_stage1_cluster_preflight_artifact import (
+                    load_production_stage1_cluster_preflight_artifact,
+                )
+
+                cluster_preflight_artifact = (
+                    load_production_stage1_cluster_preflight_artifact(
+                        manifest_path=cluster_preflight_manifest_path,
+                        config=config,
+                        registry=registry,
+                        registry_content_sha256=registry_sha,
+                        embedding_cache_identity=cache_identity,
+                    )
+                )
             embedding_cluster_feasibility_audit = copy.deepcopy(
                 dict(cluster_preflight_artifact.audit)
             )
+            if cluster_preflight_state_bundle_manifest_path is not None:
+                from .role_neutral_embedding_group_execution import (
+                    load_canonical_clustered_preflight_state_bundle,
+                )
+
+                cluster_preflight_state_bundle = (
+                    load_canonical_clustered_preflight_state_bundle(
+                        manifest_path=(
+                            cluster_preflight_state_bundle_manifest_path
+                        ),
+                        preflight=cluster_preflight_artifact,
+                        plan=stage1_scope_plan,
+                    )
+                )
         exact_inner_contract_status = _exact_inner_contract_registry_status(registry)
         query_config, query_config_identity = self._load_query_config(options.query_config_path)
         query_config_request_identity = _scientific_query_config_identity(
@@ -9359,10 +10445,34 @@ class ProductionStage1BundleBuilder:
         hierarchy_spent_evidence_contract = _hierarchy_spent_evidence_contract(
             registry=registry,
             config=config,
+            initial_training_partitions=options.initial_training_partitions,
             hierarchical_discovery_contract_identity_sha256=(
                 hierarchical_discovery_contract_identity["content_sha256"]
             ),
         )
+        if options.portable_cluster_preflight_v2:
+            from .production_stage1_cluster_preflight_artifact_v2 import (
+                build_portable_cluster_preflight_reference,
+                validate_portable_cluster_preflight_reference,
+            )
+
+            if cluster_preflight_artifact is None:
+                cluster_preflight_request_binding = (
+                    build_portable_cluster_preflight_reference(
+                        embedding_cluster_feasibility_audit,
+                        verify_source_audit_content=False,
+                    )
+                )
+            else:
+                cluster_preflight_request_binding = (
+                    validate_portable_cluster_preflight_reference(
+                        cluster_preflight_artifact.reference
+                    )
+                )
+        else:
+            cluster_preflight_request_binding = (
+                embedding_cluster_feasibility_audit
+            )
         request_body = {
             "schema_version": STAGE1_BUNDLE_REQUEST_SCHEMA,
             "dataset": {
@@ -9386,7 +10496,9 @@ class ProductionStage1BundleBuilder:
                 "sentence_encoder_unfrozen": True,
             },
             "htr_input_nontruncation_audit": htr_input_nontruncation_audit,
-            "embedding_cluster_feasibility_audit": (embedding_cluster_feasibility_audit),
+            "embedding_cluster_feasibility_audit": (
+                cluster_preflight_request_binding
+            ),
             "split_registry_content_sha256": registry_sha,
             "stage1_scope_plan": stage1_scope_plan.as_dict(),
             "exact_inner_contract": {
@@ -9403,6 +10515,11 @@ class ProductionStage1BundleBuilder:
                 # after the workflow has accepted the same content hash.
                 "source": query_config_request_identity,
             },
+            "semantic_witness_scientific_config": (
+                None
+                if semantic_witness_scientific_config is None
+                else semantic_witness_scientific_config.as_dict()
+            ),
             "runtime": {
                 "device": options.device,
                 "gpu_ids": list(options.gpu_ids),
@@ -9439,8 +10556,10 @@ class ProductionStage1BundleBuilder:
         request = {**request_body, "request_sha256": request_sha}
         if cluster_preflight_artifact is not None:
             # The artifact location is an operational capability and is not
-            # part of the scientific request.  Its sealed request must instead
-            # equal the independently reconstructed request byte-for-byte.
+            # part of the scientific request. Both exact requests are
+            # authenticated independently; their closed scientific projections
+            # must match while paths, devices, worker counts, and assignments
+            # may differ.
             cluster_preflight_artifact.require_stage1_request(request)
         self._revalidate_input_files(input_file_identities)
         if _source_identity() != behavior_identity:
@@ -9455,9 +10574,14 @@ class ProductionStage1BundleBuilder:
             htr_model_sha256=htr_sha,
             htr_input_nontruncation_audit=htr_input_nontruncation_audit,
             embedding_cluster_feasibility_audit=embedding_cluster_feasibility_audit,
+            cluster_preflight_canonical_scope_states=(
+                cluster_preflight_canonical_scope_states
+            ),
             cluster_preflight_scope_input_set_identity=(cluster_preflight_scope_input_set_identity),
             cluster_preflight_manifest_path=cluster_preflight_manifest_path,
             cluster_preflight_artifact_identity=(cluster_preflight_artifact_identity),
+            cluster_preflight_artifact_handle=cluster_preflight_artifact,
+            cluster_preflight_state_bundle=cluster_preflight_state_bundle,
             embedding_cache_path=cache_dir,
             embedding_cache=embedding_cache,
             embedding_cache_identity=cache_identity,
@@ -9472,6 +10596,9 @@ class ProductionStage1BundleBuilder:
             exact_inner_contract_status=exact_inner_contract_status,
             query_config=query_config,
             query_config_identity=query_config_identity,
+            semantic_witness_scientific_config=(
+                semantic_witness_scientific_config
+            ),
             input_file_identities=input_file_identities,
             behavior_identity=behavior_identity,
             hierarchical_discovery_contract_identity=(hierarchical_discovery_contract_identity),
@@ -9484,32 +10611,32 @@ class ProductionStage1BundleBuilder:
         path: Path | None,
     ) -> tuple[NeuralQueryAgenticForestConfig, Mapping[str, Any]]:
         if path is None:
-            config = NeuralQueryAgenticForestConfig()
-            identity: Mapping[str, Any] = {
-                "provided": False,
-                "path": None,
-                "sha256": None,
-                "stat_identity": None,
-            }
-        else:
-            resolved = path.resolve(strict=True)
-            digest, stat_identity = _read_stable_sha256(resolved)
-            payload = _load_serialized_mapping(resolved)
-            digest_after, stat_after = _read_stable_sha256(resolved)
-            if (digest_after, stat_after) != (digest, stat_identity):
-                raise RuntimeError("neural-query config changed while it was being parsed")
-            unknown = set(payload) - set(asdict(NeuralQueryAgenticForestConfig()))
-            if unknown:
-                raise ValueError(
-                    "neural-query config contains unknown fields: " + ", ".join(sorted(unknown))
-                )
-            config = NeuralQueryAgenticForestConfig(**dict(payload))
-            identity = {
-                "provided": True,
-                "path": str(resolved),
-                "sha256": digest,
-                "stat_identity": list(stat_identity),
-            }
+            raise ValueError(
+                "production requires query_config_path; neural-query scientific "
+                "settings have no implicit defaults"
+            )
+        resolved = path.resolve(strict=True)
+        digest, stat_identity = _read_stable_sha256(resolved)
+        payload = _load_serialized_mapping(resolved)
+        digest_after, stat_after = _read_stable_sha256(resolved)
+        if (digest_after, stat_after) != (digest, stat_identity):
+            raise RuntimeError("neural-query config changed while it was being parsed")
+        expected_fields = set(asdict(NeuralQueryAgenticForestConfig()))
+        missing = expected_fields - set(payload)
+        unknown = set(payload) - expected_fields
+        if missing or unknown:
+            raise ValueError(
+                "production neural-query config must explicitly provide its "
+                "complete closed schema; "
+                f"missing={sorted(missing)}, extra={sorted(unknown)}"
+            )
+        config = NeuralQueryAgenticForestConfig(**dict(payload))
+        identity: Mapping[str, Any] = {
+            "provided": True,
+            "path": str(resolved),
+            "sha256": digest,
+            "stat_identity": list(stat_identity),
+        }
         config.validate()
         return config, identity
 
@@ -9548,32 +10675,79 @@ class ProductionStage1BundleBuilder:
         current_cache_identity = prepared.embedding_cache.identity()
         if current_cache_identity != prepared.embedding_cache_identity:
             raise RuntimeError("frozen embedding cache changed after preflight")
-        validated_cluster_audit = validate_embedding_cluster_feasibility_audit(
-            prepared.embedding_cluster_feasibility_audit,
-            config=prepared.config,
-            registry=prepared.registry,
-            registry_content_sha256=prepared.registry_content_sha256,
-            embedding_cache_identity=current_cache_identity,
-        )
-        if (
-            validated_cluster_audit != prepared.embedding_cluster_feasibility_audit
-            or validated_cluster_audit
-            != prepared.request.get("embedding_cluster_feasibility_audit")
-        ):
-            raise RuntimeError("embedding cluster feasibility audit changed after preflight")
-        if prepared.cluster_preflight_manifest_path is not None:
-            from .production_stage1_cluster_preflight_artifact import (
-                load_production_stage1_cluster_preflight_artifact,
+        if prepared.options.portable_cluster_preflight_v2:
+            from .production_stage1_cluster_preflight_artifact_v2 import (
+                validate_portable_cluster_preflight_reference,
             )
 
-            reopened_preflight = load_production_stage1_cluster_preflight_artifact(
-                manifest_path=prepared.cluster_preflight_manifest_path,
+            validated_cluster_reference = (
+                validate_portable_cluster_preflight_reference(
+                    prepared.request.get(
+                        "embedding_cluster_feasibility_audit"
+                    )
+                )
+            )
+            if (
+                prepared.cluster_preflight_artifact_handle is None
+                or validated_cluster_reference
+                != dict(
+                    prepared.cluster_preflight_artifact_handle.reference
+                )
+                or dict(prepared.cluster_preflight_artifact_handle.audit)
+                != prepared.embedding_cluster_feasibility_audit
+            ):
+                raise RuntimeError(
+                    "portable embedding cluster preflight changed after loading"
+                )
+        else:
+            validated_cluster_audit = validate_embedding_cluster_feasibility_audit(
+                prepared.embedding_cluster_feasibility_audit,
                 config=prepared.config,
                 registry=prepared.registry,
                 registry_content_sha256=prepared.registry_content_sha256,
                 embedding_cache_identity=current_cache_identity,
-                expected_stage1_request=prepared.request,
+                initial_training_partitions=prepared.options.initial_training_partitions,
             )
+            if (
+                validated_cluster_audit
+                != prepared.embedding_cluster_feasibility_audit
+                or validated_cluster_audit
+                != prepared.request.get("embedding_cluster_feasibility_audit")
+            ):
+                raise RuntimeError(
+                    "embedding cluster feasibility audit changed after preflight"
+                )
+        if prepared.cluster_preflight_manifest_path is not None:
+            if prepared.options.portable_cluster_preflight_v2:
+                from .production_stage1_cluster_preflight_artifact_v2 import (
+                    load_portable_production_stage1_cluster_preflight_artifact,
+                )
+
+                reopened_preflight = (
+                    load_portable_production_stage1_cluster_preflight_artifact(
+                        manifest_path=prepared.cluster_preflight_manifest_path,
+                        config=prepared.config,
+                        registry=prepared.registry,
+                        registry_content_sha256=prepared.registry_content_sha256,
+                        embedding_cache_identity=current_cache_identity,
+                        expected_stage1_request=prepared.request,
+                    )
+                )
+            else:
+                from .production_stage1_cluster_preflight_artifact import (
+                    load_production_stage1_cluster_preflight_artifact,
+                )
+
+                reopened_preflight = (
+                    load_production_stage1_cluster_preflight_artifact(
+                        manifest_path=prepared.cluster_preflight_manifest_path,
+                        config=prepared.config,
+                        registry=prepared.registry,
+                        registry_content_sha256=prepared.registry_content_sha256,
+                        embedding_cache_identity=current_cache_identity,
+                        expected_stage1_request=prepared.request,
+                    )
+                )
             if (
                 prepared.cluster_preflight_artifact_identity is None
                 or reopened_preflight.identity() != prepared.cluster_preflight_artifact_identity
@@ -9587,13 +10761,17 @@ class ProductionStage1BundleBuilder:
             registry=prepared.registry,
             registry_content_sha256=prepared.registry_content_sha256,
             global_seed=prepared.options.seed,
+            physical_fit_identity=(
+                prepared.options.physical_fit_identity
+            ),
             gpu_ids=prepared.stage1_scope_plan.gpu_ids,
             review_rounds=(
                 int(
                     prepared.config.architecture.multi_model_forest.candidate_consistency_inner_folds
                 )
-                - 3
+                - int(prepared.options.initial_training_partitions)
             ),
+            initial_training_partitions=prepared.options.initial_training_partitions,
             scope_workers_per_gpu=prepared.options.scope_workers_per_gpu,
             expected_outer_fold_count=int(prepared.config.cv_folds),
             expected_inner_fold_count=int(
@@ -9603,6 +10781,18 @@ class ProductionStage1BundleBuilder:
         if validated_scope_plan.as_dict() != prepared.request.get("stage1_scope_plan"):
             raise RuntimeError("Stage 1 scope execution plan changed after preflight")
         if prepared.embedding_cache_relocation is None:
+            cache_provenance = prepared.embedding_cache.metadata.get(
+                "production_provenance"
+            )
+            cache_configuration = (
+                cache_provenance.get("chunk_configuration")
+                if isinstance(cache_provenance, Mapping)
+                else None
+            )
+            if not isinstance(cache_configuration, Mapping):
+                raise RuntimeError(
+                    "authenticated embedding cache lost its scientific configuration"
+                )
             current_cache_input_identity = validate_published_production_embedding_cache(
                 cache_dir=prepared.embedding_cache_path,
                 dataset_path=Path(prepared.input_file_identities["dataset"]["path"]),
@@ -9610,7 +10800,7 @@ class ProductionStage1BundleBuilder:
                 sentence_model_name=str(
                     prepared.config.architecture.multi_model_forest.embedding_contrast.model_name
                 ),
-                chunk_configuration=_embedding_chunk_configuration(prepared.config),
+                chunk_configuration=cache_configuration,
             )
         else:
             current_relocation = validate_relocated_production_embedding_cache(
@@ -10184,12 +11374,19 @@ class ProductionStage1BundleBuilder:
                 outcome_type=runtime_config.outcome_type,
                 embedding_provider=bound_embedding_cache,
                 embedding_config=embedding_generator.embedding_config,
+                semantic_witness_scientific_config=(
+                    _require_semantic_witness_scientific_config(prepared)
+                ),
                 tfidf_nested_calibration_folds=int(
                     runtime_config.architecture.multi_model_forest.tfidf_nested_calibration_folds
                 ),
                 seed=scope_seed,
             )
             embedding_generator._native_embedding_proof_observer = embedding_capture
+            embedding_generator.bind_cluster_physical_fit_authority(
+                ordered_fit_row_ids=request.spent_row_ids,
+                canonical_group_seed=scope_seed,
+            )
             runner.embedding_evidence_generator = embedding_generator
             fit_df = runner.dataset.iloc[spent_ids].reset_index(drop=True)
             bundle = runner._build_feature_bundle(
@@ -10205,7 +11402,9 @@ class ProductionStage1BundleBuilder:
         fitted = copy.deepcopy(bundle.handoff_evidence)
         safe_embedding = _embedding_concepts_only(
             fitted.get("embedding_contrast_evidence") or {},
-            contrastive_term_limit=None,
+            scientific_config=(
+                _require_semantic_witness_scientific_config(prepared)
+            ),
         )
         cluster_catalog = _embedding_only_cluster_catalog(
             scope_id=request.scope_id,
@@ -10267,8 +11466,9 @@ class ProductionStage1BundleBuilder:
             embedding_evidence={},
             htr_evidence=_htr_concepts_only(
                 fitted.get("htr_evidence") or {},
-                phrases_per_attention_row=None,
-                fallback_contrastive_term_limit=None,
+                scientific_config=(
+                    _require_semantic_witness_scientific_config(prepared)
+                ),
             ),
         )
         provenance = FoldEvidenceProvenance(
@@ -10460,11 +11660,12 @@ class ProductionStage1BundleBuilder:
         embedding_cluster_fit_rows: list[Mapping[str, Any]] = []
         if selected_scope is None:
             exact_registry = _canonical_exact_registry_from_wrapper(prepared.registry)
-            review_rounds = int(exact_registry.inner_fold_count) - 3
+            initial_partitions = int(prepared.options.initial_training_partitions)
+            review_rounds = int(exact_registry.inner_fold_count) - initial_partitions
             if review_rounds < 1:
                 raise ValueError(
-                    "cumulative hierarchy emission requires at least four canonical inner "
-                    "partitions: three initially spent plus one review gate"
+                    "cumulative hierarchy emission requires at least one configured "
+                    "initial training partition and one review gate"
                 )
             # Imported lazily because the authenticated handoff imports this
             # module's hash helpers. At execution time this module is complete.
@@ -10475,6 +11676,7 @@ class ProductionStage1BundleBuilder:
             cumulative_schedule = CanonicalHierarchySpentSchedule.build(
                 registry=exact_registry,
                 review_rounds=review_rounds,
+                initial_training_partitions=initial_partitions,
             )
             cumulative_schedule_sha256 = cumulative_schedule.schedule_sha256
             cumulative_scopes = cumulative_schedule.scopes
@@ -10595,6 +11797,11 @@ class ProductionStage1BundleBuilder:
                             outcome_type=runtime_config.outcome_type,
                             embedding_provider=bound_cache,
                             embedding_config=(runner.embedding_evidence_generator.embedding_config),
+                            semantic_witness_scientific_config=(
+                                _require_semantic_witness_scientific_config(
+                                    prepared
+                                )
+                            ),
                             tfidf_nested_calibration_folds=int(
                                 runtime_config.architecture.multi_model_forest.tfidf_nested_calibration_folds
                             ),
@@ -10688,10 +11895,19 @@ class ProductionStage1BundleBuilder:
                         )
                         runner.matched_pair_native_capture_sink = matched_pair_capture
                     else:
-                        full_outer_embedding_observer = _EmbeddingClusterPreflightObserver()
+                        full_outer_embedding_observer = (
+                            _EmbeddingClusterPreflightObserver(
+                                fit_row_ids=fit_ids,
+                                canonical_group_seed=scope_seed,
+                            )
+                        )
                         runner.embedding_evidence_generator._native_embedding_proof_observer = (
                             full_outer_embedding_observer
                         )
+                    runner.embedding_evidence_generator.bind_cluster_physical_fit_authority(
+                        ordered_fit_row_ids=fit_ids,
+                        canonical_group_seed=scope_seed,
+                    )
                     bundle = runner._build_feature_bundle(
                         train_df=fit_df,
                         test_df=heldout_df,
@@ -10712,12 +11928,15 @@ class ProductionStage1BundleBuilder:
                     fitted = copy.deepcopy(bundle.handoff_evidence)
                     safe_embedding = _embedding_concepts_only(
                         fitted.get("embedding_contrast_evidence") or {},
-                        contrastive_term_limit=None,
+                        scientific_config=(
+                            _require_semantic_witness_scientific_config(prepared)
+                        ),
                     )
                     safe_htr = _htr_concepts_only(
                         fitted.get("htr_evidence") or {},
-                        phrases_per_attention_row=None,
-                        fallback_contrastive_term_limit=None,
+                        scientific_config=(
+                            _require_semantic_witness_scientific_config(prepared)
+                        ),
                     )
                     digest = _catalog_ready_legacy_digest(
                         importance=fitted.get("importance") or {},
@@ -10989,6 +12208,16 @@ class ProductionStage1BundleBuilder:
                             "outcome_type": runtime_config.outcome_type,
                             "embedding_config": copy.deepcopy(
                                 embedding_capture_metadata["embedding_config"]
+                            ),
+                            "semantic_witness_scientific_config": copy.deepcopy(
+                                embedding_capture_metadata[
+                                    "semantic_witness_scientific_config"
+                                ]
+                            ),
+                            "semantic_witness_scientific_config_sha256": str(
+                                embedding_capture_metadata[
+                                    "semantic_witness_scientific_config_sha256"
+                                ]
                             ),
                             "capture_schema_version": EMBEDDING_NATIVE_CAPTURE_SCHEMA,
                             "semantic_policy_schema_version": (
@@ -11788,7 +13017,8 @@ class ProductionStage1BundleBuilder:
             )
 
             exact_registry = _canonical_exact_registry_from_wrapper(prepared.registry)
-            review_rounds = int(exact_registry.inner_fold_count) - 3
+            initial_partitions = int(prepared.options.initial_training_partitions)
+            review_rounds = int(exact_registry.inner_fold_count) - initial_partitions
             if review_rounds < 1:
                 raise ValueError(
                     "cumulative legacy proof index has no valid canonical review schedule"
@@ -11796,6 +13026,7 @@ class ProductionStage1BundleBuilder:
             schedule = CanonicalHierarchySpentSchedule.build(
                 registry=exact_registry,
                 review_rounds=review_rounds,
+                initial_training_partitions=initial_partitions,
             )
             expected_requests: dict[str, CumulativeSpentStage1FamilyRequest] = {}
             expected_configurations: dict[
@@ -11924,7 +13155,10 @@ class ProductionStage1BundleBuilder:
         cumulative_artifacts.mkdir(parents=True, exist_ok=False)
         cumulative_records.mkdir(parents=True, exist_ok=False)
         cumulative_proofs.mkdir(parents=True, exist_ok=False)
-        schedule = _canonical_cumulative_spent_schedule(prepared.registry)
+        schedule = _canonical_cumulative_spent_schedule(
+            prepared.registry,
+            initial_training_partitions=prepared.options.initial_training_partitions,
+        )
         tasks: list[CumulativeTfidfScopeTask] = []
         expected_requests: dict[str, CumulativeSpentStage1FamilyRequest] = {}
         cumulative_config = project_tfidf_worker_config(
@@ -12268,7 +13502,7 @@ class ProductionStage1BundleBuilder:
                         "sha256": model_registration["sha256"],
                     },
                     "heldout_moment_artifact": {
-                        "relative_path": (model_artifact_dir / "heldout_moments.npz")
+                        "relative_path": (model_artifact_dir / "heldout_moments.arrays")
                         .relative_to(root)
                         .as_posix(),
                         "sha256": moment_metadata["arrays_sha256"],
@@ -12314,7 +13548,6 @@ class ProductionStage1BundleBuilder:
                         "text_column": prepared.config.text_column,
                         "query_config": asdict(prepared.query_config),
                         "query_nuisance_folds": int(prepared.options.query_nuisance_folds),
-                        "query_devices": list(prepared.options.query_devices),
                         "seed": int(prepared.options.seed),
                         "outcome_type": prepared.config.outcome_type,
                         "split_registry_content_sha256": prepared.registry_content_sha256,
@@ -12367,16 +13600,16 @@ class ProductionStage1BundleBuilder:
                             model_artifact_dir / "owned_snapshot" / "metadata.json",
                             component_root=root,
                         ),
-                        "owned_snapshot_arrays": _component_file_registration(
-                            model_artifact_dir / "owned_snapshot" / "arrays.npz",
+                        "owned_snapshot_arrays": _component_native_artifact_registration(
+                            model_artifact_dir / "owned_snapshot" / "arrays",
                             component_root=root,
                         ),
                         "heldout_moment_metadata": _component_file_registration(
                             model_artifact_dir / "heldout_moments.metadata.json",
                             component_root=root,
                         ),
-                        "heldout_moment_arrays": _component_file_registration(
-                            model_artifact_dir / "heldout_moments.npz",
+                        "heldout_moment_arrays": _component_native_artifact_registration(
+                            model_artifact_dir / "heldout_moments.arrays",
                             component_root=root,
                         ),
                         "native_family_proof_registration": (
@@ -12394,7 +13627,10 @@ class ProductionStage1BundleBuilder:
         cumulative_artifacts.mkdir(parents=True, exist_ok=False)
         cumulative_records.mkdir(parents=True, exist_ok=False)
         cumulative_proofs.mkdir(parents=True, exist_ok=False)
-        schedule = _canonical_cumulative_spent_schedule(prepared.registry)
+        schedule = _canonical_cumulative_spent_schedule(
+            prepared.registry,
+            initial_training_partitions=prepared.options.initial_training_partitions,
+        )
         cumulative_registrations: list[Mapping[str, Any]] = []
         cumulative_requests: dict[str, CumulativeSpentStage1FamilyRequest] = {}
         with tempfile.TemporaryDirectory(
@@ -12531,7 +13767,10 @@ class ProductionStage1BundleBuilder:
     ) -> Mapping[str, Any]:
         """Reload all component indexes into ten live producers per hierarchy scope."""
 
-        schedule = _canonical_cumulative_spent_schedule(prepared.registry)
+        schedule = _canonical_cumulative_spent_schedule(
+            prepared.registry,
+            initial_training_partitions=prepared.options.initial_training_partitions,
+        )
         base_requests: dict[str, CumulativeSpentStage1FamilyRequest] = {}
         legacy_configurations: dict[str, Mapping[str, Mapping[str, Any]]] = {}
         for scope in schedule.scopes:
@@ -12951,7 +14190,6 @@ class ProductionStage1BundleBuilder:
                     raise RuntimeError(
                         f"lossless cumulative catalog roundtrip failed: {scope_id}/{family}"
                     )
-
             bundle_path = bundle_dir / f"{scope_id}.json"
             catalog_path = catalog_dir / f"{scope_id}.json"
             _write_immutable_json(bundle_path, typed_bundle)
@@ -13113,7 +14351,9 @@ class ProductionStage1BundleBuilder:
             "contract_split_registry_sha256": contract_registry.content_sha256,
             "schedule_sha256": schedule.schedule_sha256,
             "review_rounds": int(contract["review_rounds"]),
-            "initial_spent_partition_count": 3,
+            "initial_spent_partition_count": int(
+                contract["initial_spent_partition_count"]
+            ),
             "canonical_hierarchy_partition_count": int(
                 contract["canonical_hierarchy_partition_count"]
             ),
@@ -13248,7 +14488,6 @@ class ProductionStage1BundleBuilder:
                     "text_column": prepared.config.text_column,
                     "query_config": asdict(prepared.query_config),
                     "query_nuisance_folds": int(prepared.options.query_nuisance_folds),
-                    "query_devices": list(prepared.options.query_devices),
                     "seed": int(prepared.options.seed),
                     "outcome_type": prepared.config.outcome_type,
                     "split_registry_content_sha256": prepared.registry_content_sha256,
@@ -13457,9 +14696,9 @@ class ProductionStage1BundleBuilder:
             )
             if (
                 snapshot_metadata_path != model_path / "owned_snapshot" / "metadata.json"
-                or snapshot_arrays_path != model_path / "owned_snapshot" / "arrays.npz"
+                or snapshot_arrays_path != model_path / "owned_snapshot" / "arrays"
                 or moment_metadata_path != model_path / "heldout_moments.metadata.json"
-                or moment_arrays_path != model_path / "heldout_moments.npz"
+                or moment_arrays_path != model_path / "heldout_moments.arrays"
             ):
                 raise ValueError(f"neural-query native artifact layout mismatch: {scope_id}")
             snapshot = validate_owned_discovery_snapshot(
@@ -13622,8 +14861,12 @@ class ProductionStage1BundleBuilder:
             registry=prepared.registry,
             registry_content_sha256=prepared.registry_content_sha256,
             global_seed=prepared.options.seed,
+            physical_fit_identity=(
+                prepared.options.physical_fit_identity
+            ),
             gpu_ids=prepared.stage1_scope_plan.gpu_ids,
             review_rounds=prepared.stage1_scope_plan.review_rounds,
+            initial_training_partitions=prepared.options.initial_training_partitions,
             scope_workers_per_gpu=prepared.options.scope_workers_per_gpu,
             expected_outer_fold_count=int(prepared.config.cv_folds),
             expected_inner_fold_count=int(
@@ -13660,6 +14903,9 @@ class ProductionStage1BundleBuilder:
         hierarchy_handoff = load_production_stage1_hierarchy_handoff(
             manifest_path,
             review_rounds=int(hierarchy_contract["review_rounds"]),
+            initial_training_partitions=int(
+                hierarchy_contract["initial_spent_partition_count"]
+            ),
             interaction_inner_folds=int(hierarchy_contract["interaction_inner_folds"]),
             tfidf_nested_calibration_folds=int(
                 hierarchy_contract["tfidf_nested_calibration_folds"]
@@ -13682,6 +14928,48 @@ class ProductionStage1BundleBuilder:
             "oracle_columns_decoded_or_materialized": False,
             "whole_parquet_container_authenticated": True,
         }
+
+
+def publish_authenticated_role_neutral_stage1_bindings(
+    *,
+    root: Path | str,
+    plan: Stage1ScopePlan,
+    sources_by_physical_owner: Mapping[str, Sequence[Any]],
+) -> Mapping[str, Any]:
+    """Publish the explicit role-neutral path without touching legacy fragments.
+
+    ``build()`` intentionally retains its historical fail-closed behavior.
+    Callers may opt into this separate path only after all six role-neutral
+    producer validators have returned authenticated receipt/root pairs for
+    every physical-fit owner.
+    """
+
+    from .production_stage1_role_neutral_coordinator import (
+        publish_role_neutral_stage1_coordination_gate,
+    )
+
+    return publish_role_neutral_stage1_coordination_gate(
+        root=root,
+        plan=plan,
+        sources_by_physical_owner=sources_by_physical_owner,
+    )
+
+
+def validate_authenticated_role_neutral_stage1_bindings(
+    *,
+    root: Path | str,
+    plan: Stage1ScopePlan,
+) -> Mapping[str, Any]:
+    """Freshly reopen the opt-in role-neutral gate and every component byte."""
+
+    from .production_stage1_role_neutral_coordinator import (
+        validate_role_neutral_stage1_coordination_gate,
+    )
+
+    return validate_role_neutral_stage1_coordination_gate(
+        root=root,
+        plan=plan,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -13722,6 +15010,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--unit-id-column", required=True)
+    parser.add_argument("--initial-training-partitions", type=int, required=True)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
@@ -13743,7 +15032,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--query-device", action="append", default=[])
     parser.add_argument("--query-nuisance-folds", type=int, default=3)
-    parser.add_argument("--query-config", type=Path)
+    parser.add_argument("--query-config", type=Path, required=True)
     parser.add_argument(
         "--resume",
         action="store_true",
@@ -13754,6 +15043,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def options_from_args(args: argparse.Namespace) -> Stage1BundleBuildOptions:
+    if int(args.initial_training_partitions) < 1:
+        raise ValueError("--initial-training-partitions must be positive")
     if args.embedding_cache_output_dir is not None and args.embedding_local_model_path is None:
         raise ValueError(
             "--embedding-local-model-path is required with --embedding-cache-output-dir"
@@ -13776,6 +15067,7 @@ def options_from_args(args: argparse.Namespace) -> Stage1BundleBuildOptions:
         embedding_cache_output_dir=args.embedding_cache_output_dir,
         output_dir=args.output_dir,
         unit_id_column=args.unit_id_column,
+        initial_training_partitions=int(args.initial_training_partitions),
         seed=int(args.seed),
         device=str(args.device),
         gpu_ids=tuple(args.gpu_id),
@@ -13827,6 +15119,8 @@ __all__ = [
     "load_applied_stage1_config",
     "main",
     "options_from_args",
+    "publish_authenticated_role_neutral_stage1_bindings",
     "validate_embedding_cluster_feasibility_audit",
+    "validate_authenticated_role_neutral_stage1_bindings",
     "validate_htr_input_nontruncation_audit",
 ]

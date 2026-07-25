@@ -12,6 +12,7 @@ import pytest
 
 import oci.inference.production_stage1_bundle as bundle_module
 import oci.inference.production_stage1_cluster_preflight_artifact as artifact_module
+from oci.inference.neural_query_agentic_forest import NeuralQueryAgenticForestConfig
 from oci.inference.production_stage1_bundle import (
     ProductionStage1BundleBuilder,
     Stage1BundleBuildOptions,
@@ -47,6 +48,11 @@ def test_modeling_prepare_consumes_sealed_preflight_without_recomputation(
         json.dumps({"applied_inference": asdict(config)}),
         encoding="utf-8",
     )
+    query_config_path = tmp_path / "query.json"
+    query_config_path.write_text(
+        json.dumps(asdict(NeuralQueryAgenticForestConfig()), sort_keys=True),
+        encoding="utf-8",
+    )
     cache_dir = tmp_path / "embedding_cache"
     cache_dir.mkdir()
     rows = []
@@ -75,6 +81,16 @@ def test_modeling_prepare_consumes_sealed_preflight_without_recomputation(
             "normalize_embeddings": config.architecture.multi_model_forest.embedding_contrast.normalize_embeddings,
             "chunk_selection": "last",
             "max_seq_length": config.architecture.multi_model_forest.embedding_contrast.max_seq_length,
+            "production_provenance": {
+                "chunk_configuration": {
+                    "chunk_size_words": config.architecture.multi_model_forest.embedding_contrast.chunk_size_words,
+                    "chunk_overlap_words": config.architecture.multi_model_forest.embedding_contrast.chunk_overlap_words,
+                    "max_chunks": config.architecture.multi_model_forest.embedding_contrast.max_chunks,
+                    "chunk_selection": "last",
+                    "normalize_embeddings": config.architecture.multi_model_forest.embedding_contrast.normalize_embeddings,
+                    "max_seq_length": config.architecture.multi_model_forest.embedding_contrast.max_seq_length,
+                }
+            },
         }
 
         def __init__(self, path):
@@ -143,6 +159,8 @@ def test_modeling_prepare_consumes_sealed_preflight_without_recomputation(
         embedding_cache_dir=cache_dir,
         output_dir=tmp_path / "output",
         unit_id_column="person_key",
+        initial_training_partitions=3,
+        query_config_path=query_config_path,
         dry_run=True,
     )
     preflight = ProductionStage1BundleBuilder(common).prepare()

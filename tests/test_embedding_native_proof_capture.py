@@ -27,6 +27,9 @@ from oci.inference.embedding_native_proof_capture import (
     validate_embedding_cluster_support_state,
     validate_embedding_native_capture,
 )
+from oci.inference.embedding_contrast_discovery import (
+    _canonicalize_svd_component_signs,
+)
 from oci.inference.lossless_stage1_evidence_catalog import (
     build_role_neutral_evidence_catalog,
 )
@@ -48,6 +51,13 @@ from oci.inference.review_spent_evidence_provider import (
     _FrozenCacheEmbeddingEvidenceGenerator,
     _embedding_concepts_only,
 )
+from tests.semantic_witness_test_support import semantic_witness_config
+from tests.cluster_local_embedding_test_support import (
+    cluster_local_embedding_config,
+)
+
+
+_SEMANTIC_WITNESS_CONFIG = semantic_witness_config()
 
 
 def _write_cache(path: Path, texts: tuple[str, ...], embeddings: np.ndarray) -> None:
@@ -209,6 +219,21 @@ def _case(
     embedding_config.cluster_contrast_max_components = 3
     embedding_config.cluster_contrast_top_loadings = 4
     embedding_config.cluster_contrast_kmeans_n_init = 3
+    embedding_config.cluster_local_scientific = cluster_local_embedding_config(
+        requested_cluster_count=4,
+        maximum_components_per_family=3,
+        minimum_cluster_size=4,
+        minimum_group_size=2,
+        minimum_cell_size=1,
+        kmeans_batch_size_lower_bound=128,
+        kmeans_n_init=3,
+        kmeans_max_iter=300,
+        computation_dtype="float32",
+        svd_rank_tolerance_dtype="float32",
+    )
+    config.architecture.multi_model_agentic_forest.embedding_contrast.cluster_local_scientific = (
+        embedding_config.cluster_local_scientific
+    )
     dataset = pd.DataFrame(
         {
             "_oci_row_id": np.arange(row_count, dtype=int),
@@ -238,10 +263,15 @@ def _case(
         outcome_type=config.outcome_type,
         embedding_provider=provider,
         embedding_config=generator.embedding_config,
+        semantic_witness_scientific_config=_SEMANTIC_WITNESS_CONFIG,
         tfidf_nested_calibration_folds=5,
         seed=917,
     )
     generator._native_embedding_proof_observer = sink
+    generator.bind_cluster_physical_fit_authority(
+        ordered_fit_row_ids=fit_rows,
+        canonical_group_seed=917,
+    )
     sink.record_registered_fit_outputs(
         fit_row_ids=fit_rows,
         treatment=treatment,
@@ -302,10 +332,17 @@ def test_embedding_capture_replays_generator_kmeans_svd_and_semantic_projection(
     assert support["kmeans_parameters"] == replay["cluster_kmeans"]["parameters"]
     assert support["kmeans_parameters"] == {
         "n_clusters": 4,
-        "random_state": 42,
-        "batch_size": 128,
-        "n_init": 3,
+        "init": "k-means++",
         "max_iter": 300,
+        "batch_size": 128,
+        "verbose": 0,
+        "compute_labels": True,
+        "random_state": 917,
+        "tol": 0.0,
+        "max_no_improvement": 10,
+        "init_size": None,
+        "n_init": 3,
+        "reassignment_ratio": 0.01,
     }
     assert support["schema_version"] == EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA
     assert {row["family_key"] for row in support["svd_families"]} == {
@@ -316,7 +353,7 @@ def test_embedding_capture_replays_generator_kmeans_svd_and_semantic_projection(
     assert all(row["numerical_rank"] >= 2 for row in support["svd_families"])
     assert all(row["second_singular_value"] > 0.0 for row in support["svd_families"])
     assert all(
-        row["second_singular_value"] > row["numerical_rank_tolerance_float32"]
+        row["second_singular_value"] > row["numerical_rank_tolerance"]
         for row in support["svd_families"]
     )
     assert replay["tfidf_training_scope_policy"]["schema_version"] == (
@@ -328,15 +365,35 @@ def test_embedding_capture_replays_generator_kmeans_svd_and_semantic_projection(
 
 
 def test_cluster_support_contract_rejects_missing_single_cluster_and_rank_one_state():
+    cluster_scientific = cluster_local_embedding_config(
+        kmeans_batch_size_lower_bound=128,
+        kmeans_n_init=3,
+        kmeans_max_iter=300,
+        computation_dtype="float32",
+        svd_rank_tolerance_dtype="float32",
+    )
+    kmeans_parameters = {
+        "n_clusters": 2,
+        "init": "k-means++",
+        "max_iter": 300,
+        "batch_size": 128,
+        "verbose": 0,
+        "compute_labels": True,
+        "random_state": 42,
+        "tol": 0.0,
+        "max_no_improvement": 10,
+        "init_size": None,
+        "n_init": 3,
+        "reassignment_ratio": 0.01,
+    }
     kmeans = {
         "fit_row_ids": [0, 1, 2, 3],
-        "parameters": {
-            "n_clusters": 2,
-            "random_state": 42,
-            "batch_size": 128,
-            "n_init": 3,
-            "max_iter": 300,
-        },
+        "parameters": kmeans_parameters,
+        "scientific_configuration": cluster_scientific.as_dict(),
+        "canonical_group_seed": 42,
+        "ordered_fit_row_seed_policy": (
+            "canonical_ordered_fit_rows_group_seed_v1"
+        ),
         "usable_mask": np.asarray([True, True, True, True]),
         "cluster_labels": np.asarray([0, 0, 1, 1]),
         "cluster_centers": np.asarray([[1.0, 0.0], [0.0, 1.0]]),
@@ -346,13 +403,48 @@ def test_cluster_support_contract_rejects_missing_single_cluster_and_rank_one_st
     }
 
     def state(family: str, matrix: np.ndarray) -> dict[str, object]:
-        _left, values, components = np.linalg.svd(matrix, full_matrices=False)
+        typed_matrix = np.asarray(matrix, dtype=np.float32)
+        _left, values, components = np.linalg.svd(
+            typed_matrix,
+            full_matrices=False,
+            compute_uv=True,
+            hermitian=False,
+        )
+        components = _canonicalize_svd_component_signs(
+            components,
+            policy="largest_absolute_coordinate_positive_v1",
+        )
+        rank_tolerance = (
+            np.finfo(np.float32).eps
+            * max(typed_matrix.shape)
+            * float(values[0])
+        )
         return {
             "family_key": family,
             "item_cluster_ids": [0, 1],
-            "weighted_matrix": matrix,
+            "weighted_matrix": typed_matrix,
             "singular_values": values,
             "components": components,
+            "parameters": {
+                "full_matrices": False,
+                "compute_uv": True,
+                "hermitian": False,
+            },
+            "sign_canonicalization_policy": (
+                "largest_absolute_coordinate_positive_v1"
+            ),
+            "rank_tolerance_policy": (
+                "dtype_epsilon_times_max_shape_times_largest_singular_v1"
+            ),
+            "rank_tolerance_dtype": "float32",
+            "rank_tolerance_multiplier": 1.0,
+            "rank_tolerance": rank_tolerance,
+            "numerical_rank": int(np.sum(values > rank_tolerance)),
+            "replay_comparison_policy": (
+                "allclose_and_exact_discrete_state_v1"
+            ),
+            "replay_relative_tolerance": 2e-6,
+            "replay_absolute_tolerance": 2e-7,
         }
 
     treatment = state("treatment", np.asarray([[1.0, 0.0], [0.0, 1.0]]))
@@ -361,9 +453,7 @@ def test_cluster_support_contract_rejects_missing_single_cluster_and_rank_one_st
         np.asarray([[1.0, 1.0], [1.0, -1.0]]),
     )
     expected_kmeans_configuration = {
-        "cluster_contrast_n_clusters": 2,
-        "cluster_contrast_random_state": 42,
-        "cluster_contrast_kmeans_n_init": 3,
+        "cluster_local_scientific": cluster_scientific.as_dict(),
     }
     valid = validate_embedding_cluster_support_state(
         kmeans_state=kmeans,
@@ -374,7 +464,7 @@ def test_cluster_support_contract_rejects_missing_single_cluster_and_rank_one_st
     assert valid["required_svd_families"] == ["treatment", "residualized_interaction"]
     assert "kmeans_inertia" not in valid
     assert all(
-        row["second_singular_value"] > row["numerical_rank_tolerance_float32"]
+        row["second_singular_value"] > row["numerical_rank_tolerance"]
         for row in valid["svd_families"]
     )
     changed_inertia = dict(kmeans)
@@ -565,7 +655,11 @@ def test_semantic_policy_is_label_free_nonselecting_and_full_projection_is_lossl
             }
         ],
     }
-    bundle = semantic_retrieval_projection_bundle(raw, policy=policy)
+    bundle = semantic_retrieval_projection_bundle(
+        raw,
+        policy=policy,
+        scientific_config=_SEMANTIC_WITNESS_CONFIG,
+    )
     full_terms = {
         row["concept"]
         for contrast in bundle["full"]["contrasts"]
@@ -608,6 +702,7 @@ def test_embedding_capture_rejects_provider_with_heldout_rows_bound(tmp_path: Pa
             outcome_type=config.outcome_type,
             embedding_provider=provider,
             embedding_config=config.architecture.multi_model_forest.embedding_contrast,
+            semantic_witness_scientific_config=_SEMANTIC_WITNESS_CONFIG,
             tfidf_nested_calibration_folds=2,
             seed=1,
         )
@@ -618,7 +713,7 @@ def _production_registration_context(case):
         importance={},
         embedding_evidence=_embedding_concepts_only(
             case["evidence"],
-            contrastive_term_limit=None,
+            scientific_config=_SEMANTIC_WITNESS_CONFIG,
         ),
         htr_evidence={},
     )
@@ -656,6 +751,12 @@ def _production_registration_context(case):
         "outcome_column": case["outcome_column"],
         "outcome_type": case["outcome_type"],
         "embedding_config": case["metadata"]["embedding_config"],
+        "semantic_witness_scientific_config": case["metadata"][
+            "semantic_witness_scientific_config"
+        ],
+        "semantic_witness_scientific_config_sha256": case["metadata"][
+            "semantic_witness_scientific_config_sha256"
+        ],
         "capture_schema_version": case["metadata"]["schema_version"],
         "semantic_policy_schema_version": SEMANTIC_RETRIEVAL_TRAINING_ONLY_SCHEMA,
         "tfidf_nested_calibration_folds": 5,
@@ -749,7 +850,7 @@ def test_production_embedding_registration_replays_all_three_families_and_index(
     modeling_data = case["dataset"].drop(columns=["_oci_row_id"])
     safe_embedding = _embedding_concepts_only(
         case["evidence"],
-        contrastive_term_limit=None,
+        scientific_config=_SEMANTIC_WITNESS_CONFIG,
     )
     digest = _catalog_ready_legacy_digest(
         importance={},
@@ -798,6 +899,12 @@ def test_production_embedding_registration_replays_all_three_families_and_index(
         "outcome_column": case["outcome_column"],
         "outcome_type": case["outcome_type"],
         "embedding_config": case["metadata"]["embedding_config"],
+        "semantic_witness_scientific_config": case["metadata"][
+            "semantic_witness_scientific_config"
+        ],
+        "semantic_witness_scientific_config_sha256": case["metadata"][
+            "semantic_witness_scientific_config_sha256"
+        ],
         "capture_schema_version": case["metadata"]["schema_version"],
         "semantic_policy_schema_version": (SEMANTIC_RETRIEVAL_TRAINING_ONLY_SCHEMA),
         "tfidf_nested_calibration_folds": 5,

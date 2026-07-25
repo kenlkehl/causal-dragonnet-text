@@ -15,6 +15,7 @@ import marshal
 import math
 import threading
 import time
+from dataclasses import dataclass, fields as dataclass_fields
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -28,8 +29,14 @@ from ..extraction.llm_routing import (
 )
 from .all_evidence_discovery_interfaces import canonical_json, content_sha256
 from .hierarchical_all_architecture_discovery import (
+    CONSOLIDATE_ARCHITECTURE_JOB,
+    COVERAGE_CRITIC_JOB,
+    CROSS_ARCHITECTURE_INTEGRATION_JOB,
+    CROSS_ARCHITECTURE_PLANNER_JOB,
     EXTRACTION_DEFINITION_JOB,
+    INTERPRET_CHUNK_JOB,
     RAW_TRANSPORT_BUDGET_FAILURE,
+    REJECTION_CRITIC_JOB,
     STRICT_JSON_PARSE_FAILURE,
     SELECTOR_THINKING_TOKEN_BUDGET,
     DiscoveryJsonJob,
@@ -37,14 +44,16 @@ from .hierarchical_all_architecture_discovery import (
 )
 from .hierarchical_discovery_response_contract import (
     HIERARCHICAL_DISCOVERY_CONSERVATIVE_UTF8_BYTES_PER_TOKEN,
-    HIERARCHICAL_DISCOVERY_GENERATION_TOKEN_BUDGET,
-    HIERARCHICAL_DISCOVERY_MAX_TRANSPORT_BYTES,
     HIERARCHICAL_DISCOVERY_WIRE_RESPONSE_BUDGET_VERSION,
+    HierarchyWireBudget,
+    LEGACY_HIERARCHY_WIRE_BUDGET,
 )
 
-OPENAI_JSON_DISCOVERY_RUNNER_VERSION = "openai_json_discovery_job_runner_v8"
+OPENAI_JSON_DISCOVERY_RUNNER_VERSION = "openai_json_discovery_job_runner_v13"
+STAGE2_GENERATION_POLICY_VERSION = "stage2_generation_policy_v2"
 MINIMUM_DISCOVERY_MAX_TOKENS = (
-    HIERARCHICAL_DISCOVERY_GENERATION_TOKEN_BUDGET + SELECTOR_THINKING_TOKEN_BUDGET
+    LEGACY_HIERARCHY_WIRE_BUDGET.generation_token_budget
+    + SELECTOR_THINKING_TOKEN_BUDGET
 )
 DEFAULT_DISCOVERY_MAX_TOKENS = MINIMUM_DISCOVERY_MAX_TOKENS
 MAX_AUTHENTICATED_RETRIES = 8
@@ -52,6 +61,723 @@ MAX_AUTHENTICATED_RETRIES = 8
 _AUTODISCOVERY_MODEL_NAMES = frozenset(
     {"", "auto", "automatic", "autodiscover", "discover", "server", "default"}
 )
+
+FEATURE_PROPOSAL_REVIEW_FAMILY = "feature_proposal_review"
+PATIENT_FEATURE_EXTRACTION_FAMILY = "patient_feature_extraction"
+HIERARCHICAL_GENERATION_JOB_KINDS = (
+    INTERPRET_CHUNK_JOB,
+    CONSOLIDATE_ARCHITECTURE_JOB,
+    COVERAGE_CRITIC_JOB,
+    CROSS_ARCHITECTURE_PLANNER_JOB,
+    CROSS_ARCHITECTURE_INTEGRATION_JOB,
+    REJECTION_CRITIC_JOB,
+    EXTRACTION_DEFINITION_JOB,
+)
+
+
+@dataclass(frozen=True)
+class Stage2GenerationParameters:
+    """All result-changing completion controls for one Stage 2 job family.
+
+    There are deliberately no defaults.  Unsupported provider-specific
+    sampling controls cannot be silently added to a request: extending this
+    closed object and its request validator is required first.
+    """
+
+    temperature: float
+    top_p: float
+    top_k: int
+    min_p: float
+    seed: int
+    frequency_penalty: float
+    presence_penalty: float
+    repetition_penalty: float
+    max_tokens: int
+    min_tokens: int
+    ignore_eos: bool
+    stop_sequences: tuple[str, ...]
+    stop_token_ids: tuple[int, ...]
+    include_stop_str_in_output: bool
+    logit_bias: tuple[tuple[str, float], ...]
+    allowed_token_ids: tuple[int, ...] | None
+    bad_words: tuple[str, ...]
+    n: int
+    logprobs: bool
+    top_logprobs: int
+    prompt_logprobs: int | None
+    stream: bool
+    use_beam_search: bool
+    length_penalty: float
+    skip_special_tokens: bool
+    spaces_between_special_tokens: bool
+    echo: bool
+    add_generation_prompt: bool
+    continue_final_message: bool
+    add_special_tokens: bool
+    include_reasoning: bool
+    reasoning_effort: str | None
+    parallel_tool_calls: bool
+    tool_choice: str
+    return_tokens_as_token_ids: bool
+    return_token_ids: bool
+    return_prompt_text: bool
+    thinking_enabled: bool
+    thinking_token_budget: int
+    transport_max_retries: int
+    schema_repair_attempts: int
+
+    def __post_init__(self) -> None:
+        def finite_float(
+            name: str,
+            *,
+            minimum: float | None = None,
+            maximum: float | None = None,
+            minimum_inclusive: bool = True,
+        ) -> float:
+            raw = getattr(self, name)
+            if (
+                isinstance(raw, bool)
+                or not isinstance(raw, (int, float))
+                or not math.isfinite(float(raw))
+            ):
+                raise TypeError(f"{name} must be one finite number")
+            result = float(raw)
+            if minimum is not None and (
+                result < minimum
+                if minimum_inclusive
+                else result <= minimum
+            ):
+                qualifier = ">=" if minimum_inclusive else ">"
+                raise ValueError(f"{name} must be {qualifier} {minimum}")
+            if maximum is not None and result > maximum:
+                raise ValueError(f"{name} must be <= {maximum}")
+            object.__setattr__(self, name, result)
+            return result
+
+        finite_float("temperature", minimum=0.0, maximum=2.0)
+        finite_float(
+            "top_p",
+            minimum=0.0,
+            maximum=1.0,
+            minimum_inclusive=False,
+        )
+        finite_float("min_p", minimum=0.0, maximum=1.0)
+        finite_float("frequency_penalty", minimum=-2.0, maximum=2.0)
+        finite_float("presence_penalty", minimum=-2.0, maximum=2.0)
+        finite_float(
+            "repetition_penalty",
+            minimum=0.0,
+            minimum_inclusive=False,
+        )
+        finite_float(
+            "length_penalty",
+            minimum=0.0,
+            minimum_inclusive=False,
+        )
+
+        if (
+            isinstance(self.top_k, bool)
+            or not isinstance(self.top_k, int)
+            or (self.top_k != -1 and self.top_k < 1)
+        ):
+            raise ValueError("top_k must be -1 (disabled) or a positive integer")
+        if (
+            isinstance(self.seed, bool)
+            or not isinstance(self.seed, int)
+            or not 0 <= self.seed <= (2**63 - 1)
+        ):
+            raise ValueError("seed must be an integer between 0 and 2**63 - 1")
+        if isinstance(self.max_tokens, bool) or not isinstance(self.max_tokens, int):
+            raise TypeError("max_tokens must be an integer")
+        if self.max_tokens < 1:
+            raise ValueError("max_tokens must be a positive integer")
+        if (
+            isinstance(self.min_tokens, bool)
+            or not isinstance(self.min_tokens, int)
+            or not 0 <= self.min_tokens <= self.max_tokens
+        ):
+            raise ValueError(
+                "min_tokens must be an integer between zero and max_tokens"
+            )
+
+        for name in (
+            "ignore_eos",
+            "include_stop_str_in_output",
+            "logprobs",
+            "stream",
+            "use_beam_search",
+            "skip_special_tokens",
+            "spaces_between_special_tokens",
+            "echo",
+            "add_generation_prompt",
+            "continue_final_message",
+            "add_special_tokens",
+            "include_reasoning",
+            "parallel_tool_calls",
+            "return_tokens_as_token_ids",
+            "return_token_ids",
+            "return_prompt_text",
+            "thinking_enabled",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be boolean")
+
+        stop_sequences = self.stop_sequences
+        if not isinstance(stop_sequences, tuple) or any(
+            not isinstance(item, str) or not item
+            for item in stop_sequences
+        ):
+            raise TypeError(
+                "stop_sequences must be an ordered tuple of nonempty strings"
+            )
+        if len(stop_sequences) != len(set(stop_sequences)):
+            raise ValueError("stop_sequences cannot contain duplicates")
+
+        def token_id_tuple(
+            name: str,
+            *,
+            nullable: bool,
+        ) -> tuple[int, ...] | None:
+            raw = getattr(self, name)
+            if nullable and raw is None:
+                return None
+            if not isinstance(raw, tuple) or any(
+                isinstance(item, bool) or not isinstance(item, int) or item < 0
+                for item in raw
+            ):
+                qualifier = " or null" if nullable else ""
+                raise TypeError(
+                    f"{name} must be an ordered tuple of nonnegative integers"
+                    f"{qualifier}"
+                )
+            if len(raw) != len(set(raw)):
+                raise ValueError(f"{name} cannot contain duplicates")
+            return raw
+
+        token_id_tuple("stop_token_ids", nullable=False)
+        token_id_tuple("allowed_token_ids", nullable=True)
+
+        bad_words = self.bad_words
+        if not isinstance(bad_words, tuple) or any(
+            not isinstance(item, str) or not item
+            for item in bad_words
+        ):
+            raise TypeError("bad_words must be an ordered tuple of nonempty strings")
+        if len(bad_words) != len(set(bad_words)):
+            raise ValueError("bad_words cannot contain duplicates")
+
+        logit_bias = self.logit_bias
+        if not isinstance(logit_bias, tuple):
+            raise TypeError(
+                "logit_bias must be an ordered tuple of (token_id, bias) pairs"
+            )
+        normalized_bias: list[tuple[str, float]] = []
+        for pair in logit_bias:
+            if (
+                not isinstance(pair, tuple)
+                or len(pair) != 2
+                or not isinstance(pair[0], str)
+                or not pair[0].isdigit()
+            ):
+                raise TypeError(
+                    "logit_bias entries must be (nonnegative token-id string, bias)"
+                )
+            token_id, raw_bias = pair
+            if (
+                isinstance(raw_bias, bool)
+                or not isinstance(raw_bias, (int, float))
+                or not math.isfinite(float(raw_bias))
+                or not -100.0 <= float(raw_bias) <= 100.0
+            ):
+                raise ValueError("logit_bias values must be finite and between -100 and 100")
+            normalized_bias.append((token_id, float(raw_bias)))
+        if tuple(sorted(normalized_bias)) != tuple(normalized_bias):
+            raise ValueError("logit_bias entries must be sorted by token-id string")
+        if len(normalized_bias) != len({token_id for token_id, _ in normalized_bias}):
+            raise ValueError("logit_bias cannot repeat token IDs")
+        object.__setattr__(self, "logit_bias", tuple(normalized_bias))
+
+        if self.n != 1:
+            raise ValueError("production Stage 2 requires n equal to one")
+        if self.logprobs:
+            raise ValueError("production Stage 2 requires logprobs disabled")
+        if self.top_logprobs != 0:
+            raise ValueError(
+                "disabled production logprobs requires top_logprobs equal to zero"
+            )
+        if self.prompt_logprobs is not None:
+            raise ValueError("production Stage 2 requires prompt_logprobs disabled")
+        if self.stream:
+            raise ValueError("production Stage 2 requires stream disabled")
+        if self.use_beam_search:
+            raise ValueError("production Stage 2 requires beam search disabled")
+        if self.echo:
+            raise ValueError("production Stage 2 requires echo disabled")
+        if not self.add_generation_prompt:
+            raise ValueError(
+                "production Stage 2 requires add_generation_prompt enabled"
+            )
+        if self.continue_final_message:
+            raise ValueError(
+                "production Stage 2 requires continue_final_message disabled"
+            )
+        if self.add_special_tokens:
+            raise ValueError("production Stage 2 requires add_special_tokens disabled")
+        if self.parallel_tool_calls:
+            raise ValueError("production Stage 2 requires parallel_tool_calls disabled")
+        if self.tool_choice != "none":
+            raise ValueError("production Stage 2 requires tool_choice equal to 'none'")
+        for name in (
+            "return_tokens_as_token_ids",
+            "return_token_ids",
+            "return_prompt_text",
+        ):
+            if getattr(self, name):
+                raise ValueError(f"production Stage 2 requires {name} disabled")
+        allowed_reasoning_effort = {
+            None,
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+        }
+        if self.reasoning_effort not in allowed_reasoning_effort:
+            raise ValueError("reasoning_effort is unsupported")
+
+        if not isinstance(self.thinking_enabled, bool):
+            raise TypeError("thinking_enabled must be boolean")
+        if isinstance(self.thinking_token_budget, bool) or not isinstance(
+            self.thinking_token_budget,
+            int,
+        ):
+            raise TypeError("thinking_token_budget must be an integer")
+        if self.thinking_token_budget < 0:
+            raise ValueError("thinking_token_budget must be a nonnegative integer")
+        if self.thinking_enabled:
+            if not 0 < self.thinking_token_budget < self.max_tokens:
+                raise ValueError(
+                    "enabled thinking requires a positive thinking_token_budget "
+                    "strictly below max_tokens"
+                )
+        elif self.thinking_token_budget != 0:
+            raise ValueError(
+                "disabled thinking requires thinking_token_budget equal to zero"
+            )
+        for name in ("transport_max_retries", "schema_repair_attempts"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be an integer")
+            if value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+        if self.transport_max_retries > MAX_AUTHENTICATED_RETRIES:
+            raise ValueError(
+                f"transport_max_retries cannot exceed {MAX_AUTHENTICATED_RETRIES}"
+            )
+        if self.schema_repair_attempts > 1:
+            raise ValueError("schema_repair_attempts cannot exceed one")
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any],
+    ) -> "Stage2GenerationParameters":
+        if not isinstance(value, Mapping):
+            raise TypeError("Stage 2 generation parameters must be one object")
+        expected = {field.name for field in dataclass_fields(cls)}
+        missing = sorted(expected - set(value))
+        extra = sorted(set(value) - expected)
+        if missing or extra:
+            raise ValueError(
+                "Stage 2 generation parameters have a closed schema; "
+                f"missing={missing}, extra={extra}"
+            )
+        normalized = dict(value)
+        for name in (
+            "stop_sequences",
+            "stop_token_ids",
+            "bad_words",
+        ):
+            raw = normalized[name]
+            if not isinstance(raw, list):
+                raise TypeError(f"{name} must be one JSON array")
+            normalized[name] = tuple(raw)
+        allowed_token_ids = normalized["allowed_token_ids"]
+        if allowed_token_ids is not None:
+            if not isinstance(allowed_token_ids, list):
+                raise TypeError("allowed_token_ids must be one JSON array or null")
+            normalized["allowed_token_ids"] = tuple(allowed_token_ids)
+        raw_logit_bias = normalized["logit_bias"]
+        if not isinstance(raw_logit_bias, Mapping):
+            raise TypeError("logit_bias must be one JSON object")
+        normalized["logit_bias"] = tuple(
+            sorted((str(key), value) for key, value in raw_logit_bias.items())
+        )
+        return cls(**normalized)
+
+    def as_dict(self) -> dict[str, Any]:
+        result = {
+            field.name: getattr(self, field.name)
+            for field in dataclass_fields(type(self))
+        }
+        for name in ("stop_sequences", "stop_token_ids", "bad_words"):
+            result[name] = list(result[name])
+        if result["allowed_token_ids"] is not None:
+            result["allowed_token_ids"] = list(result["allowed_token_ids"])
+        result["logit_bias"] = dict(result["logit_bias"])
+        return result
+
+    def request_generation_fields(self) -> dict[str, Any]:
+        extra_body: dict[str, Any] = {
+            "top_k": self.top_k,
+            "min_p": self.min_p,
+            "repetition_penalty": self.repetition_penalty,
+            "min_tokens": self.min_tokens,
+            "ignore_eos": self.ignore_eos,
+            "stop_token_ids": list(self.stop_token_ids),
+            "include_stop_str_in_output": self.include_stop_str_in_output,
+            "use_beam_search": self.use_beam_search,
+            "length_penalty": self.length_penalty,
+            "skip_special_tokens": self.skip_special_tokens,
+            "spaces_between_special_tokens": self.spaces_between_special_tokens,
+            "prompt_logprobs": self.prompt_logprobs,
+            "allowed_token_ids": (
+                None
+                if self.allowed_token_ids is None
+                else list(self.allowed_token_ids)
+            ),
+            "bad_words": list(self.bad_words),
+            "echo": self.echo,
+            "add_generation_prompt": self.add_generation_prompt,
+            "continue_final_message": self.continue_final_message,
+            "add_special_tokens": self.add_special_tokens,
+            "include_reasoning": self.include_reasoning,
+            "return_tokens_as_token_ids": self.return_tokens_as_token_ids,
+            "return_token_ids": self.return_token_ids,
+            "return_prompt_text": self.return_prompt_text,
+            "chat_template_kwargs": {
+                "enable_thinking": self.thinking_enabled,
+            }
+        }
+        if self.thinking_enabled:
+            extra_body["thinking_token_budget"] = self.thinking_token_budget
+        return {
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "seed": self.seed,
+            "frequency_penalty": self.frequency_penalty,
+            "presence_penalty": self.presence_penalty,
+            "max_tokens": self.max_tokens,
+            "stop": list(self.stop_sequences),
+            "n": self.n,
+            "logprobs": self.logprobs,
+            "top_logprobs": self.top_logprobs,
+            "stream": self.stream,
+            "logit_bias": dict(self.logit_bias),
+            "reasoning_effort": self.reasoning_effort,
+            "parallel_tool_calls": self.parallel_tool_calls,
+            "tool_choice": self.tool_choice,
+            "extra_body": extra_body,
+        }
+
+    def legacy_constructor_fields(self) -> dict[str, Any]:
+        """Return fields exposed by older internal constructor/config objects.
+
+        This is not a completion request.  Production adapters compare these
+        six inherited knobs, then construct and validate the complete closed
+        request before transport.
+        """
+
+        return {
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "thinking_enabled": self.thinking_enabled,
+            "thinking_token_budget": self.thinking_token_budget,
+            "transport_max_retries": self.transport_max_retries,
+            "schema_repair_attempts": self.schema_repair_attempts,
+        }
+
+    def complete_inherited_request_generation_fields(
+        self,
+        request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Complete a narrowly defined inherited request before validation.
+
+        Two legacy internal request builders still originate proposal and
+        non-paged patient requests with only temperature, max_tokens, and the
+        thinking chat-template switch.  This bridge accepts exactly that
+        authenticated projection (or an already-complete request), injects all
+        remaining policy fields, and then applies the strict closed validator.
+        It is never used by typed hierarchy or complete-page request builders.
+        """
+
+        if not isinstance(request, Mapping):
+            raise TypeError("completion request must be one mapping")
+        candidate = dict(request)
+        try:
+            self.validate_request_generation_fields(candidate)
+        except ValueError:
+            expected = self.request_generation_fields()
+            inherited_keys = {"temperature", "max_tokens", "extra_body"}
+            observed_inherited = {
+                key: candidate.get(key)
+                for key in inherited_keys
+            }
+            expected_extra = {
+                "chat_template_kwargs": {
+                    "enable_thinking": self.thinking_enabled,
+                }
+            }
+            if self.thinking_enabled:
+                expected_extra["thinking_token_budget"] = (
+                    self.thinking_token_budget
+                )
+            expected_inherited = {
+                "temperature": self.temperature,
+                "max_tokens": self.max_tokens,
+                "extra_body": expected_extra,
+            }
+            if (
+                not inherited_keys.issubset(candidate)
+                or observed_inherited != expected_inherited
+            ):
+                raise ValueError(
+                    "inherited completion request generation controls differ "
+                    "from the authenticated Stage 2 generation policy"
+                )
+            forbidden_existing = (
+                set(candidate)
+                & set(expected)
+                - inherited_keys
+            )
+            if forbidden_existing:
+                raise ValueError(
+                    "inherited completion request contains a partial or "
+                    "substituted closed generation policy"
+                )
+            candidate.update(expected)
+            self.validate_request_generation_fields(candidate)
+        return candidate
+
+    def validate_request_generation_fields(
+        self,
+        request: Mapping[str, Any],
+    ) -> None:
+        if not isinstance(request, Mapping):
+            raise TypeError("completion request must be one mapping")
+        expected = self.request_generation_fields()
+        structural_keys = {"model", "messages", "response_format"}
+        missing = sorted(set(expected) - set(request))
+        extra = sorted(set(request) - set(expected) - structural_keys)
+        observed = {key: request[key] for key in expected if key in request}
+        if missing or extra or observed != expected:
+            raise ValueError(
+                "completion request generation controls differ from the "
+                "authenticated Stage 2 generation policy; "
+                f"missing={missing}, extra={extra}"
+            )
+
+
+@dataclass(frozen=True)
+class Stage2GenerationPolicy:
+    """Closed generation policy for every production Stage 2 job family."""
+
+    interpret_architecture_chunk: Stage2GenerationParameters
+    consolidate_architecture_candidates: Stage2GenerationParameters
+    audit_architecture_coverage: Stage2GenerationParameters
+    plan_cross_architecture_integration: Stage2GenerationParameters
+    integrate_cross_architecture_candidates: Stage2GenerationParameters
+    audit_rejected_candidates: Stage2GenerationParameters
+    define_one_extraction_feature: Stage2GenerationParameters
+    feature_proposal_review: Stage2GenerationParameters
+    patient_feature_extraction: Stage2GenerationParameters
+
+    def __post_init__(self) -> None:
+        expected_names = tuple(field.name for field in dataclass_fields(type(self)))
+        expected_families = (
+            *HIERARCHICAL_GENERATION_JOB_KINDS,
+            FEATURE_PROPOSAL_REVIEW_FAMILY,
+            PATIENT_FEATURE_EXTRACTION_FAMILY,
+        )
+        if expected_names != expected_families:
+            raise RuntimeError(
+                "Stage2GenerationPolicy fields drifted from the closed job-family registry"
+            )
+        for name in expected_names:
+            if not isinstance(getattr(self, name), Stage2GenerationParameters):
+                raise TypeError(
+                    f"generation policy family {name!r} must be "
+                    "Stage2GenerationParameters"
+                )
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any],
+    ) -> "Stage2GenerationPolicy":
+        if not isinstance(value, Mapping):
+            raise TypeError("Stage 2 generation policy must be one object")
+        family_names = {field.name for field in dataclass_fields(cls)}
+        expected = {"schema_version", *family_names}
+        missing = sorted(expected - set(value))
+        extra = sorted(set(value) - expected)
+        if missing or extra:
+            raise ValueError(
+                "Stage 2 generation policy has a closed family registry; "
+                f"missing={missing}, extra={extra}"
+            )
+        if value["schema_version"] != STAGE2_GENERATION_POLICY_VERSION:
+            raise ValueError("Stage 2 generation policy schema_version differs")
+        return cls(
+            **{
+                name: Stage2GenerationParameters.from_mapping(value[name])
+                for name in family_names
+            }
+        )
+
+    def for_family(self, family: str) -> Stage2GenerationParameters:
+        if family not in {field.name for field in dataclass_fields(type(self))}:
+            raise ValueError(f"unsupported Stage 2 generation family: {family!r}")
+        value = getattr(self, family)
+        if not isinstance(value, Stage2GenerationParameters):
+            raise RuntimeError("Stage 2 generation policy mutated after validation")
+        return value
+
+    def for_hierarchical_job(
+        self,
+        job_kind: str,
+    ) -> Stage2GenerationParameters:
+        if job_kind not in HIERARCHICAL_GENERATION_JOB_KINDS:
+            raise ValueError(f"unsupported hierarchical job kind: {job_kind!r}")
+        return self.for_family(job_kind)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": STAGE2_GENERATION_POLICY_VERSION,
+            **{
+                field.name: getattr(self, field.name).as_dict()
+                for field in dataclass_fields(type(self))
+            },
+        }
+
+    @property
+    def content_sha256(self) -> str:
+        return content_sha256(self.as_dict())
+
+
+def legacy_compatibility_generation_policy(
+    *,
+    max_tokens: int,
+    selector_thinking_token_budget: int,
+    transport_max_retries: int,
+) -> Stage2GenerationPolicy:
+    """Isolated adapter for historical non-production callers.
+
+    Portable and production paths must pass ``Stage2GenerationPolicy``
+    directly.  This factory exists only to keep older low-level callers
+    readable while they migrate.
+    """
+
+    selector = Stage2GenerationParameters(
+        temperature=0.0,
+        top_p=1.0,
+        top_k=-1,
+        min_p=0.0,
+        seed=0,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        repetition_penalty=1.0,
+        max_tokens=max_tokens,
+        min_tokens=0,
+        ignore_eos=False,
+        stop_sequences=(),
+        stop_token_ids=(),
+        include_stop_str_in_output=False,
+        logit_bias=(),
+        allowed_token_ids=None,
+        bad_words=(),
+        n=1,
+        logprobs=False,
+        top_logprobs=0,
+        prompt_logprobs=None,
+        stream=False,
+        use_beam_search=False,
+        length_penalty=1.0,
+        skip_special_tokens=True,
+        spaces_between_special_tokens=True,
+        echo=False,
+        add_generation_prompt=True,
+        continue_final_message=False,
+        add_special_tokens=False,
+        include_reasoning=True,
+        reasoning_effort=None,
+        parallel_tool_calls=False,
+        tool_choice="none",
+        return_tokens_as_token_ids=False,
+        return_token_ids=False,
+        return_prompt_text=False,
+        thinking_enabled=True,
+        thinking_token_budget=selector_thinking_token_budget,
+        transport_max_retries=transport_max_retries,
+        schema_repair_attempts=1,
+    )
+    extraction = Stage2GenerationParameters(
+        temperature=0.0,
+        top_p=1.0,
+        top_k=-1,
+        min_p=0.0,
+        seed=0,
+        frequency_penalty=0.0,
+        presence_penalty=0.0,
+        repetition_penalty=1.0,
+        max_tokens=max_tokens,
+        min_tokens=0,
+        ignore_eos=False,
+        stop_sequences=(),
+        stop_token_ids=(),
+        include_stop_str_in_output=False,
+        logit_bias=(),
+        allowed_token_ids=None,
+        bad_words=(),
+        n=1,
+        logprobs=False,
+        top_logprobs=0,
+        prompt_logprobs=None,
+        stream=False,
+        use_beam_search=False,
+        length_penalty=1.0,
+        skip_special_tokens=True,
+        spaces_between_special_tokens=True,
+        echo=False,
+        add_generation_prompt=True,
+        continue_final_message=False,
+        add_special_tokens=False,
+        include_reasoning=True,
+        reasoning_effort=None,
+        parallel_tool_calls=False,
+        tool_choice="none",
+        return_tokens_as_token_ids=False,
+        return_token_ids=False,
+        return_prompt_text=False,
+        thinking_enabled=False,
+        thinking_token_budget=0,
+        transport_max_retries=transport_max_retries,
+        schema_repair_attempts=1,
+    )
+    return Stage2GenerationPolicy(
+        **{
+            job_kind: (
+                extraction
+                if job_kind == EXTRACTION_DEFINITION_JOB
+                else selector
+            )
+            for job_kind in HIERARCHICAL_GENERATION_JOB_KINDS
+        },
+        feature_proposal_review=selector,
+        patient_feature_extraction=extraction,
+    )
 
 
 def _sha256_text(value: str) -> str:
@@ -432,7 +1158,10 @@ class OpenAICompatibleJsonDiscoveryJobRunner:
         retry_max_delay: float = 30.0,
         retry_backoff_factor: float = 2.0,
         retry_jitter_fraction: float = 0.15,
-        max_tokens: int = DEFAULT_DISCOVERY_MAX_TOKENS,
+        generation_policy: Stage2GenerationPolicy | None = None,
+        max_tokens: int | None = None,
+        selector_thinking_token_budget: int | None = None,
+        prompt_nontruncation_guard: Any | None = None,
         client_factory: Callable[..., Any] | None = None,
     ) -> None:
         self.server_urls = _explicit_server_urls(server_urls)
@@ -471,14 +1200,62 @@ class OpenAICompatibleJsonDiscoveryJobRunner:
         )
         if self.retry_jitter_fraction > 1.0:
             raise ValueError("retry_jitter_fraction cannot exceed 1")
-        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int):
-            raise TypeError("max_tokens must be an integer")
-        if max_tokens < MINIMUM_DISCOVERY_MAX_TOKENS:
-            raise ValueError(
-                "max_tokens must be at least the authenticated visible-response budget "
-                f"plus selector reasoning reserve ({MINIMUM_DISCOVERY_MAX_TOKENS})"
+        if generation_policy is None:
+            legacy_max_tokens = (
+                DEFAULT_DISCOVERY_MAX_TOKENS
+                if max_tokens is None
+                else max_tokens
             )
-        self.max_tokens = max_tokens
+            legacy_thinking_budget = (
+                SELECTOR_THINKING_TOKEN_BUDGET
+                if selector_thinking_token_budget is None
+                else selector_thinking_token_budget
+            )
+            generation_policy = legacy_compatibility_generation_policy(
+                max_tokens=legacy_max_tokens,
+                selector_thinking_token_budget=legacy_thinking_budget,
+                transport_max_retries=self.max_retries,
+            )
+            self._generation_policy_resolution = "legacy_compatibility_only"
+        else:
+            if not isinstance(generation_policy, Stage2GenerationPolicy):
+                raise TypeError(
+                    "generation_policy must be Stage2GenerationPolicy"
+                )
+            if max_tokens is not None or selector_thinking_token_budget is not None:
+                raise ValueError(
+                    "generation_policy cannot be combined with legacy max_tokens "
+                    "or selector_thinking_token_budget arguments"
+                )
+            self._generation_policy_resolution = "explicit_closed_policy"
+        for job_kind in HIERARCHICAL_GENERATION_JOB_KINDS:
+            parameters = generation_policy.for_hierarchical_job(job_kind)
+            if parameters.transport_max_retries != self.max_retries:
+                raise ValueError(
+                    f"generation policy for {job_kind!r} carries "
+                    "transport_max_retries that differs from the runner"
+                )
+        self.generation_policy = generation_policy
+        self._initial_generation_policy = generation_policy.as_dict()
+        self._initial_generation_policy_sha256 = generation_policy.content_sha256
+        # Compatibility-only observability.  Request construction never reads
+        # these aggregate attributes.
+        self.max_tokens = max(
+            generation_policy.for_hierarchical_job(kind).max_tokens
+            for kind in HIERARCHICAL_GENERATION_JOB_KINDS
+        )
+        self.selector_thinking_token_budget = (
+            generation_policy.interpret_architecture_chunk.thinking_token_budget
+        )
+        if prompt_nontruncation_guard is not None and any(
+            not callable(getattr(prompt_nontruncation_guard, name, None))
+            for name in ("identity", "validate_request", "validate_response")
+        ):
+            raise TypeError(
+                "prompt_nontruncation_guard must implement identity(), "
+                "validate_request(), and validate_response()"
+            )
+        self._prompt_nontruncation_guard = prompt_nontruncation_guard
         if client_factory is not None and not callable(client_factory):
             raise TypeError("client_factory must be callable")
         self._client_factory = client_factory
@@ -488,6 +1265,16 @@ class OpenAICompatibleJsonDiscoveryJobRunner:
         self._state_lock = threading.Lock()
         self._last_execution_metadata: dict[str, Any] | None = None
         self._execution_metadata: list[dict[str, Any]] = []
+
+    def _assert_generation_policy_unchanged(self) -> None:
+        if not isinstance(self.generation_policy, Stage2GenerationPolicy):
+            raise RuntimeError("Stage 2 generation policy object changed type")
+        if (
+            self.generation_policy.as_dict() != self._initial_generation_policy
+            or self.generation_policy.content_sha256
+            != self._initial_generation_policy_sha256
+        ):
+            raise RuntimeError("Stage 2 generation policy changed after initialization")
 
     def _authentication_identity(self) -> dict[str, str]:
         normalized = self._api_key.strip().casefold()
@@ -503,6 +1290,7 @@ class OpenAICompatibleJsonDiscoveryJobRunner:
         }
 
     def identity(self) -> Mapping[str, Any]:
+        self._assert_generation_policy_unchanged()
         routing_body = {
             "module": "oci.extraction.llm_routing",
             "file_sha256": _llm_routing_file_sha256(),
@@ -535,28 +1323,29 @@ class OpenAICompatibleJsonDiscoveryJobRunner:
                 "retryable_exception_policy": "llm_routing_transient_status_v1",
                 "sdk_internal_max_retries": 0,
             },
-            "max_tokens": self.max_tokens,
+            "generation_policy": self.generation_policy.as_dict(),
+            "generation_policy_sha256": self.generation_policy.content_sha256,
+            "generation_policy_resolution": self._generation_policy_resolution,
+            "prompt_nontruncation_guard": (
+                None
+                if self._prompt_nontruncation_guard is None
+                else self._prompt_nontruncation_guard.identity()
+            ),
             "response_semantics": {
                 "messages": (
                     "exact_authenticated_initial_or_single_cumulative_repair_job_messages"
                 ),
-                "temperature": 0,
                 "response_format": ("strict_json_schema_from_authenticated_discovery_job_v1"),
-                "selector_thinking": {
-                    "enabled": True,
-                    "thinking_token_budget": SELECTOR_THINKING_TOKEN_BUDGET,
-                },
                 "completion_budget_binding": {
-                    "minimum_max_tokens": MINIMUM_DISCOVERY_MAX_TOKENS,
                     "formula": (
-                        "authenticated_maximum_transport_or_visible_tokens_plus_"
-                        "authenticated_thinking_reserve_v1"
+                        "per_family_configured_max_tokens_covers_authenticated_"
+                        "hierarchy_wire_budget_plus_configured_thinking_reserve_v3"
                     ),
+                    "fixed_global_scientific_budget": False,
                 },
-                "extraction_thinking": {
-                    "enabled": False,
-                    "thinking_token_budget_field": "omitted",
-                },
+                "generation_controls": (
+                    "exact_closed_stage2_generation_policy_per_job_family_v2"
+                ),
                 "parser": "strict_top_level_object_duplicate_and_nonfinite_rejection_v1",
                 "recording": "content_and_reasoning_hashes_without_raw_reasoning_v1",
                 "parsed_response_sha256_semantics": (
@@ -608,24 +1397,22 @@ class OpenAICompatibleJsonDiscoveryJobRunner:
             self._execution_metadata.append(detached)
 
     def _request_kwargs(self, job: DiscoveryJsonJob) -> dict[str, Any]:
+        self._assert_generation_policy_unchanged()
         job.settings.validate_for(job.job_kind)
-        extra_body: dict[str, Any] = {
-            "chat_template_kwargs": {
-                "enable_thinking": job.job_kind != EXTRACTION_DEFINITION_JOB,
-            }
-        }
-        if job.job_kind != EXTRACTION_DEFINITION_JOB:
-            if job.settings.thinking_token_budget != SELECTOR_THINKING_TOKEN_BUDGET:
-                raise ValueError("selector job does not carry the exact 5000-token budget")
-            extra_body["thinking_token_budget"] = job.settings.thinking_token_budget
-        elif "thinking_token_budget" in extra_body:
-            raise AssertionError("extraction request cannot carry a thinking token budget")
+        parameters = self.generation_policy.for_hierarchical_job(job.job_kind)
+        if (
+            job.settings.thinking_enabled != parameters.thinking_enabled
+            or job.settings.thinking_token_budget
+            != parameters.thinking_token_budget
+        ):
+            raise ValueError(
+                "discovery job thinking settings differ from its configured "
+                "Stage 2 generation family"
+            )
         self._authenticated_transport_byte_ceiling(job)
-        return {
+        request = {
             "model": self.model_name,
             "messages": job.messages,
-            "temperature": 0,
-            "max_tokens": self.max_tokens,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
@@ -634,12 +1421,42 @@ class OpenAICompatibleJsonDiscoveryJobRunner:
                     "schema": job.response_schema,
                 },
             },
-            "extra_body": extra_body,
+            **parameters.request_generation_fields(),
         }
+        parameters.validate_request_generation_fields(request)
+        return request
 
     def _authenticated_transport_byte_ceiling(self, job: DiscoveryJsonJob) -> int:
         """Validate and return every job's authenticated raw transport ceiling."""
 
+        self._assert_generation_policy_unchanged()
+        parameters = self.generation_policy.for_hierarchical_job(job.job_kind)
+        if (
+            job.settings.thinking_enabled != parameters.thinking_enabled
+            or job.settings.thinking_token_budget
+            != parameters.thinking_token_budget
+        ):
+            raise ValueError(
+                "discovery job settings differ from its generation policy"
+            )
+        try:
+            request = json.loads(job.messages[1]["content"])
+        except (IndexError, KeyError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "discovery job lacks its authenticated hierarchy wire budget request"
+            ) from exc
+        if not isinstance(request, Mapping):
+            raise TypeError("discovery job request must be one JSON object")
+        configured = HierarchyWireBudget.from_mapping(
+            request.get("hierarchy_wire_budget")
+        )
+        if (
+            job.identifier_ownership.get("hierarchy_wire_budget")
+            != configured.as_dict()
+        ):
+            raise ValueError(
+                "discovery job ownership contract changed its hierarchy wire budget"
+            )
         budget = job.identifier_ownership.get("ownership", {}).get("wire_response_budget")
         if not isinstance(budget, Mapping):
             raise ValueError("discovery job lacks its authenticated response budget")
@@ -682,10 +1499,22 @@ class OpenAICompatibleJsonDiscoveryJobRunner:
         bytes_per_token = budget.get("conservative_utf8_bytes_per_estimated_token")
         if bytes_per_token != HIERARCHICAL_DISCOVERY_CONSERVATIVE_UTF8_BYTES_PER_TOKEN:
             raise ValueError("discovery job conservative byte/token proof differs")
-        if fields["maximum_transport_bytes"] != HIERARCHICAL_DISCOVERY_MAX_TRANSPORT_BYTES:
-            raise ValueError("discovery job raw transport-byte ceiling differs")
-        if fields["generation_token_budget"] != HIERARCHICAL_DISCOVERY_GENERATION_TOKEN_BUDGET:
-            raise ValueError("discovery job generation-token budget differs from runner contract")
+        if (
+            fields["maximum_transport_bytes"]
+            != configured.max_response_transport_bytes
+        ):
+            raise ValueError(
+                "discovery job raw transport-byte ceiling differs from its "
+                "authenticated HierarchyWireBudget"
+            )
+        if (
+            fields["generation_token_budget"]
+            != configured.generation_token_budget
+        ):
+            raise ValueError(
+                "discovery job generation-token budget differs from its "
+                "authenticated HierarchyWireBudget"
+            )
         if fields["maximum_canonical_json_bytes"] > fields["maximum_transport_bytes"]:
             raise ValueError("discovery canonical JSON maximum exceeds its raw transport ceiling")
         expected_estimated_tokens = (
@@ -700,23 +1529,26 @@ class OpenAICompatibleJsonDiscoveryJobRunner:
                 fields["maximum_estimated_tokens"],
                 fields["maximum_transport_bytes"],
             )
-            + job.settings.thinking_token_budget
+            + parameters.thinking_token_budget
         )
-        if self.max_tokens < required_max_tokens:
+        if parameters.max_tokens < required_max_tokens:
             raise ValueError(
-                "max_tokens is below this job's authenticated visible-response plus "
+                "family max_tokens is below this job's authenticated visible-response plus "
                 f"reasoning requirement ({required_max_tokens})"
             )
         return fields["maximum_transport_bytes"]
 
-    @staticmethod
-    def _response_message(response: Any) -> tuple[Any, Any]:
+    def _response_message(self, response: Any) -> tuple[Any, Any]:
         choices = _field(response, "choices")
         if not isinstance(choices, Sequence) or isinstance(choices, (str, bytes)):
-            raise ValueError("discovery response choices must be a non-empty sequence")
-        if not choices:
-            raise ValueError("discovery response has no choices")
+            raise ValueError("discovery response choices must be a sequence")
+        if len(choices) != 1:
+            raise ValueError("discovery response must contain exactly one choice")
+        if _field(response, "model") != self.model_name:
+            raise ValueError("discovery response model differs from the configured model")
         choice = choices[0]
+        if _field(choice, "finish_reason") != "stop":
+            raise ValueError("discovery response finish_reason must be exactly 'stop'")
         message = _field(choice, "message")
         if message is None:
             raise ValueError("discovery response choice has no message")
@@ -731,8 +1563,17 @@ class OpenAICompatibleJsonDiscoveryJobRunner:
     def run_json(self, *, job: DiscoveryJsonJob) -> Mapping[str, Any]:
         if not isinstance(job, DiscoveryJsonJob):
             raise TypeError("job must be a DiscoveryJsonJob")
+        self._assert_generation_policy_unchanged()
         self._assert_client_factory_implementation_unchanged()
         request_kwargs = self._request_kwargs(job)
+        prompt_request_audit = (
+            None
+            if self._prompt_nontruncation_guard is None
+            else self._prompt_nontruncation_guard.validate_request(
+                request_kwargs,
+                client_path="hierarchical_discovery",
+            )
+        )
         maximum_transport_bytes = self._authenticated_transport_byte_ceiling(job)
         request_sha256 = content_sha256(request_kwargs)
         runner_identity_sha256 = self._identity_sha256()
@@ -798,6 +1639,14 @@ class OpenAICompatibleJsonDiscoveryJobRunner:
                 continue
 
             try:
+                prompt_response_audit = (
+                    None
+                    if self._prompt_nontruncation_guard is None
+                    else self._prompt_nontruncation_guard.validate_response(
+                        response,
+                        request_audit=prompt_request_audit,
+                    )
+                )
                 choice, message = self._response_message(response)
                 content = _field(message, "content")
                 if not isinstance(content, str):
@@ -817,6 +1666,7 @@ class OpenAICompatibleJsonDiscoveryJobRunner:
                         "content_sha256": hashlib.sha256(content_utf8).hexdigest(),
                         "raw_transport_bytes": len(content_utf8),
                         "reasoning_hashes": _reasoning_hashes(message),
+                        "prompt_nontruncation_audit": prompt_response_audit,
                     }
                 )
                 if len(content_utf8) > maximum_transport_bytes:
@@ -894,8 +1744,15 @@ __all__ = [
     "MINIMUM_DISCOVERY_MAX_TOKENS",
     "MAX_AUTHENTICATED_RETRIES",
     "OPENAI_JSON_DISCOVERY_RUNNER_VERSION",
+    "STAGE2_GENERATION_POLICY_VERSION",
+    "FEATURE_PROPOSAL_REVIEW_FAMILY",
+    "PATIENT_FEATURE_EXTRACTION_FAMILY",
+    "HIERARCHICAL_GENERATION_JOB_KINDS",
     "InvalidDiscoveryJsonResponse",
     "InvalidDiscoveryTransportResponse",
     "OpenAICompatibleJsonDiscoveryJobRunner",
+    "Stage2GenerationParameters",
+    "Stage2GenerationPolicy",
+    "legacy_compatibility_generation_policy",
     "parse_strict_json_object",
 ]

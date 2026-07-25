@@ -18,7 +18,9 @@ from oci.inference.embedding_native_proof_capture import (
     canonical_logical_embedding_config,
 )
 from oci.inference.production_stage1_legacy_scope_adapter import (
+    LegacyStage1RoleSpecificDeduplicationError,
     _load_scope_modeling_data,
+    collect_and_merge_legacy_stage1_scope_attempts,
     publish_legacy_stage1_scope_descriptor,
     validate_legacy_stage1_scope_descriptor,
 )
@@ -123,7 +125,7 @@ def _prepared(
     label_flip_row: int | None = None,
     full_production_config: bool = False,
 ):
-    registry = _registry()
+    registry = _registry(inner_count=5)
     if full_production_config:
         config = load_applied_stage1_config(
             Path(__file__).resolve().parents[1]
@@ -133,15 +135,16 @@ def _prepared(
     else:
         config = AppliedInferenceConfig()
     config.cv_folds = 2
-    config.architecture.multi_model_forest.candidate_consistency_inner_folds = 4
+    config.architecture.multi_model_forest.candidate_consistency_inner_folds = 5
     plan = build_canonical_stage1_scope_plan(
         registry=registry,
         registry_content_sha256=_REGISTRY_SHA,
         global_seed=42,
         gpu_ids=(),
-        review_rounds=1,
+        review_rounds=2,
+        initial_training_partitions=3,
         expected_outer_fold_count=2,
-        expected_inner_fold_count=4,
+        expected_inner_fold_count=5,
     )
     row_count = registry["dataset_row_count"]
     texts = [f"note-{row}" for row in range(row_count)]
@@ -336,6 +339,22 @@ def test_private_descriptors_project_labels_text_preflight_and_cache(
         prepared=prepared,
         descriptor_root=(tmp_path / "recovery" / "descriptor").resolve(),
     )
+    assert list(descriptor_set.descriptors) == [
+        scope.scope_id for scope in prepared.stage1_scope_plan.physical_scopes
+    ]
+    assert descriptor_set.manifest["physical_scope_count"] == 14
+    assert descriptor_set.manifest["logical_scope_count"] == 16
+    assert "outer_001_hierarchy_epoch_001" not in descriptor_set.descriptors
+    reused = next(
+        row
+        for row in descriptor_set.manifest["logical_physical_bindings"]
+        if row["logical_scope_id"] == "outer_001_hierarchy_epoch_001"
+    )
+    assert reused == {
+        "logical_scope_id": "outer_001_hierarchy_epoch_001",
+        "physical_owner_scope_id": "outer_001_inner_005",
+        "reuses_physical_fit": True,
+    }
     source_path = str(prepared.options.dataset_path).encode()
     for scope_id in (
         "outer_001_full",
@@ -595,8 +614,28 @@ def test_spawned_probe_and_sibling_attempt_resume_use_stable_recovery(
     ).run()
     assert {attempt.attempt_dir for attempt in second} == attempt_directories
     assert len(tuple((recovery / "attempts").glob("*/attempt_*"))) == len(
+        prepared.stage1_scope_plan.physical_scopes
+    )
+    bindings = Stage1ScopeAttemptStore(
+        recovery / "attempts", prepared.stage1_scope_plan
+    ).validate_logical_bindings()
+    assert bindings.manifest["logical_scope_count"] == len(
         prepared.stage1_scope_plan.scopes
     )
+    assert bindings.manifest["physical_fit_count"] == len(
+        prepared.stage1_scope_plan.physical_scopes
+    )
+    merge_root = (tmp_path / "must_not_publish_role_specific_merge").resolve()
+    with pytest.raises(
+        LegacyStage1RoleSpecificDeduplicationError,
+        match="role-neutral-binding-set|role_neutral_binding_set|ten fit-side",
+    ):
+        collect_and_merge_legacy_stage1_scope_attempts(
+            prepared=prepared,
+            attempts=first,
+            merge_root=merge_root,
+        )
+    assert not merge_root.exists()
     first_scope = prepared.stage1_scope_plan.scopes[0].scope_id
     assert (
         Stage1ScopeAttemptStore(recovery / "attempts", prepared.stage1_scope_plan).reusable_attempt(
@@ -632,7 +671,10 @@ def test_descriptor_publication_preserves_and_reuses_completed_scopes_after_inte
         )
 
     assert not (descriptor_root / "descriptor_set_manifest.json").exists()
-    completed_scope_ids = [scope.scope_id for scope in prepared.stage1_scope_plan.scopes[:3]]
+    completed_scope_ids = [
+        scope.scope_id
+        for scope in prepared.stage1_scope_plan.physical_scopes[:3]
+    ]
     preserved: dict[str, tuple[str, int]] = {}
     for scope_id in completed_scope_ids:
         scope_root = descriptor_root / scope_id
@@ -644,7 +686,7 @@ def test_descriptor_publication_preserves_and_reuses_completed_scopes_after_inte
             )
 
     recovery_root = descriptor_root.parent / (f".{descriptor_root.name}.scope_descriptor_attempts")
-    interrupted_scope = prepared.stage1_scope_plan.scopes[3].scope_id
+    interrupted_scope = prepared.stage1_scope_plan.physical_scopes[3].scope_id
     partial_attempts = tuple((recovery_root / interrupted_scope).glob("attempt_*"))
     assert len(partial_attempts) == 1
     assert not (
@@ -658,7 +700,7 @@ def test_descriptor_publication_preserves_and_reuses_completed_scopes_after_inte
     )
 
     assert list(descriptor_set.descriptors) == [
-        scope.scope_id for scope in prepared.stage1_scope_plan.scopes
+        scope.scope_id for scope in prepared.stage1_scope_plan.physical_scopes
     ]
     for relative, (digest, inode) in preserved.items():
         path = descriptor_root / relative

@@ -73,6 +73,7 @@ from .tfidf_topic_discovery import (
     DISCOVERY_SCHEMA_VERSION,
     row_set_fingerprint,
     stable_hash,
+    tfidf_context_artifact_inventory,
 )
 from .tfidf_topic_stage1 import (
     TFIDF_NESTED_CALIBRATION_SCHEMA_VERSION,
@@ -347,6 +348,7 @@ _TFIDF_METADATA_FIELDS = frozenset(
         "heldout_score_tests_enabled",
         "topic_score_tests",
         "artifacts",
+        "artifact_inventory",
         "model_fit_row_ids",
         "model_fit_row_fingerprint",
         "registered_fit_treatment_sha256",
@@ -460,6 +462,13 @@ def _validate_tfidf_context(
     artifacts = metadata.get("artifacts")
     if not isinstance(artifacts, Mapping):
         raise ValueError("cumulative TF-IDF context has no native artifacts")
+    if metadata.get("artifact_inventory") != tfidf_context_artifact_inventory(
+        artifacts
+    ):
+        raise ValueError(
+            "cumulative TF-IDF context artifact inventory differs from "
+            "its registered native bytes"
+        )
     model_path = _component_file(
         artifact_dir,
         artifacts.get("fitted_context"),

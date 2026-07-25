@@ -43,13 +43,14 @@ from .production_stage1_legacy_scope_adapter import (
     _write_private_embedding_cache,
 )
 
-PREFLIGHT_SCOPE_INPUT_SCHEMA = "production_stage1_preflight_scope_input_v2"
-PREFLIGHT_SCOPE_INPUT_SET_SCHEMA = "production_stage1_preflight_scope_input_set_v2"
+PREFLIGHT_SCOPE_INPUT_SCHEMA = "production_stage1_preflight_scope_input_v3"
+PREFLIGHT_SCOPE_INPUT_SET_SCHEMA = "production_stage1_preflight_scope_input_set_v3"
 PREFLIGHT_ONE_SCOPE_AUTHORITY_SCHEMA = "production_stage1_preflight_one_scope_authority_v1"
 PREFLIGHT_SCOPE_INPUT_MANIFEST = "preflight_scope_input_manifest.json"
 PREFLIGHT_SCOPE_INPUT_SET_MANIFEST = "preflight_scope_input_set_manifest.json"
 
 _CONFIG_FILE = "effective_config.json"
+_SEMANTIC_WITNESS_CONFIG_FILE = "semantic_witness_scientific_config.json"
 _SCOPE_AUTHORITY_FILE = "one_scope_authority.json"
 _MODELING_FILE = "fit_only_modeling.parquet"
 _HEX = frozenset("0123456789abcdef")
@@ -126,6 +127,7 @@ class AuthenticatedPreflightScopeInput:
     scope_authority: Mapping[str, Any]
     scope: Mapping[str, Any]
     embedding_cache: _RestrictedLogicalIdentityEmbeddingCache
+    semantic_witness_scientific_config: Any
 
     @property
     def manifest_path(self) -> Path:
@@ -192,6 +194,7 @@ def _write_scope(
     registry_content_sha256: str,
     scope: Mapping[str, Any],
     forbidden_paths: Sequence[Path],
+    semantic_witness_scientific_config: Any,
 ) -> None:
     root.mkdir(parents=True, exist_ok=False)
     fit_rows = tuple(map(int, _scope_value(scope, "fit_row_ids")))
@@ -247,6 +250,22 @@ def _write_scope(
             forbidden_paths=forbidden_paths,
         ),
     )
+    from .review_spent_evidence_provider import (
+        SemanticWitnessScientificConfig,
+    )
+
+    if (
+        type(semantic_witness_scientific_config)
+        is not SemanticWitnessScientificConfig
+    ):
+        raise TypeError(
+            "preflight scope input requires one closed semantic-witness "
+            "scientific config"
+        )
+    _write_json(
+        root / _SEMANTIC_WITNESS_CONFIG_FILE,
+        semantic_witness_scientific_config.as_dict(),
+    )
     authority_body = {
         "schema_version": PREFLIGHT_ONE_SCOPE_AUTHORITY_SCHEMA,
         "registry_content_sha256": registry_content_sha256,
@@ -284,6 +303,10 @@ def _write_scope(
     )
     files = {
         "effective_config": _file_registration(root / _CONFIG_FILE, root),
+        "semantic_witness_scientific_config": _file_registration(
+            root / _SEMANTIC_WITNESS_CONFIG_FILE,
+            root,
+        ),
         "one_scope_authority": _file_registration(
             root / _SCOPE_AUTHORITY_FILE,
             root,
@@ -308,6 +331,9 @@ def _write_scope(
         ],
         "files": files,
         "embedding_cache": private_cache,
+        "semantic_witness_scientific_config_sha256": (
+            semantic_witness_scientific_config.identity_sha256
+        ),
         "nonfit_text_supplied": False,
         "nonfit_labels_supplied": False,
         "global_cache_path_supplied": False,
@@ -331,6 +357,7 @@ def publish_preflight_scope_inputs(
     scopes: Sequence[Mapping[str, Any]],
     source_dataset_path: Path,
     global_embedding_cache_path: Path,
+    semantic_witness_scientific_config: Any,
 ) -> AuthenticatedPreflightScopeInputSet:
     """Recoverably publish one fit-only capability per canonical scope."""
 
@@ -357,6 +384,9 @@ def publish_preflight_scope_inputs(
             parent_config=config,
             parent_embedding_cache=embedding_cache,
             parent_embedding_cache_identity=embedding_cache_identity,
+            expected_semantic_witness_scientific_config=(
+                semantic_witness_scientific_config
+            ),
             forbidden_paths=(source_dataset_path, global_embedding_cache_path),
         )
     if root.is_symlink():
@@ -386,6 +416,9 @@ def publish_preflight_scope_inputs(
                 parent_config=config,
                 parent_embedding_cache=embedding_cache,
                 parent_embedding_cache_identity=embedding_cache_identity,
+                expected_semantic_witness_scientific_config=(
+                    semantic_witness_scientific_config
+                ),
                 forbidden_paths=(
                     source_dataset_path,
                     global_embedding_cache_path,
@@ -410,6 +443,9 @@ def publish_preflight_scope_inputs(
                 registry_content_sha256=registry_content_sha256,
                 scope=scope,
                 forbidden_paths=(source_dataset_path, global_embedding_cache_path),
+                semantic_witness_scientific_config=(
+                    semantic_witness_scientific_config
+                ),
             )
             completed = validate_preflight_scope_input(
                 manifest_path=temporary / PREFLIGHT_SCOPE_INPUT_MANIFEST,
@@ -419,6 +455,9 @@ def publish_preflight_scope_inputs(
                 parent_config=config,
                 parent_embedding_cache=embedding_cache,
                 parent_embedding_cache_identity=embedding_cache_identity,
+                expected_semantic_witness_scientific_config=(
+                    semantic_witness_scientific_config
+                ),
                 forbidden_paths=(
                     source_dataset_path,
                     global_embedding_cache_path,
@@ -473,6 +512,9 @@ def publish_preflight_scope_inputs(
         parent_config=config,
         parent_embedding_cache=embedding_cache,
         parent_embedding_cache_identity=embedding_cache_identity,
+        expected_semantic_witness_scientific_config=(
+            semantic_witness_scientific_config
+        ),
         forbidden_paths=(source_dataset_path, global_embedding_cache_path),
     )
 
@@ -487,6 +529,7 @@ def validate_preflight_scope_input(
     parent_config: AppliedInferenceConfig | None = None,
     parent_embedding_cache: Any | None = None,
     parent_embedding_cache_identity: Mapping[str, Any] | None = None,
+    expected_semantic_witness_scientific_config: Any | None = None,
     forbidden_paths: Sequence[Path] = (),
 ) -> AuthenticatedPreflightScopeInput:
     path = Path(manifest_path).absolute()
@@ -509,6 +552,7 @@ def validate_preflight_scope_input(
         "columns",
         "files",
         "embedding_cache",
+        "semantic_witness_scientific_config_sha256",
         "nonfit_text_supplied",
         "nonfit_labels_supplied",
         "global_cache_path_supplied",
@@ -552,6 +596,7 @@ def validate_preflight_scope_input(
     files = manifest.get("files")
     if not isinstance(files, Mapping) or set(files) != {
         "effective_config",
+        "semantic_witness_scientific_config",
         "one_scope_authority",
         "fit_only_modeling",
     }:
@@ -583,6 +628,37 @@ def validate_preflight_scope_input(
     config.architecture.multi_model_agentic_forest.embedding_contrast = copy.deepcopy(
         restored_embedding
     )
+    from .review_spent_evidence_provider import (
+        SemanticWitnessScientificConfig,
+    )
+
+    semantic_witness_scientific_config = (
+        SemanticWitnessScientificConfig.from_mapping(
+            _read_json(
+                paths["semantic_witness_scientific_config"],
+                label="preflight semantic-witness scientific config",
+            ),
+            label="preflight semantic-witness scientific config",
+        )
+    )
+    if (
+        manifest.get("semantic_witness_scientific_config_sha256")
+        != semantic_witness_scientific_config.identity_sha256
+    ):
+        raise ValueError(
+            "preflight semantic-witness scientific config identity changed"
+        )
+    if expected_semantic_witness_scientific_config is not None:
+        if (
+            type(expected_semantic_witness_scientific_config)
+            is not SemanticWitnessScientificConfig
+            or expected_semantic_witness_scientific_config.as_dict()
+            != semantic_witness_scientific_config.as_dict()
+        ):
+            raise ValueError(
+                "preflight semantic-witness scientific config differs from "
+                "its parent request"
+            )
     if columns != [
         config.text_column,
         config.treatment_column,
@@ -737,6 +813,9 @@ def validate_preflight_scope_input(
         scope_authority=authority,
         scope=copy.deepcopy(dict(scope)),
         embedding_cache=cache,
+        semantic_witness_scientific_config=(
+            semantic_witness_scientific_config
+        ),
     )
 
 
@@ -749,6 +828,7 @@ def validate_preflight_scope_input_set(
     parent_config: AppliedInferenceConfig | None = None,
     parent_embedding_cache: Any | None = None,
     parent_embedding_cache_identity: Mapping[str, Any] | None = None,
+    expected_semantic_witness_scientific_config: Any | None = None,
     forbidden_paths: Sequence[Path] = (),
 ) -> AuthenticatedPreflightScopeInputSet:
     set_root = Path(root).absolute()
@@ -805,6 +885,9 @@ def validate_preflight_scope_input_set(
             parent_config=parent_config,
             parent_embedding_cache=parent_embedding_cache,
             parent_embedding_cache_identity=parent_embedding_cache_identity,
+            expected_semantic_witness_scientific_config=(
+                expected_semantic_witness_scientific_config
+            ),
             forbidden_paths=forbidden_paths,
         )
         if child.scope != scope:

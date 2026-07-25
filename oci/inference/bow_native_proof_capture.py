@@ -19,6 +19,7 @@ import json
 import os
 import re
 import tempfile
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -34,6 +35,7 @@ from sklearn.ensemble import (
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression, Ridge
 
+from ..config import BoWViewConfig
 from .multi_model_agentic_forest import _make_bow_vectorizer
 
 BOW_NATIVE_CAPTURE_SCHEMA = "production_bow_native_capture_v1"
@@ -174,23 +176,29 @@ def _finite_array(value: Any, *, name: str, length: int | None = None) -> np.nda
 
 
 def _json_safe_view_config(value: Mapping[str, Any]) -> dict[str, Any]:
-    allowed = {
-        "name",
-        "max_features",
-        "min_df",
-        "max_df",
-        "ngram_range_min",
-        "ngram_range_max",
-        "sublinear_tf",
-        "bow_model",
-        "logistic_c",
-        "logistic_max_iter",
-        "ridge_alpha",
-    }
-    config = {str(key): value[key] for key in value if str(key) in allowed}
-    if set(config) != allowed:
-        raise ValueError("BoW proof view configuration is incomplete")
-    return json.loads(_canonical_json(config))
+    def require_tree(raw: Any, template: Any, *, path: str) -> None:
+        if not isinstance(template, Mapping):
+            return
+        if not isinstance(raw, Mapping):
+            if hasattr(raw, "__dataclass_fields__"):
+                raw = asdict(raw)
+            else:
+                raise ValueError(f"{path} must be an explicitly configured object")
+        expected = set(template)
+        observed = {str(key) for key in raw}
+        if observed != expected:
+            raise ValueError(
+                f"{path} is not closed; "
+                f"missing={sorted(expected - observed)}, "
+                f"extra={sorted(observed - expected)}"
+            )
+        for key in sorted(expected):
+            require_tree(raw[key], template[key], path=f"{path}.{key}")
+
+    expected = asdict(BoWViewConfig())
+    require_tree(value, expected, path="BoW proof view configuration")
+    config = BoWViewConfig(**dict(value))
+    return json.loads(_canonical_json(asdict(config)))
 
 
 class _ArrayStore:

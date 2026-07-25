@@ -261,18 +261,92 @@ def run_agentic_attention_variable_forest(
     runner.run()
 
 
+def _configured_head_activation(name: str) -> nn.Module:
+    implementations = {
+        "gelu_exact": lambda: nn.GELU(approximate="none"),
+        "gelu_tanh": lambda: nn.GELU(approximate="tanh"),
+        "relu": lambda: nn.ReLU(inplace=False),
+        "silu": lambda: nn.SiLU(inplace=False),
+        "tanh": nn.Tanh,
+    }
+    key = str(name)
+    if key not in implementations:
+        raise ValueError(
+            "HTR head activation must be one of: "
+            + ", ".join(sorted(implementations))
+        )
+    return implementations[key]()
+
+
+def _configured_hidden_head(
+    *,
+    input_dim: int,
+    hidden_dim: int,
+    depth: int,
+    activation: str,
+    dropout: float,
+    layer_norm: bool,
+    bias: bool,
+) -> nn.Sequential:
+    if isinstance(depth, bool) or int(depth) < 1:
+        raise ValueError("HTR head depth must be a positive integer")
+    if int(hidden_dim) < 1:
+        raise ValueError("HTR head hidden_dim must be positive")
+    if not 0.0 <= float(dropout) < 1.0:
+        raise ValueError("HTR head dropout must be in [0, 1)")
+    if type(layer_norm) is not bool or type(bias) is not bool:
+        raise TypeError("HTR head norm/bias settings must be exact booleans")
+    _configured_head_activation(activation)
+    layers: list[nn.Module] = []
+    source_dim = int(input_dim)
+    for _ in range(int(depth)):
+        layers.append(nn.Linear(source_dim, int(hidden_dim), bias=bias))
+        if layer_norm:
+            layers.append(nn.LayerNorm(int(hidden_dim)))
+        layers.append(_configured_head_activation(activation))
+        layers.append(nn.Dropout(float(dropout), inplace=False))
+        source_dim = int(hidden_dim)
+    return nn.Sequential(*layers)
+
+
 class _NuisanceNet(nn.Module):
-    def __init__(self, extractor: nn.Module, hidden_dim: int, outcome_type: str):
+    def __init__(
+        self,
+        extractor: nn.Module,
+        hidden_dim: int,
+        outcome_type: str,
+        *,
+        head_depth: int = 1,
+        head_activation: str = "relu",
+        head_dropout: float = 0.1,
+        head_layer_norm: bool = False,
+        head_bias: bool = True,
+    ):
         super().__init__()
         self.extractor = extractor
         self.outcome_type = outcome_type
-        self.shared = nn.Sequential(
-            nn.Linear(extractor.output_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
+        self._head_configuration = {
+            "hidden_dim": int(hidden_dim),
+            "depth": int(head_depth),
+            "activation": str(head_activation),
+            "dropout": float(head_dropout),
+            "layer_norm": head_layer_norm,
+            "bias": head_bias,
+        }
+        self.shared = _configured_hidden_head(
+            input_dim=int(extractor.output_dim),
+            hidden_dim=hidden_dim,
+            depth=head_depth,
+            activation=head_activation,
+            dropout=head_dropout,
+            layer_norm=head_layer_norm,
+            bias=head_bias,
         )
-        self.propensity = nn.Linear(hidden_dim, 1)
-        self.outcome = nn.Linear(hidden_dim, 1)
+        self.propensity = nn.Linear(hidden_dim, 1, bias=head_bias)
+        self.outcome = nn.Linear(hidden_dim, 1, bias=head_bias)
+
+    def head_configuration(self) -> Dict[str, Any]:
+        return dict(self._head_configuration)
 
     def forward(self, texts_or_batch):
         features = self.extractor(
@@ -283,21 +357,46 @@ class _NuisanceNet(nn.Module):
 
 
 class _EffectNet(nn.Module):
-    def __init__(self, extractor: nn.Module, hidden_dim: int):
+    def __init__(
+        self,
+        extractor: nn.Module,
+        hidden_dim: int,
+        *,
+        head_depth: int = 1,
+        head_activation: str = "relu",
+        head_dropout: float = 0.1,
+        head_layer_norm: bool = False,
+        head_bias: bool = True,
+    ):
         super().__init__()
         self.extractor = extractor
-        self.head = nn.Sequential(
-            nn.Linear(extractor.output_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, 1),
+        self._head_configuration = {
+            "hidden_dim": int(hidden_dim),
+            "depth": int(head_depth),
+            "activation": str(head_activation),
+            "dropout": float(head_dropout),
+            "layer_norm": head_layer_norm,
+            "bias": head_bias,
+        }
+        self.hidden = _configured_hidden_head(
+            input_dim=int(extractor.output_dim),
+            hidden_dim=hidden_dim,
+            depth=head_depth,
+            activation=head_activation,
+            dropout=head_dropout,
+            layer_norm=head_layer_norm,
+            bias=head_bias,
         )
+        self.output = nn.Linear(hidden_dim, 1, bias=head_bias)
+
+    def head_configuration(self) -> Dict[str, Any]:
+        return dict(self._head_configuration)
 
     def forward(self, texts_or_batch):
         features = self.extractor(
             texts_or_batch if isinstance(texts_or_batch, dict) else list(texts_or_batch)
         )
-        return self.head(features).squeeze(-1)
+        return self.output(self.hidden(features)).squeeze(-1)
 
 
 class _JointRNet(nn.Module):
@@ -5846,6 +5945,12 @@ class AgenticAttentionVariableForestRunner:
         if env_workers is not None:
             return max(0, int(env_workers))
         if _running_inside_loky_worker():
+            return 0
+        # Cross-fit and outer-fold jobs run in thread pools.  Starting a
+        # multiprocessing DataLoader from one of those threads creates nested
+        # process parallelism, can oversubscribe the configured worker budget,
+        # and is not supported by every multiprocessing start method.
+        if threading.current_thread() is not threading.main_thread():
             return 0
         if total_folds is not None and self._fold_n_jobs(total_folds) > 1:
             return 0

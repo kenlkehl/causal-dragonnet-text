@@ -3,8 +3,9 @@
 This module contains no scientific model implementation.  It turns the
 authoritative outer/inner registry into a closed execution plan, assigns that
 plan to explicit GPU slots independently of completion order, and provides a
-spawn-only execution substrate whose reusable unit is one fully sealed scope
-attempt.
+spawn-only execution substrate whose reusable unit is one fully sealed
+physical-fit-owner attempt. Distinct logical purposes are retained as
+authenticated references to those attempts.
 
 The scheduler deliberately keeps labels out of its scope/request types.  A
 worker receives fit and held-out row identities, but a scientific worker is
@@ -36,11 +37,26 @@ from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
-STAGE1_SCOPE_PLAN_SCHEMA = "production_stage1_scope_plan_v2"
+from .physical_fit_deduplication import PhysicalFitKey, ordered_row_identity
+
+STAGE1_SCOPE_PLAN_SCHEMA = "production_stage1_scope_plan_v7"
+STAGE1_SCOPE_SCIENTIFIC_PLAN_SCHEMA = (
+    "production_stage1_scope_scientific_plan_v3"
+)
+STAGE1_PHYSICAL_FIT_IDENTITY_SCHEMA = (
+    "production_stage1_physical_fit_identity_v1"
+)
 STAGE1_SCOPE_ATTEMPT_REQUEST_SCHEMA = "production_stage1_scope_attempt_request_v4"
 STAGE1_SCOPE_ATTEMPT_MANIFEST_SCHEMA = "production_stage1_scope_attempt_manifest_v4"
 STAGE1_SCOPE_PROGRESS_SCHEMA = "production_stage1_scope_progress_v2"
 STAGE1_SCOPE_WORKER_RESULT_SCHEMA = "production_stage1_scope_worker_result_v3"
+STAGE1_LOGICAL_SCOPE_BINDING_SET_SCHEMA = (
+    "production_stage1_logical_scope_binding_set_v3"
+)
+STAGE1_LOGICAL_SCOPE_BINDING_SCHEMA = (
+    "production_stage1_logical_scope_binding_v3"
+)
+STAGE1_LOGICAL_SCOPE_BINDING_FILENAME = "logical_scope_bindings.json"
 STAGE1_TORCH_DETERMINISM_POLICY_SCHEMA = (
     "production_stage1_torch_determinism_policy_v1"
 )
@@ -596,7 +612,13 @@ def _row_order_fingerprint(rows: Sequence[int]) -> str:
 
 
 def derive_stage1_scope_seed(global_seed: int, scope_id: str) -> int:
-    """Derive one schedule-independent 31-bit seed from a canonical scope ID."""
+    """Derive the legacy schedule-independent seed from a scope name.
+
+    New portable production plans use :func:`derive_stage1_group_seed`, which
+    is content-derived and therefore assigns one seed to equivalent logical
+    contexts.  This legacy helper remains available only for authenticating
+    artifacts produced under the older scope-name policy.
+    """
 
     seed = int(global_seed)
     if seed < 0:
@@ -616,6 +638,29 @@ def derive_stage1_scope_seed(global_seed: int, scope_id: str) -> int:
     # Keep the result in the range accepted by NumPy's legacy RNG and common
     # sklearn random_state parameters.  Zero is valid but replacing it with one
     # makes accidental falsy checks harmless.
+    result = int.from_bytes(digest[:8], "big") % (2**31 - 1)
+    return result or 1
+
+
+def derive_stage1_group_seed(
+    global_seed: int,
+    fit_row_ids: Sequence[int],
+) -> int:
+    """Derive one schedule/name-independent seed from ordered physical rows."""
+
+    seed = int(global_seed)
+    if seed < 0:
+        raise ValueError("global Stage 1 seed must be nonnegative")
+    rows = _integer_rows(fit_row_ids, label="physical-fit seed rows")
+    digest = hashlib.sha256(
+        _canonical_json(
+            {
+                "schema_version": "production_stage1_group_seed_v2",
+                "global_seed": seed,
+                "ordered_fit_rows": list(rows),
+            }
+        ).encode("utf-8")
+    ).digest()
     result = int.from_bytes(digest[:8], "big") % (2**31 - 1)
     return result or 1
 
@@ -712,26 +757,371 @@ class Stage1ScopeAssignment:
 
 
 @dataclass(frozen=True)
+class Stage1PhysicalFitIdentity:
+    """Scientific axes shared by every physical fit in one scope plan.
+
+    Deployment locators and scheduling choices are intentionally absent.
+    These values must be supplied by the immutable workflow request; the
+    scheduler never invents a producer, architecture, target, configuration,
+    or runtime compatibility identity.
+    """
+
+    architecture_identity: str
+    target: str
+    scientific_configuration_identity: str
+    producer_identity: str
+    runtime_compatibility_class: str
+    schema_version: str = STAGE1_PHYSICAL_FIT_IDENTITY_SCHEMA
+
+    def __post_init__(self) -> None:
+        if self.schema_version != STAGE1_PHYSICAL_FIT_IDENTITY_SCHEMA:
+            raise ValueError("unsupported Stage 1 physical-fit identity schema")
+        for name in (
+            "architecture_identity",
+            "scientific_configuration_identity",
+            "producer_identity",
+        ):
+            if _SHA256.fullmatch(str(getattr(self, name))) is None:
+                raise ValueError(f"{name} must be one lowercase SHA-256")
+        target = str(self.target).strip()
+        runtime = str(self.runtime_compatibility_class).strip()
+        if not target:
+            raise ValueError("physical-fit target must be nonempty")
+        if not runtime:
+            raise ValueError(
+                "physical-fit runtime compatibility class must be nonempty"
+            )
+        object.__setattr__(self, "target", target)
+        object.__setattr__(self, "runtime_compatibility_class", runtime)
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any],
+    ) -> "Stage1PhysicalFitIdentity":
+        required = {
+            "schema_version",
+            "architecture_identity",
+            "target",
+            "scientific_configuration_identity",
+            "producer_identity",
+            "runtime_compatibility_class",
+            "content_sha256",
+        }
+        if not isinstance(value, Mapping) or set(value) != required:
+            raise ValueError(
+                "Stage 1 physical-fit identity must be one closed record"
+            )
+        identity = cls(
+            schema_version=str(value["schema_version"]),
+            architecture_identity=str(value["architecture_identity"]),
+            target=str(value["target"]),
+            scientific_configuration_identity=str(
+                value["scientific_configuration_identity"]
+            ),
+            producer_identity=str(value["producer_identity"]),
+            runtime_compatibility_class=str(
+                value["runtime_compatibility_class"]
+            ),
+        )
+        if value["content_sha256"] != identity.content_sha256:
+            raise ValueError("Stage 1 physical-fit identity content changed")
+        return identity
+
+    @property
+    def content_sha256(self) -> str:
+        return _sha256_json(
+            {
+                "schema_version": self.schema_version,
+                "architecture_identity": self.architecture_identity,
+                "target": self.target,
+                "scientific_configuration_identity": (
+                    self.scientific_configuration_identity
+                ),
+                "producer_identity": self.producer_identity,
+                "runtime_compatibility_class": (
+                    self.runtime_compatibility_class
+                ),
+            }
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        body = {
+            "schema_version": self.schema_version,
+            "architecture_identity": self.architecture_identity,
+            "target": self.target,
+            "scientific_configuration_identity": (
+                self.scientific_configuration_identity
+            ),
+            "producer_identity": self.producer_identity,
+            "runtime_compatibility_class": (
+                self.runtime_compatibility_class
+            ),
+        }
+        return {**body, "content_sha256": self.content_sha256}
+
+    def key_for_scope(self, scope: Stage1ScopeSpec) -> PhysicalFitKey:
+        if not isinstance(scope, Stage1ScopeSpec):
+            raise TypeError("physical-fit keys require a Stage1ScopeSpec")
+        return PhysicalFitKey(
+            architecture_identity=self.architecture_identity,
+            target=self.target,
+            fit_row_order_identity=ordered_row_identity(
+                scope.fit_row_ids
+            ),
+            scientific_configuration_identity=(
+                self.scientific_configuration_identity
+            ),
+            canonical_group_seed=int(scope.scope_seed),
+            producer_identity=self.producer_identity,
+            runtime_compatibility_class=self.runtime_compatibility_class,
+        )
+
+
+def _normalize_physical_fit_identity(
+    value: Stage1PhysicalFitIdentity | Mapping[str, Any],
+) -> Stage1PhysicalFitIdentity:
+    if isinstance(value, Stage1PhysicalFitIdentity):
+        # Round-trip its closed record so subclass/proxy behavior cannot enter
+        # a scientific plan.
+        return Stage1PhysicalFitIdentity.from_mapping(value.as_dict())
+    return Stage1PhysicalFitIdentity.from_mapping(value)
+
+
+def _physical_fit_groups(
+    *,
+    scopes: Sequence[Stage1ScopeSpec],
+    physical_fit_identity: Stage1PhysicalFitIdentity,
+) -> tuple[
+    tuple[PhysicalFitKey, Stage1ScopeSpec, tuple[Stage1ScopeSpec, ...]],
+    ...,
+]:
+    """Group exact scientific equivalents and select the earliest owner."""
+
+    if not scopes:
+        raise ValueError("Stage 1 scope plan cannot be empty")
+    canonical_indices = tuple(int(scope.canonical_index) for scope in scopes)
+    scope_ids = tuple(scope.scope_id for scope in scopes)
+    if (
+        len(canonical_indices) != len(set(canonical_indices))
+        or len(scope_ids) != len(set(scope_ids))
+    ):
+        raise ValueError("Stage 1 scopes have duplicate identities")
+
+    # Seed is validated inside, rather than used to split, a scientific
+    # equivalence group. A changed canonical seed must never silently turn an
+    # otherwise identical fit into a second accepted group.
+    grouped: dict[
+        tuple[str, int],
+        list[Stage1ScopeSpec],
+    ] = {}
+    for scope in sorted(scopes, key=lambda value: value.canonical_index):
+        row_identity = ordered_row_identity(scope.fit_row_ids)
+        grouped.setdefault(
+            (row_identity, len(scope.fit_row_ids)),
+            [],
+        ).append(scope)
+
+    output: list[
+        tuple[PhysicalFitKey, Stage1ScopeSpec, tuple[Stage1ScopeSpec, ...]]
+    ] = []
+    for members in grouped.values():
+        owner = min(members, key=lambda value: value.canonical_index)
+        owner_rows = tuple(owner.fit_row_ids)
+        owner_seed = int(owner.scope_seed)
+        key = physical_fit_identity.key_for_scope(owner)
+        for member in members:
+            if (
+                tuple(member.fit_row_ids) != owner_rows
+                or ordered_row_identity(member.fit_row_ids)
+                != key.fit_row_order_identity
+            ):
+                raise RuntimeError(
+                    "physical-fit row-order equivalence changed"
+                )
+            if int(member.scope_seed) != owner_seed:
+                raise ValueError(
+                    "ordered-equivalent logical scopes changed their "
+                    "canonical group seed"
+                )
+            if physical_fit_identity.key_for_scope(member) != key:
+                raise RuntimeError("physical-fit scientific key changed")
+        output.append((key, owner, tuple(members)))
+    return tuple(
+        sorted(output, key=lambda value: value[1].canonical_index)
+    )
+
+
+def _stage1_scope_scientific_plan_body(
+    *,
+    registry_content_sha256: str,
+    global_seed: int,
+    review_rounds: int,
+    initial_training_partitions: int,
+    physical_fit_identity: Stage1PhysicalFitIdentity,
+    scopes: tuple[Stage1ScopeSpec, ...],
+) -> dict[str, Any]:
+    """Return the fold/row/seed plan with no execution-resource metadata."""
+
+    groups = _physical_fit_groups(
+        scopes=scopes,
+        physical_fit_identity=physical_fit_identity,
+    )
+    physical_scopes = tuple(owner for _key, owner, _members in groups)
+    owner_by_scope = {
+        member.scope_id: owner.scope_id
+        for _key, owner, members in groups
+        for member in members
+    }
+    key_by_scope = {
+        member.scope_id: key
+        for key, _owner, members in groups
+        for member in members
+    }
+    return {
+        "schema_version": STAGE1_SCOPE_SCIENTIFIC_PLAN_SCHEMA,
+        "registry_content_sha256": registry_content_sha256,
+        "global_seed": int(global_seed),
+        "physical_fit_identity": physical_fit_identity.as_dict(),
+        "scope_seed_derivation": (
+            "sha256(global_seed,canonical_ordered_fit_rows)_31bit_v2"
+        ),
+        "review_rounds": int(review_rounds),
+        "initial_training_partitions": int(initial_training_partitions),
+        "canonical_scope_count": len(scopes),
+        "logical_scope_count": len(scopes),
+        "physical_scope_count": len(physical_scopes),
+        "deduplicated_physical_fit_count": len(scopes) - len(physical_scopes),
+        "canonical_scope_order": [scope.scope_id for scope in scopes],
+        "physical_scope_order": [scope.scope_id for scope in physical_scopes],
+        "physical_fit_groups": [
+            {
+                "physical_fit_key": key.key,
+                "physical_fit_key_record": key.as_dict(),
+                "canonical_owner_scope_id": owner.scope_id,
+                "logical_scope_ids": [
+                    member.scope_id for member in members
+                ],
+            }
+            for key, owner, members in groups
+        ],
+        "logical_physical_bindings": [
+            {
+                "logical_scope_id": scope.scope_id,
+                "physical_owner_scope_id": owner_by_scope[scope.scope_id],
+                "physical_fit_key": key_by_scope[scope.scope_id].key,
+                "reuses_physical_fit": (
+                    owner_by_scope[scope.scope_id] != scope.scope_id
+                ),
+            }
+            for scope in scopes
+        ],
+        "scopes": [scope.as_dict() for scope in scopes],
+        "heldout_labels_present_in_scheduler_requests": False,
+    }
+
+
+@dataclass(frozen=True)
 class Stage1ScopePlan:
     registry_content_sha256: str
     global_seed: int
     review_rounds: int
+    initial_training_partitions: int
+    physical_fit_identity: Stage1PhysicalFitIdentity
     gpu_ids: tuple[int, ...]
     scope_workers_per_gpu: int
     scopes: tuple[Stage1ScopeSpec, ...]
     assignments: tuple[Stage1ScopeAssignment, ...]
     content_sha256: str
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "physical_fit_identity",
+            _normalize_physical_fit_identity(self.physical_fit_identity),
+        )
+
+    @property
+    def scientific_content_sha256(self) -> str:
+        return _sha256_json(
+            _stage1_scope_scientific_plan_body(
+                registry_content_sha256=self.registry_content_sha256,
+                global_seed=self.global_seed,
+                review_rounds=self.review_rounds,
+                initial_training_partitions=self.initial_training_partitions,
+                physical_fit_identity=self.physical_fit_identity,
+                scopes=self.scopes,
+            )
+        )
+
+    @property
+    def physical_fit_groups(
+        self,
+    ) -> tuple[
+        tuple[
+            PhysicalFitKey,
+            Stage1ScopeSpec,
+            tuple[Stage1ScopeSpec, ...],
+        ],
+        ...,
+    ]:
+        return _physical_fit_groups(
+            scopes=self.scopes,
+            physical_fit_identity=self.physical_fit_identity,
+        )
+
+    @property
+    def physical_scope_groups(
+        self,
+    ) -> tuple[tuple[Stage1ScopeSpec, tuple[Stage1ScopeSpec, ...]], ...]:
+        """Return content-derived groups in earliest-owner order.
+
+        Logical purpose and held-out rows remain distinct. Physical
+        equivalence requires the complete :class:`PhysicalFitKey`, including
+        architecture, target, ordered rows, scientific configuration,
+        canonical group seed, producer, and runtime compatibility class.
+        """
+
+        return tuple(
+            (owner, members)
+            for _key, owner, members in self.physical_fit_groups
+        )
+
+    @property
+    def physical_scopes(self) -> tuple[Stage1ScopeSpec, ...]:
+        return tuple(owner for owner, _members in self.physical_scope_groups)
+
+    def physical_owner(self, scope_id: str) -> Stage1ScopeSpec:
+        requested = self.scope(scope_id)
+        for _key, owner, members in self.physical_fit_groups:
+            if requested in members:
+                return owner
+        raise RuntimeError("logical scope has no physical owner")
+
+    def physical_fit_key(self, scope_id: str) -> PhysicalFitKey:
+        requested = self.scope(scope_id)
+        for key, _owner, members in self.physical_fit_groups:
+            if requested in members:
+                return key
+        raise RuntimeError("logical scope has no physical-fit key")
+
     def as_dict(self) -> dict[str, Any]:
         body = {
             "schema_version": STAGE1_SCOPE_PLAN_SCHEMA,
+            "scientific_content_sha256": self.scientific_content_sha256,
             "registry_content_sha256": self.registry_content_sha256,
             "global_seed": int(self.global_seed),
-            "scope_seed_derivation": "sha256(global_seed,canonical_scope_id)_31bit_v1",
+            "physical_fit_identity": self.physical_fit_identity.as_dict(),
+            "scope_seed_derivation": (
+                "sha256(global_seed,canonical_ordered_fit_rows)_31bit_v2"
+            ),
             "python_hash_seed_policy": (
                 "set_scope_seed_immediately_before_spawn_then_restore_parent_v1"
             ),
             "review_rounds": int(self.review_rounds),
+            "initial_training_partitions": int(
+                self.initial_training_partitions
+            ),
             "gpu_ids": list(self.gpu_ids),
             "scope_workers_per_gpu": int(self.scope_workers_per_gpu),
             "scheduling_policy": (
@@ -749,6 +1139,11 @@ class Stage1ScopePlan:
                 self.scope_workers_per_gpu
             ),
             "canonical_scope_count": len(self.scopes),
+            "logical_scope_count": len(self.scopes),
+            "physical_scope_count": len(self.physical_scopes),
+            "deduplicated_physical_fit_count": (
+                len(self.scopes) - len(self.physical_scopes)
+            ),
             "full_outer_scope_count": sum(
                 scope.scope_kind == "full_outer" for scope in self.scopes
             ),
@@ -759,6 +1154,36 @@ class Stage1ScopePlan:
                 scope.scope_kind == "cumulative_spent" for scope in self.scopes
             ),
             "canonical_scope_order": [scope.scope_id for scope in self.scopes],
+            "physical_scope_order": [
+                scope.scope_id for scope in self.physical_scopes
+            ],
+            "physical_fit_groups": [
+                {
+                    "physical_fit_key": key.key,
+                    "physical_fit_key_record": key.as_dict(),
+                    "canonical_owner_scope_id": owner.scope_id,
+                    "logical_scope_ids": [
+                        member.scope_id for member in members
+                    ],
+                }
+                for key, owner, members in self.physical_fit_groups
+            ],
+            "logical_physical_bindings": [
+                {
+                    "logical_scope_id": scope.scope_id,
+                    "physical_owner_scope_id": self.physical_owner(
+                        scope.scope_id
+                    ).scope_id,
+                    "physical_fit_key": self.physical_fit_key(
+                        scope.scope_id
+                    ).key,
+                    "reuses_physical_fit": (
+                        self.physical_owner(scope.scope_id).scope_id
+                        != scope.scope_id
+                    ),
+                }
+                for scope in self.scopes
+            ],
             "scopes": [scope.as_dict() for scope in self.scopes],
             "assignments": [
                 assignment.as_dict() for assignment in self.assignments
@@ -790,27 +1215,67 @@ class Stage1ScopePlan:
             )
         )
 
+    @property
+    def physical_execution_order(self) -> tuple[str, ...]:
+        """Return only canonical owners in their precomputed execution order."""
+
+        owners = {scope.scope_id for scope in self.physical_scopes}
+        return tuple(
+            scope_id for scope_id in self.execution_order if scope_id in owners
+        )
+
 
 def _stage1_scope_plan_body(
     *,
     registry_content_sha256: str,
     global_seed: int,
     review_rounds: int,
+    initial_training_partitions: int,
+    physical_fit_identity: Stage1PhysicalFitIdentity,
     gpu_ids: tuple[int, ...],
     scope_workers_per_gpu: int,
     scopes: tuple[Stage1ScopeSpec, ...],
     assignments: tuple[Stage1ScopeAssignment, ...],
 ) -> dict[str, Any]:
     # Mirror ``as_dict`` without invoking its integrity check.
+    groups = _physical_fit_groups(
+        scopes=scopes,
+        physical_fit_identity=physical_fit_identity,
+    )
+    physical_scopes = tuple(owner for _key, owner, _members in groups)
+    owner_by_scope = {
+        member.scope_id: owner.scope_id
+        for _key, owner, members in groups
+        for member in members
+    }
+    key_by_scope = {
+        member.scope_id: key
+        for key, _owner, members in groups
+        for member in members
+    }
     return {
         "schema_version": STAGE1_SCOPE_PLAN_SCHEMA,
+        "scientific_content_sha256": _sha256_json(
+            _stage1_scope_scientific_plan_body(
+                registry_content_sha256=registry_content_sha256,
+                global_seed=global_seed,
+                review_rounds=review_rounds,
+                initial_training_partitions=initial_training_partitions,
+                physical_fit_identity=physical_fit_identity,
+                scopes=scopes,
+            )
+        ),
         "registry_content_sha256": registry_content_sha256,
         "global_seed": int(global_seed),
-        "scope_seed_derivation": "sha256(global_seed,canonical_scope_id)_31bit_v1",
+        "physical_fit_identity": physical_fit_identity.as_dict(),
+        "scope_seed_derivation": (
+            "sha256(global_seed,canonical_ordered_fit_rows)_31bit_v2"
+        ),
         "python_hash_seed_policy": (
             "set_scope_seed_immediately_before_spawn_then_restore_parent_v1"
         ),
         "review_rounds": int(review_rounds),
+        "initial_training_partitions": int(initial_training_partitions),
         "gpu_ids": list(gpu_ids),
         "scope_workers_per_gpu": int(scope_workers_per_gpu),
         "scheduling_policy": (
@@ -826,6 +1291,9 @@ def _stage1_scope_plan_body(
         "torch_determinism_policy": stage1_torch_determinism_policy(),
         "maximum_concurrent_scopes_per_gpu": int(scope_workers_per_gpu),
         "canonical_scope_count": len(scopes),
+        "logical_scope_count": len(scopes),
+        "physical_scope_count": len(physical_scopes),
+        "deduplicated_physical_fit_count": len(scopes) - len(physical_scopes),
         "full_outer_scope_count": sum(
             scope.scope_kind == "full_outer" for scope in scopes
         ),
@@ -836,6 +1304,29 @@ def _stage1_scope_plan_body(
             scope.scope_kind == "cumulative_spent" for scope in scopes
         ),
         "canonical_scope_order": [scope.scope_id for scope in scopes],
+        "physical_scope_order": [scope.scope_id for scope in physical_scopes],
+        "physical_fit_groups": [
+            {
+                "physical_fit_key": key.key,
+                "physical_fit_key_record": key.as_dict(),
+                "canonical_owner_scope_id": owner.scope_id,
+                "logical_scope_ids": [
+                    member.scope_id for member in members
+                ],
+            }
+            for key, owner, members in groups
+        ],
+        "logical_physical_bindings": [
+            {
+                "logical_scope_id": scope.scope_id,
+                "physical_owner_scope_id": owner_by_scope[scope.scope_id],
+                "physical_fit_key": key_by_scope[scope.scope_id].key,
+                "reuses_physical_fit": (
+                    owner_by_scope[scope.scope_id] != scope.scope_id
+                ),
+            }
+            for scope in scopes
+        ],
         "scopes": [scope.as_dict() for scope in scopes],
         "assignments": [assignment.as_dict() for assignment in assignments],
         "heldout_labels_present_in_scheduler_requests": False,
@@ -847,14 +1338,19 @@ def build_canonical_stage1_scope_plan(
     registry: Mapping[str, Any],
     registry_content_sha256: str,
     global_seed: int,
+    physical_fit_identity: Stage1PhysicalFitIdentity | Mapping[str, Any],
     gpu_ids: Sequence[int] = (),
     review_rounds: int,
+    initial_training_partitions: int,
     scope_workers_per_gpu: int = 1,
     expected_outer_fold_count: int | None = None,
     expected_inner_fold_count: int | None = None,
 ) -> Stage1ScopePlan:
     """Build the exact full/inner/cumulative task graph from one registry."""
 
+    resolved_physical_fit_identity = _normalize_physical_fit_identity(
+        physical_fit_identity
+    )
     if (
         not isinstance(registry_content_sha256, str)
         or _SHA256.fullmatch(registry_content_sha256) is None
@@ -868,11 +1364,16 @@ def build_canonical_stage1_scope_plan(
     rounds = int(review_rounds)
     if rounds < 1:
         raise ValueError("review_rounds must be positive")
+    initial_partitions = int(initial_training_partitions)
+    if initial_partitions < 1:
+        raise ValueError("initial_training_partitions must be positive")
     workers_per_gpu = int(scope_workers_per_gpu)
-    if workers_per_gpu != 1:
-        raise ValueError(
-            "production Stage 1 currently requires exactly one scope worker per GPU"
-        )
+    if (
+        isinstance(scope_workers_per_gpu, bool)
+        or workers_per_gpu < 1
+        or workers_per_gpu != scope_workers_per_gpu
+    ):
+        raise ValueError("scope_workers_per_gpu must be a positive integer")
     resolved_gpus = tuple(int(value) for value in gpu_ids)
     if any(value < 0 for value in resolved_gpus) or len(resolved_gpus) != len(
         set(resolved_gpus)
@@ -892,7 +1393,9 @@ def build_canonical_stage1_scope_plan(
         raise ValueError("registry outer folds are missing, duplicated, or reordered")
 
     specs: list[Stage1ScopeSpec] = []
-    cumulative_inputs: list[tuple[int, dict[int, tuple[int, ...]]]] = []
+    cumulative_inputs: list[
+        tuple[int, tuple[int, ...], dict[int, tuple[int, ...]]]
+    ] = []
     outer_heldout_counts: dict[int, int] = {}
 
     def add_scope(
@@ -922,7 +1425,7 @@ def build_canonical_stage1_scope_plan(
                 fit_row_ids=fit_rows,
                 heldout_row_ids=heldout_rows,
                 global_seed=int(global_seed),
-                scope_seed=derive_stage1_scope_seed(global_seed, scope_id),
+                scope_seed=derive_stage1_group_seed(global_seed, fit_rows),
             )
         )
 
@@ -952,9 +1455,13 @@ def build_canonical_stage1_scope_plan(
             heldout_rows=outer_heldout,
         )
         inner_rows = outer.get("inner_folds")
-        if not isinstance(inner_rows, list) or len(inner_rows) != rounds + 3:
+        if (
+            not isinstance(inner_rows, list)
+            or len(inner_rows) != rounds + initial_partitions
+        ):
             raise ValueError(
-                f"outer {outer_fold} must have review_rounds + 3 inner folds"
+                f"outer {outer_fold} must have review_rounds + "
+                "initial_training_partitions inner folds"
             )
         if expected_inner_fold_count is not None and len(inner_rows) != int(
             expected_inner_fold_count
@@ -1003,7 +1510,7 @@ def build_canonical_stage1_scope_plan(
             raise ValueError(
                 f"outer {outer_fold} inner held-outs do not partition outer fit"
             )
-        cumulative_inputs.append((outer_fold, by_partition))
+        cumulative_inputs.append((outer_fold, outer_fit, by_partition))
 
     if set(outer_heldout_counts) != dataset_rows or set(
         outer_heldout_counts.values()
@@ -1012,20 +1519,36 @@ def build_canonical_stage1_scope_plan(
 
     # Preserve the scientific order already used by clustered-embedding
     # preflight: all full/exact-inner scopes first, then cumulative scopes.
-    for outer_fold, by_partition in cumulative_inputs:
+    for outer_fold, outer_fit_order, by_partition in cumulative_inputs:
         partition_ids = tuple(sorted(by_partition))
         for epoch in range(rounds):
-            spent_partition_ids = partition_ids[: 3 + epoch]
-            sealed_partition_ids = partition_ids[3 + epoch :]
-            fit_rows = tuple(
+            gate = initial_partitions + epoch
+            spent_partition_ids = partition_ids[:gate]
+            sealed_partition_ids = partition_ids[gate:]
+            spent_rows = {
                 row_id
                 for partition_id in spent_partition_ids
                 for row_id in by_partition[partition_id]
-            )
-            heldout_rows = tuple(
+            }
+            sealed_rows = {
                 row_id
                 for partition_id in sealed_partition_ids
                 for row_id in by_partition[partition_id]
+            }
+            # A cumulative purpose inherits the canonical outer-fit row order
+            # rather than the incidental order in which partition blocks are
+            # concatenated.  This makes an exact-inner/cumulative alias a
+            # physical-fit equivalence only when their ordered fit inputs are
+            # genuinely identical.
+            fit_rows = tuple(
+                row_id
+                for row_id in outer_fit_order
+                if row_id in spent_rows
+            )
+            heldout_rows = tuple(
+                row_id
+                for row_id in outer_fit_order
+                if row_id in sealed_rows
             )
             add_scope(
                 scope_id=(
@@ -1042,8 +1565,18 @@ def build_canonical_stage1_scope_plan(
 
     if len({scope.scope_id for scope in specs}) != len(specs):
         raise RuntimeError("canonical Stage 1 plan contains duplicate scopes")
-    if len({scope.scope_seed for scope in specs}) != len(specs):
-        raise RuntimeError("canonical Stage 1 scope-seed derivation collided")
+    seeds_by_fit_order: dict[tuple[int, ...], int] = {}
+    fit_order_by_seed: dict[int, tuple[int, ...]] = {}
+    for scope in specs:
+        fit_order = tuple(scope.fit_row_ids)
+        prior_seed = seeds_by_fit_order.setdefault(fit_order, scope.scope_seed)
+        if prior_seed != scope.scope_seed:
+            raise RuntimeError(
+                "ordered-equivalent Stage 1 scopes received different seeds"
+            )
+        prior_fit_order = fit_order_by_seed.setdefault(scope.scope_seed, fit_order)
+        if prior_fit_order != fit_order:
+            raise RuntimeError("Stage 1 physical-fit seed derivation collided")
 
     execution_specs = sorted(
         specs, key=lambda scope: (-scope.fit_row_count, scope.canonical_index)
@@ -1081,6 +1614,8 @@ def build_canonical_stage1_scope_plan(
         registry_content_sha256=registry_content_sha256,
         global_seed=int(global_seed),
         review_rounds=rounds,
+        initial_training_partitions=initial_partitions,
+        physical_fit_identity=resolved_physical_fit_identity,
         gpu_ids=resolved_gpus,
         scope_workers_per_gpu=workers_per_gpu,
         scopes=scope_tuple,
@@ -1090,6 +1625,8 @@ def build_canonical_stage1_scope_plan(
         registry_content_sha256=registry_content_sha256,
         global_seed=int(global_seed),
         review_rounds=rounds,
+        initial_training_partitions=initial_partitions,
+        physical_fit_identity=resolved_physical_fit_identity,
         gpu_ids=resolved_gpus,
         scope_workers_per_gpu=workers_per_gpu,
         scopes=scope_tuple,
@@ -1104,8 +1641,10 @@ def validate_stage1_scope_plan(
     registry: Mapping[str, Any],
     registry_content_sha256: str,
     global_seed: int,
+    physical_fit_identity: Stage1PhysicalFitIdentity | Mapping[str, Any],
     gpu_ids: Sequence[int] = (),
     review_rounds: int,
+    initial_training_partitions: int,
     scope_workers_per_gpu: int = 1,
     expected_outer_fold_count: int | None = None,
     expected_inner_fold_count: int | None = None,
@@ -1118,8 +1657,10 @@ def validate_stage1_scope_plan(
         registry=registry,
         registry_content_sha256=registry_content_sha256,
         global_seed=global_seed,
+        physical_fit_identity=physical_fit_identity,
         gpu_ids=gpu_ids,
         review_rounds=review_rounds,
+        initial_training_partitions=initial_training_partitions,
         scope_workers_per_gpu=scope_workers_per_gpu,
         expected_outer_fold_count=expected_outer_fold_count,
         expected_inner_fold_count=expected_inner_fold_count,
@@ -1171,6 +1712,21 @@ class ValidatedStage1ScopeAttempt:
     scope_id: str
     attempt_dir: Path
     manifest: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class ValidatedStage1LogicalScopeBindings:
+    """Authenticated 40-logical-to-physical-attempt reference set."""
+
+    path: Path
+    manifest: Mapping[str, Any]
+
+    @property
+    def bindings(self) -> tuple[Mapping[str, Any], ...]:
+        return tuple(
+            copy.deepcopy(dict(row))
+            for row in self.manifest["logical_bindings"]
+        )
 
 
 def _attempt_inventory(
@@ -1413,6 +1969,262 @@ class Stage1ScopeAttemptStore:
             "root_inode_binding": dict(self._root_inode_binding),
         }
         return {**body, "content_sha256": _sha256_json(body)}
+
+    def _fresh_attempt_capability(
+        self,
+        *,
+        scope_id: str,
+        attempt_dir: Path | str,
+    ) -> ValidatedStage1ScopeAttempt:
+        """Reopen one attempt using only its closed, persisted request."""
+
+        path = self._validated_attempt_path(attempt_dir, scope_id=scope_id)
+        request = _load_strict_json_file(
+            path / "attempt_request.json",
+            label=f"{scope_id} logical-binding attempt request",
+        )
+        if not isinstance(request, Mapping):
+            raise ValueError("logical-binding attempt request is not an object")
+        target = request.get("worker_target")
+        parameters = request.get("worker_parameters")
+        if (
+            not isinstance(target, str)
+            or _WORKER_TARGET.fullmatch(target) is None
+            or not isinstance(parameters, Mapping)
+        ):
+            raise ValueError("logical-binding attempt capability is malformed")
+        manifest = self.validate_completed(
+            path,
+            scope_id=scope_id,
+            worker_target=target,
+            worker_parameters=parameters,
+        )
+        return ValidatedStage1ScopeAttempt(
+            scope_id=scope_id,
+            attempt_dir=path,
+            manifest=manifest,
+        )
+
+    def _logical_binding_manifest(
+        self,
+        physical_attempts: Sequence[ValidatedStage1ScopeAttempt],
+    ) -> dict[str, Any]:
+        by_scope: dict[str, ValidatedStage1ScopeAttempt] = {}
+        for supplied in physical_attempts:
+            if not isinstance(supplied, ValidatedStage1ScopeAttempt):
+                raise TypeError(
+                    "physical attempts must be authenticated Stage 1 attempts"
+                )
+            if supplied.scope_id in by_scope:
+                raise ValueError("physical attempt owner is duplicated")
+            by_scope[supplied.scope_id] = self._fresh_attempt_capability(
+                scope_id=supplied.scope_id,
+                attempt_dir=supplied.attempt_dir,
+            )
+        expected_owners = tuple(
+            scope.scope_id for scope in self.plan.physical_scopes
+        )
+        if set(by_scope) != set(expected_owners):
+            raise ValueError(
+                "physical attempts do not cover exactly the canonical owners"
+            )
+
+        physical_rows: list[dict[str, Any]] = []
+        for owner_id in expected_owners:
+            attempt = by_scope[owner_id]
+            manifest = dict(attempt.manifest)
+            physical_key = self.plan.physical_fit_key(owner_id)
+            relative = attempt.attempt_dir.relative_to(self.root).as_posix()
+            if relative != f"{owner_id}/{attempt.attempt_dir.name}":
+                raise ValueError("physical attempt capability is noncanonical")
+            physical_rows.append(
+                {
+                    "physical_owner_scope_id": owner_id,
+                    "physical_fit_key": physical_key.key,
+                    "physical_fit_key_record": physical_key.as_dict(),
+                    "physical_attempt_relative_path": relative,
+                    "attempt_request_sha256": manifest[
+                        "attempt_request_sha256"
+                    ],
+                    "attempt_manifest_content_sha256": manifest[
+                        "content_sha256"
+                    ],
+                }
+            )
+        physical_by_owner = {
+            row["physical_owner_scope_id"]: row for row in physical_rows
+        }
+
+        logical_rows: list[dict[str, Any]] = []
+        for logical in self.plan.scopes:
+            owner = self.plan.physical_owner(logical.scope_id)
+            physical_key = self.plan.physical_fit_key(logical.scope_id)
+            if (
+                tuple(logical.fit_row_ids) != tuple(owner.fit_row_ids)
+                or logical.scope_seed != owner.scope_seed
+                or physical_key
+                != self.plan.physical_fit_key(owner.scope_id)
+            ):
+                raise RuntimeError(
+                    "logical scope no longer matches its physical-fit owner"
+                )
+            body = {
+                "schema_version": STAGE1_LOGICAL_SCOPE_BINDING_SCHEMA,
+                "plan_content_sha256": self.plan.content_sha256,
+                "logical_scope_id": logical.scope_id,
+                "logical_scope_sha256": logical.as_dict()["scope_sha256"],
+                "logical_purpose": logical.scope_kind,
+                "physical_owner_scope_id": owner.scope_id,
+                "physical_owner_scope_sha256": owner.as_dict()[
+                    "scope_sha256"
+                ],
+                **physical_by_owner[owner.scope_id],
+                "physical_fit_identity": (
+                    self.plan.physical_fit_identity.as_dict()
+                ),
+                "fit_row_order_fingerprint": _row_order_fingerprint(
+                    logical.fit_row_ids
+                ),
+                "fit_row_order_identity": (
+                    physical_key.fit_row_order_identity
+                ),
+                "canonical_group_seed": int(owner.scope_seed),
+                "reuses_physical_fit": logical.scope_id != owner.scope_id,
+                "heldout_labels_supplied_to_physical_worker": False,
+            }
+            logical_rows.append(
+                {**body, "content_sha256": _sha256_json(body)}
+            )
+        top_body = {
+            "schema_version": STAGE1_LOGICAL_SCOPE_BINDING_SET_SCHEMA,
+            "plan_content_sha256": self.plan.content_sha256,
+            "canonical_logical_scope_order": [
+                scope.scope_id for scope in self.plan.scopes
+            ],
+            "physical_owner_scope_order": list(expected_owners),
+            "logical_scope_count": len(logical_rows),
+            "physical_fit_count": len(physical_rows),
+            "deduplicated_fit_count": len(logical_rows) - len(physical_rows),
+            "physical_attempts": physical_rows,
+            "logical_bindings": logical_rows,
+            "physical_fit_identity": (
+                self.plan.physical_fit_identity.as_dict()
+            ),
+            "fit_equivalence_proven_from_complete_physical_fit_key": True,
+            "evidence_family_equality_proof_location": (
+                "downstream_sealed_stage1_handoff"
+            ),
+            "heldout_labels_supplied_to_physical_workers": False,
+        }
+        return {**top_body, "content_sha256": _sha256_json(top_body)}
+
+    def seal_logical_bindings(
+        self,
+        physical_attempts: Sequence[ValidatedStage1ScopeAttempt],
+    ) -> ValidatedStage1LogicalScopeBindings:
+        """Publish logical references only after every physical owner seals."""
+
+        expected = self._logical_binding_manifest(physical_attempts)
+        path = self.root / STAGE1_LOGICAL_SCOPE_BINDING_FILENAME
+        _write_immutable_json(path, expected)
+        descriptor, _root = _open_safe_directory(
+            self.root,
+            label="scope-attempt root for logical-binding durability",
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return self.validate_logical_bindings()
+
+    def validate_logical_bindings(
+        self,
+    ) -> ValidatedStage1LogicalScopeBindings:
+        """Freshly reopen all owner attempts named by the logical references."""
+
+        path = self.root / STAGE1_LOGICAL_SCOPE_BINDING_FILENAME
+        manifest = _load_strict_json_file(
+            path,
+            label="Stage 1 logical-scope binding set",
+        )
+        if not isinstance(manifest, Mapping):
+            raise ValueError("logical-scope binding set is not an object")
+        body = dict(manifest)
+        declared = body.pop("content_sha256", None)
+        physical_rows = manifest.get("physical_attempts")
+        if (
+            manifest.get("schema_version")
+            != STAGE1_LOGICAL_SCOPE_BINDING_SET_SCHEMA
+            or _SHA256.fullmatch(str(declared or "")) is None
+            or _sha256_json(body) != declared
+            or manifest.get("plan_content_sha256")
+            != self.plan.content_sha256
+            or not isinstance(physical_rows, list)
+        ):
+            raise ValueError("logical-scope binding set has an invalid binding")
+        attempts: list[ValidatedStage1ScopeAttempt] = []
+        expected_owners = [
+            scope.scope_id for scope in self.plan.physical_scopes
+        ]
+        for owner_id, row in zip(
+            expected_owners, physical_rows, strict=True
+        ):
+            if (
+                not isinstance(row, Mapping)
+                or set(row)
+                != {
+                    "physical_owner_scope_id",
+                    "physical_fit_key",
+                    "physical_fit_key_record",
+                    "physical_attempt_relative_path",
+                    "attempt_request_sha256",
+                    "attempt_manifest_content_sha256",
+                }
+                or row.get("physical_owner_scope_id") != owner_id
+                or row.get("physical_fit_key")
+                != self.plan.physical_fit_key(owner_id).key
+                or row.get("physical_fit_key_record")
+                != self.plan.physical_fit_key(owner_id).as_dict()
+            ):
+                raise ValueError(
+                    "logical-scope binding physical capability is malformed"
+                )
+            relative = str(row["physical_attempt_relative_path"])
+            parts = Path(relative).parts
+            if (
+                Path(relative).is_absolute()
+                or len(parts) != 2
+                or parts[0] != owner_id
+                or _ATTEMPT_NAME.fullmatch(parts[1]) is None
+            ):
+                raise ValueError(
+                    "logical-scope binding physical capability is noncanonical"
+                )
+            attempt = self._fresh_attempt_capability(
+                scope_id=owner_id,
+                attempt_dir=self.root / relative,
+            )
+            if (
+                row.get("attempt_request_sha256")
+                != attempt.manifest["attempt_request_sha256"]
+                or row.get("attempt_manifest_content_sha256")
+                != attempt.manifest["content_sha256"]
+            ):
+                raise ValueError(
+                    "logical-scope binding physical attempt changed"
+                )
+            attempts.append(attempt)
+        if len(physical_rows) != len(expected_owners):
+            raise ValueError(
+                "logical-scope binding physical coverage changed"
+            )
+        expected = self._logical_binding_manifest(attempts)
+        if dict(manifest) != expected:
+            raise ValueError("logical-scope binding set changed")
+        return ValidatedStage1LogicalScopeBindings(
+            path=path.resolve(),
+            manifest=copy.deepcopy(dict(manifest)),
+        )
 
     def _attempt_filesystem_identity(
         self,
@@ -1948,11 +2760,18 @@ class Stage1ScopeProgressLedger:
             rows = []
             for scope in plan.scopes:
                 assignment = plan.assignment(scope.scope_id)
+                owner = plan.physical_owner(scope.scope_id)
                 rows.append(
                     {
                         "scope_id": scope.scope_id,
                         "canonical_index": scope.canonical_index,
                         "scope_kind": scope.scope_kind,
+                        "physical_owner_scope_id": owner.scope_id,
+                        "execution_mode": (
+                            "physical_fit"
+                            if owner.scope_id == scope.scope_id
+                            else "logical_reference"
+                        ),
                         "fit_row_count": scope.fit_row_count,
                         "gpu_id": assignment.gpu_id,
                         "scope_seed": scope.scope_seed,
@@ -1967,6 +2786,7 @@ class Stage1ScopeProgressLedger:
                         "peak_gpu_reserved_bytes": None,
                         "output_bytes": None,
                         "throughput_fit_rows_per_second": None,
+                        "logical_reference_sha256": None,
                         "failure": None,
                     }
                 )
@@ -2008,14 +2828,17 @@ class Stage1ScopeProgressLedger:
             "execution_binding": self.execution_binding,
             "execution_binding_sha256": self.execution_binding_sha256,
             "planned_scope_count": len(self.plan.scopes),
+            "planned_logical_scope_count": len(self.plan.scopes),
+            "planned_physical_fit_count": len(self.plan.physical_scopes),
             "counts": counts,
             "completed_fit_row_units": sum(
                 int(row["fit_row_count"])
                 for row in rows
                 if row.get("status") == "completed"
+                and row.get("execution_mode") == "physical_fit"
             ),
             "planned_fit_row_units": sum(
-                scope.fit_row_count for scope in self.plan.scopes
+                scope.fit_row_count for scope in self.plan.physical_scopes
             ),
             "updated_at": _utc_now(),
             "scopes": [dict(row) for row in rows],
@@ -2061,6 +2884,70 @@ class Stage1ScopeProgressLedger:
             selected["finished_at"] = now
             selected["heartbeat_at"] = now
         self._write(rows)
+
+    def reconcile_logical_references(
+        self,
+        bindings: ValidatedStage1LogicalScopeBindings,
+    ) -> None:
+        """Mark all logical purposes complete from sealed owner references."""
+
+        if not isinstance(bindings, ValidatedStage1LogicalScopeBindings):
+            raise TypeError(
+                "bindings must be authenticated Stage 1 logical references"
+            )
+        manifest = dict(bindings.manifest)
+        body = dict(manifest)
+        declared = body.pop("content_sha256", None)
+        rows = manifest.get("logical_bindings")
+        if (
+            manifest.get("schema_version")
+            != STAGE1_LOGICAL_SCOPE_BINDING_SET_SCHEMA
+            or manifest.get("plan_content_sha256")
+            != self.plan.content_sha256
+            or _SHA256.fullmatch(str(declared or "")) is None
+            or _sha256_json(body) != declared
+            or not isinstance(rows, list)
+            or [row.get("logical_scope_id") for row in rows]
+            != [scope.scope_id for scope in self.plan.scopes]
+        ):
+            raise ValueError("logical references do not match the progress plan")
+        for scope, binding in zip(self.plan.scopes, rows, strict=True):
+            owner = self.plan.physical_owner(scope.scope_id)
+            binding_body = dict(binding)
+            binding_sha = binding_body.pop("content_sha256", None)
+            if (
+                binding.get("schema_version")
+                != STAGE1_LOGICAL_SCOPE_BINDING_SCHEMA
+                or binding.get("logical_scope_sha256")
+                != scope.as_dict()["scope_sha256"]
+                or binding.get("physical_owner_scope_id") != owner.scope_id
+                or binding.get("physical_owner_scope_sha256")
+                != owner.as_dict()["scope_sha256"]
+                or binding.get("canonical_group_seed") != owner.scope_seed
+                or binding.get("heldout_labels_supplied_to_physical_worker")
+                is not False
+                or _SHA256.fullmatch(str(binding_sha or "")) is None
+                or _sha256_json(binding_body) != binding_sha
+            ):
+                raise ValueError("logical reference row has an invalid binding")
+            attempt_path = (
+                bindings.path.parent
+                / str(binding["physical_attempt_relative_path"])
+            ).resolve(strict=True)
+            fields: dict[str, Any] = {
+                "attempt_dir": str(attempt_path),
+                "logical_reference_sha256": str(binding_sha),
+                "failure": None,
+            }
+            if scope.scope_id != owner.scope_id:
+                fields.update(
+                    {
+                        "pid": None,
+                        "output_bytes": 0,
+                        "throughput_fit_rows_per_second": None,
+                    }
+                )
+            self.update(scope.scope_id, "completed", **fields)
 
     def reconcile_authenticated_completion(
         self,
@@ -2535,7 +3422,9 @@ class SpawnedStage1ScopeOrchestrator:
             raise ValueError(
                 "global and per-scope worker parameters are mutually exclusive"
             )
-        expected_scope_ids = {scope.scope_id for scope in plan.scopes}
+        expected_scope_ids = {
+            scope.scope_id for scope in plan.physical_scopes
+        }
         if worker_parameters_by_scope is None:
             self.worker_parameters: Mapping[str, Any] | None = _closed_json(
                 dict(worker_parameters or {}),
@@ -2556,7 +3445,7 @@ class SpawnedStage1ScopeOrchestrator:
                     "per-scope worker parameters must cover exactly the canonical plan"
                 )
             normalized: dict[str, Mapping[str, Any]] = {}
-            for scope in plan.scopes:
+            for scope in plan.physical_scopes:
                 raw = worker_parameters_by_scope.get(scope.scope_id)
                 if not isinstance(raw, Mapping):
                     raise TypeError(
@@ -2572,7 +3461,7 @@ class SpawnedStage1ScopeOrchestrator:
             parameter_binding = {
                 "worker_parameters_by_scope_sha256": _sha256_json(normalized),
                 "worker_parameter_scope_order": [
-                    scope.scope_id for scope in plan.scopes
+                    scope.scope_id for scope in plan.physical_scopes
                 ],
             }
         execution_binding = {
@@ -2621,7 +3510,7 @@ class SpawnedStage1ScopeOrchestrator:
         *,
         cancellation_event: Any | None = None,
     ) -> tuple[ValidatedStage1ScopeAttempt, ...]:
-        """Return canonical completed attempts after execution/authentication."""
+        """Execute each physical owner once and seal all logical references."""
 
         if (
             cancellation_event is not None
@@ -2630,7 +3519,7 @@ class SpawnedStage1ScopeOrchestrator:
             raise TypeError("cancellation_event must expose is_set()")
         completed: dict[str, ValidatedStage1ScopeAttempt] = {}
         pending: list[str] = []
-        for scope_id in self.plan.execution_order:
+        for scope_id in self.plan.physical_execution_order:
             parameters = self.worker_parameters_for_scope(scope_id)
             reusable = self.store.reusable_attempt(
                 scope_id=scope_id,
@@ -2643,7 +3532,13 @@ class SpawnedStage1ScopeOrchestrator:
                 completed[scope_id] = reusable
                 self.ledger.reconcile_authenticated_completion(reusable)
         if not pending:
-            return tuple(completed[scope.scope_id] for scope in self.plan.scopes)
+            ordered = tuple(
+                completed[scope.scope_id]
+                for scope in self.plan.physical_scopes
+            )
+            bindings = self.store.seal_logical_bindings(ordered)
+            self.ledger.reconcile_logical_references(bindings)
+            return ordered
 
         context = mp.get_context("spawn")
         messages = context.Queue()
@@ -2944,18 +3839,29 @@ class SpawnedStage1ScopeOrchestrator:
                 f"Stage 1 scope failed: {failure[0]}: "
                 f"{failure[1].get('exception_type')}: {failure[1].get('message')}"
             )
-        if set(completed) != {scope.scope_id for scope in self.plan.scopes}:
+        expected_owners = {
+            scope.scope_id for scope in self.plan.physical_scopes
+        }
+        if set(completed) != expected_owners:
             missing = sorted(
-                {scope.scope_id for scope in self.plan.scopes} - set(completed)
+                expected_owners - set(completed)
             )
             raise RuntimeError(
-                "Stage 1 scope orchestration ended with incomplete coverage: "
+                "Stage 1 physical-fit orchestration ended with incomplete coverage: "
                 + ", ".join(missing)
             )
-        return tuple(completed[scope.scope_id] for scope in self.plan.scopes)
+        ordered = tuple(
+            completed[scope.scope_id] for scope in self.plan.physical_scopes
+        )
+        bindings = self.store.seal_logical_bindings(ordered)
+        self.ledger.reconcile_logical_references(bindings)
+        return ordered
 
 
 __all__ = [
+    "STAGE1_LOGICAL_SCOPE_BINDING_FILENAME",
+    "STAGE1_LOGICAL_SCOPE_BINDING_SCHEMA",
+    "STAGE1_LOGICAL_SCOPE_BINDING_SET_SCHEMA",
     "STAGE1_SCOPE_ATTEMPT_MANIFEST_SCHEMA",
     "STAGE1_SCOPE_ATTEMPT_REQUEST_SCHEMA",
     "STAGE1_SCOPE_PLAN_SCHEMA",
@@ -2966,10 +3872,13 @@ __all__ = [
     "Stage1ScopeAttemptStore",
     "Stage1ScopeExecutionRequest",
     "Stage1ScopePlan",
+    "Stage1PhysicalFitIdentity",
     "Stage1ScopeProgressLedger",
     "Stage1ScopeSpec",
+    "ValidatedStage1LogicalScopeBindings",
     "ValidatedStage1ScopeAttempt",
     "build_canonical_stage1_scope_plan",
+    "derive_stage1_group_seed",
     "derive_stage1_scope_seed",
     "seed_stage1_scope_rngs",
     "stage1_torch_determinism_policy",

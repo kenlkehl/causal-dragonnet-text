@@ -14,7 +14,6 @@ import sys
 import tempfile
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-import joblib
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed, parallel_config
@@ -23,13 +22,22 @@ from threadpoolctl import threadpool_limits
 
 from ..config import AppliedInferenceConfig, MultiModelForestConfig
 from .tfidf_topic_discovery import (
+    DISCOVERY_SCHEMA_VERSION,
     HANDOFF_SCHEMA_VERSION,
     compact_topic_score_tests,
     fit_tfidf_topic_context,
     row_set_fingerprint,
     stable_hash,
+    tfidf_context_artifact_inventory,
 )
 from .tfidf_topic_score_selection import TOPIC_SCORE_TEST_SCHEMA_VERSION
+from .tfidf_safe_artifacts import (
+    ARRAY_BANK_SCHEMA_VERSION,
+    FITTED_CONTEXT_SCHEMA_VERSION,
+    load_fitted_topic_context,
+    load_named_array_bank,
+    write_named_array_bank,
+)
 from .tfidf_topic_split_registry import (
     TFIDF_TOPIC_SPLIT_REGISTRY_SCHEMA_VERSION,
     load_tfidf_topic_split_registry,
@@ -470,6 +478,9 @@ def tfidf_topic_stage1_identity(
     split_semantics = tfidf_topic_split_semantics(config, dataset)
     return {
         "schema": HANDOFF_SCHEMA_VERSION,
+        "discovery_schema": DISCOVERY_SCHEMA_VERSION,
+        "fitted_context_schema": FITTED_CONTEXT_SCHEMA_VERSION,
+        "topic_array_bank_schema": ARRAY_BANK_SCHEMA_VERSION,
         "topic_score_test_schema": TOPIC_SCORE_TEST_SCHEMA_VERSION,
         "views": [asdict(view) for view in nn_config.bow_views],
         "nuisance_folds": nn_config.nuisance_folds,
@@ -691,16 +702,20 @@ def _fit_tfidf_topic_context_nested_calibration(
     model_path = Path(str(artifacts.get("fitted_context") or ""))
     if not model_path.is_file():
         raise RuntimeError("nested TF-IDF fit did not persist its fitted context")
-    fitted = joblib.load(model_path)
+    fitted = load_fitted_topic_context(model_path)
     heldout_texts = registered_heldout[config.text_column].fillna("").tolist()
     registered_heldout_topics = fitted.transform_topics(heldout_texts)
 
     fit_topics_path = Path(str(artifacts.get("fit_topic_values") or ""))
     calibration_topics_path = Path(str(artifacts.get("heldout_topic_values") or ""))
-    with np.load(fit_topics_path) as archive:
-        model_topic_values = {name: np.asarray(archive[name]) for name in archive.files}
-    with np.load(calibration_topics_path) as archive:
-        calibration_topic_values = {name: np.asarray(archive[name]) for name in archive.files}
+    model_topic_values = load_named_array_bank(
+        fit_topics_path,
+        expected_row_count=len(model_fit),
+    )
+    calibration_topic_values = load_named_array_bank(
+        calibration_topics_path,
+        expected_row_count=len(calibration),
+    )
     registered_fit_ids = registered_fit["_oci_row_id"].astype(int).tolist()
     model_ids = nesting["model_fit_row_ids"]
     calibration_ids = nesting["calibration_row_ids"]
@@ -729,8 +744,18 @@ def _fit_tfidf_topic_context_nested_calibration(
             ),
             dtype=float,
         ).reshape(len(registered_heldout), topic_count)
-    np.savez_compressed(fit_topics_path, **combined_topics)
-    np.savez_compressed(calibration_topics_path, **heldout_topics)
+    fit_topics_path = write_named_array_bank(
+        combined_topics,
+        artifact_dir / "registered_fit_topic_values",
+        row_count=len(registered_fit),
+    )
+    calibration_topics_path = write_named_array_bank(
+        heldout_topics,
+        artifact_dir / "registered_heldout_topic_values",
+        row_count=len(registered_heldout),
+    )
+    artifacts["fit_topic_values"] = str(fit_topics_path)
+    artifacts["heldout_topic_values"] = str(calibration_topics_path)
 
     nuisance_path = Path(str(artifacts.get("nuisance_predictions") or ""))
     nested_nuisance = pd.read_parquet(nuisance_path)
@@ -796,6 +821,9 @@ def _fit_tfidf_topic_context_nested_calibration(
             "topic_score_tests": compact_topic_score_tests(score_tests),
         }
     )
+    metadata["artifact_inventory"] = tfidf_context_artifact_inventory(
+        metadata["artifacts"]
+    )
     metadata_path = artifact_dir / "context_metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
     return metadata
@@ -817,6 +845,10 @@ def _fit_tfidf_topic_stage1_spec_impl(
     metadata_path = contexts_dir / spec["scope_id"] / "context_metadata.json"
     if metadata_path.exists():
         try:
+            if metadata_path.is_symlink() or metadata_path.stat().st_nlink != 1:
+                raise ValueError(
+                    "sealed TF-IDF checkpoint metadata must be one unlinked regular file"
+                )
             cached = json.loads(metadata_path.read_text(encoding="utf-8"))
             expected_fit = row_set_fingerprint(spec["fit_df"]["_oci_row_id"])
             expected_heldout = row_set_fingerprint(spec["heldout_df"]["_oci_row_id"])
@@ -879,16 +911,67 @@ def _fit_tfidf_topic_stage1_spec_impl(
                 )
                 and all(path and Path(path).exists() for path in artifact_paths)
             ):
+                artifacts = cached["artifacts"]
+                observed_inventory = tfidf_context_artifact_inventory(artifacts)
+                if cached.get("artifact_inventory") != observed_inventory:
+                    raise ValueError(
+                        "sealed TF-IDF checkpoint artifact inventory changed"
+                    )
+                fitted = load_fitted_topic_context(artifacts["fitted_context"])
+                if fitted.config_hash != cached.get("config_hash"):
+                    raise ValueError(
+                        "sealed TF-IDF checkpoint fitted configuration changed"
+                    )
+                fit_topic_values = load_named_array_bank(
+                    artifacts["fit_topic_values"],
+                    expected_row_count=len(spec["fit_df"]),
+                )
+                heldout_topic_values = load_named_array_bank(
+                    artifacts["heldout_topic_values"],
+                    expected_row_count=len(spec["heldout_df"]),
+                )
+                expected_nonempty_banks = {
+                    bank
+                    for bank in ("treatment", "outcome", "effect")
+                    if len(
+                        ((cached.get("topic_banks") or {}).get(bank) or {}).get(
+                            "topics"
+                        )
+                        or ()
+                    )
+                    > 0
+                }
+                if (
+                    set(fit_topic_values) != expected_nonempty_banks
+                    or set(heldout_topic_values) != expected_nonempty_banks
+                ):
+                    raise ValueError(
+                        "sealed TF-IDF checkpoint topic-bank registry changed"
+                    )
+                nuisance = pd.read_parquet(artifacts["nuisance_predictions"])
+                fit_rows = nuisance[
+                    nuisance["prediction_scope"] == "fit_oof"
+                ]["_oci_row_id"].astype(int)
+                heldout_rows = nuisance[
+                    nuisance["prediction_scope"] == "external_heldout"
+                ]["_oci_row_id"].astype(int)
+                if (
+                    set(fit_rows) != set(map(int, cached["fit_row_ids"]))
+                    or set(heldout_rows) != set(map(int, cached["heldout_row_ids"]))
+                ):
+                    raise ValueError(
+                        "sealed TF-IDF checkpoint nuisance row registry changed"
+                    )
                 logger.info(
                     "Reusing complete exact Stage 1 context scope_id=%s",
                     spec["scope_id"],
                 )
                 return spec, cached
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            logger.warning(
-                "Ignoring incomplete exact-context checkpoint scope_id=%s",
-                spec["scope_id"],
-            )
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                "Existing exact-context TF-IDF checkpoint failed closed validation "
+                f"scope_id={spec['scope_id']}"
+            ) from exc
     logger.info(
         "Stage 1 fitting exact context scope_id=%s fit=%s heldout=%s",
         spec["scope_id"],

@@ -40,6 +40,11 @@ from .all_evidence_fusion import (
 )
 from .fold_honest_r_stack import FitRowProvenance
 from .frozen_extraction_cache_overlay import expected_extraction_columns
+from .post_extraction_scientific_policy import (
+    ExtractionQualityPolicy,
+    ExtractionRedundancyPolicy,
+    ReviewEstimatorPolicy,
+)
 
 POST_EXTRACTION_REVIEW_PROMPT_VERSION = "all_evidence_post_extraction_review_v12"
 POST_EXTRACTION_REVIEW_RESPONSE_SCHEMA_VERSION = "all_evidence_post_extraction_review_response_v1"
@@ -52,6 +57,15 @@ POST_EXTRACTION_CAUSAL_DIAGNOSTIC_SCHEMA_VERSION = (
     "all_evidence_post_extraction_causal_diagnostic_v1"
 )
 POST_EXTRACTION_GATE_DECISION_SCHEMA_VERSION = "all_evidence_post_extraction_gate_decision_v4"
+
+CONDITIONAL_CONTEXT_AND_GATE_REVIEW_POLICY = "conditional_context_and_gate_v1"
+GATE_ONLY_REFERENCE_PRESERVATION_REVIEW_POLICY = "gate_only_reference_preservation_v1"
+_UPSTREAM_REVIEW_POLICIES = frozenset(
+    {
+        CONDITIONAL_CONTEXT_AND_GATE_REVIEW_POLICY,
+        GATE_ONLY_REFERENCE_PRESERVATION_REVIEW_POLICY,
+    }
+)
 
 PROPENSITY_NUISANCE_FEATURE_ROLE = "propensity_nuisance_features"
 OUTCOME_NUISANCE_FEATURE_ROLE = "outcome_nuisance_features"
@@ -1211,16 +1225,20 @@ def _missing_mask(frame: pd.DataFrame, spec: Mapping[str, Any]) -> pd.Series:
     return declared | frame[value_column].isna()
 
 
-def _continuous_outlier_rate(values: np.ndarray) -> float:
+def _continuous_outlier_rate(
+    values: np.ndarray,
+    *,
+    policy: ExtractionQualityPolicy,
+) -> float:
     finite = values[np.isfinite(values)]
-    if len(finite) < 8:
+    if len(finite) < int(policy.continuous_outlier_minimum_rows):
         return 0.0
     q1, q3 = np.quantile(finite, [0.25, 0.75])
     iqr = float(q3 - q1)
     if iqr <= 0.0:
         return 0.0
-    lower = q1 - 6.0 * iqr
-    upper = q3 + 6.0 * iqr
+    lower = q1 - float(policy.continuous_outlier_iqr_multiplier) * iqr
+    upper = q3 + float(policy.continuous_outlier_iqr_multiplier) * iqr
     return float(np.mean((finite < lower) | (finite > upper)))
 
 
@@ -1229,6 +1247,8 @@ def _fold_stability(
     spec: Mapping[str, Any],
     missing: pd.Series,
     fold_ids: np.ndarray,
+    *,
+    policy: ExtractionQualityPolicy,
 ) -> dict[str, Any]:
     value_column, _missing_column = expected_extraction_columns(spec)
     unique_folds = list(dict.fromkeys(fold_ids.tolist()))
@@ -1283,7 +1303,10 @@ def _fold_stability(
             )
             pooled = pooled[np.isfinite(pooled)]
             scale = float(np.subtract(*np.quantile(pooled, [0.75, 0.25]))) if len(pooled) else 0.0
-            distribution_shift = float((np.max(finite) - np.min(finite)) / max(scale, 1e-8))
+            distribution_shift = float(
+                (np.max(finite) - np.min(finite))
+                / max(scale, float(policy.fold_continuous_scale_epsilon))
+            )
     return {
         "coverage_by_fold": coverage_by_fold,
         "coverage_range": float(np.max(coverages) - np.min(coverages)),
@@ -1297,6 +1320,7 @@ def build_extraction_quality_diagnostics(
     specs: Sequence[Mapping[str, Any]],
     *,
     fold_ids: Sequence[Any],
+    policy: ExtractionQualityPolicy | None = None,
     minimum_coverage: float = 0.05,
     maximum_unknown_category_rate: float = 0.05,
 ) -> dict[str, Any]:
@@ -1309,6 +1333,22 @@ def build_extraction_quality_diagnostics(
 
     if len(frame) == 0:
         raise ValueError("quality diagnostics require at least one row")
+    if policy is None:
+        # Compatibility-only behavior. Typed portable production supplies the
+        # complete policy and never inherits these legacy values.
+        policy = ExtractionQualityPolicy(
+            minimum_coverage=float(minimum_coverage),
+            maximum_unknown_category_rate=float(
+                maximum_unknown_category_rate
+            ),
+            continuous_outlier_minimum_rows=8,
+            continuous_outlier_iqr_multiplier=6.0,
+            continuous_outlier_warning_rate=0.10,
+            fold_coverage_range_warning=0.35,
+            fold_continuous_scale_epsilon=1e-8,
+        )
+    elif not isinstance(policy, ExtractionQualityPolicy):
+        raise TypeError("policy must be ExtractionQualityPolicy")
     folds = np.asarray(list(fold_ids), dtype=object)
     if folds.ndim != 1 or len(folds) != len(frame) or len(set(folds.tolist())) < 2:
         raise ValueError("fold_ids must assign every row to at least two folds")
@@ -1324,7 +1364,7 @@ def build_extraction_quality_diagnostics(
         plausibility: dict[str, Any]
         hard_failures: list[str] = []
         warnings: list[str] = []
-        if coverage < float(minimum_coverage):
+        if coverage < float(policy.minimum_coverage):
             hard_failures.append("coverage_below_minimum")
         if unique_observed <= 1:
             hard_failures.append("constant_or_unobserved")
@@ -1335,7 +1375,7 @@ def build_extraction_quality_diagnostics(
             category_counts = {
                 category: int(np.sum(observed_text == category)) for category in categories
             }
-            if unknown_rate > float(maximum_unknown_category_rate):
+            if unknown_rate > float(policy.maximum_unknown_category_rate):
                 hard_failures.append("out_of_contract_category_values")
             empty_declared = [category for category, count in category_counts.items() if count == 0]
             if empty_declared:
@@ -1356,10 +1396,13 @@ def build_extraction_quality_diagnostics(
                 else 0.0
             )
             finite = numeric_all[~missing].to_numpy(dtype=float)
-            outlier_rate = _continuous_outlier_rate(finite)
+            outlier_rate = _continuous_outlier_rate(
+                finite,
+                policy=policy,
+            )
             if parse_failure_rate > 0.0:
                 hard_failures.append("declared_numeric_value_not_parseable")
-            if outlier_rate > 0.10:
+            if outlier_rate > float(policy.continuous_outlier_warning_rate):
                 warnings.append("high_robust_outlier_rate")
             plausibility = {
                 "numeric_parse_failure_rate": parse_failure_rate,
@@ -1368,8 +1411,17 @@ def build_extraction_quality_diagnostics(
                 "observed_median": _finite_or_none(np.median(finite)) if len(finite) else None,
                 "observed_max": _finite_or_none(np.max(finite)) if len(finite) else None,
             }
-        stability = _fold_stability(frame, spec, missing, folds)
-        if stability["coverage_range"] > 0.35:
+        stability = _fold_stability(
+            frame,
+            spec,
+            missing,
+            folds,
+            policy=policy,
+        )
+        if (
+            stability["coverage_range"]
+            > float(policy.fold_coverage_range_warning)
+        ):
             warnings.append("coverage_unstable_across_inner_folds")
         row = {
             "diagnostic_id": f"diagnostic_{position:04d}",
@@ -1419,6 +1471,7 @@ def build_redundancy_diagnostics(
     frame: pd.DataFrame,
     specs: Sequence[Mapping[str, Any]],
     *,
+    policy: ExtractionRedundancyPolicy | None = None,
     association_threshold: float = 0.80,
     missingness_agreement_threshold: float = 0.90,
     diagnostic_start: int = 1,
@@ -1430,6 +1483,18 @@ def build_redundancy_diagnostics(
     cannot by itself make two fully observed variables redundant.
     """
 
+    if policy is None:
+        # Compatibility-only behavior. Typed portable production supplies the
+        # closed policy.
+        policy = ExtractionRedundancyPolicy(
+            association_threshold=float(association_threshold),
+            missingness_jaccard_threshold=float(
+                missingness_agreement_threshold
+            ),
+            minimum_pairwise_complete_rows=3,
+        )
+    elif not isinstance(policy, ExtractionRedundancyPolicy):
+        raise TypeError("policy must be ExtractionRedundancyPolicy")
     canonical_specs = [CandidateContract(spec).extraction_spec for spec in specs]
     rows: list[dict[str, Any]] = []
     next_id = int(diagnostic_start)
@@ -1451,7 +1516,10 @@ def build_redundancy_diagnostics(
         complete = ~left_missing & ~right_missing
         association = None
         association_kind = None
-        if int(np.sum(complete)) >= 3:
+        if (
+            int(np.sum(complete))
+            >= int(policy.minimum_pairwise_complete_rows)
+        ):
             if left["type"] == "continuous" and right["type"] == "continuous":
                 x = pd.to_numeric(frame.loc[complete, left_value], errors="coerce").to_numpy(
                     dtype=float
@@ -1469,11 +1537,13 @@ def build_redundancy_diagnostics(
                 )
                 association_kind = "cramers_v"
         value_redundant = bool(
-            association is not None and association >= float(association_threshold)
+            association is not None
+            and association >= float(policy.association_threshold)
         )
         missingness_redundant = bool(
             missing_jaccard is not None
-            and missing_jaccard >= float(missingness_agreement_threshold)
+            and missing_jaccard
+            >= float(policy.missingness_jaccard_threshold)
         )
         if not value_redundant and not missingness_redundant:
             continue
@@ -2223,6 +2293,50 @@ def _build_conditional_upstream_design(
     )
 
 
+def _validate_gate_only_reference_view(
+    view: GateSourceSignalView | GateFeatureBankView,
+    *,
+    exact_context_row_ids: Sequence[Hashable],
+    exact_gate_row_ids: Sequence[Hashable],
+    bank_name: str,
+) -> None:
+    """Prove a cumulative fit is a gate-only reference, never a fit covariate.
+
+    The canonical 40-context workflow has complete-spent-context predictions
+    for each untouched review gate, but it deliberately has no nested
+    spent-context OOF bank.  A gate-only view is therefore accepted only when
+    its context half is completely absent and every gate value has recursive
+    lineage equal to the exact spent context.
+    """
+
+    context = frozenset(
+        _review_keys(exact_context_row_ids, field_name="exact_context_row_ids")
+    )
+    gate = frozenset(_review_keys(exact_gate_row_ids, field_name="exact_gate_row_ids"))
+    if not context or not gate or context & gate:
+        raise ValueError("gate-only reference requires non-empty disjoint context and gate rows")
+    if (
+        view.context_row_ids
+        or view.context_inner_fold_ids
+        or view.context_fit_row_provenance
+        or np.asarray(view.context_values).size
+    ):
+        raise ValueError(
+            f"{bank_name} gate-only reference must not supply context-side upstream values"
+        )
+    # Aligning the gate half proves exact gate identity without touching the
+    # conditional-context API.
+    view.aligned_values(tuple(exact_gate_row_ids))
+    for per_column in view.fit_row_provenance:
+        for lineage in per_column:
+            fitted = lineage.recursive_fit_row_ids()
+            if fitted != context or fitted & gate:
+                raise ValueError(
+                    f"{bank_name} gate-only lineage must equal exactly all spent rows "
+                    "and contain no gate or future rows"
+                )
+
+
 @dataclass(frozen=True)
 class CausalReviewConfig:
     """Deterministic fitting, guard, and complexity settings for one review."""
@@ -2237,6 +2351,7 @@ class CausalReviewConfig:
     source_preservation_tolerance: float = 0.05
     source_context_r_loss_relative_tolerance: float = 0.05
     feature_bank_preservation_tolerance: float = 0.05
+    estimator_policy: ReviewEstimatorPolicy | None = None
 
     def __post_init__(self) -> None:
         numeric = {
@@ -2278,9 +2393,48 @@ class CausalReviewConfig:
         ):
             if float(getattr(self, name)) < 0.0:
                 raise ValueError(f"{name} must be non-negative")
+        if self.estimator_policy is not None and not isinstance(
+            self.estimator_policy,
+            ReviewEstimatorPolicy,
+        ):
+            raise TypeError("estimator_policy must be ReviewEstimatorPolicy")
 
 
-def _causal_review_config_payload(config: CausalReviewConfig) -> dict[str, float]:
+def _legacy_review_estimator_policy() -> ReviewEstimatorPolicy:
+    """Compatibility settings matching the pre-portable estimator behavior."""
+
+    return ReviewEstimatorPolicy(
+        standardization_scale_epsilon=1e-8,
+        logistic_alpha_floor=1e-12,
+        logistic_solver="liblinear",
+        logistic_max_iter=1000,
+        logistic_random_seed=0,
+        logistic_fit_intercept=True,
+        logistic_class_weight=None,
+        binary_no_features_fallback="prevalence",
+        binary_single_class_fallback="prevalence",
+        binary_fit_failure_policy="prevalence",
+        continuous_minimum_fit_rows=2,
+        continuous_degenerate_fallback="mean",
+        effect_minimum_usable_rows=2,
+        effect_no_usable_fallback="zero",
+        effect_degenerate_fallback="weighted_mean",
+        ridge_solver="auto",
+        ridge_fit_intercept=True,
+        ridge_tolerance=1e-4,
+        ridge_max_iter=None,
+        ridge_positive=False,
+        ridge_random_seed=None,
+    )
+
+
+def _review_estimator_policy(
+    config: CausalReviewConfig,
+) -> ReviewEstimatorPolicy:
+    return config.estimator_policy or _legacy_review_estimator_policy()
+
+
+def _causal_review_config_payload(config: CausalReviewConfig) -> dict[str, Any]:
     return {
         "e_clip": config.e_clip,
         "nuisance_ridge_alpha": config.nuisance_ridge_alpha,
@@ -2294,6 +2448,7 @@ def _causal_review_config_payload(config: CausalReviewConfig) -> dict[str, float
             config.source_context_r_loss_relative_tolerance
         ),
         "feature_bank_preservation_tolerance": (config.feature_bank_preservation_tolerance),
+        "estimator_policy": _review_estimator_policy(config).__dict__.copy(),
     }
 
 
@@ -2319,10 +2474,17 @@ class GateAcceptanceDecision:
 
 
 class _RoleEncoder:
-    def __init__(self, specs: Sequence[Mapping[str, Any]], role: str) -> None:
+    def __init__(
+        self,
+        specs: Sequence[Mapping[str, Any]],
+        role: str,
+        *,
+        estimator_policy: ReviewEstimatorPolicy,
+    ) -> None:
         canonical = [CandidateContract(spec).extraction_spec for spec in specs]
         self.specs = [spec for spec in canonical if role in set(spec.get("roles") or [])]
         self.role = role
+        self.estimator_policy = estimator_policy
         self._continuous: dict[str, tuple[float, float]] = {}
         self.column_names: list[str] = []
 
@@ -2352,7 +2514,13 @@ class _RoleEncoder:
                 observed = values[~missing & np.isfinite(values)]
                 mean = float(np.mean(observed)) if len(observed) else 0.0
                 scale = float(np.std(observed)) if len(observed) else 1.0
-                if not math.isfinite(scale) or scale < 1e-8:
+                if (
+                    not math.isfinite(scale)
+                    or scale
+                    < float(
+                        self.estimator_policy.standardization_scale_epsilon
+                    )
+                ):
                     scale = 1.0
                 self._continuous[name] = (mean, scale)
                 columns.extend([f"{name}__value", f"{name}__missing"])
@@ -2406,9 +2574,19 @@ def _canonical_specs(specs: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
 def _encoded_complexity(
     frame: pd.DataFrame,
     specs: Sequence[Mapping[str, Any]],
+    *,
+    estimator_policy: ReviewEstimatorPolicy,
 ) -> dict[str, int]:
-    w_encoder = _RoleEncoder(specs, "confounder").fit(frame)
-    x_encoder = _RoleEncoder(specs, "effect_modifier").fit(frame)
+    w_encoder = _RoleEncoder(
+        specs,
+        "confounder",
+        estimator_policy=estimator_policy,
+    ).fit(frame)
+    x_encoder = _RoleEncoder(
+        specs,
+        "effect_modifier",
+        estimator_policy=estimator_policy,
+    ).fit(frame)
     return {
         "contract_count": int(len(specs)),
         "confounder_encoded_columns": int(len(w_encoder.column_names)),
@@ -2427,20 +2605,33 @@ def _fit_predict_binary(
     x_predict: np.ndarray,
     *,
     alpha: float,
+    policy: ReviewEstimatorPolicy,
 ) -> np.ndarray:
     prevalence = float(np.mean(y_fit)) if len(y_fit) else 0.5
-    if x_fit.shape[1] == 0 or len(np.unique(y_fit)) < 2:
+    if x_fit.shape[1] == 0:
+        if policy.binary_no_features_fallback != "prevalence":
+            raise RuntimeError("unsupported binary no-features fallback")
+        return np.full(len(x_predict), prevalence, dtype=float)
+    if len(np.unique(y_fit)) < 2:
+        if policy.binary_single_class_fallback != "prevalence":
+            raise RuntimeError("unsupported binary single-class fallback")
         return np.full(len(x_predict), prevalence, dtype=float)
     model = LogisticRegression(
-        C=1.0 / max(float(alpha), 1e-12),
-        solver="liblinear",
-        max_iter=1000,
-        random_state=0,
+        C=1.0 / max(float(alpha), float(policy.logistic_alpha_floor)),
+        solver=policy.logistic_solver,
+        max_iter=int(policy.logistic_max_iter),
+        random_state=int(policy.logistic_random_seed),
+        fit_intercept=bool(policy.logistic_fit_intercept),
+        class_weight=policy.logistic_class_weight,
     )
     try:
         model.fit(x_fit, y_fit.astype(int))
         return np.asarray(model.predict_proba(x_predict)[:, 1], dtype=float)
     except ValueError:
+        if policy.binary_fit_failure_policy == "abort":
+            raise
+        if policy.binary_fit_failure_policy != "prevalence":
+            raise RuntimeError("unsupported binary fit-failure policy")
         return np.full(len(x_predict), prevalence, dtype=float)
 
 
@@ -2450,11 +2641,25 @@ def _fit_predict_continuous(
     x_predict: np.ndarray,
     *,
     alpha: float,
+    policy: ReviewEstimatorPolicy,
 ) -> np.ndarray:
     fallback = float(np.mean(y_fit)) if len(y_fit) else 0.0
-    if x_fit.shape[1] == 0 or len(y_fit) < 2:
+    if (
+        x_fit.shape[1] == 0
+        or len(y_fit) < int(policy.continuous_minimum_fit_rows)
+    ):
+        if policy.continuous_degenerate_fallback != "mean":
+            raise RuntimeError("unsupported continuous degenerate fallback")
         return np.full(len(x_predict), fallback, dtype=float)
-    model = Ridge(alpha=float(alpha), fit_intercept=True)
+    model = Ridge(
+        alpha=float(alpha),
+        fit_intercept=bool(policy.ridge_fit_intercept),
+        solver=policy.ridge_solver,
+        tol=float(policy.ridge_tolerance),
+        max_iter=policy.ridge_max_iter,
+        positive=bool(policy.ridge_positive),
+        random_state=policy.ridge_random_seed,
+    )
     model.fit(x_fit, y_fit)
     return np.asarray(model.predict(x_predict), dtype=float)
 
@@ -2473,7 +2678,12 @@ def _fit_predict_nuisance(
     fit_outcome_upstream: np.ndarray | None = None,
     predict_outcome_upstream: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    encoder = _RoleEncoder(specs, "confounder").fit(fit_frame)
+    estimator_policy = _review_estimator_policy(config)
+    encoder = _RoleEncoder(
+        specs,
+        "confounder",
+        estimator_policy=estimator_policy,
+    ).fit(fit_frame)
     x_fit = encoder.transform(fit_frame)
     x_predict = encoder.transform(predict_frame)
     propensity_fit = _append_fixed_upstream(
@@ -2505,6 +2715,7 @@ def _fit_predict_nuisance(
         fit_treatment,
         propensity_predict,
         alpha=config.nuisance_ridge_alpha,
+        policy=estimator_policy,
     )
     if outcome_is_binary:
         outcome_prediction = _fit_predict_binary(
@@ -2512,6 +2723,7 @@ def _fit_predict_nuisance(
             fit_outcome,
             outcome_predict,
             alpha=config.nuisance_ridge_alpha,
+            policy=estimator_policy,
         )
     else:
         outcome_prediction = _fit_predict_continuous(
@@ -2519,6 +2731,7 @@ def _fit_predict_nuisance(
             fit_outcome,
             outcome_predict,
             alpha=config.nuisance_ridge_alpha,
+            policy=estimator_policy,
         )
     return np.asarray(propensity, dtype=float), np.asarray(outcome_prediction, dtype=float)
 
@@ -2534,7 +2747,12 @@ def _fit_predict_effect(
     fit_effect_upstream: np.ndarray | None = None,
     predict_effect_upstream: np.ndarray | None = None,
 ) -> np.ndarray:
-    encoder = _RoleEncoder(specs, "effect_modifier").fit(fit_frame)
+    estimator_policy = _review_estimator_policy(config)
+    encoder = _RoleEncoder(
+        specs,
+        "effect_modifier",
+        estimator_policy=estimator_policy,
+    ).fit(fit_frame)
     x_fit = encoder.transform(fit_frame)
     x_predict = encoder.transform(predict_frame)
     x_fit = _append_fixed_upstream(
@@ -2553,11 +2771,27 @@ def _fit_predict_effect(
     values = np.asarray(pseudo_target, dtype=float)
     usable = np.isfinite(values) & np.isfinite(weights) & (weights > 0.0)
     if not np.any(usable):
+        if estimator_policy.effect_no_usable_fallback != "zero":
+            raise RuntimeError("unsupported effect no-usable fallback")
         return np.zeros(len(predict_frame), dtype=float)
     fallback = float(np.average(values[usable], weights=weights[usable]))
-    if x_fit.shape[1] == 0 or int(np.sum(usable)) < 2:
+    if (
+        x_fit.shape[1] == 0
+        or int(np.sum(usable))
+        < int(estimator_policy.effect_minimum_usable_rows)
+    ):
+        if estimator_policy.effect_degenerate_fallback != "weighted_mean":
+            raise RuntimeError("unsupported effect degenerate fallback")
         return np.full(len(predict_frame), fallback, dtype=float)
-    model = Ridge(alpha=float(config.effect_ridge_alpha), fit_intercept=True)
+    model = Ridge(
+        alpha=float(config.effect_ridge_alpha),
+        fit_intercept=bool(estimator_policy.ridge_fit_intercept),
+        solver=estimator_policy.ridge_solver,
+        tol=float(estimator_policy.ridge_tolerance),
+        max_iter=estimator_policy.ridge_max_iter,
+        positive=bool(estimator_policy.ridge_positive),
+        random_state=estimator_policy.ridge_random_seed,
+    )
     model.fit(x_fit[usable], values[usable], sample_weight=weights[usable])
     return np.asarray(model.predict(x_predict), dtype=float)
 
@@ -2913,7 +3147,12 @@ def build_causal_review_diagnostics(
         tau_hat,
         config=config,
     )
-    full_complexity = _encoded_complexity(data.extracted, canonical)
+    estimator_policy = _review_estimator_policy(config)
+    full_complexity = _encoded_complexity(
+        data.extracted,
+        canonical,
+        estimator_policy=estimator_policy,
+    )
     ablations: list[dict[str, Any]] = []
     for offset, removed in enumerate(canonical, start=1):
         reduced = [spec for spec in canonical if spec["name"] != removed["name"]]
@@ -2926,7 +3165,11 @@ def build_causal_review_diagnostics(
             a_tau,
             config=config,
         )
-        complexity = _encoded_complexity(data.extracted, reduced)
+        complexity = _encoded_complexity(
+            data.extracted,
+            reduced,
+            estimator_policy=estimator_policy,
+        )
         ablations.append(
             {
                 "diagnostic_id": f"diagnostic_{int(diagnostic_start) + offset:04d}",
@@ -3068,10 +3311,13 @@ def _gate_source_metrics(
     source_view: GateSourceSignalView,
     *,
     config: CausalReviewConfig,
+    gate_reference_only: bool = False,
 ) -> dict[str, Any]:
-    # These are post-fit preservation diagnostics.  The same authenticated
-    # values also enter the effect regression through the conditional design;
-    # they are never outcomes, pseudo-targets, or observed treatment effects.
+    # These are post-fit preservation diagnostics.  Under the legacy
+    # conditional policy the authenticated values also enter the effect
+    # regression.  Under the gate-only policy they are reference diagnostics
+    # only and never enter a fitted design.  In neither policy are they
+    # outcomes, pseudo-targets, or observed treatment effects.
     values = source_view.aligned_values(gate.row_ids)
     e_clipped = np.clip(e_hat, config.e_clip, 1.0 - config.e_clip)
     t_residual = gate.treatment - e_clipped
@@ -3105,7 +3351,7 @@ def _gate_source_metrics(
                 "contextual_r_loss_ratio_improvement_vs_zero_effect": (1.0 - contextual_ratio),
             }
         )
-    return {
+    result = {
         "sources": rows,
         "source_preservation_score": (
             float(np.mean(absolute_correlations)) if absolute_correlations else None
@@ -3116,12 +3362,19 @@ def _gate_source_metrics(
         "mean_absolute_source_correlation": (
             float(np.mean(absolute_correlations)) if absolute_correlations else None
         ),
-        "mean_source_context_r_loss_ratio": (
-            float(np.mean(contextual_ratios)) if contextual_ratios else None
-        ),
-        "calibrated_sources_used_as_effect_regression_covariates": True,
+        "calibrated_sources_used_as_effect_regression_covariates": not gate_reference_only,
         "calibrated_sources_used_as_observed_effect_targets": False,
+        "gate_reference_only": bool(gate_reference_only),
+        "diagnostic_scope": "untouched_gate_post_fit_reference",
     }
+    mean_ratio = float(np.mean(contextual_ratios)) if contextual_ratios else None
+    if gate_reference_only:
+        result["mean_source_context_r_loss_ratio"] = None
+        result["mean_source_gate_reference_r_loss_ratio"] = mean_ratio
+    else:
+        result["mean_source_context_r_loss_ratio"] = mean_ratio
+        result["mean_source_gate_reference_r_loss_ratio"] = None
+    return result
 
 
 def _gate_feature_bank_metrics(
@@ -3130,6 +3383,8 @@ def _gate_feature_bank_metrics(
     m_hat: np.ndarray,
     tau_hat: np.ndarray,
     feature_bank_view: GateFeatureBankView,
+    *,
+    gate_reference_only: bool = False,
 ) -> dict[str, Any]:
     """Measure only role-matched preservation of uncalibrated feature bases."""
 
@@ -3224,12 +3479,18 @@ def _gate_feature_bank_metrics(
             "family ablations are reported separately and always refit the model."
         ),
         "raw_feature_values_used_as_treatment_effects": False,
-        "raw_feature_values_used_as_model_inputs": True,
-        "raw_feature_model_input_routing": {
-            PROPENSITY_NUISANCE_FEATURE_ROLE: "propensity_nuisance_only",
-            OUTCOME_NUISANCE_FEATURE_ROLE: "outcome_nuisance_only",
-            UNCALIBRATED_EFFECT_MODIFIER_ROLE: "effect_regression_covariate_only",
-        },
+        "raw_feature_values_used_as_model_inputs": not gate_reference_only,
+        "raw_feature_model_input_routing": (
+            None
+            if gate_reference_only
+            else {
+                PROPENSITY_NUISANCE_FEATURE_ROLE: "propensity_nuisance_only",
+                OUTCOME_NUISANCE_FEATURE_ROLE: "outcome_nuisance_only",
+                UNCALIBRATED_EFFECT_MODIFIER_ROLE: "effect_regression_covariate_only",
+            }
+        ),
+        "gate_reference_only": bool(gate_reference_only),
+        "diagnostic_scope": "untouched_gate_post_fit_reference",
     }
 
 
@@ -3347,6 +3608,7 @@ def evaluate_untouched_gate_acceptance(
     candidate_context: ObservableCausalRows | None = None,
     candidate_gate: ObservableCausalRows | None = None,
     config: CausalReviewConfig | None = None,
+    upstream_review_policy: str = CONDITIONAL_CONTEXT_AND_GATE_REVIEW_POLICY,
 ) -> GateAcceptanceDecision:
     """Compare exactly one proposed revision on an untouched observable gate.
 
@@ -3394,6 +3656,17 @@ def evaluate_untouched_gate_acceptance(
     config = config or CausalReviewConfig()
     if not isinstance(config, CausalReviewConfig):
         raise TypeError("config must be CausalReviewConfig")
+    if not isinstance(upstream_review_policy, str):
+        raise TypeError("upstream_review_policy must be a string")
+    upstream_review_policy = upstream_review_policy.strip()
+    if upstream_review_policy not in _UPSTREAM_REVIEW_POLICIES:
+        raise ValueError(
+            "upstream_review_policy must be one of "
+            f"{sorted(_UPSTREAM_REVIEW_POLICIES)}"
+        )
+    gate_reference_only = (
+        upstream_review_policy == GATE_ONLY_REFERENCE_PRESERVATION_REVIEW_POLICY
+    )
     current_specs = _canonical_specs(current_specs)
     candidate_specs = _canonical_specs(candidate_specs)
     if not candidate_specs:
@@ -3408,12 +3681,39 @@ def evaluate_untouched_gate_acceptance(
             raise TypeError("feature_bank_view must be GateFeatureBankView")
         feature_bank_view.aligned_values(gate.row_ids)
 
-    upstream_design = _build_conditional_upstream_design(
-        context,
-        gate,
-        source_view=source_view,
-        feature_bank_view=feature_bank_view,
-    )
+    if gate_reference_only:
+        if source_view is not None:
+            _validate_gate_only_reference_view(
+                source_view,
+                exact_context_row_ids=context.row_ids,
+                exact_gate_row_ids=gate.row_ids,
+                bank_name="source",
+            )
+        if feature_bank_view is not None:
+            _validate_gate_only_reference_view(
+                feature_bank_view,
+                exact_context_row_ids=context.row_ids,
+                exact_gate_row_ids=gate.row_ids,
+                bank_name="feature",
+            )
+        # The empty design is authenticated for the decision record, but None
+        # is passed to the fit so no upstream gate value can become a training
+        # or prediction covariate.
+        upstream_design = _build_conditional_upstream_design(
+            context,
+            gate,
+            source_view=None,
+            feature_bank_view=None,
+        )
+        fit_upstream_design: _ConditionalUpstreamDesign | None = None
+    else:
+        upstream_design = _build_conditional_upstream_design(
+            context,
+            gate,
+            source_view=source_view,
+            feature_bank_view=feature_bank_view,
+        )
+        fit_upstream_design = upstream_design
     upstream_design_sha256 = upstream_design.content_sha256
     upstream_design.verify_content()
 
@@ -3422,20 +3722,29 @@ def evaluate_untouched_gate_acceptance(
         gate,
         current_specs,
         config=config,
-        upstream_design=upstream_design,
+        upstream_design=fit_upstream_design,
     )
     candidate_metrics, candidate_e, candidate_m, candidate_tau = _fit_context_predict_gate(
         candidate_context,
         candidate_gate,
         candidate_specs,
         config=config,
-        upstream_design=upstream_design,
+        upstream_design=fit_upstream_design,
     )
     upstream_design.verify_content()
     if upstream_design.content_sha256 != upstream_design_sha256:  # pragma: no cover
         raise RuntimeError("conditional upstream design identity changed during gate fitting")
-    current_complexity = _encoded_complexity(context.extracted, current_specs)
-    candidate_complexity = _encoded_complexity(candidate_context.extracted, candidate_specs)
+    estimator_policy = _review_estimator_policy(config)
+    current_complexity = _encoded_complexity(
+        context.extracted,
+        current_specs,
+        estimator_policy=estimator_policy,
+    )
+    candidate_complexity = _encoded_complexity(
+        candidate_context.extracted,
+        candidate_specs,
+        estimator_policy=estimator_policy,
+    )
     current_source: dict[str, Any] | None = None
     candidate_source: dict[str, Any] | None = None
     current_feature_bank: dict[str, Any] | None = None
@@ -3448,6 +3757,7 @@ def evaluate_untouched_gate_acceptance(
             current_tau,
             source_view,
             config=config,
+            gate_reference_only=gate_reference_only,
         )
         candidate_source = _gate_source_metrics(
             candidate_gate,
@@ -3456,6 +3766,7 @@ def evaluate_untouched_gate_acceptance(
             candidate_tau,
             source_view,
             config=config,
+            gate_reference_only=gate_reference_only,
         )
     if feature_bank_view is not None:
         current_feature_bank = _gate_feature_bank_metrics(
@@ -3464,6 +3775,7 @@ def evaluate_untouched_gate_acceptance(
             current_m,
             current_tau,
             feature_bank_view,
+            gate_reference_only=gate_reference_only,
         )
         candidate_feature_bank = _gate_feature_bank_metrics(
             candidate_gate,
@@ -3471,20 +3783,27 @@ def evaluate_untouched_gate_acceptance(
             candidate_m,
             candidate_tau,
             feature_bank_view,
+            gate_reference_only=gate_reference_only,
         )
 
-    current_family_ablations, candidate_family_ablations = _predictive_upstream_family_ablations(
-        context,
-        gate,
-        current_specs,
-        candidate_specs,
-        candidate_context=candidate_context,
-        candidate_gate=candidate_gate,
-        design=upstream_design,
-        current_full_metrics=current_metrics,
-        candidate_full_metrics=candidate_metrics,
-        config=config,
-    )
+    if gate_reference_only:
+        current_family_ablations: list[dict[str, Any]] = []
+        candidate_family_ablations: list[dict[str, Any]] = []
+    else:
+        current_family_ablations, candidate_family_ablations = (
+            _predictive_upstream_family_ablations(
+                context,
+                gate,
+                current_specs,
+                candidate_specs,
+                candidate_context=candidate_context,
+                candidate_gate=candidate_gate,
+                design=upstream_design,
+                current_full_metrics=current_metrics,
+                candidate_full_metrics=candidate_metrics,
+                config=config,
+            )
+        )
     upstream_design.verify_content()
     if upstream_design.content_sha256 != upstream_design_sha256:  # pragma: no cover
         raise RuntimeError("conditional upstream design identity changed during ablations")
@@ -3514,11 +3833,20 @@ def evaluate_untouched_gate_acceptance(
         "conditional_upstream_design": {
             "content_sha256": upstream_design_sha256,
             "shared_identically_by_current_and_candidate": True,
-            "context_numeric_standardization_fit_on_spent_context_only": True,
-            "calibrated_sources_routed_to_effect_regression": source_view is not None,
-            "role_aware_raw_features_routed_to_matching_regressions": (
-                feature_bank_view is not None
+            "upstream_review_policy": upstream_review_policy,
+            "context_numeric_standardization_fit_on_spent_context_only": (
+                not gate_reference_only
             ),
+            "calibrated_sources_routed_to_effect_regression": (
+                source_view is not None and not gate_reference_only
+            ),
+            "role_aware_raw_features_routed_to_matching_regressions": (
+                feature_bank_view is not None and not gate_reference_only
+            ),
+            "upstream_gate_values_used_as_training_or_prediction_covariates": False
+            if gate_reference_only
+            else bool(source_view is not None or feature_bank_view is not None),
+            "gate_views_used_only_as_post_fit_reference_diagnostics": gate_reference_only,
             "raw_feature_values_used_directly_as_treatment_effects": False,
         },
     }
@@ -3671,17 +3999,32 @@ def evaluate_untouched_gate_acceptance(
         if not direction_passed:
             reasons.append("source_direction_guard_failed")
 
+        source_r_loss_metric = (
+            "mean_source_gate_reference_r_loss_ratio"
+            if gate_reference_only
+            else "mean_source_context_r_loss_ratio"
+        )
         context_passed, maximum_context_ratio = _relative_upper_guard(
-            candidate_source.get("mean_source_context_r_loss_ratio"),
-            current_source.get("mean_source_context_r_loss_ratio"),
+            candidate_source.get(source_r_loss_metric),
+            current_source.get(source_r_loss_metric),
             config.source_context_r_loss_relative_tolerance,
         )
-        guards["source_context_r_loss"] = {
+        source_r_loss_guard_name = (
+            "source_gate_reference_r_loss"
+            if gate_reference_only
+            else "source_context_r_loss"
+        )
+        guards[source_r_loss_guard_name] = {
             "passed": context_passed,
             "maximum_candidate_value": maximum_context_ratio,
+            "diagnostic_scope": (
+                "untouched_gate_reference"
+                if gate_reference_only
+                else "conditional_context_and_gate"
+            ),
         }
         if not context_passed:
-            reasons.append("source_context_r_loss_guard_failed")
+            reasons.append(f"{source_r_loss_guard_name}_guard_failed")
 
     if current_feature_bank is not None and candidate_feature_bank is not None:
         current_role_scores = current_feature_bank["preservation_score_by_consumer_role"]
@@ -3814,87 +4157,114 @@ def evaluate_untouched_gate_acceptance(
             "by_source_kind_and_consumer_role": family_guards,
         }
 
-    current_ablation_by_key = {
-        (
-            str(row["input_kind"]),
-            str(row["source_kind"]),
-            str(row["consumer_role"]),
-        ): row
-        for row in current_family_ablations
-    }
-    candidate_ablation_by_key = {
-        (
-            str(row["input_kind"]),
-            str(row["source_kind"]),
-            str(row["consumer_role"]),
-        ): row
-        for row in candidate_family_ablations
-    }
-    ablation_identities_match = set(current_ablation_by_key) == set(candidate_ablation_by_key)
-    predictive_ablation_guards: list[dict[str, Any]] = []
-    for key in sorted(set(current_ablation_by_key) | set(candidate_ablation_by_key)):
-        current_row = current_ablation_by_key.get(key)
-        candidate_row = candidate_ablation_by_key.get(key)
-        current_delta = _finite_or_none(
-            None if current_row is None else current_row.get("weighted_r_loss_delta_when_removed")
+    if gate_reference_only:
+        predictive_ablation_status = "unavailable_by_design"
+        guards["upstream_predictive_family_ablations"] = {
+            "status": predictive_ablation_status,
+            "passed": None,
+            "by_family": [],
+            "predictive_refit_performed": False,
+            "gate_decision_constraint_applied": False,
+            "reason": (
+                "gate-only references have no honest spent-context nested OOF "
+                "matrix and therefore cannot be training covariates or deleted "
+                "from a predictive fit"
+            ),
+            "correlation_deletion_used_as_predictive_ablation": False,
+        }
+    else:
+        predictive_ablation_status = "available"
+        current_ablation_by_key = {
+            (
+                str(row["input_kind"]),
+                str(row["source_kind"]),
+                str(row["consumer_role"]),
+            ): row
+            for row in current_family_ablations
+        }
+        candidate_ablation_by_key = {
+            (
+                str(row["input_kind"]),
+                str(row["source_kind"]),
+                str(row["consumer_role"]),
+            ): row
+            for row in candidate_family_ablations
+        }
+        ablation_identities_match = set(current_ablation_by_key) == set(
+            candidate_ablation_by_key
         )
-        candidate_delta = _finite_or_none(
-            None
-            if candidate_row is None
-            else candidate_row.get("weighted_r_loss_delta_when_removed")
-        )
-        current_importance = (
-            None
-            if current_delta is None
-            else max(0.0, current_delta / reference_zero_effect_r_loss)
-        )
-        candidate_importance = (
-            None
-            if candidate_delta is None
-            else max(0.0, candidate_delta / reference_zero_effect_r_loss)
-        )
-        tolerance = (
-            config.source_preservation_tolerance
-            if key[0] == "calibrated_effect_source"
-            else config.feature_bank_preservation_tolerance
-        )
-        minimum = None if current_importance is None else max(0.0, current_importance - tolerance)
-        passed = bool(
+        predictive_ablation_guards: list[dict[str, Any]] = []
+        for key in sorted(set(current_ablation_by_key) | set(candidate_ablation_by_key)):
+            current_row = current_ablation_by_key.get(key)
+            candidate_row = candidate_ablation_by_key.get(key)
+            current_delta = _finite_or_none(
+                None
+                if current_row is None
+                else current_row.get("weighted_r_loss_delta_when_removed")
+            )
+            candidate_delta = _finite_or_none(
+                None
+                if candidate_row is None
+                else candidate_row.get("weighted_r_loss_delta_when_removed")
+            )
+            current_importance = (
+                None
+                if current_delta is None
+                else max(0.0, current_delta / reference_zero_effect_r_loss)
+            )
+            candidate_importance = (
+                None
+                if candidate_delta is None
+                else max(0.0, candidate_delta / reference_zero_effect_r_loss)
+            )
+            tolerance = (
+                config.source_preservation_tolerance
+                if key[0] == "calibrated_effect_source"
+                else config.feature_bank_preservation_tolerance
+            )
+            minimum = (
+                None
+                if current_importance is None
+                else max(0.0, current_importance - tolerance)
+            )
+            passed = bool(
+                ablation_identities_match
+                and current_row is not None
+                and candidate_row is not None
+                and current_row.get("upstream_columns_removed")
+                == candidate_row.get("upstream_columns_removed")
+                and minimum is not None
+                and candidate_importance is not None
+                and candidate_importance + 1e-12 >= minimum
+            )
+            predictive_ablation_guards.append(
+                {
+                    "input_kind": key[0],
+                    "source_kind": key[1],
+                    "consumer_role": key[2],
+                    "passed": passed,
+                    "current_normalized_predictive_importance": current_importance,
+                    "candidate_normalized_predictive_importance": candidate_importance,
+                    "minimum_candidate_normalized_predictive_importance": minimum,
+                    "tolerance": tolerance,
+                    "predictive_refit_performed": True,
+                }
+            )
+        predictive_ablation_passed = bool(
             ablation_identities_match
-            and current_row is not None
-            and candidate_row is not None
-            and current_row.get("upstream_columns_removed")
-            == candidate_row.get("upstream_columns_removed")
-            and minimum is not None
-            and candidate_importance is not None
-            and candidate_importance + 1e-12 >= minimum
+            and all(bool(row["passed"]) for row in predictive_ablation_guards)
         )
-        predictive_ablation_guards.append(
-            {
-                "input_kind": key[0],
-                "source_kind": key[1],
-                "consumer_role": key[2],
-                "passed": passed,
-                "current_normalized_predictive_importance": current_importance,
-                "candidate_normalized_predictive_importance": candidate_importance,
-                "minimum_candidate_normalized_predictive_importance": minimum,
-                "tolerance": tolerance,
-                "predictive_refit_performed": True,
-            }
-        )
-    predictive_ablation_passed = bool(
-        ablation_identities_match and all(bool(row["passed"]) for row in predictive_ablation_guards)
-    )
-    guards["upstream_predictive_family_ablations"] = {
-        "passed": predictive_ablation_passed,
-        "family_identities_match": ablation_identities_match,
-        "by_family": predictive_ablation_guards,
-        "ablation_method": "delete_exact_family_then_refit_all_matched_models",
-        "shared_reference_zero_effect_r_loss": reference_zero_effect_r_loss,
-        "correlation_deletion_used_as_predictive_ablation": False,
-    }
-    if not predictive_ablation_passed:
-        reasons.append("upstream_predictive_family_ablation_guard_failed")
+        guards["upstream_predictive_family_ablations"] = {
+            "status": predictive_ablation_status,
+            "passed": predictive_ablation_passed,
+            "family_identities_match": ablation_identities_match,
+            "by_family": predictive_ablation_guards,
+            "ablation_method": "delete_exact_family_then_refit_all_matched_models",
+            "shared_reference_zero_effect_r_loss": reference_zero_effect_r_loss,
+            "correlation_deletion_used_as_predictive_ablation": False,
+        }
+        if not predictive_ablation_passed:
+            reasons.append("upstream_predictive_family_ablation_guard_failed")
 
     current_payload = {
         "metrics": current_metrics,
@@ -3903,6 +4273,7 @@ def evaluate_untouched_gate_acceptance(
         "source_signal_evaluation": current_source,
         "feature_bank_evaluation": current_feature_bank,
         "upstream_predictive_family_ablations": current_family_ablations,
+        "upstream_predictive_family_ablation_status": predictive_ablation_status,
         "conditional_upstream_design_sha256": upstream_design_sha256,
     }
     candidate_payload = {
@@ -3912,6 +4283,7 @@ def evaluate_untouched_gate_acceptance(
         "source_signal_evaluation": candidate_source,
         "feature_bank_evaluation": candidate_feature_bank,
         "upstream_predictive_family_ablations": candidate_family_ablations,
+        "upstream_predictive_family_ablation_status": predictive_ablation_status,
         "conditional_upstream_design_sha256": upstream_design_sha256,
     }
     decision_content = {
@@ -3935,6 +4307,8 @@ def evaluate_untouched_gate_acceptance(
 __all__ = [
     "AppliedReviewOperations",
     "CausalReviewConfig",
+    "CONDITIONAL_CONTEXT_AND_GATE_REVIEW_POLICY",
+    "GATE_ONLY_REFERENCE_PRESERVATION_REVIEW_POLICY",
     "GateAcceptanceDecision",
     "GateFeatureBankView",
     "GateSourceSignalView",

@@ -70,7 +70,17 @@ def _indexed_overlay(tmp_path):
     }
     manifest_path = tmp_path / "cache_index.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    return dataset, cache_path, FrozenExtractionCacheOverlay([manifest_path], expected_row_count=4)
+    return dataset, cache_path, FrozenExtractionCacheOverlay(
+        [manifest_path],
+        expected_row_count=4,
+        row_id_column="_oci_row_id",
+        text_column="text",
+    )
+
+
+def test_overlay_has_no_benchmark_row_or_column_defaults(tmp_path):
+    with pytest.raises(TypeError):
+        FrozenExtractionCacheOverlay([])
 
 
 def test_exact_cache_identity_hits_and_model_mismatch_falls_through(tmp_path):

@@ -9,18 +9,22 @@ evidence content.
 
 from __future__ import annotations
 
+import contextvars
+import hashlib
 import json
 import re
 
+from dataclasses import asdict, dataclass, fields as dataclass_fields
 from typing import Any, Mapping, Sequence
 
 HIERARCHICAL_DISCOVERY_RESPONSE_CONTRACT_VERSION = (
-    "hierarchical_discovery_dynamic_response_contract_v8"
+    "hierarchical_discovery_dynamic_response_contract_v9"
 )
 
 HIERARCHICAL_DISCOVERY_WIRE_RESPONSE_BUDGET_VERSION = (
-    "hierarchical_discovery_wire_response_budget_v2"
+    "hierarchical_discovery_wire_response_budget_v3"
 )
+HIERARCHY_WIRE_BUDGET_SCHEMA_VERSION = "hierarchy_wire_budget_v1"
 
 HIERARCHICAL_DISCOVERY_EXACT_COVERAGE_REPRESENTATION = (
     "closed_object_keyed_by_authenticated_identifier_v1"
@@ -51,6 +55,185 @@ HIERARCHICAL_DISCOVERY_INTERPRET_TOKEN_BUDGET = 20_000
 HIERARCHICAL_DISCOVERY_MAX_TRANSPORT_BYTES = 20_000
 HIERARCHICAL_DISCOVERY_GENERATION_TOKEN_BUDGET = 20_000
 HIERARCHICAL_DISCOVERY_CONSERVATIVE_UTF8_BYTES_PER_TOKEN = 1
+
+
+@dataclass(frozen=True)
+class HierarchyWireBudget:
+    """Exact scientific response/schema and lossless paging bounds.
+
+    There are deliberately no constructor defaults.  Every field changes the
+    language accepted from the model, the number of items compiled into a
+    lossless page, or the authenticated output-size proof.  Production callers
+    must therefore supply and identity-bind the complete object.
+
+    ``legacy`` exists only to keep older non-production callers readable while
+    they migrate.  The production hierarchy never calls it.
+    """
+
+    max_opaque_identifier_chars: int
+    max_generated_name_chars: int
+    max_description_chars: int
+    max_reason_chars: int
+    max_ambiguity_chars: int
+    max_free_text_chars: int
+    max_generated_list_items: int
+    max_feature_names_per_member: int
+    max_findings_per_atomic_review: int
+    max_pair_relation_peers_per_page: int
+    max_definition_fold_inputs: int
+    max_group_lookback_ids: int
+    max_adaptive_review_targets: int
+    max_interpret_atoms_per_job: int
+    max_interpret_members_per_job: int
+    max_interpret_name_chars: int
+    max_interpret_description_chars: int
+    max_interpret_ambiguity_chars: int
+    max_interpret_reason_chars: int
+    max_interpret_canonical_json_bytes: int
+    max_interpret_transport_bytes: int
+    interpret_generation_token_budget: int
+    max_response_transport_bytes: int
+    generation_token_budget: int
+
+    def __post_init__(self) -> None:
+        for field in dataclass_fields(self):
+            value = getattr(self, field.name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"HierarchyWireBudget.{field.name} must be an integer")
+            if value < 1:
+                raise ValueError(f"HierarchyWireBudget.{field.name} must be positive")
+        if self.max_interpret_name_chars > self.max_generated_name_chars:
+            raise ValueError(
+                "max_interpret_name_chars cannot exceed max_generated_name_chars"
+            )
+        if (
+            self.max_interpret_canonical_json_bytes
+            > self.max_interpret_transport_bytes
+        ):
+            raise ValueError(
+                "max_interpret_canonical_json_bytes cannot exceed "
+                "max_interpret_transport_bytes"
+            )
+        if self.max_interpret_transport_bytes > self.max_response_transport_bytes:
+            raise ValueError(
+                "max_interpret_transport_bytes cannot exceed "
+                "max_response_transport_bytes"
+            )
+        if (
+            self.interpret_generation_token_budget
+            > self.generation_token_budget
+        ):
+            raise ValueError(
+                "interpret_generation_token_budget cannot exceed "
+                "generation_token_budget"
+            )
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "HierarchyWireBudget":
+        row = _mapping(value, label="hierarchy_wire_budget")
+        expected = {"budget_version", *(field.name for field in dataclass_fields(cls))}
+        actual = set(row)
+        if actual != expected:
+            raise ValueError(
+                "hierarchy_wire_budget keys differ; "
+                f"missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
+            )
+        if row["budget_version"] != HIERARCHY_WIRE_BUDGET_SCHEMA_VERSION:
+            raise ValueError("hierarchy_wire_budget budget_version is unsupported")
+        return cls(
+            **{
+                field.name: row[field.name]
+                for field in dataclass_fields(cls)
+            }
+        )
+
+    @classmethod
+    def legacy(cls) -> "HierarchyWireBudget":
+        """Return the frozen pre-v9 bounds for compatibility tests only."""
+
+        return cls(
+            max_opaque_identifier_chars=HIERARCHICAL_DISCOVERY_MAX_OPAQUE_IDENTIFIER_LENGTH,
+            max_generated_name_chars=HIERARCHICAL_DISCOVERY_MAX_GENERATED_NAME_LENGTH,
+            max_description_chars=HIERARCHICAL_DISCOVERY_MAX_DESCRIPTION_LENGTH,
+            max_reason_chars=HIERARCHICAL_DISCOVERY_MAX_REASON_LENGTH,
+            max_ambiguity_chars=HIERARCHICAL_DISCOVERY_MAX_AMBIGUITY_LENGTH,
+            max_free_text_chars=HIERARCHICAL_DISCOVERY_MAX_TEXT_LENGTH,
+            max_generated_list_items=HIERARCHICAL_DISCOVERY_MAX_GENERATED_LIST_ITEMS,
+            max_feature_names_per_member=(
+                HIERARCHICAL_DISCOVERY_MAX_FEATURE_NAMES_PER_MEMBER
+            ),
+            max_findings_per_atomic_review=(
+                HIERARCHICAL_DISCOVERY_MAX_FINDINGS_PER_ATOMIC_REVIEW
+            ),
+            max_pair_relation_peers_per_page=(
+                HIERARCHICAL_DISCOVERY_MAX_PAIR_RELATION_PEERS
+            ),
+            max_definition_fold_inputs=(
+                HIERARCHICAL_DISCOVERY_MAX_DEFINITION_FOLD_MEMBERS
+            ),
+            max_group_lookback_ids=HIERARCHICAL_DISCOVERY_MAX_GROUP_LOOKBACK_IDS,
+            max_adaptive_review_targets=(
+                HIERARCHICAL_DISCOVERY_MAX_ADAPTIVE_REVIEW_TARGETS
+            ),
+            max_interpret_atoms_per_job=(
+                HIERARCHICAL_DISCOVERY_MAX_ATOMS_PER_INTERPRET_JOB
+            ),
+            max_interpret_members_per_job=(
+                HIERARCHICAL_DISCOVERY_MAX_MEMBERS_PER_INTERPRET_JOB
+            ),
+            max_interpret_name_chars=HIERARCHICAL_DISCOVERY_MAX_INTERPRET_NAME_LENGTH,
+            max_interpret_description_chars=(
+                HIERARCHICAL_DISCOVERY_MAX_INTERPRET_DESCRIPTION_LENGTH
+            ),
+            max_interpret_ambiguity_chars=(
+                HIERARCHICAL_DISCOVERY_MAX_INTERPRET_AMBIGUITY_LENGTH
+            ),
+            max_interpret_reason_chars=(
+                HIERARCHICAL_DISCOVERY_MAX_INTERPRET_REASON_LENGTH
+            ),
+            max_interpret_canonical_json_bytes=(
+                HIERARCHICAL_DISCOVERY_MAX_INTERPRET_CANONICAL_JSON_BYTES
+            ),
+            max_interpret_transport_bytes=(
+                HIERARCHICAL_DISCOVERY_MAX_INTERPRET_TRANSPORT_BYTES
+            ),
+            interpret_generation_token_budget=(
+                HIERARCHICAL_DISCOVERY_INTERPRET_TOKEN_BUDGET
+            ),
+            max_response_transport_bytes=HIERARCHICAL_DISCOVERY_MAX_TRANSPORT_BYTES,
+            generation_token_budget=HIERARCHICAL_DISCOVERY_GENERATION_TOKEN_BUDGET,
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "budget_version": HIERARCHY_WIRE_BUDGET_SCHEMA_VERSION,
+            **asdict(self),
+        }
+
+    @property
+    def content_sha256(self) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                self.as_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+
+
+LEGACY_HIERARCHY_WIRE_BUDGET = HierarchyWireBudget.legacy()
+_ACTIVE_HIERARCHY_WIRE_BUDGET: contextvars.ContextVar[
+    HierarchyWireBudget | None
+] = contextvars.ContextVar("active_hierarchy_wire_budget", default=None)
+
+
+def _wire_budget() -> HierarchyWireBudget:
+    budget = _ACTIVE_HIERARCHY_WIRE_BUDGET.get()
+    if budget is None:
+        raise RuntimeError("hierarchy response compilation lacks an explicit wire budget")
+    return budget
 
 _ABSOLUTE_END_PATTERN = r"(?![\s\S])"
 _IDENTIFIER_BODY_PATTERN = r"[a-z][a-z0-9_.:-]*"
@@ -86,7 +269,7 @@ def _string(value: Any, *, label: str) -> str:
 
 def _identifier(value: Any, *, label: str) -> str:
     result = _string(value, label=label)
-    if len(result) > HIERARCHICAL_DISCOVERY_MAX_OPAQUE_IDENTIFIER_LENGTH:
+    if len(result) > _wire_budget().max_opaque_identifier_chars:
         raise ValueError(f"{label} exceeds the authenticated opaque-identifier length bound")
     if re.fullmatch(_IDENTIFIER_BODY_PATTERN, result) is None:
         raise ValueError(f"{label} must be one lowercase opaque identifier")
@@ -95,7 +278,7 @@ def _identifier(value: Any, *, label: str) -> str:
 
 def _feature_name(value: Any, *, label: str) -> str:
     result = _string(value, label=label)
-    if len(result) > HIERARCHICAL_DISCOVERY_MAX_GENERATED_NAME_LENGTH:
+    if len(result) > _wire_budget().max_generated_name_chars:
         raise ValueError(f"{label} exceeds the authenticated feature-name length bound")
     if re.fullmatch(_FEATURE_NAME_BODY_PATTERN, result) is None:
         raise ValueError(f"{label} must be one lower_snake_case feature name")
@@ -137,8 +320,10 @@ def _string_value(
     *,
     pattern: str | None = None,
     minimum: int | None = None,
-    maximum: int = HIERARCHICAL_DISCOVERY_MAX_TEXT_LENGTH,
+    maximum: int | None = None,
 ) -> dict[str, Any]:
+    if maximum is None:
+        maximum = _wire_budget().max_free_text_chars
     result: dict[str, Any] = {"type": "string"}
     if pattern is not None:
         result["pattern"] = pattern
@@ -160,28 +345,28 @@ def _name_value(*, allow_empty: bool = False) -> dict[str, Any]:
     pattern = _OPTIONAL_FEATURE_NAME_PATTERN if allow_empty else _FEATURE_NAME_PATTERN
     return _string_value(
         pattern=pattern,
-        maximum=HIERARCHICAL_DISCOVERY_MAX_GENERATED_NAME_LENGTH,
+        maximum=_wire_budget().max_generated_name_chars,
     )
 
 
 def _description_value(*, minimum: int = 0) -> dict[str, Any]:
     return _string_value(
         minimum=minimum,
-        maximum=HIERARCHICAL_DISCOVERY_MAX_DESCRIPTION_LENGTH,
+        maximum=_wire_budget().max_description_chars,
     )
 
 
 def _reason_value() -> dict[str, Any]:
     return _string_value(
         minimum=1,
-        maximum=HIERARCHICAL_DISCOVERY_MAX_REASON_LENGTH,
+        maximum=_wire_budget().max_reason_chars,
     )
 
 
 def _ambiguity_value(*, minimum: int = 0) -> dict[str, Any]:
     return _string_value(
         minimum=minimum,
-        maximum=HIERARCHICAL_DISCOVERY_MAX_AMBIGUITY_LENGTH,
+        maximum=_wire_budget().max_ambiguity_chars,
     )
 
 
@@ -275,8 +460,10 @@ def _contract(
     response_path_domains: Mapping[str, str],
     generated_name_paths: Sequence[str] = (),
 ) -> dict[str, Any]:
+    wire_budget = _wire_budget()
     return {
         "contract_version": HIERARCHICAL_DISCOVERY_RESPONSE_CONTRACT_VERSION,
+        "hierarchy_wire_budget": wire_budget.as_dict(),
         "job": job,
         "derivation_policy": "designated_request_fields_only_no_arbitrary_text_scan_v1",
         "identifier_domains": {
@@ -370,27 +557,34 @@ def _maximum_schema_json_bytes(schema: Mapping[str, Any], *, path: str = "$") ->
 
 
 def _wire_response_budget(schema: Mapping[str, Any]) -> dict[str, Any]:
+    configured = _wire_budget()
     maximum_canonical_json_bytes = _maximum_schema_json_bytes(schema)
-    if maximum_canonical_json_bytes > HIERARCHICAL_DISCOVERY_MAX_TRANSPORT_BYTES:
+    if maximum_canonical_json_bytes > configured.max_response_transport_bytes:
         raise ValueError(
             "hierarchical discovery response schema exceeds the authenticated "
-            "20,000-byte wire budget; compile bounded pages before creating this job "
+            "configured wire budget; compile bounded pages before creating this job "
             f"(exact canonical maximum={maximum_canonical_json_bytes})"
         )
     maximum_estimated_tokens = (
         maximum_canonical_json_bytes + HIERARCHICAL_DISCOVERY_CONSERVATIVE_UTF8_BYTES_PER_TOKEN - 1
     ) // HIERARCHICAL_DISCOVERY_CONSERVATIVE_UTF8_BYTES_PER_TOKEN
+    if maximum_estimated_tokens > configured.generation_token_budget:
+        raise ValueError(
+            "hierarchical discovery response schema exceeds the authenticated "
+            "generation-token budget; increase the configured budget or compile "
+            "bounded lossless pages"
+        )
     return {
         "budget_contract_version": HIERARCHICAL_DISCOVERY_WIRE_RESPONSE_BUDGET_VERSION,
         "maximum_canonical_json_bytes": maximum_canonical_json_bytes,
         "canonical_json_byte_proof": ("closed_json_schema_exact_structural_utf8_upper_bound_v2"),
-        "maximum_transport_bytes": HIERARCHICAL_DISCOVERY_MAX_TRANSPORT_BYTES,
+        "maximum_transport_bytes": configured.max_response_transport_bytes,
         "transport_byte_policy": "raw_utf8_response_before_json_parsing_v1",
         "conservative_utf8_bytes_per_estimated_token": (
             HIERARCHICAL_DISCOVERY_CONSERVATIVE_UTF8_BYTES_PER_TOKEN
         ),
         "maximum_estimated_tokens": maximum_estimated_tokens,
-        "generation_token_budget": HIERARCHICAL_DISCOVERY_GENERATION_TOKEN_BUDGET,
+        "generation_token_budget": configured.generation_token_budget,
     }
 
 
@@ -412,19 +606,20 @@ def _interpret_wire_budget(
     tokenizer or an empirical bytes/token ratio.
     """
 
+    configured = _wire_budget()
     maximum_utf8_code_point = "\U0010ffff"
     finding = {
-        "feature_name": "f" * HIERARCHICAL_DISCOVERY_MAX_INTERPRET_NAME_LENGTH,
+        "feature_name": "f" * configured.max_interpret_name_chars,
         "description": (
-            maximum_utf8_code_point * HIERARCHICAL_DISCOVERY_MAX_INTERPRET_DESCRIPTION_LENGTH
+            maximum_utf8_code_point * configured.max_interpret_description_chars
         ),
         "value_shape_hypothesis": "categorical",
         "unresolved_ambiguity": (
-            maximum_utf8_code_point * HIERARCHICAL_DISCOVERY_MAX_INTERPRET_AMBIGUITY_LENGTH
+            maximum_utf8_code_point * configured.max_interpret_ambiguity_chars
         ),
     }
     repeated_findings = [
-        finding for _ in range(HIERARCHICAL_DISCOVERY_MAX_FINDINGS_PER_ATOMIC_REVIEW)
+        finding for _ in range(configured.max_findings_per_atomic_review)
     ]
     dispositions = {
         evidence_id: {
@@ -434,7 +629,7 @@ def _interpret_wire_budget(
                 for member_id in members_by_evidence[evidence_id]
             },
             "reason": (
-                maximum_utf8_code_point * HIERARCHICAL_DISCOVERY_MAX_INTERPRET_REASON_LENGTH
+                maximum_utf8_code_point * configured.max_interpret_reason_chars
             ),
         }
         for evidence_id in evidence_ids
@@ -454,25 +649,26 @@ def _interpret_wire_budget(
         "atomic_review_count": len(evidence_ids)
         + sum(len(values) for values in members_by_evidence.values()),
         "maximum_findings_per_atomic_review": (
-            HIERARCHICAL_DISCOVERY_MAX_FINDINGS_PER_ATOMIC_REVIEW
+            configured.max_findings_per_atomic_review
         ),
-        "maximum_findings": HIERARCHICAL_DISCOVERY_MAX_FINDINGS_PER_ATOMIC_REVIEW
+        "maximum_findings": configured.max_findings_per_atomic_review
         * (len(evidence_ids) + sum(len(values) for values in members_by_evidence.values())),
         "maximum_canonical_json_bytes": byte_count,
         "canonical_json_byte_proof": (
             "exact_structure_plus_four_utf8_bytes_per_safe_free_text_code_point_v1"
         ),
-        "maximum_transport_bytes": HIERARCHICAL_DISCOVERY_MAX_INTERPRET_TRANSPORT_BYTES,
+        "maximum_transport_bytes": configured.max_interpret_transport_bytes,
         "transport_byte_policy": "raw_utf8_response_before_json_parsing_v1",
         "conservative_utf8_bytes_per_estimated_token": (
             HIERARCHICAL_DISCOVERY_CONSERVATIVE_UTF8_BYTES_PER_TOKEN
         ),
         "maximum_estimated_tokens": estimated_tokens,
-        "generation_token_budget": HIERARCHICAL_DISCOVERY_INTERPRET_TOKEN_BUDGET,
+        "generation_token_budget": configured.interpret_generation_token_budget,
     }
 
 
 def _interpret(request: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    configured = _wire_budget()
     evidence = _rows(request.get("evidence"), label="evidence")
     evidence_ids = _primary_ids(
         tuple(
@@ -495,13 +691,13 @@ def _interpret(request: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, An
     member_ids = _unique(
         tuple(member for values in members_by_evidence.values() for member in values)
     )
-    if len(evidence_ids) > HIERARCHICAL_DISCOVERY_MAX_ATOMS_PER_INTERPRET_JOB:
+    if len(evidence_ids) > configured.max_interpret_atoms_per_job:
         raise ValueError(
             "interpret request exceeds its response-budget atom bound; split the "
             "lossless architecture chunk"
         )
     total_member_reviews = sum(len(values) for values in members_by_evidence.values())
-    if total_member_reviews > HIERARCHICAL_DISCOVERY_MAX_MEMBERS_PER_INTERPRET_JOB:
+    if total_member_reviews > configured.max_interpret_members_per_job:
         raise ValueError(
             "interpret request exceeds its response-budget member bound; split the "
             "lossless architecture chunk"
@@ -510,18 +706,18 @@ def _interpret(request: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, An
         {
             "feature_name": _string_value(
                 pattern=_FEATURE_NAME_PATTERN,
-                maximum=HIERARCHICAL_DISCOVERY_MAX_INTERPRET_NAME_LENGTH,
+                maximum=configured.max_interpret_name_chars,
             ),
             "description": _string_value(
                 minimum=1,
-                maximum=HIERARCHICAL_DISCOVERY_MAX_INTERPRET_DESCRIPTION_LENGTH,
+                maximum=configured.max_interpret_description_chars,
             ),
             "value_shape_hypothesis": {
                 "type": "string",
                 "enum": ["continuous", "categorical", "ambiguous"],
             },
             "unresolved_ambiguity": _string_value(
-                maximum=HIERARCHICAL_DISCOVERY_MAX_INTERPRET_AMBIGUITY_LENGTH,
+                maximum=configured.max_interpret_ambiguity_chars,
             ),
         }
     )
@@ -531,7 +727,7 @@ def _interpret(request: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, An
     # limits keep the wire response below the production output budget.
     findings = _array(
         finding,
-        maximum=HIERARCHICAL_DISCOVERY_MAX_FINDINGS_PER_ATOMIC_REVIEW,
+        maximum=configured.max_findings_per_atomic_review,
     )
     disposition_by_evidence: dict[str, dict[str, Any]] = {}
     for evidence_id in evidence_ids:
@@ -553,7 +749,7 @@ def _interpret(request: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, An
                 "member_dispositions": member_dispositions,
                 "reason": _string_value(
                     minimum=1,
-                    maximum=HIERARCHICAL_DISCOVERY_MAX_INTERPRET_REASON_LENGTH,
+                    maximum=configured.max_interpret_reason_chars,
                 ),
             }
         )
@@ -571,11 +767,11 @@ def _interpret(request: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, An
     )
     if (
         response_budget["maximum_canonical_json_bytes"]
-        > HIERARCHICAL_DISCOVERY_MAX_INTERPRET_CANONICAL_JSON_BYTES
+        > configured.max_interpret_canonical_json_bytes
         or response_budget["maximum_transport_bytes"]
-        > HIERARCHICAL_DISCOVERY_MAX_INTERPRET_TRANSPORT_BYTES
+        > configured.max_interpret_transport_bytes
         or response_budget["maximum_estimated_tokens"]
-        > HIERARCHICAL_DISCOVERY_INTERPRET_TOKEN_BUDGET
+        > configured.interpret_generation_token_budget
     ):
         raise ValueError(
             "interpret request exceeds its authenticated worst-case response budget; "
@@ -692,6 +888,7 @@ def _consolidation(request: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str
 def _candidate_relation_page(
     request: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    configured = _wire_budget()
     anchor_candidate_id = _identifier(
         request.get("anchor_candidate_id"), label="anchor_candidate_id"
     )
@@ -701,7 +898,7 @@ def _candidate_relation_page(
     )
     if not peer_candidate_ids:
         raise ValueError("candidate relation page must contain at least one later peer")
-    if len(peer_candidate_ids) > HIERARCHICAL_DISCOVERY_MAX_PAIR_RELATION_PEERS:
+    if len(peer_candidate_ids) > configured.max_pair_relation_peers_per_page:
         raise ValueError("candidate relation page exceeds its authenticated peer bound")
     if anchor_candidate_id in peer_candidate_ids:
         raise ValueError("candidate relation page cannot compare an anchor with itself")
@@ -733,7 +930,7 @@ def _candidate_relation_page(
             "every_peer_is_later_in_canonical_candidate_order": True,
             "every_unordered_pair_is_compiler_scheduled_exactly_once": True,
             "response_domain_bounds": {
-                "maximum_peer_comparisons": HIERARCHICAL_DISCOVERY_MAX_PAIR_RELATION_PEERS,
+                "maximum_peer_comparisons": configured.max_pair_relation_peers_per_page,
                 "actual_peer_comparisons": len(peer_candidate_ids),
             },
         },
@@ -749,6 +946,7 @@ def _candidate_relation_page(
 def _candidate_definition_fold(
     request: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    configured = _wire_budget()
     group_id = _identifier(request.get("group_id"), label="group_id")
     member_candidate_ids = _primary_ids(
         _strings(request.get("member_candidate_ids"), label="member_candidate_ids"),
@@ -756,7 +954,7 @@ def _candidate_definition_fold(
     )
     if not member_candidate_ids:
         raise ValueError("candidate definition fold cannot be empty")
-    if len(member_candidate_ids) > HIERARCHICAL_DISCOVERY_MAX_DEFINITION_FOLD_MEMBERS:
+    if len(member_candidate_ids) > configured.max_definition_fold_inputs:
         raise ValueError("candidate definition fold exceeds its authenticated member bound")
     schema = _closed_schema(
         {
@@ -777,7 +975,7 @@ def _candidate_definition_fold(
             "member_candidate_ids": list(member_candidate_ids),
             "membership_and_support_are_compiler_owned": True,
             "response_domain_bounds": {
-                "maximum_fold_members": HIERARCHICAL_DISCOVERY_MAX_DEFINITION_FOLD_MEMBERS,
+                "maximum_fold_members": configured.max_definition_fold_inputs,
                 "actual_fold_members": len(member_candidate_ids),
             },
         },
@@ -899,6 +1097,7 @@ def _coverage(request: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any
 
 
 def _atomic_coverage(request: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    configured = _wire_budget()
     atomic_review_id = _identifier(request.get("atomic_review_id"), label="atomic_review_id")
     evidence_id = _identifier(request.get("evidence_id"), label="evidence_id")
     canonical_names = tuple(
@@ -909,7 +1108,7 @@ def _atomic_coverage(request: Mapping[str, Any]) -> tuple[dict[str, Any], dict[s
     )
     if len(canonical_names) != len(set(canonical_names)):
         raise ValueError("atomic coverage canonical_names cannot contain duplicates")
-    if len(canonical_names) > HIERARCHICAL_DISCOVERY_MAX_FINDINGS_PER_ATOMIC_REVIEW:
+    if len(canonical_names) > configured.max_findings_per_atomic_review:
         raise ValueError("atomic coverage page exceeds its canonical-name bound")
     empty_names = _array(_name_value(), maximum=0)
     affected = (
@@ -969,7 +1168,7 @@ def _atomic_coverage(request: Mapping[str, Any]) -> tuple[dict[str, Any], dict[s
         {
             "findings": _array(
                 {"anyOf": variants},
-                maximum=HIERARCHICAL_DISCOVERY_MAX_FINDINGS_PER_ATOMIC_REVIEW,
+                maximum=configured.max_findings_per_atomic_review,
             ),
             "reviewed_atomic_review": {"type": "boolean", "const": True},
         }
@@ -986,8 +1185,8 @@ def _atomic_coverage(request: Mapping[str, Any]) -> tuple[dict[str, Any], dict[s
             "supporting_evidence_id": evidence_id,
             "support_is_compiler_derived": True,
             "response_domain_bounds": {
-                "maximum_canonical_names": (HIERARCHICAL_DISCOVERY_MAX_FINDINGS_PER_ATOMIC_REVIEW),
-                "maximum_findings": HIERARCHICAL_DISCOVERY_MAX_FINDINGS_PER_ATOMIC_REVIEW,
+                "maximum_canonical_names": configured.max_findings_per_atomic_review,
+                "maximum_findings": configured.max_findings_per_atomic_review,
             },
         },
         response_path_domains={
@@ -1006,7 +1205,7 @@ def _review_input_ids(request: Mapping[str, Any], *, label: str) -> tuple[str, .
     )
     if not values:
         raise ValueError(f"{label} cannot be empty")
-    if len(values) > HIERARCHICAL_DISCOVERY_MAX_DEFINITION_FOLD_MEMBERS:
+    if len(values) > _wire_budget().max_definition_fold_inputs:
         raise ValueError(f"{label} exceeds its authenticated fold-input bound")
     return values
 
@@ -1251,7 +1450,7 @@ def _extraction_evidence_page(
     evidence_id = _identifier(request.get("evidence_id"), label="evidence_id")
     literal_values = _array(
         _string_value(minimum=1),
-        maximum=HIERARCHICAL_DISCOVERY_MAX_GENERATED_LIST_ITEMS,
+        maximum=_wire_budget().max_generated_list_items,
     )
     schema = _closed_schema(
         {
@@ -1313,7 +1512,7 @@ def _extraction_representation_schema(value_shape: str) -> dict[str, Any]:
                     "categories": _array(
                         _string_value(minimum=1),
                         minimum=2,
-                        maximum=HIERARCHICAL_DISCOVERY_MAX_GENERATED_LIST_ITEMS,
+                        maximum=_wire_budget().max_generated_list_items,
                     ),
                 }
             )
@@ -1351,11 +1550,11 @@ def _extraction_evidence_fold(
             "representation": _extraction_representation_schema(value_shape),
             "aliases": _array(
                 _string_value(),
-                maximum=HIERARCHICAL_DISCOVERY_MAX_GENERATED_LIST_ITEMS,
+                maximum=_wire_budget().max_generated_list_items,
             ),
             "distinguish_from": _array(
                 _string_value(),
-                maximum=HIERARCHICAL_DISCOVERY_MAX_GENERATED_LIST_ITEMS,
+                maximum=_wire_budget().max_generated_list_items,
             ),
             "missing_or_ambiguous": _ambiguity_value(minimum=1),
             "input_dispositions": _keyed_object(
@@ -1808,7 +2007,7 @@ def _extraction(request: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, A
                     "categories": _array(
                         _string_value(minimum=1),
                         minimum=2,
-                        maximum=8,
+                        maximum=_wire_budget().max_generated_list_items,
                     ),
                 }
             )
@@ -1821,11 +2020,11 @@ def _extraction(request: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, A
             "representation": representation,
             "aliases": _array(
                 _string_value(),
-                maximum=HIERARCHICAL_DISCOVERY_MAX_GENERATED_LIST_ITEMS,
+                maximum=_wire_budget().max_generated_list_items,
             ),
             "distinguish_from": _array(
                 _string_value(),
-                maximum=HIERARCHICAL_DISCOVERY_MAX_GENERATED_LIST_ITEMS,
+                maximum=_wire_budget().max_generated_list_items,
             ),
             "missing_or_ambiguous": _ambiguity_value(minimum=1),
             "supporting_evidence_reviewed": {"type": "boolean", "const": True},
@@ -1938,11 +2137,11 @@ def _adaptive_planner(request: Mapping[str, Any]) -> tuple[dict[str, Any], dict[
             ),
         }
     )
-    # The downstream proposer can execute at most four registry operations in
-    # one frozen round.  More model-authored review rows cannot affect that
-    # round and would make the response size grow with an arbitrary registry.
+    # The downstream proposer executes an explicitly configured number of
+    # operations.  The budget is identity-bound and never silently narrows the
+    # request-specific maximum.
     maximum_targets = min(
-        HIERARCHICAL_DISCOVERY_MAX_ADAPTIVE_REVIEW_TARGETS,
+        _wire_budget().max_adaptive_review_targets,
         max(1, len(registry_names) + len(families)),
     )
     schema = _object(
@@ -2067,6 +2266,11 @@ def _adaptive_proposer(request: Mapping[str, Any]) -> tuple[dict[str, Any], dict
         or maximum_operations < 1
     ):
         raise ValueError("maximum_operations must be a positive integer")
+    if maximum_operations > _wire_budget().max_generated_list_items:
+        raise ValueError(
+            "maximum_operations exceeds the configured generated-list wire "
+            "budget; increase the authenticated budget or compile more rounds"
+        )
     proposed_feature = _object(
         {
             "feature_name": _name_value(),
@@ -2170,19 +2374,13 @@ def _adaptive_proposer(request: Mapping[str, Any]) -> tuple[dict[str, Any], dict
         operations_schema = _array(
             {"anyOf": operation_variants},
             minimum=1,
-            maximum=min(
-                maximum_operations,
-                HIERARCHICAL_DISCOVERY_MAX_GENERATED_LIST_ITEMS,
-            ),
+            maximum=maximum_operations,
         )
         schema = _object(
             {
                 "operations": _array(
                     {"anyOf": operation_variants},
-                    maximum=min(
-                        maximum_operations,
-                        HIERARCHICAL_DISCOVERY_MAX_GENERATED_LIST_ITEMS,
-                    ),
+                    maximum=maximum_operations,
                 ),
                 "converged": {"type": "boolean"},
             }
@@ -2237,13 +2435,11 @@ def _adaptive_proposer(request: Mapping[str, Any]) -> tuple[dict[str, Any], dict
     return schema, ownership
 
 
-def build_hierarchical_discovery_response_contract(
+def _build_hierarchical_discovery_response_contract_with_active_budget(
     *,
     job_kind: str,
     request: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Derive the exact response schema and ownership contract for one request."""
-
     row = _mapping(request, label="discovery request")
     job = _string(row.get("job"), label="discovery request job")
     dispatch = {
@@ -2317,10 +2513,70 @@ def build_hierarchical_discovery_response_contract(
     return dict(schema), dict(ownership)
 
 
+def _resolved_wire_budget(
+    *,
+    request: Mapping[str, Any],
+    wire_budget: HierarchyWireBudget | None,
+    allow_legacy_default: bool,
+) -> HierarchyWireBudget:
+    if wire_budget is not None and not isinstance(wire_budget, HierarchyWireBudget):
+        raise TypeError("wire_budget must be a HierarchyWireBudget")
+    embedded_raw = request.get("hierarchy_wire_budget")
+    embedded = (
+        None
+        if embedded_raw is None
+        else HierarchyWireBudget.from_mapping(
+            _mapping(embedded_raw, label="hierarchy_wire_budget")
+        )
+    )
+    if wire_budget is not None and embedded is not None and embedded != wire_budget:
+        raise ValueError(
+            "explicit wire_budget differs from the authenticated request budget"
+        )
+    if wire_budget is not None:
+        return wire_budget
+    if embedded is not None:
+        return embedded
+    if allow_legacy_default:
+        return LEGACY_HIERARCHY_WIRE_BUDGET
+    raise ValueError("hierarchy response compilation requires an explicit wire_budget")
+
+
+def build_hierarchical_discovery_response_contract(
+    *,
+    job_kind: str,
+    request: Mapping[str, Any],
+    wire_budget: HierarchyWireBudget | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Derive an exact response contract under one authenticated wire budget.
+
+    New callers pass ``wire_budget`` or include its exact versioned mapping in
+    ``request``.  The legacy fallback remains only for source-compatible unit
+    callers; :func:`attach_hierarchical_discovery_response_contract` always
+    writes the resolved budget into the authenticated model request.
+    """
+
+    row = _mapping(request, label="discovery request")
+    resolved = _resolved_wire_budget(
+        request=row,
+        wire_budget=wire_budget,
+        allow_legacy_default=True,
+    )
+    token = _ACTIVE_HIERARCHY_WIRE_BUDGET.set(resolved)
+    try:
+        return _build_hierarchical_discovery_response_contract_with_active_budget(
+            job_kind=job_kind,
+            request=row,
+        )
+    finally:
+        _ACTIVE_HIERARCHY_WIRE_BUDGET.reset(token)
+
+
 def attach_hierarchical_discovery_response_contract(
     *,
     job_kind: str,
     request: Mapping[str, Any],
+    wire_budget: HierarchyWireBudget | None = None,
 ) -> dict[str, Any]:
     """Attach the exact model-facing schema and ownership contract once."""
 
@@ -2328,9 +2584,16 @@ def attach_hierarchical_discovery_response_contract(
     reserved = {"output_schema", "identifier_ownership"}.intersection(row)
     if reserved:
         raise ValueError(f"discovery request already contains reserved contract fields: {reserved}")
+    resolved = _resolved_wire_budget(
+        request=row,
+        wire_budget=wire_budget,
+        allow_legacy_default=True,
+    )
+    row["hierarchy_wire_budget"] = resolved.as_dict()
     schema, ownership = build_hierarchical_discovery_response_contract(
         job_kind=job_kind,
         request=row,
+        wire_budget=resolved,
     )
     row["identifier_ownership"] = ownership
     row["output_schema"] = schema
@@ -2338,6 +2601,9 @@ def attach_hierarchical_discovery_response_contract(
 
 
 __all__ = [
+    "HIERARCHY_WIRE_BUDGET_SCHEMA_VERSION",
+    "HierarchyWireBudget",
+    "LEGACY_HIERARCHY_WIRE_BUDGET",
     "HIERARCHICAL_DISCOVERY_EXACT_COVERAGE_REPRESENTATION",
     "HIERARCHICAL_DISCOVERY_MAX_AMBIGUITY_LENGTH",
     "HIERARCHICAL_DISCOVERY_MAX_ADAPTIVE_REVIEW_TARGETS",

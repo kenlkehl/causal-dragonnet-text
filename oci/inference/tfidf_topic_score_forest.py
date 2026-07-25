@@ -14,13 +14,14 @@ import json
 import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import joblib
 import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
 
+from ..config import NuisanceCalibrationScientificConfig
 from ..models.causal_forest_head import CausalForestHead
 from .tfidf_topic_discovery import (
     HANDOFF_SCHEMA_VERSION,
@@ -28,6 +29,7 @@ from .tfidf_topic_discovery import (
     row_set_fingerprint,
     stable_hash,
 )
+from .tfidf_safe_artifacts import load_named_array_bank
 
 logger = logging.getLogger(__name__)
 
@@ -190,9 +192,14 @@ def _resolve_artifact_path(value: Any, handoff_path: Path, scope_id: str) -> Pat
     raise FileNotFoundError(f"Could not resolve Stage 1 artifact path: {value}")
 
 
-def _load_npz(path: Path) -> Dict[str, np.ndarray]:
-    with np.load(path) as archive:
-        return {name: np.asarray(archive[name], dtype=np.float64) for name in archive.files}
+def _load_topic_bank(path: Path, *, row_count: int) -> Dict[str, np.ndarray]:
+    return {
+        name: np.asarray(values, dtype=np.float64)
+        for name, values in load_named_array_bank(
+            path,
+            expected_row_count=row_count,
+        ).items()
+    }
 
 
 def _topic_ids(metadata: Dict[str, Any], bank: str, width: int) -> List[str]:
@@ -450,6 +457,19 @@ def _fit_outer_fold(
     fit_data = indexed.loc[fit_ids].reset_index(drop=True)
     heldout_data = indexed.loc[heldout_ids].reset_index(drop=True)
     discovery = context["discovery"]
+    nuisance_stack_scientific = discovery.get("nuisance_stack_scientific")
+    if not isinstance(nuisance_stack_scientific, Mapping):
+        raise ValueError(
+            "TF-IDF discovery artifact lacks nuisance_stack_scientific"
+        )
+    calibration_scientific = nuisance_stack_scientific.get("calibration")
+    if not isinstance(calibration_scientific, Mapping):
+        raise ValueError(
+            "TF-IDF discovery artifact lacks nuisance calibration science"
+        )
+    calibration_config = NuisanceCalibrationScientificConfig(
+        **dict(calibration_scientific)
+    )
     scope_id = str(discovery.get("scope_id") or f"outer_{fold:03d}_full_train")
     artifacts = discovery.get("artifacts") or {}
     fit_path = _resolve_artifact_path(artifacts.get("fit_topic_values"), handoff_path, scope_id)
@@ -459,8 +479,8 @@ def _fit_outer_fold(
     nuisance_path = _resolve_artifact_path(
         artifacts.get("nuisance_predictions"), handoff_path, scope_id
     )
-    fit_scores = _load_npz(fit_path)
-    heldout_scores = _load_npz(heldout_path)
+    fit_scores = _load_topic_bank(fit_path, row_count=len(fit_ids))
+    heldout_scores = _load_topic_bank(heldout_path, row_count=len(heldout_ids))
     for bank in _REQUIRED_BANKS:
         if bank in fit_scores and fit_scores[bank].shape[0] != len(fit_ids):
             raise ValueError(f"Outer fold {fold} {bank} fit score row count mismatch")
@@ -563,11 +583,17 @@ def _fit_outer_fold(
         "r_loss_with_stage1_nuisance": _r_loss(
             heldout_y, heldout_t, outcome_prediction, propensity, tau
         ),
-        "treatment_nuisance": nuisance_metrics(heldout_t, propensity, binary=True),
+        "treatment_nuisance": nuisance_metrics(
+            heldout_t,
+            propensity,
+            binary=True,
+            calibration_config=calibration_config,
+        ),
         "outcome_nuisance": nuisance_metrics(
             heldout_y,
             outcome_prediction,
             binary=str(outcome_type).lower() != "continuous",
+            calibration_config=calibration_config,
         ),
         "oracle_metrics_included": False,
     }

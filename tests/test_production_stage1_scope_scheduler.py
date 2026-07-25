@@ -23,7 +23,7 @@ from oci.inference.production_stage1_scope_scheduler import (
     _enforce_stage1_torch_determinism,
     _observe_stage1_torch_determinism,
     build_canonical_stage1_scope_plan,
-    derive_stage1_scope_seed,
+    derive_stage1_group_seed,
     seed_stage1_scope_rngs,
     stage1_torch_determinism_policy,
     validate_stage1_scope_plan,
@@ -100,9 +100,98 @@ def _plan(*, gpu_ids: tuple[int, ...] = (0, 1)):
         global_seed=42,
         gpu_ids=gpu_ids,
         review_rounds=2,
+        initial_training_partitions=3,
         expected_outer_fold_count=5,
         expected_inner_fold_count=5,
     )
+
+
+def test_plan_supports_configured_nonbenchmark_initial_partition_count():
+    registry = _registry()
+    plan = build_canonical_stage1_scope_plan(
+        registry=registry,
+        registry_content_sha256=_REGISTRY_SHA,
+        global_seed=42,
+        gpu_ids=(),
+        review_rounds=3,
+        initial_training_partitions=2,
+        expected_outer_fold_count=5,
+        expected_inner_fold_count=5,
+    )
+    assert plan.initial_training_partitions == 2
+    first = plan.scope("outer_001_hierarchy_epoch_000")
+    spent_rows = {
+        row_id
+        for inner in registry["outer_folds"][0]["inner_folds"][:2]
+        for row_id in inner["heldout_row_ids"]
+    }
+    assert first.fit_row_ids == tuple(
+        row_id
+        for row_id in registry["outer_folds"][0]["fit_row_ids"]
+        if row_id in spent_rows
+    )
+    assert plan.as_dict()["initial_training_partitions"] == 2
+
+
+def test_scientific_scope_plan_identity_excludes_gpu_ids_and_assignments():
+    cpu = _plan(gpu_ids=())
+    heterogeneous_gpu = _plan(gpu_ids=(7, 2, 11))
+
+    assert cpu.content_sha256 != heterogeneous_gpu.content_sha256
+    assert (
+        cpu.scientific_content_sha256
+        == heterogeneous_gpu.scientific_content_sha256
+    )
+    assert cpu.as_dict()["scientific_content_sha256"] == (
+        heterogeneous_gpu.as_dict()["scientific_content_sha256"]
+    )
+    assert cpu.scopes == heterogeneous_gpu.scopes
+    assert cpu.assignments != heterogeneous_gpu.assignments
+
+
+def test_role_neutral_plan_accepts_positive_operational_concurrency_but_legacy_spawn_does_not(
+    tmp_path: Path,
+):
+    registry = _registry()
+    concurrent = build_canonical_stage1_scope_plan(
+        registry=registry,
+        registry_content_sha256=_REGISTRY_SHA,
+        global_seed=42,
+        gpu_ids=(0, 1),
+        review_rounds=2,
+        initial_training_partitions=3,
+        scope_workers_per_gpu=2,
+        expected_outer_fold_count=5,
+        expected_inner_fold_count=5,
+    )
+    serial = _plan(gpu_ids=(0, 1))
+
+    assert concurrent.scope_workers_per_gpu == 2
+    assert concurrent.content_sha256 != serial.content_sha256
+    assert concurrent.scientific_content_sha256 == serial.scientific_content_sha256
+    with pytest.raises(ValueError, match="one active scope per GPU"):
+        SpawnedStage1ScopeOrchestrator(
+            plan=concurrent,
+            attempt_root=tmp_path / "attempts",
+            progress_path=tmp_path / "progress.json",
+            worker_target=f"{__name__}:_spawn_test_worker",
+        )
+
+
+@pytest.mark.parametrize("invalid", [0, -1, 1.5, True])
+def test_scope_plan_rejects_nonpositive_or_noninteger_concurrency(invalid):
+    with pytest.raises(ValueError, match="positive integer"):
+        build_canonical_stage1_scope_plan(
+            registry=_registry(),
+            registry_content_sha256=_REGISTRY_SHA,
+            global_seed=42,
+            gpu_ids=(0,),
+            review_rounds=2,
+            initial_training_partitions=3,
+            scope_workers_per_gpu=invalid,
+            expected_outer_fold_count=5,
+            expected_inner_fold_count=5,
+        )
 
 
 def _subset_scope_plan(count: int) -> Stage1ScopePlan:
@@ -123,6 +212,7 @@ def _subset_scope_plan(count: int) -> Stage1ScopePlan:
         registry_content_sha256=base.registry_content_sha256,
         global_seed=base.global_seed,
         review_rounds=base.review_rounds,
+        initial_training_partitions=base.initial_training_partitions,
         gpu_ids=(),
         scope_workers_per_gpu=1,
         scopes=scopes,
@@ -132,6 +222,7 @@ def _subset_scope_plan(count: int) -> Stage1ScopePlan:
         registry_content_sha256=base.registry_content_sha256,
         global_seed=base.global_seed,
         review_rounds=base.review_rounds,
+        initial_training_partitions=base.initial_training_partitions,
         gpu_ids=(),
         scope_workers_per_gpu=1,
         scopes=scopes,
@@ -260,8 +351,24 @@ def test_plan_is_schedule_independent_closed_and_contains_no_labels():
     second = _plan()
 
     assert first.as_dict() == second.as_dict()
-    assert len({scope.scope_seed for scope in first.scopes}) == 40
-    assert derive_stage1_scope_seed(42, "outer_001_full") == first.scopes[0].scope_seed
+    assert len(first.scopes) == 40
+    assert len(first.physical_scopes) == 35
+    assert sum(
+        len(members) == 2
+        for _owner, members in first.physical_scope_groups
+    ) == 5
+    assert all(
+        first.physical_owner(
+            f"outer_{outer_fold:03d}_hierarchy_epoch_001"
+        ).scope_id
+        == f"outer_{outer_fold:03d}_inner_005"
+        for outer_fold in range(1, 6)
+    )
+    assert len({scope.scope_seed for scope in first.scopes}) == 35
+    assert (
+        derive_stage1_group_seed(42, first.scopes[0].fit_row_ids)
+        == first.scopes[0].scope_seed
+    )
     assert "treatment" not in json.dumps(first.as_dict()).casefold()
     assert "outcome" not in json.dumps(first.as_dict()).casefold()
     validated = validate_stage1_scope_plan(
@@ -271,6 +378,7 @@ def test_plan_is_schedule_independent_closed_and_contains_no_labels():
         global_seed=42,
         gpu_ids=(0, 1),
         review_rounds=2,
+        initial_training_partitions=3,
         expected_outer_fold_count=5,
         expected_inner_fold_count=5,
     )
@@ -286,6 +394,7 @@ def test_plan_is_schedule_independent_closed_and_contains_no_labels():
             global_seed=42,
             gpu_ids=(0, 1),
             review_rounds=2,
+            initial_training_partitions=3,
             expected_outer_fold_count=5,
             expected_inner_fold_count=5,
         )
@@ -300,6 +409,7 @@ def test_plan_rejects_reordered_or_incomplete_partitions():
             registry_content_sha256=_REGISTRY_SHA,
             global_seed=42,
             review_rounds=2,
+            initial_training_partitions=3,
         )
 
     registry = _registry()
@@ -310,6 +420,7 @@ def test_plan_rejects_reordered_or_incomplete_partitions():
             registry_content_sha256=_REGISTRY_SHA,
             global_seed=42,
             review_rounds=2,
+            initial_training_partitions=3,
         )
 
 
@@ -544,7 +655,7 @@ def test_per_scope_worker_parameters_are_closed_and_child_request_is_private(
             ),
             "stage1_request_sha256": "e" * 64,
         }
-        for scope in plan.scopes
+        for scope in plan.physical_scopes
     }
     orchestrator = SpawnedStage1ScopeOrchestrator(
         plan=plan,
@@ -1018,6 +1129,7 @@ def test_spawn_orchestrator_seals_scopes_and_resume_does_not_add_attempts(
         global_seed=42,
         gpu_ids=(),
         review_rounds=1,
+        initial_training_partitions=3,
         expected_outer_fold_count=2,
         expected_inner_fold_count=4,
     )
@@ -1032,13 +1144,41 @@ def test_spawn_orchestrator_seals_scopes_and_resume_does_not_add_attempts(
     )
     manifests = orchestrator.run()
 
-    assert len(manifests) == 12
+    assert len(plan.scopes) == 12
+    assert len(plan.physical_scopes) == 10
+    assert len(manifests) == 10
     assert orchestrator.ledger.snapshot()["counts"]["completed"] == 12
+    logical_bindings = orchestrator.store.validate_logical_bindings()
+    assert logical_bindings.manifest["logical_scope_count"] == 12
+    assert logical_bindings.manifest["physical_fit_count"] == 10
+    assert logical_bindings.manifest["deduplicated_fit_count"] == 2
     before = sorted((tmp_path / "attempts").glob("*/*"))
     replayed = orchestrator.run()
     after = sorted((tmp_path / "attempts").glob("*/*"))
     assert replayed == manifests
     assert after == before
+
+    binding_path = (
+        tmp_path / "attempts" / scope_scheduler.STAGE1_LOGICAL_SCOPE_BINDING_FILENAME
+    )
+    tampered = json.loads(binding_path.read_text(encoding="utf-8"))
+    reused = next(
+        row for row in tampered["logical_bindings"] if row["reuses_physical_fit"]
+    )
+    reused["physical_owner_scope_id"] = plan.physical_scopes[0].scope_id
+    reused_body = {
+        key: value for key, value in reused.items() if key != "content_sha256"
+    }
+    reused["content_sha256"] = scope_scheduler._sha256_json(reused_body)
+    top_body = {
+        key: value
+        for key, value in tampered.items()
+        if key != "content_sha256"
+    }
+    tampered["content_sha256"] = scope_scheduler._sha256_json(top_body)
+    binding_path.write_text(json.dumps(tampered), encoding="utf-8")
+    with pytest.raises(ValueError, match="changed"):
+        orchestrator.store.validate_logical_bindings()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")

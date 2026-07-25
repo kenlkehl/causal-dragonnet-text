@@ -134,7 +134,10 @@ def _compiler_identity(*, max_candidates: int) -> dict[str, Any]:
         "representation_policy": {
             "unresolved": "fail_closed",
             "continuous_categories": "must_be_empty",
-            "categorical_categories": "CandidateContract concrete distinct 2-8 validation",
+            "categorical_categories": (
+                "CandidateContract concrete distinct nonempty validation with at least "
+                "two values and no compiler category-count cap"
+            ),
             "extraction_vocabulary_grounding": extraction_vocabulary_grounding_policy(),
         },
         "candidate_overflow_policy": "fail_closed_without_truncation",

@@ -16,7 +16,11 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
-from ..config import AppliedInferenceConfig, EmbeddingContrastDiscoveryConfig
+from ..config import (
+    AppliedInferenceConfig,
+    ClusterLocalEmbeddingScientificConfig,
+    EmbeddingContrastDiscoveryConfig,
+)
 from ..models.concept_embedding_cache import (
     ConceptEmbeddingCache,
     clear_sentence_transformer_cache,
@@ -26,35 +30,93 @@ from ..models.concept_embedding_utils import chunk_text_words
 
 logger = logging.getLogger(__name__)
 
-_CLUSTER_KMEANS_MAX_ITER = 300
+
+class ClusterLocalEmbeddingFeasibilityError(ValueError):
+    """Fail-closed cluster geometry error carrying its lossless fit summary."""
+
+    def __init__(self, message: str, *, summary: Mapping[str, Any]) -> None:
+        super().__init__(message)
+        self.summary = copy.deepcopy(dict(summary))
+
+
+def _cluster_local_scientific_config(
+    embedding_config: EmbeddingContrastDiscoveryConfig | Mapping[str, Any],
+) -> ClusterLocalEmbeddingScientificConfig:
+    if isinstance(embedding_config, Mapping):
+        raw = embedding_config.get("cluster_local_scientific")
+    else:
+        raw = embedding_config.cluster_local_scientific
+    if isinstance(raw, ClusterLocalEmbeddingScientificConfig):
+        return raw
+    if isinstance(raw, Mapping):
+        return ClusterLocalEmbeddingScientificConfig.from_mapping(raw)
+    raise ValueError(
+        "cluster-local embedding execution requires an explicit closed "
+        "cluster_local_scientific configuration"
+    )
 
 
 def _embedding_cluster_kmeans_parameters(
     embedding_config: EmbeddingContrastDiscoveryConfig | Mapping[str, Any],
     *,
     n_usable: int,
+    canonical_group_seed: int,
     n_clusters: int | None = None,
-) -> Dict[str, int]:
+) -> Dict[str, Any]:
     """Return the one closed MiniBatchKMeans parameterization used natively."""
-
-    def configured(name: str) -> Any:
-        if isinstance(embedding_config, Mapping):
-            return embedding_config[name]
-        return getattr(embedding_config, name)
 
     usable = int(n_usable)
     if usable < 1:
         raise ValueError("clustered embedding KMeans requires usable rows")
-    cluster_count = (
-        int(configured("cluster_contrast_n_clusters")) if n_clusters is None else int(n_clusters)
+    config = _cluster_local_scientific_config(embedding_config)
+    cluster_count = int(config.requested_cluster_count)
+    if n_clusters is not None and int(n_clusters) != cluster_count:
+        raise ValueError(
+            "cluster-local KMeans cannot adapt the configured cluster count"
+        )
+    seed = int(canonical_group_seed)
+    if isinstance(canonical_group_seed, bool) or not 0 <= seed < 2**31:
+        raise ValueError("canonical cluster group seed must be a 31-bit integer")
+    actual_batch_size = max(
+        int(config.kmeans_batch_size_lower_bound),
+        min(int(config.kmeans_batch_size_upper_bound), usable),
     )
     return {
         "n_clusters": cluster_count,
-        "random_state": int(configured("cluster_contrast_random_state")),
-        "batch_size": max(128, min(1024, usable)),
-        "n_init": int(configured("cluster_contrast_kmeans_n_init")),
-        "max_iter": _CLUSTER_KMEANS_MAX_ITER,
+        "init": config.kmeans_init,
+        "max_iter": int(config.kmeans_max_iter),
+        "batch_size": actual_batch_size,
+        "verbose": int(config.kmeans_verbose),
+        "compute_labels": bool(config.kmeans_compute_labels),
+        "random_state": seed,
+        "tol": float(config.kmeans_tol),
+        "max_no_improvement": config.kmeans_max_no_improvement,
+        "init_size": config.kmeans_init_size,
+        "n_init": config.kmeans_n_init,
+        "reassignment_ratio": float(config.kmeans_reassignment_ratio),
     }
+
+
+def _canonicalize_svd_component_signs(
+    components: np.ndarray,
+    *,
+    policy: str,
+) -> np.ndarray:
+    """Remove the mathematically arbitrary sign from every right singular vector."""
+
+    if policy != "largest_absolute_coordinate_positive_v1":
+        raise ValueError("unsupported cluster-local SVD sign policy")
+    output = np.asarray(components).copy()
+    if output.ndim != 2:
+        raise ValueError("cluster-local SVD components must be a matrix")
+    for index in range(output.shape[0]):
+        row = output[index]
+        pivot = int(np.argmax(np.abs(row)))
+        if not np.isfinite(row[pivot]) or row[pivot] == 0:
+            raise ValueError("cluster-local SVD component has no canonical sign pivot")
+        if row[pivot] < 0:
+            output[index] *= -1
+    return output
 
 
 class EmbeddingContrastEvidenceGenerator:
@@ -86,6 +148,8 @@ class EmbeddingContrastEvidenceGenerator:
         self._chunk_cache_reused = False
         self._concept_probe_skip_reason: Optional[str] = None
         self._external_corpora: List[Dict[str, Any]] = []
+        self._cluster_fit_row_ids: tuple[int, ...] | None = None
+        self._cluster_group_seed: int | None = None
 
     @property
     def enabled(self) -> bool:
@@ -123,6 +187,126 @@ class EmbeddingContrastEvidenceGenerator:
         self._external_corpora = self._load_external_corpora()
         self._prepared = True
 
+    def bind_cluster_physical_fit_authority(
+        self,
+        *,
+        ordered_fit_row_ids: Sequence[int],
+        canonical_group_seed: int,
+    ) -> None:
+        """Bind KMeans to one authenticated ordered physical-fit authority."""
+
+        rows = tuple(map(int, ordered_fit_row_ids))
+        seed = int(canonical_group_seed)
+        if (
+            not rows
+            or len(rows) != len(set(rows))
+            or any(row < 0 for row in rows)
+            or isinstance(canonical_group_seed, bool)
+            or not 0 <= seed < 2**31
+        ):
+            raise ValueError("cluster physical-fit authority is invalid")
+        if self._cluster_fit_row_ids is not None and (
+            self._cluster_fit_row_ids != rows or self._cluster_group_seed != seed
+        ):
+            raise RuntimeError("cluster physical-fit authority was rebound")
+        self._cluster_fit_row_ids = rows
+        self._cluster_group_seed = seed
+
+    def _cluster_physical_fit_authority(
+        self,
+        positions: Sequence[int],
+    ) -> tuple[tuple[int, ...], int]:
+        rows = tuple(int(self._row_ids[int(position)]) for position in positions)
+        observer = getattr(self, "_native_embedding_proof_observer", None)
+        observer_rows = getattr(observer, "fit_row_ids", None)
+        observer_seed = getattr(observer, "seed", None)
+        if observer_rows is not None or observer_seed is not None:
+            observed = tuple(map(int, observer_rows or ()))
+            if (
+                observed != rows
+                or isinstance(observer_seed, bool)
+                or not isinstance(observer_seed, int)
+            ):
+                raise ValueError(
+                    "native cluster observer differs from the ordered fit authority"
+                )
+            self.bind_cluster_physical_fit_authority(
+                ordered_fit_row_ids=observed,
+                canonical_group_seed=int(observer_seed),
+            )
+        if self._cluster_fit_row_ids != rows or self._cluster_group_seed is None:
+            raise ValueError(
+                "cluster-local embedding fit lacks its canonical ordered-row group seed"
+            )
+        return rows, int(self._cluster_group_seed)
+
+    def build_cluster_only_evidence(
+        self,
+        *,
+        discovery_df: pd.DataFrame,
+        y: np.ndarray,
+        t: np.ndarray,
+    ) -> Dict[str, Any]:
+        """Fit only KMeans plus the two configured cluster-local SVD families.
+
+        This is the readiness-preflight entry point.  It deliberately cannot
+        construct whole-cohort contrasts, concept probes, or any supervised
+        logistic model.
+        """
+
+        if not self.enabled or not bool(
+            self.embedding_config.include_cluster_contrast_vectors
+        ):
+            raise ValueError("cluster-only embedding evidence is disabled")
+        if not self._prepared:
+            self.prepare(discovery_df)
+        positions = self._positions_for_frame(discovery_df)
+        if len(positions) != len(discovery_df):
+            raise ValueError("cluster-only evidence lost an ordered discovery row")
+        self._cluster_physical_fit_authority(positions)
+        patient_embeddings = self._patient_embeddings(positions)
+        patient_embeddings = _residualize_embeddings(
+            patient_embeddings,
+            discovery_df,
+            self.embedding_config.residualize_columns,
+        )
+        config = _cluster_local_scientific_config(self.embedding_config)
+        patient_embeddings = _normalize_rows_configured(
+            patient_embeddings,
+            normalize=bool(config.normalize_patient_embeddings),
+            epsilon=float(config.normalization_epsilon),
+            zero_vector_policy=config.zero_vector_policy,
+            dtype=config.computation_dtype,
+        )
+        contrasts, summary = self._build_cluster_contrast_vectors(
+            positions=positions,
+            patient_embeddings=patient_embeddings,
+            y=np.asarray(y, dtype=float),
+            t=np.asarray(t, dtype=float),
+            concept_phrases=(),
+            concept_embeddings=None,
+        )
+        evidence: Dict[str, Any] = {
+            "enabled": True,
+            "execution_mode": "cluster_only_no_probe_or_whole_cohort_v1",
+            "model_name": self.embedding_config.model_name,
+            "unit": "patient_row",
+            "n_patients": len(positions),
+            "n_concept_phrases": 0,
+            "external_corpora": [],
+            "contrasts": contrasts,
+            "cluster_contrast_vectors": summary,
+        }
+        observer = getattr(self, "_native_embedding_proof_observer", None)
+        if observer is not None:
+            record = getattr(observer, "record_cluster_only_build", None)
+            if not callable(record):
+                raise TypeError(
+                    "cluster preflight observer has no cluster-only build method"
+                )
+            record(evidence=evidence)
+        return evidence
+
     def build_evidence(
         self,
         *,
@@ -143,6 +327,9 @@ class EmbeddingContrastEvidenceGenerator:
         positions = self._positions_for_frame(discovery_df)
         if not positions:
             return {"enabled": True, "skipped": "no_rows"}
+        cluster_config = self.embedding_config.cluster_local_scientific
+        if bool(self.embedding_config.include_cluster_contrast_vectors):
+            self._cluster_physical_fit_authority(positions)
 
         patient_embeddings = self._patient_embeddings(positions)
         patient_embeddings = _residualize_embeddings(
@@ -150,7 +337,16 @@ class EmbeddingContrastEvidenceGenerator:
             discovery_df,
             self.embedding_config.residualize_columns,
         )
-        patient_embeddings = _normalize_rows(patient_embeddings)
+        if cluster_config is None:
+            patient_embeddings = _normalize_rows(patient_embeddings)
+        else:
+            patient_embeddings = _normalize_rows_configured(
+                patient_embeddings,
+                normalize=bool(cluster_config.normalize_patient_embeddings),
+                epsilon=float(cluster_config.normalization_epsilon),
+                zero_vector_policy=cluster_config.zero_vector_policy,
+                dtype=cluster_config.computation_dtype,
+            )
 
         concept_phrases = self._concept_phrases(importance or {})
         self._concept_probe_skip_reason = None
@@ -377,6 +573,25 @@ class EmbeddingContrastEvidenceGenerator:
         return np.asarray(self._flat_embeddings[start:end], dtype=np.float32)
 
     def _patient_embeddings(self, positions: Sequence[int]) -> np.ndarray:
+        config = self.embedding_config.cluster_local_scientific
+        if config is not None:
+            dtype = np.dtype(config.computation_dtype)
+            pooled = []
+            for position in positions:
+                chunks = np.asarray(self._chunk_matrix(int(position)), dtype=dtype)
+                if chunks.ndim != 2 or chunks.shape[0] < 1:
+                    raise ValueError(
+                        "cluster-local pooling requires at least one authenticated "
+                        "chunk per patient"
+                    )
+                pooled.append(np.mean(chunks, axis=0, dtype=dtype))
+            return _normalize_rows_configured(
+                np.vstack(pooled).astype(dtype, copy=False),
+                normalize=bool(config.normalize_patient_embeddings),
+                epsilon=float(config.normalization_epsilon),
+                zero_vector_policy=config.zero_vector_policy,
+                dtype=config.computation_dtype,
+            )
         pooled = []
         for position in positions:
             chunks = self._chunk_matrix(int(position))
@@ -809,43 +1024,51 @@ class EmbeddingContrastEvidenceGenerator:
         concept_embeddings: Optional[np.ndarray],
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """Build SVD components over cluster-local contrast vectors."""
+        config = _cluster_local_scientific_config(self.embedding_config)
         usable = np.all(np.isfinite(patient_embeddings), axis=1)
         n_usable = int(np.sum(usable))
-        requested_clusters = int(self.embedding_config.cluster_contrast_n_clusters)
-        min_cluster_size = int(self.embedding_config.cluster_contrast_min_cluster_size)
-        feasible_by_size = n_usable // min_cluster_size
-        n_clusters = min(requested_clusters, feasible_by_size)
+        requested_clusters = int(config.requested_cluster_count)
+        min_cluster_size = int(config.minimum_cluster_size)
+        n_clusters = requested_clusters
         summary: Dict[str, Any] = {
             "enabled": True,
+            "execution_mode": "cluster_only_native_geometry_v1",
             "n_clusters_requested": requested_clusters,
+            "n_clusters": n_clusters,
+            "cluster_count_policy": config.cluster_count_policy,
             "min_cluster_size": min_cluster_size,
-            "min_group_size": int(self.embedding_config.cluster_contrast_min_group_size),
-            "min_cell_size": int(self.embedding_config.cluster_contrast_min_cell_size),
-            "max_components": int(self.embedding_config.cluster_contrast_max_components),
+            "min_group_size": int(config.minimum_group_size),
+            "min_cell_size": int(config.minimum_cell_size),
+            "max_components": int(config.maximum_components_per_family),
             "n_usable_patients": n_usable,
+            "scientific_configuration": config.as_dict(),
         }
-        if n_clusters < 2:
-            summary["skipped"] = "too_few_patients_for_cluster_contrasts"
-            return [], summary
+        if n_usable < requested_clusters * min_cluster_size:
+            raise ClusterLocalEmbeddingFeasibilityError(
+                "cluster-local exact configured cluster count is infeasible for "
+                "the minimum support requirement",
+                summary=summary,
+            )
 
+        _ordered_rows, canonical_group_seed = (
+            self._cluster_physical_fit_authority(positions)
+        )
         kmeans_parameters = _embedding_cluster_kmeans_parameters(
             self.embedding_config,
             n_usable=n_usable,
+            canonical_group_seed=canonical_group_seed,
             n_clusters=n_clusters,
         )
-        try:
-            kmeans = MiniBatchKMeans(**kmeans_parameters)
-            cluster_labels = np.full(len(patient_embeddings), -1, dtype=int)
-            cluster_labels[usable] = kmeans.fit_predict(patient_embeddings[usable])
-        except Exception as exc:
-            logger.warning("Cluster contrast vector construction failed during clustering: %s", exc)
-            summary["skipped"] = "clustering_failed"
-            summary["error"] = str(exc)
-            return [], summary
+        kmeans = MiniBatchKMeans(**kmeans_parameters)
+        cluster_labels = np.full(len(patient_embeddings), -1, dtype=int)
+        cluster_labels[usable] = kmeans.fit_predict(patient_embeddings[usable])
 
         cluster_counts = np.bincount(cluster_labels[usable], minlength=n_clusters).astype(int)
         summary["n_clusters"] = int(n_clusters)
         summary["cluster_counts"] = [int(item) for item in cluster_counts]
+        summary["actual_kmeans_parameters"] = copy.deepcopy(kmeans_parameters)
+        summary["actual_canonical_group_seed"] = canonical_group_seed
+        summary["actual_batch_size"] = int(kmeans_parameters["batch_size"])
         native_observer = getattr(self, "_native_embedding_proof_observer", None)
         if native_observer is not None:
             record_kmeans = getattr(native_observer, "record_cluster_kmeans", None)
@@ -862,6 +1085,11 @@ class EmbeddingContrastEvidenceGenerator:
                 n_iter=int(kmeans.n_iter_),
                 inertia=float(kmeans.inertia_),
                 parameters=kmeans_parameters,
+                scientific_configuration=config.as_dict(),
+                canonical_group_seed=canonical_group_seed,
+                ordered_fit_row_seed_policy=(
+                    config.kmeans_seed_derivation_policy
+                ),
             )
 
         records: List[Dict[str, Any]] = []
@@ -882,6 +1110,17 @@ class EmbeddingContrastEvidenceGenerator:
         )
         summary["usable_treatment_local_contrasts"] = len(treatment_items)
         summary["usable_residualized_interaction_local_contrasts"] = len(interaction_items)
+        if (
+            len(treatment_items)
+            < int(config.minimum_distinct_local_clusters_per_family)
+            or len(interaction_items)
+            < int(config.minimum_distinct_local_clusters_per_family)
+        ):
+            raise ClusterLocalEmbeddingFeasibilityError(
+                "cluster-local evidence lacks the configured number of "
+                "independently supported local contrasts",
+                summary=summary,
+            )
         records.extend(
             self._cluster_component_records(
                 family_key="treatment",
@@ -923,8 +1162,14 @@ class EmbeddingContrastEvidenceGenerator:
             )
         )
         summary["n_cluster_contrast_components"] = len(records)
-        if not records:
-            summary["skipped"] = "too_few_usable_local_contrasts"
+        expected_minimum = (
+            2 * int(config.minimum_numerical_rank_per_family)
+        )
+        if len(records) < expected_minimum:
+            raise ClusterLocalEmbeddingFeasibilityError(
+                "cluster-local evidence emitted fewer components than its rank contract",
+                summary=summary,
+            )
         return records, summary
 
     def _cluster_treatment_local_contrasts(
@@ -937,8 +1182,9 @@ class EmbeddingContrastEvidenceGenerator:
         cluster_counts: np.ndarray,
     ) -> List[Dict[str, Any]]:
         labels, treatment_mask = _binary_labels(t)
-        min_cluster_size = int(self.embedding_config.cluster_contrast_min_cluster_size)
-        min_group_size = int(self.embedding_config.cluster_contrast_min_group_size)
+        config = _cluster_local_scientific_config(self.embedding_config)
+        min_cluster_size = int(config.minimum_cluster_size)
+        min_group_size = int(config.minimum_group_size)
         items: List[Dict[str, Any]] = []
         for cluster_id in range(n_clusters):
             if int(cluster_counts[cluster_id]) < min_cluster_size:
@@ -954,7 +1200,7 @@ class EmbeddingContrastEvidenceGenerator:
             direction = (
                 np.mean(patient_embeddings[positive_mask], axis=0)
                 - np.mean(patient_embeddings[negative_mask], axis=0)
-            ).astype(np.float32)
+            ).astype(np.dtype(config.computation_dtype), copy=False)
             direction_norm = float(np.linalg.norm(direction))
             if not np.isfinite(direction_norm) or direction_norm <= 0.0:
                 continue
@@ -982,8 +1228,9 @@ class EmbeddingContrastEvidenceGenerator:
     ) -> List[Dict[str, Any]]:
         treatment_labels, treatment_mask = _binary_labels(t)
         outcome_labels, outcome_mask, _positive_label, _negative_label = self._outcome_label_spec(y)
-        min_cluster_size = int(self.embedding_config.cluster_contrast_min_cluster_size)
-        min_cell_size = int(self.embedding_config.cluster_contrast_min_cell_size)
+        config = _cluster_local_scientific_config(self.embedding_config)
+        min_cluster_size = int(config.minimum_cluster_size)
+        min_cell_size = int(config.minimum_cell_size)
         items: List[Dict[str, Any]] = []
         for cluster_id in range(n_clusters):
             if int(cluster_counts[cluster_id]) < min_cluster_size:
@@ -1007,7 +1254,7 @@ class EmbeddingContrastEvidenceGenerator:
                 - np.mean(patient_embeddings[treated_negative], axis=0)
                 - np.mean(patient_embeddings[untreated_positive], axis=0)
                 + np.mean(patient_embeddings[untreated_negative], axis=0)
-            ).astype(np.float32)
+            ).astype(np.dtype(config.computation_dtype), copy=False)
             local_treatment_direction, _ = _binary_mean_difference_direction(
                 patient_embeddings,
                 treatment_labels,
@@ -1056,18 +1303,46 @@ class EmbeddingContrastEvidenceGenerator:
         concept_phrases: Sequence[str],
         concept_embeddings: Optional[np.ndarray],
     ) -> List[Dict[str, Any]]:
-        if len(items) < 2:
-            return []
+        config = _cluster_local_scientific_config(self.embedding_config)
+        if len(items) < int(config.minimum_distinct_local_clusters_per_family):
+            raise ValueError(
+                f"cluster-local {family_key} family lacks configured local support"
+            )
+        dtype = np.dtype(config.computation_dtype)
         weighted_rows = []
         for item in items:
-            direction = _normalize_vector(np.asarray(item["direction"], dtype=np.float32))
+            direction = _normalize_rows_configured(
+                np.asarray(item["direction"], dtype=dtype).reshape(1, -1),
+                normalize=True,
+                epsilon=float(config.normalization_epsilon),
+                zero_vector_policy=config.zero_vector_policy,
+                dtype=config.computation_dtype,
+            )[0]
             weighted_rows.append(direction * np.sqrt(float(item["n_cluster"])))
-        matrix = np.vstack(weighted_rows).astype(np.float32, copy=False)
-        try:
-            _left, singular_values, components = np.linalg.svd(matrix, full_matrices=False)
-        except np.linalg.LinAlgError:
-            logger.warning("Cluster contrast SVD failed for %s contrasts", family_key)
-            return []
+        matrix = np.vstack(weighted_rows).astype(dtype, copy=False)
+        _left, singular_values, components = np.linalg.svd(
+            matrix,
+            full_matrices=bool(config.svd_full_matrices),
+            compute_uv=bool(config.svd_compute_uv),
+            hermitian=bool(config.svd_hermitian),
+        )
+        components = _canonicalize_svd_component_signs(
+            components,
+            policy=config.svd_sign_canonicalization_policy,
+        )
+        total_energy = float(np.sum(np.square(singular_values)))
+        rank_dtype = np.dtype(config.svd_rank_tolerance_dtype)
+        rank_tolerance = (
+            float(config.svd_rank_tolerance_multiplier)
+            * float(np.finfo(rank_dtype).eps)
+            * max(matrix.shape)
+            * float(singular_values[0])
+        )
+        numerical_rank = int(np.sum(singular_values > rank_tolerance))
+        if numerical_rank < int(config.minimum_numerical_rank_per_family):
+            raise ValueError(
+                f"cluster-local {family_key} SVD lacks configured numerical rank"
+            )
         native_observer = getattr(self, "_native_embedding_proof_observer", None)
         if native_observer is not None:
             record_svd = getattr(native_observer, "record_cluster_svd", None)
@@ -1079,22 +1354,53 @@ class EmbeddingContrastEvidenceGenerator:
                 weighted_matrix=matrix,
                 singular_values=singular_values,
                 components=components,
+                parameters={
+                    "full_matrices": bool(config.svd_full_matrices),
+                    "compute_uv": bool(config.svd_compute_uv),
+                    "hermitian": bool(config.svd_hermitian),
+                },
+                sign_canonicalization_policy=(
+                    config.svd_sign_canonicalization_policy
+                ),
+                rank_tolerance_policy=config.svd_rank_tolerance_policy,
+                rank_tolerance_dtype=config.svd_rank_tolerance_dtype,
+                rank_tolerance_multiplier=float(
+                    config.svd_rank_tolerance_multiplier
+                ),
+                rank_tolerance=float(rank_tolerance),
+                numerical_rank=numerical_rank,
+                replay_comparison_policy=config.replay_comparison_policy,
+                replay_relative_tolerance=float(
+                    config.replay_relative_tolerance
+                ),
+                replay_absolute_tolerance=float(
+                    config.replay_absolute_tolerance
+                ),
             )
-        total_energy = float(np.sum(np.square(singular_values)))
         max_components = min(
-            int(self.embedding_config.cluster_contrast_max_components),
-            len(singular_values),
+            int(config.maximum_components_per_family),
+            numerical_rank,
         )
         records: List[Dict[str, Any]] = []
         for component_index in range(max_components):
             singular_value = float(singular_values[component_index])
             if not np.isfinite(singular_value) or singular_value <= 0.0:
                 continue
-            direction = _normalize_vector(components[component_index])
+            direction = _normalize_rows_configured(
+                np.asarray(components[component_index]).reshape(1, -1),
+                normalize=True,
+                epsilon=float(config.normalization_epsilon),
+                zero_vector_policy=config.zero_vector_policy,
+                dtype=config.computation_dtype,
+            )[0]
             loadings = np.asarray(matrix @ direction, dtype=float)
-            top_indices = np.argsort(np.abs(loadings))[::-1][
-                : int(self.embedding_config.cluster_contrast_top_loadings)
-            ]
+            top_indices = np.argsort(np.abs(loadings))[::-1]
+            capacity = config.loading_evidence_capacity
+            if capacity is not None and len(top_indices) > int(capacity):
+                raise ValueError(
+                    "cluster-local loading evidence exceeds its configured "
+                    "capacity; truncation is forbidden"
+                )
             loading_rows = []
             for item_index in top_indices:
                 item = items[int(item_index)]
@@ -1128,6 +1434,13 @@ class EmbeddingContrastEvidenceGenerator:
                 "cluster_component_explained_energy": _finite_or_none(
                     float(singular_value**2 / total_energy) if total_energy > 0.0 else np.nan
                 ),
+                "cluster_component_sign_policy": (
+                    config.svd_sign_canonicalization_policy
+                ),
+                "cluster_component_rank_tolerance": _finite_or_none(
+                    rank_tolerance
+                ),
+                "cluster_component_numerical_rank": numerical_rank,
                 "cluster_component_loadings": loading_rows,
                 "mean_difference_norm": None,
             }
@@ -1797,6 +2110,31 @@ def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
     matrix = np.asarray(matrix, dtype=np.float32)
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     return matrix / np.maximum(norms, 1e-12)
+
+
+def _normalize_rows_configured(
+    matrix: np.ndarray,
+    *,
+    normalize: bool,
+    epsilon: float,
+    zero_vector_policy: str,
+    dtype: str,
+) -> np.ndarray:
+    resolved_dtype = np.dtype(dtype)
+    values = np.asarray(matrix, dtype=resolved_dtype)
+    if values.ndim != 2 or not np.isfinite(values).all():
+        raise ValueError("configured embedding matrix must be finite and two-dimensional")
+    if not normalize:
+        return values
+    norms = np.linalg.norm(values, axis=1, keepdims=True)
+    if zero_vector_policy != "reject":
+        raise ValueError("configured cluster-local zero-vector policy is unsupported")
+    if np.any(~np.isfinite(norms)) or np.any(norms <= float(epsilon)):
+        raise ValueError("cluster-local normalization encountered a zero vector")
+    normalized = values / norms
+    if not np.isfinite(normalized).all():
+        raise ValueError("cluster-local normalized patient embeddings are non-finite")
+    return normalized.astype(resolved_dtype, copy=False)
 
 
 def _normalize_vector(vector: np.ndarray) -> np.ndarray:

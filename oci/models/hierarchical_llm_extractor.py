@@ -25,6 +25,10 @@ import torch
 import torch.nn as nn
 
 from .gated_attention_pooling import GatedAttentionPooling
+from .lossless_tokenization import (
+    require_nonbinding_chunk_capacity,
+    tokenize_losslessly,
+)
 from .text_chunking import chunk_token_ids
 from .gpu_hidden_state_store import _get_hidden_size
 
@@ -87,6 +91,14 @@ class HierarchicalLLMExtractor(nn.Module):
         self._downprojection_dim = downprojection_dim
         self._skip_llm = skip_llm
         self._chat_template_prompt = chat_template_prompt
+
+        require_nonbinding_chunk_capacity(
+            0,
+            chunk_size=self._chunk_size,
+            chunk_overlap=self._chunk_overlap,
+            max_chunks=self._max_chunks,
+            context="HierarchicalLLMExtractor configuration",
+        )
 
         if skip_llm:
             if cached_hidden_size <= 0:
@@ -230,8 +242,8 @@ class HierarchicalLLMExtractor(nn.Module):
         if self._model is None:
             raise RuntimeError("LLM not loaded (skip_llm=True). Provide cached hidden states.")
 
-        # Tokenize full texts (no truncation here; chunking handles length)
-        max_total_tokens = self._chunk_size * self._max_chunks
+        # Tokenize every complete text.  max_chunks is a fail-closed capacity,
+        # never permission to select only a prefix/tail of the note.
         prepared = [self._prepare_text(t) for t in texts]
 
         # Tokenize all texts to get token IDs, then chunk
@@ -240,11 +252,21 @@ class HierarchicalLLMExtractor(nn.Module):
         sample_chunk_counts = []  # how many chunks each sample has
 
         for text in prepared:
-            encoding = self._tokenizer(
-                text, truncation=True, max_length=max_total_tokens,
+            encoding = tokenize_losslessly(
+                self._tokenizer,
+                text,
+                configured_max_length=None,
+                context="HierarchicalLLMExtractor document",
                 return_tensors="pt", padding=False,
             )
             token_ids = encoding['input_ids'][0].tolist()
+            require_nonbinding_chunk_capacity(
+                len(token_ids),
+                chunk_size=self._chunk_size,
+                chunk_overlap=self._chunk_overlap,
+                max_chunks=self._max_chunks,
+                context="HierarchicalLLMExtractor document",
+            )
             chunks = chunk_token_ids(
                 token_ids, self._chunk_size, self._chunk_overlap, self._max_chunks
             )

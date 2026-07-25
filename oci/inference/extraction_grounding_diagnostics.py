@@ -25,8 +25,9 @@ import pandas as pd
 
 from .all_evidence_fusion import CandidateContract, source_text_temporal_policy_audit
 from .frozen_extraction_cache_overlay import expected_extraction_columns
+from .post_extraction_scientific_policy import ExtractionGroundingPolicy
 
-EXTRACTION_GROUNDING_DIAGNOSTIC_VERSION = "extraction_grounding_diagnostic_v5"
+EXTRACTION_GROUNDING_DIAGNOSTIC_VERSION = "extraction_grounding_diagnostic_v6"
 
 _NOTE_BREAK = re.compile(r"\s*<new_note>\s*", re.IGNORECASE)
 _WORD = re.compile(r"[a-z0-9]+")
@@ -148,7 +149,9 @@ def _contract_anchor_groups(
         singleton = (token,)
         if singleton not in groups:
             groups.append(singleton)
-    return tuple(groups[:4])
+    # Preserve every source-attested signature. A fixed top-k selection would
+    # silently omit valid dataset-specific identifiers.
+    return tuple(groups)
 
 
 def _contract_anchor_tokens(groups: Sequence[Sequence[str]]) -> tuple[str, ...]:
@@ -267,10 +270,15 @@ def _declared_category_index(value: Any, spec: Mapping[str, Any]) -> int | None:
     return matches[0] if len(matches) == 1 else None
 
 
-def _category_match_is_asserted(segment: str, match: _ValueMatch) -> bool:
+def _category_match_is_asserted(
+    segment: str,
+    match: _ValueMatch,
+    *,
+    prefix_chars: int,
+) -> bool:
     """Conservatively reject negated or hypothetical category mentions."""
 
-    prefix = segment[max(0, match.start - 64) : match.start]
+    prefix = segment[max(0, match.start - int(prefix_chars)) : match.start]
     return _UNASSERTED_CATEGORY_PREFIX.search(prefix) is None
 
 
@@ -381,7 +389,7 @@ def _row_support(
     spec: Mapping[str, Any],
     anchor_groups: Sequence[Sequence[str]],
     unit_pattern: re.Pattern[str] | None,
-    window_chars: int,
+    policy: ExtractionGroundingPolicy,
 ) -> Mapping[str, Any]:
     segments = [segment for segment in _NOTE_BREAK.split(_normalize(text)) if segment]
     if not segments:
@@ -392,24 +400,41 @@ def _row_support(
     anchor_found = False
     supported_categories: set[int] = set()
     for segment in segments:
-        anchors = _anchor_spans(segment, anchor_groups)
+        anchors = _anchor_spans(
+            segment,
+            anchor_groups,
+            maximum_group_span=policy.maximum_group_span_chars,
+        )
         anchor_found = anchor_found or bool(anchors)
+        unit_window_chars = max(
+            int(policy.unit_window_min_chars),
+            min(
+                int(policy.unit_window_max_chars),
+                int(policy.anchor_value_window_chars)
+                // int(policy.unit_window_divisor),
+            ),
+        )
         matches = _value_matches(
             segment,
             value=value,
             spec=spec,
             unit_pattern=unit_pattern,
-            unit_window_chars=max(12, min(32, int(window_chars) // 3)),
+            unit_window_chars=unit_window_chars,
         )
         for value_match in matches:
             if (
                 str(spec["type"]) == "categorical"
-                and not _category_match_is_asserted(segment, value_match)
+                and not _category_match_is_asserted(
+                    segment,
+                    value_match,
+                    prefix_chars=policy.category_assertion_prefix_chars,
+                )
             ):
                 continue
             value_span = (value_match.start, value_match.end)
             if not any(
-                _span_distance(anchor, value_span) <= int(window_chars)
+                _span_distance(anchor, value_span)
+                <= int(policy.anchor_value_window_chars)
                 and _same_local_clause(anchor, value_span, segment)
                 for anchor in anchors
             ):
@@ -425,14 +450,19 @@ def _row_support(
                     value=category,
                     spec=spec,
                     unit_pattern=None,
-                    unit_window_chars=max(12, min(32, int(window_chars) // 3)),
+                    unit_window_chars=unit_window_chars,
                 )
                 for category_match in category_matches:
-                    if not _category_match_is_asserted(segment, category_match):
+                    if not _category_match_is_asserted(
+                        segment,
+                        category_match,
+                        prefix_chars=policy.category_assertion_prefix_chars,
+                    ):
                         continue
                     category_span = (category_match.start, category_match.end)
                     if not any(
-                        _span_distance(anchor, category_span) <= int(window_chars)
+                        _span_distance(anchor, category_span)
+                        <= int(policy.anchor_value_window_chars)
                         and _same_local_clause(anchor, category_span, segment)
                         for anchor in anchors
                     ):
@@ -465,6 +495,7 @@ def build_extraction_grounding_diagnostics(
     specs: Sequence[Mapping[str, Any]],
     *,
     diagnostic_start: int = 1,
+    policy: ExtractionGroundingPolicy | None = None,
     window_chars: int = 96,
     minimum_evaluable_rows: int = 3,
     maximum_alternative_category_only_rate: float = 0.50,
@@ -482,12 +513,30 @@ def build_extraction_grounding_diagnostics(
         raise ValueError("texts must contain one exact string per extracted row")
     if isinstance(diagnostic_start, bool) or int(diagnostic_start) < 1:
         raise ValueError("diagnostic_start must be a positive integer")
-    if int(window_chars) < 40:
-        raise ValueError("window_chars must be at least 40")
-    if int(minimum_evaluable_rows) < 1:
-        raise ValueError("minimum_evaluable_rows must be positive")
-    if not 0.0 <= float(maximum_alternative_category_only_rate) <= 1.0:
-        raise ValueError("maximum_alternative_category_only_rate must be in [0, 1]")
+    if policy is None:
+        # Compatibility-only behavior. The typed portable workflow supplies
+        # the complete closed policy and never enters this branch.
+        policy = ExtractionGroundingPolicy(
+            anchor_group_selection="all_source_attested_unbounded",
+            maximum_group_span_chars=96,
+            anchor_value_window_chars=int(window_chars),
+            category_assertion_prefix_chars=64,
+            unit_window_min_chars=12,
+            unit_window_max_chars=32,
+            unit_window_divisor=3,
+            minimum_evaluable_rows=int(minimum_evaluable_rows),
+            maximum_alternative_category_only_rate=float(
+                maximum_alternative_category_only_rate
+            ),
+            unsupported_value_warning_rate=0.25,
+            minimum_unit_support_rate=0.50,
+        )
+    elif not isinstance(policy, ExtractionGroundingPolicy):
+        raise TypeError("policy must be ExtractionGroundingPolicy")
+    if int(policy.anchor_value_window_chars) < 40:
+        raise ValueError(
+            "extraction grounding anchor_value_window_chars must be at least 40"
+        )
 
     canonical = [CandidateContract(spec).extraction_spec for spec in specs]
     diagnostics: list[dict[str, Any]] = []
@@ -527,7 +576,7 @@ def build_extraction_grounding_diagnostics(
                 spec=spec,
                 anchor_groups=anchor_groups,
                 unit_pattern=unit_pattern,
-                window_chars=int(window_chars),
+                policy=policy,
             )
             supported_categories = tuple(support["declared_category_supported_indices"])
             category_conflict = len(supported_categories) > 1
@@ -574,7 +623,10 @@ def build_extraction_grounding_diagnostics(
         )
         hard_failures: list[str] = []
         warnings: list[str] = []
-        if observed and unsupported_rate > 0.25:
+        if (
+            observed
+            and unsupported_rate > float(policy.unsupported_value_warning_rate)
+        ):
             warnings.append("many_values_not_lexically_grounded_to_contract")
         if counters["missing_single_category"]:
             warnings.append("missing_rows_have_single_declared_category_support")
@@ -583,9 +635,11 @@ def build_extraction_grounding_diagnostics(
         if counters["category_conflict"]:
             warnings.append("multiple_declared_categories_supported_near_anchor")
         if (
-            locally_grounded_alternative_count >= int(minimum_evaluable_rows)
-            and category_evaluable >= int(minimum_evaluable_rows)
-            and locally_grounded_alternative_rate > float(maximum_alternative_category_only_rate)
+            locally_grounded_alternative_count
+            >= int(policy.minimum_evaluable_rows)
+            and category_evaluable >= int(policy.minimum_evaluable_rows)
+            and locally_grounded_alternative_rate
+            > float(policy.maximum_alternative_category_only_rate)
         ):
             hard_failures.append("alternative_category_only_value_support")
         if not anchor_groups:
@@ -597,8 +651,8 @@ def build_extraction_grounding_diagnostics(
         )
         if (
             unit_rate is not None
-            and counters["unit_evaluable"] >= int(minimum_evaluable_rows)
-            and unit_rate < 0.50
+            and counters["unit_evaluable"] >= int(policy.minimum_evaluable_rows)
+            and unit_rate < float(policy.minimum_unit_support_rate)
         ):
             warnings.append("expected_unit_not_consistently_supported")
 

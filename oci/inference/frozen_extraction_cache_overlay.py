@@ -61,6 +61,18 @@ def canonical_extraction_contract(spec: Mapping[str, Any] | Any) -> dict[str, An
     if not isinstance(spec, Mapping):
         raise TypeError("an extraction contract must be a mapping or dataclass")
     contract = dict(spec)
+    compatibility_defaults = {
+        "temporal_rule": "use_only_complete_prepared_decision_time_text",
+        "aggregation_rule": "reconcile_all_pages_without_loss",
+    }
+    for name, expected in compatibility_defaults.items():
+        if name not in contract:
+            continue
+        if contract.pop(name) != expected:
+            raise ValueError(
+                "legacy extraction-cache identities cannot reuse a feature "
+                f"with a nonlegacy {name}"
+            )
     allowed = {"name", "type", "categories", "description", "roles", "value_aliases"}
     unexpected = set(contract) - allowed
     if unexpected:
@@ -211,9 +223,9 @@ class FrozenExtractionCacheOverlay:
         self,
         index_paths: Sequence[Path | str],
         *,
-        expected_row_count: int = 1000,
-        row_id_column: str = "_oci_row_id",
-        text_column: str = "text",
+        expected_row_count: int,
+        row_id_column: str,
+        text_column: str,
     ) -> None:
         if int(expected_row_count) < 1:
             raise ValueError("expected_row_count must be positive")

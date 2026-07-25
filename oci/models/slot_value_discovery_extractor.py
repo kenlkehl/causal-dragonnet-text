@@ -14,6 +14,7 @@ import torch.nn.functional as F
 
 from .concept_embedding_cache import load_sentence_transformer
 from .concept_embedding_utils import chunk_text_words
+from .lossless_tokenization import SemanticTruncationError
 
 
 logger = logging.getLogger(__name__)
@@ -407,7 +408,13 @@ class SlotValueDiscoveryExtractor(nn.Module):
         ]
         adjusted = []
         for chunks in sample_chunks:
-            row = list(chunks[:max_len])
+            if len(chunks) > max_len:
+                raise SemanticTruncationError(
+                    "SlotValueDiscovery value-feature chunk capacity is smaller "
+                    "than the complete chunk plan; semantic truncation is forbidden "
+                    f"({len(chunks)} > {max_len})"
+                )
+            row = list(chunks)
             if len(row) < max_len:
                 row.extend([""] * (max_len - len(row)))
             adjusted.append(row)

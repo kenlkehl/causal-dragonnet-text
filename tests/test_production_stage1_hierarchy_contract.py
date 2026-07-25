@@ -127,8 +127,12 @@ def test_contract_encodes_architecture_local_then_lossless_cross_architecture_wo
     assert hierarchy["resolver"] == "exact_authenticated_catalog_evidence_id_only"
     assert hierarchy["model_written_or_unknown_ids_allowed"] is False
     assert hierarchy["one_raw_evidence_item_per_page"] is True
-    assert hierarchy["maximum_fold_inputs"] == 8
-    assert hierarchy["maximum_fresh_inputs_after_first_fold"] == 7
+    assert hierarchy[
+        "maximum_fold_inputs_configured_by_hierarchy_wire_budget"
+    ] is True
+    assert hierarchy[
+        "maximum_fresh_inputs_after_first_fold_derived_from_configured_fan_in"
+    ] is True
     assert hierarchy["integration_rejection_and_extraction_all_use_pages_and_folds"] is True
     assert hierarchy["every_input_receives_an_explicit_disposition"] is True
     assert hierarchy["semantic_sampling_or_truncation"] is False

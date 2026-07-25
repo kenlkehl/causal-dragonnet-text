@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 
-SOURCE_SNAPSHOT_SCHEMA = "production_source_snapshot_v1"
+SOURCE_SNAPSHOT_SCHEMA = "production_source_snapshot_v2"
 SOURCE_SNAPSHOT_MANIFEST = "source_snapshot_manifest.json"
 _MANIFEST_FIELDS = frozenset(
     {
@@ -24,6 +24,7 @@ _MANIFEST_FIELDS = frozenset(
         "file_count",
         "python_bytecode_writes_allowed",
         "content_sha256",
+        "locator_attestation_sha256",
     }
 )
 _INVENTORY_FIELDS = frozenset({"relative_path", "sha256", "size_bytes"})
@@ -51,6 +52,32 @@ def _canonical_json(value: Any) -> str:
 
 def _sha256_json(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _scientific_snapshot_body(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the path-neutral source content authenticated scientifically."""
+
+    return {
+        "schema_version": value.get("schema_version"),
+        "files": value.get("files"),
+        "file_count": value.get("file_count"),
+        "python_bytecode_writes_allowed": value.get(
+            "python_bytecode_writes_allowed"
+        ),
+    }
+
+
+def _locator_attestation_body(
+    *,
+    source_repository: str,
+    content_sha256: str,
+) -> dict[str, str]:
+    """Bind the operational producer locator without changing code identity."""
+
+    return {
+        "source_repository": source_repository,
+        "content_sha256": content_sha256,
+    }
 
 
 def _stat_signature(value: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
@@ -225,14 +252,25 @@ def create_production_source_snapshot(
                 or observed_size != int(row["size_bytes"])
             ):
                 raise RuntimeError(f"source snapshot copy changed bytes: {relative}")
-        body = {
+        scientific_body = {
             "schema_version": SOURCE_SNAPSHOT_SCHEMA,
-            "source_repository": str(repository),
             "files": list(inventory),
             "file_count": len(inventory),
             "python_bytecode_writes_allowed": False,
         }
-        manifest = {**body, "content_sha256": _sha256_json(body)}
+        content_sha256 = _sha256_json(scientific_body)
+        source_repository = str(repository)
+        manifest = {
+            **scientific_body,
+            "source_repository": source_repository,
+            "content_sha256": content_sha256,
+            "locator_attestation_sha256": _sha256_json(
+                _locator_attestation_body(
+                    source_repository=source_repository,
+                    content_sha256=content_sha256,
+                )
+            ),
+        }
         manifest_path = temporary / SOURCE_SNAPSHOT_MANIFEST
         manifest_path.write_text(
             json.dumps(manifest, indent=2, sort_keys=True),
@@ -289,18 +327,30 @@ def validate_production_source_snapshot(
         raise ValueError("source snapshot manifest must be one object")
     if set(value) != set(_MANIFEST_FIELDS):
         raise ValueError("source snapshot manifest is not a closed schema")
-    body = {key: item for key, item in value.items() if key != "content_sha256"}
-    files = body.get("files")
+    files = value.get("files")
+    scientific_body = _scientific_snapshot_body(value)
+    source_repository = value.get("source_repository")
+    content_sha256 = value.get("content_sha256")
+    locator_attestation_sha256 = value.get("locator_attestation_sha256")
     if (
-        body.get("schema_version") != SOURCE_SNAPSHOT_SCHEMA
-        or body.get("python_bytecode_writes_allowed") is not False
-        or not isinstance(body.get("source_repository"), str)
-        or not Path(body["source_repository"]).is_absolute()
+        scientific_body.get("schema_version") != SOURCE_SNAPSHOT_SCHEMA
+        or scientific_body.get("python_bytecode_writes_allowed") is not False
+        or not isinstance(source_repository, str)
+        or not Path(source_repository).is_absolute()
         or not isinstance(files, list)
-        or body.get("file_count") != len(files)
-        or not isinstance(value.get("content_sha256"), str)
-        or _SHA256.fullmatch(value["content_sha256"]) is None
-        or value.get("content_sha256") != _sha256_json(body)
+        or scientific_body.get("file_count") != len(files)
+        or not isinstance(content_sha256, str)
+        or _SHA256.fullmatch(content_sha256) is None
+        or content_sha256 != _sha256_json(scientific_body)
+        or not isinstance(locator_attestation_sha256, str)
+        or _SHA256.fullmatch(locator_attestation_sha256) is None
+        or locator_attestation_sha256
+        != _sha256_json(
+            _locator_attestation_body(
+                source_repository=source_repository,
+                content_sha256=content_sha256,
+            )
+        )
     ):
         raise ValueError("source snapshot manifest identity is invalid")
 
@@ -382,7 +432,7 @@ def validate_production_source_snapshot(
     return ProductionSourceSnapshot(
         root=root,
         manifest_path=manifest_path,
-        content_sha256=str(value["content_sha256"]),
+        content_sha256=content_sha256,
         file_count=len(files),
     )
 

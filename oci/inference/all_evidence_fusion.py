@@ -26,10 +26,10 @@ import re
 from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any, Hashable, Mapping, Sequence
 
-FUSION_PROMPT_VERSION = "all_evidence_candidate_fusion_v9"
+FUSION_PROMPT_VERSION = "all_evidence_candidate_fusion_v10"
 EVIDENCE_CONTRACT_GROUNDING_VERSION = "all_evidence_contract_name_grounding_v2"
 LEGACY_COMPACTION_STRATEGY_VERSION = "legacy_multiaxis_interleave_v1"
-EXACT_INNER_RECURRENCE_VERSION = "exact_inner_normalized_term_recurrence_v1"
+EXACT_INNER_RECURRENCE_VERSION = "exact_inner_normalized_term_recurrence_v2"
 SOURCE_TEXT_TEMPORAL_POLICY = "source_text_temporally_valid_by_design_v1"
 SOURCE_TEXT_TEMPORAL_BOUNDARY_ENFORCED = False
 
@@ -234,7 +234,6 @@ _MAX_ROWS_PER_GROUP = 16
 _MAX_TOPICS_PER_BANK = 12
 _MAX_TERMS_PER_TOPIC = 15
 _MAX_QUERY_ITEMS = 24
-_MAX_EXACT_INNER_RECURRENCE_TERMS = 24
 _MAX_TEXT_CHARS = 420
 _MAX_CANDIDATE_POOL = 256
 
@@ -874,12 +873,14 @@ def render_all_evidence_fusion_prompt(request: AllEvidenceFusionRequest) -> str:
         "codes, and structural name words cannot establish that match. Never use an "
         "unrelated real block merely because its opaque ID and source family are "
         "valid.\n\n"
-        "For a categorical proposal, provide 2-8 mutually exclusive, canonical "
-        "values specific to that variable. Optional value_aliases must map exact "
-        "canonical categories to nonoverlapping normalized surface forms. Omit both "
-        "categories and value_aliases for a continuous proposal. The response-contract "
-        "values are shape examples, not reusable content: never return schema "
-        "instructions or placeholder labels as category values.\n\n"
+        "For a categorical proposal, provide every supported mutually exclusive, "
+        "canonical value specific to that variable, with at least two values. Do not "
+        "collapse or omit supported values to meet an implicit category-count cap. "
+        "Optional value_aliases must map exact canonical categories to nonoverlapping "
+        "normalized surface forms. Omit both categories and value_aliases for a "
+        "continuous proposal. The response-contract values are shape examples, not "
+        "reusable content: never return schema instructions or placeholder labels as "
+        "category values.\n\n"
         f"{action} Return exactly one JSON object and at most "
         f"{request.max_candidates} candidates.\n\n"
         f"Fusion context:\n{payload}"
@@ -1632,13 +1633,14 @@ def build_all_evidence_fusion_repair_prompt(
 }"""
         mode_rules = (
             "Propose only variables grounded in the supplied evidence IDs. For a "
-            "categorical proposal, replace the example categories with 2-8 "
-            "mutually exclusive canonical values specific to that variable. Omit "
-            "categories and value_aliases for continuous proposals. For a categorical "
-            "proposal, value_aliases is optional; when supplied, its keys must exactly "
-            "match declared categories and every normalized alias must belong to only "
-            "one category. Never use schema instructions or placeholder labels as "
-            "category values."
+            "categorical proposal, replace the example categories with every supported "
+            "mutually exclusive canonical value specific to that variable, with at "
+            "least two values; never omit values to meet an implicit category-count "
+            "cap. Omit categories and value_aliases for continuous proposals. For a "
+            "categorical proposal, value_aliases is optional; when supplied, its keys "
+            "must exactly match declared categories and every normalized alias must "
+            "belong to only one category. Never use schema instructions or placeholder "
+            "labels as category values."
         )
     return f"""The previous all-evidence fusion response failed these checks:
 {issue_lines}
@@ -2093,8 +2095,8 @@ def _validate_extraction_spec(spec: Mapping[str, Any], *, source: str) -> None:
     categories = spec.get("categories")
     value_aliases = spec.get("value_aliases")
     if feature_type == "categorical":
-        if not isinstance(categories, list) or not 2 <= len(categories) <= 8:
-            raise ValueError(f"{source}.categories requires at least two and at most eight values")
+        if not isinstance(categories, list) or len(categories) < 2:
+            raise ValueError(f"{source}.categories requires at least two values")
         if not all(str(value).strip() for value in categories):
             raise ValueError(f"{source}.categories cannot contain empty values")
         category_text = [str(value).strip() for value in categories]
@@ -2512,12 +2514,11 @@ def _compact_exact_inner_recurrence(
         if (
             discovered_count < retained_count
             or retained_count != len(raw_terms)
-            or retained_count > _MAX_EXACT_INNER_RECURRENCE_TERMS
         ):
             raise ValueError("exact-inner recurrence group accounting is inconsistent")
         compact_terms: list[dict[str, Any]] = []
         seen_terms: set[str] = set()
-        for term_index, raw_term in enumerate(raw_terms[:_MAX_EXACT_INNER_RECURRENCE_TERMS]):
+        for term_index, raw_term in enumerate(raw_terms):
             if not isinstance(raw_term, Mapping):
                 raise ValueError(f"exact-inner recurrence terms[{term_index}] must be an object")
             term = _clip_text(raw_term.get("term"), 160)

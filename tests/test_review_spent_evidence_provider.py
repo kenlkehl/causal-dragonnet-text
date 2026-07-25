@@ -38,6 +38,13 @@ from oci.inference.review_spent_evidence_provider import (
 from oci.inference.multi_model_agentic_forest import _build_role_grouped_evidence_digest
 import oci.inference.review_spent_evidence_provider as spent_module
 import oci.inference.tfidf_upstream_gate_backend as tfidf_backend_module
+from tests.semantic_witness_test_support import (
+    semantic_witness_config,
+    semantic_witness_mapping,
+)
+
+
+_SEMANTIC_WITNESS_CONFIG = semantic_witness_config()
 
 
 def test_temporal_wording_is_not_filtered_from_spent_concepts():
@@ -45,6 +52,19 @@ def test_temporal_wording_is_not_filtered_from_spent_concepts():
         "sensor output after recalibration"
     )
     assert _safe_concept_phrase("account number 12345678") == ""
+
+
+def test_safe_concept_phrase_has_no_hidden_length_or_token_cutoff():
+    phrase = " ".join(f"biomarkersegment{index}" for index in range(40))
+    assert len(phrase) > 120
+    assert _safe_concept_phrase(phrase) == phrase
+
+    with pytest.raises(ValueError, match="max_chars"):
+        _safe_concept_phrase(phrase, max_chars=0)
+    with pytest.raises(ValueError, match="max_chars.*silent semantic omission"):
+        _safe_concept_phrase(phrase, max_chars=len(phrase) - 1)
+    with pytest.raises(ValueError, match="max_tokens.*silent semantic omission"):
+        _safe_concept_phrase(phrase, max_tokens=39)
 
 
 def test_stage1_spent_identity_rejects_live_parallelism_mutation() -> None:
@@ -140,6 +160,8 @@ def test_lazy_embedding_cache_rejects_mismatch_duplicate_range_and_tamper(
     texts = ("one two three four", "five six seven eight")
     _write_lazy_embedding_cache(tmp_path, texts)
     cache = SpentOnlyFrozenChunkEmbeddingCache(tmp_path)
+    snapshot_identity = cache.authenticated_snapshot_identity()
+    assert snapshot_identity == cache.identity()
     with pytest.raises(ValueError, match="does not match"):
         cache.bind_spent((0,), ("changed spent text",))
     with pytest.raises(ValueError, match="unique"):
@@ -153,6 +175,7 @@ def test_lazy_embedding_cache_rejects_mismatch_duplicate_range_and_tamper(
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
     with pytest.raises(RuntimeError, match="bytes changed"):
         cache.identity()
+    assert cache.authenticated_snapshot_identity() == snapshot_identity
 
 
 def test_lazy_embedding_cache_rejects_path_swap_during_snapshot(
@@ -515,7 +538,8 @@ def test_stage1_semantic_projection_discards_raw_embedding_and_htr_excerpts() ->
                     ],
                 }
             ]
-        }
+        },
+        scientific_config=_SEMANTIC_WITNESS_CONFIG,
     )
     htr = _htr_concepts_only(
         {
@@ -530,7 +554,8 @@ def test_stage1_semantic_projection_discards_raw_embedding_and_htr_excerpts() ->
                     }
                 ]
             }
-        }
+        },
+        scientific_config=_SEMANTIC_WITNESS_CONFIG,
     )
     serialized = json.dumps({"embedding": embedding, "htr": htr})
     assert "row_id" not in serialized
@@ -605,15 +630,19 @@ def test_chunk_only_htr_projection_is_contrastive_deterministic_and_excerpt_free
         )
     ]
 
-    projected = _htr_concepts_only({"effect": {"attention": attention}})
-    permuted = _htr_concepts_only({"effect": {"attention": list(reversed(attention))}})
+    projected = _htr_concepts_only(
+        {"effect": {"attention": attention}},
+        scientific_config=_SEMANTIC_WITNESS_CONFIG,
+    )
+    permuted = _htr_concepts_only(
+        {"effect": {"attention": list(reversed(attention))}},
+        scientific_config=_SEMANTIC_WITNESS_CONFIG,
+    )
 
     assert projected == permuted
     concepts = projected["effect"]["attention"]
     assert concepts
     assert all(1 <= len(row["attended_token_summary"].split()) <= 3 for row in concepts)
-    concept_tokens = [token for row in concepts for token in row["attended_token_summary"].split()]
-    assert len(concept_tokens) == len(set(concept_tokens))
     serialized = json.dumps(projected, sort_keys=True)
     assert all(text not in serialized for text in (*high_texts, *low_texts))
     assert "row_id" not in serialized
@@ -654,7 +683,7 @@ def test_chunk_only_htr_projection_is_contrastive_deterministic_and_excerpt_free
     assert all(text not in json.dumps(compacted.context(), sort_keys=True) for text in high_texts)
 
 
-def test_semantic_projection_default_is_exhaustive_beyond_old_4096_cap() -> None:
+def test_semantic_projection_is_exhaustive_and_finite_cap_fails_closed() -> None:
     positive = " ".join(f"positiveconcept{index}" for index in range(900))
     negative = " ".join(f"negativeconcept{index}" for index in range(900))
     raw = {
@@ -669,16 +698,129 @@ def test_semantic_projection_default_is_exhaustive_beyond_old_4096_cap() -> None
         ]
     }
 
-    exhaustive = _embedding_concepts_only(raw)["contrasts"][0]["concept_probe_scores"]
-    explicitly_bounded = spent_module._signed_contrastive_terms(
-        [positive],
-        [negative],
-        limit=4096,
-    )
+    exhaustive = _embedding_concepts_only(
+        raw,
+        scientific_config=_SEMANTIC_WITNESS_CONFIG,
+    )["contrasts"][0]["concept_probe_scores"]
 
     assert len(exhaustive) > 4096
-    assert len(explicitly_bounded) == 4096
-    assert explicitly_bounded == exhaustive[:4096]
+    with pytest.raises(RuntimeError, match="fail-closed assertion 4096"):
+        spent_module._signed_contrastive_terms(
+            [positive],
+            [negative],
+            scientific_config=semantic_witness_config(
+                maximum_retrieval_terms=4096
+            ),
+        )
+
+
+def test_semantic_projection_accounts_for_every_term_across_more_than_twelve_chunks() -> None:
+    long_token = "biomarker" + ("x" * 180)
+    positive = [
+        f"positivechunkterm{index:02d} sharedpositive {long_token}"
+        for index in range(15)
+    ]
+    negative = [
+        f"negativechunkterm{index:02d} sharednegative baseline"
+        for index in range(15)
+    ]
+    raw = {
+        "contrasts": [
+            {
+                "name": "complete retrieval tails",
+                "contrast_family": "marginal",
+                "positive_aligned_chunks": [{"text": text} for text in positive],
+                "negative_aligned_chunks": [{"text": text} for text in negative],
+            }
+        ]
+    }
+
+    projected = _embedding_concepts_only(
+        raw,
+        scientific_config=_SEMANTIC_WITNESS_CONFIG,
+    )
+    observed = {
+        row["concept"]
+        for row in projected["contrasts"][0]["concept_probe_scores"]
+    }
+    vectorizer = spent_module._semantic_vectorizer(
+        _SEMANTIC_WITNESS_CONFIG.retrieval_vectorizer
+    )
+    vectorizer.fit([*positive, *negative])
+    expected = {
+        _safe_concept_phrase(term)
+        for term in vectorizer.get_feature_names_out()
+        if _safe_concept_phrase(term)
+    }
+
+    assert len(positive) > 12 and len(negative) > 12
+    assert observed == expected
+    assert long_token in observed
+
+
+def test_semantic_witness_config_is_closed_and_identity_sensitive() -> None:
+    original = semantic_witness_mapping()
+    changed = copy.deepcopy(original)
+    changed["retrieval_vectorizer"]["min_df"] = 2
+    first = spent_module.SemanticWitnessScientificConfig.from_mapping(original)
+    second = spent_module.SemanticWitnessScientificConfig.from_mapping(changed)
+
+    assert first.identity_sha256 != second.identity_sha256
+
+    omitted = copy.deepcopy(original)
+    omitted["retrieval_vectorizer"].pop("token_pattern")
+    with pytest.raises(ValueError, match="missing=.*token_pattern"):
+        spent_module.SemanticWitnessScientificConfig.from_mapping(omitted)
+
+
+def test_nonempty_vectorizer_configuration_error_is_not_masked_as_no_evidence() -> None:
+    mapping = semantic_witness_mapping()
+    mapping["retrieval_vectorizer"]["min_df"] = 2
+    mapping["retrieval_vectorizer"]["max_df"] = 1
+    config = spent_module.SemanticWitnessScientificConfig.from_mapping(mapping)
+
+    with pytest.raises(ValueError, match="max_df corresponds to < documents than min_df"):
+        spent_module._signed_contrastive_terms(
+            ["positive biomarker"],
+            ["negative biomarker"],
+            scientific_config=config,
+        )
+
+
+def test_semantic_vectorizer_finite_vocabulary_capacity_fails_without_selection() -> None:
+    mapping = semantic_witness_mapping()
+    mapping["retrieval_vectorizer"]["max_features"] = 3
+    config = spent_module.SemanticWitnessScientificConfig.from_mapping(mapping)
+
+    with pytest.raises(RuntimeError, match="complete vocabulary.*fail-closed assertion 3"):
+        spent_module._signed_contrastive_terms(
+            ["alphaone alphatwo alphathree"],
+            ["betaone betatwo betathree"],
+            scientific_config=config,
+        )
+
+
+def test_htr_explicit_phrase_capacity_fails_without_prefix_selection() -> None:
+    config = semantic_witness_config(
+        maximum_explicit_phrases_per_attention_row=2
+    )
+    evidence = {
+        "effect": {
+            "attention": [
+                {
+                    "row_id": 1,
+                    "top_token_spans": [
+                        {"text": "alpha marker"},
+                        {"text": "beta marker"},
+                        {"text": "gamma marker"},
+                    ],
+                }
+            ]
+        }
+    }
+
+    with pytest.raises(RuntimeError, match="produced 3 complete values"):
+        _htr_concepts_only(evidence, scientific_config=config)
 
 
 def test_chunk_only_htr_projection_default_is_not_limited_to_six_concepts() -> None:
@@ -704,7 +846,10 @@ def test_chunk_only_htr_projection_default_is_not_limited_to_six_concepts() -> N
         )
     ]
 
-    projected = _htr_concepts_only({"effect": {"attention": attention}})
+    projected = _htr_concepts_only(
+        {"effect": {"attention": attention}},
+        scientific_config=_SEMANTIC_WITNESS_CONFIG,
+    )
 
     assert len(projected["effect"]["attention"]) > 6
 
@@ -755,7 +900,10 @@ def test_chunk_only_htr_projection_rejects_name_and_numeric_fragments() -> None:
         )
     ]
 
-    projected = _htr_concepts_only({"effect": {"attention": attention}})
+    projected = _htr_concepts_only(
+        {"effect": {"attention": attention}},
+        scientific_config=_SEMANTIC_WITNESS_CONFIG,
+    )
     serialized = json.dumps(projected, sort_keys=True)
     assert projected
     assert "john" not in serialized
@@ -786,7 +934,13 @@ def test_chunk_only_htr_projection_rejects_name_and_numeric_fragments() -> None:
             },
         )
     ]
-    assert _htr_concepts_only({"effect": {"attention": contextual_lowercase_name}}) == {}
+    assert (
+        _htr_concepts_only(
+            {"effect": {"attention": contextual_lowercase_name}},
+            scientific_config=_SEMANTIC_WITNESS_CONFIG,
+        )
+        == {}
+    )
 
 
 @pytest.mark.parametrize(
@@ -842,7 +996,13 @@ def test_chunk_only_htr_projection_rejects_name_and_numeric_fragments() -> None:
 def test_chunk_only_htr_projection_fails_closed_without_usable_contrast(
     attention: list[dict],
 ) -> None:
-    assert _htr_concepts_only({"effect": {"attention": attention}}) == {}
+    assert (
+        _htr_concepts_only(
+            {"effect": {"attention": attention}},
+            scientific_config=_SEMANTIC_WITNESS_CONFIG,
+        )
+        == {}
+    )
 
 
 def test_tfidf_backend_refits_only_spent_rows_and_builds_safe_orphans(

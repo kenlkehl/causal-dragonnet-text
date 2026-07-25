@@ -15,6 +15,7 @@ from oci.inference.all_evidence_fusion import (
     prepare_all_evidence_fusion,
 )
 from oci.inference.query_moment_evidence_adapter import (
+    QueryMomentEvidenceAdapterConfig,
     adapt_query_moment_evidence,
     derive_sparse_query_moment_evidence,
     load_query_moment_evidence_artifact,
@@ -233,6 +234,43 @@ def test_sparse_fallback_rejects_row_input_containing_heldout_member():
 
     with pytest.raises(ValueError, match="outer-heldout row"):
         derive_sparse_query_moment_evidence(provenance=_provenance(), **inputs)
+
+
+def test_sparse_fallback_fails_closed_instead_of_truncating_query_definitions():
+    inputs = _fallback_inputs()
+    inputs["tfidf_topic_evidence"]["discovery"]["topic_banks"]["treatment"][
+        "topics"
+    ] = [
+        {
+            "topic_id": f"topic-{index:03d}",
+            "terms": [{"term": f"configured marker {index:03d}", "loading": 1.0}],
+        }
+        for index in range(25)
+    ]
+
+    with pytest.raises(ValueError, match="refusing silent definition omission"):
+        derive_sparse_query_moment_evidence(
+            provenance=_provenance(),
+            config=QueryMomentEvidenceAdapterConfig(max_queries=24),
+            **inputs,
+        )
+
+
+def test_sparse_fallback_fails_closed_instead_of_truncating_definition_terms():
+    inputs = _fallback_inputs()
+    inputs["tfidf_topic_evidence"]["discovery"]["topic_banks"]["treatment"][
+        "topics"
+    ][0]["terms"] = [
+        {"term": f"configured term {index:03d}", "loading": 1.0}
+        for index in range(33)
+    ]
+
+    with pytest.raises(ValueError, match="refusing silent term omission"):
+        derive_sparse_query_moment_evidence(
+            provenance=_provenance(),
+            config=QueryMomentEvidenceAdapterConfig(max_terms_per_query=32),
+            **inputs,
+        )
 
 
 def test_adapter_uses_sparse_fallback_when_artifact_is_absent(tmp_path):

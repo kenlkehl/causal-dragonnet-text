@@ -1502,6 +1502,9 @@ def load_authenticated_stage1_bundle_for_hierarchy(
         schedule = CanonicalHierarchySpentSchedule.build(
             registry=contract_registry,
             review_rounds=int(hierarchy_contract.get("review_rounds", 0)),
+            initial_training_partitions=int(
+                hierarchy_contract.get("initial_spent_partition_count", 0)
+            ),
         )
         if schedule.schedule_sha256 != cumulative_index.get("schedule_sha256"):
             raise ValueError("cumulative all-ten root index changed its canonical schedule")
@@ -1737,7 +1740,7 @@ def load_authenticated_stage1_bundle_for_hierarchy(
             ]
             text_column = effective_config["text_column"]
             sentence_model_name = embedding_config["model_name"]
-            chunk_configuration = {
+            stage1_chunk_configuration = {
                 "chunk_size_words": embedding_config["chunk_size_words"],
                 "chunk_overlap_words": embedding_config["chunk_overlap_words"],
                 "max_chunks": embedding_config["max_chunks"],
@@ -1745,6 +1748,19 @@ def load_authenticated_stage1_bundle_for_hierarchy(
                 "normalize_embeddings": embedding_config["normalize_embeddings"],
                 "max_seq_length": embedding_config["max_seq_length"],
             }
+            provenance = metadata["production_provenance"]
+            chunk_configuration = provenance["chunk_configuration"]
+            if (
+                not isinstance(chunk_configuration, Mapping)
+                or any(
+                    chunk_configuration.get(key) != value
+                    for key, value in stage1_chunk_configuration.items()
+                )
+            ):
+                raise ValueError(
+                    "candidate Stage 1 request differs from its authenticated "
+                    "embedding-cache chunk/normalization configuration"
+                )
         except (KeyError, TypeError) as exc:
             raise ValueError(
                 "candidate Stage 1 request lacks its closed embedding-cache configuration"
@@ -1768,12 +1784,27 @@ def load_authenticated_stage1_bundle_for_hierarchy(
                 "production embedding-cache build identity differs from current inputs"
             )
     try:
+        hierarchy_contract = request.get("hierarchy_spent_evidence_contract")
+        scope_plan = request.get("stage1_scope_plan")
+        initial_training_partitions = int(
+            (
+                hierarchy_contract.get("initial_spent_partition_count")
+                if isinstance(hierarchy_contract, Mapping)
+                else None
+            )
+            or (
+                scope_plan.get("initial_training_partitions")
+                if isinstance(scope_plan, Mapping)
+                else 0
+            )
+        )
         validate_embedding_cluster_feasibility_audit(
             cluster_audit,
             config=effective_config,
             registry=wrapper_registry,
             registry_content_sha256=str(request.get("split_registry_content_sha256") or ""),
             embedding_cache_identity=expected_cache_identity,
+            initial_training_partitions=initial_training_partitions,
         )
     except (TypeError, ValueError) as exc:
         raise ValueError(

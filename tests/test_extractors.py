@@ -331,21 +331,21 @@ class TestHierarchicalTransformer:
             "seven eight nine",
         ]
 
-    def test_split_text_into_word_chunks_keeps_tail_when_truncated(self):
+    def test_split_text_into_word_chunks_rejects_binding_capacity(self):
         from oci.models.hierarchical_transformer_extractor import split_text_into_word_chunks
+        from oci.models.lossless_tokenization import SemanticTruncationError
 
         text = " ".join(f"w{i}" for i in range(1, 21))
-        chunks = split_text_into_word_chunks(
-            text,
-            chunk_size_words=4,
-            chunk_overlap_words=1,
-            max_chunks=3,
-        )
-        assert chunks == [
-            "w11 w12 w13 w14",
-            "w14 w15 w16 w17",
-            "w17 w18 w19 w20",
-        ]
+        with pytest.raises(
+            SemanticTruncationError,
+            match=r"requires 7 chunks.*max_chunks=3",
+        ):
+            split_text_into_word_chunks(
+                text,
+                chunk_size_words=4,
+                chunk_overlap_words=1,
+                max_chunks=3,
+            )
 
     def test_sentence_encoder_backend_and_pooling_defaults(self):
         from oci.models.hierarchical_transformer_extractor import (
@@ -651,6 +651,112 @@ class TestHierarchicalTransformer:
                 {"padding": False, "truncation": False},
             )
         ]
+
+    def test_transformer_attention_evidence_never_enables_tokenizer_truncation(self):
+        import re
+
+        from oci.models.hierarchical_transformer_extractor import (
+            HierarchicalTransformerExtractor,
+        )
+
+        calls = []
+
+        class AuditedTokenizer:
+            all_special_ids = [101, 102]
+            all_special_tokens = ["[CLS]", "[SEP]"]
+
+            def __call__(
+                self,
+                text,
+                *,
+                padding=False,
+                truncation=True,
+                return_offsets_mapping=False,
+            ):
+                calls.append(
+                    {
+                        "padding": padding,
+                        "truncation": truncation,
+                        "return_offsets_mapping": return_offsets_mapping,
+                    }
+                )
+                words = list(re.finditer(r"\S+", text))
+                result = {
+                    "input_ids": [101] + list(range(10, 10 + len(words))) + [102],
+                    "attention_mask": [1] * (len(words) + 2),
+                }
+                if return_offsets_mapping:
+                    result["offset_mapping"] = (
+                        [(0, 0)]
+                        + [
+                            (int(match.start()), int(match.end()))
+                            for match in words
+                        ]
+                        + [(0, 0)]
+                    )
+                return result
+
+            @staticmethod
+            def convert_ids_to_tokens(input_ids):
+                return [str(token_id) for token_id in input_ids]
+
+        ext = HierarchicalTransformerExtractor(
+            sentence_encoder_model="hash",
+            max_chunk_length=8,
+        )
+        ext._tokenizer = AuditedTokenizer()
+
+        spans = ext._top_token_spans(
+            "alpha beta gamma",
+            torch.ones(5),
+            top_n=2,
+        )
+
+        assert spans
+        assert calls == [
+            {
+                "padding": False,
+                "truncation": False,
+                "return_offsets_mapping": True,
+            }
+        ]
+
+    def test_transformer_attention_evidence_rejects_unexpected_token_overflow(self):
+        from oci.models.hierarchical_transformer_extractor import (
+            HierarchicalTransformerExtractor,
+        )
+
+        class OverflowTokenizer:
+            all_special_ids = []
+
+            @staticmethod
+            def __call__(
+                _text,
+                *,
+                padding=False,
+                truncation=True,
+                return_offsets_mapping=False,
+            ):
+                assert padding is False
+                assert truncation is False
+                assert return_offsets_mapping is True
+                return {
+                    "input_ids": list(range(9)),
+                    "attention_mask": [1] * 9,
+                    "offset_mapping": [(0, 1)] * 9,
+                }
+
+        ext = HierarchicalTransformerExtractor(
+            sentence_encoder_model="hash",
+            max_chunk_length=8,
+        )
+        ext._tokenizer = OverflowTokenizer()
+
+        with pytest.raises(
+            ValueError,
+            match="HTR evidence tokenizer input exceeds max_chunk_length",
+        ):
+            ext._top_token_spans("overflow", torch.ones(9))
 
     def test_token_attention_pooling_exports_token_spans(self):
         import json

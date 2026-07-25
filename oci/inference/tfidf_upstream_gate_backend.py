@@ -14,10 +14,10 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-import joblib
 import numpy as np
 import pandas as pd
 
@@ -32,6 +32,10 @@ from .stage1_upstream_gate_backend import (
     _historical_stage1_config_snapshot,
 )
 from .tfidf_topic_discovery import fit_tfidf_topic_context
+from .tfidf_safe_artifacts import (
+    load_fitted_topic_context,
+    load_named_array_bank,
+)
 
 TFIDF_CONTEXT_BACKEND_ID = "tfidf_topic_orphan_context_gate_backend_v2"
 
@@ -108,8 +112,10 @@ class TfidfTopicOrphanContextBackend:
             "backend": TFIDF_CONTEXT_BACKEND_ID,
             "stage1_config_sha256": self._stage1_config_snapshot.sha256,
             "discovery_code_sha256": _sha256_file(Path(discovery_module.__file__)),
-            "topic_config_sha256": _sha256_json(vars(self._topic_config)),
-            "view_config_sha256": _sha256_json([vars(view) for view in self._views]),
+            "topic_config_sha256": _sha256_json(asdict(self._topic_config)),
+            "view_config_sha256": _sha256_json(
+                [asdict(view) for view in self._views]
+            ),
             "outcome_type": self.outcome_type,
             "max_orphan_features": self.max_orphan_features,
             "minimum_orphan_arm_support": self.minimum_orphan_arm_support,
@@ -156,7 +162,7 @@ class TfidfTopicOrphanContextBackend:
         candidates = candidates.sort_values(
             ["_absolute_importance", "feature"], ascending=[False, True]
         )
-        fitted = joblib.load(fitted_path)
+        fitted = load_fitted_topic_context(fitted_path)
         vectorizer = getattr(fitted, "common_vectorizer", None)
         if vectorizer is None or not hasattr(vectorizer, "vocabulary_"):
             raise ValueError("fitted TF-IDF context has no authenticated vocabulary")
@@ -228,8 +234,13 @@ class TfidfTopicOrphanContextBackend:
         nuisance_path = Path(artifacts.get("nuisance_predictions") or "")
         if not topic_path.is_file() or not nuisance_path.is_file():
             raise ValueError("TF-IDF context omitted required heldout transformations")
-        with np.load(topic_path, allow_pickle=False) as payload:
-            topics = {name: np.asarray(payload[name], dtype=float) for name in payload.files}
+        topics = {
+            name: np.asarray(values, dtype=float)
+            for name, values in load_named_array_bank(
+                topic_path,
+                expected_row_count=len(gate_row_ids),
+            ).items()
+        }
         if set(topics) != {"treatment", "outcome", "effect"}:
             raise RuntimeError("TF-IDF context must produce all three topic banks")
         nuisance = pd.read_parquet(nuisance_path)

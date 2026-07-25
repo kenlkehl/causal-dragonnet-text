@@ -20,14 +20,8 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
 from .hierarchical_discovery_response_contract import (
-    HIERARCHICAL_DISCOVERY_MAX_DEFINITION_FOLD_MEMBERS,
-    HIERARCHICAL_DISCOVERY_MAX_FINDINGS_PER_ATOMIC_REVIEW,
-    HIERARCHICAL_DISCOVERY_MAX_GENERATED_NAME_LENGTH,
-    HIERARCHICAL_DISCOVERY_MAX_INTERPRET_AMBIGUITY_LENGTH,
-    HIERARCHICAL_DISCOVERY_MAX_INTERPRET_DESCRIPTION_LENGTH,
-    HIERARCHICAL_DISCOVERY_MAX_INTERPRET_NAME_LENGTH,
-    HIERARCHICAL_DISCOVERY_MAX_INTERPRET_REASON_LENGTH,
-    HIERARCHICAL_DISCOVERY_MAX_PAIR_RELATION_PEERS,
+    HierarchyWireBudget,
+    LEGACY_HIERARCHY_WIRE_BUDGET,
     attach_hierarchical_discovery_response_contract,
 )
 
@@ -442,6 +436,8 @@ class DiscoveryCandidate:
 
 def bounded_candidate_relation_pages(
     candidates: Sequence[DiscoveryCandidate],
+    *,
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> tuple[dict[str, Any], ...]:
     """Enumerate every unordered candidate pair once in bounded anchor pages."""
 
@@ -450,9 +446,13 @@ def bounded_candidate_relation_pages(
     pages: list[dict[str, Any]] = []
     for anchor_index, anchor in enumerate(items[:-1]):
         later = items[anchor_index + 1 :]
-        for page_offset in range(0, len(later), HIERARCHICAL_DISCOVERY_MAX_PAIR_RELATION_PEERS):
+        for page_offset in range(
+            0,
+            len(later),
+            wire_budget.max_pair_relation_peers_per_page,
+        ):
             peers = later[
-                page_offset : page_offset + HIERARCHICAL_DISCOVERY_MAX_PAIR_RELATION_PEERS
+                page_offset : page_offset + wire_budget.max_pair_relation_peers_per_page
             ]
             identity = {
                 "anchor_candidate_id": anchor.candidate_id,
@@ -477,6 +477,7 @@ def validate_candidate_relation_page_response(
     *,
     anchor_candidate_id: str,
     peer_candidate_ids: Sequence[str],
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> dict[str, Any]:
     """Validate one exact ternary-relation page and normalize it to pair rows."""
 
@@ -485,7 +486,7 @@ def validate_candidate_relation_page_response(
         _require_id(value, label=f"peer_candidate_ids[{index}]")
         for index, value in enumerate(peer_candidate_ids)
     )
-    if not peers or len(peers) > HIERARCHICAL_DISCOVERY_MAX_PAIR_RELATION_PEERS:
+    if not peers or len(peers) > wire_budget.max_pair_relation_peers_per_page:
         raise ValueError("peer_candidate_ids violates the bounded relation-page contract")
     if len(peers) != len(set(peers)) or anchor in peers:
         raise ValueError("candidate relation page contains a duplicate/self pair")
@@ -651,7 +652,10 @@ def compile_complete_link_candidate_groups(
 
 
 def candidate_definition_fold_batches(
-    *, group_id: str, member_candidate_ids: Sequence[str]
+    *,
+    group_id: str,
+    member_candidate_ids: Sequence[str],
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> tuple[dict[str, Any], ...]:
     """Schedule terminating accumulator folds for one proven candidate group."""
 
@@ -667,10 +671,15 @@ def candidate_definition_fold_batches(
     fold_index = 0
     while consumed < len(members):
         capacity = (
-            HIERARCHICAL_DISCOVERY_MAX_DEFINITION_FOLD_MEMBERS
+            wire_budget.max_definition_fold_inputs
             if fold_index == 0
-            else HIERARCHICAL_DISCOVERY_MAX_DEFINITION_FOLD_MEMBERS - 1
+            else wire_budget.max_definition_fold_inputs - 1
         )
+        if capacity < 1:
+            raise ValueError(
+                "max_definition_fold_inputs must be at least two when an "
+                "accumulator fold is required"
+            )
         fresh = members[consumed : consumed + capacity]
         batches.append(
             {
@@ -714,7 +723,10 @@ INTERPRET_SYSTEM_PROMPT = """You interpret concept-bearing Stage 1 evidence from
 
 
 def render_interpret_evidence_chunk_messages(
-    *, family_explanation: str, evidence: Sequence[DiscoveryEvidenceItem]
+    *,
+    family_explanation: str,
+    evidence: Sequence[DiscoveryEvidenceItem],
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> tuple[dict[str, str], ...]:
     context = interpret_evidence_chunk_context(
         family_explanation=family_explanation,
@@ -726,6 +738,7 @@ def render_interpret_evidence_chunk_messages(
     request = attach_hierarchical_discovery_response_contract(
         job_kind="interpret_architecture_chunk",
         request=context,
+        wire_budget=wire_budget,
     )
     return (
         {"role": "system", "content": INTERPRET_SYSTEM_PROMPT},
@@ -741,6 +754,7 @@ def _validated_interpret_finding(
     *,
     label: str,
     include_compiler_fields: bool = False,
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> dict[str, str]:
     finding = _require_mapping(value, label=label)
     if not include_compiler_fields:
@@ -765,15 +779,15 @@ def _validated_interpret_finding(
         allow_empty=True,
     )
     bounds = (
-        (name, HIERARCHICAL_DISCOVERY_MAX_INTERPRET_NAME_LENGTH, "feature_name"),
+        (name, wire_budget.max_interpret_name_chars, "feature_name"),
         (
             description,
-            HIERARCHICAL_DISCOVERY_MAX_INTERPRET_DESCRIPTION_LENGTH,
+            wire_budget.max_interpret_description_chars,
             "description",
         ),
         (
             ambiguity,
-            HIERARCHICAL_DISCOVERY_MAX_INTERPRET_AMBIGUITY_LENGTH,
+            wire_budget.max_interpret_ambiguity_chars,
             "unresolved_ambiguity",
         ),
     )
@@ -812,14 +826,19 @@ def _interpret_findings(
     label: str,
     evidence: DiscoveryEvidenceItem,
     member_id: str,
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise TypeError(f"{label} must be a JSON list")
-    if len(value) > HIERARCHICAL_DISCOVERY_MAX_FINDINGS_PER_ATOMIC_REVIEW:
+    if len(value) > wire_budget.max_findings_per_atomic_review:
         raise ValueError(f"{label} exceeds its atomic proposal bound")
     concepts: list[dict[str, Any]] = []
     for ordinal, raw in enumerate(value):
-        finding = _validated_interpret_finding(raw, label=f"{label}[{ordinal}]")
+        finding = _validated_interpret_finding(
+            raw,
+            label=f"{label}[{ordinal}]",
+            wire_budget=wire_budget,
+        )
         concepts.append(
             {
                 "concept_occurrence_id": _interpret_occurrence_id(
@@ -918,7 +937,10 @@ def interpretation_model_view(response: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def validate_interpret_evidence_chunk_response(
-    response: Any, *, evidence: Sequence[DiscoveryEvidenceItem]
+    response: Any,
+    *,
+    evidence: Sequence[DiscoveryEvidenceItem],
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> dict[str, Any]:
     """Compile atomic inline findings into the legacy ordered projection.
 
@@ -964,6 +986,7 @@ def validate_interpret_evidence_chunk_response(
             label=f"{label}.evidence_findings",
             evidence=items_by_id[evidence_id],
             member_id="",
+            wire_budget=wire_budget,
         )
         concepts.extend(evidence_findings)
         evidence_feature_names = [row["feature_name"] for row in evidence_findings]
@@ -986,6 +1009,7 @@ def validate_interpret_evidence_chunk_response(
                 label=f"{member_label}.findings",
                 evidence=items_by_id[evidence_id],
                 member_id=member_id,
+                wire_budget=wire_budget,
             )
             concepts.extend(member_findings)
             parsed_member_names = tuple(
@@ -998,7 +1022,7 @@ def validate_interpret_evidence_chunk_response(
         names = tuple(dict.fromkeys(evidence_feature_names))
         status = "supports_concept" if names else "reviewed_no_specific_concept"
         reason = _require_string(disposition["reason"], label=f"{label}.reason")
-        if len(reason) > HIERARCHICAL_DISCOVERY_MAX_INTERPRET_REASON_LENGTH:
+        if len(reason) > wire_budget.max_interpret_reason_chars:
             raise ValueError(f"{label}.reason exceeds its wire bound")
         normalized_dispositions.append(
             {
@@ -1019,7 +1043,10 @@ def validate_interpret_evidence_chunk_response(
 
 
 def revalidate_normalized_interpret_evidence_chunk_response(
-    response: Any, *, evidence: Sequence[DiscoveryEvidenceItem]
+    response: Any,
+    *,
+    evidence: Sequence[DiscoveryEvidenceItem],
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> dict[str, Any]:
     """Revalidate only the deterministic internal ordered projection."""
     items = tuple(evidence)
@@ -1079,7 +1106,7 @@ def revalidate_normalized_interpret_evidence_chunk_response(
             isinstance(ordinal, bool)
             or not isinstance(ordinal, int)
             or ordinal < 0
-            or ordinal >= HIERARCHICAL_DISCOVERY_MAX_FINDINGS_PER_ATOMIC_REVIEW
+            or ordinal >= wire_budget.max_findings_per_atomic_review
         ):
             raise ValueError("normalized concept finding_ordinal is outside its atomic bound")
         origin_key = (evidence_id, member_id, ordinal)
@@ -1090,6 +1117,7 @@ def revalidate_normalized_interpret_evidence_chunk_response(
             concept,
             label=f"normalized concepts[{index}]",
             include_compiler_fields=True,
+            wire_budget=wire_budget,
         )
         occurrence_id = _require_id(
             concept["concept_occurrence_id"],
@@ -1166,7 +1194,7 @@ def revalidate_normalized_interpret_evidence_chunk_response(
         if row["status"] != expected_status:
             raise ValueError("normalized evidence status is not compiler-derived")
         reason = _require_string(row["reason"], label=f"{label}.reason")
-        if len(reason) > HIERARCHICAL_DISCOVERY_MAX_INTERPRET_REASON_LENGTH:
+        if len(reason) > wire_budget.max_interpret_reason_chars:
             raise ValueError(f"{label}.reason exceeds its wire bound")
         members = row["member_dispositions"]
         if not isinstance(members, list):
@@ -1225,13 +1253,24 @@ def consolidate_candidate_context(
     }
 
 
-def _derive_unique_slot_name(*, proposed: str, slot: str, used: set[str]) -> str:
+def _derive_unique_slot_name(
+    *,
+    proposed: str,
+    slot: str,
+    used: set[str],
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
+) -> str:
     if proposed not in used:
         return proposed
     ordinal = 1
     while True:
         suffix = f"_{slot}" if ordinal == 1 else f"_{slot}_{ordinal}"
-        available = HIERARCHICAL_DISCOVERY_MAX_GENERATED_NAME_LENGTH - len(suffix)
+        available = wire_budget.max_generated_name_chars - len(suffix)
+        if available < 1:
+            raise ValueError(
+                "generated-name wire budget cannot encode a compiler-owned "
+                "disambiguation suffix"
+            )
         prefix = proposed[:available].rstrip("_") or "feature"
         derived = f"{prefix}{suffix}"
         if derived not in used:
@@ -1244,6 +1283,7 @@ def validate_consolidation_response(
     *,
     source_family: str,
     candidates: Sequence[DiscoveryCandidate],
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> dict[str, Any]:
     if source_family not in ACTIVE_STAGE1_CONCEPT_FAMILY_SET:
         raise ValueError(f"inactive or unknown source_family: {source_family!r}")
@@ -1317,6 +1357,7 @@ def validate_consolidation_response(
             proposed=proposed,
             slot=slot,
             used=used_names,
+            wire_budget=wire_budget,
         )
         if derived != proposed:
             disambiguations.append(
@@ -1397,6 +1438,7 @@ def revalidate_normalized_consolidation_response(
     *,
     source_family: str,
     candidates: Sequence[DiscoveryCandidate],
+    wire_budget: HierarchyWireBudget,
 ) -> dict[str, Any]:
     root = _require_mapping(response, label="normalized consolidation response")
     _require_exact_keys(
@@ -1456,6 +1498,7 @@ def revalidate_normalized_consolidation_response(
         },
         source_family=source_family,
         candidates=candidates,
+        wire_budget=wire_budget,
     )
     if canonical_json(validated) != canonical_json(root):
         raise ValueError("normalized consolidation is not the deterministic projection")
@@ -1645,6 +1688,7 @@ def render_cross_architecture_planner_messages(
     dossiers: Sequence[ArchitectureDossier],
     *,
     maximum_raw_evidence_lookback_ids: int,
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> tuple[dict[str, str], ...]:
     context = cross_architecture_planner_context(dossiers)
     # The interface version is bound to the immutable job, not shown to the
@@ -1654,6 +1698,7 @@ def render_cross_architecture_planner_messages(
     request = attach_hierarchical_discovery_response_contract(
         job_kind="plan_cross_architecture_integration",
         request=context,
+        wire_budget=wire_budget,
     )
     return (
         {"role": "system", "content": _CROSS_ARCHITECTURE_PLANNER_SYSTEM_PROMPT},
@@ -1666,6 +1711,7 @@ def validate_cross_architecture_planner_response(
     *,
     dossiers: Sequence[ArchitectureDossier],
     maximum_raw_evidence_lookback_ids: int,
+    wire_budget: HierarchyWireBudget = LEGACY_HIERARCHY_WIRE_BUDGET,
 ) -> dict[str, Any]:
     cross_architecture_planner_context(dossiers)
     if (
@@ -1754,7 +1800,12 @@ def validate_cross_architecture_planner_response(
     disambiguations: list[dict[str, str]] = []
     for slot in active_slots:
         proposed = definitions[slot]["provisional_name"]
-        derived = _derive_unique_slot_name(proposed=proposed, slot=slot, used=names)
+        derived = _derive_unique_slot_name(
+            proposed=proposed,
+            slot=slot,
+            used=names,
+            wire_budget=wire_budget,
+        )
         names.add(derived)
         name_by_slot[slot] = derived
         if derived != proposed:
@@ -2317,7 +2368,15 @@ def validate_extraction_definition_response(
     normalization_events: list[dict[str, Any]] = []
     normalized_kind = str(kind)
     normalized_unit = unit
-    normalized_categories = tuple(dict.fromkeys(categories))
+    category_identities = tuple(
+        re.sub(r"[\s_-]+", " ", category).strip().casefold()
+        for category in categories
+    )
+    if len(category_identities) != len(set(category_identities)):
+        raise ValueError(
+            "representation.categories must be distinct after case/spacing normalization"
+        )
+    normalized_categories = categories
     if kind == "continuous":
         if request.value_shape_hypothesis == "categorical":
             raise ValueError("continuous extraction conflicts with the categorical value shape")
@@ -2345,8 +2404,8 @@ def validate_extraction_definition_response(
     elif kind == "categorical":
         if request.value_shape_hypothesis == "continuous":
             raise ValueError("categorical extraction conflicts with the continuous value shape")
-        if not 2 <= len(categories) <= 8:
-            raise ValueError("categorical extraction requires 2-8 concrete categories")
+        if len(categories) < 2:
+            raise ValueError("categorical extraction requires at least two concrete categories")
         if unit:
             raise ValueError("categorical extraction cannot define a unit")
         if set(normalized_categories) & set(MECHANICAL_MENTION_CATEGORIES):

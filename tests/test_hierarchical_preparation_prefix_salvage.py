@@ -192,6 +192,7 @@ def _tfidf_payload(outer_fold: int, review_round: int) -> dict:
         return {
             "topic_id": f"{bank}_topic_001",
             "bank": bank,
+            "terms_per_topic": 1,
             "terms": [
                 {
                     "term": phrase,
@@ -208,9 +209,18 @@ def _tfidf_payload(outer_fold: int, review_round: int) -> dict:
         "inner_fold": review_round + 1,
         "discovery": {
             "topic_banks": {
-                "treatment": {"topics": [topic("treatment", "baseline routing pattern")]},
-                "outcome": {"topics": [topic("outcome", "baseline failure pattern")]},
-                "effect": {"topics": [topic("effect", "baseline sensor phrase")]},
+                "treatment": {
+                    "terms_per_topic": 1,
+                    "topics": [topic("treatment", "baseline routing pattern")],
+                },
+                "outcome": {
+                    "terms_per_topic": 1,
+                    "topics": [topic("outcome", "baseline failure pattern")],
+                },
+                "effect": {
+                    "terms_per_topic": 1,
+                    "topics": [topic("effect", "baseline sensor phrase")],
+                },
             },
             "effect_orphan_ngram_branch": {
                 "status": "completed",
@@ -276,7 +286,7 @@ class _SpentBackend:
         if self.source_kind == LEGACY_ALL_SOURCE:
             return {
                 "backend": "historical_stage1_spent_discovery_v5",
-                "code_sha256": ("de11740a862c13d59d340e1dba26fb1202820dec4a0055c49819b7e01eccc1f1"),
+                "code_sha256": ("6978aa0419a89a0b74a7c187ef1580bfc857ace49159726d2681fc1f0a2d5916"),
                 "concept_projection": (
                     "short_bow_terms_htr_tokens_or_per_row_chunk_attention_contrast_"
                     "embedding_tail_ngrams_v2"

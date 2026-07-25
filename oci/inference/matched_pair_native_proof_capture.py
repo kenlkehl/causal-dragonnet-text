@@ -254,6 +254,22 @@ def _capture_offset_model(
         "vectorizer_params": json.loads(_canonical_json(model.vectorizer_params)),
         "l2_alpha": float(model.l2_alpha),
         "max_iter": int(model.max_iter),
+        "optimizer": {
+            "method": str(model.optimizer_method),
+            "ftol": float(model.optimizer_ftol),
+            "gtol": float(model.optimizer_gtol),
+            "maxls": int(model.optimizer_maxls),
+            "maxcor": int(model.optimizer_maxcor),
+            "maxfun": int(model.optimizer_maxfun),
+            "tol": (
+                None
+                if model.optimizer_tol is None
+                else float(model.optimizer_tol)
+            ),
+            "initialization": str(model.optimizer_initialization),
+            "require_success": bool(model.require_optimizer_success),
+            "jacobian": "analytic",
+        },
         "constant_delta": (None if model.constant_delta_ is None else float(model.constant_delta_)),
     }
     if model.constant_delta_ is None:
@@ -303,6 +319,8 @@ def _capture_htr_pair_model(
     model: HTRPairUpliftNet | None,
     store: _ArrayStore,
     prefix: str,
+    *,
+    training_configuration: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     if model is None:
         body = {"kind": "constant_zero_htr_pair", "class_name": None}
@@ -321,11 +339,25 @@ def _capture_htr_pair_model(
                 "shape": list(tensor.shape),
             }
         )
+    head_configuration = model.head_configuration()
+    if set(head_configuration) != {
+        "hidden_dim",
+        "depth",
+        "activation",
+        "dropout",
+        "layer_norm",
+        "bias",
+    }:
+        raise RuntimeError("matched-pair HTR head constructor is incomplete")
     body = {
         "kind": "htr_pair_network",
         "class_name": "HTRPairUpliftNet",
-        "hidden_dim": int(model.fusion[0].out_features),
-        "dropout": float(model.fusion[2].p),
+        "head_configuration": head_configuration,
+        "training_configuration": (
+            None
+            if training_configuration is None
+            else json.loads(_canonical_json(dict(training_configuration)))
+        ),
         "extractor": extractor,
         "state_tensors": state_rows,
     }
@@ -361,10 +393,26 @@ def _build_htr_pair_model(
     extractor.fit_tokenizer(list(map(str, initialization_texts)))
     if _extractor_descriptor(extractor) != extractor_row:
         raise RuntimeError("reconstructed HTR pair extractor identity changed")
+    head_configuration = descriptor.get("head_configuration")
+    if not isinstance(head_configuration, Mapping) or set(head_configuration) != {
+        "hidden_dim",
+        "depth",
+        "activation",
+        "dropout",
+        "layer_norm",
+        "bias",
+    }:
+        raise ValueError(
+            "captured typed HTR pair model lacks its complete head constructor"
+        )
     model = HTRPairUpliftNet(
         extractor=extractor,
-        hidden_dim=int(descriptor["hidden_dim"]),
-        dropout=float(descriptor["dropout"]),
+        hidden_dim=int(head_configuration["hidden_dim"]),
+        dropout=float(head_configuration["dropout"]),
+        head_depth=int(head_configuration["depth"]),
+        head_activation=str(head_configuration["activation"]),
+        head_layer_norm=head_configuration["layer_norm"],
+        head_bias=head_configuration["bias"],
     ).to(device)
     state: dict[str, torch.Tensor] = {}
     for row in descriptor.get("state_tensors") or ():
@@ -1255,17 +1303,11 @@ def validate_matched_pair_native_capture(
                 subproducer="bow",
                 split_seed=split_seed,
             )
-            expected_vectorizer_params = {
-                key: view[key]
-                for key in (
-                    "ngram_range_min",
-                    "ngram_range_max",
-                    "min_df",
-                    "max_df",
-                    "sublinear_tf",
-                    "max_features",
+            expected_vectorizer_params = view.get("vectorizer_scientific")
+            if not isinstance(expected_vectorizer_params, Mapping):
+                raise ValueError(
+                    "matched-pair BoW view lacks exact vectorizer science"
                 )
-            }
             if row.get("model", {}).get("vectorizer_params") != expected_vectorizer_params:
                 raise ValueError("matched-pair BoW view/model configuration changed")
             fit_pairs, validation_pairs, heldout_pairs = rebuild_pairs(fit_pos, validation_pos)
@@ -1328,17 +1370,11 @@ def validate_matched_pair_native_capture(
     for row in full_rows:
         view_index = int(row["view_index"])
         view = view_configs[view_index]
-        expected_vectorizer_params = {
-            key: view[key]
-            for key in (
-                "ngram_range_min",
-                "ngram_range_max",
-                "min_df",
-                "max_df",
-                "sublinear_tf",
-                "max_features",
+        expected_vectorizer_params = view.get("vectorizer_scientific")
+        if not isinstance(expected_vectorizer_params, Mapping):
+            raise ValueError(
+                "matched-pair BoW view lacks exact vectorizer science"
             )
-        }
         if (
             row.get("subproducer") != "bow"
             or row.get("objective") != "matched_pair_full_importance_models"

@@ -28,6 +28,7 @@ from oci.inference.all_evidence_discovery_interfaces import (
 from oci.inference.hierarchical_all_architecture_discovery import (
     AUTHENTICATED_RESPONSE_REPAIR_BINDING,
     HIERARCHICAL_DISCOVERY_IMPLEMENTATION_BUNDLE_BINDING,
+    LOCAL_JSON_SCHEMA_VALIDATION_FAILURE,
     SEMANTIC_VALIDATION_FAILURE,
     STRICT_JSON_PARSE_FAILURE,
     VALIDATED_RESPONSE,
@@ -53,6 +54,7 @@ if __package__:
         MAX_TOKENS,
         MODEL,
         REQUIRED_INTERPRETER,
+        RETIRED_TARGET_DIAGNOSTIC_WIRE_BUDGET,
         _build_preflight as _build_initial_preflight,
         _sha256_bytes,
         _wire_coverage_counts,
@@ -65,6 +67,7 @@ else:
         MAX_TOKENS,
         MODEL,
         REQUIRED_INTERPRETER,
+        RETIRED_TARGET_DIAGNOSTIC_WIRE_BUDGET,
         _build_preflight as _build_initial_preflight,
         _sha256_bytes,
         _wire_coverage_counts,
@@ -266,7 +269,7 @@ def _assert_exact_repair_job(
     if (
         binding.get("original_job_id") != original_job.job_id
         or binding.get("repair_attempt_number") != 1
-        or binding.get("failure_category") != SEMANTIC_VALIDATION_FAILURE
+        or binding.get("failure_category") != LOCAL_JSON_SCHEMA_VALIDATION_FAILURE
         or binding.get("prior_response_content_sha256")
         != EXPECTED_INITIAL_RESPONSE_PROJECTION_SHA256
         or binding.get("policy_sha256")
@@ -297,32 +300,42 @@ def _build_repair_preflight() -> tuple[
     initial_record, initial_record_file_sha256 = _authenticated_initial_record()
     initial_preflight, original_job, evidence, runner = _build_initial_preflight()
     initial_preflight_sha256 = content_sha256(initial_preflight)
-    if initial_preflight_sha256 != EXPECTED_INITIAL_PREFLIGHT_SHA256:
+    current_initial_probe_file_sha256 = _sha256_bytes(INITIAL_PROBE_PATH.read_bytes())
+    if current_initial_probe_file_sha256 != initial_preflight.get(
+        "probe_implementation_file_sha256"
+    ):
         runner.close()
-        raise ValueError("current original-job preflight differs from the live initial call")
-    if _sha256_bytes(INITIAL_PROBE_PATH.read_bytes()) != EXPECTED_INITIAL_PROBE_FILE_SHA256:
-        runner.close()
-        raise ValueError("initial probe implementation differs from the live call")
+        raise ValueError("current initial probe differs from its fresh preflight")
     job_record = initial_record.get("job")
     if not isinstance(job_record, Mapping):
         runner.close()
         raise TypeError("initial rejection job record must be one object")
     if (
-        job_record.get("job_id") != original_job.job_id
-        or job_record.get("job_kind") != original_job.job_kind
-        or job_record.get("request_sha256") != initial_preflight["fresh_current_request_sha256"]
-        or job_record.get("runner_identity_sha256")
-        != initial_preflight["fresh_current_runner_identity_sha256"]
+        job_record.get("job_kind") != original_job.job_kind
+        or job_record.get("job_id") == original_job.job_id
+        or job_record.get("request_sha256")
+        == initial_preflight["fresh_current_request_sha256"]
         or initial_record.get("hierarchy_implementation_bundle_sha256")
-        != initial_preflight["fresh_current_implementation_bundle_sha256"]
+        == initial_preflight["fresh_current_implementation_bundle_sha256"]
     ):
         runner.close()
-        raise ValueError("initial rejection record differs from the reconstructed original job")
+        raise ValueError(
+            "historical rejection and current schema-migrated job identities are not distinct"
+        )
+    migration = initial_preflight.get("current_schema_migration")
+    if (
+        not isinstance(migration, Mapping)
+        or migration.get("evidence_ownership_and_grouping_preserved") is not True
+        or initial_preflight.get("diagnostic_wire_budget_sha256")
+        != RETIRED_TARGET_DIAGNOSTIC_WIRE_BUDGET.content_sha256
+    ):
+        runner.close()
+        raise ValueError("current original job lacks its authenticated schema migration")
 
     repair_job = _build_response_repair_job_from_projection_sha256(
         original_job=original_job,
         prior_response_content_sha256=EXPECTED_INITIAL_RESPONSE_PROJECTION_SHA256,
-        failure_category=SEMANTIC_VALIDATION_FAILURE,
+        failure_category=LOCAL_JSON_SCHEMA_VALIDATION_FAILURE,
     )
     repair_binding = _assert_exact_repair_job(
         original_job=original_job,
@@ -357,17 +370,24 @@ def _build_repair_preflight() -> tuple[
         "repair_probe_implementation_file_sha256": _sha256_bytes(
             Path(__file__).resolve().read_bytes()
         ),
-        "initial_probe_implementation_file_sha256": EXPECTED_INITIAL_PROBE_FILE_SHA256,
+        "initial_probe_implementation_file_sha256": current_initial_probe_file_sha256,
+        "historical_initial_probe_implementation_file_sha256": (
+            EXPECTED_INITIAL_PROBE_FILE_SHA256
+        ),
         "initial_rejection_record_file_sha256": initial_record_file_sha256,
         "initial_rejection_record_content_sha256": content_sha256(initial_record),
         "initial_probe_preflight_sha256": initial_preflight_sha256,
+        "historical_initial_probe_preflight_sha256": EXPECTED_INITIAL_PREFLIGHT_SHA256,
+        "continuation_kind": (
+            "current_schema_migration_from_authenticated_historical_rejection_v1"
+        ),
         "initial_failure_stage": EXPECTED_INITIAL_FAILURE_STAGE,
         "initial_failure_category_persisted": None,
         "repair_category_basis": (
-            "strict_parse_succeeded_and_all_remaining_production_validator_failures_"
-            "map_to_semantic_validation_failure"
+            "strict_parse_succeeded_and_historical_exact_coverage_failure_maps_to_"
+            "current_closed_json_schema_validation_failure"
         ),
-        "repair_failure_category": SEMANTIC_VALIDATION_FAILURE,
+        "repair_failure_category": LOCAL_JSON_SCHEMA_VALIDATION_FAILURE,
         "initial_response_projection_sha256": (EXPECTED_INITIAL_RESPONSE_PROJECTION_SHA256),
         "original_job_id": original_job.job_id,
         "repair_job_id": repair_job.job_id,
@@ -691,6 +711,7 @@ def _execute_repair(
             validated = validate_interpret_evidence_chunk_response(
                 response,
                 evidence=evidence,
+                wire_budget=RETIRED_TARGET_DIAGNOSTIC_WIRE_BUDGET,
             )
         except (TypeError, ValueError) as exc:
             return _rejection(
@@ -724,7 +745,7 @@ def _execute_repair(
             attempts=(
                 _response_attempt_entry(
                     job=original_job,
-                    validation_outcome=SEMANTIC_VALIDATION_FAILURE,
+                    validation_outcome=LOCAL_JSON_SCHEMA_VALIDATION_FAILURE,
                     raw_response_projection_sha256=(EXPECTED_INITIAL_RESPONSE_PROJECTION_SHA256),
                 ),
                 _response_attempt_entry(
@@ -744,7 +765,9 @@ def _execute_repair(
             "schema_version": REPAIR_PROBE_SCHEMA_VERSION,
             "status": "accepted",
             "preflight_sha256": preflight_sha256,
-            "initial_probe_preflight_sha256": EXPECTED_INITIAL_PREFLIGHT_SHA256,
+            "initial_probe_preflight_sha256": preflight_body[
+                "initial_probe_preflight_sha256"
+            ],
             "initial_response_projection_sha256": (EXPECTED_INITIAL_RESPONSE_PROJECTION_SHA256),
             "original_job_id": original_job.job_id,
             "repair_job_id": repair_job.job_id,

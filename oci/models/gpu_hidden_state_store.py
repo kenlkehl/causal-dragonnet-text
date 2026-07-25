@@ -24,6 +24,8 @@ from typing import List, Optional, Tuple
 import numpy as np
 import torch
 
+from .lossless_tokenization import tokenize_losslessly
+
 logger = logging.getLogger(__name__)
 
 
@@ -164,6 +166,9 @@ class GPUHiddenStateStore:
         """
         from transformers import AutoConfig, AutoTokenizer
 
+        if isinstance(max_length, bool) or not isinstance(max_length, int) or max_length < 1:
+            raise ValueError("max_length must be a positive integer")
+
         tokenizer = AutoTokenizer.from_pretrained(
             model_name, trust_remote_code=True, padding_side="right",
             truncation_side="left",  # Keep end of long documents
@@ -196,10 +201,11 @@ class GPUHiddenStateStore:
         total_tokens = 0
         batch_size = 512
         for i in range(0, len(texts), batch_size):
-            encodings = tokenizer(
+            encodings = tokenize_losslessly(
+                tokenizer,
                 texts[i : i + batch_size],
-                truncation=True,
-                max_length=max_length,
+                configured_max_length=max_length,
+                context="GPUHiddenStateStore VRAM estimate",
                 padding=False,
                 return_length=True,
             )
@@ -244,6 +250,9 @@ class GPUHiddenStateStore:
         """
         from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+        if isinstance(max_length, bool) or not isinstance(max_length, int) or max_length < 1:
+            raise ValueError("max_length must be a positive integer")
+
         num_samples = len(texts)
         self._device = device
         self._num_samples = num_samples
@@ -287,10 +296,11 @@ class GPUHiddenStateStore:
         sequence_lengths: List[int] = []
         for i in range(0, num_samples, batch_size * 4):
             batch_texts = texts[i : i + batch_size * 4]
-            encodings = tokenizer(
+            encodings = tokenize_losslessly(
+                tokenizer,
                 batch_texts,
-                truncation=True,
-                max_length=max_length,
+                configured_max_length=max_length,
+                context="GPUHiddenStateStore precompute",
                 padding=False,
                 return_length=True,
             )
@@ -371,11 +381,12 @@ class GPUHiddenStateStore:
             batch_lengths = sequence_lengths[i:batch_end]
             batch_max_len = max(batch_lengths)
 
-            encoding = tokenizer(
+            encoding = tokenize_losslessly(
+                tokenizer,
                 batch_texts,
+                configured_max_length=batch_max_len,
+                context="GPUHiddenStateStore precompute batch",
                 padding="max_length",
-                truncation=True,
-                max_length=batch_max_len,
                 return_tensors="pt",
             )
 

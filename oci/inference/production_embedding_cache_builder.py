@@ -37,15 +37,15 @@ from oci.models.concept_embedding_utils import chunk_text_words
 from .review_spent_evidence_provider import SpentOnlyFrozenChunkEmbeddingCache
 
 PRODUCTION_EMBEDDING_CACHE_BUILDER_VERSION = (
-    "production_arbitrary_cohort_embedding_cache_builder_v2"
+    "production_arbitrary_cohort_embedding_cache_builder_v3"
 )
 PRODUCTION_EMBEDDING_CACHE_METADATA_SCHEMA = (
-    "production_arbitrary_cohort_embedding_cache_metadata_v2"
+    "production_arbitrary_cohort_embedding_cache_metadata_v3"
 )
 PRODUCTION_EMBEDDING_CACHE_PROVENANCE_SCHEMA = (
-    "production_arbitrary_cohort_embedding_cache_provenance_v2"
+    "production_arbitrary_cohort_embedding_cache_provenance_v3"
 )
-PRODUCTION_EMBEDDING_CACHE_RESULT_SCHEMA = "production_arbitrary_cohort_embedding_cache_result_v2"
+PRODUCTION_EMBEDDING_CACHE_RESULT_SCHEMA = "production_arbitrary_cohort_embedding_cache_result_v3"
 
 _CACHE_FILES = frozenset(
     {
@@ -68,6 +68,17 @@ _CHUNK_CONFIG_FIELDS = frozenset(
         "chunk_selection",
         "normalize_embeddings",
         "max_seq_length",
+        "prompt_policy",
+        "prompt_name",
+        "output_value",
+        "precision",
+        "convert_to_numpy",
+        "convert_to_tensor",
+        "truncate_dim",
+        "pooling_output_policy",
+        "model_dtype",
+        "stored_array_dtype",
+        "zero_vector_policy",
     }
 )
 _METADATA_FIELDS = frozenset(
@@ -84,6 +95,17 @@ _METADATA_FIELDS = frozenset(
         "chunk_selection",
         "normalize_embeddings",
         "max_seq_length",
+        "prompt_policy",
+        "prompt_name",
+        "output_value",
+        "precision",
+        "convert_to_numpy",
+        "convert_to_tensor",
+        "truncate_dim",
+        "pooling_output_policy",
+        "model_dtype",
+        "stored_array_dtype",
+        "zero_vector_policy",
         "effective_max_seq_length",
         "chunking_mode",
         "actual_max_len",
@@ -94,6 +116,9 @@ _METADATA_FIELDS = frozenset(
         "max_observed_token_count",
         "ordered_token_counts_sha256",
         "tokenizer_truncation_allowed",
+        "resolved_prompt_sha256",
+        "resolved_prompt_length",
+        "zero_vector_count",
         "storage_format",
         "dtype",
         "production_provenance",
@@ -120,6 +145,9 @@ _PROVENANCE_FIELDS = frozenset(
         "max_observed_token_count",
         "ordered_token_counts_sha256",
         "tokenizer_truncation_allowed",
+        "resolved_prompt_sha256",
+        "resolved_prompt_length",
+        "zero_vector_count",
         "atomic_publication",
         "partial_cache_reuse_allowed",
         "network_access_allowed",
@@ -260,7 +288,7 @@ def _cache_configuration_sha256(
 ) -> str:
     return _sha256_json(
         {
-            "schema_version": "production_embedding_cache_configuration_identity_v1",
+            "schema_version": "production_embedding_cache_configuration_identity_v2",
             "sentence_model_name": sentence_model_name,
             "chunk_configuration": copy.deepcopy(dict(chunk_configuration)),
         }
@@ -456,8 +484,10 @@ def _validated_chunk_configuration(value: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("chunk_overlap_words must be nonnegative and smaller than chunk size")
     if raw["max_chunks"] < 1:
         raise ValueError("max_chunks must be positive")
-    if raw["chunk_selection"] != "last":
-        raise ValueError("production embedding cache requires explicit chunk_selection='last'")
+    if raw["chunk_selection"] not in {"first", "last"}:
+        raise ValueError(
+            "production embedding cache requires explicit " "chunk_selection='first' or 'last'"
+        )
     if not isinstance(raw["normalize_embeddings"], bool):
         raise TypeError("normalize_embeddings must be a boolean")
     maximum = raw["max_seq_length"]
@@ -465,6 +495,38 @@ def _validated_chunk_configuration(value: Mapping[str, Any]) -> dict[str, Any]:
         isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1
     ):
         raise ValueError("max_seq_length must be null or a positive integer")
+    if raw["prompt_policy"] not in {"disabled", "authenticated_model_prompt_name"}:
+        raise ValueError("prompt_policy must be 'disabled' or 'authenticated_model_prompt_name'")
+    prompt_name = raw["prompt_name"]
+    if raw["prompt_policy"] == "disabled":
+        if prompt_name is not None:
+            raise ValueError("prompt_name must be null when prompt_policy is disabled")
+    elif (
+        not isinstance(prompt_name, str)
+        or not prompt_name
+        or prompt_name != prompt_name.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in prompt_name)
+    ):
+        raise ValueError("prompt_name must be one exact non-empty authenticated model prompt name")
+    if raw["output_value"] != "sentence_embedding":
+        raise ValueError("output_value must be 'sentence_embedding'")
+    if raw["precision"] != "float32":
+        raise ValueError(
+            "precision must be 'float32'; quantized precision would make "
+            "deployment batch size result-changing"
+        )
+    if raw["convert_to_numpy"] is not True or raw["convert_to_tensor"] is not False:
+        raise ValueError("convert_to_numpy must be true and convert_to_tensor must be false")
+    if raw["truncate_dim"] is not None:
+        raise ValueError("truncate_dim must be null; embedding truncation is forbidden")
+    if raw["pooling_output_policy"] != "single_process_sentence_embedding_v1":
+        raise ValueError("pooling_output_policy must be 'single_process_sentence_embedding_v1'")
+    if raw["model_dtype"] not in {"float32", "float16", "bfloat16"}:
+        raise ValueError("model_dtype must be float32, float16, or bfloat16")
+    if raw["stored_array_dtype"] != "float32":
+        raise ValueError("stored_array_dtype must be 'float32'")
+    if raw["zero_vector_policy"] not in {"reject", "preserve"}:
+        raise ValueError("zero_vector_policy must be 'reject' or 'preserve'")
     _canonical_json(raw)
     return raw
 
@@ -582,19 +644,32 @@ def _load_local_sentence_encoder(
     model_path: Path,
     device: str | None,
     max_seq_length: int | None,
+    model_dtype: str,
 ) -> Any:
     try:
         import torch
         from sentence_transformers import SentenceTransformer
     except ImportError as exc:  # pragma: no cover - production dependency
         raise ImportError("sentence-transformers and torch are required") from exc
+    torch_dtype = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }[model_dtype]
     encoder = SentenceTransformer(
         str(model_path),
         device=device,
         trust_remote_code=False,
         local_files_only=True,
-        model_kwargs={"torch_dtype": torch.float32},
+        model_kwargs={"torch_dtype": torch_dtype},
+        backend="torch",
+        truncate_dim=None,
     )
+    if getattr(encoder, "truncate_dim", None) is not None:
+        raise ValueError(
+            "local sentence encoder declares a hidden truncate_dim; "
+            "embedding dimensional truncation is forbidden"
+        )
     if max_seq_length is not None:
         current = getattr(encoder, "max_seq_length", None)
         try:
@@ -602,7 +677,12 @@ def _load_local_sentence_encoder(
         except (TypeError, ValueError):
             effective = max_seq_length
         encoder.max_seq_length = int(effective)
-    encoder.float()
+    if model_dtype == "float32":
+        encoder.float()
+    elif model_dtype == "float16":
+        encoder.half()
+    else:
+        encoder.bfloat16()
     encoder.eval()
     return encoder
 
@@ -618,21 +698,30 @@ def _effective_max_seq_length(encoder: Any, requested: int | None) -> int | None
     return min(observed, requested) if observed is not None and observed > 0 else requested
 
 
-def _default_encoder_prompt(encoder: Any) -> str:
-    """Return the exact default prompt that ``SentenceTransformer.encode`` applies."""
+def _resolve_encoder_prompt(
+    encoder: Any,
+    *,
+    configuration: Mapping[str, Any],
+) -> tuple[str | None, str | None, str]:
+    """Resolve one explicit prompt policy without model-default substitution."""
 
-    prompt_name = getattr(encoder, "default_prompt_name", None)
-    if prompt_name is None:
-        return ""
+    if configuration["prompt_policy"] == "disabled":
+        # Passing an explicit empty prompt prevents SentenceTransformer from
+        # silently substituting ``default_prompt_name`` when it is configured
+        # in the authenticated model tree.
+        return None, "", ""
+    prompt_name = configuration["prompt_name"]
     if not isinstance(prompt_name, str) or not prompt_name:
-        raise ValueError("local sentence encoder has an invalid default prompt name")
+        raise ValueError("configured sentence-encoder prompt name is invalid")
     prompts = getattr(encoder, "prompts", None)
     if not isinstance(prompts, Mapping) or prompt_name not in prompts:
-        raise ValueError("local sentence encoder default prompt is not present in its prompt map")
+        raise ValueError(
+            "configured sentence-encoder prompt name is not present in its authenticated prompt map"
+        )
     prompt = prompts[prompt_name]
     if not isinstance(prompt, str):
-        raise ValueError("local sentence encoder default prompt must be an exact string")
-    return prompt
+        raise ValueError("configured sentence-encoder prompt must be an exact string")
+    return prompt_name, None, prompt
 
 
 def _tokenizer_lengths_without_truncation(tokenizer: Any, inputs: Sequence[str]) -> tuple[int, ...]:
@@ -689,6 +778,7 @@ def _require_nontruncating_token_lengths(
     flat_chunks: Sequence[str],
     row_chunk_coordinates: Sequence[tuple[int, int]],
     effective_max_seq_length: int | None,
+    prompt_prefix: str,
 ) -> tuple[int, ...]:
     """Prove every exact encoder input fits without tokenizer-level truncation."""
 
@@ -706,14 +796,13 @@ def _require_nontruncating_token_lengths(
     tokenizer = getattr(encoder, "tokenizer", None)
     if not callable(tokenizer):
         raise ValueError("local sentence encoder does not expose an auditable tokenizer")
-    prompt = _default_encoder_prompt(encoder)
     token_counts: list[int] = []
     for start in range(0, len(flat_chunks), _TOKEN_LENGTH_AUDIT_BATCH_SIZE):
         stop = min(start + _TOKEN_LENGTH_AUDIT_BATCH_SIZE, len(flat_chunks))
         token_counts.extend(
             _tokenizer_lengths_without_truncation(
                 tokenizer,
-                tuple(prompt + chunk for chunk in flat_chunks[start:stop]),
+                tuple(prompt_prefix + chunk for chunk in flat_chunks[start:stop]),
             )
         )
     offending = [
@@ -758,25 +847,37 @@ def _encode_chunks(
     flat_chunks: Sequence[str],
     output_path: Path,
     batch_size: int,
-    normalize_embeddings: bool,
-) -> tuple[int, int]:
+    configuration: Mapping[str, Any],
+    prompt_name: str | None,
+    prompt: str | None,
+) -> tuple[int, int, int]:
     total = len(flat_chunks)
     if total < 1:
         raise ValueError("cohort produced no embedding chunks")
     matrix: np.memmap | None = None
     hidden_size: int | None = None
     cursor = 0
+    zero_vector_count = 0
+    stored_dtype = np.dtype(str(configuration["stored_array_dtype"]))
     try:
         while cursor < total:
             stop = min(cursor + batch_size, total)
             encoded = encoder.encode(
                 list(flat_chunks[cursor:stop]),
+                prompt_name=prompt_name,
+                prompt=prompt,
                 batch_size=stop - cursor,
-                convert_to_numpy=True,
-                normalize_embeddings=normalize_embeddings,
+                output_value=configuration["output_value"],
+                precision=configuration["precision"],
+                convert_to_numpy=configuration["convert_to_numpy"],
+                convert_to_tensor=configuration["convert_to_tensor"],
+                normalize_embeddings=configuration["normalize_embeddings"],
+                truncate_dim=configuration["truncate_dim"],
                 show_progress_bar=False,
+                pool=None,
+                chunk_size=None,
             )
-            values = np.asarray(encoded, dtype=np.float32)
+            values = np.asarray(encoded)
             if values.ndim == 1:
                 values = values.reshape(1, -1)
             if (
@@ -786,12 +887,25 @@ def _encode_chunks(
                 or not np.isfinite(values).all()
             ):
                 raise ValueError("local sentence encoder returned an invalid embedding matrix")
+            batch_zero_vectors = (
+                np.linalg.norm(
+                    np.asarray(values, dtype=np.float64),
+                    axis=1,
+                )
+                == 0.0
+            )
+            zero_vector_count += int(np.count_nonzero(batch_zero_vectors))
+            if configuration["zero_vector_policy"] == "reject" and bool(np.any(batch_zero_vectors)):
+                raise ValueError(
+                    "local sentence encoder returned a zero vector under zero_vector_policy='reject'"
+                )
+            values = np.asarray(values, dtype=stored_dtype)
             if hidden_size is None:
                 hidden_size = int(values.shape[1])
                 matrix = np.lib.format.open_memmap(
                     output_path,
                     mode="w+",
-                    dtype=np.float32,
+                    dtype=stored_dtype,
                     shape=(total, hidden_size),
                 )
             elif int(values.shape[1]) != hidden_size:
@@ -804,7 +918,7 @@ def _encode_chunks(
     finally:
         if matrix is not None:
             del matrix
-    return total, int(hidden_size or 0)
+    return total, int(hidden_size or 0), zero_vector_count
 
 
 def _write_json_new(path: Path, value: Mapping[str, Any]) -> None:
@@ -994,6 +1108,27 @@ def _validate_metadata(
         and isinstance(effective_max_seq_length, int)
         and max_observed_token_count <= effective_max_seq_length
     )
+    resolved_prompt_sha256 = metadata.get("resolved_prompt_sha256")
+    resolved_prompt_length = metadata.get("resolved_prompt_length")
+    zero_vector_count = metadata.get("zero_vector_count")
+    empty_prompt_sha256 = hashlib.sha256(b"").hexdigest()
+    valid_prompt_proof = (
+        isinstance(resolved_prompt_length, int)
+        and not isinstance(resolved_prompt_length, bool)
+        and resolved_prompt_length >= 0
+        and isinstance(resolved_prompt_sha256, str)
+        and _SHA256.fullmatch(resolved_prompt_sha256) is not None
+        and (
+            expected_configuration["prompt_policy"] != "disabled"
+            or (resolved_prompt_length == 0 and resolved_prompt_sha256 == empty_prompt_sha256)
+        )
+    )
+    valid_zero_vector_proof = (
+        isinstance(zero_vector_count, int)
+        and not isinstance(zero_vector_count, bool)
+        and 0 <= zero_vector_count <= total_chunks
+        and (expected_configuration["zero_vector_policy"] != "reject" or zero_vector_count == 0)
+    )
 
     if (
         metadata.get("schema_version") != PRODUCTION_EMBEDDING_CACHE_METADATA_SCHEMA
@@ -1003,7 +1138,7 @@ def _validate_metadata(
         != _canonical_json(dict(expected_configuration))
         or not valid_effective_max_seq_length
         or metadata.get("chunking_mode")
-        != "whitespace_word_chunks_tokenizer_verified_nontruncating_v2"
+        != "whitespace_word_chunks_tokenizer_verified_nontruncating_v3"
         or metadata.get("actual_max_len") != max(chunk_counts)
         or not isinstance(metadata.get("actual_max_len"), int)
         or isinstance(metadata.get("actual_max_len"), bool)
@@ -1014,8 +1149,10 @@ def _validate_metadata(
         or metadata.get("semantic_truncation_allowed") is not False
         or not valid_token_audit
         or metadata.get("tokenizer_truncation_allowed") is not False
+        or not valid_prompt_proof
+        or not valid_zero_vector_proof
         or metadata.get("storage_format") != "variable_length_chunks"
-        or metadata.get("dtype") != "float32"
+        or metadata.get("dtype") != expected_configuration["stored_array_dtype"]
         or provenance.get("schema_version") != PRODUCTION_EMBEDDING_CACHE_PROVENANCE_SCHEMA
         or provenance.get("builder_version") != PRODUCTION_EMBEDDING_CACHE_BUILDER_VERSION
         or provenance.get("builder_code_sha256") != _builder_code_sha256()
@@ -1038,6 +1175,9 @@ def _validate_metadata(
         or provenance.get("ordered_token_counts_sha256")
         != metadata.get("ordered_token_counts_sha256")
         or provenance.get("tokenizer_truncation_allowed") is not False
+        or provenance.get("resolved_prompt_sha256") != resolved_prompt_sha256
+        or provenance.get("resolved_prompt_length") != resolved_prompt_length
+        or provenance.get("zero_vector_count") != zero_vector_count
         or provenance.get("atomic_publication") != "fresh_temp_sibling_directory_rename_v1"
         or provenance.get("partial_cache_reuse_allowed") is not False
         or provenance.get("network_access_allowed") is not False
@@ -1064,6 +1204,10 @@ def _validate_metadata(
     )
     if metadata_token_counts_sha256 != provenance_token_counts_sha256:
         raise ValueError("production embedding cache token-length proofs differ")
+    _require_sha256(
+        resolved_prompt_sha256,
+        field_name="resolved_prompt_sha256",
+    )
 
 
 def _validate_cache_files_against_provider_identity(
@@ -1154,7 +1298,7 @@ def _validate_cache_content(
         embeddings.ndim != 2
         or embeddings.shape[0] < 1
         or embeddings.shape[1] < 1
-        or embeddings.dtype != np.dtype(np.float32)
+        or embeddings.dtype != np.dtype(str(configuration["stored_array_dtype"]))
         or not np.isfinite(embeddings).all()
         or offsets.dtype != np.int64
         or offsets.ndim != 1
@@ -1420,6 +1564,11 @@ def _build_production_embedding_cache(
             model_path=model,
             device=device,
             max_seq_length=configuration["max_seq_length"],
+            model_dtype=configuration["model_dtype"],
+        )
+        prompt_name, prompt, resolved_prompt = _resolve_encoder_prompt(
+            encoder,
+            configuration=configuration,
         )
         effective_max_seq_length = _effective_max_seq_length(
             encoder,
@@ -1430,13 +1579,16 @@ def _build_production_embedding_cache(
             flat_chunks=flat_chunks,
             row_chunk_coordinates=row_chunk_coordinates,
             effective_max_seq_length=effective_max_seq_length,
+            prompt_prefix=resolved_prompt,
         )
-        total_chunks, hidden_size = _encode_chunks(
+        total_chunks, hidden_size, zero_vector_count = _encode_chunks(
             encoder=encoder,
             flat_chunks=flat_chunks,
             output_path=temporary / "chunk_embeddings.npy",
             batch_size=batch_size,
-            normalize_embeddings=configuration["normalize_embeddings"],
+            configuration=configuration,
+            prompt_name=prompt_name,
+            prompt=prompt,
         )
 
         companion_registrations = {
@@ -1491,6 +1643,9 @@ def _build_production_embedding_cache(
             "max_observed_token_count": max(ordered_token_counts),
             "ordered_token_counts_sha256": _sha256_json(ordered_token_counts),
             "tokenizer_truncation_allowed": False,
+            "resolved_prompt_sha256": hashlib.sha256(resolved_prompt.encode("utf-8")).hexdigest(),
+            "resolved_prompt_length": len(resolved_prompt),
+            "zero_vector_count": zero_vector_count,
             "atomic_publication": "fresh_temp_sibling_directory_rename_v1",
             "partial_cache_reuse_allowed": False,
             "network_access_allowed": False,
@@ -1506,7 +1661,7 @@ def _build_production_embedding_cache(
             "chunk_counts": chunk_counts,
             **copy.deepcopy(configuration),
             "effective_max_seq_length": effective_max_seq_length,
-            "chunking_mode": "whitespace_word_chunks_tokenizer_verified_nontruncating_v2",
+            "chunking_mode": "whitespace_word_chunks_tokenizer_verified_nontruncating_v3",
             "actual_max_len": max(chunk_counts),
             "uncapped_total_chunks": sum(uncapped_chunk_counts),
             "uncapped_chunk_counts_sha256": _sha256_json(uncapped_chunk_counts),
@@ -1515,8 +1670,11 @@ def _build_production_embedding_cache(
             "max_observed_token_count": max(ordered_token_counts),
             "ordered_token_counts_sha256": _sha256_json(ordered_token_counts),
             "tokenizer_truncation_allowed": False,
+            "resolved_prompt_sha256": hashlib.sha256(resolved_prompt.encode("utf-8")).hexdigest(),
+            "resolved_prompt_length": len(resolved_prompt),
+            "zero_vector_count": zero_vector_count,
             "storage_format": "variable_length_chunks",
-            "dtype": "float32",
+            "dtype": configuration["stored_array_dtype"],
             "production_provenance": provenance,
             "production_provenance_sha256": _sha256_json(provenance),
         }

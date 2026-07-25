@@ -183,7 +183,7 @@ def _validated_adaptive_reconsideration_identity(value: Any) -> dict[str, Any]:
         label="adaptive reconsideration config_sha256",
     )
     config = _mapping(row["config"], label="adaptive reconsideration config")
-    chosen = AdaptiveReconsiderationConfig(**dict(config))
+    chosen = AdaptiveReconsiderationConfig.from_mapping(config)
     normalized = dict(_clone(row))
     current = adaptive_hierarchical_stage1_reconsideration_identity(chosen)
     if canonical_json(normalized) != canonical_json(current):
@@ -307,7 +307,7 @@ class FrozenReviewEvidencePolicyBinding:
 
         self.validate_authentication()
         identity = json.loads(self._adaptive_reconsideration_identity_json)
-        return AdaptiveReconsiderationConfig(**dict(identity["config"]))
+        return AdaptiveReconsiderationConfig.from_mapping(identity["config"])
 
 
 @dataclass(frozen=True)

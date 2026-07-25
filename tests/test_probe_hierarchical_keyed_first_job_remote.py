@@ -22,6 +22,7 @@ from scripts.probe_hierarchical_keyed_first_job_remote import (
     EXPECTED_RETIRED_JOB_ID,
     EXPECTED_TARGET_MEMBER_ID,
     MODEL,
+    RETIRED_TARGET_DIAGNOSTIC_WIRE_BUDGET,
     _build_preflight,
     _execute,
 )
@@ -42,13 +43,11 @@ def prepared_probe():
 
 def _valid_wire_response(evidence) -> dict[str, Any]:
     return {
-        "concepts": [],
         "evidence_dispositions": {
             item.evidence_id: {
-                "status": "reviewed_no_specific_concept",
-                "feature_names": [],
+                "evidence_findings": [],
                 "member_dispositions": {
-                    member_id: {"feature_names": []} for member_id in item.member_ids
+                    member_id: {"findings": []} for member_id in item.member_ids
                 },
                 "reason": "No specific concept is supported.",
             }
@@ -166,7 +165,11 @@ def test_missing_member_is_rejected_by_exact_semantics_and_probe(prepared_probe)
     wire["evidence_dispositions"][first.evidence_id]["member_dispositions"].pop(first.member_ids[0])
 
     with pytest.raises(ValueError, match="keys differ"):
-        validate_interpret_evidence_chunk_response(wire, evidence=evidence)
+        validate_interpret_evidence_chunk_response(
+            wire,
+            evidence=evidence,
+            wire_budget=RETIRED_TARGET_DIAGNOSTIC_WIRE_BUDGET,
+        )
 
     runner = _HashOnlyFakeRunner(response=wire, preflight=preflight)
     result = _execute(

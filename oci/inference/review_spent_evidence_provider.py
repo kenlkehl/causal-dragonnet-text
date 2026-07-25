@@ -13,7 +13,7 @@ Two production backends are provided:
 * ``TfidfTopicOrphanSpentDiscoveryBackend`` reuses the exact-context TF-IDF
   topic fitter and the orphan n-gram safety/clustering adapter.
 
-Only short concept phrases and aggregate fit-side scores leave a backend.
+Only sanitized lexical concept phrases and aggregate fit-side scores leave a backend.
 Patient/document identifiers, row IDs, retrieved note/chunk excerpts, raw
 prediction vectors, and backend artifact paths are rejected before a fusion
 request can be built.  A third backend (for example, spent-only neural query
@@ -32,14 +32,14 @@ import re
 import tempfile
 import unicodedata
 from collections import Counter
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, BinaryIO, Mapping, Protocol, Sequence
 
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, TfidfVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 from ..models.concept_embedding_utils import chunk_text_words
 from .all_evidence_fusion import (
@@ -62,6 +62,7 @@ from .embedding_contrast_discovery import EmbeddingContrastEvidenceGenerator
 from .fold_honest_r_stack import FitRowProvenance
 from .multi_model_agentic_forest import _build_role_grouped_evidence_digest
 from .multi_model_forest_stage1 import MultiModelForestStage1Runner
+from .production_stage1_scope_scheduler import derive_stage1_group_seed
 from .stage1_upstream_gate_backend import (
     EFFECTIVE_STAGE1_CONFIG_ID,
     HistoricalStage1ConfigSnapshot,
@@ -126,23 +127,6 @@ _PERSON_NAME_CONTEXT = re.compile(
     r"(?:[\s,]+(?:[A-Z][a-z]+|[A-Z]{3,})){1,2}\b"
 )
 
-_HTR_CONCEPT_STOP_WORDS = frozenset(ENGLISH_STOP_WORDS) | {
-    "clinical",
-    "date",
-    "document",
-    "findings",
-    "history",
-    "impression",
-    "note",
-    "patient",
-    "prepared",
-    "provider",
-    "record",
-    "report",
-    "section",
-    "signature",
-    "timepoint",
-}
 _EMAIL_URL_LONG_ID = re.compile(
     r"(?:\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b|https?://|www\.|"
     r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b|"
@@ -153,6 +137,368 @@ _TERM_TOKEN = re.compile(r"[a-z0-9%<>+=-]+", re.IGNORECASE)
 _PAYLOAD_TERM_KEYS = frozenset(
     {"term", "feature", "phrase", "concept", "token", "attended_token_summary"}
 )
+
+SEMANTIC_WITNESS_VECTORIZER_SCHEMA = "semantic_witness_tfidf_vectorizer_v1"
+SEMANTIC_WITNESS_SCIENTIFIC_SCHEMA = "semantic_witness_scientific_config_v1"
+
+
+def _closed_mapping(
+    value: Any,
+    *,
+    expected: frozenset[str],
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{label} must be one configured object")
+    observed = set(value)
+    missing = sorted(expected - observed)
+    extra = sorted(observed - expected)
+    if missing or extra:
+        raise ValueError(
+            f"{label} must be closed and explicit; missing={missing}, extra={extra}"
+        )
+    return copy.deepcopy(dict(value))
+
+
+def _document_frequency(value: Any, *, label: str, maximum: bool) -> int | float:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, float, np.integer, np.floating)
+    ):
+        raise TypeError(f"{label} must be an integer count or floating proportion")
+    if isinstance(value, (int, np.integer)):
+        count = int(value)
+        if count < 1:
+            raise ValueError(f"{label} integer count must be positive")
+        return count
+    proportion = float(value)
+    lower_bound = 0.0 if not maximum else 0.0
+    if not math.isfinite(proportion) or not lower_bound <= proportion <= 1.0:
+        raise ValueError(f"{label} floating proportion must be in [0, 1]")
+    if maximum and proportion == 0.0:
+        raise ValueError(f"{label} maximum proportion must be positive")
+    return proportion
+
+
+@dataclass(frozen=True)
+class SemanticWitnessTfidfVectorizerConfig:
+    """Closed TF-IDF behavior for one semantic-witness projection.
+
+    No field has a default.  ``max_features`` is an overflow assertion, not a
+    feature-selection instruction: the implementation always fits the complete
+    configured vocabulary first and raises if a finite bound is exceeded.
+    """
+
+    schema_version: str
+    input: str
+    encoding: str
+    decode_error: str
+    strip_accents: str | None
+    lowercase: bool
+    preprocessor: None
+    tokenizer: None
+    analyzer: str
+    stop_words: str | tuple[str, ...] | None
+    token_pattern: str | None
+    ngram_range_min: int
+    ngram_range_max: int
+    max_df: int | float
+    min_df: int | float
+    max_features: int | None
+    vocabulary: None
+    binary: bool
+    dtype: str
+    norm: str | None
+    use_idf: bool
+    smooth_idf: bool
+    sublinear_tf: bool
+
+    def __post_init__(self) -> None:
+        if self.schema_version != SEMANTIC_WITNESS_VECTORIZER_SCHEMA:
+            raise ValueError("semantic-witness vectorizer schema is unsupported")
+        if self.input != "content":
+            raise ValueError("semantic-witness vectorizer input must be 'content'")
+        if not isinstance(self.encoding, str) or not self.encoding:
+            raise ValueError("semantic-witness vectorizer encoding must be nonempty")
+        if self.decode_error not in {"strict", "ignore", "replace"}:
+            raise ValueError("semantic-witness vectorizer decode_error is unsupported")
+        if self.strip_accents not in {None, "ascii", "unicode"}:
+            raise ValueError("semantic-witness vectorizer strip_accents is unsupported")
+        for name in ("lowercase", "binary", "use_idf", "smooth_idf", "sublinear_tf"):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"semantic-witness vectorizer {name} must be boolean")
+        if self.preprocessor is not None or self.tokenizer is not None:
+            raise ValueError(
+                "semantic-witness vectorizer preprocessor/tokenizer must be null"
+            )
+        if self.analyzer not in {"word", "char", "char_wb"}:
+            raise ValueError("semantic-witness vectorizer analyzer is unsupported")
+        if isinstance(self.stop_words, str):
+            if self.stop_words != "english":
+                raise ValueError(
+                    "semantic-witness vectorizer stop_words string must be 'english'"
+                )
+        elif self.stop_words is not None:
+            if not isinstance(self.stop_words, (list, tuple)):
+                raise TypeError(
+                    "semantic-witness vectorizer stop_words must be null, "
+                    "'english', or an ordered list"
+                )
+            normalized = tuple(str(item) for item in self.stop_words)
+            if (
+                not normalized
+                or any(not item for item in normalized)
+                or len(set(normalized)) != len(normalized)
+                or normalized != tuple(sorted(normalized))
+            ):
+                raise ValueError(
+                    "semantic-witness explicit stop_words must be nonempty, "
+                    "unique, and sorted"
+                )
+            object.__setattr__(self, "stop_words", normalized)
+        if self.analyzer == "word":
+            if not isinstance(self.token_pattern, str) or not self.token_pattern:
+                raise ValueError(
+                    "word semantic-witness vectorizer requires token_pattern"
+                )
+        else:
+            if self.token_pattern is not None:
+                raise ValueError(
+                    "character semantic-witness vectorizer token_pattern must be null"
+                )
+            if self.stop_words is not None:
+                raise ValueError(
+                    "character semantic-witness vectorizer stop_words must be null"
+                )
+        if (
+            isinstance(self.ngram_range_min, (bool, np.bool_))
+            or isinstance(self.ngram_range_max, (bool, np.bool_))
+            or not isinstance(self.ngram_range_min, (int, np.integer))
+            or not isinstance(self.ngram_range_max, (int, np.integer))
+            or int(self.ngram_range_min) < 1
+            or int(self.ngram_range_max) < int(self.ngram_range_min)
+        ):
+            raise ValueError("semantic-witness vectorizer ngram range is invalid")
+        object.__setattr__(self, "ngram_range_min", int(self.ngram_range_min))
+        object.__setattr__(self, "ngram_range_max", int(self.ngram_range_max))
+        object.__setattr__(
+            self,
+            "min_df",
+            _document_frequency(self.min_df, label="min_df", maximum=False),
+        )
+        object.__setattr__(
+            self,
+            "max_df",
+            _document_frequency(self.max_df, label="max_df", maximum=True),
+        )
+        if self.max_features is not None:
+            if (
+                isinstance(self.max_features, (bool, np.bool_))
+                or not isinstance(self.max_features, (int, np.integer))
+                or int(self.max_features) < 1
+            ):
+                raise ValueError(
+                    "semantic-witness vectorizer max_features must be null "
+                    "or a positive overflow assertion"
+                )
+            object.__setattr__(self, "max_features", int(self.max_features))
+        if self.vocabulary is not None:
+            raise ValueError(
+                "semantic-witness vectorizer vocabulary must be null so the "
+                "complete fit-scope vocabulary is learned"
+            )
+        if self.dtype not in {"float32", "float64"}:
+            raise ValueError("semantic-witness vectorizer dtype must be float32 or float64")
+        if self.norm not in {None, "l1", "l2"}:
+            raise ValueError("semantic-witness vectorizer norm is unsupported")
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        label: str = "semantic-witness vectorizer",
+    ) -> "SemanticWitnessTfidfVectorizerConfig":
+        values = _closed_mapping(
+            value,
+            expected=frozenset(item.name for item in fields(cls)),
+            label=label,
+        )
+        return cls(**values)
+
+    def as_dict(self) -> dict[str, Any]:
+        value = asdict(self)
+        if isinstance(self.stop_words, tuple):
+            value["stop_words"] = list(self.stop_words)
+        return value
+
+    @property
+    def identity_sha256(self) -> str:
+        return _sha256_json(self.as_dict())
+
+
+@dataclass(frozen=True)
+class SemanticWitnessScientificConfig:
+    """All scientific choices used by safe embedding/HTR term projection."""
+
+    schema_version: str
+    retrieval_vectorizer: SemanticWitnessTfidfVectorizerConfig
+    htr_vectorizer: SemanticWitnessTfidfVectorizerConfig
+    retrieval_min_positive_documents: int
+    retrieval_min_negative_documents: int
+    htr_min_unique_sources: int
+    htr_min_distinct_positive_documents: int
+    htr_min_positive_source_support: int
+    htr_attention_score_min_exclusive: float
+    htr_direction_score_min_exclusive: float
+    htr_require_strict_attention_separation: bool
+    retrieval_document_weighting_policy: str
+    htr_source_weighting_policy: str
+    htr_extreme_chunk_tie_policy: str
+    retrieval_ranking_policy: str
+    htr_ranking_policy: str
+    phrase_collision_policy: str
+    htr_term_overlap_policy: str
+    retrieval_score_eligibility_policy: str
+    maximum_retrieval_terms: int | None
+    maximum_htr_terms: int | None
+    maximum_explicit_phrases_per_attention_row: int | None
+    overflow_policy: str
+    insufficient_source_policy: str
+    empty_vocabulary_policy: str
+    direction_numeric_dtype: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != SEMANTIC_WITNESS_SCIENTIFIC_SCHEMA:
+            raise ValueError("semantic-witness scientific schema is unsupported")
+        for name in ("retrieval_vectorizer", "htr_vectorizer"):
+            if type(getattr(self, name)) is not SemanticWitnessTfidfVectorizerConfig:
+                raise TypeError(f"{name} must be a closed semantic-witness vectorizer")
+        for name in (
+            "retrieval_min_positive_documents",
+            "retrieval_min_negative_documents",
+            "htr_min_unique_sources",
+            "htr_min_distinct_positive_documents",
+            "htr_min_positive_source_support",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, (bool, np.bool_))
+                or not isinstance(value, (int, np.integer))
+                or int(value) < 1
+            ):
+                raise ValueError(f"{name} must be a positive integer")
+            object.__setattr__(self, name, int(value))
+        for name in (
+            "htr_attention_score_min_exclusive",
+            "htr_direction_score_min_exclusive",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
+            object.__setattr__(self, name, value)
+        if type(self.htr_require_strict_attention_separation) is not bool:
+            raise TypeError("htr_require_strict_attention_separation must be boolean")
+        expected_policies = {
+            "retrieval_document_weighting_policy": "unweighted_document_mean_v1",
+            "htr_source_weighting_policy": (
+                "equal_source_mass_inverse_repeated_partition_count_v1"
+            ),
+            "htr_extreme_chunk_tie_policy": (
+                "attention_then_chunk_index_then_casefolded_text_v1"
+            ),
+            "retrieval_ranking_policy": "absolute_score_desc_then_term_asc_v1",
+            "htr_ranking_policy": (
+                "score_desc_then_token_count_desc_then_term_asc_v1"
+            ),
+            "phrase_collision_policy": "highest_ranked_normalized_phrase_v1",
+            "htr_term_overlap_policy": "retain_all_eligible_terms_v1",
+            "retrieval_score_eligibility_policy": "all_finite_including_zero_v1",
+            "overflow_policy": "fail_closed_without_selection_v1",
+            "insufficient_source_policy": "return_empty_evidence_v1",
+            "empty_vocabulary_policy": "return_empty_evidence_v1",
+        }
+        for name, expected in expected_policies.items():
+            if getattr(self, name) != expected:
+                raise ValueError(f"{name} must equal {expected!r}")
+        for name in (
+            "maximum_retrieval_terms",
+            "maximum_htr_terms",
+            "maximum_explicit_phrases_per_attention_row",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                if (
+                    isinstance(value, (bool, np.bool_))
+                    or not isinstance(value, (int, np.integer))
+                    or int(value) < 1
+                ):
+                    raise ValueError(f"{name} must be null or a positive overflow assertion")
+                object.__setattr__(self, name, int(value))
+        if self.direction_numeric_dtype not in {"float32", "float64"}:
+            raise ValueError("direction_numeric_dtype must be float32 or float64")
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        label: str = "semantic-witness scientific config",
+    ) -> "SemanticWitnessScientificConfig":
+        values = _closed_mapping(
+            value,
+            expected=frozenset(item.name for item in fields(cls)),
+            label=label,
+        )
+        values["retrieval_vectorizer"] = (
+            SemanticWitnessTfidfVectorizerConfig.from_mapping(
+                values["retrieval_vectorizer"],
+                label=f"{label}.retrieval_vectorizer",
+            )
+        )
+        values["htr_vectorizer"] = SemanticWitnessTfidfVectorizerConfig.from_mapping(
+            values["htr_vectorizer"],
+            label=f"{label}.htr_vectorizer",
+        )
+        return cls(**values)
+
+    def as_dict(self) -> dict[str, Any]:
+        value = asdict(self)
+        value["retrieval_vectorizer"] = self.retrieval_vectorizer.as_dict()
+        value["htr_vectorizer"] = self.htr_vectorizer.as_dict()
+        return value
+
+    @property
+    def identity_sha256(self) -> str:
+        return _sha256_json(self.as_dict())
+
+
+def semantic_witness_config_from_portable_scientific_spec(
+    value: Mapping[str, Any],
+) -> SemanticWitnessScientificConfig:
+    """Load the closed witness config from the authenticated portable profile."""
+
+    if not isinstance(value, Mapping):
+        raise TypeError("portable scientific identity must be one mapping")
+    profiles = value.get("architecture_profiles")
+    if not isinstance(profiles, Mapping):
+        raise ValueError("portable scientific identity has no architecture_profiles")
+    profile = profiles.get("lexical_semantic_retrieval")
+    if (
+        not isinstance(profile, Mapping)
+        or profile.get("enabled") is not True
+        or profile.get("shared_physical_producer") != "whole_cohort_embeddings"
+    ):
+        raise ValueError(
+            "lexical semantic retrieval must be enabled and bind the "
+            "whole-cohort physical producer"
+        )
+    return SemanticWitnessScientificConfig.from_mapping(
+        profile.get("producer_configuration"),
+        label=(
+            "architecture_profiles.lexical_semantic_retrieval."
+            "producer_configuration"
+        ),
+    )
 
 
 def _canonical_json(value: Any) -> str:
@@ -350,17 +696,48 @@ def _array_digest(values: np.ndarray) -> str:
     return digest.hexdigest()
 
 
-def _safe_concept_phrase(value: Any, *, max_tokens: int = 8, max_chars: int = 120) -> str:
+def _safe_concept_phrase(
+    value: Any,
+    *,
+    max_tokens: int | None = None,
+    max_chars: int | None = None,
+) -> str:
+    """Normalize a lexical phrase without an implicit size cutoff.
+
+    Optional finite capacities are caller-owned assertions. They are not
+    production defaults and never replace the complete term.
+    """
+
+    for name, capacity in (
+        ("max_tokens", max_tokens),
+        ("max_chars", max_chars),
+    ):
+        if capacity is not None and (
+            isinstance(capacity, bool)
+            or not isinstance(capacity, int)
+            or capacity < 1
+        ):
+            raise ValueError(f"{name} must be null or a positive integer")
     text = unicodedata.normalize("NFKC", str(value or ""))
     text = re.sub(r"\s+", " ", text).strip(" \t\r\n;,:|/\\")
-    if not text or len(text) > int(max_chars):
+    if max_chars is not None and len(text) > max_chars:
+        raise ValueError(
+            "safe concept phrase exceeds configured max_chars; refusing "
+            "silent semantic omission"
+        )
+    if not text:
         return ""
     if _IDENTIFIER_NOISE.search(text):
         return ""
     if _EMAIL_URL_LONG_ID.search(text):
         return ""
     tokens = _TERM_TOKEN.findall(text)
-    if not tokens or len(tokens) > int(max_tokens):
+    if max_tokens is not None and len(tokens) > max_tokens:
+        raise ValueError(
+            "safe concept phrase exceeds configured max_tokens; refusing "
+            "silent semantic omission"
+        )
+    if not tokens:
         return ""
     if all(token.isdigit() for token in tokens):
         return ""
@@ -830,6 +1207,18 @@ class SpentOnlyFrozenChunkEmbeddingCache:
     def row_count(self) -> int:
         return int(self._metadata["num_samples"])
 
+    def authenticated_snapshot_identity(self) -> Mapping[str, Any]:
+        """Return the identity of this already-authenticated private snapshot.
+
+        Construction opens private file descriptors, hashes every registered
+        byte, and verifies the path/stat inventory after all snapshots exist.
+        Consumers holding this nonserializable handle may therefore reuse its
+        identity without replaying the same multi-gigabyte cache merely to
+        recover the digest that was just authenticated.
+        """
+
+        return copy.deepcopy(self._identity)
+
     def identity(self) -> Mapping[str, Any]:
         hash_fields = {
             "metadata.json": "metadata_sha256",
@@ -1036,53 +1425,147 @@ class _FrozenCacheEmbeddingEvidenceGenerator(EmbeddingContrastEvidenceGenerator)
         raise RuntimeError("frozen spent discovery never encodes novel concept text")
 
 
+def _semantic_vectorizer(
+    config: SemanticWitnessTfidfVectorizerConfig,
+) -> TfidfVectorizer:
+    if type(config) is not SemanticWitnessTfidfVectorizerConfig:
+        raise TypeError("semantic witness projection requires a typed vectorizer config")
+    return TfidfVectorizer(
+        input=config.input,
+        encoding=config.encoding,
+        decode_error=config.decode_error,
+        strip_accents=config.strip_accents,
+        lowercase=config.lowercase,
+        preprocessor=config.preprocessor,
+        tokenizer=config.tokenizer,
+        analyzer=config.analyzer,
+        stop_words=(
+            list(config.stop_words)
+            if isinstance(config.stop_words, tuple)
+            else config.stop_words
+        ),
+        token_pattern=config.token_pattern,
+        ngram_range=(config.ngram_range_min, config.ngram_range_max),
+        max_df=config.max_df,
+        min_df=config.min_df,
+        # A finite configured value is checked after exhaustive fitting.  It
+        # never authorizes sklearn to select a vocabulary prefix.
+        max_features=None,
+        vocabulary=None,
+        binary=config.binary,
+        dtype=np.float32 if config.dtype == "float32" else np.float64,
+        norm=config.norm,
+        use_idf=config.use_idf,
+        smooth_idf=config.smooth_idf,
+        sublinear_tf=config.sublinear_tf,
+    )
+
+
+def _fit_semantic_witness_matrix(
+    documents: Sequence[str],
+    *,
+    config: SemanticWitnessTfidfVectorizerConfig,
+    empty_vocabulary_policy: str,
+    label: str,
+) -> tuple[TfidfVectorizer, Any] | None:
+    vectorizer = _semantic_vectorizer(config)
+    try:
+        matrix = vectorizer.fit_transform(list(documents))
+    except ValueError as exc:
+        message = str(exc)
+        vocabulary_is_empty = (
+            "empty vocabulary" in message
+            or "After pruning, no terms remain" in message
+        )
+        if (
+            empty_vocabulary_policy == "return_empty_evidence_v1"
+            and vocabulary_is_empty
+        ):
+            return None
+        raise
+    feature_count = len(vectorizer.get_feature_names_out())
+    if config.max_features is not None and feature_count > config.max_features:
+        raise RuntimeError(
+            f"{label} complete vocabulary has {feature_count} terms, exceeding "
+            f"the configured fail-closed assertion {config.max_features}"
+        )
+    return vectorizer, matrix
+
+
+def _fail_on_semantic_witness_overflow(
+    values: Sequence[Any],
+    *,
+    capacity: int | None,
+    label: str,
+) -> None:
+    if capacity is not None and len(values) > capacity:
+        raise RuntimeError(
+            f"{label} produced {len(values)} complete values, exceeding the "
+            f"configured fail-closed assertion {capacity}"
+        )
+
+
 def _signed_contrastive_terms(
     positive: Sequence[str],
     negative: Sequence[str],
     *,
-    limit: int | None = None,
+    scientific_config: SemanticWitnessScientificConfig,
 ) -> list[dict[str, Any]]:
-    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
-        raise ValueError("contrastive term limit must be a positive integer or None")
+    if type(scientific_config) is not SemanticWitnessScientificConfig:
+        raise TypeError("contrastive terms require SemanticWitnessScientificConfig")
     positive_documents = [str(value) for value in positive if str(value).strip()]
     negative_documents = [str(value) for value in negative if str(value).strip()]
     documents = [*positive_documents, *negative_documents]
-    if not positive_documents or not negative_documents:
+    if (
+        len(positive_documents) < scientific_config.retrieval_min_positive_documents
+        or len(negative_documents) < scientific_config.retrieval_min_negative_documents
+    ):
         return []
-    try:
-        vectorizer = TfidfVectorizer(
-            lowercase=True,
-            strip_accents="unicode",
-            ngram_range=(1, 3),
-            min_df=1,
-            sublinear_tf=True,
-        )
-        matrix = vectorizer.fit_transform(documents)
-    except ValueError:
+    fitted = _fit_semantic_witness_matrix(
+        documents,
+        config=scientific_config.retrieval_vectorizer,
+        empty_vocabulary_policy=scientific_config.empty_vocabulary_policy,
+        label="retrieval semantic witness",
+    )
+    if fitted is None:
         return []
+    vectorizer, matrix = fitted
     split = len(positive_documents)
-    direction = np.asarray(matrix[:split].mean(axis=0) - matrix[split:].mean(axis=0)).ravel()
+    numeric_dtype = (
+        np.float32
+        if scientific_config.direction_numeric_dtype == "float32"
+        else np.float64
+    )
+    direction = np.asarray(
+        matrix[:split].mean(axis=0) - matrix[split:].mean(axis=0),
+        dtype=numeric_dtype,
+    ).ravel()
     terms = vectorizer.get_feature_names_out()
     ranked = sorted(range(len(terms)), key=lambda index: (-abs(direction[index]), terms[index]))
     output: list[dict[str, Any]] = []
     seen: set[str] = set()
     for index in ranked:
-        phrase = _safe_concept_phrase(terms[index], max_tokens=6, max_chars=100)
+        phrase = _safe_concept_phrase(terms[index])
         score = float(direction[index])
-        if not phrase or phrase in seen or not math.isfinite(score) or score == 0.0:
+        if not phrase or phrase in seen or not math.isfinite(score):
             continue
         seen.add(phrase)
         output.append({"concept": phrase, "score": score})
-        if limit is not None and len(output) >= limit:
-            break
+    _fail_on_semantic_witness_overflow(
+        output,
+        capacity=scientific_config.maximum_retrieval_terms,
+        label="retrieval semantic witness",
+    )
     return output
 
 
 def _embedding_concepts_only(
     evidence: Mapping[str, Any],
     *,
-    contrastive_term_limit: int | None = None,
+    scientific_config: SemanticWitnessScientificConfig,
 ) -> dict[str, Any]:
+    if type(scientific_config) is not SemanticWitnessScientificConfig:
+        raise TypeError("embedding concept projection requires a typed scientific config")
     output: list[dict[str, Any]] = []
     for raw in evidence.get("contrasts") or ():
         if not isinstance(raw, Mapping):
@@ -1102,7 +1585,7 @@ def _embedding_concepts_only(
         scores = _signed_contrastive_terms(
             positive,
             negative,
-            limit=contrastive_term_limit,
+            scientific_config=scientific_config,
         )
         if not scores:
             continue
@@ -1127,7 +1610,11 @@ def _embedding_concepts_only(
     }
 
 
-def _htr_attention_score(row: Mapping[str, Any]) -> float | None:
+def _htr_attention_score(
+    row: Mapping[str, Any],
+    *,
+    minimum_exclusive: float,
+) -> float | None:
     for key in ("attention", "attention_score", "chunk_attention"):
         value = row.get(key)
         if isinstance(value, (bool, np.bool_)):
@@ -1136,14 +1623,14 @@ def _htr_attention_score(row: Mapping[str, Any]) -> float | None:
             score = float(value)
         except (TypeError, ValueError):
             continue
-        if math.isfinite(score) and score > 0.0:
+        if math.isfinite(score) and score > minimum_exclusive:
             return score
     return None
 
 
 def _htr_attention_text(row: Mapping[str, Any]) -> str:
     # These are observed HTR attention-table aliases.  Raw text is used only
-    # transiently to derive recurrent short n-grams and never enters a payload.
+    # transiently to derive configured n-grams and never enters a payload.
     for key in ("chunk_text", "highlighted_chunk_text", "evidence_snippet"):
         text = unicodedata.normalize("NFKC", str(row.get(key) or ""))
         text = re.sub(r"\s+", " ", text).strip()
@@ -1228,7 +1715,7 @@ def _htr_phrase_has_unsafe_numeric_fragment(phrase: str) -> bool:
 def _htr_attention_contrastive_terms(
     attention_rows: Sequence[Mapping[str, Any]],
     *,
-    limit: int | None = None,
+    scientific_config: SemanticWitnessScientificConfig,
 ) -> list[dict[str, Any]]:
     """Derive recurrent concepts from patient-local high/low HTR attention.
 
@@ -1239,8 +1726,8 @@ def _htr_attention_contrastive_terms(
     two rows survive; source chunks and row identities remain transient.
     """
 
-    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
-        raise ValueError("HTR contrastive term limit must be a positive integer or None")
+    if type(scientific_config) is not SemanticWitnessScientificConfig:
+        raise TypeError("HTR contrastive terms require a typed scientific config")
     grouped: dict[tuple[str, ...], list[tuple[float, int, str, str]]] = {}
     sources: dict[tuple[str, ...], tuple[str, str]] = {}
     for raw in attention_rows:
@@ -1248,7 +1735,10 @@ def _htr_attention_contrastive_terms(
             continue
         source_key = _htr_attention_source_key(raw)
         group_key = _htr_attention_group_key(raw)
-        score = _htr_attention_score(raw)
+        score = _htr_attention_score(
+            raw,
+            minimum_exclusive=scientific_config.htr_attention_score_min_exclusive,
+        )
         text = _htr_attention_text(raw)
         if source_key is None or group_key is None or score is None or not text:
             continue
@@ -1267,32 +1757,36 @@ def _htr_attention_contrastive_terms(
         candidates = grouped[group_key]
         high = min(candidates, key=lambda row: (-row[0], row[1], row[2]))
         low = min(candidates, key=lambda row: (row[0], row[1], row[2]))
-        if high[0] <= low[0] or high[2] == low[2]:
+        if (
+            scientific_config.htr_require_strict_attention_separation
+            and high[0] <= low[0]
+        ) or high[2] == low[2]:
             continue
         positive_documents.append(high[3])
         negative_documents.append(low[3])
         source_keys.append(sources[group_key])
 
-    # Requiring two independently spent rows and two distinct high chunks
-    # prevents repeated cross-fit models or one template from manufacturing
+    # The configured independent-source and distinct-high-document thresholds
+    # prevent repeated cross-fit models or one template from manufacturing
     # recurrence for a patient-specific fragment.
     unique_sources = tuple(sorted(set(source_keys)))
     distinct_high_documents = {text.casefold() for text in positive_documents}
-    if len(unique_sources) < 2 or len(distinct_high_documents) < 2:
+    if (
+        len(unique_sources) < scientific_config.htr_min_unique_sources
+        or len(distinct_high_documents)
+        < scientific_config.htr_min_distinct_positive_documents
+    ):
         return []
     documents = [*positive_documents, *negative_documents]
-    try:
-        vectorizer = TfidfVectorizer(
-            lowercase=True,
-            strip_accents="unicode",
-            ngram_range=(1, 3),
-            min_df=2,
-            stop_words=sorted(_HTR_CONCEPT_STOP_WORDS),
-            sublinear_tf=True,
-        )
-        matrix = vectorizer.fit_transform(documents)
-    except ValueError:
+    fitted = _fit_semantic_witness_matrix(
+        documents,
+        config=scientific_config.htr_vectorizer,
+        empty_vocabulary_policy=scientific_config.empty_vocabulary_policy,
+        label="HTR semantic witness",
+    )
+    if fitted is None:
         return []
+    vectorizer, matrix = fitted
 
     split = len(positive_documents)
     positive_matrix = matrix[:split]
@@ -1300,10 +1794,15 @@ def _htr_attention_contrastive_terms(
     source_counts = Counter(source_keys)
     row_weights = np.asarray(
         [1.0 / (len(unique_sources) * source_counts[key]) for key in source_keys],
-        dtype=float,
+        dtype=(
+            np.float32
+            if scientific_config.direction_numeric_dtype == "float32"
+            else np.float64
+        ),
     )
     direction = np.asarray(
-        positive_matrix.T.dot(row_weights) - negative_matrix.T.dot(row_weights)
+        positive_matrix.T.dot(row_weights) - negative_matrix.T.dot(row_weights),
+        dtype=row_weights.dtype,
     ).ravel()
     positive_support = np.zeros(positive_matrix.shape[1], dtype=np.int64)
     for source_key in unique_sources:
@@ -1320,35 +1819,40 @@ def _htr_attention_contrastive_terms(
     )
     output: list[dict[str, Any]] = []
     seen: set[str] = set()
-    used_tokens: set[str] = set()
     for index in ranked:
         score = float(direction[index])
-        if score <= 0.0 or not math.isfinite(score) or int(positive_support[index]) < 2:
+        if (
+            score <= scientific_config.htr_direction_score_min_exclusive
+            or not math.isfinite(score)
+            or int(positive_support[index])
+            < scientific_config.htr_min_positive_source_support
+        ):
             continue
-        phrase = _safe_concept_phrase(terms[index], max_tokens=6, max_chars=100)
-        phrase_tokens = set(phrase.split())
+        phrase = _safe_concept_phrase(terms[index])
         if (
             not phrase
             or phrase in seen
             or _htr_phrase_has_unsafe_numeric_fragment(phrase)
             or _htr_name_like_term_in_documents(phrase, positive_documents)
-            or phrase_tokens & used_tokens
         ):
             continue
         seen.add(phrase)
-        used_tokens.update(phrase_tokens)
         output.append({"concept": phrase, "score": score})
-        if limit is not None and len(output) >= limit:
-            break
+    _fail_on_semantic_witness_overflow(
+        output,
+        capacity=scientific_config.maximum_htr_terms,
+        label="HTR semantic witness",
+    )
     return output
 
 
 def _htr_concepts_only(
     evidence: Mapping[str, Any],
     *,
-    phrases_per_attention_row: int | None = None,
-    fallback_contrastive_term_limit: int | None = None,
+    scientific_config: SemanticWitnessScientificConfig,
 ) -> dict[str, Any]:
+    if type(scientific_config) is not SemanticWitnessScientificConfig:
+        raise TypeError("HTR concept projection requires a typed scientific config")
     output: dict[str, Any] = {}
     for stage in ("nuisance", "effect", "pair_uplift"):
         raw_stage = evidence.get(stage)
@@ -1378,13 +1882,16 @@ def _htr_concepts_only(
                 phrase = _safe_concept_phrase(candidate)
                 if phrase and phrase not in phrases:
                     phrases.append(phrase)
-                if phrases_per_attention_row is not None and len(phrases) >= int(
-                    phrases_per_attention_row
-                ):
-                    break
+            _fail_on_semantic_witness_overflow(
+                phrases,
+                capacity=(
+                    scientific_config.maximum_explicit_phrases_per_attention_row
+                ),
+                label="HTR explicit attention phrases for one source row",
+            )
             if phrases:
                 # The historical compactor recognizes this field directly.
-                # Each value is a short normalized attention-derived concept,
+                # Each value is a normalized attention-derived concept,
                 # never the source chunk or evidence snippet.
                 rows.extend({"attended_token_summary": value} for value in phrases)
         if not rows:
@@ -1395,7 +1902,7 @@ def _htr_concepts_only(
                 }
                 for item in _htr_attention_contrastive_terms(
                     attention_rows,
-                    limit=fallback_contrastive_term_limit,
+                    scientific_config=scientific_config,
                 )
             ]
         if rows:
@@ -1424,8 +1931,6 @@ def _sanitize_digest_terms(digest: Mapping[str, Any]) -> dict[str, Any]:
                     continue
                 phrase = _safe_concept_phrase(
                     raw_row.get("feature") or raw_row.get("term") or raw_row.get("phrase"),
-                    max_tokens=6,
-                    max_chars=100,
                 )
                 if not phrase:
                     continue
@@ -1474,6 +1979,9 @@ class HistoricalStage1SpentDiscoveryBackend:
         stage1_config_snapshot: HistoricalStage1ConfigSnapshot | None = None,
         embedding_cache: SpentOnlyFrozenChunkEmbeddingCache | None = None,
         htr_model_snapshot: PrivateHTRModelTreeSnapshot | None = None,
+        semantic_witness_scientific_config: (
+            SemanticWitnessScientificConfig | Mapping[str, Any]
+        ),
         device: str = "cuda:0",
         bow_fold_parallelism: int = 1,
         bow_parallel_backend: str = "threads",
@@ -1488,6 +1996,18 @@ class HistoricalStage1SpentDiscoveryBackend:
         self.stage1_config_path = self._stage1_config_snapshot.source_path
         self.config = self._stage1_config_snapshot.applied_config()
         self.config.dataset_path = str(self.dataset_path)
+        if isinstance(semantic_witness_scientific_config, Mapping):
+            semantic_witness_scientific_config = (
+                SemanticWitnessScientificConfig.from_mapping(
+                    semantic_witness_scientific_config
+                )
+            )
+        if type(semantic_witness_scientific_config) is not SemanticWitnessScientificConfig:
+            raise TypeError(
+                "historical spent discovery requires one closed semantic-witness "
+                "scientific config"
+            )
+        self.semantic_witness_scientific_config = semantic_witness_scientific_config
         if isinstance(bow_fold_parallelism, (bool, np.bool_)) or not isinstance(
             bow_fold_parallelism, (int, np.integer)
         ):
@@ -1567,9 +2087,15 @@ class HistoricalStage1SpentDiscoveryBackend:
             "bow_fold_parallelism": self.bow_fold_parallelism,
             "bow_parallel_backend": self.bow_parallel_backend,
             "htr_fold_parallelism": 1,
+            "semantic_witness_scientific_config": (
+                self.semantic_witness_scientific_config.as_dict()
+            ),
+            "semantic_witness_scientific_config_sha256": (
+                self.semantic_witness_scientific_config.identity_sha256
+            ),
             "concept_projection": (
-                "short_bow_terms_htr_tokens_or_per_row_chunk_attention_contrast_"
-                "embedding_tail_ngrams_v2"
+                "complete_configured_bow_terms_htr_tokens_or_per_row_chunk_"
+                "attention_contrast_embedding_tail_ngrams_v3"
             ),
             "raw_attention_or_embedding_excerpts_retained": False,
             "embedding_language_model_launch_allowed": False,
@@ -1668,6 +2194,13 @@ class HistoricalStage1SpentDiscoveryBackend:
             output_dir=work_dir / "embedding_concept_discovery",
         )
         embedding_generator.prepare(self._dataset_frame)
+        embedding_generator.bind_cluster_physical_fit_authority(
+            ordered_fit_row_ids=exact_spent_row_ids,
+            canonical_group_seed=derive_stage1_group_seed(
+                int(self.config.seed),
+                exact_spent_row_ids,
+            ),
+        )
         raw_embedding = embedding_generator.build_evidence(
             discovery_df=train_df,
             y=np.asarray(spent_outcome, dtype=float),
@@ -1679,8 +2212,14 @@ class HistoricalStage1SpentDiscoveryBackend:
         )
         digest = _build_role_grouped_evidence_digest(
             importance=handoff.get("importance") or {},
-            embedding_evidence=_embedding_concepts_only(raw_embedding),
-            htr_evidence=_htr_concepts_only(handoff.get("htr_evidence") or {}),
+            embedding_evidence=_embedding_concepts_only(
+                raw_embedding,
+                scientific_config=self.semantic_witness_scientific_config,
+            ),
+            htr_evidence=_htr_concepts_only(
+                handoff.get("htr_evidence") or {},
+                scientific_config=self.semantic_witness_scientific_config,
+            ),
         )
         digest = _sanitize_digest_terms(digest)
         payload = {
@@ -1713,8 +2252,6 @@ def _sanitize_topic_banks(value: Any) -> dict[str, Any]:
                 row = raw_term if isinstance(raw_term, Mapping) else {"term": raw_term}
                 phrase = _safe_concept_phrase(
                     row.get("term") or row.get("feature") or row.get("ngram"),
-                    max_tokens=6,
-                    max_chars=100,
                 )
                 if not phrase:
                     continue
@@ -1751,7 +2288,7 @@ def _sanitize_orphan_clusters(value: Sequence[Mapping[str, Any]]) -> list[dict[s
         for raw_term in raw_cluster.get("terms") or ():
             if not isinstance(raw_term, Mapping):
                 continue
-            phrase = _safe_concept_phrase(raw_term.get("term"), max_tokens=6, max_chars=100)
+            phrase = _safe_concept_phrase(raw_term.get("term"))
             if not phrase:
                 continue
             term = {"term": phrase}

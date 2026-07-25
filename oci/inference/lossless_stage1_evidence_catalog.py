@@ -53,11 +53,14 @@ from .all_evidence_fusion import (
     FoldEvidenceInput,
 )
 
-ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION = "role_neutral_stage1_evidence_catalog_v4"
-ARCHITECTURE_CHUNK_SCHEMA_VERSION = "role_neutral_architecture_chunk_v4"
+ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION = "role_neutral_stage1_evidence_catalog_v5"
+ARCHITECTURE_CHUNK_SCHEMA_VERSION = "role_neutral_architecture_chunk_v5"
 ARCHITECTURE_CHUNK_PLAN_SCHEMA_VERSION = "complete_architecture_chunk_plan_v5"
 NON_GROUNDING_SUMMARY_SCHEMA_VERSION = "separated_non_grounding_summary_v1"
 NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION = "native_stage1_family_concept_evidence_v1"
+SEMANTIC_MEMBER_BATCHING_SCHEMA_VERSION = (
+    "configured_lossless_semantic_member_batching_v1"
+)
 SEMANTIC_RETRIEVAL_DERIVATION = "tfidf_ngrams_contrasting_frozen_embedding_retrieval_tails"
 
 DEFAULT_MAX_ATOMS_PER_ARCHITECTURE_CHUNK = 2
@@ -67,21 +70,8 @@ DEFAULT_MAX_SEMANTIC_MEMBER_IDS_PER_ARCHITECTURE_CHUNK = 3
 _REQUIRED_SOURCE_KINDS = frozenset({LEGACY_ALL_SOURCE, TFIDF_TOPIC_SOURCE, NEURAL_QUERY_SOURCE})
 _FAMILY_ORDER = {family: index for index, family in enumerate(ACTIVE_STAGE1_CONCEPT_FAMILIES)}
 _AXIS_ORDER = {axis: index for index, axis in enumerate(OBSERVABLE_AXES)}
-_MAX_MEMBERS_PER_SEMANTIC_ATOM = 3
-_MAX_CONCEPT_PHRASE_CHARS = 160
-_MAX_CONCEPT_PHRASE_WORDS = 12
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _CUMULATIVE_SCOPE_ID = re.compile(r"^outer_[0-9]{3}_hierarchy_epoch_[0-9]{3}$")
-_BOW_BASE_VIEWS = frozenset(
-    {
-        "linear_unigram_c0p5",
-        "linear_1_2",
-        "linear_1_3",
-        "linear_2_4_min_df3",
-        "extratrees_1_3",
-        "random_forest_1_2",
-    }
-)
 _BOW_NUISANCE_TYPES = frozenset(
     {
         "confounder_overlap",
@@ -209,6 +199,26 @@ def _sha256_json(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _semantic_member_batching_identity(
+    semantic_member_batch_size: Any,
+) -> dict[str, Any]:
+    if (
+        isinstance(semantic_member_batch_size, bool)
+        or not isinstance(semantic_member_batch_size, int)
+        or semantic_member_batch_size < 1
+    ):
+        raise ValueError(
+            "semantic_member_batch_size must be an explicitly configured "
+            "positive integer"
+        )
+    return {
+        "schema_version": SEMANTIC_MEMBER_BATCHING_SCHEMA_VERSION,
+        "semantic_member_batch_size": int(semantic_member_batch_size),
+        "selection_or_truncation_authorized": False,
+        "complete_member_coverage_required": True,
+    }
+
+
 def _clone(value: Any) -> Any:
     return json.loads(canonical_json(value))
 
@@ -255,15 +265,22 @@ def _short_string(
 
 
 def _concept_phrase(value: Any, *, path: str) -> str:
-    phrase = _short_string(
-        value,
-        path=path,
-        max_chars=_MAX_CONCEPT_PHRASE_CHARS,
-    )
+    """Validate one complete semantic witness without a hidden length cap.
+
+    Architecture-level configured byte/member capacities decide whether an
+    atom can be transported and fail closed when it cannot.  This adapter must
+    not shorten or discard an otherwise valid phrase before that accounting.
+    """
+
+    if not isinstance(value, str):
+        raise ValueError(f"{path} must be a string")
+    phrase = unicodedata.normalize("NFKC", value)
+    if phrase != value:
+        raise ValueError(f"{path} must use normalized Unicode")
+    if not phrase.strip():
+        raise ValueError(f"{path} cannot be empty")
     if phrase != " ".join(phrase.split()):
         raise ValueError(f"{path} must use normalized whitespace")
-    if len(phrase.split()) > _MAX_CONCEPT_PHRASE_WORDS:
-        raise ValueError(f"{path} is not a bounded concept phrase")
     if re.search(r"https?://|\b[^\s@]+@[^\s@]+\.[^\s@]+\b", phrase):
         raise ValueError(f"{path} contains URL or email-like text")
     if re.search(
@@ -325,8 +342,10 @@ def _classify_bow(metadata: Mapping[str, str]) -> tuple[str, tuple[str, ...]]:
     view = metadata["view_name"]
     evidence_type = metadata["evidence_type"]
     source = metadata["source"]
+    if not view:
+        raise ValueError("BOW producer view name cannot be empty")
     if evidence_type in _BOW_NUISANCE_TYPES:
-        if view not in _BOW_BASE_VIEWS or source != f"{view}.{evidence_type}":
+        if source != f"{view}.{evidence_type}":
             raise ValueError("BOW nuisance producer tuple is not canonical")
         if evidence_type == "confounder_overlap":
             axes = (TREATMENT_AXIS, OUTCOME_AXIS)
@@ -336,20 +355,18 @@ def _classify_bow(metadata: Mapping[str, str]) -> tuple[str, tuple[str, ...]]:
             axes = (OUTCOME_AXIS,)
         return BOW_NUISANCE, axes
     if evidence_type in _BOW_R_LOSS_TYPES:
-        if view in _BOW_BASE_VIEWS:
-            expected_source = f"{view}.{evidence_type}"
-        elif (
-            view.startswith("ensemble_r__") and view.removeprefix("ensemble_r__") in _BOW_BASE_VIEWS
-        ):
+        if view.startswith("ensemble_r__"):
+            if not view.removeprefix("ensemble_r__"):
+                raise ValueError("BOW R-loss ensemble view has no configured base view")
             expected_source = f"ensemble_r.{view}.{evidence_type}"
         else:
-            raise ValueError("BOW R-loss view is not canonical")
+            expected_source = f"{view}.{evidence_type}"
         if source != expected_source:
             raise ValueError("BOW R-loss source does not match its view and evidence type")
         return BOW_R_LOSS, (HETEROGENEITY_AXIS,)
     if evidence_type in _MATCHED_PAIR_TYPES:
         prefix = "pair_uplift__"
-        if not view.startswith(prefix) or view.removeprefix(prefix) not in _BOW_BASE_VIEWS:
+        if not view.startswith(prefix) or not view.removeprefix(prefix):
             raise ValueError("matched-pair BOW view is not canonical")
         if source != f"matched_pair_uplift.{view}.{evidence_type}":
             raise ValueError("matched-pair BOW source does not match its producer tuple")
@@ -396,7 +413,12 @@ def _bank_axis(bank: str, *, path: str) -> tuple[str, ...]:
     return mapping[normalized]
 
 
-def _member_batches(rows: Sequence[Mapping[str, Any]]) -> tuple[tuple[dict[str, Any], ...], ...]:
+def _member_batches(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    semantic_member_batch_size: int,
+) -> tuple[tuple[dict[str, Any], ...], ...]:
+    _semantic_member_batching_identity(semantic_member_batch_size)
     canonical = sorted((_clone(row) for row in rows), key=canonical_json)
     if not canonical:
         # An empty adapter record carries no lexical or semantic grounding.  It
@@ -404,8 +426,8 @@ def _member_batches(rows: Sequence[Mapping[str, Any]]) -> tuple[tuple[dict[str, 
         # look present in the all-architecture audit.
         return ()
     return tuple(
-        tuple(canonical[start : start + _MAX_MEMBERS_PER_SEMANTIC_ATOM])
-        for start in range(0, len(canonical), _MAX_MEMBERS_PER_SEMANTIC_ATOM)
+        tuple(canonical[start : start + semantic_member_batch_size])
+        for start in range(0, len(canonical), semantic_member_batch_size)
     )
 
 
@@ -696,8 +718,17 @@ class _Prototype:
 
 
 class _CatalogBuilder:
-    def __init__(self, inputs: Sequence[FoldEvidenceInput]) -> None:
+    def __init__(
+        self,
+        inputs: Sequence[FoldEvidenceInput],
+        *,
+        semantic_member_batch_size: int,
+    ) -> None:
         self.inputs = tuple(inputs)
+        self.semantic_member_batching = _semantic_member_batching_identity(
+            semantic_member_batch_size
+        )
+        self.semantic_member_batch_size = int(semantic_member_batch_size)
         self.prototypes: list[_Prototype] = []
         self.summaries: list[NonGroundingNumericalSummary] = []
         self.semantic_source_counts: Counter[str] = Counter()
@@ -878,6 +909,7 @@ class _CatalogBuilder:
             raise ValueError("duplicate non-grounding numerical summaries")
         identity = {
             "schema_version": ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION,
+            "semantic_member_batching": self.semantic_member_batching,
             "outer_fold": reference.outer_fold,
             "scope": reference.scope,
             "inner_fold": reference.inner_fold,
@@ -912,7 +944,8 @@ class _CatalogBuilder:
             "extraction_contracts_emitted": False,
             "temporal_policy_emitted": False,
             "global_top_k_applied": False,
-            "semantic_member_batch_size": _MAX_MEMBERS_PER_SEMANTIC_ATOM,
+            "semantic_member_batching": self.semantic_member_batching,
+            "semantic_member_batch_size": self.semantic_member_batch_size,
             "semantic_member_batches_truncated": False,
             "atom_count": len(atoms),
             "atom_count_by_family": {
@@ -1008,7 +1041,10 @@ class _CatalogBuilder:
             }
             rows.append(projected)
         parent = _sha256_json({"metadata": metadata, "rows": sorted(rows, key=canonical_json)})
-        batches = _member_batches(rows)
+        batches = _member_batches(
+            rows,
+            semantic_member_batch_size=self.semantic_member_batch_size,
+        )
         for batch_index, batch in enumerate(batches, start=1):
             self.emit(
                 item=item,
@@ -1083,7 +1119,10 @@ class _CatalogBuilder:
                 }
             )
         parent = _sha256_json({"metadata": metadata, "probes": sorted(probes, key=canonical_json)})
-        batches = _member_batches(probes)
+        batches = _member_batches(
+            probes,
+            semantic_member_batch_size=self.semantic_member_batch_size,
+        )
         semantic = contrast.get("concept_derivation") == SEMANTIC_RETRIEVAL_DERIVATION
         if semantic and contrast.get("raw_retrieved_excerpts_retained") is not False:
             raise ValueError("semantic retrieval view must attest that raw excerpts were removed")
@@ -1277,10 +1316,15 @@ class _CatalogBuilder:
                     "bank",
                     "requested_topic_count",
                     "actual_topic_count",
+                    "terms_per_topic",
                     "component_reduction_reason",
                     "seeds",
                     "selected_term_count",
                     "selected_terms",
+                    "eligible_candidate_count",
+                    "selected_candidate_count",
+                    "discarded_candidate_count",
+                    "selection_rule",
                     "feature_weights",
                     "alignments",
                     "weak_or_unstable_raw_evidence",
@@ -1288,8 +1332,19 @@ class _CatalogBuilder:
                 },
                 path=f"tfidf.{bank}",
             )
+            terms_per_topic = int(bank_payload.get("terms_per_topic") or 0)
+            if terms_per_topic < 1 and (bank_payload.get("topics") or []):
+                raise ValueError(
+                    f"tfidf.{bank}.terms_per_topic must be a positive "
+                    "configured evidence capacity"
+                )
             for raw in _sequence(bank_payload.get("topics"), path=f"tfidf.{bank}.topics"):
-                self._tfidf_topic(item, _mapping(raw, path="tfidf.topic"), bank)
+                self._tfidf_topic(
+                    item,
+                    _mapping(raw, path="tfidf.topic"),
+                    bank,
+                    terms_per_topic=terms_per_topic,
+                )
         orphan = discovery.get("effect_orphan_ngram_branch")
         if not isinstance(orphan, Mapping):
             for key in ("topic_score_tests", "topic_score_selection", "score_tests"):
@@ -1458,7 +1513,10 @@ class _CatalogBuilder:
                     "terms": sorted(terms, key=canonical_json),
                 }
             )
-            batches = _member_batches(terms)
+            batches = _member_batches(
+                terms,
+                semantic_member_batch_size=self.semantic_member_batch_size,
+            )
             for batch_index, batch in enumerate(batches, start=1):
                 self.emit(
                     item=item,
@@ -1475,11 +1533,26 @@ class _CatalogBuilder:
                     },
                 )
 
-    def _tfidf_topic(self, item: FoldEvidenceInput, topic: Mapping[str, Any], bank: str) -> None:
-        _closed_keys(topic, allowed={"topic_id", "bank", "terms"}, path="tfidf.topic")
+    def _tfidf_topic(
+        self,
+        item: FoldEvidenceInput,
+        topic: Mapping[str, Any],
+        bank: str,
+        *,
+        terms_per_topic: int,
+    ) -> None:
+        _closed_keys(
+            topic,
+            allowed={"topic_id", "bank", "terms_per_topic", "terms"},
+            path="tfidf.topic",
+        )
         topic_id = _short_string(topic.get("topic_id"), path="tfidf.topic.topic_id")
         if topic.get("bank") is not None and str(topic.get("bank")).casefold() != bank:
             raise ValueError("TF-IDF topic bank field does not match its containing bank")
+        if int(topic.get("terms_per_topic") or 0) != int(terms_per_topic):
+            raise ValueError(
+                "TF-IDF topic term capacity does not match its containing bank"
+            )
         terms: list[dict[str, Any]] = []
         for index, raw in enumerate(_sequence(topic.get("terms"), path="tfidf.topic.terms")):
             row = {"term": raw} if isinstance(raw, str) else _mapping(raw, path="tfidf.term")
@@ -1495,10 +1568,18 @@ class _CatalogBuilder:
                 if row.get(key) is not None:
                     projected[key] = _finite_number(row[key], path=f"tfidf.term.{key}")
             terms.append(projected)
+        if len(terms) != int(terms_per_topic):
+            raise ValueError(
+                f"TF-IDF topic supplied {len(terms)} terms; expected the "
+                f"complete configured capacity {int(terms_per_topic)}"
+            )
         parent = _sha256_json(
             {"bank": bank, "topic_id": topic_id, "terms": sorted(terms, key=canonical_json)}
         )
-        batches = _member_batches(terms)
+        batches = _member_batches(
+            terms,
+            semantic_member_batch_size=self.semantic_member_batch_size,
+        )
         for batch_index, batch in enumerate(batches, start=1):
             self.emit(
                 item=item,
@@ -1571,7 +1652,10 @@ class _CatalogBuilder:
         parent = _sha256_json(
             {"cluster_id": cluster_id, "terms": sorted(terms, key=canonical_json)}
         )
-        batches = _member_batches(terms)
+        batches = _member_batches(
+            terms,
+            semantic_member_batch_size=self.semantic_member_batch_size,
+        )
         for batch_index, batch in enumerate(batches, start=1):
             self.emit(
                 item=item,
@@ -1681,7 +1765,10 @@ class _CatalogBuilder:
                 }
             )
             if witnesses:
-                batches = _member_batches(witnesses)
+                batches = _member_batches(
+                    witnesses,
+                    semantic_member_batch_size=self.semantic_member_batch_size,
+                )
                 for batch_index, batch in enumerate(batches, start=1):
                     self.emit(
                         item=item,
@@ -1720,13 +1807,19 @@ class _CatalogBuilder:
 def build_role_neutral_evidence_catalog(
     evidence_inputs: Sequence[FoldEvidenceInput],
     *,
+    semantic_member_batch_size: int = (
+        DEFAULT_MAX_SEMANTIC_MEMBER_IDS_PER_ARCHITECTURE_CHUNK
+    ),
     require_all_source_kinds: bool = True,
     require_all_architecture_families: bool = True,
     require_upstream_completeness: bool = True,
 ) -> RoleNeutralEvidenceCatalog:
     """Build a complete catalog with no role-first or numerical grounding path."""
 
-    return _CatalogBuilder(evidence_inputs).build(
+    return _CatalogBuilder(
+        evidence_inputs,
+        semantic_member_batch_size=semantic_member_batch_size,
+    ).build(
         require_all_source_kinds=require_all_source_kinds,
         require_all_architecture_families=require_all_architecture_families,
         require_upstream_completeness=require_upstream_completeness,
@@ -1747,7 +1840,8 @@ def _validate_cumulative_payload_item(
     value: Any,
     *,
     family: str,
-    batch_groups: dict[str, list[tuple[int, int]]],
+    semantic_member_batch_size: int,
+    batch_groups: dict[str, list[tuple[int, int, int, int]]],
 ) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise TypeError(f"{family} cumulative family evidence item must be a mapping")
@@ -1833,7 +1927,7 @@ def _validate_cumulative_payload_item(
         if (
             not isinstance(members, list)
             or not members
-            or len(members) > _MAX_MEMBERS_PER_SEMANTIC_ATOM
+            or len(members) > semantic_member_batch_size
             or not all(isinstance(member, Mapping) for member in members)
         ):
             raise ValueError(f"{family} cumulative semantic-member batch is invalid")
@@ -1849,21 +1943,11 @@ def _validate_cumulative_payload_item(
         batch_index = int(raw_numbers["member_batch_index"])
         batch_count = int(raw_numbers["member_batch_count"])
         full_count = int(raw_numbers["full_member_count"])
-        expected_batch_count = (
-            full_count + _MAX_MEMBERS_PER_SEMANTIC_ATOM - 1
-        ) // _MAX_MEMBERS_PER_SEMANTIC_ATOM
-        expected_batch_size = (
-            _MAX_MEMBERS_PER_SEMANTIC_ATOM
-            if batch_index < batch_count
-            else full_count - _MAX_MEMBERS_PER_SEMANTIC_ATOM * (batch_count - 1)
-        )
         if (
             batch_index < 1
             or batch_count < 1
             or full_count < 1
             or batch_index > batch_count
-            or batch_count != expected_batch_count
-            or len(members) != expected_batch_size
         ):
             raise ValueError(f"{family} cumulative member-batch accounting is incomplete")
         collection_identity = {
@@ -1880,7 +1964,9 @@ def _validate_cumulative_payload_item(
                 "collection_identity": collection_identity,
             }
         )
-        batch_groups[group_sha256].append((batch_index, batch_count))
+        batch_groups[group_sha256].append(
+            (batch_index, batch_count, full_count, len(members))
+        )
     else:
         singular_key = _CUMULATIVE_ATOM_SINGULAR_KEY[atom_kind]
         if not isinstance(content.get(singular_key), Mapping):
@@ -1934,6 +2020,9 @@ def assemble_cumulative_spent_role_neutral_catalog(
     outer_fold: int,
     provider_inner_fold: int,
     split_fingerprint: str,
+    semantic_member_batch_size: int = (
+        DEFAULT_MAX_SEMANTIC_MEMBER_IDS_PER_ARCHITECTURE_CHUNK
+    ),
 ) -> RoleNeutralEvidenceCatalog:
     """Assemble one lossless hierarchy catalog from ten authenticated payloads.
 
@@ -1943,6 +2032,9 @@ def assemble_cumulative_spent_role_neutral_catalog(
     ten-way projection roundtrip before returning the hierarchy catalog.
     """
 
+    batching = _semantic_member_batching_identity(
+        semantic_member_batch_size
+    )
     if (
         not isinstance(family_payload_by_family, Mapping)
         or set(family_payload_by_family) != ACTIVE_STAGE1_CONCEPT_FAMILY_SET
@@ -1978,7 +2070,7 @@ def assemble_cumulative_spent_role_neutral_catalog(
     if len(set(artifact_hashes.values())) != len(ACTIVE_STAGE1_CONCEPT_FAMILIES):
         raise ValueError("cumulative family artifacts must have distinct identities")
 
-    batch_groups: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    batch_groups: dict[str, list[tuple[int, int, int, int]]] = defaultdict(list)
     payloads: dict[str, dict[str, Any]] = {}
     rows: list[tuple[str, dict[str, Any]]] = []
     for family in ACTIVE_STAGE1_CONCEPT_FAMILIES:
@@ -2000,6 +2092,7 @@ def assemble_cumulative_spent_role_neutral_catalog(
             _validate_cumulative_payload_item(
                 item,
                 family=family,
+                semantic_member_batch_size=semantic_member_batch_size,
                 batch_groups=batch_groups,
             )
             for item in evidence
@@ -2011,12 +2104,34 @@ def assemble_cumulative_spent_role_neutral_catalog(
         rows.extend((family, item) for item in validated)
 
     for group_rows in batch_groups.values():
-        declared_counts = {batch_count for _batch_index, batch_count in group_rows}
-        indices = Counter(batch_index for batch_index, _batch_count in group_rows)
-        if len(declared_counts) != 1:
-            raise ValueError("cumulative semantic collection changed its batch count")
+        declared_counts = {
+            batch_count
+            for _batch_index, batch_count, _full_count, _member_count in group_rows
+        }
+        declared_full_counts = {
+            full_count
+            for _batch_index, _batch_count, full_count, _member_count in group_rows
+        }
+        indices = Counter(
+            batch_index
+            for batch_index, _batch_count, _full_count, _member_count in group_rows
+        )
+        if len(declared_counts) != 1 or len(declared_full_counts) != 1:
+            raise ValueError(
+                "cumulative semantic collection changed its batch or member count"
+            )
         batch_count = next(iter(declared_counts))
-        if set(indices) != set(range(1, batch_count + 1)) or len(set(indices.values())) != 1:
+        full_count = next(iter(declared_full_counts))
+        observed_member_count = sum(
+            member_count
+            for _batch_index, _batch_count, _full_count, member_count in group_rows
+        )
+        if (
+            set(indices) != set(range(1, batch_count + 1))
+            or any(count != 1 for count in indices.values())
+            or len(group_rows) != batch_count
+            or observed_member_count != full_count
+        ):
             raise ValueError("cumulative semantic collection omitted or duplicated a batch")
 
     multiplicities = Counter(
@@ -2108,6 +2223,7 @@ def assemble_cumulative_spent_role_neutral_catalog(
         raise RuntimeError("cumulative catalog evidence identifiers collided")
     catalog_identity = {
         "schema_version": ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION,
+        "semantic_member_batching": batching,
         "outer_fold": outer_fold,
         "scope": "inner_train",
         "inner_fold": provider_inner_fold,
@@ -2142,7 +2258,8 @@ def assemble_cumulative_spent_role_neutral_catalog(
         "extraction_contracts_emitted": False,
         "temporal_policy_emitted": False,
         "global_top_k_applied": False,
-        "semantic_member_batch_size": _MAX_MEMBERS_PER_SEMANTIC_ATOM,
+        "semantic_member_batching": batching,
+        "semantic_member_batch_size": semantic_member_batch_size,
         "semantic_member_batches_truncated": False,
         "atom_count": len(atoms),
         "atom_count_by_family": {
@@ -2179,6 +2296,19 @@ def assemble_cumulative_spent_role_neutral_catalog(
 def validate_role_neutral_catalog(catalog: RoleNeutralEvidenceCatalog) -> None:
     if not isinstance(catalog, RoleNeutralEvidenceCatalog):
         raise TypeError("catalog must be RoleNeutralEvidenceCatalog")
+    batching = catalog.audit.get("semantic_member_batching")
+    if (
+        not isinstance(batching, Mapping)
+        or batching
+        != _semantic_member_batching_identity(
+            batching.get("semantic_member_batch_size")
+        )
+        or catalog.audit.get("semantic_member_batch_size")
+        != batching["semantic_member_batch_size"]
+    ):
+        raise ValueError(
+            "catalog lacks its configured semantic-member batching identity"
+        )
     seen: set[str] = set()
     seen_members: set[str] = set()
     for atom in catalog.atoms:
@@ -2212,6 +2342,7 @@ def validate_role_neutral_catalog(catalog: RoleNeutralEvidenceCatalog) -> None:
         atom.as_discovery_item()
     identity = {
         "schema_version": ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION,
+        "semantic_member_batching": batching,
         "outer_fold": catalog.outer_fold,
         "scope": catalog.scope,
         "inner_fold": catalog.inner_fold,
@@ -2569,6 +2700,7 @@ __all__ = [
     "NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION",
     "NON_GROUNDING_SUMMARY_SCHEMA_VERSION",
     "ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION",
+    "SEMANTIC_MEMBER_BATCHING_SCHEMA_VERSION",
     "ArchitectureChunkPlan",
     "ArchitectureEvidenceChunk",
     "NonGroundingNumericalSummary",

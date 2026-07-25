@@ -14,6 +14,7 @@ import torch.nn.functional as F
 
 from .gpu_hidden_state_store import _get_hidden_size, _get_model_dtype, _make_downprojection
 from .hidden_state_cache import _sanitize_hidden_states
+from .lossless_tokenization import tokenize_losslessly
 
 
 logger = logging.getLogger(__name__)
@@ -145,12 +146,13 @@ class LLMTokenHiddenStateEncoder:
         sequences: List[np.ndarray] = []
         for start in range(0, len(texts), batch_size):
             batch_texts = texts[start:start + batch_size]
-            encoding = self._tokenizer(
+            encoding = tokenize_losslessly(
+                self._tokenizer,
                 batch_texts,
                 add_special_tokens=add_special_tokens,
+                configured_max_length=max_length,
+                context="LLMTokenHiddenStateEncoder input",
                 padding=True,
-                truncation=max_length is not None,
-                max_length=max_length,
                 return_tensors="pt",
             )
             input_ids = encoding["input_ids"].to(self._device)

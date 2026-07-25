@@ -3,7 +3,7 @@
 
 Architecture:
     Raw text
-      -> LearnedTokenizer (truncated to max_length)
+      -> LearnedTokenizer (fails if configured max_length would bind)
       -> nn.Embedding
       -> Dilated residual CNN stack
       -> GatedAttentionPooling -> document vector

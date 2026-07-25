@@ -21,6 +21,7 @@ from ..config import (
     ExplicitFeatureForestConfig,
     ExplicitFeatureSpec,
     MultiModelForestConfig,
+    NuisanceCalibrationScientificConfig,
     load_explicit_feature_specs_json,
 )
 from ..models.explicit_feature_featurizer import get_raw_explicit_features
@@ -48,6 +49,7 @@ from .tfidf_topic_discovery import (
     stable_hash,
 )
 from .tfidf_topic_score_selection import TOPIC_SCORE_TEST_SCHEMA_VERSION
+from .tfidf_safe_artifacts import load_named_array_bank
 from .tfidf_topic_split_registry import (
     load_tfidf_topic_split_registry,
     validate_handoff_rows_against_split_registry,
@@ -374,34 +376,61 @@ def validate_tfidf_topic_stage2_handoff(
         )
 
         bank_metadata = discovery.get("topic_banks") or {}
-        with np.load(fit_topics_path) as fit_archive, np.load(
-            heldout_topics_path
-        ) as heldout_archive:
-            for bank in ("treatment", "outcome", "effect"):
-                if bank not in bank_metadata:
-                    raise RuntimeError(f"Missing {bank} topic bank in fold {row.get('fold_key')}")
-                topics = list((bank_metadata.get(bank) or {}).get("topics") or [])
-                topic_counts[bank].append(len(topics))
-                if any(len(topic.get("terms") or []) != 15 for topic in topics):
-                    raise RuntimeError(f"A {bank} topic does not contain exactly 15 terms")
-                fit_values = (
-                    np.asarray(fit_archive[bank])
-                    if bank in fit_archive.files
-                    else np.zeros((len(fit_ids), 0))
-                )
-                heldout_values = (
-                    np.asarray(heldout_archive[bank])
-                    if bank in heldout_archive.files
-                    else np.zeros((len(heldout_ids), 0))
-                )
-                if fit_values.shape != (len(fit_ids), len(topics)):
-                    raise RuntimeError(
-                        f"Misaligned fit {bank} topic values in fold {row.get('fold_key')}"
+        configured_terms_per_topic = int(
+            config.architecture.multi_model_forest.tfidf_topic.terms_per_topic
+        )
+        fit_archive = load_named_array_bank(
+            fit_topics_path,
+            expected_row_count=len(fit_ids),
+        )
+        heldout_archive = load_named_array_bank(
+            heldout_topics_path,
+            expected_row_count=len(heldout_ids),
+        )
+        for bank in ("treatment", "outcome", "effect"):
+            if bank not in bank_metadata:
+                raise RuntimeError(f"Missing {bank} topic bank in fold {row.get('fold_key')}")
+            topics = list((bank_metadata.get(bank) or {}).get("topics") or [])
+            topic_counts[bank].append(len(topics))
+            if (
+                int(
+                    (bank_metadata.get(bank) or {}).get(
+                        "terms_per_topic",
+                        configured_terms_per_topic,
                     )
-                if heldout_values.shape != (len(heldout_ids), len(topics)):
-                    raise RuntimeError(
-                        f"Misaligned held-out {bank} topic values in fold " f"{row.get('fold_key')}"
+                )
+                != configured_terms_per_topic
+                or any(
+                    int(
+                        topic.get(
+                            "terms_per_topic",
+                            configured_terms_per_topic,
+                        )
                     )
+                    != configured_terms_per_topic
+                    or len(topic.get("terms") or [])
+                    != configured_terms_per_topic
+                    for topic in topics
+                )
+            ):
+                raise RuntimeError(
+                    f"A {bank} topic does not contain exactly the configured "
+                    f"{configured_terms_per_topic} terms"
+                )
+            fit_values = np.asarray(
+                fit_archive.get(bank, np.zeros((len(fit_ids), 0)))
+            )
+            heldout_values = np.asarray(
+                heldout_archive.get(bank, np.zeros((len(heldout_ids), 0)))
+            )
+            if fit_values.shape != (len(fit_ids), len(topics)):
+                raise RuntimeError(
+                    f"Misaligned fit {bank} topic values in fold {row.get('fold_key')}"
+                )
+            if heldout_values.shape != (len(heldout_ids), len(topics)):
+                raise RuntimeError(
+                    f"Misaligned held-out {bank} topic values in fold " f"{row.get('fold_key')}"
+                )
 
         nuisance = pd.read_parquet(nuisance_path)
         fit_nuisance = nuisance.loc[nuisance["prediction_scope"] == "fit_oof"].copy()
@@ -479,6 +508,13 @@ def validate_tfidf_topic_stage2_handoff(
                 )
                 or bool(score_tests.get("fits_patient_level_cate_model"))
                 or bool(score_tests.get("constructs_divided_pseudo_target"))
+                or int(
+                    score_tests.get(
+                        "terms_per_topic",
+                        configured_terms_per_topic,
+                    )
+                )
+                != configured_terms_per_topic
             ):
                 raise RuntimeError(f"Invalid inner score-test artifact: {score_path}")
             for bank in ("treatment", "outcome", "effect"):
@@ -506,7 +542,8 @@ def validate_tfidf_topic_stage2_handoff(
                         f"Incomplete {bank} multiplier family in fold {row.get('fold_key')}"
                     )
                 if any(
-                    len(test.get("term_scores") or []) != 15
+                    len(test.get("term_scores") or [])
+                    != configured_terms_per_topic
                     or "topic_standardized_score" not in test
                     or "term_group_primary_p" not in test
                     or "_topic_bootstrap_rows" in test
@@ -684,6 +721,7 @@ def build_topic_label_context(
     inner_fold: Optional[int],
     bank: str,
     topic: Dict[str, Any],
+    terms_per_topic: Optional[int] = None,
     prompt_version: str = TOPIC_LABEL_PROMPT_VERSION,
     uncovered_raw_ngrams: Optional[Sequence[str]] = None,
     current_definitions: Optional[Sequence[Dict[str, Any]]] = None,
@@ -694,8 +732,29 @@ def build_topic_label_context(
     if prompt_version == ORPHAN_NGRAM_LABEL_PROMPT_VERSION:
         if not 1 <= len(terms) <= 15:
             raise ValueError("Every orphan n-gram prompt must receive 1-15 terms")
-    elif len(terms) != 15:
-        raise ValueError("Every topic-label prompt must receive exactly 15 supplied terms")
+        configured_terms_per_topic: Optional[int] = None
+    else:
+        if terms_per_topic is None:
+            raise ValueError(
+                "Every topic-label prompt requires configured terms_per_topic"
+            )
+        configured_terms_per_topic = int(terms_per_topic)
+        if configured_terms_per_topic < 1:
+            raise ValueError("terms_per_topic must be positive")
+        if (
+            int(
+                topic.get(
+                    "terms_per_topic",
+                    configured_terms_per_topic,
+                )
+            )
+            != configured_terms_per_topic
+            or len(terms) != configured_terms_per_topic
+        ):
+            raise ValueError(
+                "Every topic-label prompt must receive exactly the configured "
+                f"{configured_terms_per_topic} supplied terms"
+            )
     role = "effect_modifier" if bank == "effect" else "confounder"
     return {
         "prompt_version": prompt_version,
@@ -714,6 +773,7 @@ def build_topic_label_context(
             )
         ),
         "topic_terms": terms,
+        "terms_per_topic": configured_terms_per_topic,
         "uncovered_raw_ngrams": list(uncovered_raw_ngrams or []),
         "current_canonical_definitions": list(current_definitions or []),
         "extraction_failures": list(extraction_failures or []),
@@ -808,8 +868,17 @@ def render_topic_label_prompt(context: Dict[str, Any]) -> str:
     if is_orphan:
         if not 1 <= len(terms) <= 15:
             raise ValueError("Orphan n-gram prompt rendering requires 1-15 terms")
-    elif len(terms) != 15:
-        raise ValueError("Topic prompt rendering requires exactly 15 supplied terms")
+    else:
+        configured_terms_per_topic = context.get("terms_per_topic")
+        if (
+            not isinstance(configured_terms_per_topic, int)
+            or isinstance(configured_terms_per_topic, bool)
+            or configured_terms_per_topic < 1
+            or len(terms) != configured_terms_per_topic
+        ):
+            raise ValueError(
+                "Topic prompt rendering requires the complete configured term set"
+            )
     payload = json.dumps(context, indent=2, default=str)
     evidence_description = (
         "These raw text phrases formed a stable, held-out-supported evidence "
@@ -817,7 +886,7 @@ def render_topic_label_prompt(context: Dict[str, Any]) -> str:
         f"this one group and its {len(terms)} supplied phrases."
         if is_orphan
         else "Topic modeling was used only to organize candidate text signals. "
-        "Review this one topic and its 15 highest-loading supplied terms."
+        f"Review this one topic and its {len(terms)} highest-loading supplied terms."
     )
     prompt = f"""You are organizing candidate pre-treatment clinical information for a study of treatment choice, baseline outcome risk, and variation in outcomes after treatment.
 
@@ -2431,6 +2500,7 @@ def _nuisance_benchmark(
     outcome: np.ndarray,
     *,
     outcome_binary: bool,
+    calibration_config: NuisanceCalibrationScientificConfig,
 ) -> Dict[str, Any]:
     predictions = pd.read_parquet(metadata["artifacts"]["nuisance_predictions"])
     predictions = predictions[predictions["prediction_scope"] == "external_heldout"]
@@ -2443,6 +2513,7 @@ def _nuisance_benchmark(
                     treatment,
                     predictions["treatment_stacked"].to_numpy(dtype=float),
                     binary=True,
+                    calibration_config=calibration_config,
                 )
             },
             "outcome": {
@@ -2450,6 +2521,7 @@ def _nuisance_benchmark(
                     outcome,
                     predictions["outcome_stacked"].to_numpy(dtype=float),
                     binary=outcome_binary,
+                    calibration_config=calibration_config,
                 )
             },
         },
@@ -3027,16 +3099,31 @@ def structured_heldout_diagnostic(
     t_heldout = heldout_df[config.treatment_column].to_numpy(dtype=float)
     y_heldout = heldout_df[config.outcome_column].to_numpy(dtype=float)
     outcome_binary = str(config.outcome_type).lower() != "continuous"
+    calibration_config = (
+        config.architecture.multi_model_forest.tfidf_topic
+        .nuisance_stack_scientific.calibration
+    )
     structured_e = _fit_nuisance_from_structured(w_fit, w_heldout, t_fit, binary=True)
     structured_m = _fit_nuisance_from_structured(w_fit, w_heldout, y_fit, binary=outcome_binary)
-    treatment_metrics = nuisance_metrics(t_heldout, structured_e, binary=True)
-    outcome_metrics = nuisance_metrics(y_heldout, structured_m, binary=outcome_binary)
+    treatment_metrics = nuisance_metrics(
+        t_heldout,
+        structured_e,
+        binary=True,
+        calibration_config=calibration_config,
+    )
+    outcome_metrics = nuisance_metrics(
+        y_heldout,
+        structured_m,
+        binary=outcome_binary,
+        calibration_config=calibration_config,
+    )
     benchmark = _nuisance_benchmark(
         metadata,
         heldout_df["_oci_row_id"].astype(int).tolist(),
         t_heldout,
         y_heldout,
         outcome_binary=outcome_binary,
+        calibration_config=calibration_config,
     )
 
     coverage = _effect_evidence_coverage(
@@ -3049,9 +3136,15 @@ def structured_heldout_diagnostic(
         "topic_correlations": [],
         "n_topics": 0,
     }
-    fit_topics = np.load(metadata["artifacts"]["fit_topic_values"])
-    heldout_topics = np.load(metadata["artifacts"]["heldout_topic_values"])
-    if "effect" in fit_topics.files and x_fit.shape[1] > 0:
+    fit_topics = load_named_array_bank(
+        metadata["artifacts"]["fit_topic_values"],
+        expected_row_count=len(fit_df),
+    )
+    heldout_topics = load_named_array_bank(
+        metadata["artifacts"]["heldout_topic_values"],
+        expected_row_count=len(heldout_df),
+    )
+    if "effect" in fit_topics and x_fit.shape[1] > 0:
         fit_values = np.asarray(fit_topics["effect"], dtype=float)
         heldout_values = np.asarray(heldout_topics["effect"], dtype=float)
         effect_topics = list(
@@ -4124,6 +4217,7 @@ class TfidfTopicAgenticForestRunner:
                 inner_fold=row.get("inner_fold"),
                 bank=bank,
                 topic=topic,
+                terms_per_topic=int(self.nn_config.tfidf_topic.terms_per_topic),
                 prompt_version=str(topic.get("_prompt_version") or TOPIC_LABEL_PROMPT_VERSION),
                 score_test_evidence=topic.get("_selection_evidence"),
             )
@@ -4172,6 +4266,7 @@ class TfidfTopicAgenticForestRunner:
                 inner_fold=row.get("inner_fold"),
                 bank=bank,
                 topic=topic,
+                terms_per_topic=int(self.nn_config.tfidf_topic.terms_per_topic),
                 prompt_version=str(topic.get("_prompt_version") or TOPIC_LABEL_PROMPT_VERSION),
                 score_test_evidence=topic.get("_selection_evidence"),
             )
@@ -4944,6 +5039,9 @@ class TfidfTopicAgenticForestRunner:
                     inner_fold=inner_fold,
                     bank=bank,
                     topic=topic,
+                    terms_per_topic=int(
+                        self.nn_config.tfidf_topic.terms_per_topic
+                    ),
                     prompt_version=(
                         ORPHAN_NGRAM_LABEL_PROMPT_VERSION
                         if is_orphan_cluster

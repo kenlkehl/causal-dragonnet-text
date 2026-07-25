@@ -1,4 +1,5 @@
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +20,7 @@ from oci.inference.bow_native_proof_capture import (
     _ArrayStore,
     _capture_learner,
     _capture_vectorizer,
+    _json_safe_view_config,
     _predict_learner,
     _replay_fit_transform,
     _restore_vectorizer,
@@ -34,7 +36,10 @@ from oci.inference.lossless_stage1_evidence_catalog import (
     build_role_neutral_evidence_catalog,
 )
 from oci.inference.multi_model_agentic_forest import _normalize_texts
-from oci.inference.multi_model_agentic_forest import _make_bow_vectorizer
+from oci.inference.multi_model_agentic_forest import (
+    _bow_vectorizer_params,
+    _make_bow_vectorizer,
+)
 from oci.inference.multi_model_forest_stage1 import MultiModelForestStage1Runner
 from oci.inference.production_stage1_bundle import (
     PRODUCTION_BOW_REGISTERED_NATIVE_FAMILY_ADAPTERS,
@@ -49,6 +54,14 @@ from oci.inference.production_stage1_bundle import (
     _write_immutable_json,
 )
 from oci.inference.tfidf_topic_discovery import row_set_fingerprint
+
+
+def test_bow_proof_view_config_rejects_missing_nested_scientific_leaf():
+    raw = asdict(BoWViewConfig(name="closed_nested_view"))
+    del raw["vectorizer_scientific"]["norm"]
+
+    with pytest.raises(ValueError, match="vectorizer_scientific.*norm"):
+        _json_safe_view_config(raw)
 
 
 def _dataset(*, heldout_labels_flipped: bool = False) -> pd.DataFrame:
@@ -134,7 +147,10 @@ def _capture(tmp_path: Path, *, flipped: bool = False, name: str = "capture"):
         e_clip=config.architecture.multi_model_forest.e_clip,
         nuisance_folds=2,
         effect_folds=2,
-        view_configs=[vars(view) for view in config.architecture.multi_model_forest.bow_views],
+        view_configs=[
+            asdict(view)
+            for view in config.architecture.multi_model_forest.bow_views
+        ],
     )
     runner = MultiModelForestStage1Runner(
         dataset=dataset,
@@ -460,14 +476,17 @@ def test_safe_tree_state_replays_without_pickle(model, classification: bool):
         "alpha brain benefit",
         "beta liver risk",
     ]
-    params = {
-        "ngram_range_min": 1,
-        "ngram_range_max": 2,
-        "min_df": 1,
-        "max_df": 1.0,
-        "sublinear_tf": True,
-        "max_features": 100,
-    }
+    params = _bow_vectorizer_params(
+        BoWViewConfig(
+            name="proof_tree",
+            ngram_range_min=1,
+            ngram_range_max=2,
+            min_df=1,
+            max_df=1.0,
+            sublinear_tf=True,
+            max_features=100,
+        )
+    )
     vectorizer = _make_bow_vectorizer(params)
     x = vectorizer.fit_transform(texts)
     target = (
@@ -504,14 +523,17 @@ def test_safe_ridge_replay_preserves_native_float32_arithmetic():
         f"common group{index % 7} marker{index % 11} detail{index % 5} row{index}"
         for index in range(75)
     ]
-    params = {
-        "ngram_range_min": 1,
-        "ngram_range_max": 2,
-        "min_df": 1,
-        "max_df": 1.0,
-        "sublinear_tf": True,
-        "max_features": 1000,
-    }
+    params = _bow_vectorizer_params(
+        BoWViewConfig(
+            name="proof_ridge",
+            ngram_range_min=1,
+            ngram_range_max=2,
+            min_df=1,
+            max_df=1.0,
+            sublinear_tf=True,
+            max_features=1000,
+        )
+    )
     vectorizer = _make_bow_vectorizer(params)
     matrix = vectorizer.fit_transform(texts)
     target = np.random.default_rng(917).normal(size=len(texts))

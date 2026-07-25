@@ -49,6 +49,7 @@ from oci.inference.hierarchical_all_architecture_discovery import (
 )
 from oci.inference.lossless_stage1_evidence_catalog import (
     ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION,
+    SEMANTIC_MEMBER_BATCHING_SCHEMA_VERSION,
     RoleNeutralEvidenceCatalog,
     Stage1EvidenceAtom,
     build_complete_architecture_chunks,
@@ -65,6 +66,13 @@ from oci.inference.openai_compatible_json_discovery_job_runner import (
 
 def _catalog(*, first_family_atom_count: int = 1) -> RoleNeutralEvidenceCatalog:
     split_fingerprint = "1" * 64
+    semantic_member_batch_size = 1
+    semantic_member_batching = {
+        "schema_version": SEMANTIC_MEMBER_BATCHING_SCHEMA_VERSION,
+        "semantic_member_batch_size": semantic_member_batch_size,
+        "selection_or_truncation_authorized": False,
+        "complete_member_coverage_required": True,
+    }
     atoms = []
     atom_ordinal = 0
     for family_index, family in enumerate(ACTIVE_STAGE1_CONCEPT_FAMILIES, start=1):
@@ -114,6 +122,7 @@ def _catalog(*, first_family_atom_count: int = 1) -> RoleNeutralEvidenceCatalog:
             )
     catalog_identity = {
         "schema_version": ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION,
+        "semantic_member_batching": semantic_member_batching,
         "outer_fold": 1,
         "scope": "outer_train",
         "inner_fold": None,
@@ -129,7 +138,12 @@ def _catalog(*, first_family_atom_count: int = 1) -> RoleNeutralEvidenceCatalog:
         atoms=tuple(atoms),
         non_grounding_numerical_summaries=(),
         catalog_sha256=content_sha256(catalog_identity),
-        _audit_json="{}",
+        _audit_json=canonical_json(
+            {
+                "semantic_member_batching": semantic_member_batching,
+                "semantic_member_batch_size": semantic_member_batch_size,
+            }
+        ),
     )
     validate_role_neutral_catalog(catalog)
     return catalog
@@ -1222,7 +1236,9 @@ def test_every_job_hides_machine_metadata_and_authenticates_exact_message_bytes(
         envelope = job.input_bindings[AUTHENTICATED_MESSAGE_ENVELOPE_BINDING]
         assert envelope["byte_count"] == len(job.rendered_messages_bytes)
         assert envelope["sha256"] == content_sha256(messages)
-        assert envelope["max_byte_count"] == MAX_RENDERED_DISCOVERY_PROMPT_BYTES
+        assert envelope["byte_limit_binding"] == (
+            "content_addressed_orchestrator_runtime_config_v1"
+        )
         assert envelope["schema_version"].endswith(("_v1", "_v2", "_v3", "_v4", "_v5"))
 
     dossier_jobs = [
@@ -1248,7 +1264,7 @@ def test_every_job_hides_machine_metadata_and_authenticates_exact_message_bytes(
         assert "schema_version" in job.input_bindings["deterministic_role_routing"]
 
 
-def test_fixed_prompt_byte_guard_fails_before_runner_invocation():
+def test_configured_prompt_byte_guard_fails_before_runner_invocation():
     catalog = _catalog()
     plan = build_complete_architecture_chunks(
         catalog,
@@ -1277,8 +1293,12 @@ def test_fixed_prompt_byte_guard_fails_before_runner_invocation():
         )
     assert runner.calls == []
 
-    with pytest.raises(ValueError, match="fixed at 220000"):
-        HierarchicalDiscoveryConfig(max_rendered_prompt_bytes=219_999)
+    assert (
+        HierarchicalDiscoveryConfig(
+            max_rendered_prompt_bytes=MAX_RENDERED_DISCOVERY_PROMPT_BYTES + 130_000
+        ).max_rendered_prompt_bytes
+        == 350_000
+    )
 
 
 def test_semantic_member_chunk_cap_is_positive_and_must_match_the_plan():
@@ -1343,6 +1363,7 @@ def test_cross_architecture_plan_schedules_arbitrary_complete_support_without_sa
             }
         },
         evidence_by_id=evidence_by_id,
+        wire_budget=HierarchicalDiscoveryConfig().wire_budget,
     )
 
     assert len(complete_support) == 20

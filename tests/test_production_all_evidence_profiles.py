@@ -4,6 +4,8 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
 from oci.inference.production_stage1_bundle import (
     ProductionStage1BundleBuilder,
     load_applied_stage1_config,
@@ -27,13 +29,16 @@ def _sha256(path: Path) -> str:
 
 def test_checked_in_full_profiles_match_the_fixed_stage1_scientific_design() -> None:
     assert _sha256(STAGE1_PROFILE) == (
-        "1af35bb0a107c28a79a76fa74319de105d2ee4352c12345d8bdbe97869b9cfc0"
+        "5238beef2ce259735b2ebb5517a2d2c1ee6d511eb1e75695b60b52d95cc3fc56"
     )
     assert _sha256(QUERY_PROFILE) == (
-        "2d465f6c2eae71d4c9f4d18716f0919aee954b0afde9ef4414a27c5ad4771997"
+        "9f79d85203ba3486e1f459dd21e2b84fa6d8c78a5857123a984b86f0cdc248fd"
     )
 
-    config = load_applied_stage1_config(STAGE1_PROFILE)
+    config = load_applied_stage1_config(
+        STAGE1_PROFILE,
+        require_explicit_scientific_fields=True,
+    )
     query, query_identity = ProductionStage1BundleBuilder._load_query_config(
         QUERY_PROFILE
     )
@@ -100,7 +105,116 @@ def test_checked_in_full_profiles_match_the_fixed_stage1_scientific_design() -> 
     assert query.query_inner_folds == 5
     assert query.max_review_rounds == 2
     assert query.max_canonical_features == 20
-    assert query.rag_max_chunks_per_patient == 128
+    assert query.rag_max_chunks_per_patient is None
+    assert query.evidence_chunks_per_patient_per_query is None
+    assert query.evidence_excerpt_chars is None
+    assert query.evidence_ngram_vocabulary_max_features is None
+    assert query.evidence_ngram_analyzer == "word"
+    assert query.evidence_safe_term_max_tokens == 6
+    assert query.evidence_safe_term_max_chars == 160
+    assert (
+        query.evidence_ngram_range_min,
+        query.evidence_ngram_range_max,
+    ) == (1, 3)
+
+
+def test_production_stage1_profile_cannot_inherit_an_active_dataclass_default(
+    tmp_path: Path,
+) -> None:
+    raw = json.loads(STAGE1_PROFILE.read_text(encoding="utf-8"))
+    topic = raw["config"]["architecture"]["multi_model_forest"]["tfidf_topic"]
+    topic.pop("max_features")
+    path = tmp_path / "missing-active-field.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    # The compatibility loader still supports historical partial configs and
+    # demonstrates the implicit default that production must reject.
+    compatibility = load_applied_stage1_config(path)
+    assert compatibility.architecture.multi_model_forest.tfidf_topic.max_features == 30000
+    with pytest.raises(
+        ValueError,
+        match=r"would inherit dataclass defaults.*tfidf_topic is missing: max_features",
+    ):
+        load_applied_stage1_config(
+            path,
+            require_explicit_scientific_fields=True,
+        )
+
+
+def test_production_stage1_profile_active_subtrees_are_closed(
+    tmp_path: Path,
+) -> None:
+    raw = json.loads(STAGE1_PROFILE.read_text(encoding="utf-8"))
+    raw["config"]["architecture"]["multi_model_forest"]["tfidf_topic"][
+        "unreviewed_topic_cap"
+    ] = 7
+    path = tmp_path / "extra-active-field.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match=r"unsupported fields.*tfidf_topic contains: unreviewed_topic_cap",
+    ):
+        load_applied_stage1_config(
+            path,
+            require_explicit_scientific_fields=True,
+        )
+
+
+def test_production_stage1_rejects_empty_active_bow_view_list(
+    tmp_path: Path,
+) -> None:
+    raw = json.loads(STAGE1_PROFILE.read_text(encoding="utf-8"))
+    forest = raw["config"]["architecture"]["multi_model_forest"]
+    assert forest["bow_discovery_enabled"] is True
+    forest["bow_views"] = []
+    path = tmp_path / "empty-active-bow-views.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"nonempty.*bow_views"):
+        load_applied_stage1_config(
+            path,
+            require_explicit_scientific_fields=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "message"),
+    (
+        (
+            None,
+            "htr_max_chunks",
+            r"architecture is missing: htr_max_chunks",
+        ),
+        (
+            "embedding_contrast",
+            "max_chunks",
+            r"embedding_contrast is missing: max_chunks",
+        ),
+    ),
+)
+def test_production_stage1_text_window_limits_must_be_explicit(
+    tmp_path: Path,
+    section: str | None,
+    field: str,
+    message: str,
+) -> None:
+    raw = json.loads(STAGE1_PROFILE.read_text(encoding="utf-8"))
+    architecture = raw["config"]["architecture"]
+    target = (
+        architecture
+        if section is None
+        else architecture["multi_model_forest"][section]
+    )
+    target.pop(field)
+    path = tmp_path / f"missing-{field}.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        load_applied_stage1_config(
+            path,
+            require_explicit_scientific_fields=True,
+        )
 
 
 def test_checked_in_profiles_are_secret_free_and_contain_only_inert_endpoints() -> None:

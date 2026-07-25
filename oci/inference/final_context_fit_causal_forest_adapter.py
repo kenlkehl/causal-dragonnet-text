@@ -38,6 +38,9 @@ from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 
+from ..models.strict_causal_forest_runtime import (
+    StrictCausalForestRuntimeConfig,
+)
 from .all_evidence_post_extraction_review import (
     OUTCOME_NUISANCE_FEATURE_ROLE,
     PROPENSITY_NUISANCE_FEATURE_ROLE,
@@ -97,6 +100,34 @@ def _positive_int(value: Any, *, name: str) -> int:
     if result < 1:
         raise ValueError(f"{name} must be positive")
     return result
+
+
+def _validate_max_features(
+    value: Any,
+    *,
+    name: str,
+    allow_none: bool,
+) -> None:
+    if value is None:
+        if allow_none:
+            return
+        raise ValueError(f"{name} cannot be None")
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError(f"{name} cannot be boolean")
+    if isinstance(value, str):
+        if not value.strip():
+            raise ValueError(f"{name} cannot be empty")
+        return
+    if isinstance(value, (int, np.integer)):
+        if int(value) < 1:
+            raise ValueError(f"integer {name} must be positive")
+        return
+    if isinstance(value, (float, np.floating)):
+        numeric = float(value)
+        if not math.isfinite(numeric) or not 0 < numeric <= 1:
+            raise ValueError(f"fractional {name} must be finite and in (0, 1]")
+        return
+    raise TypeError(f"{name} must be a supported scalar")
 
 
 def _row_ids(values: Sequence[Any], *, name: str) -> tuple[int, ...]:
@@ -578,11 +609,12 @@ class FinalCausalForestBackend(Protocol):
 
 @dataclass(frozen=True)
 class FixedCausalForestHeadBackend:
-    """Precommitted wrapper preserving the prior working forest defaults.
+    """Precommitted wrapper around the repository's strict EconML path.
 
-    EconML's tuning step consumes outer-train labels only.  It remains enabled
-    here because that was part of the recovered working causal-forest path and
-    does not expose the outer-heldout labels.
+    Defaults remain available for legacy callers.  The typed portable workflow
+    passes every scientific field explicitly and requires ``tune_model=False``.
+    ``n_jobs`` is an operational resource choice and is intentionally excluded
+    from :meth:`identity`.
     """
 
     n_estimators: int = 200
@@ -591,16 +623,102 @@ class FixedCausalForestHeadBackend:
     max_features: str | float | int = "sqrt"
     honest: bool = True
     inference: bool = True
+    subforest_size: int = 4
     tune_model: bool = True
+    nuisance_n_estimators: int = 100
+    nuisance_max_depth: int | None = None
+    nuisance_min_samples_leaf: int = 10
+    nuisance_treatment_max_features: str | float | int | None = "sqrt"
+    nuisance_outcome_max_features: str | float | int | None = 1.0
     random_state: int = 42
+    n_jobs: int = -1
+    runtime_config: StrictCausalForestRuntimeConfig | None = None
 
     def __post_init__(self) -> None:
+        if self.runtime_config is not None:
+            if not isinstance(self.runtime_config, StrictCausalForestRuntimeConfig):
+                raise TypeError("runtime_config must be StrictCausalForestRuntimeConfig")
+            legacy_values = {
+                "n_estimators": self.n_estimators,
+                "max_depth": self.max_depth,
+                "min_samples_leaf": self.min_samples_leaf,
+                "max_features": self.max_features,
+                "honest": self.honest,
+                "inference": self.inference,
+                "subforest_size": self.subforest_size,
+                "tune_model": self.tune_model,
+                "nuisance_n_estimators": self.nuisance_n_estimators,
+                "nuisance_max_depth": self.nuisance_max_depth,
+                "nuisance_min_samples_leaf": (self.nuisance_min_samples_leaf),
+                "nuisance_treatment_max_features": (self.nuisance_treatment_max_features),
+                "nuisance_outcome_max_features": (self.nuisance_outcome_max_features),
+                "random_state": self.random_state,
+                "n_jobs": self.n_jobs,
+            }
+            legacy_defaults = {
+                "n_estimators": 200,
+                "max_depth": None,
+                "min_samples_leaf": 10,
+                "max_features": "sqrt",
+                "honest": True,
+                "inference": True,
+                "subforest_size": 4,
+                "tune_model": True,
+                "nuisance_n_estimators": 100,
+                "nuisance_max_depth": None,
+                "nuisance_min_samples_leaf": 10,
+                "nuisance_treatment_max_features": "sqrt",
+                "nuisance_outcome_max_features": 1.0,
+                "random_state": 42,
+                "n_jobs": -1,
+            }
+            if legacy_values != legacy_defaults:
+                changed = sorted(
+                    key for key in legacy_defaults if legacy_values[key] != legacy_defaults[key]
+                )
+                raise ValueError(
+                    "runtime_config cannot be combined with legacy "
+                    f"compatibility flags: {changed}"
+                )
+            return
+
         trees = _positive_int(self.n_estimators, name="n_estimators")
-        if trees % 4 != 0:
-            raise ValueError("n_estimators must be divisible by four")
+        subforest = _positive_int(self.subforest_size, name="subforest_size")
+        if self.inference and trees % subforest != 0:
+            raise ValueError(
+                "n_estimators must be divisible by subforest_size when " "inference is enabled"
+            )
         if self.max_depth is not None:
             _positive_int(self.max_depth, name="max_depth")
         _positive_int(self.min_samples_leaf, name="min_samples_leaf")
+        _positive_int(
+            self.nuisance_n_estimators,
+            name="nuisance_n_estimators",
+        )
+        if self.nuisance_max_depth is not None:
+            _positive_int(
+                self.nuisance_max_depth,
+                name="nuisance_max_depth",
+            )
+        _positive_int(
+            self.nuisance_min_samples_leaf,
+            name="nuisance_min_samples_leaf",
+        )
+        _validate_max_features(
+            self.max_features,
+            name="max_features",
+            allow_none=False,
+        )
+        _validate_max_features(
+            self.nuisance_treatment_max_features,
+            name="nuisance_treatment_max_features",
+            allow_none=True,
+        )
+        _validate_max_features(
+            self.nuisance_outcome_max_features,
+            name="nuisance_outcome_max_features",
+            allow_none=True,
+        )
         for name, value in (
             ("honest", self.honest),
             ("inference", self.inference),
@@ -614,17 +732,44 @@ class FixedCausalForestHeadBackend:
             self.random_state, (int, np.integer)
         ):
             raise TypeError("random_state must be an integer")
+        if isinstance(self.n_jobs, (bool, np.bool_)) or not isinstance(
+            self.n_jobs, (int, np.integer)
+        ):
+            raise TypeError("n_jobs must be an integer")
+        if int(self.n_jobs) == 0:
+            raise ValueError("n_jobs must be nonzero")
 
     def identity(self) -> Mapping[str, Any]:
+        if self.runtime_config is not None:
+            return {
+                "backend": "repository_strict_causal_forest_path_v4",
+                "configuration_mode": ("portable_strict_runtime_config_v1"),
+                "strict_runtime_scientific_identity": (self.runtime_config.scientific_identity()),
+                "strict_runtime_scientific_identity_sha256": (
+                    self.runtime_config.scientific_identity_sha256()
+                ),
+                "operational_settings_excluded_from_scientific_identity": (True),
+                "exact_nuisance_used_as_fixed_internal_predictions": False,
+                "tuning_labels": "outer_train_only",
+                "outer_heldout_labels_accepted": False,
+                "repository_runtime": dict(_repository_causal_forest_runtime_attestation()),
+            }
         return {
-            "backend": "repository_causal_forest_prior_working_path_v2",
+            "backend": "repository_strict_causal_forest_path_v3",
+            "configuration_mode": "legacy_compatibility_shim_v1",
             "n_estimators": int(self.n_estimators),
             "max_depth": self.max_depth,
             "min_samples_leaf": int(self.min_samples_leaf),
             "max_features": self.max_features,
             "honest": self.honest,
             "inference": self.inference,
+            "subforest_size": int(self.subforest_size),
             "tune_model": self.tune_model,
+            "nuisance_n_estimators": int(self.nuisance_n_estimators),
+            "nuisance_max_depth": self.nuisance_max_depth,
+            "nuisance_min_samples_leaf": int(self.nuisance_min_samples_leaf),
+            "nuisance_treatment_max_features": (self.nuisance_treatment_max_features),
+            "nuisance_outcome_max_features": (self.nuisance_outcome_max_features),
             "random_state": int(self.random_state),
             "exact_nuisance_used_as_fixed_internal_predictions": False,
             "tuning_labels": "outer_train_only",
@@ -652,16 +797,26 @@ class FixedCausalForestHeadBackend:
             )
         CausalForestHead = causal_forest_head_module.CausalForestHead
 
-        model = CausalForestHead(
-            n_estimators=int(self.n_estimators),
-            max_depth=self.max_depth,
-            min_samples_leaf=int(self.min_samples_leaf),
-            max_features=self.max_features,
-            honest=self.honest,
-            inference=self.inference,
-            random_state=int(self.random_state),
-            tune_model=self.tune_model,
-        )
+        if self.runtime_config is not None:
+            model = CausalForestHead(runtime_config=self.runtime_config)
+        else:
+            model = CausalForestHead(
+                n_estimators=int(self.n_estimators),
+                max_depth=self.max_depth,
+                min_samples_leaf=int(self.min_samples_leaf),
+                max_features=self.max_features,
+                honest=self.honest,
+                inference=self.inference,
+                random_state=int(self.random_state),
+                tune_model=self.tune_model,
+                subforest_size=int(self.subforest_size),
+                nuisance_n_estimators=int(self.nuisance_n_estimators),
+                nuisance_max_depth=self.nuisance_max_depth,
+                nuisance_min_samples_leaf=int(self.nuisance_min_samples_leaf),
+                nuisance_treatment_max_features=(self.nuisance_treatment_max_features),
+                nuisance_outcome_max_features=(self.nuisance_outcome_max_features),
+                n_jobs=int(self.n_jobs),
+            )
         model.fit(
             X=np.asarray(effect_train, dtype=float),
             T=np.asarray(treatment, dtype=float),
@@ -669,9 +824,54 @@ class FixedCausalForestHeadBackend:
             W=np.asarray(control_train, dtype=float),
         )
         model_fit_audit = model.fit_audit()
+        if self.runtime_config is not None:
+            if model_fit_audit.get("configuration_mode") != ("portable_strict_runtime_config_v1"):
+                raise RuntimeError(
+                    "causal-forest head did not enter the portable strict " "runtime path"
+                )
+            if (
+                model_fit_audit.get("scientific_identity_sha256")
+                != self.runtime_config.scientific_identity_sha256()
+            ):
+                raise RuntimeError(
+                    "causal-forest head scientific identity differs from "
+                    "the backend runtime configuration"
+                )
+            if (
+                model_fit_audit.get("scientific_identity")
+                != self.runtime_config.scientific_identity()
+            ):
+                raise RuntimeError(
+                    "causal-forest head scientific settings differ from "
+                    "the backend runtime configuration"
+                )
+            if (
+                model_fit_audit.get("operational_attestation")
+                != self.runtime_config.operational_attestation()
+            ):
+                raise RuntimeError(
+                    "causal-forest head operational attestation differs "
+                    "from the backend runtime configuration"
+                )
+            if model_fit_audit.get("tuning_attempted") is not False:
+                raise RuntimeError(
+                    "portable strict causal forest unexpectedly attempted " "hyperparameter tuning"
+                )
+            if not isinstance(model_fit_audit.get("fitted_estimator_audit"), Mapping):
+                raise RuntimeError(
+                    "portable strict causal forest returned no fitted " "estimator audit"
+                )
+        else:
+            self._validate_legacy_fit_audit(model_fit_audit)
+
         runtime_after = _repository_causal_forest_runtime_attestation()
         if runtime_after != runtime_before:
             raise RuntimeError("causal-forest implementation changed during model fitting")
+        operational = (
+            self.runtime_config.operational_attestation()
+            if self.runtime_config is not None
+            else {"n_jobs": int(self.n_jobs)}
+        )
         object.__setattr__(
             self,
             "_last_fit_audit",
@@ -680,6 +880,12 @@ class FixedCausalForestHeadBackend:
                     **copy.deepcopy(model_fit_audit),
                     "outer_train_labels_only": True,
                     "outer_heldout_labels_accepted": False,
+                    "configuration_mode": (
+                        "portable_strict_runtime_config_v1"
+                        if self.runtime_config is not None
+                        else "legacy_compatibility_shim_v1"
+                    ),
+                    "operational_parameters": copy.deepcopy(operational),
                     "repository_runtime": copy.deepcopy(dict(runtime_after)),
                 }
             ),
@@ -688,6 +894,52 @@ class FixedCausalForestHeadBackend:
         if not isinstance(result, Mapping) or "tau_pred" not in result:
             raise TypeError("CausalForestHead returned no tau_pred vector")
         return np.asarray(result["tau_pred"], dtype=float)
+
+    def _validate_legacy_fit_audit(self, model_fit_audit: Mapping[str, Any]) -> None:
+        """Validate the explicitly labelled non-portable compatibility path."""
+
+        expected_parameters = {
+            "n_estimators": int(self.n_estimators),
+            "max_depth": self.max_depth,
+            "min_samples_leaf": int(self.min_samples_leaf),
+            "max_features": self.max_features,
+            "honest": self.honest,
+            "inference": self.inference,
+            "subforest_size": int(self.subforest_size),
+            "random_state": int(self.random_state),
+        }
+        expected_nuisance_parameters = {
+            "n_estimators": int(self.nuisance_n_estimators),
+            "max_depth": self.nuisance_max_depth,
+            "min_samples_leaf": int(self.nuisance_min_samples_leaf),
+            "treatment_max_features": (self.nuisance_treatment_max_features),
+            "outcome_max_features": self.nuisance_outcome_max_features,
+            "random_state": int(self.random_state),
+        }
+        if model_fit_audit.get("configured_parameters") != expected_parameters:
+            raise RuntimeError(
+                "causal-forest head audit disagrees with the backend's "
+                "configured scientific parameters"
+            )
+        if model_fit_audit.get("configured_nuisance_parameters") != expected_nuisance_parameters:
+            raise RuntimeError(
+                "causal-forest head audit disagrees with the backend's "
+                "configured nuisance parameters"
+            )
+        if model_fit_audit.get("effective_nuisance_parameters") != (expected_nuisance_parameters):
+            raise RuntimeError(
+                "effective nuisance parameters differ from the fixed backend " "configuration"
+            )
+        if model_fit_audit.get("operational_parameters") != {"n_jobs": int(self.n_jobs)}:
+            raise RuntimeError("causal-forest head audit disagrees with operational n_jobs")
+        if not self.tune_model:
+            if model_fit_audit.get("tuning_attempted") is not False:
+                raise RuntimeError("fixed causal forest unexpectedly attempted tuning")
+            if model_fit_audit.get("effective_parameters") != expected_parameters:
+                raise RuntimeError(
+                    "effective causal-forest parameters differ from the fixed "
+                    "backend configuration"
+                )
 
     def fit_audit(self) -> Mapping[str, Any]:
         if not hasattr(self, "_last_fit_audit"):
@@ -739,15 +991,28 @@ def _repository_causal_forest_runtime_attestation() -> Mapping[str, Any]:
     """Bind the dynamically imported forest implementation and dependencies."""
 
     from ..models import causal_forest_head as module
+    from ..models import strict_causal_forest_runtime as runtime_module
 
     module_path = Path(module.__file__).resolve(strict=True)
+    runtime_module_path = Path(runtime_module.__file__).resolve(strict=True)
     head = module.CausalForestHead
     result: dict[str, Any] = {
         "causal_forest_head_module_sha256": _sha256_file(module_path),
+        "strict_runtime_module_sha256": _sha256_file(runtime_module_path),
+        "strict_runtime_schema_version": (runtime_module.STRICT_CAUSAL_FOREST_RUNTIME_SCHEMA),
+        "strict_runtime_config_class_module": (
+            runtime_module.StrictCausalForestRuntimeConfig.__module__
+        ),
+        "strict_runtime_config_class_qualname": (
+            runtime_module.StrictCausalForestRuntimeConfig.__qualname__
+        ),
         "causal_forest_head_class_module": head.__module__,
         "causal_forest_head_class_qualname": head.__qualname__,
         "causal_forest_head_init_code_sha256": _method_code_sha256(head, "__init__"),
         "causal_forest_head_create_model_code_sha256": _method_code_sha256(head, "_create_model"),
+        "causal_forest_head_create_strict_model_code_sha256": (
+            _method_code_sha256(head, "_create_strict_model")
+        ),
         "causal_forest_head_fit_code_sha256": _method_code_sha256(head, "fit"),
         "causal_forest_head_predict_code_sha256": _method_code_sha256(head, "predict"),
         "causal_forest_head_fit_audit_code_sha256": _method_code_sha256(head, "fit_audit"),
@@ -764,6 +1029,8 @@ def _repository_causal_forest_runtime_attestation() -> Mapping[str, Any]:
     for label, estimator_class in (
         ("propensity_random_forest", getattr(module, "RandomForestClassifier", None)),
         ("outcome_random_forest", getattr(module, "RandomForestRegressor", None)),
+        ("stratified_crossfit", getattr(module, "StratifiedKFold", None)),
+        ("econml_grf", getattr(module, "EconMLCausalForest", None)),
     ):
         if estimator_class is None:
             result[f"{label}_class_module"] = None

@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 import oci.inference.neural_query_context_backend as query_context_module
 
+from oci.config import TfidfNuisanceStackScientificConfig
 from oci.inference.all_evidence_post_extraction_review import (
     OUTCOME_NUISANCE_FEATURE_ROLE,
     PROPENSITY_NUISANCE_FEATURE_ROLE,
@@ -136,6 +137,7 @@ def _service(
     service.embedding_cache = _FakeFrozenEmbeddings(_TEST_TEXTS)
     service._dataset_row_count = service.embedding_cache.row_count
     service._nuisance_views = ({"name": "test_unigram_view"},)
+    service._nuisance_stack_config = TfidfNuisanceStackScientificConfig()
     service.query_config = query_config or _query_config()
     service.nuisance_folds = 2
     service.devices = ("cpu",)
@@ -183,6 +185,81 @@ def _discovery():
         "validation_audits_used_for_selection": False,
         "executable_checkpoint_io": False,
     }
+
+
+def test_service_scientific_identity_is_independent_of_device_ids_and_count(tmp_path):
+    service = _service(tmp_path)
+    cpu_identity = service._identity_payload()
+    service.devices = ("cuda:7", "cuda:2")
+    multi_gpu_identity = service._identity_payload()
+
+    assert multi_gpu_identity == cpu_identity
+    assert "devices" not in cpu_identity
+    assert (
+        cpu_identity["device_assignment_policy"]
+        == "round_robin_over_compatible_execution_devices_v1"
+    )
+
+
+def test_safe_evidence_preserves_second_ranked_chunk_semantics(tmp_path):
+    class TwoChunkBound(_FakeBoundFrozenEmbeddings):
+        def chunk_matrices(self, row_ids):
+            requested = tuple(map(int, row_ids))
+            if requested != (0, 1):
+                raise ValueError("test provider accepts only its two spent rows")
+            return [
+                np.asarray([[1.0, 0.0], [0.8, 0.6]], dtype=np.float32),
+                np.asarray([[0.0, 1.0], [-0.2, 0.98]], dtype=np.float32),
+            ]
+
+        def chunk_texts(self, row_ids):
+            requested = tuple(map(int, row_ids))
+            if requested != (0, 1):
+                raise ValueError("test provider accepts only its two spent rows")
+            return [
+                ["shared baseline text", "secondrank biomarker"],
+                ["shared baseline text", "background finding"],
+            ]
+
+    class TwoChunkCache(_FakeFrozenEmbeddings):
+        def bind_spent(self, row_ids, texts):
+            rows = tuple(map(int, row_ids))
+            exact = tuple(texts)
+            if rows != (0, 1) or exact != self.texts[:2]:
+                raise ValueError("spent text does not match the test cache")
+            return TwoChunkBound(self, rows)
+
+    config = replace(
+        _query_config(),
+        evidence_top_ngrams=20,
+        evidence_chunks_per_patient_per_query=2,
+        evidence_ngram_range_min=1,
+        evidence_ngram_range_max=2,
+        evidence_ngram_stop_words=None,
+    )
+    service = _service(tmp_path, query_config=config)
+    service.embedding_cache = TwoChunkCache(_TEST_TEXTS)
+    evidence = service.safe_evidence(
+        discovery=_discovery(),
+        context_row_ids=(0, 1),
+        context_texts=_TEST_TEXTS[:2],
+    )
+
+    assert len(evidence) == 3
+    for row in evidence:
+        assert "secondrank biomarker" in {
+            item["term"] for item in row["top_contrastive_ngrams"]
+        }
+        assert row["top_chunks"] == []
+
+
+def test_safe_evidence_term_bound_fails_instead_of_omitting_witness():
+    with pytest.raises(ValueError, match="refusing silent omission"):
+        query_context_module._safe_query_ngram_rows(
+            [{"term": "clinically meaningful second ranked witness"}],
+            max_tokens=3,
+            max_chars=160,
+        )
 
 
 def _patch_discovery(monkeypatch, calls: list[tuple[int, ...]]) -> None:
@@ -510,7 +587,9 @@ def test_spent_evidence_never_requests_sealed_chunks(tmp_path, monkeypatch):
 
 def test_live_service_state_mutation_fails_closed(tmp_path):
     service = _service(tmp_path)
-    service.devices = ("cpu", "cpu")
+    # Execution-device count is deliberately absent from scientific identity.
+    # Mutating a scientific seed must still fail the owned-state binding.
+    service.seed += 1
     with pytest.raises(RuntimeError, match="state changed after binding"):
         service.identity()
 
@@ -623,6 +702,7 @@ def test_context_discovery_import_and_use_forbid_oracle_experiment_package(monke
             outcome=np.asarray([0.0, 1.0, 1.0, 0.0]),
             outcome_binary=True,
             nuisance_views=({"name": "test"},),
+            nuisance_stack_config=TfidfNuisanceStackScientificConfig(),
             query_config=backend.NeuralQueryAgenticForestConfig(),
             nuisance_folds=2,
             devices=("cpu",),
@@ -668,6 +748,7 @@ def test_context_discovery_calls_production_in_memory_runtime(monkeypatch):
         outcome=np.asarray([0.0, 1.0, 1.0, 0.0]),
         outcome_binary=True,
         nuisance_views=({"name": "test"},),
+        nuisance_stack_config=TfidfNuisanceStackScientificConfig(),
         query_config=_query_config(),
         nuisance_folds=2,
         devices=("cpu",),
@@ -753,10 +834,11 @@ def test_production_runtime_structurally_has_no_executable_checkpoint_api(monkey
         texts=_TEST_TEXTS[:4],
         treatment=np.asarray([0.0, 1.0, 0.0, 1.0]),
         outcome=np.asarray([0.0, 1.0, 1.0, 0.0]),
-        outcome_binary=True,
-        nuisance_views=({"name": "test"},),
-        nuisance_folds=2,
-        config=_query_config(),
+            outcome_binary=True,
+            nuisance_views=({"name": "test"},),
+            nuisance_folds=2,
+            nuisance_stack_config=TfidfNuisanceStackScientificConfig(),
+            config=_query_config(),
         seed=13,
         device="cpu",
         parent_input_binding_sha256="a" * 64,
@@ -830,7 +912,14 @@ def test_production_runtime_matches_historical_in_memory_discovery_algorithm(
                 },
             }
 
-        def fake_activations(current_chunks, queries, *, temperature, device):
+        def fake_activations(
+            current_chunks,
+            queries,
+            *,
+            temperature,
+            device,
+            patient_batch_size=None,
+        ):
             query_values = np.asarray(queries, dtype=float)
             row_markers = np.asarray(
                 [float(np.asarray(chunk)[0, 0]) for chunk in current_chunks],
@@ -844,6 +933,7 @@ def test_production_runtime_matches_historical_in_memory_discovery_algorithm(
                     "queries": query_values.tolist(),
                     "temperature": float(temperature),
                     "device": str(device),
+                    "patient_batch_size": patient_batch_size,
                 }
             )
             return values
@@ -1007,6 +1097,7 @@ def test_production_runtime_matches_historical_in_memory_discovery_algorithm(
             n_queries,
             bank,
             seed,
+            config,
         ):
             trace.append(
                 {
@@ -1029,6 +1120,7 @@ def test_production_runtime_matches_historical_in_memory_discovery_algorithm(
                 n_queries=n_queries,
                 bank=bank,
                 seed=seed,
+                config=config,
             )
 
         with monkeypatch.context() as scoped:
@@ -1050,6 +1142,7 @@ def test_production_runtime_matches_historical_in_memory_discovery_algorithm(
                 "fit_e": fit_e,
                 "fit_m": fit_m,
                 "nuisance_views": nuisance_views,
+                "nuisance_stack_config": TfidfNuisanceStackScientificConfig(),
                 "config": config,
                 "nuisance_folds": 2,
                 "devices": ("cpu",),
@@ -1283,16 +1376,23 @@ def test_owned_snapshot_persists_exact_trusted_arrays_without_loading_joblib(
     assert metadata["executable_serialization_present"] is False
     assert metadata["joblib_checkpoint_loaded"] is False
     assert not list(snapshot_dir.rglob("*.joblib"))
-    with np.load(snapshot_dir / "arrays.npz", allow_pickle=False) as arrays:
-        for bank in ("treatment", "outcome", "effect"):
-            np.testing.assert_array_equal(
-                arrays[f"{bank}_queries"],
-                discovery["banks"][bank]["queries"],
-            )
-            np.testing.assert_array_equal(
-                arrays[f"{bank}_train_activations"],
-                discovery["banks"][bank]["train_activations"],
-            )
+    for position, (bank, suffix) in enumerate(
+        (
+            (bank, suffix)
+            for bank in ("treatment", "outcome", "effect")
+            for suffix in ("queries", "train_activations")
+        )
+    ):
+        array = np.load(
+            snapshot_dir / "arrays" / f"{position:03d}_{bank}_{suffix}.npy",
+            mmap_mode="r",
+            allow_pickle=False,
+        )
+        assert isinstance(array, np.memmap)
+        np.testing.assert_array_equal(
+            array,
+            discovery["banks"][bank][suffix],
+        )
 
 
 def test_owned_snapshot_rejects_unknown_existing_mutated_and_tampered_state(
@@ -1325,9 +1425,9 @@ def test_owned_snapshot_rejects_unknown_existing_mutated_and_tampered_state(
 
     snapshot_dir = tmp_path / "snapshot"
     service.write_owned_discovery_snapshot(cache_key=cache_key, output_dir=snapshot_dir)
-    arrays_path = snapshot_dir / "arrays.npz"
+    arrays_path = snapshot_dir / "arrays" / "000_treatment_queries.npy"
     arrays_path.write_bytes(arrays_path.read_bytes() + b"tamper")
-    with pytest.raises(RuntimeError, match="NPZ changed"):
+    with pytest.raises(RuntimeError, match="changed"):
         query_context_module.validate_owned_discovery_snapshot(snapshot_dir)
 
     service._owned_discoveries[cache_key]["banks"]["effect"]["queries"][0, 0] = -17.0
@@ -1381,11 +1481,24 @@ def test_owned_queries_and_exact_gate_moments_ignore_external_heldout_labels(
 
     np.testing.assert_array_equal(first.feature_values, second.feature_values)
     assert first.feature_names == second.feature_names
-    for bank in ("treatment", "outcome", "effect"):
-        with np.load(tmp_path / "snapshot_before" / "arrays.npz", allow_pickle=False) as before:
-            before_queries = before[f"{bank}_queries"].copy()
-        with np.load(tmp_path / "snapshot_after" / "arrays.npz", allow_pickle=False) as after:
-            np.testing.assert_array_equal(before_queries, after[f"{bank}_queries"])
+    for position, bank in enumerate(("treatment", "outcome", "effect")):
+        before_queries = np.load(
+            tmp_path
+            / "snapshot_before"
+            / "arrays"
+            / f"{position * 2:03d}_{bank}_queries.npy",
+            mmap_mode="r",
+            allow_pickle=False,
+        ).copy()
+        after_queries = np.load(
+            tmp_path
+            / "snapshot_after"
+            / "arrays"
+            / f"{position * 2:03d}_{bank}_queries.npy",
+            mmap_mode="r",
+            allow_pickle=False,
+        )
+        np.testing.assert_array_equal(before_queries, after_queries)
     assert heldout_treatment.tolist() == [1.0]
     assert heldout_outcome.tolist() == [0.0]
 

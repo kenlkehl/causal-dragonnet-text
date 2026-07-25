@@ -5,7 +5,6 @@ import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
-import joblib
 import numpy as np
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -17,6 +16,7 @@ from oci.inference.all_evidence_post_extraction_review import (
     UNCALIBRATED_EFFECT_MODIFIER_ROLE,
 )
 import oci.inference.tfidf_upstream_gate_backend as module
+from oci.inference.tfidf_safe_artifacts import write_named_array_bank
 
 
 def test_tfidf_backend_transforms_label_free_gate_into_role_aware_banks(
@@ -47,8 +47,15 @@ def test_tfidf_backend_transforms_label_free_gate_into_role_aware_banks(
         vectorizer = TfidfVectorizer(ngram_range=(1, 2)).fit(
             ["high torque bearing vibration", "low torque stable output"]
         )
-        fitted_path = output / "fitted_context.joblib"
-        joblib.dump(SimpleNamespace(common_vectorizer=vectorizer), fitted_path)
+        fitted_root = output / "fitted_context"
+        fitted_root.mkdir()
+        fitted_path = fitted_root / "index.json"
+        fitted_path.write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(
+            module,
+            "load_fitted_topic_context",
+            lambda _path: SimpleNamespace(common_vectorizer=vectorizer),
+        )
         scores_path = output / "effect_ngram_scores.parquet"
         pd.DataFrame(
             {
@@ -59,12 +66,14 @@ def test_tfidf_backend_transforms_label_free_gate_into_role_aware_banks(
                 "support_treated": [5, 5],
             }
         ).to_parquet(scores_path, index=False)
-        topic_path = output / "heldout_topic_values.npz"
-        np.savez(
-            topic_path,
-            treatment=np.asarray([[0.1], [0.2]]),
-            outcome=np.asarray([[0.3], [0.4]]),
-            effect=np.asarray([[0.5], [0.6]]),
+        topic_path = write_named_array_bank(
+            {
+                "treatment": np.asarray([[0.1], [0.2]]),
+                "outcome": np.asarray([[0.3], [0.4]]),
+                "effect": np.asarray([[0.5], [0.6]]),
+            },
+            output / "heldout_topic_values",
+            row_count=2,
         )
         nuisance_path = output / "nuisance.parquet"
         pd.DataFrame(

@@ -296,6 +296,8 @@ def _cli_args(tmp_path: Path, *extra: str):
             "http://remote-worker:8010/v1",
             "--model",
             "remote/model",
+            "--extraction-max-text-length",
+            "400000",
             *extra,
         ]
     )

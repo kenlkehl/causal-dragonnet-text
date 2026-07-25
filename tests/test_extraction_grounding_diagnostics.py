@@ -7,6 +7,27 @@ from oci.inference.all_evidence_fusion import SOURCE_TEXT_TEMPORAL_POLICY
 from oci.inference.extraction_grounding_diagnostics import (
     build_extraction_grounding_diagnostics,
 )
+from oci.inference.post_extraction_scientific_policy import (
+    ExtractionGroundingPolicy,
+)
+
+
+def _grounding_policy(**overrides):
+    values = {
+        "anchor_group_selection": "all_source_attested_unbounded",
+        "maximum_group_span_chars": 96,
+        "anchor_value_window_chars": 96,
+        "category_assertion_prefix_chars": 64,
+        "unit_window_min_chars": 12,
+        "unit_window_max_chars": 32,
+        "unit_window_divisor": 3,
+        "minimum_evaluable_rows": 3,
+        "maximum_alternative_category_only_rate": 0.50,
+        "unsupported_value_warning_rate": 0.25,
+        "minimum_unit_support_rate": 0.50,
+    }
+    values.update(overrides)
+    return ExtractionGroundingPolicy(**values)
 
 
 def _continuous_frame(values, *, name="orbital_flux"):
@@ -317,3 +338,49 @@ def test_unattested_short_contract_token_cannot_create_an_anchor():
     assert row["anchor_detected_row_count"] == 0
     assert row["value_grounding"]["unsupported_row_count"] == 3
     assert "contract_anchor_not_discriminative" in row["warnings"]
+
+
+def test_all_source_attested_anchor_groups_are_retained_without_top_k_cap():
+    spec = {
+        "name": "qx1_qx2_qx3_qx4_qx5",
+        "type": "continuous",
+        "roles": ["confounder"],
+        "description": "QX1 QX2 QX3 QX4 QX5 measurement in quanta/turn.",
+    }
+    text = "QX1 QX2 QX3 QX4 QX5 measurement was 7 quanta/turn."
+    row = build_extraction_grounding_diagnostics(
+        _continuous_frame([7.0] * 3, name=spec["name"]),
+        [text] * 3,
+        [spec],
+        policy=_grounding_policy(),
+    )[0]
+
+    # One conjunctive name signature plus every independently attested
+    # digit-bearing identifier; no fixed four-anchor slice is permitted.
+    assert row["contract_anchor_group_count"] == 6
+    assert row["value_grounding"]["supported_row_count"] == 3
+
+
+def test_configured_grounding_warning_threshold_changes_diagnostic():
+    frame = _continuous_frame([7.0] * 4)
+    texts = [
+        "Orbital flux was not recorded.",
+        "Orbital flux was 7 quanta/turn.",
+        "Orbital flux was not recorded.",
+        "Orbital flux was 7 quanta/turn.",
+    ]
+    strict = build_extraction_grounding_diagnostics(
+        frame,
+        texts,
+        [_orbital_flux_spec()],
+        policy=_grounding_policy(unsupported_value_warning_rate=0.25),
+    )[0]
+    permissive = build_extraction_grounding_diagnostics(
+        frame,
+        texts,
+        [_orbital_flux_spec()],
+        policy=_grounding_policy(unsupported_value_warning_rate=0.75),
+    )[0]
+
+    assert "many_values_not_lexically_grounded_to_contract" in strict["warnings"]
+    assert "many_values_not_lexically_grounded_to_contract" not in permissive["warnings"]

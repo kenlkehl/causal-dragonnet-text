@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 import textwrap
 from dataclasses import replace
 from pathlib import Path
@@ -180,6 +181,26 @@ def _initial_registry(
         initial_catalog=catalog,
     )
     return registry, family_by_id
+
+
+def _diagnostic_adapter_audit(
+    *,
+    score: float = 0.25,
+) -> dict[str, object]:
+    catalog = _catalog()
+    registry, _family_by_id = _initial_registry(catalog)
+    _adapted, audit = AllEvidenceFusionRunner._adaptive_diagnostics(
+        [
+            {
+                "diagnostic_id": "diagnostic_0001",
+                "kind": "feature_quality",
+                "feature_name": "alpha_measure",
+                "missingness_rate": score,
+            }
+        ],
+        current_registry=registry,
+    )
+    return audit
 
 
 def _support_by_name(
@@ -570,11 +591,116 @@ def test_adaptive_diagnostics_maps_every_kind_and_redacts_historical_targets() -
     }
     assert audit["unknown_current_diagnostic_targets_fail_closed"] is True
     assert audit["model_context_contains_excluded_historical_names"] is False
+    assert audit["metric_coverage_proof_count"] == 9
+    assert audit["total_eligible_metric_count"] == audit["total_emitted_metric_count"]
+    assert audit["every_eligible_metric_emitted_once"] is True
+    runner_module._validate_adaptive_diagnostic_adapter_audit(audit)
     serialized_model_context = canonical_json([item.as_prompt_item() for item in adapted])
     assert "removed_measure" not in serialized_model_context
     assert "older_measure" not in serialized_model_context
     assert "provider_sha256" not in serialized_model_context
     assert "gate_score" not in serialized_model_context
+
+
+def test_adaptive_diagnostics_preserves_more_than_32_metrics_and_long_distinct_keys() -> None:
+    catalog = _catalog()
+    registry, _family_by_id = _initial_registry(catalog)
+    shared_prefix = "score_" + ("clinically_meaningful_component_" * 5)
+    long_left = f"{shared_prefix}left"
+    long_right = f"{shared_prefix}right"
+    assert len(long_left) > 96
+    assert long_left[:96] == long_right[:96]
+    metric_values = {f"score_component_{index:03d}": float(index) for index in range(40)}
+    metric_values[long_left] = 101.0
+    metric_values[long_right] = 202.0
+
+    adapted, audit = AllEvidenceFusionRunner._adaptive_diagnostics(
+        [
+            {
+                "diagnostic_id": "diagnostic_0001",
+                "kind": "feature_quality",
+                "feature_name": "alpha_measure",
+                **metric_values,
+            }
+        ],
+        current_registry=registry,
+    )
+
+    metrics = dict(adapted[0].aggregate_metrics)
+    assert len(metrics) == 42
+    assert metrics[long_left] == 101.0
+    assert metrics[long_right] == 202.0
+    assert set(metrics) == set(metric_values)
+    proof = audit["metric_coverage_proofs"][0]
+    assert proof["eligible_metric_count"] == 42
+    assert proof["emitted_metric_count"] == 42
+    assert proof["ordered_metric_keys"] == sorted(metric_values)
+    assert audit["total_eligible_metric_count"] == 42
+    assert audit["total_emitted_metric_count"] == 42
+
+
+def test_adaptive_diagnostic_path_encoding_keeps_flat_and_nested_metrics_distinct() -> None:
+    catalog = _catalog()
+    registry, _family_by_id = _initial_registry(catalog)
+
+    adapted, audit = AllEvidenceFusionRunner._adaptive_diagnostics(
+        [
+            {
+                "diagnostic_id": "diagnostic_0001",
+                "kind": "feature_quality",
+                "feature_name": "alpha_measure",
+                "quality_score": 1.0,
+                "quality": {"score": 2.0},
+                "Score_metric_count": 3,
+                "score_metric_count": 4,
+            }
+        ],
+        current_registry=registry,
+    )
+
+    assert adapted[0].aggregate_metrics == {
+        runner_module._encode_adaptive_metric_path_segment("Score_metric_count"): 3,
+        "quality.score": 2.0,
+        "quality_score": 1.0,
+        "score_metric_count": 4,
+    }
+    runner_module._validate_adaptive_diagnostic_adapter_audit(audit)
+    runner_module._validate_adaptive_diagnostic_adapter_audit(
+        json.loads(canonical_json(audit))
+    )
+
+
+def test_adaptive_diagnostic_metric_coverage_proof_rejects_duplicate_and_tampering() -> None:
+    audit = _diagnostic_adapter_audit()
+    proof = audit["metric_coverage_proofs"][0]
+
+    duplicate = json.loads(canonical_json(proof))
+    duplicate["ordered_metric_keys"].append(duplicate["ordered_metric_keys"][0])
+    with pytest.raises(ValueError, match="contain duplicates"):
+        runner_module._validate_adaptive_diagnostic_metric_coverage_proof(duplicate)
+
+    omitted = json.loads(canonical_json(proof))
+    omitted["aggregate_metrics"] = {}
+    with pytest.raises(ValueError, match="key order is inconsistent"):
+        runner_module._validate_adaptive_diagnostic_metric_coverage_proof(omitted)
+
+
+def test_adaptive_diagnostics_rejects_metric_like_non_scalar_collections() -> None:
+    catalog = _catalog()
+    registry, _family_by_id = _initial_registry(catalog)
+
+    with pytest.raises(ValueError, match="must be pre-aggregated to scalar"):
+        AllEvidenceFusionRunner._adaptive_diagnostics(
+            [
+                {
+                    "diagnostic_id": "diagnostic_0001",
+                    "kind": "feature_quality",
+                    "feature_name": "alpha_measure",
+                    "quality_score_history": [0.1, 0.2],
+                }
+            ],
+            current_registry=registry,
+        )
 
 
 def test_adaptive_diagnostics_rejects_unknown_target_for_current_diagnostic() -> None:
@@ -655,7 +781,7 @@ def _authenticated_execution_artifact_body(
         "review_round": 2,
         "review_attempt": 1,
         "request_sha256": request_sha256,
-        "diagnostic_adapter_audit": {"every_diagnostic_id_represented_once": True},
+        "diagnostic_adapter_audit": _diagnostic_adapter_audit(),
         "authenticated_execution": execution,
         "proposal_frozen_before_executable_bridge": True,
         "executable_revision_frozen_before_gate": True,
@@ -692,6 +818,29 @@ def test_post_revalidation_adaptive_artifact_consistency_loader_preserves_frozen
     assert execution["frozen_round"]["freeze_sha256"] == (
         execution["executable_revision"]["proposal_freeze_sha256"]
     )
+
+
+def test_adaptive_execution_loader_rejects_metric_audit_different_from_fresh_extraction(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "authenticated_adaptive_hierarchy.json"
+    request_sha256 = "9" * 64
+    body = _authenticated_execution_artifact_body(request_sha256=request_sha256)
+    runner_module._write_immutable_json(
+        path,
+        body,
+        schema=runner_module.ADAPTIVE_HIERARCHICAL_REVIEW_EXECUTION_SCHEMA_VERSION,
+    )
+
+    with pytest.raises(RuntimeError, match="differs from fresh extraction"):
+        runner_module._load_request_bound_adaptive_execution(
+            path,
+            outer_fold=1,
+            request_sha256=request_sha256,
+            review_round=2,
+            review_attempt=1,
+            expected_diagnostic_adapter_audit=_diagnostic_adapter_audit(score=0.75),
+        )
 
 
 def test_adaptive_execution_precedes_outer_artifact_comparison_and_bypasses_legacy_validation() -> (

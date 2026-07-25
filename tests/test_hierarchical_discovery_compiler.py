@@ -310,7 +310,7 @@ def test_compiler_rechecks_complete_extraction_support_set():
         ["positive"],
         ["high-risk", "high risk"],
         ["category 1", "positive"],
-        [f"state_{index}" for index in range(9)],
+        "positive,negative",
     ),
 )
 def test_candidate_contract_rejects_invalid_categorical_values(categories):
@@ -323,8 +323,34 @@ def test_candidate_contract_rejects_invalid_categorical_values(categories):
             ),
         )
     )
-    with pytest.raises(ValueError, match="categories"):
+    with pytest.raises((TypeError, ValueError), match="categories"):
         compile_hierarchical_discovery(completed)
+
+
+def test_compiler_preserves_more_than_eight_categorical_values_losslessly():
+    categories = [f"state_{index}" for index in range(12)]
+    completed = _completed(
+        (
+            _FeatureCase(
+                name="detailed_biomarker_status",
+                definition=_categorical_definition(
+                    "detailed_biomarker_status",
+                    categories,
+                ),
+                effect_modifier=True,
+            ),
+        )
+    )
+
+    registry = compile_hierarchical_discovery(completed, max_candidates=1)
+
+    assert registry.specs[0]["categories"] == categories
+    assert registry.contracts[0].extraction_spec["categories"] == categories
+    assert (
+        registry.compiler_identity["representation_policy"]["categorical_categories"]
+        == "CandidateContract concrete distinct nonempty validation with at least "
+        "two values and no compiler category-count cap"
+    )
 
 
 @pytest.mark.parametrize(

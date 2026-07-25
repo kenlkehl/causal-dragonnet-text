@@ -281,6 +281,67 @@ def _extractor_descriptor(extractor: Any) -> dict[str, Any]:
             "role_attention": bool(extractor._role_attention),
             "w_attention_heads": int(extractor._w_attention_heads),
             "x_attention_heads": int(extractor._x_attention_heads),
+            "transformer_feedforward_dim": int(
+                extractor._transformer_feedforward_dim
+            ),
+            "transformer_activation": str(
+                extractor._transformer_activation
+            ),
+            "transformer_norm_style": str(
+                extractor._transformer_norm_style
+            ),
+            "transformer_layer_norm_eps": float(
+                extractor._transformer_layer_norm_eps
+            ),
+            "transformer_layer_norm_elementwise_affine": bool(
+                extractor._transformer_layer_norm_elementwise_affine
+            ),
+            "transformer_layer_norm_bias": bool(
+                extractor._transformer_layer_norm_bias
+            ),
+            "transformer_attention_dropout": float(
+                extractor._transformer_attention_dropout
+            ),
+            "transformer_residual_dropout": float(
+                extractor._transformer_residual_dropout
+            ),
+            "transformer_feedforward_dropout": float(
+                extractor._transformer_feedforward_dropout
+            ),
+            "transformer_attention_bias": bool(
+                extractor._transformer_attention_bias
+            ),
+            "transformer_feedforward_bias": bool(
+                extractor._transformer_feedforward_bias
+            ),
+            "output_projection_depth": int(
+                extractor._output_projection_depth
+            ),
+            "output_projection_hidden_dim": int(
+                extractor._output_projection_hidden_dim
+            ),
+            "output_projection_activation": str(
+                extractor._output_projection_activation
+            ),
+            "output_projection_dropout": float(
+                extractor._output_projection_dropout
+            ),
+            "output_projection_hidden_layer_norm": bool(
+                extractor._output_projection_hidden_layer_norm
+            ),
+            "output_projection_final_layer_norm": bool(
+                extractor._output_projection_final_layer_norm
+            ),
+            "output_projection_bias": bool(
+                extractor._output_projection_bias
+            ),
+            "pool_token_init_std": float(extractor._pool_token_init_std),
+            "positional_encoding_base": float(
+                extractor._positional_encoding_base
+            ),
+            "environment_override_policy": str(
+                extractor._environment_override_policy
+            ),
         },
         "hash_backend": hash_backend,
         "effective_sentence_encoder_backend": str(
@@ -299,6 +360,7 @@ def _capture_model_state(
     *,
     kind: str,
     outcome_type: str,
+    training_configuration: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if kind not in {"nuisance", "effect"}:
         raise ValueError("unsupported HTR proof model kind")
@@ -321,11 +383,26 @@ def _capture_model_state(
         )
     if not state_rows:
         raise ValueError("fitted HTR model has no tensor state")
-    hidden_layer = model.shared[0] if kind == "nuisance" else model.head[0]
+    head_configuration = model.head_configuration()
+    required_head_fields = {
+        "hidden_dim",
+        "depth",
+        "activation",
+        "dropout",
+        "layer_norm",
+        "bias",
+    }
+    if set(head_configuration) != required_head_fields:
+        raise RuntimeError("HTR head did not expose its closed constructor")
     descriptor = {
         "kind": kind,
         "class_name": type(model).__name__,
-        "hidden_dim": int(hidden_layer.out_features),
+        "head_configuration": head_configuration,
+        "training_configuration": (
+            None
+            if training_configuration is None
+            else json.loads(_canonical_json(dict(training_configuration)))
+        ),
         "outcome_type": str(outcome_type),
         "extractor": extractor,
         "state_tensors": state_rows,
@@ -1021,15 +1098,34 @@ def _build_model(
     if observed_descriptor != expected_descriptor:
         raise RuntimeError("reconstructed HTR extractor identity changed")
     kind = str(descriptor.get("kind") or "")
-    hidden_dim = int(descriptor.get("hidden_dim", 0))
+    head_configuration = descriptor.get("head_configuration")
+    if not isinstance(head_configuration, Mapping) or set(head_configuration) != {
+        "hidden_dim",
+        "depth",
+        "activation",
+        "dropout",
+        "layer_norm",
+        "bias",
+    }:
+        raise ValueError(
+            "captured typed HTR model lacks its complete head constructor"
+        )
+    head_kwargs = {
+        "hidden_dim": int(head_configuration["hidden_dim"]),
+        "head_depth": int(head_configuration["depth"]),
+        "head_activation": str(head_configuration["activation"]),
+        "head_dropout": float(head_configuration["dropout"]),
+        "head_layer_norm": head_configuration["layer_norm"],
+        "head_bias": head_configuration["bias"],
+    }
     if kind == "nuisance":
         model = _NuisanceNet(
             extractor=extractor,
-            hidden_dim=hidden_dim,
             outcome_type=str(descriptor.get("outcome_type") or ""),
+            **head_kwargs,
         )
     elif kind == "effect":
-        model = _EffectNet(extractor=extractor, hidden_dim=hidden_dim)
+        model = _EffectNet(extractor=extractor, **head_kwargs)
     else:
         raise ValueError("captured HTR model kind is unsupported")
     model = model.to(device)

@@ -42,6 +42,7 @@ from oci.inference.tfidf_topic_stage1 import (
     _outer_split_plan,
     tfidf_topic_stage1_config_hash,
 )
+from oci.inference.tfidf_safe_artifacts import write_named_array_bank
 
 
 def _dataset() -> pd.DataFrame:
@@ -253,10 +254,16 @@ def _source_context_row(
         path = context_dir / f"{bank}_scores.parquet"
         path.write_bytes(b"sealed score placeholder")
         ngram_paths[bank] = str(path)
-    fit_topic_path = context_dir / "fit_topics.npz"
-    heldout_topic_path = context_dir / "heldout_topics.npz"
-    np.savez_compressed(fit_topic_path)
-    np.savez_compressed(heldout_topic_path)
+    fit_topic_path = write_named_array_bank(
+        {},
+        context_dir / "fit_topics",
+        row_count=len(fit_ids),
+    )
+    heldout_topic_path = write_named_array_bank(
+        {},
+        context_dir / "heldout_topics",
+        row_count=len(heldout_ids),
+    )
 
     nuisance_rows = []
     for row_id in fit_ids:

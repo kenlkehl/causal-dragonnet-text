@@ -67,14 +67,30 @@ class _Encoder:
         self,
         chunks,
         *,
+        prompt_name,
+        prompt,
         batch_size,
+        output_value,
+        precision,
         convert_to_numpy,
+        convert_to_tensor,
         normalize_embeddings,
+        truncate_dim,
         show_progress_bar,
+        pool,
+        chunk_size,
     ):
+        assert prompt_name is None
+        assert prompt == ""
         assert batch_size == len(chunks)
+        assert output_value == "sentence_embedding"
+        assert precision == "float32"
         assert convert_to_numpy is True
+        assert convert_to_tensor is False
+        assert truncate_dim is None
         assert show_progress_bar is False
+        assert pool is None
+        assert chunk_size is None
         output = []
         for chunk in chunks:
             digest = hashlib.sha256(chunk.encode("utf-8")).digest()
@@ -93,6 +109,17 @@ def _chunk_configuration() -> dict[str, object]:
         "chunk_selection": "last",
         "normalize_embeddings": True,
         "max_seq_length": 32,
+        "prompt_policy": "disabled",
+        "prompt_name": None,
+        "output_value": "sentence_embedding",
+        "precision": "float32",
+        "convert_to_numpy": True,
+        "convert_to_tensor": False,
+        "truncate_dim": None,
+        "pooling_output_policy": "single_process_sentence_embedding_v1",
+        "model_dtype": "float32",
+        "stored_array_dtype": "float32",
+        "zero_vector_policy": "reject",
     }
 
 
@@ -240,7 +267,7 @@ def test_historical_cache_provenance_uses_one_shared_model_authentication_path(
         "production_embedding_cache_relocator_v2"
     )
     assert hashlib.sha256(Path(builder_module.__file__).read_bytes()).hexdigest() == (
-        "9af77ce3cc47ea77c819974f4b55885ddeb279f758bbac6ca5b987ac9d61aabd"
+        "5f3d60019b1313e5dfde2c3c4065751c0a3c24ab00128dfefb71a34b0c55ffa5"
     )
     options = _case(tmp_path, monkeypatch)
     source_metadata = json.loads(

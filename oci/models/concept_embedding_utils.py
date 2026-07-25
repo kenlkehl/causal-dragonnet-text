@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from typing import List
 
+from .lossless_tokenization import SemanticTruncationError
+
 
 _WORD_RE = re.compile(r"\S+")
 
@@ -50,8 +52,12 @@ def chunk_text_words(
         start += stride
 
     if len(chunks) > max_chunks:
-        chunks = chunks[:max_chunks] if selection == "first" else chunks[-max_chunks:]
-
+        raise SemanticTruncationError(
+            "Concept embedding note requires "
+            f"{len(chunks)} chunks but configured max_chunks={max_chunks}; "
+            "semantic truncation is forbidden. Increase max_chunks so the "
+            "capacity is nonbinding."
+        )
     return chunks or [""]
 
 

@@ -9,6 +9,8 @@ from typing import List, Tuple
 
 import torch
 
+from .lossless_tokenization import SemanticTruncationError
+
 
 def chunk_token_ids(
     token_ids: List[int],
@@ -22,30 +24,44 @@ def chunk_token_ids(
         token_ids: Full sequence of token IDs for one document.
         chunk_size: Number of tokens per chunk.
         chunk_overlap: Number of overlapping tokens between consecutive chunks.
-        max_chunks: Maximum number of chunks to return (truncates the rest).
+        max_chunks: Configured chunk capacity. A binding value is rejected.
 
     Returns:
         List of token ID lists, one per chunk. Always returns at least one chunk.
     """
-    if chunk_overlap >= chunk_size:
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive")
+    if chunk_overlap < 0 or chunk_overlap >= chunk_size:
         raise ValueError(
-            f"chunk_overlap ({chunk_overlap}) must be < chunk_size ({chunk_size})"
+            f"chunk_overlap ({chunk_overlap}) must be in [0, chunk_size)"
         )
+    if max_chunks < 1:
+        raise ValueError("max_chunks must be positive")
 
     stride = chunk_size - chunk_overlap
     chunks = []
     start = 0
 
-    while start < len(token_ids) and len(chunks) < max_chunks:
+    while start < len(token_ids):
         end = start + chunk_size
         chunk = token_ids[start:end]
         if chunk:  # skip empty trailing chunk
             chunks.append(chunk)
+        if end >= len(token_ids):
+            break
         start += stride
 
     # Always return at least one chunk (possibly shorter than chunk_size)
     if not chunks:
-        chunks = [token_ids[:chunk_size] if token_ids else []]
+        if token_ids:
+            raise RuntimeError("token chunk planner produced no chunks")
+        chunks = [[]]
+    if len(chunks) > max_chunks:
+        raise SemanticTruncationError(
+            "Token chunk plan requires "
+            f"{len(chunks)} chunks but configured max_chunks={max_chunks}; "
+            "semantic truncation is forbidden."
+        )
 
     return chunks
 

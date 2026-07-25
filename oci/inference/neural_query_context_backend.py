@@ -21,6 +21,7 @@ import hashlib
 import json
 import math
 import os
+import stat
 import tempfile
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -33,6 +34,7 @@ import scipy
 import sklearn
 import torch
 
+from ..config import TfidfNuisanceStackScientificConfig
 from .all_evidence_fusion import (
     FoldEvidenceInput,
     FoldEvidenceProvenance,
@@ -55,6 +57,11 @@ from .neural_query_discovery_runtime import (
     NEURAL_QUERY_DISCOVERY_RUNTIME_ID,
     fit_in_memory_query_discovery,
 )
+from .production_neural_query_binary_layout import (
+    numerical_array_sha256,
+    validate_npy_array_set,
+    write_npy_array_set,
+)
 from .stage1_upstream_gate_backend import (
     HistoricalStage1ConfigSnapshot,
     _historical_stage1_config_snapshot,
@@ -70,12 +77,12 @@ from .tfidf_topic_discovery import (
     fit_joint_cross_fitted_nuisance_stacks,
 )
 
-NEURAL_QUERY_CONTEXT_SERVICE_ID = "neural_query_context_service_v7"
+NEURAL_QUERY_CONTEXT_SERVICE_ID = "neural_query_context_service_v8"
 NEURAL_QUERY_CONTEXT_BACKEND_ID = "neural_query_context_gate_backend_v3"
 NEURAL_QUERY_SPENT_EVIDENCE_PROVIDER_ID = "neural_query_spent_evidence_provider_v2"
 NEURAL_QUERY_SPENT_DISCOVERY_BACKEND_ID = "neural_query_spent_discovery_backend_v2"
 NEURAL_QUERY_SPENT_EVIDENCE_SCHEMA = "context_fit_neural_query_evidence_v2"
-NEURAL_QUERY_OWNED_SNAPSHOT_SCHEMA = "context_fit_neural_query_owned_snapshot_v1"
+NEURAL_QUERY_OWNED_SNAPSHOT_SCHEMA = "context_fit_neural_query_owned_snapshot_v2"
 NEURAL_QUERY_NUISANCE_OUTPUT_BINDING_SCHEMA = "context_fit_neural_query_nuisance_output_binding_v1"
 
 _BANKS = ("treatment", "outcome", "effect")
@@ -122,31 +129,24 @@ def _sha256_file(path: Path) -> str:
 def _array_content_sha256(value: np.ndarray) -> str:
     """Hash one closed numerical array including its dtype and exact shape."""
 
-    array = np.ascontiguousarray(np.asarray(value))
-    if array.dtype.hasobject:
-        raise ValueError("neural-query snapshot arrays cannot contain Python objects")
-    header = _canonical_json(
-        {
-            "dtype": array.dtype.str,
-            "shape": [int(dimension) for dimension in array.shape],
-        }
-    ).encode("utf-8")
-    digest = hashlib.sha256()
-    digest.update(header)
-    digest.update(b"\0")
-    digest.update(memoryview(array).cast("B"))
-    return digest.hexdigest()
+    return numerical_array_sha256(value)
 
 
 def _stable_json_file(path: Path) -> tuple[dict[str, Any], str]:
-    if path.is_symlink() or not path.is_file():
+    if path.is_symlink():
         raise ValueError("neural-query snapshot metadata must be one regular file")
-    before = path.stat()
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise ValueError(
+            "neural-query snapshot metadata must be one non-hard-linked regular file"
+        )
     payload = path.read_bytes()
-    after = path.stat()
+    after = path.lstat()
     before_identity = (
         int(before.st_dev),
         int(before.st_ino),
+        int(before.st_mode),
+        int(before.st_nlink),
         int(before.st_size),
         int(before.st_mtime_ns),
         int(before.st_ctime_ns),
@@ -154,6 +154,8 @@ def _stable_json_file(path: Path) -> tuple[dict[str, Any], str]:
     after_identity = (
         int(after.st_dev),
         int(after.st_ino),
+        int(after.st_mode),
+        int(after.st_nlink),
         int(after.st_size),
         int(after.st_mtime_ns),
         int(after.st_ctime_ns),
@@ -180,26 +182,6 @@ def _atomic_write_new_bytes(path: Path, payload: bytes) -> None:
     ) as handle:
         temporary = Path(handle.name)
         handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
-    try:
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _atomic_write_new_npz(path: Path, arrays: Mapping[str, np.ndarray]) -> None:
-    if path.exists() or path.is_symlink():
-        raise FileExistsError(f"refusing to replace neural-query snapshot file: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".npz",
-        delete=False,
-    ) as handle:
-        temporary = Path(handle.name)
-        np.savez_compressed(handle, **arrays)
         handle.flush()
         os.fsync(handle.fileno())
     try:
@@ -335,14 +317,43 @@ def _dependency_code_sha256s() -> dict[str, str]:
     }
 
 
-def _safe_query_ngram_rows(values: Any) -> list[dict[str, Any]]:
+def _safe_query_ngram_rows(
+    values: Any,
+    *,
+    max_tokens: int,
+    max_chars: int,
+) -> list[dict[str, Any]]:
+    if int(max_tokens) < 1 or int(max_chars) < 1:
+        raise ValueError("neural-query safe-term bounds must be positive")
     if not isinstance(values, (list, tuple)):
         return []
     output: list[dict[str, Any]] = []
     for raw in values:
         if not isinstance(raw, Mapping):
             continue
-        term = _safe_concept_phrase(raw.get("term") or raw.get("feature") or raw.get("ngram"))
+        raw_term = raw.get("term") or raw.get("feature") or raw.get("ngram")
+        # First apply identifier/privacy filtering without a length ceiling.
+        # Configured transport bounds are then hard failures rather than
+        # silently dropping an otherwise safe semantic witness.
+        probe_bound = max(32 * len(str(raw_term or "")), 1)
+        unbounded = _safe_concept_phrase(
+            raw_term,
+            max_tokens=probe_bound,
+            max_chars=probe_bound,
+        )
+        if unbounded and (
+            len(unbounded) > int(max_chars)
+            or len(unbounded.split()) > int(max_tokens)
+        ):
+            raise ValueError(
+                "neural-query semantic witness exceeds configured safe-term "
+                "transport bounds; refusing silent omission"
+            )
+        term = _safe_concept_phrase(
+            raw_term,
+            max_tokens=int(max_tokens),
+            max_chars=int(max_chars),
+        )
         if not term:
             continue
         row: dict[str, Any] = {"term": term}
@@ -493,24 +504,26 @@ def validate_owned_discovery_snapshot(
     expected_binding: Mapping[str, Any] | None = None,
     expected_service_identity_sha256: str | None = None,
 ) -> Mapping[str, Any]:
-    """Read and validate the non-executable NPZ/JSON snapshot only.
+    """Read and validate the non-executable NPY/JSON snapshot only.
 
     This validator never reads the service's joblib audit checkpoint and calls
-    ``numpy.load`` with object deserialization disabled.
+    ``numpy.load(..., mmap_mode="r", allow_pickle=False)`` for every array.
     """
 
     root = Path(snapshot_dir)
     if root.is_symlink() or not root.is_dir():
         raise ValueError("neural-query owned snapshot must be one real directory")
     candidates = sorted(root.iterdir(), key=lambda path: path.name)
-    if any(path.is_symlink() for path in candidates) or {path.name for path in candidates} != {
-        "arrays.npz",
-        "metadata.json",
-    }:
+    if (
+        any(path.is_symlink() for path in candidates)
+        or {path.name for path in candidates} != {"arrays", "metadata.json"}
+        or not (root / "arrays").is_dir()
+    ):
         raise ValueError(
-            "neural-query owned snapshot must contain only NPZ arrays and JSON metadata"
+            "neural-query owned snapshot must contain only indexed NPY arrays "
+            "and JSON metadata"
         )
-    arrays_path = root / "arrays.npz"
+    arrays_path = root / "arrays"
     metadata_path = root / "metadata.json"
     metadata, _metadata_sha256 = _stable_json_file(metadata_path)
     expected_fields = {
@@ -518,8 +531,10 @@ def validate_owned_discovery_snapshot(
         "cache_key",
         "binding",
         "service_identity_sha256",
-        "arrays_file",
-        "arrays_sha256",
+        "arrays_directory",
+        "arrays_index_sha256",
+        "arrays_content_sha256",
+        "array_order",
         "array_inventory",
         "query_count_by_bank",
         "fit_row_count",
@@ -536,7 +551,7 @@ def validate_owned_discovery_snapshot(
     if (
         metadata.get("schema_version") != NEURAL_QUERY_OWNED_SNAPSHOT_SCHEMA
         or metadata.get("content_sha256") != _sha256_json(body)
-        or metadata.get("arrays_file") != "arrays.npz"
+        or metadata.get("arrays_directory") != "arrays"
         or metadata.get("snapshot_source") != "trusted_current_service_memory"
         or metadata.get("executable_serialization_present") is not False
         or metadata.get("joblib_checkpoint_loaded") is not False
@@ -581,12 +596,6 @@ def validate_owned_discovery_snapshot(
     if binding.get("service_identity_sha256") != service_sha256:
         raise ValueError("neural-query snapshot service binding is inconsistent")
 
-    arrays_sha256 = _sha256_file(arrays_path)
-    if arrays_sha256 != _require_sha256(
-        metadata.get("arrays_sha256"),
-        name="snapshot arrays_sha256",
-    ):
-        raise RuntimeError("neural-query owned snapshot NPZ changed after emission")
     inventory = metadata.get("array_inventory")
     counts = metadata.get("query_count_by_bank")
     discovery_metadata = metadata.get("discovery_metadata")
@@ -602,24 +611,35 @@ def validate_owned_discovery_snapshot(
     }
     if set(inventory) != expected_array_keys:
         raise ValueError("neural-query owned snapshot array inventory is incomplete")
-    observed_inventory: dict[str, Any] = {}
-    before_npz_sha256 = arrays_sha256
-    with np.load(arrays_path, allow_pickle=False) as archive:
-        if set(archive.files) != expected_array_keys:
-            raise ValueError("neural-query owned snapshot NPZ has unexpected arrays")
-        for key in sorted(expected_array_keys):
-            array = np.asarray(archive[key])
-            if array.dtype.hasobject or array.ndim != 2 or not np.isfinite(array).all():
-                raise ValueError("neural-query owned snapshot contains an invalid numerical array")
-            observed_inventory[key] = {
-                "dtype": array.dtype.str,
-                "shape": [int(dimension) for dimension in array.shape],
-                "content_sha256": _array_content_sha256(array),
-            }
-    if _sha256_file(arrays_path) != before_npz_sha256:
-        raise RuntimeError("neural-query owned snapshot NPZ changed while validating")
-    if observed_inventory != dict(inventory):
-        raise RuntimeError("neural-query owned snapshot array inventory does not match its NPZ")
+    expected_order = tuple(
+        f"{bank}_{suffix}"
+        for bank in _BANKS
+        for suffix in ("queries", "train_activations")
+    )
+    if metadata.get("array_order") != list(expected_order):
+        raise ValueError("neural-query owned snapshot array order is invalid")
+    descriptor, arrays = validate_npy_array_set(
+        arrays_path,
+        expected_order=expected_order,
+        expected_inventory=inventory,
+    )
+    if (
+        metadata.get("arrays_index_sha256") != descriptor["index_sha256"]
+        or metadata.get("arrays_content_sha256") != descriptor["content_sha256"]
+    ):
+        raise RuntimeError(
+            "neural-query owned snapshot array index differs from its metadata"
+        )
+    observed_inventory = descriptor["array_inventory"]
+    for key in expected_order:
+        array = arrays[key]
+        if (
+            array.dtype != np.dtype(np.float32)
+            or array.ndim != 2
+            or not array.flags.c_contiguous
+            or not np.isfinite(array).all()
+        ):
+            raise ValueError("neural-query owned snapshot contains an invalid numerical array")
     fit_row_count = int(metadata.get("fit_row_count", 0))
     if fit_row_count != len(binding_rows):
         raise ValueError("neural-query owned snapshot activations are bound to another row count")
@@ -672,6 +692,7 @@ def _fit_context_query_discovery(
     outcome: np.ndarray,
     outcome_binary: bool,
     nuisance_views: Sequence[Any],
+    nuisance_stack_config: TfidfNuisanceStackScientificConfig,
     query_config: NeuralQueryAgenticForestConfig,
     nuisance_folds: int,
     devices: tuple[str, ...],
@@ -688,6 +709,7 @@ def _fit_context_query_discovery(
         views=list(nuisance_views),
         folds=int(nuisance_folds),
         random_state=int(seed + 10_000),
+        nuisance_stack_config=nuisance_stack_config,
     )
     fit_e = np.asarray(nuisance["treatment"]["stacked_oof"], dtype=float)
     fit_m = np.asarray(nuisance["outcome"]["stacked_oof"], dtype=float)
@@ -702,6 +724,7 @@ def _fit_context_query_discovery(
         fit_e=fit_e,
         fit_m=fit_m,
         nuisance_views=list(nuisance_views),
+        nuisance_stack_config=nuisance_stack_config,
         config=query_config,
         nuisance_folds=int(nuisance_folds),
         devices=devices,
@@ -722,11 +745,11 @@ class ContextFitNeuralQueryService:
         stage1_config_path: Path | str | None = None,
         embedding_cache: SpentOnlyFrozenChunkEmbeddingCache | None = None,
         stage1_config_snapshot: HistoricalStage1ConfigSnapshot | None = None,
-        query_config: NeuralQueryAgenticForestConfig = NeuralQueryAgenticForestConfig(),
-        nuisance_folds: int = 3,
-        devices: Sequence[str] = ("cuda:0",),
-        seed: int = 42,
-        outcome_type: str = "binary",
+        query_config: NeuralQueryAgenticForestConfig,
+        nuisance_folds: int,
+        devices: Sequence[str],
+        seed: int,
+        outcome_type: str,
     ) -> None:
         self.cache_dir = _validated_fresh_executable_cache_root(cache_dir)
         # A checkpoint is executable Python serialization. Persisted copies are
@@ -770,6 +793,13 @@ class ContextFitNeuralQueryService:
         )
         if not self._nuisance_views:
             raise ValueError("Stage-1 config contains no nuisance views")
+        self._nuisance_stack_config = copy.deepcopy(
+            applied.architecture.multi_model_forest.tfidf_topic.nuisance_stack_scientific
+        )
+        if type(self._nuisance_stack_config) is not TfidfNuisanceStackScientificConfig:
+            raise TypeError(
+                "Stage-1 config lacks an explicit typed TF-IDF nuisance stack"
+            )
         self.query_config = copy.deepcopy(query_config)
         self.query_config.validate()
         self.nuisance_folds = _positive_int(nuisance_folds, name="nuisance_folds")
@@ -812,9 +842,14 @@ class ContextFitNeuralQueryService:
             "nuisance_views_sha256": _sha256_json(
                 [_json_state(view) for view in self._nuisance_views]
             ),
+            "nuisance_stack_scientific": asdict(
+                self._nuisance_stack_config
+            ),
             "query_config": asdict(self.query_config),
             "nuisance_folds": self.nuisance_folds,
-            "devices": list(self.devices),
+            "device_assignment_policy": (
+                "round_robin_over_compatible_execution_devices_v1"
+            ),
             "seed": self.seed,
             "outcome_type": self.outcome_type,
             "gate_labels_accepted": False,
@@ -937,6 +972,9 @@ class ContextFitNeuralQueryService:
             outcome=outcome,
             outcome_binary=self.outcome_type == "binary",
             nuisance_views=self._nuisance_views,
+            nuisance_stack_config=copy.deepcopy(
+                self._nuisance_stack_config
+            ),
             query_config=copy.deepcopy(self.query_config),
             nuisance_folds=self.nuisance_folds,
             devices=self.devices,
@@ -1055,7 +1093,7 @@ class ContextFitNeuralQueryService:
         cache_key: str,
         output_dir: Path | str,
     ) -> Mapping[str, Any]:
-        """Persist one trusted fit as non-executable NPZ arrays plus closed JSON.
+        """Persist one trusted fit as mmap-safe NPY arrays plus closed JSON.
 
         The executable audit checkpoint is neither read nor copied.  Only state
         retained in this service instance after the genuine fit is eligible.
@@ -1081,16 +1119,27 @@ class ContextFitNeuralQueryService:
         if root.parent.is_symlink():
             raise ValueError("neural-query owned snapshot parent cannot be a symlink")
         root.mkdir(exist_ok=False)
-        arrays_path = root / "arrays.npz"
-        _atomic_write_new_npz(arrays_path, arrays)
+        array_order = tuple(
+            f"{bank}_{suffix}"
+            for bank in _BANKS
+            for suffix in ("queries", "train_activations")
+        )
+        arrays_path = root / "arrays"
+        array_layout = write_npy_array_set(
+            arrays_path,
+            arrays,
+            ordered_names=array_order,
+        )
         service_identity_sha256 = _sha256_json(self._identity)
         body = {
             "schema_version": NEURAL_QUERY_OWNED_SNAPSHOT_SCHEMA,
             "cache_key": key,
             "binding": copy.deepcopy(dict(binding)),
             "service_identity_sha256": service_identity_sha256,
-            "arrays_file": arrays_path.name,
-            "arrays_sha256": _sha256_file(arrays_path),
+            "arrays_directory": arrays_path.name,
+            "arrays_index_sha256": array_layout["index_sha256"],
+            "arrays_content_sha256": array_layout["content_sha256"],
+            "array_order": list(array_order),
             "array_inventory": details["array_inventory"],
             "query_count_by_bank": details["query_count_by_bank"],
             "fit_row_count": details["fit_row_count"],
@@ -1171,7 +1220,13 @@ class ContextFitNeuralQueryService:
                         ),
                         "top_chunks": [],
                         "top_contrastive_ngrams": _safe_query_ngram_rows(
-                            row.get("top_contrastive_ngrams")
+                            row.get("top_contrastive_ngrams"),
+                            max_tokens=int(
+                                self.query_config.evidence_safe_term_max_tokens
+                            ),
+                            max_chars=int(
+                                self.query_config.evidence_safe_term_max_chars
+                            ),
                         ),
                     }
                 )
@@ -1270,6 +1325,9 @@ class NeuralQueryContextBackend:
                 np.asarray(result["queries"], dtype=np.float32),
                 temperature=float(self.service.query_config.temperature),
                 device=self.service.devices[bank_index % len(self.service.devices)],
+                patient_batch_size=int(
+                    self.service.query_config.retrieval_patient_batch_size
+                ),
             )
             expected = self.service.query_config.query_count(bank)
             if (

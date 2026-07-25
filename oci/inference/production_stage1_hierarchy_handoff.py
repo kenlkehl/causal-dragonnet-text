@@ -370,19 +370,23 @@ class CanonicalHierarchySpentSchedule:
         *,
         registry: CanonicalStage1SplitRegistry,
         review_rounds: int,
+        initial_training_partitions: int,
     ) -> "CanonicalHierarchySpentSchedule":
         if not isinstance(registry, CanonicalStage1SplitRegistry):
             raise TypeError("registry must be CanonicalStage1SplitRegistry")
         rounds = int(review_rounds)
+        initial_partitions = int(initial_training_partitions)
         if rounds < 1:
             raise ValueError("hierarchical adaptive review requires at least one round")
-        # Exactly three initial partitions mirrors the production review
-        # contract and prevents a caller from silently changing the amount of
-        # evidence available to initial discovery.
-        if registry.inner_fold_count != rounds + 3:
+        if initial_partitions < 1:
+            raise ValueError("initial_training_partitions must be at least one")
+        # The initial evidence budget is a scientific input.  Bind it into the
+        # authenticated schedule instead of inferring a benchmark-specific
+        # value from the number of review rounds.
+        if registry.inner_fold_count != rounds + initial_partitions:
             raise ValueError(
-                "the canonical Stage 1 inner-fold count must equal review_rounds + 3 "
-                "so the hierarchy has exactly three initial-spent partitions"
+                "the canonical Stage 1 inner-fold count must equal review_rounds + "
+                "initial_training_partitions"
             )
 
         partitions: dict[int, Mapping[int, tuple[int, ...]]] = {}
@@ -404,17 +408,28 @@ class CanonicalHierarchySpentSchedule:
                 raise ValueError("canonical inner held-outs do not partition outer train")
             partitions[int(outer.outer_fold)] = MappingProxyType(dict(by_partition))
             for epoch in range(rounds):
-                spent_partition_ids = expected_partition_ids[: 3 + epoch]
-                sealed_partition_ids = expected_partition_ids[3 + epoch :]
-                spent_rows = tuple(
+                gate = initial_partitions + epoch
+                spent_partition_ids = expected_partition_ids[:gate]
+                sealed_partition_ids = expected_partition_ids[gate:]
+                spent_members = {
                     row_id
                     for partition_id in spent_partition_ids
                     for row_id in by_partition[partition_id]
-                )
-                sealed_rows = tuple(
+                }
+                sealed_members = {
                     row_id
                     for partition_id in sealed_partition_ids
                     for row_id in by_partition[partition_id]
+                }
+                spent_rows = tuple(
+                    row_id
+                    for row_id in outer.train_row_ids
+                    if row_id in spent_members
+                )
+                sealed_rows = tuple(
+                    row_id
+                    for row_id in outer.train_row_ids
+                    if row_id in sealed_members
                 )
                 provenance = FoldEvidenceProvenance(
                     outer_fold=int(outer.outer_fold),
@@ -440,7 +455,7 @@ class CanonicalHierarchySpentSchedule:
             "schema_version": STAGE1_HIERARCHY_SPENT_SCHEDULE_SCHEMA,
             "split_registry_sha256": registry.content_sha256,
             "review_rounds": rounds,
-            "initial_spent_partition_count": 3,
+            "initial_spent_partition_count": initial_partitions,
             "partitions_by_outer_fold": {
                 str(outer_fold): {
                     str(partition_id): list(row_ids)
@@ -453,7 +468,7 @@ class CanonicalHierarchySpentSchedule:
         return cls(
             split_registry_sha256=registry.content_sha256,
             review_rounds=rounds,
-            initial_spent_partition_count=3,
+            initial_spent_partition_count=initial_partitions,
             partitions_by_outer_fold=MappingProxyType(partitions),
             scopes=tuple(scopes),
             schedule_sha256=_sha(body),
@@ -1273,9 +1288,17 @@ class AuthenticatedProductionStage1HierarchyProvider:
             "schedule": schedule.as_dict(),
             "fold_domains": {
                 "hierarchy_schedule": {
-                    "partition_count": schedule.review_rounds + 3,
+                    "partition_count": (
+                        schedule.review_rounds
+                        + schedule.initial_spent_partition_count
+                    ),
                     "review_rounds": schedule.review_rounds,
-                    "purpose": "three_initial_spent_partitions_then_one_sealed_gate_per_round",
+                    "initial_training_partitions": (
+                        schedule.initial_spent_partition_count
+                    ),
+                    "purpose": (
+                        "configured_initial_spent_partitions_then_one_sealed_gate_per_round"
+                    ),
                 },
                 "interaction_crossfit": {
                     "fold_count": self._interaction_inner_folds,
@@ -1475,6 +1498,7 @@ def load_production_stage1_hierarchy_handoff(
     manifest_path: Path | str,
     *,
     review_rounds: int,
+    initial_training_partitions: int,
     interaction_inner_folds: int = 3,
     tfidf_nested_calibration_folds: int = 3,
 ) -> AuthenticatedProductionStage1HierarchyHandoff:
@@ -1482,6 +1506,9 @@ def load_production_stage1_hierarchy_handoff(
 
     interaction_folds = int(interaction_inner_folds)
     tfidf_folds = int(tfidf_nested_calibration_folds)
+    initial_partitions = int(initial_training_partitions)
+    if initial_partitions < 1:
+        raise ValueError("initial_training_partitions must be at least one")
     if interaction_folds < 2:
         raise ValueError("interaction_inner_folds must be at least two")
     if tfidf_folds < 2:
@@ -1518,8 +1545,9 @@ def load_production_stage1_hierarchy_handoff(
         or int(contract.get("review_rounds", 0)) != int(review_rounds)
         or contract.get("partition_authority")
         != "canonical_stage1_inner_heldout_partitions_in_registry_order"
-        or int(contract.get("initial_spent_partition_count", 0)) != 3
-        or int(contract.get("canonical_hierarchy_partition_count", 0)) != int(review_rounds) + 3
+        or int(contract.get("initial_spent_partition_count", 0)) != initial_partitions
+        or int(contract.get("canonical_hierarchy_partition_count", 0))
+        != int(review_rounds) + initial_partitions
         or int(contract.get("interaction_inner_folds", 0)) != interaction_folds
         or int(contract.get("tfidf_nested_calibration_folds", 0)) != tfidf_folds
         or contract.get("fold_domains_are_distinct") is not True
@@ -1537,6 +1565,7 @@ def load_production_stage1_hierarchy_handoff(
     schedule = CanonicalHierarchySpentSchedule.build(
         registry=registry,
         review_rounds=int(review_rounds),
+        initial_training_partitions=initial_partitions,
     )
     if contract.get("schedule_sha256") != schedule.schedule_sha256:
         raise ValueError("Stage 1 request is bound to another canonical hierarchy schedule")
@@ -1582,8 +1611,9 @@ def load_production_stage1_hierarchy_handoff(
         or index_body.get("contract_split_registry_sha256") != registry.content_sha256
         or index_body.get("schedule_sha256") != schedule.schedule_sha256
         or int(index_body.get("review_rounds", 0)) != int(review_rounds)
-        or int(index_body.get("initial_spent_partition_count", 0)) != 3
-        or int(index_body.get("canonical_hierarchy_partition_count", 0)) != int(review_rounds) + 3
+        or int(index_body.get("initial_spent_partition_count", 0)) != initial_partitions
+        or int(index_body.get("canonical_hierarchy_partition_count", 0))
+        != int(review_rounds) + initial_partitions
         or int(index_body.get("interaction_inner_folds", 0)) != interaction_folds
         or int(index_body.get("tfidf_nested_calibration_folds", 0)) != tfidf_folds
         or index_body.get("fold_domains_are_distinct") is not True

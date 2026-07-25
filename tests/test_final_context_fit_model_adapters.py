@@ -399,30 +399,43 @@ def test_model_adapter_apis_have_no_heldout_label_or_posthoc_target_channel():
         assert "freeze_sentence_encoder" not in source
 
 
-def test_repository_forest_backend_preserves_prior_working_defaults():
+def test_repository_forest_backend_exposes_all_scientific_defaults():
     backend = FixedCausalForestHeadBackend()
     identity = dict(backend.identity())
     runtime = identity.pop("repository_runtime")
     assert identity == {
-        "backend": "repository_causal_forest_prior_working_path_v2",
+        "backend": "repository_strict_causal_forest_path_v3",
+        "configuration_mode": "legacy_compatibility_shim_v1",
         "n_estimators": 200,
         "max_depth": None,
         "min_samples_leaf": 10,
         "max_features": "sqrt",
         "honest": True,
         "inference": True,
+        "subforest_size": 4,
         "tune_model": True,
+        "nuisance_n_estimators": 100,
+        "nuisance_max_depth": None,
+        "nuisance_min_samples_leaf": 10,
+        "nuisance_treatment_max_features": "sqrt",
+        "nuisance_outcome_max_features": 1.0,
         "random_state": 42,
         "exact_nuisance_used_as_fixed_internal_predictions": False,
         "tuning_labels": "outer_train_only",
         "outer_heldout_labels_accepted": False,
     }
     assert runtime["causal_forest_head_module_sha256"]
+    assert runtime["strict_runtime_module_sha256"]
+    assert runtime["causal_forest_head_create_strict_model_code_sha256"]
     assert runtime["causal_forest_head_fit_code_sha256"]
     assert runtime["causal_forest_head_fit_audit_code_sha256"]
     assert runtime["econml_distribution_version"] != "not_installed"
     assert runtime["sklearn_distribution_version"] != "not_installed"
     assert isinstance(runtime["econml_import_available"], bool)
+    assert "n_jobs" not in backend.identity()
+    assert FixedCausalForestHeadBackend(n_jobs=1).identity() == (
+        FixedCausalForestHeadBackend(n_jobs=7).identity()
+    )
     with pytest.raises(ValueError, match="honest tree splitting"):
         FixedCausalForestHeadBackend(honest=False)
 

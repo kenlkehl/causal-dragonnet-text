@@ -769,8 +769,6 @@ def _prove_runtime_and_select_columns(
         or calibration_runtime_module._logit is not _AUTHENTICATED_CALIBRATION_LOGIT
         or calibration_runtime_module._sigmoid is not _AUTHENTICATED_CALIBRATION_SIGMOID
         or calibration_runtime_module.IsotonicRegression is not _AUTHENTICATED_CALIBRATION_ISOTONIC
-        or stage1_model_module.AgenticAttentionVariableForestRunner
-        is not AgenticAttentionVariableForestRunner
         or htr_provider_module.AgenticAttentionVariableForestRunner
         is not AgenticAttentionVariableForestRunner
         or attention_runtime_module.create_feature_extractor is not _AUTHENTICATED_EXTRACTOR_FACTORY

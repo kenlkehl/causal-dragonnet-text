@@ -73,6 +73,51 @@ APPROVED_HIERARCHICAL_DISCOVERY_PRECOMMIT_VERSION = "approved_hierarchical_disco
 AUTHENTICATED_RUNNER_EXECUTION_TRACE_VERSION = (
     "authenticated_json_discovery_runner_and_cache_execution_trace_v8"
 )
+REFERENCE_ONLY_DIRECT_NUMERICAL_CONTRACT_SCHEMA = (
+    "authenticated_reference_only_direct_numerical_contract_v1"
+)
+_REFERENCE_ONLY_DIRECT_NUMERICAL_CONTRACT_KEYS = frozenset(
+    {
+        "schema_version",
+        "outer_fold",
+        "context_epoch",
+        "plan_scientific_content_sha256",
+        "source_execution_content_sha256",
+        "reference_manifest_content_sha256",
+        "runtime_binding_content_sha256",
+        "provider_identity_sha256",
+        "projection_content_sha256",
+        "spent_row_ids",
+        "spent_row_ids_sha256",
+        "gate_row_ids",
+        "gate_row_ids_sha256",
+        "semantic_catalog",
+        "family_coverage",
+        "already_fit_stage1_projection",
+        "conditional_fit_or_refit_performed",
+        "row_values_included",
+        "coordinate_to_semantic_atom_linkage",
+        "concept_grounding_allowed",
+    }
+)
+_REFERENCE_ONLY_SEMANTIC_CATALOG_KEYS = frozenset(
+    {
+        "catalog_sha256",
+        "scope",
+        "inner_fold",
+        "split_fingerprint",
+        "atom_count",
+    }
+)
+_REFERENCE_ONLY_FAMILY_COVERAGE_KEYS = frozenset(
+    {
+        "source_family",
+        "coordinate_ids",
+        "coordinate_ids_sha256",
+        "semantic_atom_ids",
+        "semantic_atom_ids_sha256",
+    }
+)
 APPROVED_HIERARCHICAL_DISCOVERY_RESULT_VERSION = "approved_hierarchical_discovery_result_v7"
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -276,6 +321,402 @@ def _reauthenticate_full_manifest(manifest: DirectUpstreamNumericalManifest) -> 
     manifest.__post_init__()
     if manifest.content_sha256 != declared_sha256:
         raise ValueError("direct numerical manifest mutated after authentication")
+
+
+def _validate_reference_only_direct_numerical_contract_body(
+    value: Any,
+) -> Mapping[str, Any]:
+    body = _closed_mapping(
+        value,
+        keys=_REFERENCE_ONLY_DIRECT_NUMERICAL_CONTRACT_KEYS,
+        label="reference-only direct numerical contract",
+    )
+    if body["schema_version"] != REFERENCE_ONLY_DIRECT_NUMERICAL_CONTRACT_SCHEMA:
+        raise ValueError("reference-only direct numerical contract schema changed")
+    outer_fold = body["outer_fold"]
+    context_epoch = body["context_epoch"]
+    if (
+        isinstance(outer_fold, bool)
+        or not isinstance(outer_fold, int)
+        or outer_fold < 1
+        or isinstance(context_epoch, bool)
+        or not isinstance(context_epoch, int)
+        or context_epoch < 0
+    ):
+        raise ValueError("reference-only direct numerical scope is invalid")
+    for key in (
+        "plan_scientific_content_sha256",
+        "source_execution_content_sha256",
+        "reference_manifest_content_sha256",
+        "runtime_binding_content_sha256",
+        "provider_identity_sha256",
+        "projection_content_sha256",
+    ):
+        _require_sha256(body[key], label=f"reference-only {key}")
+
+    row_scopes: dict[str, tuple[int, ...]] = {}
+    for scope in ("spent", "gate"):
+        values = body[f"{scope}_row_ids"]
+        if (
+            not isinstance(values, list)
+            or not values
+            or any(
+                isinstance(row_id, bool)
+                or not isinstance(row_id, int)
+                or row_id < 0
+                for row_id in values
+            )
+            or len(values) != len(set(values))
+            or body[f"{scope}_row_ids_sha256"] != content_sha256(values)
+        ):
+            raise ValueError(
+                f"reference-only direct numerical {scope} rows are invalid"
+            )
+        row_scopes[scope] = tuple(values)
+    if set(row_scopes["spent"]) & set(row_scopes["gate"]):
+        raise ValueError("reference-only spent and gate scopes overlap")
+
+    semantic = _closed_mapping(
+        body["semantic_catalog"],
+        keys=_REFERENCE_ONLY_SEMANTIC_CATALOG_KEYS,
+        label="reference-only semantic catalog",
+    )
+    _require_sha256(
+        semantic["catalog_sha256"],
+        label="reference-only semantic catalog",
+    )
+    _require_sha256(
+        semantic["split_fingerprint"],
+        label="reference-only semantic split",
+    )
+    if not isinstance(semantic["scope"], str) or not semantic["scope"].strip():
+        raise ValueError("reference-only semantic catalog scope is invalid")
+    inner_fold = semantic["inner_fold"]
+    if (
+        inner_fold is not None
+        and (
+            isinstance(inner_fold, bool)
+            or not isinstance(inner_fold, int)
+            or inner_fold < 1
+        )
+    ):
+        raise ValueError("reference-only semantic inner fold is invalid")
+    atom_count = semantic["atom_count"]
+    if (
+        isinstance(atom_count, bool)
+        or not isinstance(atom_count, int)
+        or atom_count < 1
+    ):
+        raise ValueError("reference-only semantic atom count is invalid")
+
+    rows = body["family_coverage"]
+    if (
+        not isinstance(rows, list)
+        or len(rows) != len(ACTIVE_STAGE1_CONCEPT_FAMILIES)
+    ):
+        raise ValueError(
+            "reference-only direct numerical family coverage is incomplete"
+        )
+    coordinate_ids_seen: set[str] = set()
+    semantic_ids_seen: set[str] = set()
+    for family, raw_row in zip(ACTIVE_STAGE1_CONCEPT_FAMILIES, rows):
+        row = _closed_mapping(
+            raw_row,
+            keys=_REFERENCE_ONLY_FAMILY_COVERAGE_KEYS,
+            label=f"reference-only family coverage {family}",
+        )
+        if row["source_family"] != family:
+            raise ValueError(
+                "reference-only direct numerical family order changed"
+            )
+        coordinate_ids = row["coordinate_ids"]
+        semantic_ids = row["semantic_atom_ids"]
+        if (
+            not isinstance(coordinate_ids, list)
+            or not coordinate_ids
+            or any(
+                not isinstance(coordinate_id, str)
+                or not coordinate_id.strip()
+                for coordinate_id in coordinate_ids
+            )
+            or len(coordinate_ids) != len(set(coordinate_ids))
+            or coordinate_ids_seen.intersection(coordinate_ids)
+            or row["coordinate_ids_sha256"]
+            != content_sha256(coordinate_ids)
+        ):
+            raise ValueError(
+                f"reference-only numerical coordinates are invalid for {family}"
+            )
+        if (
+            not isinstance(semantic_ids, list)
+            or not semantic_ids
+            or any(
+                not isinstance(evidence_id, str)
+                or not evidence_id.strip()
+                for evidence_id in semantic_ids
+            )
+            or len(semantic_ids) != len(set(semantic_ids))
+            or semantic_ids_seen.intersection(semantic_ids)
+            or row["semantic_atom_ids_sha256"]
+            != content_sha256(semantic_ids)
+        ):
+            raise ValueError(
+                f"reference-only semantic atoms are invalid for {family}"
+            )
+        coordinate_ids_seen.update(coordinate_ids)
+        semantic_ids_seen.update(semantic_ids)
+    if len(semantic_ids_seen) != atom_count:
+        raise ValueError("reference-only semantic atom count changed")
+    if (
+        body["already_fit_stage1_projection"] is not True
+        or body["conditional_fit_or_refit_performed"] is not False
+        or body["row_values_included"] is not False
+        or body["coordinate_to_semantic_atom_linkage"] is not False
+        or body["concept_grounding_allowed"] is not False
+    ):
+        raise ValueError(
+            "reference-only direct numerical safety declaration changed"
+        )
+    return body
+
+
+@dataclass(frozen=True)
+class AuthenticatedReferenceOnlyDirectNumericalContract:
+    """Non-grounding hierarchy binding to an already-fit reference projection.
+
+    Unlike :class:`FirstGateMaterializationIntent`, this contract never
+    represents a deferred conditional fit.  It binds the semantic catalog to
+    the exact cumulative projection already authenticated by the role-neutral
+    Stage 1 reference bank.
+    """
+
+    _body_json: str = field(repr=False)
+    content_sha256: str
+
+    def __post_init__(self) -> None:
+        body = _validate_reference_only_direct_numerical_contract_body(
+            self.body
+        )
+        if content_sha256(body) != _require_sha256(
+            self.content_sha256,
+            label="reference-only numerical contract",
+        ):
+            raise ValueError(
+                "reference-only direct numerical contract is unauthenticated"
+            )
+        object.__setattr__(self, "_body_json", canonical_json(body))
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        outer_fold: int,
+        context_epoch: int,
+        plan_scientific_content_sha256: str,
+        source_execution_content_sha256: str,
+        reference_manifest_content_sha256: str,
+        runtime_binding_content_sha256: str,
+        provider_identity_sha256: str,
+        spent_row_ids: Sequence[int],
+        gate_row_ids: Sequence[int],
+        catalog: RoleNeutralEvidenceCatalog,
+        family_coordinate_ids: Mapping[str, Sequence[str]],
+        projection_content_sha256: str,
+    ) -> "AuthenticatedReferenceOnlyDirectNumericalContract":
+        validate_role_neutral_catalog(catalog)
+        spent = tuple(int(value) for value in spent_row_ids)
+        gate = tuple(int(value) for value in gate_row_ids)
+        if (
+            isinstance(outer_fold, bool)
+            or not isinstance(outer_fold, int)
+            or outer_fold < 1
+            or isinstance(context_epoch, bool)
+            or not isinstance(context_epoch, int)
+            or context_epoch < 0
+            or not spent
+            or not gate
+            or len(spent) != len(set(spent))
+            or len(gate) != len(set(gate))
+            or set(spent) & set(gate)
+            or catalog.outer_fold != outer_fold
+        ):
+            raise ValueError("reference-only direct numerical scope is invalid")
+        if set(family_coordinate_ids) != ACTIVE_STAGE1_CONCEPT_FAMILY_SET:
+            raise ValueError(
+                "reference-only direct numerical family coordinates are incomplete"
+            )
+        family_rows = []
+        for family in ACTIVE_STAGE1_CONCEPT_FAMILIES:
+            coordinates = tuple(
+                str(value) for value in family_coordinate_ids.get(family, ())
+            )
+            if not coordinates or len(coordinates) != len(set(coordinates)):
+                raise ValueError(
+                    f"reference-only direct numerical coordinates are invalid for {family}"
+                )
+            semantic_ids = tuple(
+                atom.evidence_id for atom in catalog.family_atoms(family)
+            )
+            if not semantic_ids:
+                raise ValueError(
+                    f"reference-only semantic catalog is empty for {family}"
+                )
+            family_rows.append(
+                {
+                    "source_family": family,
+                    "coordinate_ids": list(coordinates),
+                    "coordinate_ids_sha256": content_sha256(list(coordinates)),
+                    "semantic_atom_ids": list(semantic_ids),
+                    "semantic_atom_ids_sha256": content_sha256(
+                        list(semantic_ids)
+                    ),
+                }
+            )
+        body = {
+            "schema_version": REFERENCE_ONLY_DIRECT_NUMERICAL_CONTRACT_SCHEMA,
+            "outer_fold": outer_fold,
+            "context_epoch": context_epoch,
+            "plan_scientific_content_sha256": _require_sha256(
+                plan_scientific_content_sha256,
+                label="reference-only scope plan",
+            ),
+            "source_execution_content_sha256": _require_sha256(
+                source_execution_content_sha256,
+                label="reference-only source execution",
+            ),
+            "reference_manifest_content_sha256": _require_sha256(
+                reference_manifest_content_sha256,
+                label="reference-only numerical manifest",
+            ),
+            "runtime_binding_content_sha256": _require_sha256(
+                runtime_binding_content_sha256,
+                label="reference-only runtime binding",
+            ),
+            "provider_identity_sha256": _require_sha256(
+                provider_identity_sha256,
+                label="reference-only provider identity",
+            ),
+            "projection_content_sha256": _require_sha256(
+                projection_content_sha256,
+                label="reference-only cumulative projection",
+            ),
+            "spent_row_ids": list(spent),
+            "spent_row_ids_sha256": content_sha256(list(spent)),
+            "gate_row_ids": list(gate),
+            "gate_row_ids_sha256": content_sha256(list(gate)),
+            "semantic_catalog": {
+                "catalog_sha256": catalog.catalog_sha256,
+                "scope": catalog.scope,
+                "inner_fold": catalog.inner_fold,
+                "split_fingerprint": catalog.split_fingerprint,
+                "atom_count": len(catalog.atoms),
+            },
+            "family_coverage": family_rows,
+            "already_fit_stage1_projection": True,
+            "conditional_fit_or_refit_performed": False,
+            "row_values_included": False,
+            "coordinate_to_semantic_atom_linkage": False,
+            "concept_grounding_allowed": False,
+        }
+        return cls(
+            _body_json=canonical_json(body),
+            content_sha256=content_sha256(body),
+        )
+
+    @property
+    def body(self) -> dict[str, Any]:
+        value = json.loads(self._body_json)
+        if not isinstance(value, dict):
+            raise RuntimeError("reference-only numerical contract was corrupted")
+        return value
+
+    def as_dict(self) -> dict[str, Any]:
+        return {**self.body, "content_sha256": self.content_sha256}
+
+    def verify(
+        self,
+        *,
+        catalog: RoleNeutralEvidenceCatalog,
+    ) -> None:
+        validate_role_neutral_catalog(catalog)
+        body = _validate_reference_only_direct_numerical_contract_body(
+            self.body
+        )
+        if (
+            body.get("schema_version")
+            != REFERENCE_ONLY_DIRECT_NUMERICAL_CONTRACT_SCHEMA
+            or content_sha256(body) != self.content_sha256
+            or body.get("outer_fold") != catalog.outer_fold
+            or body.get("semantic_catalog")
+            != {
+                "catalog_sha256": catalog.catalog_sha256,
+                "scope": catalog.scope,
+                "inner_fold": catalog.inner_fold,
+                "split_fingerprint": catalog.split_fingerprint,
+                "atom_count": len(catalog.atoms),
+            }
+            or body.get("already_fit_stage1_projection") is not True
+            or body.get("conditional_fit_or_refit_performed") is not False
+            or body.get("row_values_included") is not False
+            or body.get("coordinate_to_semantic_atom_linkage") is not False
+            or body.get("concept_grounding_allowed") is not False
+        ):
+            raise ValueError(
+                "reference-only direct numerical contract is invalid"
+            )
+        rows = body.get("family_coverage")
+        if (
+            not isinstance(rows, list)
+            or [row.get("source_family") for row in rows if isinstance(row, Mapping)]
+            != list(ACTIVE_STAGE1_CONCEPT_FAMILIES)
+        ):
+            raise ValueError(
+                "reference-only direct numerical family coverage is incomplete"
+            )
+        for family, row in zip(ACTIVE_STAGE1_CONCEPT_FAMILIES, rows):
+            if not isinstance(row, Mapping):
+                raise TypeError("reference-only family coverage is malformed")
+            coordinates = row.get("coordinate_ids")
+            semantic_ids = [
+                atom.evidence_id for atom in catalog.family_atoms(family)
+            ]
+            if (
+                not isinstance(coordinates, list)
+                or not coordinates
+                or len(coordinates) != len(set(coordinates))
+                or row.get("coordinate_ids_sha256")
+                != content_sha256(coordinates)
+                or row.get("semantic_atom_ids") != semantic_ids
+                or row.get("semantic_atom_ids_sha256")
+                != content_sha256(semantic_ids)
+            ):
+                raise ValueError(
+                    f"reference-only numerical family binding changed for {family}"
+                )
+
+
+def direct_numerical_bindings_from_reference_contract(
+    contract: AuthenticatedReferenceOnlyDirectNumericalContract,
+    *,
+    catalog: RoleNeutralEvidenceCatalog,
+) -> tuple[DirectNumericalDossierBinding, ...]:
+    if type(contract) is not AuthenticatedReferenceOnlyDirectNumericalContract:
+        raise TypeError("reference-only numerical contract has the wrong type")
+    contract.verify(catalog=catalog)
+    coverage = contract.body["family_coverage"]
+    return tuple(
+        DirectNumericalDossierBinding(
+            source_family=family,
+            signal_count=len(row["coordinate_ids"]),
+            zero_reason="",
+            direct_numerical_contract_kind=(
+                DIRECT_NUMERICAL_CONTRACT_KIND_REALIZED_MANIFEST
+            ),
+            direct_numerical_contract_sha256=contract.content_sha256,
+            manifest_sha256=contract.content_sha256,
+        )
+        for family, row in zip(ACTIVE_STAGE1_CONCEPT_FAMILIES, coverage)
+    )
 
 
 def direct_numerical_bindings_from_manifest(
@@ -487,6 +928,52 @@ def _safe_intent_binding(
             for family, row in zip(ACTIVE_STAGE1_CONCEPT_FAMILIES, coverage)
         ],
         "materialization_state": "deferred_until_after_approval_and_proposal_freeze",
+        "row_values_included": False,
+        "matrix_metadata_included": False,
+        "coordinate_metadata_included": False,
+        "coordinate_to_semantic_atom_linkage": False,
+        "concept_grounding_allowed": False,
+    }
+
+
+def _safe_reference_contract_binding(
+    contract: AuthenticatedReferenceOnlyDirectNumericalContract,
+    *,
+    catalog: RoleNeutralEvidenceCatalog,
+) -> dict[str, Any]:
+    contract.verify(catalog=catalog)
+    body = contract.body
+    return {
+        "direct_numerical_contract_kind": (
+            DIRECT_NUMERICAL_CONTRACT_KIND_REALIZED_MANIFEST
+        ),
+        "direct_numerical_contract_sha256": contract.content_sha256,
+        "reference_manifest_content_sha256": body[
+            "reference_manifest_content_sha256"
+        ],
+        "projection_content_sha256": body["projection_content_sha256"],
+        "semantic_catalog_sha256": body["semantic_catalog"][
+            "catalog_sha256"
+        ],
+        "signal_count": sum(
+            len(row["coordinate_ids"])
+            for row in body["family_coverage"]
+        ),
+        "families": [
+            {
+                "source_family": row["source_family"],
+                "semantic_atom_ids": list(row["semantic_atom_ids"]),
+                "semantic_atom_ids_sha256": row[
+                    "semantic_atom_ids_sha256"
+                ],
+                "semantic_atom_count": len(row["semantic_atom_ids"]),
+                "signal_count": len(row["coordinate_ids"]),
+                "numerical_zero_reason": "",
+            }
+            for row in body["family_coverage"]
+        ],
+        "materialization_state": "already_fit_stage1_reference_projection",
+        "conditional_fit_or_refit_performed": False,
         "row_values_included": False,
         "matrix_metadata_included": False,
         "coordinate_metadata_included": False,
@@ -1339,6 +1826,9 @@ class ApprovedHierarchicalDiscoveryAgent:
         runner: MetadataJsonDiscoveryJobRunner,
         direct_numerical_manifest: DirectUpstreamNumericalManifest | None = None,
         first_gate_materialization_intent: FirstGateMaterializationIntent | None = None,
+        reference_only_direct_numerical_contract: (
+            AuthenticatedReferenceOnlyDirectNumericalContract | None
+        ) = None,
         direct_numerical_bindings: Sequence[DirectNumericalDossierBinding] | None = None,
         config: HierarchicalDiscoveryConfig | None = None,
         compiler: HierarchicalDiscoveryCompiler | None = None,
@@ -1351,16 +1841,27 @@ class ApprovedHierarchicalDiscoveryAgent:
         self.family_explanations = dict(family_explanations)
         self.direct_numerical_manifest = direct_numerical_manifest
         self.first_gate_materialization_intent = first_gate_materialization_intent
-        if (direct_numerical_manifest is None) == (first_gate_materialization_intent is None):
+        self.reference_only_direct_numerical_contract = (
+            reference_only_direct_numerical_contract
+        )
+        supplied_contracts = sum(
+            value is not None
+            for value in (
+                direct_numerical_manifest,
+                first_gate_materialization_intent,
+                reference_only_direct_numerical_contract,
+            )
+        )
+        if supplied_contracts != 1:
             raise ValueError(
-                "provide exactly one of direct_numerical_manifest or "
-                "first_gate_materialization_intent"
+                "provide exactly one direct numerical manifest, first-gate "
+                "materialization intent, or reference-only direct contract"
             )
         if direct_numerical_manifest is not None:
             expected_bindings = direct_numerical_bindings_from_manifest(direct_numerical_manifest)
             self.direct_numerical_contract_kind = DIRECT_NUMERICAL_CONTRACT_KIND_REALIZED_MANIFEST
             self.direct_numerical_contract_sha256 = direct_numerical_manifest.content_sha256
-        else:
+        elif first_gate_materialization_intent is not None:
             assert first_gate_materialization_intent is not None
             expected_bindings = direct_numerical_bindings_from_intent(
                 first_gate_materialization_intent,
@@ -1368,6 +1869,18 @@ class ApprovedHierarchicalDiscoveryAgent:
             )
             self.direct_numerical_contract_kind = DIRECT_NUMERICAL_CONTRACT_KIND_FIRST_GATE_INTENT
             self.direct_numerical_contract_sha256 = first_gate_materialization_intent.content_sha256
+        else:
+            assert reference_only_direct_numerical_contract is not None
+            expected_bindings = direct_numerical_bindings_from_reference_contract(
+                reference_only_direct_numerical_contract,
+                catalog=catalog,
+            )
+            self.direct_numerical_contract_kind = (
+                DIRECT_NUMERICAL_CONTRACT_KIND_REALIZED_MANIFEST
+            )
+            self.direct_numerical_contract_sha256 = (
+                reference_only_direct_numerical_contract.content_sha256
+            )
         self.direct_numerical_bindings = _validate_explicit_bindings(
             supplied=(
                 expected_bindings
@@ -1428,6 +1941,9 @@ class ApprovedHierarchicalDiscoveryAgent:
         runner: MetadataJsonDiscoveryJobRunner,
         direct_numerical_manifest: DirectUpstreamNumericalManifest | None = None,
         first_gate_materialization_intent: FirstGateMaterializationIntent | None = None,
+        reference_only_direct_numerical_contract: (
+            AuthenticatedReferenceOnlyDirectNumericalContract | None
+        ) = None,
         config: HierarchicalDiscoveryConfig | None = None,
         compiler: HierarchicalDiscoveryCompiler | None = None,
         job_cache: AuthenticatedHierarchicalDiscoveryJobCache | None = None,
@@ -1468,6 +1984,9 @@ class ApprovedHierarchicalDiscoveryAgent:
             family_explanations=family_explanations,
             direct_numerical_manifest=direct_numerical_manifest,
             first_gate_materialization_intent=first_gate_materialization_intent,
+            reference_only_direct_numerical_contract=(
+                reference_only_direct_numerical_contract
+            ),
             runner=runner,
             config=chosen_config,
             compiler=compiler,
@@ -1486,6 +2005,18 @@ class ApprovedHierarchicalDiscoveryAgent:
                 ),
                 "direct_numerical_contract_sha256": (self.direct_numerical_manifest.content_sha256),
                 "contract": self.direct_numerical_manifest.as_dict(),
+            }
+        if self.reference_only_direct_numerical_contract is not None:
+            return {
+                "direct_numerical_contract_kind": (
+                    DIRECT_NUMERICAL_CONTRACT_KIND_REALIZED_MANIFEST
+                ),
+                "direct_numerical_contract_sha256": (
+                    self.reference_only_direct_numerical_contract.content_sha256
+                ),
+                "contract": (
+                    self.reference_only_direct_numerical_contract.as_dict()
+                ),
             }
         if self.first_gate_materialization_intent is None:
             raise RuntimeError("direct numerical contract is missing")
@@ -1513,6 +2044,11 @@ class ApprovedHierarchicalDiscoveryAgent:
                 manifest=self.direct_numerical_manifest,
             )
             expected = direct_numerical_bindings_from_manifest(self.direct_numerical_manifest)
+        elif self.reference_only_direct_numerical_contract is not None:
+            expected = direct_numerical_bindings_from_reference_contract(
+                self.reference_only_direct_numerical_contract,
+                catalog=self.catalog,
+            )
         else:
             if self.first_gate_materialization_intent is None:
                 raise ValueError("first-gate materialization intent is missing")
@@ -1578,9 +2114,17 @@ class ApprovedHierarchicalDiscoveryAgent:
             "direct_numerical_contract_binding": (
                 _safe_manifest_binding(self.direct_numerical_manifest)
                 if self.direct_numerical_manifest is not None
-                else _safe_intent_binding(
-                    self.first_gate_materialization_intent,
-                    catalog=self.catalog,
+                else (
+                    _safe_reference_contract_binding(
+                        self.reference_only_direct_numerical_contract,
+                        catalog=self.catalog,
+                    )
+                    if self.reference_only_direct_numerical_contract
+                    is not None
+                    else _safe_intent_binding(
+                        self.first_gate_materialization_intent,
+                        catalog=self.catalog,
+                    )
                 )
             ),
             "direct_numerical_dossier_bindings": [
@@ -1604,6 +2148,7 @@ class ApprovedHierarchicalDiscoveryAgent:
                 "direct_numerical_contract_kind": self.direct_numerical_contract_kind,
                 "direct_numerical_contract_materialized": (
                     self.direct_numerical_manifest is not None
+                    or self.reference_only_direct_numerical_contract is not None
                 ),
                 "direct_row_level_numerical_values_in_packet": False,
                 "direct_coordinate_metadata_in_packet": False,
@@ -1770,6 +2315,7 @@ __all__ = [
     "APPROVED_HIERARCHICAL_DISCOVERY_PRECOMMIT_VERSION",
     "APPROVED_HIERARCHICAL_DISCOVERY_RESULT_VERSION",
     "AUTHENTICATED_RUNNER_EXECUTION_TRACE_VERSION",
+    "AuthenticatedReferenceOnlyDirectNumericalContract",
     "ApprovedHierarchicalDiscoveryAgent",
     "ApprovedHierarchicalDiscoveryPrecommit",
     "ApprovedHierarchicalDiscoveryResult",
@@ -1777,4 +2323,5 @@ __all__ = [
     "MetadataJsonDiscoveryJobRunner",
     "direct_numerical_bindings_from_intent",
     "direct_numerical_bindings_from_manifest",
+    "direct_numerical_bindings_from_reference_contract",
 ]

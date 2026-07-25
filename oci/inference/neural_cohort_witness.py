@@ -8,6 +8,7 @@ queries optimize a cohort score moment, not a patient-level pseudo-outcome.
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -41,27 +42,156 @@ class NeuralCohortWitnessConfig:
     consensus_max_prototypes: int = 16
     consensus_min_prototypes: int = 4
     epsilon: float = 1e-6
+    optimizer_beta1: float = 0.9
+    optimizer_beta2: float = 0.999
+    optimizer_epsilon: float = 1e-8
+    optimizer_weight_decay: float = 0.0
+    optimizer_amsgrad: bool = False
+    optimizer_maximize: bool = False
+    optimizer_foreach: bool = False
+    optimizer_capturable: bool = False
+    optimizer_differentiable: bool = False
+    optimizer_fused: bool = False
+    gradient_clip_norm: float = 5.0
+    consensus_kmeans_init: str = "k-means++"
+    consensus_kmeans_n_init: int = 20
+    consensus_kmeans_max_iter: int = 300
+    consensus_kmeans_tolerance: float = 1e-4
+    consensus_kmeans_copy_x: bool = True
+    consensus_kmeans_algorithm: str = "lloyd"
 
     def validate(self) -> None:
-        if self.n_prototypes < 1:
-            raise ValueError("n_prototypes must be positive")
+        integer_fields = (
+            "n_prototypes",
+            "initial_pool_size",
+            "epochs",
+            "kmeans_iterations",
+            "kmeans_sample_chunks",
+            "consensus_min_subfold_recurrence",
+            "consensus_max_prototypes",
+            "consensus_min_prototypes",
+            "consensus_kmeans_n_init",
+            "consensus_kmeans_max_iter",
+        )
+        for name in integer_fields:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be an integer")
+            if value < 1:
+                raise ValueError(f"{name} must be positive")
+        finite_fields = (
+            "temperature",
+            "learning_rate",
+            "max_query_drift",
+            "query_diversity_weight",
+            "activation_diversity_weight",
+            "anchor_weight",
+            "min_activation_sd",
+            "activation_scale_weight",
+            "initialization_max_cosine",
+            "validation_min_abs_z",
+            "consensus_cosine_threshold",
+            "consensus_activation_correlation_threshold",
+            "epsilon",
+            "optimizer_beta1",
+            "optimizer_beta2",
+            "optimizer_epsilon",
+            "optimizer_weight_decay",
+            "gradient_clip_norm",
+            "consensus_kmeans_tolerance",
+        )
+        for name in finite_fields:
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+            ):
+                raise ValueError(f"{name} must be finite")
+        boolean_fields = (
+            "validation_requires_sign_agreement",
+            "optimizer_amsgrad",
+            "optimizer_maximize",
+            "optimizer_foreach",
+            "optimizer_capturable",
+            "optimizer_differentiable",
+            "optimizer_fused",
+            "consensus_kmeans_copy_x",
+        )
+        for name in boolean_fields:
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be boolean")
         if self.initial_pool_size < self.n_prototypes:
             raise ValueError("initial_pool_size must be at least n_prototypes")
         if not 0.0 < self.temperature <= 1.0:
             raise ValueError("temperature must be in (0, 1]")
-        if self.epochs < 1:
-            raise ValueError("epochs must be positive")
+        if self.learning_rate <= 0.0:
+            raise ValueError("learning_rate must be positive")
         if not 0.0 <= self.max_query_drift <= 2.0:
             raise ValueError("max_query_drift must be in [0, 2]")
-        if self.consensus_min_prototypes < 1:
-            raise ValueError("consensus_min_prototypes must be positive")
+        for name in (
+            "query_diversity_weight",
+            "activation_diversity_weight",
+            "anchor_weight",
+            "min_activation_sd",
+            "activation_scale_weight",
+            "validation_min_abs_z",
+            "optimizer_weight_decay",
+            "consensus_kmeans_tolerance",
+        ):
+            if float(getattr(self, name)) < 0.0:
+                raise ValueError(f"{name} must be nonnegative")
+        if not 0.0 <= self.initialization_max_cosine <= 1.0:
+            raise ValueError("initialization_max_cosine must be in [0, 1]")
+        if not 0.0 <= self.consensus_cosine_threshold <= 1.0:
+            raise ValueError("consensus_cosine_threshold must be in [0, 1]")
+        if not -1.0 <= self.consensus_activation_correlation_threshold <= 1.0:
+            raise ValueError(
+                "consensus_activation_correlation_threshold must be in [-1, 1]"
+            )
         if self.consensus_max_prototypes < self.consensus_min_prototypes:
             raise ValueError(
                 "consensus_max_prototypes must be at least consensus_min_prototypes"
             )
+        if self.epsilon <= 0.0:
+            raise ValueError("epsilon must be positive")
+        if not 0.0 <= self.optimizer_beta1 < 1.0:
+            raise ValueError("optimizer_beta1 must be in [0, 1)")
+        if not 0.0 <= self.optimizer_beta2 < 1.0:
+            raise ValueError("optimizer_beta2 must be in [0, 1)")
+        if self.optimizer_epsilon <= 0.0:
+            raise ValueError("optimizer_epsilon must be positive")
+        if self.gradient_clip_norm <= 0.0:
+            raise ValueError("gradient_clip_norm must be positive")
+        if self.optimizer_foreach and self.optimizer_fused:
+            raise ValueError("optimizer_foreach and optimizer_fused cannot both be true")
+        if self.consensus_kmeans_init not in {"k-means++", "random"}:
+            raise ValueError("consensus_kmeans_init must be k-means++ or random")
+        if self.consensus_kmeans_algorithm not in {"lloyd", "elkan"}:
+            raise ValueError("consensus_kmeans_algorithm must be lloyd or elkan")
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+def _adamw_parameters(config: NeuralCohortWitnessConfig) -> Dict[str, Any]:
+    """Return the complete result-changing AdamW constructor contract."""
+
+    return {
+        "lr": float(config.learning_rate),
+        "betas": (
+            float(config.optimizer_beta1),
+            float(config.optimizer_beta2),
+        ),
+        "eps": float(config.optimizer_epsilon),
+        "weight_decay": float(config.optimizer_weight_decay),
+        "amsgrad": bool(config.optimizer_amsgrad),
+        "maximize": bool(config.optimizer_maximize),
+        "foreach": bool(config.optimizer_foreach),
+        "capturable": bool(config.optimizer_capturable),
+        "differentiable": bool(config.optimizer_differentiable),
+        "fused": bool(config.optimizer_fused),
+    }
 
 
 def fit_constant_residual_effect(
@@ -192,13 +322,19 @@ def soft_retrieval_activations(
     queries: np.ndarray,
     *,
     temperature: float,
-    device: str = "cpu",
-    patient_batch_size: int = 128,
+    device: str,
+    patient_batch_size: int,
 ) -> np.ndarray:
     """Compute log-mean-exp patient activations for fixed semantic queries."""
 
     import torch
 
+    if (
+        isinstance(patient_batch_size, bool)
+        or not isinstance(patient_batch_size, int)
+        or patient_batch_size < 1
+    ):
+        raise ValueError("patient_batch_size must be a positive integer")
     padded, mask = pad_chunk_embeddings(chunk_matrices)
     query_array = np.asarray(queries, dtype=np.float32)
     if query_array.ndim != 2 or query_array.shape[1] != padded.shape[2]:
@@ -207,8 +343,8 @@ def soft_retrieval_activations(
     query_tensor = torch.as_tensor(query_array, device=device)
     outputs: List[np.ndarray] = []
     with torch.no_grad():
-        for start in range(0, len(padded), max(1, int(patient_batch_size))):
-            stop = min(len(padded), start + max(1, int(patient_batch_size)))
+        for start in range(0, len(padded), int(patient_batch_size)):
+            stop = min(len(padded), start + int(patient_batch_size))
             chunks = torch.as_tensor(padded[start:stop], device=device)
             chunk_mask = torch.as_tensor(mask[start:stop], device=device)
             activations = _torch_soft_activations(
@@ -342,11 +478,7 @@ def fit_soft_witness_queries(
         initial_queries = pool[selected_indices].detach().clone()
 
     queries = torch.nn.Parameter(initial_queries.clone())
-    optimizer = torch.optim.AdamW(
-        [queries],
-        lr=float(config.learning_rate),
-        weight_decay=0.0,
-    )
+    optimizer = torch.optim.AdamW([queries], **_adamw_parameters(config))
     loss_history: List[float] = []
     for _epoch in range(int(config.epochs)):
         optimizer.zero_grad(set_to_none=True)
@@ -395,7 +527,10 @@ def fit_soft_witness_queries(
             + float(config.activation_scale_weight) * activation_scale_penalty
         )
         loss.backward()
-        torch.nn.utils.clip_grad_norm_([queries], max_norm=5.0)
+        torch.nn.utils.clip_grad_norm_(
+            [queries],
+            max_norm=float(config.gradient_clip_norm),
+        )
         optimizer.step()
         with torch.no_grad():
             queries.copy_(functional.normalize(queries, dim=1))
@@ -547,9 +682,7 @@ def fit_soft_contrast_queries(
         initial_tensor = torch.as_tensor(initial_array, device=device).clone()
 
     queries = torch.nn.Parameter(initial_tensor.clone())
-    optimizer = torch.optim.AdamW(
-        [queries], lr=float(config.learning_rate), weight_decay=0.0
-    )
+    optimizer = torch.optim.AdamW([queries], **_adamw_parameters(config))
     loss_history: List[float] = []
     for _epoch in range(int(config.epochs)):
         optimizer.zero_grad(set_to_none=True)
@@ -601,7 +734,10 @@ def fit_soft_contrast_queries(
             + float(config.activation_scale_weight) * activation_scale_penalty
         )
         loss.backward()
-        torch.nn.utils.clip_grad_norm_([queries], max_norm=5.0)
+        torch.nn.utils.clip_grad_norm_(
+            [queries],
+            max_norm=float(config.gradient_clip_norm),
+        )
         optimizer.step()
         with torch.no_grad():
             queries.copy_(functional.normalize(queries, dim=1))
@@ -687,6 +823,7 @@ def build_ungated_consensus_query_bank(
     n_queries: int,
     bank: str,
     seed: int,
+    config: NeuralCohortWitnessConfig,
 ) -> Dict[str, Any]:
     """Consolidate every fold-specific query into exactly ``n_queries`` groups.
 
@@ -699,8 +836,13 @@ def build_ungated_consensus_query_bank(
 
     from sklearn.cluster import KMeans
 
+    if not isinstance(config, NeuralCohortWitnessConfig):
+        raise TypeError("config must be NeuralCohortWitnessConfig")
+    config.validate()
     if int(n_queries) < 1:
         raise ValueError("n_queries must be positive")
+    if int(n_queries) != int(config.n_prototypes):
+        raise ValueError("n_queries must equal the configured witness prototype count")
     if len(candidates) < int(n_queries):
         raise ValueError("at least n_queries candidates are required")
     values = np.asarray(candidate_activations, dtype=float)
@@ -712,8 +854,13 @@ def build_ungated_consensus_query_bank(
     representations = standardized.T
     labels = KMeans(
         n_clusters=int(n_queries),
+        init=str(config.consensus_kmeans_init),
+        n_init=int(config.consensus_kmeans_n_init),
+        max_iter=int(config.consensus_kmeans_max_iter),
+        tol=float(config.consensus_kmeans_tolerance),
         random_state=int(seed),
-        n_init=20,
+        copy_x=bool(config.consensus_kmeans_copy_x),
+        algorithm=str(config.consensus_kmeans_algorithm),
     ).fit_predict(representations)
 
     groups: List[Dict[str, Any]] = []

@@ -38,6 +38,7 @@ from oci.config import (  # noqa: E402
     ExplicitFeatureExtractionConfig,
     ExplicitFeatureForestConfig,
     ModelArchitectureConfig,
+    TfidfNuisanceStackScientificConfig,
 )
 from oci.inference.agentic_explicit_feature_forest import (  # noqa: E402
     make_explicit_feature_extraction_provider,
@@ -88,6 +89,7 @@ from oci.inference.neural_query_signal_fusion_adapter import (  # noqa: E402
 from oci.inference.tfidf_topic_discovery import (  # noqa: E402
     _strata,
     fit_joint_cross_fitted_nuisance_stacks,
+    legacy_tfidf_nuisance_stack_v1,
     row_set_fingerprint,
 )
 from oci.models.causal_forest_head import CausalForestHead  # noqa: E402
@@ -176,6 +178,7 @@ def _write_authenticated_query_signals_from_checkpoints(
     query_discovery_checkpoint_path: Path,
     subfold_checkpoint_paths: Sequence[Path],
     temperature: float,
+    patient_batch_size: int,
     devices_by_bank: Mapping[str, str],
     expected_parent_input_binding_sha256: str,
     expected_query_discovery_identity: str,
@@ -191,6 +194,7 @@ def _write_authenticated_query_signals_from_checkpoints(
         query_discovery_checkpoint_path=query_discovery_checkpoint_path,
         subfold_checkpoint_paths=subfold_checkpoint_paths,
         temperature=temperature,
+        patient_batch_size=patient_batch_size,
         devices_by_bank=devices_by_bank,
         expected_parent_input_binding_sha256=expected_parent_input_binding_sha256,
         expected_query_discovery_identity=expected_query_discovery_identity,
@@ -410,10 +414,34 @@ def _witness_config(
             if final_refit
             else float(config.max_query_drift)
         ),
+        query_diversity_weight=float(config.query_diversity_weight),
+        activation_diversity_weight=float(config.activation_diversity_weight),
+        anchor_weight=float(config.anchor_weight),
+        min_activation_sd=float(config.min_activation_sd),
+        activation_scale_weight=float(config.activation_scale_weight),
         kmeans_iterations=int(config.kmeans_iterations),
         kmeans_sample_chunks=int(config.kmeans_sample_chunks),
+        initialization_max_cosine=float(config.initialization_max_cosine),
         consensus_min_prototypes=config.query_count(bank),
         consensus_max_prototypes=config.query_count(bank),
+        epsilon=float(config.witness_epsilon),
+        optimizer_beta1=float(config.optimizer_beta1),
+        optimizer_beta2=float(config.optimizer_beta2),
+        optimizer_epsilon=float(config.optimizer_epsilon),
+        optimizer_weight_decay=float(config.optimizer_weight_decay),
+        optimizer_amsgrad=bool(config.optimizer_amsgrad),
+        optimizer_maximize=bool(config.optimizer_maximize),
+        optimizer_foreach=bool(config.optimizer_foreach),
+        optimizer_capturable=bool(config.optimizer_capturable),
+        optimizer_differentiable=bool(config.optimizer_differentiable),
+        optimizer_fused=bool(config.optimizer_fused),
+        gradient_clip_norm=float(config.gradient_clip_norm),
+        consensus_kmeans_init=str(config.consensus_kmeans_init),
+        consensus_kmeans_n_init=int(config.consensus_kmeans_n_init),
+        consensus_kmeans_max_iter=int(config.consensus_kmeans_max_iter),
+        consensus_kmeans_tolerance=float(config.consensus_kmeans_tolerance),
+        consensus_kmeans_copy_x=bool(config.consensus_kmeans_copy_x),
+        consensus_kmeans_algorithm=str(config.consensus_kmeans_algorithm),
     )
 
 
@@ -430,6 +458,7 @@ def _fit_subfold(
     outcome_binary: bool,
     nuisance_views: Sequence[Any],
     nuisance_folds: int,
+    nuisance_stack_config: TfidfNuisanceStackScientificConfig,
     config: NeuralQueryAgenticForestConfig,
     seed: int,
     device: str,
@@ -451,6 +480,7 @@ def _fit_subfold(
         "outcome_binary": bool(outcome_binary),
         "parent_input_binding_sha256": parent_binding or None,
         "nuisance_folds": int(nuisance_folds),
+        "nuisance_stack_scientific": asdict(nuisance_stack_config),
         "nuisance_views_sha256": _stable_hash(list(nuisance_views)),
         "query_config": config.to_dict(),
         "seed": int(seed),
@@ -504,6 +534,7 @@ def _fit_subfold(
             views=nuisance_views,
             folds=int(nuisance_folds),
             random_state=int(seed + 10_000),
+            nuisance_stack_config=nuisance_stack_config,
         )
         validation_e, _ = nuisance["treatment"]["fitted"].predict(validation_texts)
         validation_m, _ = nuisance["outcome"]["fitted"].predict(validation_texts)
@@ -577,6 +608,7 @@ def _fit_subfold(
             result["queries"],
             temperature=float(config.temperature),
             device=device,
+            patient_batch_size=int(config.retrieval_patient_batch_size),
         )
         if bank == "treatment":
             audit = standardized_direct_target_contrasts(
@@ -658,6 +690,7 @@ def _fit_query_discovery(
     fit_e: np.ndarray,
     fit_m: np.ndarray,
     nuisance_views: Sequence[Any],
+    nuisance_stack_config: TfidfNuisanceStackScientificConfig,
     config: NeuralQueryAgenticForestConfig,
     nuisance_folds: int,
     devices: Sequence[str],
@@ -690,6 +723,7 @@ def _fit_query_discovery(
                 "outcome": np.asarray(outcome, dtype=float).tolist(),
                 "outcome_binary": bool(outcome_binary),
                 "nuisance_views_sha256": _stable_hash(list(nuisance_views)),
+                "nuisance_stack_scientific": asdict(nuisance_stack_config),
                 "query_config": config.to_dict(),
             }
         )
@@ -717,6 +751,7 @@ def _fit_query_discovery(
                 "outcome_binary": bool(outcome_binary),
                 "nuisance_views": nuisance_views,
                 "nuisance_folds": int(nuisance_folds),
+                "nuisance_stack_config": nuisance_stack_config,
                 "config": config,
                 "seed": int(seed + fold),
                 "checkpoint_path": checkpoint_dir / f"subfold_{fold:02d}.joblib",
@@ -750,6 +785,12 @@ def _fit_query_discovery(
             candidate_queries,
             temperature=float(config.temperature),
             device=str(devices[bank_index % len(devices)]),
+            patient_batch_size=int(config.retrieval_patient_batch_size),
+        )
+        consensus_config = _witness_config(
+            config,
+            bank,
+            final_refit=False,
         )
         consensus = build_ungated_consensus_query_bank(
             candidates,
@@ -757,6 +798,7 @@ def _fit_query_discovery(
             n_queries=config.query_count(bank),
             bank=bank,
             seed=int(seed + 1000 + bank_index),
+            config=consensus_config,
         )
         initial_queries = np.asarray(consensus.pop("queries"), dtype=np.float32)
         refit_config = _witness_config(config, bank, final_refit=True)
@@ -1015,6 +1057,10 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     )
     nuisance_views = list(fitted_context.treatment_stack.views)
     nuisance_views_sha256 = _stable_hash(nuisance_views)
+    # This standalone historical runner has no typed scientific-spec input.
+    # Bind its compatibility profile explicitly and include the complete
+    # profile in every discovery/checkpoint identity.
+    nuisance_stack_config = legacy_tfidf_nuisance_stack_v1()
 
     query_config = NeuralQueryAgenticForestConfig(
         treatment_query_count=int(args.treatment_queries),
@@ -1053,6 +1099,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "nuisance_snapshot_sha256": nuisance_snapshot_sha256,
             "fitted_context_snapshot_sha256": fitted_context_snapshot_sha256,
             "nuisance_views_sha256": nuisance_views_sha256,
+            "nuisance_stack_scientific": asdict(nuisance_stack_config),
             "stage1_config_hash": context["stage1_config_hash"],
             "query_config": query_config.to_dict(),
             "nuisance_folds": int(args.subfold_nuisance_folds),
@@ -1097,6 +1144,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             fit_e=fit_e,
             fit_m=fit_m,
             nuisance_views=nuisance_views,
+            nuisance_stack_config=nuisance_stack_config,
             config=query_config,
             nuisance_folds=int(args.subfold_nuisance_folds),
             devices=devices,
@@ -1172,6 +1220,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             query_discovery_checkpoint_path=query_checkpoint,
             subfold_checkpoint_paths=subfold_checkpoint_paths,
             temperature=float(query_config.temperature),
+            patient_batch_size=int(query_config.retrieval_patient_batch_size),
             devices_by_bank={
                 bank: devices[index % len(devices)] for index, bank in enumerate(BANKS)
             },
@@ -1453,6 +1502,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         all_queries,
         temperature=float(query_config.temperature),
         device=devices[0],
+        patient_batch_size=int(query_config.retrieval_patient_batch_size),
     ).astype(np.float32)
     query_means = np.mean(train_query_values, axis=0)
     query_scales = np.std(train_query_values, axis=0)

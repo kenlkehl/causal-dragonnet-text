@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -164,7 +165,10 @@ def _run_capture(
     torch.manual_seed(4321)
     dataset = _dataset(heldout_labels_flipped=heldout_labels_flipped)
     config = _config(tmp_path, htr_effect_folds=htr_effect_folds)
-    view_configs = [vars(view) for view in config.architecture.multi_model_forest.bow_views]
+    view_configs = [
+        asdict(view)
+        for view in config.architecture.multi_model_forest.bow_views
+    ]
     sink = NativeMatchedPairProofCaptureSink(
         artifact_dir=tmp_path / name,
         scope_id="outer_001_inner_001",
