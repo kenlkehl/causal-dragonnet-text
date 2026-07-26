@@ -28,6 +28,7 @@ import copy
 import concurrent.futures
 import hashlib
 import json
+import math
 import os
 import shutil
 import stat
@@ -38,6 +39,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
+from . import performance_telemetry as telemetry_module
 from .portable_resource_scheduler import (
     ResourcePlan,
     assign_physical_fits,
@@ -59,7 +61,11 @@ from .production_stage1_scope_scheduler import (
 from .neural_query_execution_topology import (
     NeuralQueryExecutionTopology,
 )
+from .neural_query_operational_controls import (
+    RoleNeutralNeuralQueryOperationalControls,
+)
 from .role_neutral_htr_group_execution import (
+    ROLE_NEUTRAL_HTR_OPERATIONAL_ATTESTATION_SCHEMA,
     RoleNeutralHTROperationalControls,
 )
 from .role_neutral_all_ten_binding import (
@@ -71,7 +77,7 @@ from .role_neutral_all_ten_binding import (
 
 ROLE_NEUTRAL_STAGE1_EXECUTION_SCHEMA = "production_role_neutral_stage1_execution_v1"
 ROLE_NEUTRAL_STAGE1_EXECUTION_ATTESTATION_SCHEMA = (
-    "production_role_neutral_stage1_execution_attestation_v2"
+    "production_role_neutral_stage1_execution_attestation_v3"
 )
 
 ROLE_NEUTRAL_COMPONENT_DIRECTORY = "components"
@@ -81,6 +87,21 @@ ROLE_NEUTRAL_EXECUTION_MANIFEST = "execution_manifest.json"
 ROLE_NEUTRAL_COMPUTE_CANARY_ATTESTATION = "compute_canary_attestation.json"
 ROLE_NEUTRAL_COMPUTE_CANARY_SCHEMA = (
     "production_role_neutral_stage1_compute_canary_v1"
+)
+ROLE_NEUTRAL_FIRST_OWNER_VALIDATION_GATE_SCHEMA = (
+    "production_role_neutral_first_owner_validation_gate_v1"
+)
+ROLE_NEUTRAL_FIRST_OWNER_VALIDATION_POLICY_SCHEMA = (
+    "production_role_neutral_first_owner_validation_policy_v1"
+)
+ROLE_NEUTRAL_FIRST_OWNER_VALIDATION_GATE_SUFFIX = (
+    "first_owner_validation_gate.json"
+)
+_MATCHED_PAIR_OPERATIONAL_ATTESTATION_SCHEMA = (
+    "production_role_neutral_matched_pair_operational_attestation_v1"
+)
+_TFIDF_NUISANCE_EXECUTION_ATTESTATION_SCHEMA = (
+    "tfidf_joint_nuisance_fold_execution_attestation_v1"
 )
 
 EARLIEST_CANONICAL_OWNER_CANARY_SELECTION = (
@@ -291,6 +312,9 @@ class RoleNeutralComponentInvocation:
         NeuralQueryExecutionTopology | None
     ) = None
     htr_operational_controls: RoleNeutralHTROperationalControls | None = None
+    neural_query_operational_controls: (
+        RoleNeutralNeuralQueryOperationalControls | None
+    ) = None
     htr_fold_devices: tuple[str, ...] = ()
     owner_cpu_budget: int | None = None
 
@@ -336,6 +360,17 @@ class RoleNeutralComponentInvocation:
                 "component invocation HTR controls must use the typed "
                 "deployment-only contract"
             )
+        if (
+            self.neural_query_operational_controls is not None
+            and not isinstance(
+                self.neural_query_operational_controls,
+                RoleNeutralNeuralQueryOperationalControls,
+            )
+        ):
+            raise TypeError(
+                "component invocation neural-query controls must use the "
+                "typed deployment-only contract"
+            )
         htr_fold_devices = tuple(str(value) for value in self.htr_fold_devices)
         if not htr_fold_devices:
             htr_fold_devices = (str(self.resource),)
@@ -358,6 +393,16 @@ class RoleNeutralComponentInvocation:
             raise ValueError(
                 "component invocation owner CPU budget must be positive"
             )
+        if self.neural_query_operational_controls is not None:
+            if self.owner_cpu_budget is None:
+                raise ValueError(
+                    "component invocation neural-query controls require an "
+                    "owner CPU budget"
+                )
+            self.neural_query_operational_controls.bind_task_resources(
+                devices=topology.devices,
+                owner_cpu_budget=self.owner_cpu_budget,
+            )
 
     def scientific_payload(self) -> dict[str, Any]:
         body = {
@@ -373,6 +418,7 @@ class RoleNeutralComponentInvocation:
             "resource_assignment_included": False,
             "neural_query_device_topology_included": False,
             "htr_operational_controls_included": False,
+            "neural_query_operational_controls_included": False,
             "htr_fold_devices_included": False,
         }
         return {**body, "content_sha256": _sha256_json(body)}
@@ -457,6 +503,9 @@ class RoleNeutralPhysicalOwnerTask:
         NeuralQueryExecutionTopology | None
     ) = None
     htr_operational_controls: RoleNeutralHTROperationalControls | None = None
+    neural_query_operational_controls: (
+        RoleNeutralNeuralQueryOperationalControls | None
+    ) = None
     htr_fold_devices: tuple[str, ...] = ()
     owner_cpu_budget: int | None = None
 
@@ -497,6 +546,17 @@ class RoleNeutralPhysicalOwnerTask:
                 "physical-owner task HTR controls must use the typed "
                 "deployment-only contract"
             )
+        if (
+            self.neural_query_operational_controls is not None
+            and not isinstance(
+                self.neural_query_operational_controls,
+                RoleNeutralNeuralQueryOperationalControls,
+            )
+        ):
+            raise TypeError(
+                "physical-owner task neural-query controls must use the "
+                "typed deployment-only contract"
+            )
         htr_fold_devices = tuple(str(value) for value in self.htr_fold_devices)
         if not htr_fold_devices:
             htr_fold_devices = (str(self.resource),)
@@ -517,6 +577,16 @@ class RoleNeutralPhysicalOwnerTask:
         ):
             raise ValueError(
                 "physical-owner task CPU budget must be positive"
+            )
+        if self.neural_query_operational_controls is not None:
+            if self.owner_cpu_budget is None:
+                raise ValueError(
+                    "physical-owner neural-query controls require an owner "
+                    "CPU budget"
+                )
+            self.neural_query_operational_controls.bind_task_resources(
+                devices=topology.devices,
+                owner_cpu_budget=self.owner_cpu_budget,
             )
 
 
@@ -649,6 +719,107 @@ class RoleNeutralComputeCanaryPolicy:
 
 
 @dataclass(frozen=True)
+class RoleNeutralFirstOwnerValidationPolicy:
+    """Deployment-only hard gate before the second physical owner starts."""
+
+    devices: tuple[str, ...]
+    gpu_max_allocation_fraction: float
+    gpu_minimum_headroom_bytes: int
+    gpu_sample_interval_seconds: float
+    required_tfidf_parallel_backend: str
+    schema_version: str
+
+    def __post_init__(self) -> None:
+        devices = tuple(str(value) for value in self.devices)
+        if (
+            not devices
+            or len(devices) != len(set(devices))
+            or any(
+                not value.startswith("cuda:")
+                or not value.split(":", 1)[1].isdigit()
+                for value in devices
+            )
+        ):
+            raise ValueError(
+                "first-owner validation devices must be distinct CUDA devices"
+            )
+        fraction = float(self.gpu_max_allocation_fraction)
+        if (
+            isinstance(self.gpu_max_allocation_fraction, bool)
+            or not math.isfinite(fraction)
+            or not 0.0 < fraction < 1.0
+        ):
+            raise ValueError(
+                "first-owner GPU maximum allocation fraction must be in (0, 1)"
+            )
+        if (
+            isinstance(self.gpu_minimum_headroom_bytes, bool)
+            or not isinstance(self.gpu_minimum_headroom_bytes, int)
+            or self.gpu_minimum_headroom_bytes < 1
+        ):
+            raise ValueError(
+                "first-owner GPU minimum headroom must be a positive integer"
+            )
+        interval = float(self.gpu_sample_interval_seconds)
+        if (
+            isinstance(self.gpu_sample_interval_seconds, bool)
+            or not math.isfinite(interval)
+            or interval <= 0.0
+        ):
+            raise ValueError(
+                "first-owner GPU sample interval must be finite and positive"
+            )
+        backend = str(self.required_tfidf_parallel_backend).strip().lower()
+        if backend == "loky":
+            backend = "processes"
+        if backend not in {"threads", "processes"}:
+            raise ValueError(
+                "first-owner TF-IDF backend must be threads or processes"
+            )
+        if (
+            self.schema_version
+            != ROLE_NEUTRAL_FIRST_OWNER_VALIDATION_POLICY_SCHEMA
+        ):
+            raise ValueError(
+                "unsupported first-owner validation policy schema"
+            )
+        object.__setattr__(self, "devices", devices)
+        object.__setattr__(
+            self,
+            "gpu_max_allocation_fraction",
+            fraction,
+        )
+        object.__setattr__(
+            self,
+            "gpu_sample_interval_seconds",
+            interval,
+        )
+        object.__setattr__(
+            self,
+            "required_tfidf_parallel_backend",
+            backend,
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "devices": list(self.devices),
+            "gpu_max_allocation_fraction": (
+                self.gpu_max_allocation_fraction
+            ),
+            "gpu_minimum_headroom_bytes": (
+                self.gpu_minimum_headroom_bytes
+            ),
+            "gpu_sample_interval_seconds": (
+                self.gpu_sample_interval_seconds
+            ),
+            "required_tfidf_parallel_backend": (
+                self.required_tfidf_parallel_backend
+            ),
+        }
+
+
+@dataclass(frozen=True)
 class RoleNeutralStage1ExecutionPolicy:
     resource_plan: ResourcePlan
     max_parallel_owners: int
@@ -658,6 +829,12 @@ class RoleNeutralStage1ExecutionPolicy:
         NeuralQueryExecutionTopology,
     ] = field(default_factory=dict)
     htr_operational_controls: RoleNeutralHTROperationalControls | None = None
+    neural_query_operational_controls: (
+        RoleNeutralNeuralQueryOperationalControls | None
+    ) = None
+    first_owner_validation: (
+        RoleNeutralFirstOwnerValidationPolicy | None
+    ) = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.resource_plan, ResourcePlan):
@@ -674,6 +851,32 @@ class RoleNeutralStage1ExecutionPolicy:
             raise TypeError(
                 "compute_canary must be a typed RoleNeutralComputeCanaryPolicy"
             )
+        gate = self.first_owner_validation
+        if gate is not None and not isinstance(
+            gate,
+            RoleNeutralFirstOwnerValidationPolicy,
+        ):
+            raise TypeError(
+                "first_owner_validation must use its typed deployment policy"
+            )
+        if gate is not None:
+            if self.compute_canary is not None:
+                raise ValueError(
+                    "first-owner validation and the two-replica canary are "
+                    "mutually exclusive"
+                )
+            if tuple(self.resource_plan.devices) != gate.devices:
+                raise ValueError(
+                    "first-owner validation devices differ from the resource plan"
+                )
+            if (
+                self.htr_operational_controls is None
+                or self.neural_query_operational_controls is None
+            ):
+                raise ValueError(
+                    "first-owner validation requires HTR and neural operational "
+                    "controls"
+                )
         if self.htr_operational_controls is not None and not isinstance(
             self.htr_operational_controls,
             RoleNeutralHTROperationalControls,
@@ -684,17 +887,20 @@ class RoleNeutralStage1ExecutionPolicy:
             )
         if self.htr_operational_controls is not None:
             selected_devices = tuple(self.resource_plan.devices)
-            effective_htr_owners = max(
-                1,
-                workers // len(selected_devices),
-            )
             self.htr_operational_controls.bind_fold_resources(
                 devices=selected_devices,
-                owner_cpu_budget=max(
-                    1,
-                    int(self.resource_plan.cpu_budget)
-                    // effective_htr_owners,
-                ),
+                owner_cpu_budget=int(self.resource_plan.cpu_budget),
+            )
+        if (
+            self.neural_query_operational_controls is not None
+            and not isinstance(
+                self.neural_query_operational_controls,
+                RoleNeutralNeuralQueryOperationalControls,
+            )
+        ):
+            raise TypeError(
+                "execution policy neural-query controls must use the typed "
+                "deployment-only contract"
             )
         topologies = dict(self.neural_query_execution_topologies)
         selected = set(self.resource_plan.devices)
@@ -721,6 +927,25 @@ class RoleNeutralStage1ExecutionPolicy:
             "neural_query_execution_topologies",
             topologies,
         )
+        if self.neural_query_operational_controls is not None:
+            effective_owners = (
+                max(1, workers // len(self.resource_plan.devices))
+                if self.htr_operational_controls is not None
+                else workers
+            )
+            owner_cpu_budget = max(
+                1,
+                int(self.resource_plan.cpu_budget) // effective_owners,
+            )
+            runtime_topologies = tuple(topologies.values()) or tuple(
+                NeuralQueryExecutionTopology.single(device)
+                for device in self.resource_plan.devices
+            )
+            for topology in runtime_topologies:
+                self.neural_query_operational_controls.bind_task_resources(
+                    devices=topology.devices,
+                    owner_cpu_budget=owner_cpu_budget,
+                )
 
     def neural_query_topology_for(
         self,
@@ -760,6 +985,9 @@ def _execute_one_owner(
                 task.neural_query_execution_topology
             ),
             htr_operational_controls=task.htr_operational_controls,
+            neural_query_operational_controls=(
+                task.neural_query_operational_controls
+            ),
             htr_fold_devices=task.htr_fold_devices,
             owner_cpu_budget=task.owner_cpu_budget,
         )
@@ -789,7 +1017,10 @@ def _execute_one_owner(
             resource_ids = tuple(
                 task.neural_query_execution_topology.devices
             )
-        elif component == "htr" and accelerator_associated:
+        elif (
+            component in {"htr", "matched_pair"}
+            and accelerator_associated
+        ):
             resource_ids = tuple(task.htr_fold_devices)
         elif accelerator_associated:
             resource_ids = (task.resource,)
@@ -839,9 +1070,21 @@ def _execute_one_owner(
             operational_reports[component] = copy.deepcopy(
                 dict(execution_result.attestation)
             )
-        elif component == "htr" and task.htr_operational_controls is not None:
+        elif (
+            component in {"htr", "matched_pair"}
+            and task.htr_operational_controls is not None
+        ):
             raise RuntimeError(
-                "typed HTR deployment controls were not operationally attested"
+                f"typed {component} deployment controls were not "
+                "operationally attested"
+            )
+        elif (
+            component == "neural_query"
+            and task.neural_query_operational_controls is not None
+        ):
+            raise RuntimeError(
+                "typed neural-query deployment controls were not "
+                "operationally attested"
             )
         if (
             component_root.is_symlink()
@@ -976,7 +1219,10 @@ def validate_role_neutral_component_execution_intervals(
             if component == "neural_query" and accelerator_associated
             else (
                 htr_resources
-                if component == "htr" and accelerator_associated
+                if (
+                    component in {"htr", "matched_pair"}
+                    and accelerator_associated
+                )
                 else (
                     (primary_resource,)
                     if accelerator_associated
@@ -1079,6 +1325,772 @@ def _compute_canary_scientific_replica(
         "resource_locator_included": False,
     }
     return {**body, "content_sha256": _sha256_json(body)}
+
+
+class _FirstOwnerGpuSampler:
+    """Continuously observe total device allocation during the hard gate."""
+
+    def __init__(
+        self,
+        *,
+        devices: tuple[str, ...],
+        interval_seconds: float,
+    ) -> None:
+        self.devices = tuple(devices)
+        self.interval_seconds = float(interval_seconds)
+        self._samples: list[dict[str, Any]] = []
+        self._errors: list[dict[str, str]] = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _sample(self) -> None:
+        acquisition_started = time.monotonic()
+        try:
+            rows = telemetry_module.sample_nvidia_gpus(self.devices)
+        except BaseException as exc:
+            with self._lock:
+                self._errors.append(
+                    {
+                        "exception_type": type(exc).__name__,
+                        "message": str(exc),
+                    }
+                )
+            return
+        acquisition_finished = time.monotonic()
+        if acquisition_finished < acquisition_started:
+            with self._lock:
+                self._errors.append(
+                    {
+                        "exception_type": "RuntimeError",
+                        "message": (
+                            "first-owner GPU sample acquisition clock "
+                            "moved backwards"
+                        ),
+                    }
+                )
+            return
+        with self._lock:
+            self._samples.extend(
+                {
+                    **copy.deepcopy(dict(row)),
+                    "sample_acquisition_started_monotonic_seconds": (
+                        acquisition_started
+                    ),
+                    "sample_acquisition_finished_monotonic_seconds": (
+                        acquisition_finished
+                    ),
+                    # A point sample is observed only when the host NVML
+                    # acquisition returns, so its timestamp is completion.
+                    "sample_monotonic_seconds": acquisition_finished,
+                }
+                for row in rows
+            )
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            self._sample()
+
+    def __enter__(self) -> "_FirstOwnerGpuSampler":
+        self._sample()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="oci-first-owner-gpu-sampler",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        if self._thread is not None:
+            self._stop.set()
+            self._thread.join()
+        self._sample()
+
+    @property
+    def samples(self) -> tuple[Mapping[str, Any], ...]:
+        with self._lock:
+            return tuple(copy.deepcopy(self._samples))
+
+    @property
+    def errors(self) -> tuple[Mapping[str, str], ...]:
+        with self._lock:
+            return tuple(copy.deepcopy(self._errors))
+
+
+def _first_owner_gate_path(execution_root: Path) -> Path:
+    return (
+        execution_root
+        / ROLE_NEUTRAL_FIRST_OWNER_VALIDATION_GATE_SUFFIX
+    )
+
+
+def _durably_publish_first_owner_gate(
+    *,
+    path: Path,
+    value: Mapping[str, Any],
+) -> None:
+    _write_new_json(path, value)
+    descriptor = os.open(
+        path.parent,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise ValueError(
+                "first-owner validation parent is not a directory"
+            )
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _validated_operational_attestation(
+    value: Any,
+    *,
+    label: str,
+    schema: str,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} operational attestation is missing")
+    result = copy.deepcopy(dict(value))
+    body = {
+        key: copy.deepcopy(child)
+        for key, child in result.items()
+        if key != "content_sha256"
+    }
+    if (
+        result.get("schema_version") != schema
+        or result.get("content_sha256") != _sha256_json(body)
+    ):
+        raise ValueError(
+            f"{label} operational attestation is not self-authenticated"
+        )
+    return result
+
+
+def _first_owner_receipt_reauthentication(
+    result: RoleNeutralPhysicalOwnerResult,
+) -> dict[str, Any]:
+    """Bind the freshly reopened component receipts behind coverage claims."""
+
+    if not isinstance(result, RoleNeutralPhysicalOwnerResult):
+        raise TypeError(
+            "first-owner receipt reauthentication requires a typed result"
+        )
+    if (
+        result.component_execution_order
+        != tuple(EXPECTED_COMPONENT_FAMILIES)
+        or len(result.sources) != len(EXPECTED_COMPONENT_FAMILIES)
+    ):
+        raise ValueError(
+            "first-owner receipt reauthentication lacks every component"
+        )
+    components: list[dict[str, Any]] = []
+    for component, source in zip(
+        EXPECTED_COMPONENT_FAMILIES,
+        result.sources,
+        strict=True,
+    ):
+        receipt = source.receipt
+        if (
+            not isinstance(
+                receipt,
+                AuthenticatedRoleNeutralComponentReceipt,
+            )
+            or receipt.component != component
+        ):
+            raise ValueError(
+                "first-owner receipt reauthentication changed component order"
+            )
+        scientific = receipt.scientific_dict()
+        execution = receipt.execution_attestation()
+        components.append(
+            {
+                "component": component,
+                "component_authentication_content_sha256": (
+                    receipt.authentication_content_sha256
+                ),
+                "component_scientific_content_sha256": (
+                    scientific["content_sha256"]
+                ),
+                "component_execution_attestation_content_sha256": (
+                    execution["content_sha256"]
+                ),
+                "source_terminal_content_sha256": (
+                    receipt.source_terminal_content_sha256
+                ),
+                "source_tree_sha256": receipt.source_tree_sha256,
+                "family_fit_artifact_sha256": copy.deepcopy(
+                    scientific["family_fit_artifact_sha256"]
+                ),
+                "registered_heldout_labels_accessed": False,
+                "oracle_fields_accessed": False,
+                "text_truncation_applied": False,
+                "lossy_evidence_selection_applied": False,
+            }
+        )
+    body = {
+        "schema_version": (
+            "production_role_neutral_first_owner_receipt_"
+            "reauthentication_v1"
+        ),
+        "physical_owner_scope_id": result.physical_owner_scope_id,
+        "canonical_component_order": list(EXPECTED_COMPONENT_FAMILIES),
+        "components": components,
+        "component_root_count": len(components),
+        "every_component_root_reopened_and_tree_rehashed": True,
+        "every_component_terminal_reopened_and_content_hash_matched": True,
+        "every_component_receipt_self_authenticated": True,
+        "complete_text_and_chunk_coverage_reauthenticated": True,
+        "coverage_reauthentication_basis": (
+            "fresh_parent_component_tree_terminal_and_receipt_validation_v1"
+        ),
+    }
+    return {**body, "content_sha256": _sha256_json(body)}
+
+
+def _maximum_interval_overlap(
+    rows: Sequence[Mapping[str, Any]],
+) -> int:
+    events: list[tuple[int, int]] = []
+    for row in rows:
+        started = row.get("started_monotonic_ns")
+        finished = row.get("finished_monotonic_ns")
+        if (
+            isinstance(started, bool)
+            or not isinstance(started, int)
+            or isinstance(finished, bool)
+            or not isinstance(finished, int)
+            or finished <= started
+        ):
+            raise ValueError("first-owner task interval is invalid")
+        events.extend(((started, 1), (finished, -1)))
+    active = 0
+    maximum = 0
+    for _timestamp, delta in sorted(
+        events,
+        key=lambda event: (event[0], event[1]),
+    ):
+        active += delta
+        if active < 0:
+            raise ValueError(
+                "first-owner task interval released an inactive lease"
+            )
+        maximum = max(maximum, active)
+    if active != 0:
+        raise ValueError("first-owner task intervals are not closed")
+    return maximum
+
+
+def _validate_first_owner_task_phase(
+    value: Any,
+    *,
+    phase: str,
+    devices: tuple[str, ...],
+) -> dict[str, Any]:
+    report = _validated_operational_attestation(
+        value,
+        label=f"neural-query {phase}",
+        schema="production_neural_query_task_phase_execution_attestation_v1",
+    )
+    intervals = report.get("task_intervals")
+    per_device = report.get("per_device")
+    configured = report.get("configured_parallelism")
+    actual_count = report.get("actual_task_count")
+    maximum = report.get("maximum_concurrent_leases")
+    if (
+        report.get("phase") != phase
+        or not isinstance(intervals, list)
+        or not intervals
+        or {
+            str(row.get("device"))
+            for row in intervals
+            if isinstance(row, Mapping)
+        }
+        != set(devices)
+        or not isinstance(per_device, Mapping)
+        or set(per_device) != set(devices)
+        or isinstance(configured, bool)
+        or not isinstance(configured, int)
+        or configured < 1
+        or isinstance(actual_count, bool)
+        or not isinstance(actual_count, int)
+        or actual_count != len(intervals)
+        or isinstance(maximum, bool)
+        or not isinstance(maximum, int)
+        or maximum != _maximum_interval_overlap(intervals)
+        or maximum > configured
+        or report.get("configured_total_parallelism_respected") is not True
+        or report.get("configured_per_device_slots_respected") is not True
+        or report.get("waiting_tasks_hold_no_lease") is not True
+        or report.get("canonical_result_order_restored") is not True
+        or (
+            configured > 1
+            and actual_count > 1
+            and (
+                maximum < 2
+                or report.get("process_isolated") is not True
+            )
+        )
+        or any(
+            not isinstance(per_device[device], Mapping)
+            or int(per_device[device].get("task_count", 0)) < 1
+            for device in devices
+        )
+    ):
+        raise ValueError(
+            f"neural-query {phase} execution serialized or changed resources"
+        )
+    return {
+        "content_sha256": report["content_sha256"],
+        "configured_parallelism": configured,
+        "actual_task_count": actual_count,
+        "maximum_concurrent_leases": maximum,
+        "devices": list(devices),
+    }
+
+
+def _validate_first_owner_component_reports(
+    *,
+    result: RoleNeutralPhysicalOwnerResult | None = None,
+    execution_telemetry: Mapping[str, Any] | None = None,
+    policy: RoleNeutralStage1ExecutionPolicy | None = None,
+    gate: RoleNeutralFirstOwnerValidationPolicy,
+) -> dict[str, Any]:
+    del policy
+    if (result is None) is (execution_telemetry is None):
+        raise ValueError(
+            "first-owner component validation requires exactly one "
+            "telemetry source"
+        )
+    telemetry = (
+        result.execution_telemetry
+        if result is not None
+        else execution_telemetry
+    )
+    if not isinstance(telemetry, Mapping):
+        raise ValueError("first owner omitted execution telemetry")
+    worker_report: Any = telemetry
+    if worker_report.get("schema_version") != (
+        "production_role_neutral_component_operational_reports_v2"
+    ):
+        worker_report = telemetry.get("worker_report")
+    if (
+        not isinstance(worker_report, Mapping)
+        or worker_report.get("schema_version")
+        != "production_role_neutral_component_operational_reports_v2"
+    ):
+        raise ValueError(
+            "first owner omitted its authenticated component reports"
+        )
+    reports = worker_report.get("component_reports")
+    expected_reports = {
+        "htr",
+        "matched_pair",
+        "tfidf",
+        "neural_query",
+    }
+    if not isinstance(reports, Mapping) or set(reports) != expected_reports:
+        raise ValueError(
+            "first owner did not attest every parallel producer"
+        )
+
+    htr = _validated_operational_attestation(
+        reports["htr"],
+        label="HTR",
+        schema=ROLE_NEUTRAL_HTR_OPERATIONAL_ATTESTATION_SCHEMA,
+    )
+    htr_plan = htr.get("fold_resource_plan")
+    htr_execution = htr.get("fold_execution")
+    if (
+        not isinstance(htr_plan, Mapping)
+        or htr_plan.get("devices") != list(gate.devices)
+        or not isinstance(htr_execution, Mapping)
+        or htr_execution.get("resource_plan") != htr_plan
+        or htr_execution.get("nuisance_barrier_enforced") is not True
+        or htr_execution.get(
+            "effect_submitted_only_after_nuisance_oof_and_residuals"
+        )
+        is not True
+        or htr_execution.get(
+            "every_selected_device_used_by_each_stage"
+        )
+        is not True
+    ):
+        raise ValueError("first-owner HTR execution changed its resource plan")
+    htr_intervals = htr_execution.get("fold_intervals")
+    if not isinstance(htr_intervals, list) or not htr_intervals:
+        raise ValueError("first-owner HTR fold intervals are missing")
+    htr_nuisance = [
+        row for row in htr_intervals if row.get("stage") == "nuisance"
+    ]
+    htr_effect = [
+        row for row in htr_intervals if row.get("stage") == "effect"
+    ]
+    htr_parallelism = int(htr_plan.get("fold_parallelism", 0))
+    htr_nuisance_overlap = _maximum_interval_overlap(htr_nuisance)
+    htr_effect_overlap = _maximum_interval_overlap(htr_effect)
+    if (
+        htr_parallelism < 1
+        or int(htr_execution.get("maximum_concurrent_fold_leases", 0))
+        > htr_parallelism
+        or (
+            htr_parallelism > 1
+            and (
+                htr_nuisance_overlap < 2
+                or htr_effect_overlap < 2
+                or htr_execution.get("process_isolated_rng") is not True
+            )
+        )
+    ):
+        raise ValueError("first-owner HTR folds serialized")
+
+    matched = _validated_operational_attestation(
+        reports["matched_pair"],
+        label="matched-pair",
+        schema=_MATCHED_PAIR_OPERATIONAL_ATTESTATION_SCHEMA,
+    )
+    matched_plan = matched.get("fold_resource_plan")
+    matched_execution = matched.get("fold_execution")
+    if (
+        not isinstance(matched_plan, Mapping)
+        or matched_plan.get("devices") != list(gate.devices)
+        or not isinstance(matched_execution, Mapping)
+        or matched_execution.get("resource_plan") != matched_plan
+        or matched_execution.get("every_selected_device_used") is not True
+    ):
+        raise ValueError(
+            "first-owner matched-pair execution changed its resource plan"
+        )
+    matched_intervals = matched_execution.get("fold_intervals")
+    if not isinstance(matched_intervals, list) or not matched_intervals:
+        raise ValueError("first-owner matched-pair intervals are missing")
+    matched_parallelism = int(
+        matched_plan.get("fold_parallelism", 0)
+    )
+    matched_overlap = _maximum_interval_overlap(matched_intervals)
+    if (
+        matched_parallelism < 1
+        or matched_overlap
+        != int(
+            matched_execution.get(
+                "maximum_concurrent_fold_leases",
+                -1,
+            )
+        )
+        or matched_overlap > matched_parallelism
+        or (
+            matched_parallelism > 1
+            and (
+                matched_overlap < 2
+                or matched_execution.get(
+                    "process_isolated_rng_and_torch_determinism"
+                )
+                is not True
+            )
+        )
+    ):
+        raise ValueError("first-owner matched-pair folds serialized")
+
+    tfidf = _validated_operational_attestation(
+        reports["tfidf"],
+        label="TF-IDF",
+        schema=_TFIDF_NUISANCE_EXECUTION_ATTESTATION_SCHEMA,
+    )
+    tfidf_effective = int(tfidf.get("effective_workers", 0))
+    tfidf_overlap = int(
+        tfidf.get("actual_peak_concurrent_fold_workers", 0)
+    )
+    tfidf_pids = tfidf.get("worker_pids")
+    if (
+        tfidf.get("configured_backend")
+        != gate.required_tfidf_parallel_backend
+        or tfidf_effective < 1
+        or tfidf_overlap < 1
+        or tfidf_overlap > tfidf_effective
+        or tfidf.get("subfold_parallelism") != 1
+        or tfidf.get("subfold_joblib_pools_created") is not False
+        or tfidf.get("full_data_base_fits_after_fold_barrier") is not True
+        or tfidf.get("final_stack_fits_after_fold_barrier") is not True
+        or (
+            tfidf_effective > 1
+            and (
+                tfidf_overlap < 2
+                or tfidf.get("fold_overlap_observed") is not True
+                or not isinstance(tfidf_pids, list)
+                or (
+                    gate.required_tfidf_parallel_backend == "processes"
+                    and len(set(tfidf_pids)) < 2
+                )
+            )
+        )
+    ):
+        raise ValueError("first-owner TF-IDF folds serialized")
+
+    neural = _validated_operational_attestation(
+        reports["neural_query"],
+        label="neural-query",
+        schema=(
+            "production_role_neutral_neural_query_operational_attestation_v1"
+        ),
+    )
+    neural_plan = neural.get("resource_plan")
+    phases = neural.get("phases")
+    expected_phase_order = [
+        "inner_folds_then_consensus_final_refits",
+        "safe_evidence_banks",
+        "heldout_moment_banks",
+    ]
+    if (
+        not isinstance(neural_plan, Mapping)
+        or neural_plan.get("devices") != list(gate.devices)
+        or neural.get("phase_order") != expected_phase_order
+        or neural.get("phase_count") != len(expected_phase_order)
+        or not isinstance(phases, list)
+        or len(phases) != len(expected_phase_order)
+        or neural.get("all_phase_attestations_self_authenticated")
+        is not True
+        or neural.get("canonical_execution_order_preserved") is not True
+    ):
+        raise ValueError(
+            "first-owner neural-query operational coverage changed"
+        )
+    discovery_wrapper = phases[0]
+    if (
+        not isinstance(discovery_wrapper, Mapping)
+        or discovery_wrapper.get("phase_index") != 0
+        or discovery_wrapper.get("phase")
+        != "inner_folds_then_consensus_final_refits"
+    ):
+        raise ValueError("first-owner neural discovery phase changed")
+    discovery = _validated_operational_attestation(
+        discovery_wrapper.get("attestation"),
+        label="neural-query discovery",
+        schema="production_neural_query_discovery_execution_attestation_v1",
+    )
+    if (
+        discovery.get("resource_plan") != neural_plan
+        or discovery.get("inner_fold_barrier_enforced") is not True
+        or discovery.get(
+            "all_inner_results_verified_before_final_task_construction"
+        )
+        is not True
+    ):
+        raise ValueError("first-owner neural-query barrier changed")
+    neural_summaries = {
+        "inner_folds": _validate_first_owner_task_phase(
+            discovery.get("inner_fold_phase"),
+            phase="inner_folds",
+            devices=gate.devices,
+        ),
+        "consensus_and_final_refit_banks": (
+            _validate_first_owner_task_phase(
+                discovery.get("final_bank_phase"),
+                phase="consensus_and_final_refit_banks",
+                devices=gate.devices,
+            )
+        ),
+    }
+    for index, phase in enumerate(
+        ("safe_evidence_banks", "heldout_moment_banks"),
+        start=1,
+    ):
+        wrapper = phases[index]
+        if (
+            not isinstance(wrapper, Mapping)
+            or wrapper.get("phase_index") != index
+            or wrapper.get("phase") != phase
+        ):
+            raise ValueError(
+                f"first-owner neural-query {phase} wrapper changed"
+            )
+        neural_summaries[phase] = _validate_first_owner_task_phase(
+            wrapper.get("attestation"),
+            phase=phase,
+            devices=gate.devices,
+        )
+
+    return {
+        "htr": {
+            "content_sha256": htr["content_sha256"],
+            "nuisance_maximum_concurrent_leases": (
+                htr_nuisance_overlap
+            ),
+            "effect_maximum_concurrent_leases": htr_effect_overlap,
+            "devices": list(gate.devices),
+        },
+        "matched_pair": {
+            "content_sha256": matched["content_sha256"],
+            "maximum_concurrent_leases": matched_overlap,
+            "devices": list(gate.devices),
+        },
+        "tfidf": {
+            "content_sha256": tfidf["content_sha256"],
+            "effective_workers": tfidf_effective,
+            "maximum_concurrent_leases": tfidf_overlap,
+            "backend": gate.required_tfidf_parallel_backend,
+        },
+        "neural_query": {
+            "content_sha256": neural["content_sha256"],
+            "phases": neural_summaries,
+            "devices": list(gate.devices),
+        },
+        "every_parallel_component_report_self_authenticated": True,
+        "configured_parallel_work_did_not_serialize": True,
+    }
+
+
+def _first_owner_memory_observation(
+    *,
+    samples: Sequence[Mapping[str, Any]],
+    sampling_errors: Sequence[Mapping[str, str]],
+    policy: RoleNeutralFirstOwnerValidationPolicy,
+) -> dict[str, Any]:
+    if sampling_errors:
+        raise RuntimeError(
+            "first-owner GPU sampler recorded one or more errors"
+        )
+    by_device = {
+        device: [
+            copy.deepcopy(dict(row))
+            for row in samples
+            if str(row.get("device")) == device
+        ]
+        for device in policy.devices
+    }
+    result: dict[str, Any] = {}
+    for device in policy.devices:
+        rows = by_device[device]
+        uuids = {
+            str(row.get("uuid"))
+            for row in rows
+            if isinstance(row.get("uuid"), str)
+            and str(row.get("uuid")).strip()
+        }
+        totals = {
+            int(row.get("memory_total_bytes", 0))
+            for row in rows
+            if isinstance(row.get("memory_total_bytes"), int)
+            and not isinstance(row.get("memory_total_bytes"), bool)
+        }
+        used = [
+            int(row.get("memory_used_bytes", -1))
+            for row in rows
+            if isinstance(row.get("memory_used_bytes"), int)
+            and not isinstance(row.get("memory_used_bytes"), bool)
+        ]
+        acquisition_brackets: list[tuple[float, float, float]] = []
+        for row in rows:
+            started = row.get(
+                "sample_acquisition_started_monotonic_seconds"
+            )
+            finished = row.get(
+                "sample_acquisition_finished_monotonic_seconds"
+            )
+            sampled = row.get("sample_monotonic_seconds")
+            if (
+                isinstance(started, bool)
+                or not isinstance(started, (int, float))
+                or not math.isfinite(float(started))
+                or isinstance(finished, bool)
+                or not isinstance(finished, (int, float))
+                or not math.isfinite(float(finished))
+                or float(finished) < float(started)
+                or isinstance(sampled, bool)
+                or not isinstance(sampled, (int, float))
+                or not math.isfinite(float(sampled))
+                or float(sampled) != float(finished)
+            ):
+                raise RuntimeError(
+                    "first-owner GPU sample lacks its acquisition bracket"
+                )
+            acquisition_brackets.append(
+                (
+                    float(started),
+                    float(finished),
+                    float(sampled),
+                )
+            )
+        if (
+            len(rows) < 2
+            or len(uuids) != 1
+            or len(totals) != 1
+            or next(iter(totals)) <= 0
+            or len(used) != len(rows)
+            or any(value < 0 for value in used)
+            or [
+                bracket[2] for bracket in acquisition_brackets
+            ]
+            != sorted(
+                bracket[2] for bracket in acquisition_brackets
+            )
+        ):
+            raise RuntimeError(
+                f"first-owner GPU telemetry is incomplete for {device}"
+            )
+        total = next(iter(totals))
+        peak = max(used)
+        if peak > total:
+            raise RuntimeError(
+                f"first-owner GPU allocation exceeds capacity on {device}"
+            )
+        fraction = peak / total
+        headroom = total - peak
+        result[device] = {
+            "uuid": next(iter(uuids)),
+            "sample_count": len(rows),
+            "memory_total_bytes": total,
+            "host_peak_memory_used_bytes": peak,
+            "peak_memory_used_bytes": peak,
+            "memory_acceptance_peak_bytes": peak,
+            "memory_acceptance_peak_source": (
+                "host_nvml_absolute_peak"
+            ),
+            "peak_allocation_fraction": fraction,
+            "minimum_headroom_bytes": headroom,
+            "maximum_allocation_fraction_threshold": (
+                policy.gpu_max_allocation_fraction
+            ),
+            "minimum_headroom_threshold_bytes": (
+                policy.gpu_minimum_headroom_bytes
+            ),
+            "allocation_fraction_accepted": (
+                fraction <= policy.gpu_max_allocation_fraction
+            ),
+            "headroom_accepted": (
+                headroom >= policy.gpu_minimum_headroom_bytes
+            ),
+            "host_nvml_absolute_peak_used_for_acceptance": True,
+            "sample_timestamp_is_acquisition_completion": True,
+            "sample_acquisition_brackets_retained": True,
+        }
+    accepted = not any(
+        row["allocation_fraction_accepted"] is not True
+        or row["headroom_accepted"] is not True
+        for row in result.values()
+    )
+    return {
+        "devices": result,
+        "all_selected_devices_sampled": True,
+        "continuous_host_level_sampling": True,
+        "host_nvml_absolute_peak_used_for_acceptance": True,
+        "memory_acceptance_checks_absolute_peak_fraction_and_headroom": True,
+        "sample_timestamp_is_acquisition_completion": True,
+        "sample_acquisition_brackets_retained": True,
+        "maximum_allocation_fraction_respected": all(
+            row["allocation_fraction_accepted"] is True
+            for row in result.values()
+        ),
+        "minimum_headroom_respected": all(
+            row["headroom_accepted"] is True
+            for row in result.values()
+        ),
+        "accepted": accepted,
+    }
 
 
 def _compare_role_neutral_compute_canary(
@@ -1424,11 +2436,7 @@ def execute_and_publish_role_neutral_stage1(
     )
     groups = {owner.scope_id: (owner, members) for owner, members in plan.physical_scope_groups}
     effective_owner_concurrency = (
-        max(
-            1,
-            int(policy.max_parallel_owners)
-            // len(policy.resource_plan.devices),
-        )
+        1
         if policy.htr_operational_controls is not None
         else int(policy.max_parallel_owners)
     )
@@ -1454,6 +2462,9 @@ def execute_and_publish_role_neutral_stage1(
                 )
             ),
             htr_operational_controls=policy.htr_operational_controls,
+            neural_query_operational_controls=(
+                policy.neural_query_operational_controls
+            ),
             htr_fold_devices=(
                 tuple(policy.resource_plan.devices)
                 if policy.htr_operational_controls is not None
@@ -1468,6 +2479,7 @@ def execute_and_publish_role_neutral_stage1(
     claim_lock = threading.Lock()
     claimed: set[str] = set()
     canary_result: dict[str, Any] | None = None
+    first_owner_validation_result: dict[str, Any] | None = None
     preexecuted_results: list[RoleNeutralPhysicalOwnerResult] = []
     canary_replica_results: tuple[
         RoleNeutralPhysicalOwnerResult,
@@ -1540,8 +2552,229 @@ def execute_and_publish_role_neutral_stage1(
 
     def run_productive_compute() -> Sequence[RoleNeutralPhysicalOwnerResult]:
         nonlocal canary_result, canary_replica_results
+        nonlocal first_owner_validation_result
 
         executor_tasks = tasks
+        gate_policy = policy.first_owner_validation
+        if gate_policy is not None:
+            selected_task = tasks[0]
+            gate_path = _first_owner_gate_path(destination)
+            gate_started_monotonic_ns = time.monotonic_ns()
+            sampler = _FirstOwnerGpuSampler(
+                devices=gate_policy.devices,
+                interval_seconds=(
+                    gate_policy.gpu_sample_interval_seconds
+                ),
+            )
+            selected_result: RoleNeutralPhysicalOwnerResult | None = None
+            scientific_replica: Mapping[str, Any] | None = None
+            receipt_reauthentication: Mapping[str, Any] | None = None
+            component_summary: Mapping[str, Any] | None = None
+            memory_observation: Mapping[str, Any] | None = None
+            failures: list[dict[str, str]] = []
+
+            def record_failure(stage: str, exc: BaseException) -> None:
+                failures.append(
+                    {
+                        "stage": stage,
+                        "exception_type": type(exc).__name__,
+                        "message": str(exc),
+                    }
+                )
+
+            try:
+                with sampler:
+                    if process_isolated:
+                        selected_result = execute_isolated_tasks(
+                            (selected_task,),
+                            max_workers=1,
+                        )[0]
+                    else:
+                        raw = execute(
+                            tasks=(selected_task,),
+                            worker=guarded_worker,
+                            max_workers=1,
+                            cpu_budget=int(
+                                policy.resource_plan.cpu_budget
+                            ),
+                        )
+                        first_rows = (
+                            ()
+                            if isinstance(
+                                raw,
+                                (str, bytes, Mapping),
+                            )
+                            else tuple(raw)
+                        )
+                        if (
+                            isinstance(raw, (str, bytes, Mapping))
+                            or len(first_rows) != 1
+                        ):
+                            raise ValueError(
+                                "first-owner executor returned another result "
+                                "cardinality"
+                            )
+                        only = first_rows[0]
+                        selected_result = (
+                            _freshly_reauthenticate_owner_result(
+                                task=selected_task,
+                                result=only,
+                            )
+                        )
+            except BaseException as exc:
+                record_failure("owner_execution", exc)
+
+            if selected_result is not None:
+                try:
+                    receipt_reauthentication = (
+                        _first_owner_receipt_reauthentication(
+                            selected_result
+                        )
+                    )
+                except BaseException as exc:
+                    record_failure(
+                        "component_receipt_reauthentication",
+                        exc,
+                    )
+                try:
+                    scientific_replica = (
+                        _compute_canary_scientific_replica(
+                            selected_result
+                        )
+                    )
+                except BaseException as exc:
+                    record_failure(
+                        "scientific_and_text_coverage",
+                        exc,
+                    )
+                try:
+                    component_summary = (
+                        _validate_first_owner_component_reports(
+                            result=selected_result,
+                            policy=policy,
+                            gate=gate_policy,
+                        )
+                    )
+                except BaseException as exc:
+                    record_failure("component_parallelism", exc)
+            try:
+                memory_observation = _first_owner_memory_observation(
+                    samples=sampler.samples,
+                    sampling_errors=sampler.errors,
+                    policy=gate_policy,
+                )
+                if memory_observation.get("accepted") is not True:
+                    raise RuntimeError(
+                        "first-owner GPU memory exceeded the deployment "
+                        "safety policy"
+                    )
+            except BaseException as exc:
+                record_failure("gpu_memory", exc)
+
+            gate_finished_monotonic_ns = time.monotonic_ns()
+            passed = not failures
+            diagnostic_body = {
+                "schema_version": (
+                    ROLE_NEUTRAL_FIRST_OWNER_VALIDATION_GATE_SCHEMA
+                ),
+                "status": "passed" if passed else "failed",
+                "plan_scientific_content_sha256": (
+                    plan.scientific_content_sha256
+                ),
+                "physical_owner_scope_id": (
+                    selected_task.physical_owner.scope_id
+                ),
+                "physical_owner_canonical_index": int(
+                    selected_task.physical_owner.canonical_index
+                ),
+                "canonical_fit_row_ids": list(
+                    selected_task.physical_owner.fit_row_ids
+                ),
+                "canonical_heldout_row_ids": list(
+                    selected_task.physical_owner.heldout_row_ids
+                ),
+                "canonical_group_seed": int(
+                    selected_task.physical_owner.scope_seed
+                ),
+                "policy": gate_policy.as_dict(),
+                "started_monotonic_ns": gate_started_monotonic_ns,
+                "finished_monotonic_ns": gate_finished_monotonic_ns,
+                "gpu_samples": [
+                    copy.deepcopy(dict(row))
+                    for row in sampler.samples
+                ],
+                "gpu_sampling_errors": [
+                    copy.deepcopy(dict(row))
+                    for row in sampler.errors
+                ],
+                "gpu_memory_observation": (
+                    None
+                    if memory_observation is None
+                    else copy.deepcopy(dict(memory_observation))
+                ),
+                "component_execution_validation": (
+                    None
+                    if component_summary is None
+                    else copy.deepcopy(dict(component_summary))
+                ),
+                "complete_scientific_owner_replica": (
+                    None
+                    if scientific_replica is None
+                    else copy.deepcopy(dict(scientific_replica))
+                ),
+                "fresh_component_receipt_reauthentication": (
+                    None
+                    if receipt_reauthentication is None
+                    else copy.deepcopy(
+                        dict(receipt_reauthentication)
+                    )
+                ),
+                "fresh_parent_reauthentication_completed": (
+                    receipt_reauthentication is not None
+                ),
+                "complete_text_and_chunk_coverage_reauthenticated": (
+                    receipt_reauthentication is not None
+                    and receipt_reauthentication.get(
+                        "complete_text_and_chunk_coverage_reauthenticated"
+                    )
+                    is True
+                ),
+                "complete_text_and_chunk_coverage_basis": (
+                    None
+                    if receipt_reauthentication is None
+                    else receipt_reauthentication.get(
+                        "coverage_reauthentication_basis"
+                    )
+                ),
+                "owner_two_submitted_before_gate": False,
+                "selected_owner_adopted_as_production_result": passed,
+                "replica_b_executed": False,
+                "failures": failures,
+                "operational_gate_in_scientific_identity": False,
+                "external_processes_killed": False,
+            }
+            diagnostic = {
+                **diagnostic_body,
+                "content_sha256": _sha256_json(diagnostic_body),
+            }
+            first_owner_validation_result = diagnostic
+            _durably_publish_first_owner_gate(
+                path=gate_path,
+                value=diagnostic,
+            )
+            if not passed or selected_result is None:
+                raise RuntimeError(
+                    "first complete Stage 1 owner failed its hard "
+                    f"validation gate before owner two: {gate_path}"
+                )
+            if process_isolated:
+                with claim_lock:
+                    claimed.add(
+                        selected_task.physical_owner.scope_id
+                    )
+            preexecuted_results.append(selected_result)
+            executor_tasks = tasks[1:]
+
         if policy.compute_canary is not None:
             selected_owner = _canary_owner(
                 plan=plan,
@@ -1567,6 +2800,11 @@ def execute_and_publish_role_neutral_stage1(
                 )
             )
             try:
+                replica_b_resource = _canary_replica_resource(
+                    primary_resource=selected_task.resource,
+                    policy=policy.compute_canary,
+                    resource_plan=policy.resource_plan,
+                )
                 replica_b_task = RoleNeutralPhysicalOwnerTask(
                     plan=plan,
                     physical_owner=selected_task.physical_owner,
@@ -1574,18 +2812,17 @@ def execute_and_publish_role_neutral_stage1(
                     component_parent=(
                         scratch_tree / selected_task.physical_owner.scope_id
                     ),
-                    resource=_canary_replica_resource(
-                        primary_resource=selected_task.resource,
-                        policy=policy.compute_canary,
-                        resource_plan=policy.resource_plan,
-                    ),
+                    resource=replica_b_resource,
                     htr_operational_controls=(
                         policy.htr_operational_controls
+                    ),
+                    neural_query_operational_controls=(
+                        policy.neural_query_operational_controls
                     ),
                     htr_fold_devices=(
                         tuple(policy.resource_plan.devices)
                         if policy.htr_operational_controls is not None
-                        else (selected_task.resource,)
+                        else (replica_b_resource,)
                     ),
                     owner_cpu_budget=selected_task.owner_cpu_budget,
                 )
@@ -1635,7 +2872,7 @@ def execute_and_publish_role_neutral_stage1(
         if process_isolated:
             results = execute_isolated_tasks(
                 executor_tasks,
-                max_workers=int(policy.max_parallel_owners),
+                max_workers=effective_owner_concurrency,
             )
             with claim_lock:
                 claimed.update(
@@ -1645,7 +2882,7 @@ def execute_and_publish_role_neutral_stage1(
         return execute(
             tasks=executor_tasks,
             worker=guarded_worker,
-            max_workers=int(policy.max_parallel_owners),
+            max_workers=effective_owner_concurrency,
             cpu_budget=int(policy.resource_plan.cpu_budget),
         )
 
@@ -1656,7 +2893,7 @@ def execute_and_publish_role_neutral_stage1(
         )
         with open_session(
             resources=tuple(policy.resource_plan.devices),
-            max_workers=int(policy.max_parallel_owners),
+            max_workers=effective_owner_concurrency,
             cpu_budget=int(policy.resource_plan.cpu_budget),
             marker_root=session_marker_root,
         ) as persistent_session:
@@ -1726,11 +2963,34 @@ def execute_and_publish_role_neutral_stage1(
             "size_bytes": canary_size,
             "content_sha256": canary_result["content_sha256"],
         }
+    first_owner_validation_registration: dict[str, Any] | None = None
+    if first_owner_validation_result is not None:
+        first_owner_path = _first_owner_gate_path(destination)
+        first_owner_sha256, first_owner_size = _private_file_identity(
+            first_owner_path
+        )
+        first_owner_validation_registration = {
+            "relative_path": (
+                ROLE_NEUTRAL_FIRST_OWNER_VALIDATION_GATE_SUFFIX
+            ),
+            "sha256": first_owner_sha256,
+            "size_bytes": first_owner_size,
+            "content_sha256": (
+                first_owner_validation_result["content_sha256"]
+            ),
+        }
     attestation_body = {
         "schema_version": ROLE_NEUTRAL_STAGE1_EXECUTION_ATTESTATION_SCHEMA,
         "plan_scientific_content_sha256": plan.scientific_content_sha256,
         "resource_attestation": resource_attestation,
         "max_parallel_owners": int(policy.max_parallel_owners),
+        "effective_max_parallel_owners": effective_owner_concurrency,
+        "owner_cpu_budget": owner_cpu_budget,
+        "effective_owner_concurrency_policy": (
+            "htr_union_device_owner_serialization_v1"
+            if policy.htr_operational_controls is not None
+            else "configured_topology_capacity_v1"
+        ),
         "cpu_budget": int(policy.resource_plan.cpu_budget),
         "submitted_owner_order": list(physical_order),
         "completed_owner_order": list(completion_order),
@@ -1741,6 +3001,9 @@ def execute_and_publish_role_neutral_stage1(
         "physical_owner_execution_count": len(claimed),
         "producer_execution_count": (len(claimed) * len(EXPECTED_COMPONENT_FAMILIES)),
         "compute_canary": copy.deepcopy(canary_registration),
+        "first_owner_validation": copy.deepcopy(
+            first_owner_validation_registration
+        ),
         "compute_canary_replica_execution_count": (
             2 if canary_result is not None else 0
         ),
@@ -1811,6 +3074,420 @@ def execute_and_publish_role_neutral_stage1(
         root=destination,
         plan=plan,
     )
+
+
+def _first_owner_policy_from_dict(
+    value: Any,
+) -> RoleNeutralFirstOwnerValidationPolicy:
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema_version",
+        "devices",
+        "gpu_max_allocation_fraction",
+        "gpu_minimum_headroom_bytes",
+        "gpu_sample_interval_seconds",
+        "required_tfidf_parallel_backend",
+    }:
+        raise ValueError("first-owner validation policy is malformed")
+    policy = RoleNeutralFirstOwnerValidationPolicy(
+        devices=tuple(value["devices"]),
+        gpu_max_allocation_fraction=value[
+            "gpu_max_allocation_fraction"
+        ],
+        gpu_minimum_headroom_bytes=value[
+            "gpu_minimum_headroom_bytes"
+        ],
+        gpu_sample_interval_seconds=value[
+            "gpu_sample_interval_seconds"
+        ],
+        required_tfidf_parallel_backend=value[
+            "required_tfidf_parallel_backend"
+        ],
+        schema_version=value["schema_version"],
+    )
+    if policy.as_dict() != dict(value):
+        raise ValueError("first-owner validation policy changed on reload")
+    return policy
+
+
+def _validate_first_owner_receipt_reauthentication(
+    value: Any,
+    *,
+    physical_owner_scope_id: str,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(
+            "first-owner receipt reauthentication is missing"
+        )
+    result = copy.deepcopy(dict(value))
+    body = {
+        key: copy.deepcopy(child)
+        for key, child in result.items()
+        if key != "content_sha256"
+    }
+    expected_fields = {
+        "schema_version",
+        "physical_owner_scope_id",
+        "canonical_component_order",
+        "components",
+        "component_root_count",
+        "every_component_root_reopened_and_tree_rehashed",
+        "every_component_terminal_reopened_and_content_hash_matched",
+        "every_component_receipt_self_authenticated",
+        "complete_text_and_chunk_coverage_reauthenticated",
+        "coverage_reauthentication_basis",
+        "content_sha256",
+    }
+    components = result.get("components")
+    if (
+        set(result) != expected_fields
+        or result.get("schema_version")
+        != (
+            "production_role_neutral_first_owner_receipt_"
+            "reauthentication_v1"
+        )
+        or result.get("physical_owner_scope_id")
+        != physical_owner_scope_id
+        or result.get("canonical_component_order")
+        != list(EXPECTED_COMPONENT_FAMILIES)
+        or not isinstance(components, list)
+        or len(components) != len(EXPECTED_COMPONENT_FAMILIES)
+        or result.get("component_root_count") != len(components)
+        or result.get(
+            "every_component_root_reopened_and_tree_rehashed"
+        )
+        is not True
+        or result.get(
+            "every_component_terminal_reopened_and_content_hash_matched"
+        )
+        is not True
+        or result.get("every_component_receipt_self_authenticated")
+        is not True
+        or result.get(
+            "complete_text_and_chunk_coverage_reauthenticated"
+        )
+        is not True
+        or result.get("coverage_reauthentication_basis")
+        != (
+            "fresh_parent_component_tree_terminal_and_receipt_"
+            "validation_v1"
+        )
+        or result.get("content_sha256") != _sha256_json(body)
+    ):
+        raise ValueError(
+            "first-owner receipt reauthentication is invalid"
+        )
+    expected_component_fields = {
+        "component",
+        "component_authentication_content_sha256",
+        "component_scientific_content_sha256",
+        "component_execution_attestation_content_sha256",
+        "source_terminal_content_sha256",
+        "source_tree_sha256",
+        "family_fit_artifact_sha256",
+        "registered_heldout_labels_accessed",
+        "oracle_fields_accessed",
+        "text_truncation_applied",
+        "lossy_evidence_selection_applied",
+    }
+    for component, row in zip(
+        EXPECTED_COMPONENT_FAMILIES,
+        components,
+        strict=True,
+    ):
+        if not isinstance(row, Mapping):
+            raise ValueError(
+                "first-owner receipt component row is malformed"
+            )
+        scientific_sha256 = _require_sha256(
+            row.get("component_scientific_content_sha256"),
+            label=f"first-owner {component} scientific receipt",
+        )
+        tree_sha256 = _require_sha256(
+            row.get("source_tree_sha256"),
+            label=f"first-owner {component} source tree",
+        )
+        family_ids = row.get("family_fit_artifact_sha256")
+        execution_body = {
+            "schema_version": (
+                "production_role_neutral_component_execution_"
+                "attestation_v1"
+            ),
+            "component_scientific_content_sha256": scientific_sha256,
+            "source_tree_sha256": tree_sha256,
+        }
+        if (
+            set(row) != expected_component_fields
+            or row.get("component") != component
+            or not isinstance(family_ids, Mapping)
+            or set(family_ids)
+            != set(EXPECTED_COMPONENT_FAMILIES[component])
+            or any(
+                _require_sha256(
+                    digest,
+                    label=f"first-owner {component} family fit",
+                )
+                != digest
+                for digest in family_ids.values()
+            )
+            or _require_sha256(
+                row.get("component_authentication_content_sha256"),
+                label=f"first-owner {component} authentication receipt",
+            )
+            != row.get("component_authentication_content_sha256")
+            or _require_sha256(
+                row.get("source_terminal_content_sha256"),
+                label=f"first-owner {component} source terminal",
+            )
+            != row.get("source_terminal_content_sha256")
+            or row.get(
+                "component_execution_attestation_content_sha256"
+            )
+            != _sha256_json(execution_body)
+            or row.get("registered_heldout_labels_accessed")
+            is not False
+            or row.get("oracle_fields_accessed") is not False
+            or row.get("text_truncation_applied") is not False
+            or row.get("lossy_evidence_selection_applied") is not False
+        ):
+            raise ValueError(
+                f"first-owner {component} receipt binding is invalid"
+            )
+    return result
+
+
+def _validate_first_owner_gate_attestation(
+    *,
+    path: Path,
+    plan: Stage1ScopePlan,
+    registration: Mapping[str, Any],
+    selected_devices: Sequence[str],
+) -> dict[str, Any]:
+    expected_registration = {
+        "relative_path",
+        "sha256",
+        "size_bytes",
+        "content_sha256",
+    }
+    if (
+        set(registration) != expected_registration
+        or registration.get("relative_path")
+        != ROLE_NEUTRAL_FIRST_OWNER_VALIDATION_GATE_SUFFIX
+    ):
+        raise ValueError(
+            "first-owner validation registration is malformed"
+        )
+    digest, size = _private_file_identity(path)
+    value = _read_json(
+        path,
+        label="first-owner validation gate",
+    )
+    body = {
+        key: copy.deepcopy(child)
+        for key, child in value.items()
+        if key != "content_sha256"
+    }
+    expected_fields = {
+        "schema_version",
+        "status",
+        "plan_scientific_content_sha256",
+        "physical_owner_scope_id",
+        "physical_owner_canonical_index",
+        "canonical_fit_row_ids",
+        "canonical_heldout_row_ids",
+        "canonical_group_seed",
+        "policy",
+        "started_monotonic_ns",
+        "finished_monotonic_ns",
+        "gpu_samples",
+        "gpu_sampling_errors",
+        "gpu_memory_observation",
+        "component_execution_validation",
+        "complete_scientific_owner_replica",
+        "fresh_component_receipt_reauthentication",
+        "fresh_parent_reauthentication_completed",
+        "complete_text_and_chunk_coverage_reauthenticated",
+        "complete_text_and_chunk_coverage_basis",
+        "owner_two_submitted_before_gate",
+        "selected_owner_adopted_as_production_result",
+        "replica_b_executed",
+        "failures",
+        "operational_gate_in_scientific_identity",
+        "external_processes_killed",
+        "content_sha256",
+    }
+    first_owner_id = plan.physical_execution_order[0]
+    owners = {
+        owner.scope_id: owner for owner in plan.physical_scopes
+    }
+    first_owner = owners[first_owner_id]
+    policy = _first_owner_policy_from_dict(value.get("policy"))
+    samples = value.get("gpu_samples")
+    sampling_errors = value.get("gpu_sampling_errors")
+    started = value.get("started_monotonic_ns")
+    finished = value.get("finished_monotonic_ns")
+    if (
+        set(value) != expected_fields
+        or value.get("schema_version")
+        != ROLE_NEUTRAL_FIRST_OWNER_VALIDATION_GATE_SCHEMA
+        or value.get("status") != "passed"
+        or value.get("plan_scientific_content_sha256")
+        != plan.scientific_content_sha256
+        or value.get("physical_owner_scope_id") != first_owner_id
+        or value.get("physical_owner_canonical_index")
+        != int(first_owner.canonical_index)
+        or value.get("canonical_fit_row_ids")
+        != list(first_owner.fit_row_ids)
+        or value.get("canonical_heldout_row_ids")
+        != list(first_owner.heldout_row_ids)
+        or value.get("canonical_group_seed")
+        != int(first_owner.scope_seed)
+        or policy.devices
+        != tuple(str(device) for device in selected_devices)
+        or isinstance(started, bool)
+        or not isinstance(started, int)
+        or isinstance(finished, bool)
+        or not isinstance(finished, int)
+        or finished <= started
+        or not isinstance(samples, list)
+        or not samples
+        or sampling_errors != []
+        or value.get("fresh_parent_reauthentication_completed")
+        is not True
+        or value.get(
+            "complete_text_and_chunk_coverage_reauthenticated"
+        )
+        is not True
+        or value.get("complete_text_and_chunk_coverage_basis")
+        != (
+            "fresh_parent_component_tree_terminal_and_receipt_"
+            "validation_v1"
+        )
+        or value.get("owner_two_submitted_before_gate") is not False
+        or value.get(
+            "selected_owner_adopted_as_production_result"
+        )
+        is not True
+        or value.get("replica_b_executed") is not False
+        or value.get("failures") != []
+        or value.get("operational_gate_in_scientific_identity")
+        is not False
+        or value.get("external_processes_killed") is not False
+        or value.get("content_sha256") != _sha256_json(body)
+        or digest
+        != _require_sha256(
+            registration.get("sha256"),
+            label="first-owner validation bytes",
+        )
+        or size != registration.get("size_bytes")
+        or value.get("content_sha256")
+        != _require_sha256(
+            registration.get("content_sha256"),
+            label="first-owner validation content",
+        )
+    ):
+        raise ValueError("first-owner validation gate is invalid")
+    memory = _first_owner_memory_observation(
+        samples=samples,
+        sampling_errors=sampling_errors,
+        policy=policy,
+    )
+    if (
+        memory.get("accepted") is not True
+        or value.get("gpu_memory_observation") != memory
+    ):
+        raise ValueError(
+            "first-owner validation memory evidence changed"
+        )
+    receipts = _validate_first_owner_receipt_reauthentication(
+        value.get("fresh_component_receipt_reauthentication"),
+        physical_owner_scope_id=first_owner_id,
+    )
+    replica = value.get("complete_scientific_owner_replica")
+    if not isinstance(replica, Mapping):
+        raise ValueError(
+            "first-owner validation scientific replica is missing"
+        )
+    replica_body = {
+        key: copy.deepcopy(child)
+        for key, child in replica.items()
+        if key != "content_sha256"
+    }
+    scientific_receipts = replica.get("component_scientific_receipts")
+    receipt_rows = receipts["components"]
+    from .portable_workflow_spec import EVIDENCE_FAMILIES
+
+    portable_family_ids = {
+        NATIVE_TO_PORTABLE_FAMILY[native_family]: digest
+        for row in receipt_rows
+        for native_family, digest in row[
+            "family_fit_artifact_sha256"
+        ].items()
+    }
+    if (
+        set(replica)
+        != {
+            "schema_version",
+            "physical_owner_scope_id",
+            "canonical_component_order",
+            "component_scientific_receipts",
+            "family_artifact_ids",
+            "all_ten_scientific_families_present",
+            "resource_locator_included",
+            "content_sha256",
+        }
+        or replica.get("schema_version")
+        != "production_role_neutral_compute_canary_scientific_replica_v1"
+        or replica.get("physical_owner_scope_id") != first_owner_id
+        or replica.get("canonical_component_order")
+        != list(EXPECTED_COMPONENT_FAMILIES)
+        or not isinstance(scientific_receipts, list)
+        or len(scientific_receipts) != len(receipt_rows)
+        or set(portable_family_ids) != set(EVIDENCE_FAMILIES)
+        or replica.get("family_artifact_ids")
+        != {
+            family: portable_family_ids[family]
+            for family in EVIDENCE_FAMILIES
+        }
+        or replica.get("all_ten_scientific_families_present")
+        is not True
+        or replica.get("resource_locator_included") is not False
+        or replica.get("content_sha256")
+        != _sha256_json(replica_body)
+        or any(
+            not isinstance(scientific, Mapping)
+            or scientific.get("component") != row["component"]
+            or scientific.get("content_sha256")
+            != row["component_scientific_content_sha256"]
+            or scientific.get("source_terminal_content_sha256")
+            != row["source_terminal_content_sha256"]
+            or scientific.get("family_fit_artifact_sha256")
+            != row["family_fit_artifact_sha256"]
+            for scientific, row in zip(
+                scientific_receipts,
+                receipt_rows,
+                strict=True,
+            )
+        )
+    ):
+        raise ValueError(
+            "first-owner validation scientific receipt binding changed"
+        )
+    component_summary = value.get("component_execution_validation")
+    if (
+        not isinstance(component_summary, Mapping)
+        or component_summary.get(
+            "every_parallel_component_report_self_authenticated"
+        )
+        is not True
+        or component_summary.get(
+            "configured_parallel_work_did_not_serialize"
+        )
+        is not True
+    ):
+        raise ValueError(
+            "first-owner validation component evidence is incomplete"
+        )
+    return value
 
 
 def _validate_compute_canary_attestation(
@@ -1938,9 +3615,15 @@ def validate_role_neutral_stage1_execution(
         ROLE_NEUTRAL_EXECUTION_ATTESTATION,
         ROLE_NEUTRAL_EXECUTION_MANIFEST,
     }
-    if top_level not in (
-        required_top_level,
-        required_top_level | {ROLE_NEUTRAL_COMPUTE_CANARY_ATTESTATION},
+    optional_top_level = {
+        ROLE_NEUTRAL_COMPUTE_CANARY_ATTESTATION,
+        ROLE_NEUTRAL_FIRST_OWNER_VALIDATION_GATE_SUFFIX,
+    }
+    if (
+        not required_top_level.issubset(top_level)
+        or not (top_level - required_top_level).issubset(
+            optional_top_level
+        )
     ):
         raise ValueError("role-neutral execution root has extra/missing data")
     manifest = _read_json(
@@ -2046,6 +3729,9 @@ def validate_role_neutral_stage1_execution(
         "plan_scientific_content_sha256",
         "resource_attestation",
         "max_parallel_owners",
+        "effective_max_parallel_owners",
+        "owner_cpu_budget",
+        "effective_owner_concurrency_policy",
         "cpu_budget",
         "submitted_owner_order",
         "completed_owner_order",
@@ -2054,6 +3740,7 @@ def validate_role_neutral_stage1_execution(
         "physical_owner_execution_count",
         "producer_execution_count",
         "compute_canary",
+        "first_owner_validation",
         "compute_canary_replica_execution_count",
         "compute_canary_additional_physical_execution_count",
         "total_producer_execution_count",
@@ -2083,9 +3770,36 @@ def validate_role_neutral_stage1_execution(
         or len(attestation.get("completed_owner_order") or ()) != len(owner_ids)
         or set(attestation.get("assigned_resources") or {}) != set(owner_ids)
         or not isinstance(attestation.get("max_parallel_owners"), int)
+        or not isinstance(
+            attestation.get("effective_max_parallel_owners"),
+            int,
+        )
+        or not isinstance(attestation.get("owner_cpu_budget"), int)
         or not isinstance(attestation.get("cpu_budget"), int)
         or int(attestation["max_parallel_owners"]) < 1
+        or int(attestation["effective_max_parallel_owners"]) < 1
+        or int(attestation["effective_max_parallel_owners"])
+        > int(attestation["max_parallel_owners"])
         or int(attestation["cpu_budget"]) < int(attestation["max_parallel_owners"])
+        or int(attestation["owner_cpu_budget"])
+        != int(attestation["cpu_budget"])
+        // int(attestation["effective_max_parallel_owners"])
+        or attestation.get("effective_owner_concurrency_policy")
+        not in {
+            "configured_topology_capacity_v1",
+            "htr_union_device_owner_serialization_v1",
+        }
+        or (
+            attestation.get("effective_owner_concurrency_policy")
+            == "configured_topology_capacity_v1"
+            and int(attestation["effective_max_parallel_owners"])
+            != int(attestation["max_parallel_owners"])
+        )
+        or (
+            attestation.get("effective_owner_concurrency_policy")
+            == "htr_union_device_owner_serialization_v1"
+            and int(attestation["effective_max_parallel_owners"]) != 1
+        )
         or attestation.get("producer_component_order") != list(EXPECTED_COMPONENT_FAMILIES)
         or attestation.get("physical_owner_execution_count") != len(owner_ids)
         or attestation.get("producer_execution_count")
@@ -2102,6 +3816,20 @@ def validate_role_neutral_stage1_execution(
         or (
             isinstance(attestation.get("compute_canary"), Mapping)
             is not canary_completed
+        )
+        or (
+            isinstance(
+                attestation.get("first_owner_validation"),
+                Mapping,
+            )
+            is not (
+                ROLE_NEUTRAL_FIRST_OWNER_VALIDATION_GATE_SUFFIX
+                in top_level
+            )
+        )
+        or (
+            canary_completed
+            and attestation.get("first_owner_validation") is not None
         )
         or not isinstance(attestation.get("owner_execution_telemetry"), Mapping)
         or attestation.get("owner_execution_telemetry")
@@ -2146,6 +3874,28 @@ def validate_role_neutral_stage1_execution(
         )
     elif attestation.get("compute_canary") is not None:
         raise ValueError("disabled compute canary has a registration")
+    validated_first_owner_gate: Mapping[str, Any] | None = None
+    first_owner_registration = attestation.get(
+        "first_owner_validation"
+    )
+    if isinstance(first_owner_registration, Mapping):
+        validated_first_owner_gate = (
+            _validate_first_owner_gate_attestation(
+                path=(
+                    tree
+                    / ROLE_NEUTRAL_FIRST_OWNER_VALIDATION_GATE_SUFFIX
+                ),
+                plan=plan,
+                registration=first_owner_registration,
+                selected_devices=tuple(
+                    str(value) for value in selected_devices
+                ),
+            )
+        )
+    elif first_owner_registration is not None:
+        raise ValueError(
+            "first-owner validation registration is malformed"
+        )
 
     locator = _read_json(
         tree / ROLE_NEUTRAL_COORDINATION_DIRECTORY / ROLE_NEUTRAL_COMPONENT_LOCATOR_ATTESTATION,
@@ -2163,6 +3913,11 @@ def validate_role_neutral_stage1_execution(
     if not isinstance(registrations, list):
         raise ValueError("component locator attestation is malformed")
     seen: set[tuple[str, str]] = set()
+    first_owner_component_registrations: dict[
+        str,
+        Mapping[str, Any],
+    ] = {}
+    first_owner_id = plan.physical_execution_order[0]
     for registration in registrations:
         if not isinstance(registration, Mapping):
             raise ValueError("component locator registration is malformed")
@@ -2175,9 +3930,91 @@ def validate_role_neutral_stage1_execution(
         registered_root = Path(str(registration.get("absolute_root_locator")))
         if registered_root != expected_roots[key]:
             raise ValueError("component locator points outside the execution-owned tree")
+        if key[0] == first_owner_id:
+            first_owner_component_registrations[key[1]] = (
+                copy.deepcopy(dict(registration))
+            )
         seen.add(key)
     if seen != set(expected_roots):
         raise ValueError("component locator coverage is incomplete")
+    if validated_first_owner_gate is not None:
+        if set(first_owner_component_registrations) != set(
+            EXPECTED_COMPONENT_FAMILIES
+        ):
+            raise ValueError(
+                "first-owner validation lost a component registration"
+            )
+        receipt_summary = validated_first_owner_gate[
+            "fresh_component_receipt_reauthentication"
+        ]
+        gate_rows = receipt_summary["components"]
+        scientific_rows = validated_first_owner_gate[
+            "complete_scientific_owner_replica"
+        ]["component_scientific_receipts"]
+        for component, gate_row, scientific_row in zip(
+            EXPECTED_COMPONENT_FAMILIES,
+            gate_rows,
+            scientific_rows,
+            strict=True,
+        ):
+            registration = first_owner_component_registrations[
+                component
+            ]
+            registered_scientific = registration[
+                "component_scientific_receipt"
+            ]
+            if (
+                gate_row.get(
+                    "component_authentication_content_sha256"
+                )
+                != registration.get(
+                    "component_authentication_content_sha256"
+                )
+                or gate_row.get(
+                    "component_scientific_content_sha256"
+                )
+                != registered_scientific.get("content_sha256")
+                or gate_row.get("source_terminal_content_sha256")
+                != registration.get("source_terminal_content_sha256")
+                or gate_row.get("source_tree_sha256")
+                != registration.get("source_tree_sha256")
+                or gate_row.get("family_fit_artifact_sha256")
+                != registered_scientific.get(
+                    "family_fit_artifact_sha256"
+                )
+                or scientific_row != registered_scientific
+            ):
+                raise ValueError(
+                    f"first-owner {component} receipt changed after its gate"
+                )
+        owner_telemetry_rows = attestation[
+            "owner_execution_telemetry"
+        ]["physical_owners"]
+        first_owner_telemetry = next(
+            (
+                row.get("telemetry")
+                for row in owner_telemetry_rows
+                if row.get("physical_owner_scope_id")
+                == first_owner_id
+            ),
+            None,
+        )
+        gate_policy = _first_owner_policy_from_dict(
+            validated_first_owner_gate["policy"]
+        )
+        recomputed_component_summary = (
+            _validate_first_owner_component_reports(
+                execution_telemetry=first_owner_telemetry,
+                gate=gate_policy,
+            )
+        )
+        if recomputed_component_summary != validated_first_owner_gate.get(
+            "component_execution_validation"
+        ):
+            raise ValueError(
+                "first-owner component execution evidence changed "
+                "after its gate"
+            )
     return manifest
 
 
@@ -2193,10 +4030,14 @@ __all__ = [
     "ROLE_NEUTRAL_COORDINATION_DIRECTORY",
     "ROLE_NEUTRAL_EXECUTION_ATTESTATION",
     "ROLE_NEUTRAL_EXECUTION_MANIFEST",
+    "ROLE_NEUTRAL_FIRST_OWNER_VALIDATION_GATE_SCHEMA",
+    "ROLE_NEUTRAL_FIRST_OWNER_VALIDATION_GATE_SUFFIX",
+    "ROLE_NEUTRAL_FIRST_OWNER_VALIDATION_POLICY_SCHEMA",
     "ROLE_NEUTRAL_STAGE1_EXECUTION_ATTESTATION_SCHEMA",
     "ROLE_NEUTRAL_STAGE1_EXECUTION_SCHEMA",
     "RoleNeutralComponentInvocation",
     "RoleNeutralComputeCanaryPolicy",
+    "RoleNeutralFirstOwnerValidationPolicy",
     "LocalThreadRoleNeutralPhysicalOwnerExecutor",
     "NeuralQueryExecutionTopology",
     "RoleNeutralPhysicalOwnerExecutor",

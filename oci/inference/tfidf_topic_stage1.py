@@ -12,7 +12,7 @@ from dataclasses import asdict
 from pathlib import Path
 import sys
 import tempfile
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -654,6 +654,12 @@ def _fit_tfidf_topic_context_nested_calibration(
     spec: Dict[str, Any],
     config: AppliedInferenceConfig,
     artifact_dir: Path,
+    tfidf_workers: int = 1,
+    tfidf_parallel_backend: str = "threads",
+    owner_cpu_budget: Optional[int] = None,
+    operational_attestation_sink: Optional[
+        Callable[[Mapping[str, Any]], None]
+    ] = None,
 ) -> Dict[str, Any]:
     """Reuse the native TF-IDF fitter with fit-only nested calibration.
 
@@ -686,6 +692,10 @@ def _fit_tfidf_topic_context_nested_calibration(
         artifact_dir=artifact_dir,
         scope_id=f"{spec['scope_id']}__nested_calibration",
         enable_heldout_score_tests=True,
+        tfidf_workers=tfidf_workers,
+        tfidf_parallel_backend=tfidf_parallel_backend,
+        owner_cpu_budget=owner_cpu_budget,
+        operational_attestation_sink=operational_attestation_sink,
     )
     artifacts = metadata.get("artifacts") or {}
     score_path = Path(str(artifacts.get("topic_score_tests") or ""))

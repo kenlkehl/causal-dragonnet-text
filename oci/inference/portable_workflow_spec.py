@@ -26,6 +26,9 @@ from .stage1_execution_topology_policy import (
 from .stage1_htr_operational_controls import (
     RoleNeutralHTROperationalControls,
 )
+from .neural_query_operational_controls import (
+    RoleNeutralNeuralQueryOperationalControls,
+)
 
 from ..models.strict_causal_forest_runtime import (
     CAUSAL_FOREST_IMPLEMENTATION,
@@ -52,8 +55,8 @@ from .post_extraction_scientific_policy import (
 )
 
 PORTABLE_SPEC_VERSION = "portable_all_evidence_scientific_workflow_v11"
-DEPLOYMENT_PROFILE_VERSION = "portable_all_evidence_deployment_profile_v8"
-STAGE1_EXECUTION_PROFILE_VERSION = "portable_stage1_execution_profile_v7"
+DEPLOYMENT_PROFILE_VERSION = "portable_all_evidence_deployment_profile_v9"
+STAGE1_EXECUTION_PROFILE_VERSION = "portable_stage1_execution_profile_v8"
 RESOURCE_PERFORMANCE_SAFETY_VERSION = "portable_resource_performance_safety_policy_v2"
 RUN_CONTROL_VERSION = "portable_all_evidence_run_control_v2"
 BINARY_PROBABILITY_DIFFERENCE = "binary_treatment_binary_outcome_probability_difference_v1"
@@ -1244,6 +1247,10 @@ class Stage1ExecutionProfile:
     persistent_slot_startup_timeout_seconds: float
     neural_query_topology: Stage1ExecutionTopologyPolicy
     htr_operational_controls: RoleNeutralHTROperationalControls
+    neural_query_operational_controls: (
+        RoleNeutralNeuralQueryOperationalControls
+    )
+    tfidf_parallel_backend: str
     selection_method: str
     benchmark_evidence_kind: str
     selected_candidate: str | None
@@ -1347,6 +1354,83 @@ class Stage1ExecutionProfile:
                 "process or parallel HTR fold execution requires one "
                 "reusable complete tokenizer/chunk plan"
             )
+        if not isinstance(
+            self.neural_query_operational_controls,
+            RoleNeutralNeuralQueryOperationalControls,
+        ):
+            raise TypeError(
+                "Stage 1 execution requires typed neural-query operational "
+                "controls"
+            )
+        neural_controls = self.neural_query_operational_controls
+        neural_devices_per_owner = (
+            self.device_count
+            if self.neural_query_topology.mode
+            == "one_context_spanning_all_selected_devices"
+            else 1
+        )
+        neural_slot_capacity = (
+            neural_devices_per_owner
+            * neural_controls.fold_slots_per_device
+        )
+        if (
+            neural_controls.inner_fold_parallelism
+            > neural_slot_capacity
+            or neural_controls.bank_parallelism > neural_slot_capacity
+        ):
+            raise ValueError(
+                "Stage 1 neural-query task parallelism exceeds the "
+                "per-owner device-slot capacity"
+            )
+        if (
+            neural_devices_per_owner > 1
+            and (
+                neural_controls.inner_fold_parallelism
+                < neural_devices_per_owner
+                or neural_controls.bank_parallelism
+                < neural_devices_per_owner
+            )
+        ):
+            raise ValueError(
+                "Stage 1 neural-query task parallelism must make every "
+                "reserved device schedulable"
+            )
+        if (
+            self.resource_kind == "accelerator"
+            and max(
+                neural_controls.inner_fold_parallelism,
+                neural_controls.bank_parallelism,
+            )
+            > 1
+            and neural_controls.fold_parallel_backend != "processes"
+        ):
+            raise ValueError(
+                "parallel CUDA neural-query execution requires the "
+                "process-isolated backend"
+            )
+        if (
+            (
+                neural_controls.inner_fold_parallelism > 1
+                or neural_controls.bank_parallelism > 1
+                or neural_controls.fold_slots_per_device > 1
+            )
+            and self.scope_workers_per_device != 1
+        ):
+            raise ValueError(
+                "per-owner neural-query task slots require exactly one "
+                "outer owner slot per selected device"
+            )
+        tfidf_backend = str(self.tfidf_parallel_backend).strip().lower()
+        if tfidf_backend not in {"threads", "processes"}:
+            raise ValueError(
+                "Stage 1 TF-IDF parallel backend must be 'threads' or "
+                "'processes'"
+            )
+        object.__setattr__(
+            self,
+            "tfidf_parallel_backend",
+            tfidf_backend,
+        )
         if self.executor_mode not in {
             "fresh_per_fit",
             "persistent_slots",
@@ -1503,6 +1587,19 @@ class Stage1ExecutionProfile:
         normalized["htr_operational_controls"] = (
             RoleNeutralHTROperationalControls.from_mapping(htr_controls)
         )
+        neural_controls = normalized.get(
+            "neural_query_operational_controls"
+        )
+        if not isinstance(neural_controls, Mapping):
+            raise ValueError(
+                "stage1_execution must explicitly configure "
+                "neural_query_operational_controls"
+            )
+        normalized["neural_query_operational_controls"] = (
+            RoleNeutralNeuralQueryOperationalControls.from_mapping(
+                neural_controls
+            )
+        )
         for name in (
             "benchmark_result_locator",
             "benchmark_workload_deployment_locator",
@@ -1605,6 +1702,21 @@ class DeploymentProfile:
             raise ValueError(
                 "HTR fold parallelism exceeds the configured global host "
                 "CPU budget"
+            )
+        neural_controls = (
+            self.stage1_execution.neural_query_operational_controls
+        )
+        if (
+            max(
+                neural_controls.inner_fold_parallelism,
+                neural_controls.bank_parallelism,
+            )
+            * neural_controls.worker_cpu_threads
+            > self.cpu_budget
+        ):
+            raise ValueError(
+                "neural-query task CPU threads exceed the configured global "
+                "host CPU budget"
             )
         if self.storage_backend not in {"posix", "local_posix", "sshfs"}:
             raise ValueError("unsupported storage backend")
@@ -1891,6 +2003,7 @@ __all__ = [
     "PostExtractionCausalReviewSpec",
     "RESOURCE_PERFORMANCE_SAFETY_VERSION",
     "ResourcePerformanceSafetyPolicy",
+    "RoleNeutralNeuralQueryOperationalControls",
     "RUN_CONTROL_VERSION",
     "RunControl",
     "SentenceEmbeddingEncoderSpec",

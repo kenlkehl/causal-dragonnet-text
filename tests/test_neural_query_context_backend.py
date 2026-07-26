@@ -7,6 +7,7 @@ import importlib.util
 import inspect
 import json
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +30,9 @@ from oci.inference.neural_query_context_backend import (
     NeuralQueryContextBackend,
     NeuralQuerySpentDiscoveryBackend,
     NeuralQuerySpentEvidenceProvider,
+)
+from oci.inference.neural_query_operational_controls import (
+    RoleNeutralNeuralQueryTaskResourcePlan,
 )
 from oci.inference.neural_query_signal_artifact import query_signal_columns
 from oci.inference.stable_context_fit_upstream_backend import (
@@ -1211,7 +1215,7 @@ def test_production_runtime_matches_historical_in_memory_discovery_algorithm(
             {
                 key: value
                 for key, value in audit.items()
-                if key not in {"identity", "identity_payload"}
+                if key not in {"identity", "identity_payload", "device"}
             }
             for audit in result["subfold_audit"]
         ]
@@ -1222,6 +1226,283 @@ def test_production_runtime_matches_historical_in_memory_discovery_algorithm(
     assert production_result["all_queries_retained"] is True
     assert production_result["validation_audits_used_for_selection"] is False
     assert production_result["executable_checkpoint_io"] is False
+
+
+def test_bounded_runtime_overlaps_folds_enforces_barrier_and_preserves_science(
+    monkeypatch,
+):
+    from oci.inference import neural_query_discovery_runtime as runtime
+
+    config = _query_config()
+    row_ids = tuple(range(8))
+    texts = tuple(f"bounded runtime row {row}" for row in row_ids)
+    chunks = tuple(
+        np.asarray([[float(row + 1), 1.0]], dtype=np.float32)
+        for row in row_ids
+    )
+    treatment = np.asarray(
+        [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+    )
+    outcome = np.asarray(
+        [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0]
+    )
+    fit_e = np.linspace(0.2, 0.6, len(row_ids))
+    fit_m = np.linspace(0.3, 0.7, len(row_ids))
+
+    class _Predictor:
+        def __init__(self, value):
+            self.value = float(value)
+
+        def predict(self, prediction_texts):
+            return (
+                np.full(len(prediction_texts), self.value, dtype=float),
+                {},
+            )
+
+    def fake_nuisance(**kwargs):
+        # Fold 1 deliberately finishes after fold 2.  Canonical merge must
+        # still return fold 1 then fold 2.
+        random_state = int(kwargs["random_state"])
+        time.sleep(0.18 if random_state % 2 == 0 else 0.06)
+        size = len(kwargs["treatment"])
+        return {
+            "treatment": {
+                "stacked_oof": np.full(size, 0.4),
+                "fitted": _Predictor(0.4),
+                "metrics": {"random_state": random_state},
+            },
+            "outcome": {
+                "stacked_oof": np.full(size, 0.5),
+                "fitted": _Predictor(0.5),
+                "metrics": {"random_state": random_state},
+            },
+        }
+
+    def fake_activations(current_chunks, queries, **_kwargs):
+        matrix = np.asarray(queries, dtype=float)
+        markers = np.asarray(
+            [float(np.asarray(value)[0, 0]) for value in current_chunks]
+        )
+        return markers[:, None] + matrix[None, :, 0]
+
+    def fake_query_result(
+        current_chunks,
+        *,
+        seed,
+        config,
+        device,
+        initial_queries,
+        bank,
+    ):
+        time.sleep(0.04)
+        if initial_queries is None:
+            base = {"treatment": 1.0, "outcome": 2.0, "effect": 3.0}[bank]
+            queries = np.asarray(
+                [[base + int(seed) / 10_000.0, 1.0]],
+                dtype=np.float32,
+            )
+        else:
+            queries = np.asarray(
+                initial_queries,
+                dtype=np.float32,
+            ).copy()
+            queries[:, 0] += np.float32(0.01)
+        return {
+            "queries": queries,
+            "train_activations": fake_activations(
+                current_chunks,
+                queries,
+            ),
+            "train_standardized_scores": np.asarray([0.4]),
+            "query_drift": np.asarray([0.01]),
+            "loss_history": [float(seed)],
+            "objective": f"test_{bank}",
+        }
+
+    def fake_target(
+        current_chunks,
+        _target,
+        *,
+        config,
+        seed,
+        device,
+        initial_queries=None,
+        target_name,
+        **_kwargs,
+    ):
+        return fake_query_result(
+            current_chunks,
+            seed=seed,
+            config=config,
+            device=device,
+            initial_queries=initial_queries,
+            bank=str(target_name),
+        )
+
+    def fake_effect(
+        current_chunks,
+        _contribution,
+        *,
+        config,
+        seed,
+        device,
+        initial_queries=None,
+        **_kwargs,
+    ):
+        return fake_query_result(
+            current_chunks,
+            seed=seed,
+            config=config,
+            device=device,
+            initial_queries=initial_queries,
+            bank="effect",
+        )
+
+    def fake_consensus(
+        candidates,
+        *,
+        bank,
+        n_queries,
+        seed,
+        **_kwargs,
+    ):
+        assert n_queries == 1
+        return {
+            "queries": np.asarray(
+                [candidates[0]["query"]],
+                dtype=np.float32,
+            ),
+            "records": [
+                {
+                    "query_id": f"{bank}_context_query_001",
+                    "member_count": len(candidates),
+                    "member_subfolds": sorted(
+                        {
+                            int(value["subfold"])
+                            for value in candidates
+                        }
+                    ),
+                }
+            ],
+            "method": "test_ungated_consensus",
+            "seed": int(seed),
+        }
+
+    monkeypatch.setattr(
+        runtime,
+        "fit_joint_cross_fitted_nuisance_stacks",
+        fake_nuisance,
+    )
+    monkeypatch.setattr(runtime, "fit_soft_target_queries", fake_target)
+    monkeypatch.setattr(runtime, "fit_soft_contrast_queries", fake_effect)
+    monkeypatch.setattr(
+        runtime,
+        "soft_retrieval_activations",
+        fake_activations,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "standardized_direct_target_contrasts",
+        lambda *_args, **_kwargs: {
+            "standardized_scores": np.asarray([0.3])
+        },
+    )
+    monkeypatch.setattr(
+        runtime,
+        "standardized_cohort_moments",
+        lambda *_args, **_kwargs: {
+            "standardized_scores": np.asarray([0.3])
+        },
+    )
+    monkeypatch.setattr(
+        runtime,
+        "cohort_contribution",
+        lambda u, v: (np.asarray(u) * np.asarray(v), 0.0),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "build_ungated_consensus_query_bank",
+        fake_consensus,
+    )
+    common = {
+        "fit_ids": row_ids,
+        "fit_chunks": chunks,
+        "fit_texts": texts,
+        "treatment": treatment,
+        "outcome": outcome,
+        "outcome_binary": True,
+        "fit_e": fit_e,
+        "fit_m": fit_m,
+        "nuisance_views": ({"name": "bounded"},),
+        "nuisance_stack_config": TfidfNuisanceStackScientificConfig(),
+        "config": config,
+        "nuisance_folds": 2,
+        "devices": ("cpu",),
+        "seed": 31,
+    }
+    serial = runtime.fit_in_memory_query_discovery(**common)
+    resource_plan = RoleNeutralNeuralQueryTaskResourcePlan(
+        devices=("cpu",),
+        inner_fold_parallelism=2,
+        fold_parallel_backend="threads",
+        fold_slots_per_device=2,
+        bank_parallelism=2,
+        worker_cpu_threads=1,
+        owner_cpu_budget=2,
+    )
+    attestations = []
+    parallel = runtime.fit_in_memory_query_discovery(
+        **common,
+        task_resource_plan=resource_plan,
+        execution_attestation_sink=attestations.append,
+    )
+
+    assert len(attestations) == 1
+    attestation = attestations[0]
+    inner = attestation["inner_fold_phase"]
+    final = attestation["final_bank_phase"]
+    barrier = attestation["inner_fold_barrier_monotonic_ns"]
+    assert inner["maximum_concurrent_leases"] == 2
+    assert final["maximum_concurrent_leases"] == 2
+    assert max(
+        row["finished_monotonic_ns"]
+        for row in inner["task_intervals"]
+    ) < barrier
+    assert min(
+        row["started_monotonic_ns"]
+        for row in final["task_intervals"]
+    ) > barrier
+    assert [
+        row["identity_payload"]["seed"]
+        for row in parallel["subfold_audit"]
+    ] == [32, 33]
+    assert all(
+        "device" not in row for row in parallel["subfold_audit"]
+    )
+    assert parallel["fit_input_binding_sha256"] == serial[
+        "fit_input_binding_sha256"
+    ]
+    assert parallel["fit_nuisance_output_binding"] == serial[
+        "fit_nuisance_output_binding"
+    ]
+    assert parallel["subfold_audit"] == serial["subfold_audit"]
+    for bank in ("treatment", "outcome", "effect"):
+        np.testing.assert_allclose(
+            parallel["banks"][bank]["queries"],
+            serial["banks"][bank]["queries"],
+        )
+        np.testing.assert_allclose(
+            parallel["banks"][bank]["train_activations"],
+            serial["banks"][bank]["train_activations"],
+        )
+        assert (
+            parallel["banks"][bank]["records"]
+            == serial["banks"][bank]["records"]
+        )
+        assert (
+            parallel["banks"][bank]["consensus"]
+            == serial["banks"][bank]["consensus"]
+        )
 
 
 def test_neural_query_discovery_backend_composes_with_spent_provider(tmp_path, monkeypatch):

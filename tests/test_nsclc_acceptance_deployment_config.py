@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -39,6 +40,11 @@ BENCHMARK_STAGING_PROFILE = (
     REPOSITORY_ROOT
     / "example_configs"
     / "portable_all_evidence_deployment_nsclc.benchmark-staging.json"
+)
+R14_HIGH_POWERED_PROFILE = (
+    REPOSITORY_ROOT
+    / "example_configs"
+    / "portable_all_evidence_deployment_nsclc.r14-high-powered.json"
 )
 BENCHMARK_CONFIG = (
     REPOSITORY_ROOT
@@ -127,6 +133,23 @@ def test_acceptance_deployment_is_closed_full_workflow_configuration() -> None:
             "chunk_plan_cache_max_entries": 1000,
             "tokenized_chunk_cache_max_entries": 150000,
         }
+    )
+    assert (
+        deployment.stage1_execution.neural_query_operational_controls.as_dict()
+        == {
+            "schema_version": (
+                "production_role_neutral_neural_query_operational_controls_v1"
+            ),
+            "inner_fold_parallelism": 3,
+            "fold_parallel_backend": "processes",
+            "fold_slots_per_device": 3,
+            "bank_parallelism": 3,
+            "worker_cpu_threads": 1,
+        }
+    )
+    assert (
+        deployment.stage1_execution.tfidf_parallel_backend
+        == "processes"
     )
     assert deployment.cpu_budget == 8
     assert deployment.forest_operational.requested_host_cpu_budget == 8
@@ -261,6 +284,7 @@ def test_acceptance_cli_compiles_offline_stage1_prefix_without_server_access(
     assert options.run_control.validation_depth == "fresh_terminal_audit"
     assert options.stage1_execution_device_count == 2
     assert options.stage1_scope_workers_per_gpu == 1
+    assert options.tfidf_parallel_backend == "processes"
     assert options.run_control.adopt_checkpoints == (
         V5_PREPARATION,
         V5_EMBEDDING_CACHE,
@@ -275,3 +299,114 @@ def test_acceptance_cli_compiles_offline_stage1_prefix_without_server_access(
         "handoff_validation",
     )
     assert hooks.role_neutral_stage1 is not None
+
+
+def test_r14_high_powered_operational_controls_are_closed_and_bounded(
+    monkeypatch,
+) -> None:
+    scientific = ScientificWorkflowSpec.from_json(SCIENTIFIC_SPEC)
+    deployment = DeploymentProfile.from_json(R14_HIGH_POWERED_PROFILE)
+    execution = deployment.stage1_execution
+    controls = execution.neural_query_operational_controls
+
+    assert deployment.devices == ("cuda:0", "cuda:1")
+    assert deployment.cpu_budget == 64
+    assert deployment.storage_backend == "local_posix"
+    assert execution.max_parallel_owners == 1
+    assert (
+        execution.neural_query_topology.mode
+        == "one_context_spanning_all_selected_devices"
+    )
+    assert controls.as_dict() == {
+        "schema_version": (
+            "production_role_neutral_neural_query_operational_controls_v1"
+        ),
+        "inner_fold_parallelism": 4,
+        "fold_parallel_backend": "processes",
+        "fold_slots_per_device": 2,
+        "bank_parallelism": 3,
+        "worker_cpu_threads": 1,
+    }
+    assert execution.tfidf_parallel_backend == "processes"
+    scientific_identity = scientific.identity_payload()
+    assert "neural_query_operational_controls" not in scientific_identity
+    assert "tfidf_parallel_backend" not in scientific_identity
+    assert "devices" not in scientific_identity
+
+    monkeypatch.setattr(
+        "oci.inference.portable_resource_scheduler.discover_resources",
+        lambda: ResourceInventory(
+            cpu_count=64,
+            gpus=(
+                GPUResource(
+                    device="cuda:0",
+                    uuid="TEST-H100-0",
+                    total_memory_bytes=96 * 1024**3,
+                    free_memory_bytes=92 * 1024**3,
+                    utilization_percent=0.0,
+                ),
+                GPUResource(
+                    device="cuda:1",
+                    uuid="TEST-H100-1",
+                    total_memory_bytes=96 * 1024**3,
+                    free_memory_bytes=92 * 1024**3,
+                    utilization_percent=0.0,
+                ),
+            ),
+        ),
+    )
+    compiled = options_from_args(
+        build_parser().parse_args(
+            [
+                "--scientific-spec",
+                str(SCIENTIFIC_SPEC),
+                "--deployment-profile",
+                str(R14_HIGH_POWERED_PROFILE),
+                "--stop-after",
+                "handoff_validation",
+                "--validation-depth",
+                "fresh_terminal_audit",
+            ]
+        )
+    )
+    assert compiled.query_devices == ("cuda:0", "cuda:1")
+    assert compiled.cpu_budget == compiled.tfidf_workers == 64
+    assert compiled.tfidf_parallel_backend == "processes"
+    assert (
+        compiled.stage1_execution_profile
+        .neural_query_operational_controls
+        == controls
+    )
+
+    payload = json.loads(R14_HIGH_POWERED_PROFILE.read_text(encoding="utf-8"))
+    payload["stage1_execution"].pop("neural_query_operational_controls")
+    with pytest.raises(ValueError, match="configure every field exactly"):
+        DeploymentProfile.from_mapping(payload)
+
+    oversubscribed_slots = replace(
+        controls,
+        inner_fold_parallelism=7,
+    )
+    with pytest.raises(ValueError, match="device-slot capacity"):
+        replace(
+            execution,
+            neural_query_operational_controls=oversubscribed_slots,
+        )
+
+    three_cpu_execution = replace(
+        execution,
+        htr_operational_controls=replace(
+            execution.htr_operational_controls,
+            fold_parallelism=4,
+        ),
+    )
+    with pytest.raises(ValueError, match="global host CPU budget"):
+        replace(
+            deployment,
+            cpu_budget=3,
+            forest_operational=replace(
+                deployment.forest_operational,
+                requested_host_cpu_budget=3,
+            ),
+            stage1_execution=three_cpu_execution,
+        )

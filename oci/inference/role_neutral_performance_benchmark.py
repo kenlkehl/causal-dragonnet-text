@@ -2327,44 +2327,146 @@ class _CandidateGpuSampler:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._source: Any | None = None
+        self._thread_error: BaseException | None = None
+        self._sampling_backend: str | None = None
+        self._completed_monotonic_ns: int | None = None
+        self._entered = False
 
     def _sample(self) -> None:
-        sampled_at = time.monotonic()
-        rows = telemetry_module.sample_nvidia_gpus(self.devices)
+        if self._source is None:
+            raise RuntimeError("GPU sampler source is not active")
+        acquisition_started_ns = time.monotonic_ns()
+        rows = self._source.sample()
+        acquisition_finished_ns = time.monotonic_ns()
+        if acquisition_finished_ns < acquisition_started_ns:
+            raise RuntimeError("GPU sample acquisition clock moved backwards")
+        observed_devices = tuple(
+            sorted(str(value.get("device")) for value in rows)
+        )
+        expected_devices = tuple(sorted(self.devices))
+        if observed_devices != expected_devices:
+            raise RuntimeError(
+                "persistent GPU sampler omitted a configured device"
+            )
         with self._lock:
             self._samples.extend(
                 {
                     **dict(value),
-                    "sample_monotonic_seconds": sampled_at,
+                    "gpu_sample_acquisition_started_monotonic_ns": (
+                        acquisition_started_ns
+                    ),
+                    "gpu_sample_acquisition_finished_monotonic_ns": (
+                        acquisition_finished_ns
+                    ),
+                    # Preserve the established point timestamp, but make its
+                    # meaning explicit: it is the acquisition completion.
+                    "sample_monotonic_seconds": (
+                        acquisition_finished_ns / 1e9
+                    ),
                 }
                 for value in rows
             )
 
     def _run(self) -> None:
-        while not self._stop.wait(self.interval_seconds):
-            self._sample()
+        try:
+            while not self._stop.wait(self.interval_seconds):
+                self._sample()
+        except BaseException as exc:
+            with self._lock:
+                self._thread_error = exc
+            self._stop.set()
 
     def __enter__(self) -> "_CandidateGpuSampler":
+        if self._entered or self._completed_monotonic_ns is not None:
+            raise RuntimeError("GPU sampler is single-use")
+        self._entered = True
         if self.devices != ("cpu",):
-            self._sample()
-            self._thread = threading.Thread(
-                target=self._run,
-                name="oci-role-neutral-gpu-sampler",
-                daemon=True,
+            source = telemetry_module.persistent_nvidia_gpu_sampler(
+                self.devices
             )
-            self._thread.start()
+            self._source = source.__enter__()
+            self._sampling_backend = str(
+                getattr(self._source, "backend_name", "")
+            )
+            if not self._sampling_backend:
+                source.__exit__(None, None, None)
+                self._source = None
+                raise RuntimeError("GPU sampler source omitted its backend")
+            try:
+                self._sample()
+                self._thread = threading.Thread(
+                    target=self._run,
+                    name="oci-role-neutral-gpu-sampler",
+                    daemon=True,
+                )
+                self._thread.start()
+            except BaseException:
+                source.__exit__(None, None, None)
+                self._source = None
+                raise
         return self
 
     def __exit__(self, *_exc: object) -> None:
+        sampling_error: BaseException | None = None
         if self._thread is not None:
             self._stop.set()
             self._thread.join()
-            self._sample()
+            with self._lock:
+                sampling_error = self._thread_error
+            if sampling_error is None:
+                try:
+                    self._sample()
+                except BaseException as exc:
+                    sampling_error = exc
+        self._completed_monotonic_ns = time.monotonic_ns()
+        try:
+            with self._lock:
+                if self._samples:
+                    last_finish = max(
+                        int(
+                            row[
+                                "gpu_sample_acquisition_finished_monotonic_ns"
+                            ]
+                        )
+                        for row in self._samples
+                    )
+                    if self._completed_monotonic_ns < last_finish:
+                        raise RuntimeError(
+                            "GPU sampler completed before its final acquisition"
+                        )
+        except BaseException as exc:
+            sampling_error = sampling_error or exc
+        source = self._source
+        self._source = None
+        if source is not None:
+            try:
+                source.__exit__(None, None, None)
+            except BaseException as exc:
+                sampling_error = sampling_error or exc
+        if sampling_error is not None:
+            raise RuntimeError(
+                "persistent GPU sampling failed during the observation"
+            ) from sampling_error
 
     @property
     def samples(self) -> tuple[Mapping[str, Any], ...]:
         with self._lock:
             return tuple(copy.deepcopy(self._samples))
+
+    @property
+    def completed_monotonic_ns(self) -> int:
+        if self._completed_monotonic_ns is None:
+            raise RuntimeError("GPU sampler has not completed")
+        return self._completed_monotonic_ns
+
+    @property
+    def sampling_backend(self) -> str:
+        if self._sampling_backend is None:
+            if self.devices == ("cpu",):
+                return "none_cpu_only"
+            raise RuntimeError("GPU sampling backend is unavailable")
+        return self._sampling_backend
 
 
 def _instrumented_factories(

@@ -89,6 +89,10 @@ from .stage1_execution_topology_policy import (
 from .stage1_htr_operational_controls import (
     RoleNeutralHTROperationalControls,
 )
+from .neural_query_operational_controls import (
+    ROLE_NEUTRAL_NEURAL_QUERY_OPERATIONAL_CONTROLS_SCHEMA,
+    RoleNeutralNeuralQueryOperationalControls,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -12438,6 +12442,8 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
         )
         from .production_stage1_role_neutral_execution import (
             ROLE_NEUTRAL_EXECUTION_MANIFEST,
+            ROLE_NEUTRAL_FIRST_OWNER_VALIDATION_POLICY_SCHEMA,
+            RoleNeutralFirstOwnerValidationPolicy,
             RoleNeutralProducerFactories,
             RoleNeutralStage1ExecutionPolicy,
             execute_and_publish_role_neutral_stage1,
@@ -12575,6 +12581,34 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             ),
             htr_operational_controls=(
                 stage1_execution_profile.htr_operational_controls
+            ),
+            neural_query_operational_controls=(
+                stage1_execution_profile
+                .neural_query_operational_controls
+            ),
+            first_owner_validation=(
+                RoleNeutralFirstOwnerValidationPolicy(
+                    devices=tuple(resource_plan.devices),
+                    gpu_max_allocation_fraction=(
+                        self.options.resource_performance_safety
+                        .gpu_max_allocation_fraction
+                    ),
+                    gpu_minimum_headroom_bytes=(
+                        self.options.resource_performance_safety
+                        .gpu_minimum_headroom_bytes
+                    ),
+                    gpu_sample_interval_seconds=0.1,
+                    required_tfidf_parallel_backend=(
+                        stage1_execution_profile
+                        .tfidf_parallel_backend
+                    ),
+                    schema_version=(
+                        ROLE_NEUTRAL_FIRST_OWNER_VALIDATION_POLICY_SCHEMA
+                    ),
+                )
+                if stage1_execution_profile.resource_kind
+                == "accelerator"
+                else None
             ),
             compute_canary=None,
         )
@@ -13926,6 +13960,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--stage1-htr-tokenized-chunk-cache-max-entries",
         type=int,
     )
+    parser.add_argument(
+        "--stage1-neural-query-inner-fold-parallelism",
+        type=int,
+    )
+    parser.add_argument(
+        "--stage1-neural-query-fold-parallel-backend",
+        choices=("threads", "processes"),
+    )
+    parser.add_argument(
+        "--stage1-neural-query-fold-slots-per-device",
+        type=int,
+    )
+    parser.add_argument(
+        "--stage1-neural-query-bank-parallelism",
+        type=int,
+    )
+    parser.add_argument(
+        "--stage1-neural-query-worker-cpu-threads",
+        type=int,
+    )
     parser.add_argument("--cpu-budget", type=int)
     parser.add_argument(
         "--forest-operational",
@@ -14329,6 +14383,12 @@ _DIRECT_DEPLOYMENT_SHIMS = (
     "stage1_htr_reuse_tokenizer_and_chunk_plans",
     "stage1_htr_chunk_plan_cache_max_entries",
     "stage1_htr_tokenized_chunk_cache_max_entries",
+    "stage1_neural_query_inner_fold_parallelism",
+    "stage1_neural_query_fold_parallel_backend",
+    "stage1_neural_query_fold_slots_per_device",
+    "stage1_neural_query_bank_parallelism",
+    "stage1_neural_query_worker_cpu_threads",
+    "tfidf_parallel_backend",
     "cpu_budget",
     "forest_operational",
     "response_concurrency",
@@ -14359,7 +14419,6 @@ _UNSUPPORTED_LEGACY_EXECUTION_SHIMS = (
     "stage1_preflight_workers",
     "num_workers",
     "tfidf_workers",
-    "tfidf_parallel_backend",
 )
 
 
@@ -14416,6 +14475,12 @@ def _compile_direct_deployment_profile(
         "stage1_htr_reuse_tokenizer_and_chunk_plans",
         "stage1_htr_chunk_plan_cache_max_entries",
         "stage1_htr_tokenized_chunk_cache_max_entries",
+        "stage1_neural_query_inner_fold_parallelism",
+        "stage1_neural_query_fold_parallel_backend",
+        "stage1_neural_query_fold_slots_per_device",
+        "stage1_neural_query_bank_parallelism",
+        "stage1_neural_query_worker_cpu_threads",
+        "tfidf_parallel_backend",
         "cpu_budget",
         "forest_operational",
         "response_concurrency",
@@ -14552,6 +14617,29 @@ def _compile_direct_deployment_profile(
                     ],
                 )
             ),
+            neural_query_operational_controls=(
+                RoleNeutralNeuralQueryOperationalControls(
+                    inner_fold_parallelism=values[
+                        "stage1_neural_query_inner_fold_parallelism"
+                    ],
+                    fold_parallel_backend=values[
+                        "stage1_neural_query_fold_parallel_backend"
+                    ],
+                    fold_slots_per_device=values[
+                        "stage1_neural_query_fold_slots_per_device"
+                    ],
+                    bank_parallelism=values[
+                        "stage1_neural_query_bank_parallelism"
+                    ],
+                    worker_cpu_threads=values[
+                        "stage1_neural_query_worker_cpu_threads"
+                    ],
+                    schema_version=(
+                        ROLE_NEUTRAL_NEURAL_QUERY_OPERATIONAL_CONTROLS_SCHEMA
+                    ),
+                )
+            ),
+            tfidf_parallel_backend=values["tfidf_parallel_backend"],
             selection_method="operator_configured",
             benchmark_evidence_kind="none",
             selected_candidate=None,
@@ -14686,6 +14774,38 @@ def _compile_production_options(
             "Stage 1 effective owner concurrency differs from the resolved "
             "resource topology or exceeds the host CPU budget"
         )
+    learned_query_profile = scientific.architecture_profiles.get(
+        "learned_neural_queries"
+    )
+    learned_query_configuration = (
+        learned_query_profile.get("producer_configuration")
+        if isinstance(learned_query_profile, Mapping)
+        else None
+    )
+    learned_query_scientific = (
+        learned_query_configuration.get("query_config")
+        if isinstance(learned_query_configuration, Mapping)
+        else None
+    )
+    query_inner_folds = (
+        learned_query_scientific.get("query_inner_folds")
+        if isinstance(learned_query_scientific, Mapping)
+        else None
+    )
+    neural_controls = (
+        deployment.stage1_execution.neural_query_operational_controls
+    )
+    if (
+        isinstance(query_inner_folds, bool)
+        or not isinstance(query_inner_folds, int)
+        or query_inner_folds < 2
+        or neural_controls.inner_fold_parallelism > query_inner_folds
+        or neural_controls.bank_parallelism > 3
+    ):
+        raise ValueError(
+            "Stage 1 neural-query concurrency exceeds the configured "
+            "scientific inner-fold or three-bank task count"
+        )
     # Bind the repeated optimizer batch to the authenticated scientific HTR
     # profile before any output root is created.
     htr_profile = scientific.architecture_profiles.get(
@@ -14767,7 +14887,9 @@ def _compile_production_options(
         stage1_seed_policy=scientific.seed_policy,
         num_workers=deployment.cpu_budget,
         tfidf_workers=deployment.cpu_budget,
-        tfidf_parallel_backend="processes",
+        tfidf_parallel_backend=(
+            deployment.stage1_execution.tfidf_parallel_backend
+        ),
         seed=scientific.seed,
         empty_text_policy=scientific.preprocessing.empty_text_policy,
         repeated_character_policy=(scientific.preprocessing.repeated_character_policy),

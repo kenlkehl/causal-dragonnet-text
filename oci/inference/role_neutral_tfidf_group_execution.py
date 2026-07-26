@@ -920,6 +920,12 @@ def execute_role_neutral_tfidf_physical_group(
     fit_outcome: Sequence[Any],
     config: AppliedInferenceConfig,
     exact_heldout_text_loader: Callable[[tuple[int, ...]], Sequence[str]],
+    tfidf_workers: int = 1,
+    tfidf_parallel_backend: str = "threads",
+    owner_cpu_budget: int | None = None,
+    operational_attestation_sink: (
+        Callable[[Mapping[str, Any]], None] | None
+    ) = None,
 ) -> Mapping[str, Any]:
     """Fit once, seal both TF-IDF families, then open exact held-out text."""
 
@@ -999,6 +1005,10 @@ def execute_role_neutral_tfidf_physical_group(
             },
             config=fit_config,
             artifact_dir=scratch,
+            tfidf_workers=tfidf_workers,
+            tfidf_parallel_backend=tfidf_parallel_backend,
+            owner_cpu_budget=owner_cpu_budget,
+            operational_attestation_sink=operational_attestation_sink,
         )
         source_index = Path(metadata["artifacts"]["fitted_context"])
         fitted = load_fitted_topic_context(source_index)

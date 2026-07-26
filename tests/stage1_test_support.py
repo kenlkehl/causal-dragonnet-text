@@ -13,6 +13,10 @@ from oci.inference.stage1_execution_topology_policy import (
 from oci.inference.stage1_htr_operational_controls import (
     RoleNeutralHTROperationalControls,
 )
+from oci.inference.neural_query_operational_controls import (
+    ROLE_NEUTRAL_NEURAL_QUERY_OPERATIONAL_CONTROLS_SCHEMA,
+    RoleNeutralNeuralQueryOperationalControls,
+)
 
 
 PHYSICAL_FIT_IDENTITY = Stage1PhysicalFitIdentity(
@@ -38,6 +42,12 @@ def stage1_execution_profile(
     reuse_tokenizer_and_chunk_plans: bool = True,
     chunk_plan_cache_max_entries: int = 100,
     tokenized_chunk_cache_max_entries: int = 1000,
+    neural_query_inner_fold_parallelism: int = 1,
+    neural_query_fold_parallel_backend: str = "threads",
+    neural_query_fold_slots_per_device: int = 1,
+    neural_query_bank_parallelism: int = 1,
+    neural_query_worker_cpu_threads: int = 1,
+    tfidf_parallel_backend: str = "processes",
     selection_method: str = "operator_configured",
     benchmark_evidence_kind: str = "none",
     selected_candidate: str | None = None,
@@ -83,6 +93,25 @@ def stage1_execution_profile(
                 tokenized_chunk_cache_max_entries
             ),
         ),
+        neural_query_operational_controls=(
+            RoleNeutralNeuralQueryOperationalControls(
+                inner_fold_parallelism=(
+                    neural_query_inner_fold_parallelism
+                ),
+                fold_parallel_backend=(
+                    neural_query_fold_parallel_backend
+                ),
+                fold_slots_per_device=(
+                    neural_query_fold_slots_per_device
+                ),
+                bank_parallelism=neural_query_bank_parallelism,
+                worker_cpu_threads=neural_query_worker_cpu_threads,
+                schema_version=(
+                    ROLE_NEUTRAL_NEURAL_QUERY_OPERATIONAL_CONTROLS_SCHEMA
+                ),
+            )
+        ),
+        tfidf_parallel_backend=tfidf_parallel_backend,
         selection_method=selection_method,
         benchmark_evidence_kind=benchmark_evidence_kind,
         selected_candidate=selected_candidate,

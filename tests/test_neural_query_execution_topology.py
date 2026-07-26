@@ -241,6 +241,7 @@ def test_non_session_persistent_shortcut_rejects_device_span(
     task = replace(
         task,
         resource="cuda:0",
+        htr_fold_devices=("cuda:0", "cuda:1"),
         neural_query_execution_topology=(
             NeuralQueryExecutionTopology(
                 devices=("cuda:0", "cuda:1")

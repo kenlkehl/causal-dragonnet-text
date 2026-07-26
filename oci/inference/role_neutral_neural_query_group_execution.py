@@ -897,80 +897,32 @@ def _transform_owned_snapshot(
         snapshot_root,
         expected_service_identity_sha256=expected_service_identity_sha256,
     )
-    rows, texts, bound = service._bind_rows_and_texts(
-        heldout_row_ids,
-        heldout_texts,
-        row_name="registered_heldout_row_ids",
-        text_name="registered_heldout_texts",
-    )
-    if rows != heldout_row_ids or texts != heldout_texts:
-        raise RuntimeError("held-out neural-query binding changed row order")
-    chunks = bound.chunk_matrices(rows)
     discovery_banks = metadata["discovery_metadata"]["banks"]
-    names: list[str] = []
-    kinds: list[str] = []
-    roles: list[str] = []
-    columns: list[np.ndarray] = []
-    for bank_index, bank in enumerate(_BANKS):
-        # ``soft_retrieval_activations`` normalizes query rows in place.  The
-        # authenticated mmap is deliberately read-only, so transform a private
-        # numerical copy while preserving the sealed bytes.
+    banks: dict[str, dict[str, Any]] = {}
+    for bank in _BANKS:
         queries = np.array(
             arrays[f"{bank}_queries"],
             dtype=np.float32,
             copy=True,
             order="C",
         )
-        records = discovery_banks[bank]["records"]
+        records = copy.deepcopy(discovery_banks[bank]["records"])
         expected = int(metadata["query_count_by_bank"][bank])
         if len(records) != expected or queries.shape[0] != expected:
-            raise ValueError("owned neural-query snapshot record count changed")
-        activations = soft_retrieval_activations(
-            chunks,
-            queries,
-            temperature=float(service.query_config.temperature),
-            device=service.devices[bank_index % len(service.devices)],
-            patient_batch_size=int(
-                service.query_config.retrieval_patient_batch_size
-            ),
-        )
-        if (
-            activations.shape != (len(rows), expected)
-            or not np.isfinite(activations).all()
-        ):
-            raise ValueError("owned neural-query held-out transform is invalid")
-        fit_scores = np.asarray(
-            [float(record["fit_standardized_score"]) for record in records],
-            dtype=np.float64,
-        )
-        if fit_scores.shape != (expected,) or not np.isfinite(fit_scores).all():
-            raise ValueError("owned neural-query fit-score state is invalid")
-        signed = np.asarray(activations, dtype=np.float64) * np.sign(fit_scores)[None, :]
-        descending = np.sort(signed, axis=1, kind="stable")[:, ::-1]
-        bank_names = (
-            f"neural_query_{bank}_signed_mean",
-            f"neural_query_{bank}_absolute_max",
-            *(
-                f"neural_query_{bank}_signed_order_{rank:02d}"
-                for rank in range(1, expected + 1)
-            ),
-        )
-        bank_values = np.column_stack(
-            (
-                np.mean(descending, axis=1),
-                np.max(np.abs(activations), axis=1),
-                descending,
+            raise ValueError(
+                "owned neural-query snapshot record count changed"
             )
-        )
-        for column, name in enumerate(bank_names):
-            names.append(name)
-            kinds.append(f"neural_query_{bank}_moments")
-            roles.append(_ROLE_BY_BANK[bank])
-            columns.append(np.asarray(bank_values[:, column], dtype=np.float64))
-    values = np.column_stack(columns)
-    if values.shape != (len(rows), len(names)) or not np.isfinite(values).all():
-        raise RuntimeError("owned neural-query held-out feature matrix is incomplete")
-    return tuple(names), tuple(kinds), tuple(roles), values
+        banks[bank] = {
+            "queries": queries,
+            "records": records,
+        }
+    return service.moments_for_rows(
+        banks=banks,
+        row_ids=heldout_row_ids,
+        texts=heldout_texts,
+        row_name="registered_heldout_row_ids",
+        text_name="registered_heldout_texts",
+    )
 
 
 def _producer_identity() -> str:

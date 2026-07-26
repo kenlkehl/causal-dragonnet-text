@@ -436,6 +436,176 @@ def test_complete_htr_configuration_roundtrips_without_source_defaults():
     assert RoleNeutralHTRConfig.from_mapping(config.as_dict()) == config
 
 
+def test_effect_fold_task_builder_preserves_legacy_production_semantics():
+    from sklearn.model_selection import KFold
+
+    config = replace(
+        _config(),
+        effect_folds=3,
+        effect_objectives=("pseudo_outcome_mse", "squared_r_loss"),
+        e_clip=0.1,
+        r_stage_min_propensity=0.2,
+        r_stage_max_propensity=0.8,
+    ).validated()
+    owner_scope_seed = 918_273
+    treatment = np.asarray(
+        [0, 1, 0, 1, 0, 1, 0, 1, 0],
+        dtype=np.float64,
+    )
+    outcome = np.asarray(
+        [0, 1, 1, 0, 0, 1, 1, 1, 0],
+        dtype=np.float64,
+    )
+    nuisance_oof_e = np.asarray(
+        [0.01, 0.2, 0.35, 0.5, 0.65, 0.8, 0.99, 0.4, 0.6],
+        dtype=np.float64,
+    )
+    nuisance_oof_m = np.asarray(
+        [0.1, 0.7, 0.4, 0.3, 0.2, 0.8, 0.6, 0.5, 0.25],
+        dtype=np.float64,
+    )
+    controls = object()
+    text_authority = object()
+
+    plan = group_module._build_effect_fold_tasks(
+        owner_scope_seed=owner_scope_seed,
+        text_count=len(treatment),
+        treatment=treatment,
+        outcome=outcome,
+        nuisance_oof_e=nuisance_oof_e,
+        nuisance_oof_m=nuisance_oof_m,
+        config=config,
+        model_marker="authenticated-model-marker",
+        operational_controls=controls,
+        text_authority=text_authority,
+    )
+
+    # This is the production transformation that preceded the helper
+    # extraction. Keep the oracle explicit so calibration and full execution
+    # cannot silently diverge on clipping, residuals, or eligibility.
+    expected_clipped_e = np.clip(
+        nuisance_oof_e,
+        config.e_clip,
+        1.0 - config.e_clip,
+    )
+    expected_y_residual = outcome - nuisance_oof_m
+    expected_t_residual = treatment - expected_clipped_e
+    expected_pseudo_outcome = (
+        expected_y_residual / expected_t_residual
+    )
+    expected_eligible = (
+        (nuisance_oof_e >= config.r_stage_min_propensity)
+        & (nuisance_oof_e <= config.r_stage_max_propensity)
+        & np.isfinite(expected_pseudo_outcome)
+    )
+
+    np.testing.assert_array_equal(plan.clipped_e, expected_clipped_e)
+    np.testing.assert_array_equal(plan.y_residual, expected_y_residual)
+    np.testing.assert_array_equal(plan.t_residual, expected_t_residual)
+    np.testing.assert_array_equal(
+        plan.pseudo_outcome,
+        expected_pseudo_outcome,
+    )
+    np.testing.assert_array_equal(plan.eligible, expected_eligible)
+    assert plan.clipped_e.dtype == np.float64
+    assert plan.y_residual.dtype == np.float64
+    assert plan.t_residual.dtype == np.float64
+    assert plan.pseudo_outcome.dtype == np.float64
+    assert plan.eligible.dtype == np.bool_
+    assert all(
+        value.flags.c_contiguous
+        for value in (
+            plan.clipped_e,
+            plan.y_residual,
+            plan.t_residual,
+            plan.pseudo_outcome,
+            plan.eligible,
+        )
+    )
+
+    expected_tasks = []
+    all_positions = np.arange(len(treatment))
+    for objective in config.effect_objectives:
+        split_seed = group_module._derived_seed(
+            owner_scope_seed,
+            purpose="split",
+            objective=objective,
+            fold=0,
+        )
+        for fold, (fit_positions, validation_positions) in enumerate(
+            KFold(
+                n_splits=config.effect_folds,
+                shuffle=True,
+                random_state=split_seed,
+            ).split(all_positions),
+            start=1,
+        ):
+            fit_positions = np.asarray(fit_positions, dtype=np.int64)
+            validation_positions = np.asarray(
+                validation_positions,
+                dtype=np.int64,
+            )
+            expected_tasks.append(
+                (
+                    objective,
+                    fold,
+                    split_seed,
+                    group_module._derived_seed(
+                        owner_scope_seed,
+                        purpose="fit",
+                        objective=objective,
+                        fold=fold,
+                    ),
+                    fit_positions,
+                    fit_positions[expected_eligible[fit_positions]],
+                    validation_positions,
+                )
+            )
+
+    assert len(plan.tasks) == (
+        config.effect_folds * len(config.effect_objectives)
+    )
+    for task, expected in zip(plan.tasks, expected_tasks, strict=True):
+        (
+            objective,
+            fold,
+            split_seed,
+            model_seed,
+            fit_positions,
+            eligible_fit_positions,
+            validation_positions,
+        ) = expected
+        assert task.objective == objective
+        assert task.fold == fold
+        assert task.split_seed == split_seed
+        assert task.model_seed == model_seed
+        np.testing.assert_array_equal(task.fit_positions, fit_positions)
+        np.testing.assert_array_equal(
+            task.eligible_fit_positions,
+            eligible_fit_positions,
+        )
+        np.testing.assert_array_equal(
+            task.validation_positions,
+            validation_positions,
+        )
+        np.testing.assert_array_equal(
+            task.y_residual,
+            expected_y_residual,
+        )
+        np.testing.assert_array_equal(
+            task.t_residual,
+            expected_t_residual,
+        )
+        np.testing.assert_array_equal(
+            task.pseudo_outcome,
+            expected_pseudo_outcome,
+        )
+        assert task.config is config
+        assert task.model_marker == "authenticated-model-marker"
+        assert task.operational_controls is controls
+        assert task.text_authority is text_authority
+
+
 def test_htr_operational_controls_fail_closed_for_scientific_or_idle_workers():
     config = _config()
     with pytest.raises(ValueError, match="optimizer training_batch_size"):
@@ -624,6 +794,12 @@ def test_process_fold_invocation_enforces_and_reobserves_torch_determinism(
         group_module,
         "_observe_stage1_torch_determinism",
         observe,
+    )
+    monkeypatch.setattr(group_module.torch, "get_num_threads", lambda: 1)
+    monkeypatch.setattr(
+        group_module.torch,
+        "get_num_interop_threads",
+        lambda: 1,
     )
     completed = group_module._invoke_htr_fold_worker(
         lambda task, device: (task, device),

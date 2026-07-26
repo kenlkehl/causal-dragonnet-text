@@ -131,7 +131,7 @@ def test_terminal_path_reopens_measured_benchmark_authorities(
     )
     request = {
         "stage1_execution_profile": {
-            "schema_version": "portable_stage1_execution_profile_v7",
+            "schema_version": "portable_stage1_execution_profile_v8",
             "resource_kind": "accelerator",
             "device_count": 2,
             "scope_workers_per_device": 2,
@@ -158,6 +158,17 @@ def test_terminal_path_reopens_measured_benchmark_authorities(
                 "chunk_plan_cache_max_entries": 100,
                 "tokenized_chunk_cache_max_entries": 1000,
             },
+            "neural_query_operational_controls": {
+                "schema_version": (
+                    "production_role_neutral_neural_query_operational_controls_v1"
+                ),
+                "inner_fold_parallelism": 1,
+                "fold_parallel_backend": "threads",
+                "fold_slots_per_device": 1,
+                "bank_parallelism": 1,
+                "worker_cpu_threads": 1,
+            },
+            "tfidf_parallel_backend": "processes",
             "selection_method": "measured_role_neutral_benchmark_v1",
             "benchmark_evidence_kind": "raw_result_v1",
             "selected_candidate": "measured-x2",

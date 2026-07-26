@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
+from oci.inference import performance_telemetry
 from oci.inference.performance_telemetry import (
     BenchmarkRunObservation,
     ImmutableInputObservation,
@@ -24,6 +26,65 @@ from tests.resource_safety_test_support import resource_safety_policy
 
 OUTER_SCOPE = "configured-full-fit"
 INNER_SCOPE = "configured-inner-fit"
+
+
+def test_persistent_nvml_sampler_initializes_once_and_queries_exact_devices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pynvml
+
+    calls: list[object] = []
+    monkeypatch.setattr(
+        pynvml,
+        "nvmlInit",
+        lambda: calls.append("init"),
+    )
+    monkeypatch.setattr(
+        pynvml,
+        "nvmlShutdown",
+        lambda: calls.append("shutdown"),
+    )
+    monkeypatch.setattr(
+        pynvml,
+        "nvmlDeviceGetHandleByIndex",
+        lambda index: calls.append(("handle", index)) or f"handle-{index}",
+    )
+    monkeypatch.setattr(
+        pynvml,
+        "nvmlDeviceGetUUID",
+        lambda handle: f"uuid-{handle}".encode("utf-8"),
+    )
+    monkeypatch.setattr(
+        pynvml,
+        "nvmlDeviceGetUtilizationRates",
+        lambda handle: SimpleNamespace(
+            gpu=40 if handle == "handle-0" else 50
+        ),
+    )
+    monkeypatch.setattr(
+        pynvml,
+        "nvmlDeviceGetMemoryInfo",
+        lambda handle: SimpleNamespace(
+            used=100 if handle == "handle-0" else 200,
+            total=1_000,
+        ),
+    )
+    source = performance_telemetry.PersistentNvidiaGpuSampler(
+        ("cuda:0", "cuda:1")
+    )
+    with source:
+        first = source.sample()
+        second = source.sample()
+    assert calls.count("init") == 1
+    assert calls.count("shutdown") == 1
+    assert calls.count(("handle", 0)) == 1
+    assert calls.count(("handle", 1)) == 1
+    assert first == second
+    assert [row["device"] for row in first] == ["cuda:0", "cuda:1"]
+    assert first[0]["uuid"] == "uuid-handle-0"
+    assert first[1]["memory_used_bytes"] == 200
+    with pytest.raises(RuntimeError, match="not active"):
+        source.sample()
 
 
 def _digest(label: str) -> str:

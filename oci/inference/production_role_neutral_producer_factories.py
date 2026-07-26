@@ -2014,23 +2014,62 @@ class PreparedBuildRoleNeutralProducerFactoriesBuilder:
                 config=bindings.matched_pair,
                 model_path=prepared.htr_model_path,
             )
-            return BoundRoleNeutralComponentProducer(
-                execute=lambda: (
-                    execute_role_neutral_matched_pair_from_bow_nuisance_bank(
-                        request=request,
-                        output_root=invocation.output_root,
-                        fit_texts=inputs.fit_texts,
-                        fit_treatment=inputs.fit_treatment,
-                        fit_outcome=inputs.fit_outcome,
-                        nuisance_bank=nuisance_bank,
-                        view_configs=bindings.bow_views,
-                        config=bindings.matched_pair,
-                        htr_extractor_factory=extractor_factory,
-                        exact_heldout_text_loader=heldout_loader,
-                        device=invocation.resource,
-                        htr_model_path=prepared.htr_model_path,
+
+            def execute_matched_pair() -> Any:
+                controls = invocation.htr_operational_controls
+                if controls is None:
+                    return (
+                        execute_role_neutral_matched_pair_from_bow_nuisance_bank(
+                            request=request,
+                            output_root=invocation.output_root,
+                            fit_texts=inputs.fit_texts,
+                            fit_treatment=inputs.fit_treatment,
+                            fit_outcome=inputs.fit_outcome,
+                            nuisance_bank=nuisance_bank,
+                            view_configs=bindings.bow_views,
+                            config=bindings.matched_pair,
+                            htr_extractor_factory=extractor_factory,
+                            exact_heldout_text_loader=heldout_loader,
+                            device=invocation.resource,
+                            htr_model_path=prepared.htr_model_path,
+                        )
                     )
-                ),
+                owner_cpu_budget = invocation.owner_cpu_budget
+                if owner_cpu_budget is None:
+                    owner_cpu_budget = prepared.options.num_workers
+                fold_resource_plan = controls.bind_fold_resources(
+                    devices=invocation.htr_fold_devices,
+                    owner_cpu_budget=owner_cpu_budget,
+                )
+                captured: list[Mapping[str, Any]] = []
+                execute_role_neutral_matched_pair_from_bow_nuisance_bank(
+                    request=request,
+                    output_root=invocation.output_root,
+                    fit_texts=inputs.fit_texts,
+                    fit_treatment=inputs.fit_treatment,
+                    fit_outcome=inputs.fit_outcome,
+                    nuisance_bank=nuisance_bank,
+                    view_configs=bindings.bow_views,
+                    config=bindings.matched_pair,
+                    htr_extractor_factory=extractor_factory,
+                    exact_heldout_text_loader=heldout_loader,
+                    device=invocation.resource,
+                    htr_model_path=prepared.htr_model_path,
+                    fold_resource_plan=fold_resource_plan,
+                    operational_attestation_sink=captured.append,
+                )
+                if len(captured) != 1:
+                    raise RuntimeError(
+                        "matched-pair operational execution omitted its one "
+                        "attestation"
+                    )
+                return RoleNeutralOperationalComponentReport(
+                    component="matched_pair",
+                    attestation=captured[0],
+                )
+
+            return BoundRoleNeutralComponentProducer(
+                execute=execute_matched_pair,
                 authenticate=lambda: (
                     authenticate_role_neutral_matched_pair_component(
                         root=invocation.output_root,
@@ -2145,8 +2184,13 @@ class PreparedBuildRoleNeutralProducerFactoriesBuilder:
                 owner_rows=request.physical_owner.heldout_row_ids,
                 texts=inputs.heldout_texts,
             )
-            return BoundRoleNeutralComponentProducer(
-                execute=lambda: execute_role_neutral_tfidf_physical_group(
+
+            def execute_tfidf() -> Any:
+                owner_cpu_budget = invocation.owner_cpu_budget
+                if owner_cpu_budget is None:
+                    owner_cpu_budget = prepared.options.num_workers
+                captured: list[Mapping[str, Any]] = []
+                execute_role_neutral_tfidf_physical_group(
                     request=request,
                     output_root=invocation.output_root,
                     fit_texts=inputs.fit_texts,
@@ -2154,7 +2198,25 @@ class PreparedBuildRoleNeutralProducerFactoriesBuilder:
                     fit_outcome=inputs.fit_outcome,
                     config=prepared.config,
                     exact_heldout_text_loader=heldout_loader,
-                ),
+                    tfidf_workers=prepared.options.tfidf_workers,
+                    tfidf_parallel_backend=(
+                        prepared.options.tfidf_parallel_backend
+                    ),
+                    owner_cpu_budget=owner_cpu_budget,
+                    operational_attestation_sink=captured.append,
+                )
+                if len(captured) != 1:
+                    raise RuntimeError(
+                        "TF-IDF operational execution omitted its one "
+                        "attestation"
+                    )
+                return RoleNeutralOperationalComponentReport(
+                    component="tfidf",
+                    attestation=captured[0],
+                )
+
+            return BoundRoleNeutralComponentProducer(
+                execute=execute_tfidf,
                 authenticate=lambda: authenticate_role_neutral_tfidf_component(
                     root=invocation.output_root,
                     plan=invocation.plan,
@@ -2190,6 +2252,15 @@ class PreparedBuildRoleNeutralProducerFactoriesBuilder:
                     ),
                     seed=int(invocation.physical_owner.scope_seed),
                     outcome_type=str(prepared.config.outcome_type),
+                    operational_controls=(
+                        invocation.neural_query_operational_controls
+                    ),
+                    owner_cpu_budget=(
+                        invocation.owner_cpu_budget
+                        if invocation.neural_query_operational_controls
+                        is not None
+                        else None
+                    ),
                 )
                 request = (
                     RoleNeutralNeuralQueryPhysicalGroupRequest.from_plan(
@@ -2248,9 +2319,9 @@ class PreparedBuildRoleNeutralProducerFactoriesBuilder:
                 texts=inputs.heldout_texts,
             )
 
-            def execute_neural() -> Mapping[str, Any]:
+            def execute_neural() -> Any:
                 try:
-                    return execute_role_neutral_neural_query_physical_group(
+                    result = execute_role_neutral_neural_query_physical_group(
                         request=request,
                         output_root=invocation.output_root,
                         service=service,
@@ -2261,6 +2332,16 @@ class PreparedBuildRoleNeutralProducerFactoriesBuilder:
                             invocation.neural_query_execution_topology
                         ),
                         heldout_text_loader=heldout_loader,
+                    )
+                    if (
+                        invocation.neural_query_operational_controls
+                        is None
+                    ):
+                        return result
+                    attestation = service.operational_attestation()
+                    return RoleNeutralOperationalComponentReport(
+                        component="neural_query",
+                        attestation=attestation,
                     )
                 finally:
                     scratch.cleanup()

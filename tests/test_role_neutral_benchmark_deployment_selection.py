@@ -779,6 +779,13 @@ def test_durable_publication_selection_is_relocatable_and_drops_scratch_locators
         resource_performance_safety=(
             config.resource_performance_safety
         ),
+        stage1_execution=replace(
+            base.stage1_execution,
+            htr_operational_controls=replace(
+                base.stage1_execution.htr_operational_controls,
+                fold_parallelism=4,
+            ),
+        ),
         cpu_budget=4,
         forest_operational=replace(
             base.forest_operational,

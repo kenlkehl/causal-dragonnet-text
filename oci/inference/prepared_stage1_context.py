@@ -388,8 +388,21 @@ class PreparedStage1ContextArtifact:
         self,
         *,
         slot_cpu_budget: int | None = None,
+        ordinary_full_byte_cache_fallback: bool = False,
+        absent_htr_model_path_rebinding: Path | str | None = None,
     ) -> tuple[Any, Any]:
-        """Rehydrate the sealed state without rerunning monolithic prepare()."""
+        """Rehydrate the sealed state without rerunning monolithic prepare().
+
+        The two optional recovery controls are deliberately narrow and
+        operational.  ``ordinary_full_byte_cache_fallback`` bypasses only an
+        operator-trusted stat-continuity shortcut and instead reauthenticates
+        every registered cache byte through the ordinary reader.
+        ``absent_htr_model_path_rebinding`` may replace a legacy local HTR
+        locator only when that recorded locator no longer exists.  The
+        replacement is accepted only after the existing path-neutral
+        effective-configuration projection and sealed model-tree digest both
+        reproduce exactly.
+        """
 
         import dataclasses
 
@@ -437,6 +450,15 @@ class PreparedStage1ContextArtifact:
             dict(locators["exact_stage1_request"])
         )
         options = _options_from_mapping(locators["stage1_build_options"])
+        if not isinstance(ordinary_full_byte_cache_fallback, bool):
+            raise TypeError(
+                "ordinary_full_byte_cache_fallback must be boolean"
+            )
+        if ordinary_full_byte_cache_fallback:
+            options = dataclasses.replace(
+                options,
+                embedding_cache_operator_trusted_read_proof=None,
+            )
         if slot_cpu_budget is not None:
             budget = int(slot_cpu_budget)
             if isinstance(slot_cpu_budget, bool) or budget < 1:
@@ -473,6 +495,41 @@ class PreparedStage1ContextArtifact:
             config_path,
             require_explicit_scientific_fields=True,
         )
+        if absent_htr_model_path_rebinding is not None:
+            supplied_htr_path = Path(
+                absent_htr_model_path_rebinding
+            )
+            if not supplied_htr_path.is_absolute():
+                raise ValueError(
+                    "HTR model-path rebinding must be absolute"
+                )
+            if supplied_htr_path.is_symlink():
+                raise ValueError(
+                    "HTR model-path rebinding must name a real directory"
+                )
+            supplied_htr_path = supplied_htr_path.resolve(strict=True)
+            if not supplied_htr_path.is_dir():
+                raise ValueError(
+                    "HTR model-path rebinding must name a directory"
+                )
+            recorded_htr_path = Path(
+                str(source_config.architecture.htr_sentence_model)
+            ).expanduser()
+            if not recorded_htr_path.is_absolute():
+                recorded_htr_path = config_path.parent / recorded_htr_path
+            if recorded_htr_path.exists() or recorded_htr_path.is_symlink():
+                if (
+                    recorded_htr_path.resolve(strict=True)
+                    != supplied_htr_path
+                ):
+                    raise ValueError(
+                        "HTR model-path rebinding is permitted only when "
+                        "the sealed legacy locator is absent"
+                    )
+            else:
+                source_config.architecture.htr_sentence_model = str(
+                    supplied_htr_path
+                )
         config, htr_model_path = _validate_effective_config(
             source_config,
             dataset_path=dataset_path,

@@ -335,6 +335,8 @@ def _accepted_fresh_terminal_report(
     checkpoint_body = {
         "status": "accepted",
         "fresh_full_byte_validation": True,
+        "payload_bytes_reauthenticated_for_all_adoptions": True,
+        "global_release_certified": False,
         "oracle_evaluation_after_frozen_prediction": True,
     }
     body = {
@@ -477,6 +479,16 @@ def _portable_options(
 def _write_scientific_spec(path: Path) -> Path:
     specification = _scientific_spec()
     payload = asdict(specification)
+    learned_profile = payload["architecture_profiles"][
+        "learned_neural_queries"
+    ]
+    learned_producer = dict(
+        learned_profile.get("producer_configuration", {})
+    )
+    learned_producer["query_config"] = {
+        "query_inner_folds": 3,
+    }
+    learned_profile["producer_configuration"] = learned_producer
     payload["stage2_prompt_protocol"] = specification.stage2_prompt_protocol.as_dict()
     payload["post_extraction_causal_review"] = specification.post_extraction_causal_review.as_dict()
     path.write_text(
@@ -550,6 +562,18 @@ def _direct_deployment_args(
         "0",
         "--stage1-htr-tokenized-chunk-cache-max-entries",
         "0",
+        "--stage1-neural-query-inner-fold-parallelism",
+        "1",
+        "--stage1-neural-query-fold-parallel-backend",
+        "threads",
+        "--stage1-neural-query-fold-slots-per-device",
+        "1",
+        "--stage1-neural-query-bank-parallelism",
+        "1",
+        "--stage1-neural-query-worker-cpu-threads",
+        "1",
+        "--tfidf-parallel-backend",
+        "threads",
         "--cpu-budget",
         "2",
         "--forest-operational",
@@ -831,7 +855,7 @@ def test_run_control_selection_and_fresh_achievement_are_separate_attestations(
     )
     with pytest.raises(
         RuntimeError,
-        match="fresh path-only terminal report",
+        match="declared fresh or operator-trusted checkpoint policy",
     ):
         workflow._write_validation_achievement_attestation(
             _published_terminal_phase_manifest(
@@ -4191,11 +4215,11 @@ def test_resume_revalidation_reopens_measured_benchmark_authorities(
         ),
         "deployment_profile_path": None,
         "stage1_execution_profile": {
-            "schema_version": "portable_stage1_execution_profile_v7",
+            "schema_version": "portable_stage1_execution_profile_v8",
             "resource_kind": "accelerator",
             "device_count": 2,
-            "scope_workers_per_device": 2,
-            "max_parallel_owners": 4,
+            "scope_workers_per_device": 1,
+            "max_parallel_owners": 2,
             "executor_mode": "persistent_slots",
             "persistent_slot_startup_timeout_seconds": 30.0,
             "neural_query_topology": {
@@ -4218,6 +4242,17 @@ def test_resume_revalidation_reopens_measured_benchmark_authorities(
                 "chunk_plan_cache_max_entries": 100,
                 "tokenized_chunk_cache_max_entries": 1000,
             },
+            "neural_query_operational_controls": {
+                "schema_version": (
+                    "production_role_neutral_neural_query_operational_controls_v1"
+                ),
+                "inner_fold_parallelism": 1,
+                "fold_parallel_backend": "threads",
+                "fold_slots_per_device": 1,
+                "bank_parallelism": 1,
+                "worker_cpu_threads": 1,
+            },
+            "tfidf_parallel_backend": "processes",
             "selection_method": "measured_role_neutral_benchmark_v1",
             "benchmark_evidence_kind": "raw_result_v1",
             "selected_candidate": "measured-x2",
@@ -4237,7 +4272,7 @@ def test_resume_revalidation_reopens_measured_benchmark_authorities(
     }
 
     def reached(**kwargs):
-        assert kwargs["profile"].scope_workers_per_device == 2
+        assert kwargs["profile"].scope_workers_per_device == 1
         assert kwargs["resource_performance_safety"] == safety
         raise RuntimeError("measured-benchmark-revalidation-reached")
 
@@ -4507,6 +4542,15 @@ def test_relocated_cache_attestation_is_propagated_to_stage1_builder(
     workflow.request["stage1_physical_fit_identity"] = (
         PHYSICAL_FIT_IDENTITY.as_dict()
     )
+    monkeypatch.setattr(
+        workflow,
+        "_validated_complete",
+        lambda phase: (
+            {"result": {}}
+            if phase == "embedding_cache"
+            else None
+        ),
+    )
     sentinel = object()
     monkeypatch.setattr(
         workflow,
@@ -4540,6 +4584,7 @@ def test_relocated_cache_attestation_is_propagated_to_stage1_builder(
 
 def test_portable_semantic_witness_profile_is_bound_to_stage1_request(
     tmp_path,
+    monkeypatch,
 ) -> None:
     options = _portable_options(tmp_path)
     portable_identity = deepcopy(options.portable_scientific_spec)
@@ -4564,6 +4609,15 @@ def test_portable_semantic_witness_profile_is_bound_to_stage1_request(
     workflow = ProductionAllEvidenceWorkflow(options)
     workflow.request["stage1_physical_fit_identity"] = (
         PHYSICAL_FIT_IDENTITY.as_dict()
+    )
+    monkeypatch.setattr(
+        workflow,
+        "_validated_complete",
+        lambda phase: (
+            {"result": {}}
+            if phase == "embedding_cache"
+            else None
+        ),
     )
     cache = tmp_path / "embedding-cache"
     cache.mkdir()

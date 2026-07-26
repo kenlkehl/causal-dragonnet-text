@@ -33,6 +33,9 @@ from oci.inference.role_neutral_matched_pair_group_execution import (
     replay_role_neutral_matched_pair_exact_transform,
     validate_role_neutral_matched_pair_group_execution,
 )
+from oci.inference.stage1_htr_operational_controls import (
+    RoleNeutralHTRFoldResourcePlan,
+)
 from oci.inference.role_neutral_all_ten_binding import (
     authenticate_role_neutral_matched_pair_component,
 )
@@ -321,6 +324,9 @@ def _execute(
     request: RoleNeutralMatchedPairPhysicalGroupRequest,
     loader,
     config: RoleNeutralMatchedPairConfig | None = None,
+    fold_resource_plan: RoleNeutralHTRFoldResourcePlan | None = None,
+    operational_attestation_sink=None,
+    fold_event_sink=None,
 ):
     config = _config() if config is None else config
     texts, treatment, outcome, propensity, outcome_nuisance, _exact = _inputs(request)
@@ -337,6 +343,9 @@ def _execute(
         htr_extractor_factory=_factory(config),
         exact_heldout_input_loader=loader,
         device="cpu",
+        fold_resource_plan=fold_resource_plan,
+        operational_attestation_sink=operational_attestation_sink,
+        fold_event_sink=fold_event_sink,
     )
 
 
@@ -512,6 +521,233 @@ def test_matched_typed_htr_rejects_environment_override(
         _factory(_config())(torch.device("cpu"))
 
 
+def test_serial_and_process_parallel_matched_pair_preserve_science_and_attest_leases(
+    tmp_path: Path,
+) -> None:
+    request = _request()
+    config = _config()
+    *_fit_inputs, exact = _inputs(request)
+    serial_root = (tmp_path / "matched_serial").resolve()
+    parallel_root = (tmp_path / "matched_parallel").resolve()
+    serial_attestations: list[dict] = []
+    parallel_attestations: list[dict] = []
+
+    serial_plan = RoleNeutralHTRFoldResourcePlan(
+        devices=("cpu",),
+        fold_parallelism=1,
+        fold_slots_per_device=1,
+        owner_cpu_budget=2,
+        fold_parallel_backend="threads",
+    )
+    parallel_plan = RoleNeutralHTRFoldResourcePlan(
+        devices=("cpu",),
+        fold_parallelism=2,
+        fold_slots_per_device=2,
+        owner_cpu_budget=2,
+        fold_parallel_backend="processes",
+    )
+
+    def serial_loader(row_ids: tuple[int, ...]):
+        assert serial_attestations
+        assert row_ids == request.physical_owner.heldout_row_ids
+        return exact
+
+    def parallel_loader(row_ids: tuple[int, ...]):
+        assert parallel_attestations
+        assert row_ids == request.physical_owner.heldout_row_ids
+        return exact
+
+    serial_terminal = _execute(
+        root=serial_root,
+        request=request,
+        loader=serial_loader,
+        config=config,
+        fold_resource_plan=serial_plan,
+        operational_attestation_sink=serial_attestations.append,
+    )
+    parallel_terminal = _execute(
+        root=parallel_root,
+        request=request,
+        loader=parallel_loader,
+        config=config,
+        fold_resource_plan=parallel_plan,
+        operational_attestation_sink=parallel_attestations.append,
+    )
+
+    assert len(serial_attestations) == len(parallel_attestations) == 1
+    for attestation in (serial_attestations[0], parallel_attestations[0]):
+        attestation_body = {
+            key: value
+            for key, value in attestation.items()
+            if key != "content_sha256"
+        }
+        assert attestation["content_sha256"] == _canonical_sha256(
+            attestation_body
+        )
+    serial_execution = serial_attestations[0]["fold_execution"]
+    parallel_execution = parallel_attestations[0]["fold_execution"]
+    assert serial_execution["maximum_concurrent_fold_leases"] == 1
+    assert parallel_execution["maximum_concurrent_fold_leases"] == 2
+    assert [row["fold"] for row in parallel_execution["fold_intervals"]] == [
+        1,
+        2,
+    ]
+    assert len(
+        {
+            row["process_id"]
+            for row in parallel_execution["fold_intervals"]
+        }
+    ) == 2
+    assert parallel_attestations[0]["fold_resource_plan"] == (
+        parallel_plan.as_dict()
+    )
+    assert parallel_attestations[0][
+        "shared_mutable_array_store_used_by_fold_workers"
+    ] is False
+    assert parallel_attestations[0][
+        "live_models_returned_across_fold_boundary"
+    ] is False
+
+    def load_fit(root: Path):
+        metadata = json.loads(
+            (root / "fit_state" / "metadata.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        arrays = {}
+        for key, row in metadata["array_inventory"].items():
+            with (root / "fit_state" / row["relative_path"]).open(
+                "rb"
+            ) as handle:
+                arrays[key] = np.load(handle, allow_pickle=False)
+        return metadata, arrays
+
+    serial_metadata, serial_arrays = load_fit(serial_root)
+    parallel_metadata, parallel_arrays = load_fit(parallel_root)
+
+    def discrete_metadata(metadata: dict) -> dict:
+        result = json.loads(json.dumps(metadata))
+        result.pop("content_sha256")
+        result.pop("subproducer_evidence_identity_sha256")
+        for row in result["array_inventory"].values():
+            row.pop("content_sha256")
+            row.pop("file_sha256")
+            row.pop("size_bytes")
+        return result
+
+    assert discrete_metadata(serial_metadata) == discrete_metadata(
+        parallel_metadata
+    )
+    assert set(serial_arrays) == set(parallel_arrays)
+    htr_array_keys = {
+        key for key in serial_arrays if "_htr_" in key
+    } | {
+        serial_metadata["fit_numerical_bank"][name]
+        for name in serial_metadata["fit_numerical_bank"]
+        if name.startswith("htr::")
+    }
+    for key in sorted(serial_arrays):
+        if key in htr_array_keys:
+            np.testing.assert_allclose(
+                parallel_arrays[key],
+                serial_arrays[key],
+                rtol=config.replay_relative_tolerance,
+                atol=config.replay_absolute_tolerance,
+                equal_nan=True,
+            )
+        else:
+            np.testing.assert_array_equal(
+                parallel_arrays[key],
+                serial_arrays[key],
+            )
+
+    serial_seal = json.loads(
+        (serial_root / "fit_only_family_seal.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    parallel_seal = json.loads(
+        (parallel_root / "fit_only_family_seal.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert (
+        serial_seal["subproducer_proofs"][0]["evidence_payload"]
+        == parallel_seal["subproducer_proofs"][0]["evidence_payload"]
+    )
+    serial_htr_atoms = serial_seal["subproducer_proofs"][1][
+        "evidence_payload"
+    ]["atoms"]
+    parallel_htr_atoms = parallel_seal["subproducer_proofs"][1][
+        "evidence_payload"
+    ]["atoms"]
+    assert len(serial_htr_atoms) == len(parallel_htr_atoms)
+    for serial_atom, parallel_atom in zip(
+        serial_htr_atoms,
+        parallel_htr_atoms,
+        strict=True,
+    ):
+        serial_discrete = dict(serial_atom)
+        parallel_discrete = dict(parallel_atom)
+        serial_delta = serial_discrete.pop("delta_logit")
+        parallel_delta = parallel_discrete.pop("delta_logit")
+        assert serial_discrete == parallel_discrete
+        assert parallel_delta == pytest.approx(
+            serial_delta,
+            rel=config.replay_relative_tolerance,
+            abs=config.replay_absolute_tolerance,
+        )
+
+    for subproducer in ("bow", "htr"):
+        serial_view = json.loads(
+            (
+                serial_root
+                / "logical_views"
+                / f"{request.physical_owner.scope_id}.json"
+            ).read_text(encoding="utf-8")
+        )
+        parallel_view = json.loads(
+            (
+                parallel_root
+                / "logical_views"
+                / f"{request.physical_owner.scope_id}.json"
+            ).read_text(encoding="utf-8")
+        )
+        serial_registration = serial_view["prediction_artifacts"][
+            subproducer
+        ]
+        parallel_registration = parallel_view["prediction_artifacts"][
+            subproducer
+        ]
+        with (serial_root / serial_registration["relative_path"]).open(
+            "rb"
+        ) as handle:
+            serial_prediction = np.load(handle, allow_pickle=False)
+        with (parallel_root / parallel_registration["relative_path"]).open(
+            "rb"
+        ) as handle:
+            parallel_prediction = np.load(handle, allow_pickle=False)
+        if subproducer == "bow":
+            np.testing.assert_array_equal(
+                parallel_prediction,
+                serial_prediction,
+            )
+        else:
+            np.testing.assert_allclose(
+                parallel_prediction,
+                serial_prediction,
+                rtol=config.replay_relative_tolerance,
+                atol=config.replay_absolute_tolerance,
+                equal_nan=True,
+            )
+
+    for terminal in (serial_terminal, parallel_terminal):
+        assert "fold_resource_plan" not in terminal
+        assert "fold_execution" not in terminal
+        assert terminal["live_model_objects_reused_for_exact_transform"] is False
+        assert terminal["model_state_reloaded_for_primary_transform"] is True
+
+
 def test_matched_pair_consumes_authenticated_bow_bank_without_heldout_labels(
     tmp_path: Path,
 ):
@@ -537,6 +773,9 @@ def test_matched_pair_consumes_authenticated_bow_bank_without_heldout_labels(
         nuisance_folds=2,
         effect_folds=2,
         e_clip=0.02,
+        bow_fold_parallelism=1,
+        bow_parallel_backend="threads",
+        owner_cpu_budget=1,
         exact_heldout_text_loader=lambda row_ids: (
             exact.texts
             if row_ids

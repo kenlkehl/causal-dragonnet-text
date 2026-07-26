@@ -428,6 +428,151 @@ def sample_nvidia_gpus(devices: Sequence[str]) -> tuple[Mapping[str, Any], ...]:
     return tuple(sorted(rows, key=lambda row: row["device"]))
 
 
+class PersistentNvidiaGpuSampler:
+    """Query a fixed physical-device set through one persistent NVML session.
+
+    ``nvidia-smi`` process startup is intentionally avoided here.  This source
+    is used when an acquisition must fit wholly inside a short measured kernel
+    interval, so failure to initialize or query NVML is fatal rather than
+    silently producing an empty sample.
+    """
+
+    backend_name = "persistent_pynvml_nvml_session_v1"
+
+    def __init__(self, devices: Sequence[str]) -> None:
+        normalized = tuple(str(value) for value in devices)
+        indices: list[int] = []
+        for value in normalized:
+            match = re.fullmatch(r"cuda:([0-9]+)", value)
+            if match is None:
+                if value == "cpu":
+                    continue
+                raise ValueError(
+                    "persistent NVML sampling requires canonical CUDA devices"
+                )
+            indices.append(int(match.group(1)))
+        if len(indices) != len(set(indices)):
+            raise ValueError("persistent NVML sampling devices must be unique")
+        self.devices = tuple(f"cuda:{index}" for index in indices)
+        self._indices = tuple(indices)
+        self._nvml: Any | None = None
+        self._handles: tuple[Any, ...] = ()
+        self._uuids: tuple[str, ...] = ()
+        self._entered = False
+        self._closed = False
+
+    def __enter__(self) -> "PersistentNvidiaGpuSampler":
+        if self._entered or self._closed:
+            raise RuntimeError("persistent NVML sampler is single-use")
+        self._entered = True
+        if not self._indices:
+            return self
+        try:
+            import pynvml
+
+            pynvml.nvmlInit()
+            self._nvml = pynvml
+            handles = tuple(
+                pynvml.nvmlDeviceGetHandleByIndex(index)
+                for index in self._indices
+            )
+            uuids = tuple(
+                self._normalize_uuid(pynvml.nvmlDeviceGetUUID(handle))
+                for handle in handles
+            )
+        except BaseException as exc:
+            nvml = self._nvml
+            self._nvml = None
+            if nvml is not None:
+                try:
+                    nvml.nvmlShutdown()
+                except BaseException:
+                    pass
+            self._closed = True
+            raise RuntimeError(
+                "failed to initialize persistent NVML GPU sampling"
+            ) from exc
+        self._handles = handles
+        self._uuids = uuids
+        return self
+
+    @staticmethod
+    def _normalize_uuid(value: Any) -> str:
+        normalized = (
+            value.decode("utf-8", errors="strict")
+            if isinstance(value, bytes)
+            else str(value)
+        )
+        if not normalized:
+            raise RuntimeError("NVML returned an empty GPU UUID")
+        return normalized
+
+    def sample(self) -> tuple[Mapping[str, Any], ...]:
+        if not self._entered or self._closed:
+            raise RuntimeError("persistent NVML sampler is not active")
+        if not self._indices:
+            return ()
+        nvml = self._nvml
+        if nvml is None or len(self._handles) != len(self._indices):
+            raise RuntimeError("persistent NVML sampler has no active handles")
+        rows: list[dict[str, Any]] = []
+        try:
+            for device, handle, uuid in zip(
+                self.devices,
+                self._handles,
+                self._uuids,
+                strict=True,
+            ):
+                utilization = nvml.nvmlDeviceGetUtilizationRates(handle)
+                memory = nvml.nvmlDeviceGetMemoryInfo(handle)
+                row = {
+                    "device": device,
+                    "uuid": uuid,
+                    "utilization_percent": float(utilization.gpu),
+                    "memory_used_bytes": int(memory.used),
+                    "memory_total_bytes": int(memory.total),
+                }
+                if (
+                    not math.isfinite(row["utilization_percent"])
+                    or row["utilization_percent"] < 0.0
+                    or row["memory_used_bytes"] < 0
+                    or row["memory_total_bytes"] <= 0
+                    or row["memory_used_bytes"] > row["memory_total_bytes"]
+                ):
+                    raise RuntimeError(
+                        "NVML returned an invalid GPU telemetry row"
+                    )
+                rows.append(row)
+        except BaseException as exc:
+            if isinstance(exc, RuntimeError):
+                raise
+            raise RuntimeError("persistent NVML GPU query failed") from exc
+        return tuple(rows)
+
+    def __exit__(self, *_exc: object) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        nvml = self._nvml
+        self._nvml = None
+        self._handles = ()
+        if nvml is not None:
+            try:
+                nvml.nvmlShutdown()
+            except BaseException as exc:
+                raise RuntimeError(
+                    "failed to close persistent NVML GPU sampling"
+                ) from exc
+
+
+def persistent_nvidia_gpu_sampler(
+    devices: Sequence[str],
+) -> PersistentNvidiaGpuSampler:
+    """Return a single-use persistent NVML sampling source."""
+
+    return PersistentNvidiaGpuSampler(devices)
+
+
 def _reset_torch_peaks(devices: Sequence[str]) -> None:
     try:
         import torch
@@ -1098,4 +1243,6 @@ __all__ = [
     "assess_benchmark_acceptance",
     "assess_performance_acceptance",
     "sample_nvidia_gpus",
+    "PersistentNvidiaGpuSampler",
+    "persistent_nvidia_gpu_sampler",
 ]

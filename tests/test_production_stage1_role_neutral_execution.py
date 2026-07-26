@@ -507,6 +507,13 @@ def test_executes_derived_physical_owners_once_and_publishes_all_ten(
     execution_attestation = json.loads(
         (root / "execution_attestation.json").read_text(encoding="utf-8")
     )
+    assert execution_attestation["max_parallel_owners"] == 4
+    assert execution_attestation["effective_max_parallel_owners"] == 4
+    assert execution_attestation["owner_cpu_budget"] == 2
+    assert (
+        execution_attestation["effective_owner_concurrency_policy"]
+        == "configured_topology_capacity_v1"
+    )
     assert execution_attestation["compute_canary"] is None
     assert execution_attestation["compute_canary_replica_execution_count"] == 0
     assert (

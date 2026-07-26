@@ -13,12 +13,14 @@ import json
 import logging
 import os
 import stat
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from joblib import Parallel, delayed, parallel_config
 from scipy import sparse
 from scipy.optimize import linear_sum_assignment
 from sklearn.decomposition import NMF
@@ -38,6 +40,7 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 from sklearn.model_selection import KFold, StratifiedKFold
+from threadpoolctl import threadpool_limits
 
 from ..config import (
     BoWViewConfig,
@@ -69,6 +72,9 @@ logger = logging.getLogger(__name__)
 HANDOFF_SCHEMA_VERSION = "multi_model_forest_handoff_v2"
 DISCOVERY_SCHEMA_VERSION = "tfidf_topic_discovery_v3_safe_arrays"
 TFIDF_CONTEXT_ARTIFACT_INVENTORY_SCHEMA = "tfidf_context_artifact_inventory_v1"
+TFIDF_NUISANCE_EXECUTION_ATTESTATION_SCHEMA = (
+    "tfidf_joint_nuisance_fold_execution_attestation_v1"
+)
 
 
 def stable_hash(value: Any) -> str:
@@ -554,6 +560,458 @@ def _matrix_model_prediction(
     return np.asarray(prediction, dtype=float), model
 
 
+@dataclass(frozen=True)
+class _JointNuisanceTopLevelFoldTask:
+    """Complete immutable input for one top-level nuisance fold."""
+
+    fold: int
+    fit_positions: np.ndarray
+    heldout_positions: np.ndarray
+    texts: Tuple[str, ...]
+    treatment: np.ndarray
+    outcome: np.ndarray
+    outcome_binary: bool
+    split_labels: np.ndarray
+    views: Tuple[BoWViewConfig, ...]
+    fold_count: int
+    random_state: int
+    nuisance_stack_config: TfidfNuisanceStackScientificConfig
+
+
+@dataclass(frozen=True)
+class _JointNuisanceTopLevelFoldResult:
+    """Isolated CPU result returned by one top-level nuisance worker."""
+
+    fold: int
+    fit_positions: np.ndarray
+    heldout_positions: np.ndarray
+    base_predictions: Mapping[str, np.ndarray]
+    stacked_predictions: Mapping[str, np.ndarray]
+    worker_pid: int
+    started_monotonic_ns: int
+    finished_monotonic_ns: int
+    subfold_parallelism: int
+
+
+def _resolve_joint_nuisance_parallelism(
+    *,
+    tfidf_workers: int,
+    tfidf_parallel_backend: str,
+    owner_cpu_budget: Optional[int],
+    task_count: int,
+) -> Tuple[int, str, str, int]:
+    """Validate deployment controls and return the bounded Joblib plan."""
+
+    if isinstance(tfidf_workers, bool) or not isinstance(tfidf_workers, int):
+        raise TypeError("tfidf_workers must be a positive integer")
+    configured_workers = int(tfidf_workers)
+    if configured_workers < 1:
+        raise ValueError("tfidf_workers must be a positive integer")
+    if owner_cpu_budget is None:
+        budget = configured_workers
+    else:
+        if isinstance(owner_cpu_budget, bool) or not isinstance(owner_cpu_budget, int):
+            raise TypeError("TF-IDF owner_cpu_budget must be a positive integer")
+        budget = int(owner_cpu_budget)
+        if budget < 1:
+            raise ValueError("TF-IDF owner_cpu_budget must be a positive integer")
+    if isinstance(task_count, bool) or int(task_count) < 1:
+        raise ValueError("TF-IDF nuisance top-level fold count must be positive")
+    configured_backend = str(tfidf_parallel_backend).strip().lower()
+    if configured_backend == "loky":
+        configured_backend = "processes"
+    if configured_backend not in {"threads", "processes"}:
+        raise ValueError(
+            "tfidf_parallel_backend must be 'threads', 'processes', or 'loky'"
+        )
+    return (
+        min(configured_workers, budget, int(task_count)),
+        configured_backend,
+        "threading" if configured_backend == "threads" else "loky",
+        budget,
+    )
+
+
+def _fit_joint_nuisance_top_level_fold(
+    task: _JointNuisanceTopLevelFoldTask,
+) -> _JointNuisanceTopLevelFoldResult:
+    """Fit one outer nuisance fold; its subfold loop is deliberately serial."""
+
+    if not isinstance(task, _JointNuisanceTopLevelFoldTask):
+        raise TypeError("joint nuisance worker requires its typed fold task")
+    started_monotonic_ns = time.monotonic_ns()
+    fit_pos = np.asarray(task.fit_positions, dtype=int)
+    heldout_pos = np.asarray(task.heldout_positions, dtype=int)
+    texts = task.texts
+    targets = {
+        "treatment": (np.asarray(task.treatment, dtype=float), True),
+        "outcome": (
+            np.asarray(task.outcome, dtype=float),
+            bool(task.outcome_binary),
+        ),
+    }
+    split_labels = np.asarray(task.split_labels, dtype=int)
+    views = list(task.views)
+    grouped: Dict[Tuple[Any, ...], List[Tuple[int, BoWViewConfig]]] = {}
+    for index, view in enumerate(views):
+        grouped.setdefault(_vectorizer_key(view), []).append((index, view))
+
+    # This is the only numeric-library limiter inside a worker. The subfold
+    # iterator below remains an ordinary serial loop and never constructs a
+    # nested Joblib pool.
+    with threadpool_limits(limits=1):
+        fit_strata = split_labels[fit_pos]
+        sub_folds = _bounded_folds(
+            min(task.fold_count, len(fit_pos) // 2),
+            fit_strata,
+            stratified=True,
+        )
+        meta_fit = {
+            target: np.full(
+                (len(fit_pos), len(views)),
+                np.nan,
+                dtype=float,
+            )
+            for target in targets
+        }
+        for sub_fold, (sub_fit_local, sub_hold_local) in enumerate(
+            _splitter(
+                fit_strata,
+                sub_folds,
+                stratified=True,
+                seed=task.random_state + 1000 * task.fold,
+                shuffle=task.nuisance_stack_config.split_shuffle,
+            ),
+            start=1,
+        ):
+            sub_fit_local = np.asarray(sub_fit_local, dtype=int)
+            sub_hold_local = np.asarray(sub_hold_local, dtype=int)
+            sub_fit_pos = fit_pos[sub_fit_local]
+            sub_hold_pos = fit_pos[sub_hold_local]
+            for group_index, group_views in enumerate(grouped.values()):
+                vectorizer = _vectorizer(group_views[0][1])
+                try:
+                    x_sub_fit = vectorizer.fit_transform(
+                        [texts[index] for index in sub_fit_pos]
+                    )
+                    x_sub_hold = vectorizer.transform(
+                        [texts[index] for index in sub_hold_pos]
+                    )
+                except ValueError as exc:
+                    if group_views[0][1].empty_vocabulary_policy == "fail_closed":
+                        raise ValueError(
+                            "joint nuisance subfold could not fit the configured "
+                            f"vocabulary for view {group_views[0][1].name!r}"
+                        ) from exc
+                    x_sub_fit = x_sub_hold = None
+                for view_index, view in group_views:
+                    for target_index, (target, (values, binary)) in enumerate(
+                        targets.items()
+                    ):
+                        if x_sub_fit is None:
+                            prediction = _constant_prediction(
+                                values[sub_fit_pos],
+                                len(sub_hold_pos),
+                            )
+                        else:
+                            prediction, _ = _matrix_model_prediction(
+                                x_sub_fit,
+                                x_sub_hold,
+                                values[sub_fit_pos],
+                                view,
+                                binary=binary,
+                                seed=(
+                                    task.random_state
+                                    + 10_000 * task.fold
+                                    + 1000 * sub_fold
+                                    + 100 * group_index
+                                    + 10 * view_index
+                                    + target_index
+                                ),
+                            )
+                        meta_fit[target][sub_hold_local, view_index] = prediction
+
+        base_predictions = {
+            target: np.full(
+                (len(heldout_pos), len(views)),
+                np.nan,
+                dtype=float,
+            )
+            for target in targets
+        }
+        for group_index, group_views in enumerate(grouped.values()):
+            vectorizer = _vectorizer(group_views[0][1])
+            try:
+                x_fit = vectorizer.fit_transform(
+                    [texts[index] for index in fit_pos]
+                )
+                x_heldout = vectorizer.transform(
+                    [texts[index] for index in heldout_pos]
+                )
+            except ValueError as exc:
+                if group_views[0][1].empty_vocabulary_policy == "fail_closed":
+                    raise ValueError(
+                        "joint nuisance fold could not fit the configured "
+                        f"vocabulary for view {group_views[0][1].name!r}"
+                    ) from exc
+                x_fit = x_heldout = None
+            for view_index, view in group_views:
+                for target_index, (target, (values, binary)) in enumerate(
+                    targets.items()
+                ):
+                    if x_fit is None:
+                        prediction = _constant_prediction(
+                            values[fit_pos],
+                            len(heldout_pos),
+                        )
+                    else:
+                        prediction, _ = _matrix_model_prediction(
+                            x_fit,
+                            x_heldout,
+                            values[fit_pos],
+                            view,
+                            binary=binary,
+                            seed=(
+                                task.random_state
+                                + 30_000 * task.fold
+                                + 100 * group_index
+                                + 10 * view_index
+                                + target_index
+                            ),
+                        )
+                    base_predictions[target][:, view_index] = prediction
+
+        stacked_predictions: Dict[str, np.ndarray] = {}
+        for target_index, (target, (values, binary)) in enumerate(targets.items()):
+            if not np.isfinite(meta_fit[target]).all():
+                raise RuntimeError(
+                    f"Nested {target} nuisance meta-features are incomplete"
+                )
+            stack_model, stack_constant = _fit_stack(
+                meta_fit[target],
+                values[fit_pos],
+                binary=binary,
+                seed=(
+                    task.random_state
+                    + 40_000
+                    + 10 * task.fold
+                    + target_index
+                ),
+                config=task.nuisance_stack_config,
+            )
+            held_meta = base_predictions[target]
+            if stack_model is None:
+                stacked = np.full(
+                    len(heldout_pos),
+                    stack_constant,
+                    dtype=float,
+                )
+            elif binary:
+                stacked = stack_model.predict_proba(held_meta)[:, 1]
+            else:
+                stacked = stack_model.predict(held_meta)
+            stacked_predictions[target] = np.asarray(stacked, dtype=float)
+
+    return _JointNuisanceTopLevelFoldResult(
+        fold=int(task.fold),
+        fit_positions=fit_pos,
+        heldout_positions=heldout_pos,
+        base_predictions=base_predictions,
+        stacked_predictions=stacked_predictions,
+        worker_pid=int(os.getpid()),
+        started_monotonic_ns=int(started_monotonic_ns),
+        finished_monotonic_ns=int(time.monotonic_ns()),
+        subfold_parallelism=1,
+    )
+
+
+def _run_joint_nuisance_top_level_folds(
+    *,
+    tasks: Sequence[_JointNuisanceTopLevelFoldTask],
+    tfidf_workers: int,
+    tfidf_parallel_backend: str,
+    owner_cpu_budget: Optional[int],
+) -> Tuple[
+    List[_JointNuisanceTopLevelFoldResult],
+    Dict[str, Any],
+]:
+    """Run independent outer folds and return a strictly canonical merge set."""
+
+    task_list = list(tasks)
+    effective_workers, configured_backend, joblib_backend, budget = (
+        _resolve_joint_nuisance_parallelism(
+            tfidf_workers=tfidf_workers,
+            tfidf_parallel_backend=tfidf_parallel_backend,
+            owner_cpu_budget=owner_cpu_budget,
+            task_count=len(task_list),
+        )
+    )
+    expected_by_fold: Dict[int, _JointNuisanceTopLevelFoldTask] = {}
+    for task in task_list:
+        fold = int(task.fold)
+        if fold in expected_by_fold:
+            raise ValueError("joint nuisance task list contains a duplicate fold")
+        expected_by_fold[fold] = task
+    expected_folds = list(range(1, len(task_list) + 1))
+    if list(expected_by_fold) != expected_folds:
+        raise ValueError("joint nuisance task list is not in canonical fold order")
+
+    with threadpool_limits(limits=1):
+        if effective_workers == 1:
+            completion_order_results = [
+                _fit_joint_nuisance_top_level_fold(task)
+                for task in task_list
+            ]
+        else:
+            parallel_settings: Dict[str, Any] = {
+                "backend": joblib_backend,
+                "n_jobs": effective_workers,
+            }
+            if joblib_backend == "loky":
+                parallel_settings["inner_max_num_threads"] = 1
+            with parallel_config(**parallel_settings):
+                completion_order_results = Parallel(
+                    batch_size=1,
+                    pre_dispatch="all",
+                )(
+                    delayed(_fit_joint_nuisance_top_level_fold)(task)
+                    for task in task_list
+                )
+
+    completion_order = [
+        int(result.fold)
+        for result in sorted(
+            completion_order_results,
+            key=lambda result: (
+                int(result.finished_monotonic_ns),
+                int(result.fold),
+            ),
+        )
+    ]
+    ordered = sorted(
+        completion_order_results,
+        key=lambda result: int(result.fold),
+    )
+    if [int(result.fold) for result in ordered] != expected_folds:
+        raise RuntimeError(
+            "parallel TF-IDF nuisance execution changed canonical fold coverage"
+        )
+    for result in ordered:
+        expected = expected_by_fold[int(result.fold)]
+        if (
+            not np.array_equal(
+                np.asarray(result.fit_positions, dtype=int),
+                np.asarray(expected.fit_positions, dtype=int),
+            )
+            or not np.array_equal(
+                np.asarray(result.heldout_positions, dtype=int),
+                np.asarray(expected.heldout_positions, dtype=int),
+            )
+        ):
+            raise RuntimeError(
+                "parallel TF-IDF nuisance worker substituted fold positions"
+            )
+        if (
+            set(result.base_predictions) != {"treatment", "outcome"}
+            or set(result.stacked_predictions) != {"treatment", "outcome"}
+            or int(result.subfold_parallelism) != 1
+            or int(result.finished_monotonic_ns)
+            <= int(result.started_monotonic_ns)
+        ):
+            raise RuntimeError(
+                "parallel TF-IDF nuisance worker returned an invalid fold result"
+            )
+        for target in ("treatment", "outcome"):
+            base = np.asarray(result.base_predictions[target], dtype=float)
+            stacked = np.asarray(
+                result.stacked_predictions[target],
+                dtype=float,
+            )
+            if (
+                base.shape
+                != (len(result.heldout_positions), len(expected.views))
+                or stacked.shape != (len(result.heldout_positions),)
+                or not np.isfinite(base).all()
+                or not np.isfinite(stacked).all()
+            ):
+                raise RuntimeError(
+                    "parallel TF-IDF nuisance worker returned misaligned predictions"
+                )
+
+    concurrency = 0
+    peak_concurrency = 0
+    interval_events = sorted(
+        [
+            event
+            for result in ordered
+            for event in (
+                (
+                    int(result.started_monotonic_ns),
+                    1,
+                ),
+                (
+                    int(result.finished_monotonic_ns),
+                    -1,
+                ),
+            )
+        ],
+        # Treat a finish as releasing its worker before a same-tick start.
+        key=lambda event: (event[0], event[1]),
+    )
+    for _timestamp, delta in interval_events:
+        concurrency += int(delta)
+        peak_concurrency = max(peak_concurrency, concurrency)
+    if concurrency != 0 or peak_concurrency > effective_workers:
+        raise RuntimeError(
+            "parallel TF-IDF nuisance execution exceeded its worker plan"
+        )
+    worker_pids = sorted(
+        {int(result.worker_pid) for result in ordered}
+    )
+    if effective_workers > 1 and peak_concurrency < 2:
+        raise RuntimeError(
+            "parallel TF-IDF nuisance execution silently serialized its "
+            "top-level folds"
+        )
+    if (
+        effective_workers > 1
+        and configured_backend == "processes"
+        and len(worker_pids) < 2
+    ):
+        raise RuntimeError(
+            "process-parallel TF-IDF nuisance execution did not use "
+            "isolated workers"
+        )
+    execution = {
+        "configured_workers": int(tfidf_workers),
+        "effective_workers": int(effective_workers),
+        "actual_peak_concurrent_fold_workers": int(peak_concurrency),
+        "owner_cpu_budget": int(budget),
+        "worker_cpu_threads": 1,
+        "peak_active_worker_cpu_threads": int(peak_concurrency),
+        "configured_backend": configured_backend,
+        "joblib_backend": joblib_backend,
+        "fold_count": len(task_list),
+        "canonical_fold_order": expected_folds,
+        "completion_order": completion_order,
+        "fold_overlap_observed": bool(peak_concurrency > 1),
+        "worker_pids": worker_pids,
+        "subfold_parallelism": 1,
+        "subfold_joblib_pools_created": False,
+        "clock_domain_id": "python_monotonic_ns_systemwide_v1",
+        "fold_intervals": [
+            {
+                "fold": int(result.fold),
+                "worker_pid": int(result.worker_pid),
+                "started_monotonic_ns": int(result.started_monotonic_ns),
+                "finished_monotonic_ns": int(result.finished_monotonic_ns),
+            }
+            for result in ordered
+        ],
+    }
+    return ordered, execution
+
+
 def fit_joint_cross_fitted_nuisance_stacks(
     *,
     texts: Sequence[str],
@@ -565,10 +1023,20 @@ def fit_joint_cross_fitted_nuisance_stacks(
     folds: int,
     random_state: int,
     nuisance_stack_config: TfidfNuisanceStackScientificConfig,
+    tfidf_workers: int = 1,
+    tfidf_parallel_backend: str = "threads",
+    owner_cpu_budget: Optional[int] = None,
+    operational_attestation_sink: Optional[
+        Callable[[Mapping[str, Any]], None]
+    ] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Fit treatment/outcome stacks while sharing every label-free TF-IDF fit."""
     if type(nuisance_stack_config) is not TfidfNuisanceStackScientificConfig:
         raise TypeError("nuisance_stack_config must be explicitly typed")
+    if operational_attestation_sink is not None and not callable(
+        operational_attestation_sink
+    ):
+        raise TypeError("operational_attestation_sink must be callable")
     texts = _normalize_texts(texts)
     targets = {
         "treatment": (np.asarray(treatment, dtype=float), True),
@@ -586,128 +1054,67 @@ def fit_joint_cross_fitted_nuisance_stacks(
     for index, view in enumerate(views):
         grouped.setdefault(_vectorizer_key(view), []).append((index, view))
 
-    for fold, (fit_pos, heldout_pos) in enumerate(
-        _splitter(
-            split_labels,
-            fold_count,
-            stratified=True,
-            seed=random_state,
-            shuffle=nuisance_stack_config.split_shuffle,
-        ),
-        start=1,
-    ):
-        fit_pos = np.asarray(fit_pos, dtype=int)
-        heldout_pos = np.asarray(heldout_pos, dtype=int)
-        fit_strata = split_labels[fit_pos]
-        sub_folds = _bounded_folds(min(fold_count, len(fit_pos) // 2), fit_strata, stratified=True)
-        meta_fit = {
-            target: np.full((len(fit_pos), len(views)), np.nan, dtype=float) for target in targets
-        }
-        for sub_fold, (sub_fit_local, sub_hold_local) in enumerate(
+    tasks = [
+        _JointNuisanceTopLevelFoldTask(
+            fold=int(fold),
+            fit_positions=np.asarray(fit_pos, dtype=int),
+            heldout_positions=np.asarray(heldout_pos, dtype=int),
+            texts=tuple(texts),
+            treatment=np.asarray(targets["treatment"][0], dtype=float),
+            outcome=np.asarray(targets["outcome"][0], dtype=float),
+            outcome_binary=bool(outcome_binary),
+            split_labels=split_labels,
+            views=tuple(views),
+            fold_count=int(fold_count),
+            random_state=int(random_state),
+            nuisance_stack_config=nuisance_stack_config,
+        )
+        for fold, (fit_pos, heldout_pos) in enumerate(
             _splitter(
-                fit_strata,
-                sub_folds,
+                split_labels,
+                fold_count,
                 stratified=True,
-                seed=random_state + 1000 * fold,
+                seed=random_state,
                 shuffle=nuisance_stack_config.split_shuffle,
             ),
             start=1,
-        ):
-            sub_fit_local = np.asarray(sub_fit_local, dtype=int)
-            sub_hold_local = np.asarray(sub_hold_local, dtype=int)
-            sub_fit_pos = fit_pos[sub_fit_local]
-            sub_hold_pos = fit_pos[sub_hold_local]
-            for group_index, group_views in enumerate(grouped.values()):
-                vectorizer = _vectorizer(group_views[0][1])
-                try:
-                    x_sub_fit = vectorizer.fit_transform([texts[index] for index in sub_fit_pos])
-                    x_sub_hold = vectorizer.transform([texts[index] for index in sub_hold_pos])
-                except ValueError as exc:
-                    if group_views[0][1].empty_vocabulary_policy == "fail_closed":
-                        raise ValueError(
-                            "joint nuisance subfold could not fit the configured "
-                            f"vocabulary for view {group_views[0][1].name!r}"
-                        ) from exc
-                    x_sub_fit = x_sub_hold = None
-                for view_index, view in group_views:
-                    for target_index, (target, (values, binary)) in enumerate(targets.items()):
-                        if x_sub_fit is None:
-                            prediction = _constant_prediction(
-                                values[sub_fit_pos], len(sub_hold_pos)
-                            )
-                        else:
-                            prediction, _ = _matrix_model_prediction(
-                                x_sub_fit,
-                                x_sub_hold,
-                                values[sub_fit_pos],
-                                view,
-                                binary=binary,
-                                seed=(
-                                    random_state
-                                    + 10_000 * fold
-                                    + 1000 * sub_fold
-                                    + 100 * group_index
-                                    + 10 * view_index
-                                    + target_index
-                                ),
-                            )
-                        meta_fit[target][sub_hold_local, view_index] = prediction
-
-        for group_index, group_views in enumerate(grouped.values()):
-            vectorizer = _vectorizer(group_views[0][1])
-            try:
-                x_fit = vectorizer.fit_transform([texts[index] for index in fit_pos])
-                x_heldout = vectorizer.transform([texts[index] for index in heldout_pos])
-            except ValueError as exc:
-                if group_views[0][1].empty_vocabulary_policy == "fail_closed":
-                    raise ValueError(
-                        "joint nuisance fold could not fit the configured "
-                        f"vocabulary for view {group_views[0][1].name!r}"
-                    ) from exc
-                x_fit = x_heldout = None
-            for view_index, view in group_views:
-                for target_index, (target, (values, binary)) in enumerate(targets.items()):
-                    if x_fit is None:
-                        prediction = _constant_prediction(values[fit_pos], len(heldout_pos))
-                    else:
-                        prediction, _ = _matrix_model_prediction(
-                            x_fit,
-                            x_heldout,
-                            values[fit_pos],
-                            view,
-                            binary=binary,
-                            seed=(
-                                random_state
-                                + 30_000 * fold
-                                + 100 * group_index
-                                + 10 * view_index
-                                + target_index
-                            ),
-                        )
-                    base_oof[target][heldout_pos, view_index] = prediction
-
-        for target_index, (target, (values, binary)) in enumerate(targets.items()):
-            if not np.isfinite(meta_fit[target]).all():
-                raise RuntimeError(f"Nested {target} nuisance meta-features are incomplete")
-            stack_model, stack_constant = _fit_stack(
-                meta_fit[target],
-                values[fit_pos],
-                binary=binary,
-                seed=random_state + 40_000 + 10 * fold + target_index,
-                config=nuisance_stack_config,
+        )
+    ]
+    fold_results, execution_attestation = (
+        _run_joint_nuisance_top_level_folds(
+            tasks=tasks,
+            tfidf_workers=tfidf_workers,
+            tfidf_parallel_backend=tfidf_parallel_backend,
+            owner_cpu_budget=owner_cpu_budget,
+        )
+    )
+    for result in fold_results:
+        fold = int(result.fold)
+        fit_pos = np.asarray(result.fit_positions, dtype=int)
+        heldout_pos = np.asarray(result.heldout_positions, dtype=int)
+        if np.any(fold_ids[heldout_pos] != -1):
+            raise RuntimeError(
+                "parallel TF-IDF nuisance folds overlap held-out positions"
             )
-            held_meta = base_oof[target][heldout_pos]
-            if stack_model is None:
-                stack_oof[target][heldout_pos] = stack_constant
-            elif binary:
-                stack_oof[target][heldout_pos] = stack_model.predict_proba(held_meta)[:, 1]
-            else:
-                stack_oof[target][heldout_pos] = stack_model.predict(held_meta)
+        for target in targets:
+            base_oof[target][heldout_pos] = np.asarray(
+                result.base_predictions[target],
+                dtype=float,
+            )
+            stack_oof[target][heldout_pos] = np.asarray(
+                result.stacked_predictions[target],
+                dtype=float,
+            )
         fold_ids[heldout_pos] = fold
         fit_list = fit_pos.astype(int).tolist()
         for position in heldout_pos:
             fit_positions_by_row[int(position)] = fit_list
+    if np.any(fold_ids < 1):
+        raise RuntimeError(
+            "parallel TF-IDF nuisance merge omitted held-out positions"
+        )
 
+    full_fit_started_monotonic_ns = time.monotonic_ns()
     fitted_bases: Dict[str, List[Tuple[Optional[TfidfVectorizer], Optional[Any], float]]] = {
         target: [(None, None, float(np.mean(values))) for _ in views]
         for target, (values, _binary) in targets.items()
@@ -798,6 +1205,35 @@ def fit_joint_cross_fitted_nuisance_stacks(
                 for index, view in enumerate(views)
             },
         }
+    full_fit_finished_monotonic_ns = time.monotonic_ns()
+    latest_fold_finish = max(
+        int(row["finished_monotonic_ns"])
+        for row in execution_attestation["fold_intervals"]
+    )
+    if full_fit_started_monotonic_ns < latest_fold_finish:
+        raise RuntimeError(
+            "TF-IDF full-data nuisance fits started before the fold barrier"
+        )
+    attestation_body = {
+        "schema_version": TFIDF_NUISANCE_EXECUTION_ATTESTATION_SCHEMA,
+        **execution_attestation,
+        "fold_barrier_monotonic_ns": int(full_fit_started_monotonic_ns),
+        "full_fit_started_monotonic_ns": int(
+            full_fit_started_monotonic_ns
+        ),
+        "full_fit_finished_monotonic_ns": int(
+            full_fit_finished_monotonic_ns
+        ),
+        "full_data_base_fits_after_fold_barrier": True,
+        "final_stack_fits_after_fold_barrier": True,
+        "scientific_outputs_include_operational_metadata": False,
+    }
+    attestation = {
+        **attestation_body,
+        "content_sha256": stable_hash(attestation_body),
+    }
+    if operational_attestation_sink is not None:
+        operational_attestation_sink(attestation)
     return output
 
 
@@ -1597,6 +2033,12 @@ def fit_tfidf_topic_context(
     artifact_dir: Path,
     scope_id: str,
     enable_heldout_score_tests: bool = False,
+    tfidf_workers: int = 1,
+    tfidf_parallel_backend: str = "threads",
+    owner_cpu_budget: Optional[int] = None,
+    operational_attestation_sink: Optional[
+        Callable[[Mapping[str, Any]], None]
+    ] = None,
 ) -> Dict[str, Any]:
     """Fit one exact context and transform its externally held-out row set."""
     artifact_dir = Path(artifact_dir)
@@ -1617,6 +2059,10 @@ def fit_tfidf_topic_context(
         folds=nuisance_folds,
         random_state=config.random_state + 101,
         nuisance_stack_config=config.nuisance_stack_scientific,
+        tfidf_workers=tfidf_workers,
+        tfidf_parallel_backend=tfidf_parallel_backend,
+        owner_cpu_budget=owner_cpu_budget,
+        operational_attestation_sink=operational_attestation_sink,
     )
     treatment_result = joint_nuisance["treatment"]
     outcome_result = joint_nuisance["outcome"]

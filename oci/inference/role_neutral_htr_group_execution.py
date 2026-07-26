@@ -3540,6 +3540,11 @@ def _invoke_htr_fold_worker(
     worker_cpu_threads: int,
     process_isolated: bool,
 ) -> _CompletedFoldWork:
+    # The lease is active as soon as the child begins the submitted task.
+    # Include process-local determinism and native-thread setup in its
+    # interval; excluding that preamble can falsely report serial execution
+    # even while multiple fold workers are occupied concurrently.
+    started = time.monotonic_ns()
     determinism_before: Mapping[str, Any] | None = None
     if process_isolated:
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -3550,7 +3555,14 @@ def _invoke_htr_fold_worker(
             _enforce_stage1_torch_determinism()
         )
         torch.set_num_threads(worker_cpu_threads)
-    started = time.monotonic_ns()
+        if (
+            torch.get_num_threads() != worker_cpu_threads
+            or torch.get_num_interop_threads() != worker_cpu_threads
+        ):
+            raise RuntimeError(
+                "spawned HTR fold worker did not preserve its one-thread "
+                "Torch CPU lease"
+            )
     with threadpool_limits(limits=worker_cpu_threads):
         value = worker(task, device)
     finished = time.monotonic_ns()
@@ -3582,6 +3594,24 @@ def _invoke_htr_fold_worker(
     )
 
 
+def _warm_htr_process_slot(worker_cpu_threads: int) -> tuple[int, int, int]:
+    """Configure and prove one spawned slot without initializing CUDA."""
+
+    threads = int(worker_cpu_threads)
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    os.environ["OMP_NUM_THREADS"] = str(threads)
+    os.environ["MKL_NUM_THREADS"] = str(threads)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(threads)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(threads)
+    torch.set_num_threads(threads)
+    torch.set_num_interop_threads(threads)
+    return (
+        os.getpid(),
+        int(torch.get_num_threads()),
+        int(torch.get_num_interop_threads()),
+    )
+
+
 class _HTRFoldExecutor:
     """One stable single-worker executor per configured fold lease."""
 
@@ -3603,6 +3633,48 @@ class _HTRFoldExecutor:
                 )
                 for _slot in range(self.resource_plan.fold_parallelism)
             )
+            # ProcessPoolExecutor starts workers lazily.  If the first tiny
+            # fold is submitted while later slots are still importing this
+            # module, genuine parallel capacity can look serial in the lease
+            # attestation.  Ready every stable slot before any fold receives
+            # a lease; the warm-up itself does not initialize CUDA or carry
+            # scientific inputs.
+            try:
+                warm_futures = tuple(
+                    executor.submit(
+                        _warm_htr_process_slot,
+                        self.resource_plan.worker_cpu_threads,
+                    )
+                    for executor in self._executors
+                )
+                worker_reports = tuple(
+                    future.result() for future in warm_futures
+                )
+                worker_pids = tuple(
+                    int(report[0]) for report in worker_reports
+                )
+                if len(set(worker_pids)) != len(worker_pids):
+                    raise RuntimeError(
+                        "HTR process fold slots did not receive isolated "
+                        "workers"
+                    )
+                if any(
+                    report[1:] != (
+                        self.resource_plan.worker_cpu_threads,
+                        self.resource_plan.worker_cpu_threads,
+                    )
+                    for report in worker_reports
+                ):
+                    raise RuntimeError(
+                        "HTR process fold slot failed to bind its Torch CPU "
+                        "thread lease"
+                    )
+            except BaseException:
+                executors = self._executors
+                self._executors = ()
+                for executor in executors:
+                    executor.shutdown(wait=True, cancel_futures=True)
+                raise
         else:
             self._executors = tuple(
                 concurrent.futures.ThreadPoolExecutor(
@@ -3803,6 +3875,137 @@ class _OwnerFoldFitResult:
     effect_records: tuple[Mapping[str, Any], ...]
     architecture_evidence: tuple[Mapping[str, Any], ...]
     fold_execution_events: tuple[Mapping[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class _EffectFoldTaskPlan:
+    """Canonical R-stage quantities and tasks built after the nuisance barrier."""
+
+    tasks: tuple[_EffectFoldTask, ...]
+    clipped_e: np.ndarray
+    y_residual: np.ndarray
+    t_residual: np.ndarray
+    pseudo_outcome: np.ndarray
+    eligible: np.ndarray
+
+
+def _build_effect_fold_tasks(
+    *,
+    owner_scope_seed: int,
+    text_count: int,
+    treatment: np.ndarray,
+    outcome: np.ndarray,
+    nuisance_oof_e: np.ndarray,
+    nuisance_oof_m: np.ndarray,
+    config: RoleNeutralHTRConfig,
+    model_marker: str,
+    operational_controls: RoleNeutralHTROperationalControls | None,
+    text_authority: _FoldTextAuthority,
+) -> _EffectFoldTaskPlan:
+    """Build the exact production effect tasks from one complete nuisance OOF.
+
+    Keeping this barrier transformation in one production helper lets bounded
+    kernel calibration exercise the same splits, seeds, eligibility rule, and
+    optimizer inputs without duplicating the scientific R-stage builder.
+    """
+
+    row_count = int(text_count)
+    treatment_values = np.asarray(treatment, dtype=np.float64)
+    outcome_values = np.asarray(outcome, dtype=np.float64)
+    nuisance_e_values = np.asarray(nuisance_oof_e, dtype=np.float64)
+    nuisance_m_values = np.asarray(nuisance_oof_m, dtype=np.float64)
+    if (
+        row_count < 1
+        or any(
+            value.shape != (row_count,) or not np.isfinite(value).all()
+            for value in (
+                treatment_values,
+                outcome_values,
+                nuisance_e_values,
+                nuisance_m_values,
+            )
+        )
+    ):
+        raise ValueError(
+            "HTR effect-task builder requires complete finite nuisance OOF rows"
+        )
+    clipped_e = np.clip(
+        nuisance_e_values,
+        config.e_clip,
+        1.0 - config.e_clip,
+    )
+    y_residual = outcome_values - nuisance_m_values
+    t_residual = treatment_values - clipped_e
+    pseudo_outcome = y_residual / t_residual
+    eligible = (
+        (nuisance_e_values >= config.r_stage_min_propensity)
+        & (nuisance_e_values <= config.r_stage_max_propensity)
+        & np.isfinite(pseudo_outcome)
+    )
+    if not np.any(eligible):
+        raise ValueError("configured HTR R-stage bounds retain no fit rows")
+
+    tasks: list[_EffectFoldTask] = []
+    for objective in config.effect_objectives:
+        split_seed = _derived_seed(
+            int(owner_scope_seed),
+            purpose="split",
+            objective=objective,
+            fold=0,
+        )
+        splits = tuple(
+            KFold(
+                n_splits=config.effect_folds,
+                shuffle=True,
+                random_state=split_seed,
+            ).split(np.arange(row_count))
+        )
+        for fold, (fit_pos_raw, validation_pos_raw) in enumerate(
+            splits,
+            start=1,
+        ):
+            fit_pos = np.asarray(fit_pos_raw, dtype=np.int64)
+            validation_pos = np.asarray(
+                validation_pos_raw,
+                dtype=np.int64,
+            )
+            eligible_fit_pos = fit_pos[eligible[fit_pos]]
+            if not len(eligible_fit_pos):
+                raise ValueError(
+                    f"configured HTR {objective} fold {fold} "
+                    "has no eligible fit rows"
+                )
+            tasks.append(
+                _EffectFoldTask(
+                    objective=objective,
+                    fold=fold,
+                    split_seed=split_seed,
+                    model_seed=_derived_seed(
+                        int(owner_scope_seed),
+                        purpose="fit",
+                        objective=objective,
+                        fold=fold,
+                    ),
+                    fit_positions=fit_pos,
+                    eligible_fit_positions=eligible_fit_pos,
+                    validation_positions=validation_pos,
+                    y_residual=y_residual,
+                    t_residual=t_residual,
+                    pseudo_outcome=pseudo_outcome,
+                    config=config,
+                    model_marker=model_marker,
+                    operational_controls=operational_controls,
+                    text_authority=text_authority,
+                )
+            )
+    return _EffectFoldTaskPlan(
+        tasks=tuple(tasks),
+        clipped_e=np.ascontiguousarray(clipped_e),
+        y_residual=np.ascontiguousarray(y_residual),
+        t_residual=np.ascontiguousarray(t_residual),
+        pseudo_outcome=np.ascontiguousarray(pseudo_outcome),
+        eligible=np.ascontiguousarray(eligible),
+    )
 
 
 def _fit_owner_htr_folds(
@@ -4043,23 +4246,23 @@ def _fit_owner_htr_folds(
             # This is the strict stage barrier. No effect task is constructed
             # or submitted until every nuisance result is merged into OOF
             # order and every derived R-stage quantity is complete.
-            clipped_e = np.clip(
-                nuisance_oof_e,
-                config.e_clip,
-                1.0 - config.e_clip,
+            effect_plan = _build_effect_fold_tasks(
+                owner_scope_seed=int(owner.scope_seed),
+                text_count=len(texts),
+                treatment=treatment,
+                outcome=outcome,
+                nuisance_oof_e=nuisance_oof_e,
+                nuisance_oof_m=nuisance_oof_m,
+                config=config,
+                model_marker=model_marker,
+                operational_controls=operational_controls,
+                text_authority=text_authority,
             )
-            y_residual = outcome - nuisance_oof_m
-            t_residual = treatment - clipped_e
-            pseudo_outcome = y_residual / t_residual
-            eligible = (
-                (nuisance_oof_e >= config.r_stage_min_propensity)
-                & (nuisance_oof_e <= config.r_stage_max_propensity)
-                & np.isfinite(pseudo_outcome)
-            )
-            if not np.any(eligible):
-                raise ValueError(
-                    "configured HTR R-stage bounds retain no fit rows"
-                )
+            clipped_e = effect_plan.clipped_e
+            y_residual = effect_plan.y_residual
+            t_residual = effect_plan.t_residual
+            pseudo_outcome = effect_plan.pseudo_outcome
+            eligible = effect_plan.eligible
             emit(
                 {
                     "event": "nuisance_barrier_completed",
@@ -4078,61 +4281,9 @@ def _fit_owner_htr_folds(
                 }
             )
 
-            effect_tasks: list[_EffectFoldTask] = []
-            for objective in config.effect_objectives:
-                split_seed = _derived_seed(
-                    owner.scope_seed,
-                    purpose="split",
-                    objective=objective,
-                    fold=0,
-                )
-                splits = tuple(
-                    KFold(
-                        n_splits=config.effect_folds,
-                        shuffle=True,
-                        random_state=split_seed,
-                    ).split(np.arange(len(texts)))
-                )
-                for fold, (fit_pos_raw, validation_pos_raw) in enumerate(
-                    splits,
-                    start=1,
-                ):
-                    fit_pos = np.asarray(fit_pos_raw, dtype=np.int64)
-                    validation_pos = np.asarray(
-                        validation_pos_raw,
-                        dtype=np.int64,
-                    )
-                    eligible_fit_pos = fit_pos[eligible[fit_pos]]
-                    if not len(eligible_fit_pos):
-                        raise ValueError(
-                            f"configured HTR {objective} fold {fold} "
-                            "has no eligible fit rows"
-                        )
-                    effect_tasks.append(
-                        _EffectFoldTask(
-                            objective=objective,
-                            fold=fold,
-                            split_seed=split_seed,
-                            model_seed=_derived_seed(
-                                owner.scope_seed,
-                                purpose="fit",
-                                objective=objective,
-                                fold=fold,
-                            ),
-                            fit_positions=fit_pos,
-                            eligible_fit_positions=eligible_fit_pos,
-                            validation_positions=validation_pos,
-                            y_residual=y_residual,
-                            t_residual=t_residual,
-                            pseudo_outcome=pseudo_outcome,
-                            config=config,
-                            model_marker=model_marker,
-                            operational_controls=operational_controls,
-                            text_authority=text_authority,
-                        )
-                    )
+            effect_tasks = effect_plan.tasks
             effect_results = _execute_htr_fold_tasks(
-                tuple(effect_tasks),
+                effect_tasks,
                 resource_plan=resource_plan,
                 worker=_run_effect_fold,
                 stage="effect",

@@ -1188,6 +1188,12 @@ def select_benchmarked_deployment_profile(
             ),
             neural_query_topology=topology,
             htr_operational_controls=htr_controls,
+            neural_query_operational_controls=(
+                base.stage1_execution.neural_query_operational_controls
+            ),
+            tfidf_parallel_backend=(
+                base.stage1_execution.tfidf_parallel_backend
+            ),
             selection_method="measured_role_neutral_benchmark_v1",
             benchmark_evidence_kind=evidence.kind,
             selected_candidate=selected_name,

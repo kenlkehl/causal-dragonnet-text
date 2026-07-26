@@ -43,7 +43,7 @@
   },
   "response_concurrency": 8,
   "runtime_compatibility_class": "portable_python_posix_v1",
-  "schema_version": "portable_all_evidence_deployment_profile_v8",
+  "schema_version": "portable_all_evidence_deployment_profile_v9",
   "scratch_root": "/tmp/causal_dragonnet_portable_scratch",
   "stage1_execution": {
     "benchmark_evidence_kind": "none",
@@ -68,16 +68,25 @@
       "tokenized_chunk_cache_max_entries": 150000,
       "training_batch_size": 8
     },
+    "neural_query_operational_controls": {
+      "bank_parallelism": 3,
+      "fold_parallel_backend": "processes",
+      "fold_slots_per_device": 4,
+      "inner_fold_parallelism": 4,
+      "schema_version": "production_role_neutral_neural_query_operational_controls_v1",
+      "worker_cpu_threads": 1
+    },
     "max_parallel_owners": 1,
     "neural_query_topology": {
       "mode": "one_context_per_selected_device",
       "schema_version": "portable_stage1_execution_topology_policy_v1"
     },
     "resource_kind": "accelerator",
-    "schema_version": "portable_stage1_execution_profile_v7",
+    "schema_version": "portable_stage1_execution_profile_v8",
     "selected_candidate": null,
     "selection_method": "operator_configured",
-    "scope_workers_per_device": 1
+    "scope_workers_per_device": 1,
+    "tfidf_parallel_backend": "processes"
   },
   "stage2_tokenizer_locator": null,
   "stage1_profile_locator": "production_all_evidence_stage1_full.json",

@@ -25,7 +25,7 @@ import stat
 import tempfile
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, NamedTuple, Sequence
 
 import joblib
 import numpy as np
@@ -56,6 +56,14 @@ from .neural_query_agentic_forest import (
 from .neural_query_discovery_runtime import (
     NEURAL_QUERY_DISCOVERY_RUNTIME_ID,
     fit_in_memory_query_discovery,
+)
+from .neural_query_operational_controls import (
+    RoleNeutralNeuralQueryOperationalControls,
+    RoleNeutralNeuralQueryTaskResourcePlan,
+)
+from .neural_query_task_execution import (
+    NeuralQueryAuthenticatedCacheReference,
+    execute_bounded_neural_query_tasks,
 )
 from .production_neural_query_binary_layout import (
     numerical_array_sha256,
@@ -102,6 +110,14 @@ _DISCOVERY_MANIFEST_FIELDS = frozenset(
         "content_sha256",
     }
 )
+
+
+class _NeuralQuerySafeEvidenceBankTask(NamedTuple):
+    arguments: Mapping[str, Any]
+
+
+class _NeuralQueryMomentBankTask(NamedTuple):
+    arguments: Mapping[str, Any]
 
 
 def _canonical_json(value: Any) -> str:
@@ -375,6 +391,257 @@ def _safe_query_ngram_rows(
                 row[key] = float(value)
         output.append(row)
     return output
+
+
+def _resolve_bank_task_cache_rows(
+    *,
+    row_ids: Sequence[int],
+    texts: Sequence[str],
+    chunks: Sequence[np.ndarray] | None,
+    chunk_texts: Sequence[Sequence[str]] | None,
+    embedding_task_reference: (
+        NeuralQueryAuthenticatedCacheReference | None
+    ),
+) -> tuple[tuple[np.ndarray, ...], tuple[tuple[str, ...], ...]]:
+    rows = tuple(map(int, row_ids))
+    exact_texts = tuple(texts)
+    if embedding_task_reference is not None:
+        if chunks is not None or chunk_texts is not None:
+            raise ValueError(
+                "neural-query bank task cannot mix an mmap reference with "
+                "materialized cache payloads"
+            )
+        bound = embedding_task_reference.open_bound(
+            row_ids=rows,
+            texts=exact_texts,
+        )
+        resolved_chunks = tuple(bound.chunk_matrices(rows))
+        resolved_texts = tuple(
+            tuple(value) for value in bound.chunk_texts(rows)
+        )
+    else:
+        if chunks is None or chunk_texts is None:
+            raise ValueError(
+                "neural-query bank task lacks cache-backed row data"
+            )
+        resolved_chunks = tuple(chunks)
+        resolved_texts = tuple(
+            tuple(value) for value in chunk_texts
+        )
+    if (
+        len(rows)
+        != len(exact_texts)
+        or len(resolved_chunks) != len(rows)
+        or len(resolved_texts) != len(rows)
+        or any(
+            not isinstance(array, np.ndarray)
+            or array.dtype != np.dtype(np.float32)
+            or array.ndim != 2
+            or not np.isfinite(array).all()
+            or len(array) != len(text_rows)
+            for array, text_rows in zip(
+                resolved_chunks,
+                resolved_texts,
+                strict=True,
+            )
+        )
+    ):
+        raise ValueError(
+            "neural-query bank task cache rows changed coverage or dtype"
+        )
+    return resolved_chunks, resolved_texts
+
+
+def _run_safe_evidence_bank(
+    task: _NeuralQuerySafeEvidenceBankTask,
+    device: str,
+) -> dict[str, Any]:
+    if not isinstance(task, _NeuralQuerySafeEvidenceBankTask):
+        raise TypeError(
+            "neural-query evidence worker received another task type"
+        )
+    arguments = dict(task.arguments)
+    bank = str(arguments.pop("bank"))
+    bank_index = int(arguments.pop("bank_index"))
+    if bank not in _BANKS or bank_index != _BANKS.index(bank):
+        raise ValueError(
+            "neural-query evidence task changed canonical bank identity"
+        )
+    row_ids = tuple(map(int, arguments.pop("row_ids")))
+    chunks, chunk_texts = _resolve_bank_task_cache_rows(
+        row_ids=row_ids,
+        texts=arguments.pop("texts"),
+        chunks=arguments.pop("chunks"),
+        chunk_texts=arguments.pop("chunk_texts"),
+        embedding_task_reference=arguments.pop(
+            "embedding_task_reference"
+        ),
+    )
+    dataset_row_count = int(arguments.pop("dataset_row_count"))
+    corpus: list[Sequence[str]] = [()] * dataset_row_count
+    for row_id, values in zip(row_ids, chunk_texts, strict=True):
+        corpus[row_id] = values
+    query_config = arguments.pop("query_config")
+    result = arguments.pop("result")
+    evidence_rows = build_query_evidence(
+        bank=bank,
+        queries=np.asarray(result["queries"], dtype=np.float32),
+        query_records=result["records"],
+        row_ids=row_ids,
+        chunk_matrices=chunks,
+        all_chunk_texts=corpus,
+        config=copy.deepcopy(query_config),
+        device=str(device),
+        seed=int(arguments.pop("evidence_seed")),
+    )
+    if arguments:
+        raise ValueError(
+            "neural-query evidence task contains unexpected fields"
+        )
+    safe_rows: list[dict[str, Any]] = []
+    for row in evidence_rows:
+        safe_rows.append(
+            {
+                "query_id": str(row["query_id"]),
+                "bank": str(row["bank"]),
+                "mechanical_role": str(row["mechanical_role"]),
+                "statistical_gate_applied": False,
+                "member_count": int(row.get("member_count", 0)),
+                "fit_standardized_score": (
+                    None
+                    if row.get("fit_standardized_score") is None
+                    else float(row["fit_standardized_score"])
+                ),
+                "top_chunks": [],
+                "top_contrastive_ngrams": _safe_query_ngram_rows(
+                    row.get("top_contrastive_ngrams"),
+                    max_tokens=int(
+                        query_config.evidence_safe_term_max_tokens
+                    ),
+                    max_chars=int(
+                        query_config.evidence_safe_term_max_chars
+                    ),
+                ),
+            }
+        )
+    return {
+        "bank": bank,
+        "bank_index": bank_index,
+        "evidence_seed": int(
+            task.arguments["evidence_seed"]
+        ),
+        "rows": safe_rows,
+    }
+
+
+def _run_moment_bank(
+    task: _NeuralQueryMomentBankTask,
+    device: str,
+) -> dict[str, Any]:
+    if not isinstance(task, _NeuralQueryMomentBankTask):
+        raise TypeError(
+            "neural-query moment worker received another task type"
+        )
+    arguments = dict(task.arguments)
+    bank = str(arguments.pop("bank"))
+    bank_index = int(arguments.pop("bank_index"))
+    if bank not in _BANKS or bank_index != _BANKS.index(bank):
+        raise ValueError(
+            "neural-query moment task changed canonical bank identity"
+        )
+    row_ids = tuple(map(int, arguments.pop("row_ids")))
+    chunks, _chunk_texts = _resolve_bank_task_cache_rows(
+        row_ids=row_ids,
+        texts=arguments.pop("texts"),
+        chunks=arguments.pop("chunks"),
+        chunk_texts=arguments.pop("chunk_texts"),
+        embedding_task_reference=arguments.pop(
+            "embedding_task_reference"
+        ),
+    )
+    query_config = arguments.pop("query_config")
+    queries = np.array(
+        arguments.pop("queries"),
+        dtype=np.float32,
+        copy=True,
+        order="C",
+    )
+    records = copy.deepcopy(arguments.pop("records"))
+    expected = int(arguments.pop("expected_query_count"))
+    if arguments:
+        raise ValueError(
+            "neural-query moment task contains unexpected fields"
+        )
+    if len(records) != expected or queries.shape[0] != expected:
+        raise ValueError(
+            "neural-query moment task record count changed"
+        )
+    activations = soft_retrieval_activations(
+        chunks,
+        queries,
+        temperature=float(query_config.temperature),
+        device=str(device),
+        patient_batch_size=int(
+            query_config.retrieval_patient_batch_size
+        ),
+    )
+    if (
+        activations.shape != (len(row_ids), expected)
+        or not np.isfinite(activations).all()
+    ):
+        raise ValueError(
+            "neural-query moment activations are invalid"
+        )
+    fit_scores = np.asarray(
+        [
+            float(record["fit_standardized_score"])
+            for record in records
+        ],
+        dtype=np.float64,
+    )
+    if (
+        fit_scores.shape != (expected,)
+        or not np.isfinite(fit_scores).all()
+    ):
+        raise ValueError(
+            "neural-query moment fit-score state is invalid"
+        )
+    signed = np.asarray(activations, dtype=np.float64) * np.sign(
+        fit_scores
+    )[None, :]
+    descending = np.sort(signed, axis=1, kind="stable")[:, ::-1]
+    names = (
+        f"neural_query_{bank}_signed_mean",
+        f"neural_query_{bank}_absolute_max",
+        *(
+            f"neural_query_{bank}_signed_order_{rank:02d}"
+            for rank in range(1, expected + 1)
+        ),
+    )
+    values = np.column_stack(
+        (
+            np.mean(descending, axis=1),
+            np.max(np.abs(activations), axis=1),
+            descending,
+        )
+    )
+    if (
+        values.shape != (len(row_ids), expected + 2)
+        or not np.isfinite(values).all()
+    ):
+        raise RuntimeError(
+            "neural-query moment reduction is incomplete"
+        )
+    return {
+        "bank": bank,
+        "bank_index": bank_index,
+        "names": names,
+        "kinds": tuple(
+            f"neural_query_{bank}_moments" for _ in names
+        ),
+        "roles": tuple(_ROLE_BY_BANK[bank] for _ in names),
+        "values": np.asarray(values, dtype=np.float64),
+    }
 
 
 def _require_sha256(value: Any, *, name: str) -> str:
@@ -686,7 +953,7 @@ def validate_owned_discovery_snapshot(
 def _fit_context_query_discovery(
     *,
     row_ids: tuple[int, ...],
-    chunks: Sequence[np.ndarray],
+    chunks: Sequence[np.ndarray] | None,
     texts: tuple[str, ...],
     treatment: np.ndarray,
     outcome: np.ndarray,
@@ -697,6 +964,15 @@ def _fit_context_query_discovery(
     nuisance_folds: int,
     devices: tuple[str, ...],
     seed: int,
+    task_resource_plan: (
+        RoleNeutralNeuralQueryTaskResourcePlan | None
+    ) = None,
+    embedding_task_reference: (
+        NeuralQueryAuthenticatedCacheReference | None
+    ) = None,
+    execution_attestation_sink: (
+        Callable[[Mapping[str, Any]], None] | None
+    ) = None,
 ) -> Mapping[str, Any]:
     """Run production in-memory neural-query discovery on one spent context."""
 
@@ -729,6 +1005,9 @@ def _fit_context_query_discovery(
         nuisance_folds=int(nuisance_folds),
         devices=devices,
         seed=int(seed),
+        task_resource_plan=task_resource_plan,
+        embedding_task_reference=embedding_task_reference,
+        execution_attestation_sink=execution_attestation_sink,
     )
 
 
@@ -750,6 +1029,10 @@ class ContextFitNeuralQueryService:
         devices: Sequence[str],
         seed: int,
         outcome_type: str,
+        operational_controls: (
+            RoleNeutralNeuralQueryOperationalControls | None
+        ) = None,
+        owner_cpu_budget: int | None = None,
     ) -> None:
         self.cache_dir = _validated_fresh_executable_cache_root(cache_dir)
         # A checkpoint is executable Python serialization. Persisted copies are
@@ -810,6 +1093,33 @@ class ContextFitNeuralQueryService:
             not (value == "cpu" or value.startswith("cuda:")) for value in self.devices
         ):
             raise ValueError("devices must contain explicit CPU/CUDA device names")
+        if operational_controls is None:
+            if owner_cpu_budget is not None:
+                raise ValueError(
+                    "neural-query owner CPU budget requires operational "
+                    "controls"
+                )
+            self._task_resource_plan = None
+        else:
+            if not isinstance(
+                operational_controls,
+                RoleNeutralNeuralQueryOperationalControls,
+            ):
+                raise TypeError(
+                    "neural-query operational controls must be typed"
+                )
+            if owner_cpu_budget is None:
+                raise ValueError(
+                    "neural-query operational controls require the owner's "
+                    "CPU budget"
+                )
+            self._task_resource_plan = (
+                operational_controls.bind_task_resources(
+                    devices=self.devices,
+                    owner_cpu_budget=owner_cpu_budget,
+                )
+            )
+        self._operational_attestations: list[Mapping[str, Any]] = []
         self.seed = int(seed)
         self.outcome_type = str(outcome_type).strip().lower()
         if self.outcome_type not in {"binary", "continuous"}:
@@ -863,6 +1173,140 @@ class ContextFitNeuralQueryService:
         if current != self._identity:
             raise RuntimeError("neural-query context service state changed after binding")
         return copy.deepcopy(self._identity)
+
+    @property
+    def task_resource_plan(
+        self,
+    ) -> RoleNeutralNeuralQueryTaskResourcePlan | None:
+        """Return deployment resources without adding them to identity."""
+
+        return getattr(self, "_task_resource_plan", None)
+
+    def operational_attestations(self) -> tuple[Mapping[str, Any], ...]:
+        """Return detached runtime telemetry accumulated by this service."""
+
+        return tuple(
+            copy.deepcopy(dict(value))
+            for value in getattr(
+                self,
+                "_operational_attestations",
+                (),
+            )
+        )
+
+    def operational_attestation(self) -> Mapping[str, Any]:
+        """Validate and aggregate runtime phases outside scientific state."""
+
+        plan = self.task_resource_plan
+        if plan is None:
+            raise ValueError(
+                "serial neural-query service has no bounded-task "
+                "operational attestation"
+            )
+        phases = self.operational_attestations()
+        if not phases:
+            raise RuntimeError(
+                "neural-query service recorded no operational task phases"
+            )
+        names: list[str] = []
+        validated: list[dict[str, Any]] = []
+        for index, phase in enumerate(phases):
+            row = copy.deepcopy(dict(phase))
+            body = {
+                key: copy.deepcopy(value)
+                for key, value in row.items()
+                if key != "content_sha256"
+            }
+            if row.get("content_sha256") != _sha256_json(body):
+                raise RuntimeError(
+                    "neural-query operational phase attestation changed"
+                )
+            schema = str(row.get("schema_version") or "")
+            if schema == (
+                "production_neural_query_discovery_execution_attestation_v1"
+            ):
+                name = "inner_folds_then_consensus_final_refits"
+                if row.get("resource_plan") != plan.as_dict():
+                    raise RuntimeError(
+                        "neural-query discovery attested another resource "
+                        "plan"
+                    )
+            elif schema == (
+                "production_neural_query_task_phase_execution_attestation_v1"
+            ):
+                name = str(row.get("phase") or "")
+                if name not in {
+                    "safe_evidence_banks",
+                    "heldout_moment_banks",
+                }:
+                    raise ValueError(
+                        "neural-query service recorded an unsupported bank "
+                        "phase"
+                    )
+            else:
+                raise ValueError(
+                    "neural-query service recorded an unsupported "
+                    "operational attestation schema"
+                )
+            names.append(name)
+            validated.append(
+                {
+                    "phase_index": index,
+                    "phase": name,
+                    "attestation": row,
+                }
+            )
+        if (
+            "inner_folds_then_consensus_final_refits" in names
+            and names.index(
+                "inner_folds_then_consensus_final_refits"
+            )
+            != 0
+        ):
+            raise RuntimeError(
+                "neural-query discovery telemetry followed a transform phase"
+            )
+        if (
+            "safe_evidence_banks" in names
+            and "heldout_moment_banks" in names
+            and names.index("safe_evidence_banks")
+            > names.index("heldout_moment_banks")
+        ):
+            raise RuntimeError(
+                "neural-query held-out moments preceded safe evidence"
+            )
+        aggregate_body = {
+            "schema_version": (
+                "production_role_neutral_neural_query_operational_attestation_v1"
+            ),
+            "resource_plan": plan.as_dict(),
+            "phase_order": names,
+            "phase_count": len(validated),
+            "phases": validated,
+            "all_phase_attestations_self_authenticated": True,
+            "canonical_execution_order_preserved": True,
+            "scientific_payload_contains_device_metadata": False,
+            "attestation_embedded_in_scientific_artifact": False,
+            "resource_locators_in_scientific_identity": False,
+        }
+        return {
+            **aggregate_body,
+            "content_sha256": _sha256_json(aggregate_body),
+        }
+
+    def _record_operational_attestation(
+        self,
+        value: Mapping[str, Any],
+    ) -> None:
+        if not isinstance(value, Mapping):
+            raise TypeError(
+                "neural-query operational attestation must be one mapping"
+            )
+        if not hasattr(self, "_operational_attestations"):
+            self._operational_attestations = []
+        self._operational_attestations.append(
+            copy.deepcopy(dict(value))
+        )
 
     def _normalize_rows_and_texts(
         self,
@@ -963,7 +1407,28 @@ class ContextFitNeuralQueryService:
         if root.exists() and any(root.iterdir()):
             raise ValueError("refusing a pre-populated neural-query executable cache entry")
         root.mkdir(parents=True, exist_ok=True)
-        chunks = embedding_provider.chunk_matrices(row_ids)
+        task_resource_plan = self.task_resource_plan
+        embedding_task_reference: (
+            NeuralQueryAuthenticatedCacheReference | None
+        )
+        if task_resource_plan is None:
+            chunks: Sequence[np.ndarray] | None = (
+                embedding_provider.chunk_matrices(row_ids)
+            )
+            embedding_task_reference = None
+        else:
+            # The parent has already authenticated exact row/text binding.
+            # Spawned tasks receive only this row-scoped reference and reopen
+            # the one shared mmap cache; no chunk matrix or chunk text crosses
+            # process IPC.
+            embedding_task_reference = (
+                NeuralQueryAuthenticatedCacheReference.from_bound_provider(
+                    embedding_provider,
+                    allowed_row_ids=row_ids,
+                )
+            )
+            chunks = None
+        task_attestations: list[Mapping[str, Any]] = []
         discovery = _fit_context_query_discovery(
             row_ids=row_ids,
             chunks=chunks,
@@ -979,7 +1444,23 @@ class ContextFitNeuralQueryService:
             nuisance_folds=self.nuisance_folds,
             devices=self.devices,
             seed=int(self.seed + 100_000 * int(outer_fold)),
+            task_resource_plan=task_resource_plan,
+            embedding_task_reference=embedding_task_reference,
+            execution_attestation_sink=(
+                None
+                if task_resource_plan is None
+                else task_attestations.append
+            ),
         )
+        if task_resource_plan is not None:
+            if len(task_attestations) != 1:
+                raise RuntimeError(
+                    "neural-query discovery omitted its one operational "
+                    "attestation"
+                )
+            self._record_operational_attestation(
+                task_attestations[0]
+            )
         self._validate_discovery(discovery)
         self.identity()
         with tempfile.NamedTemporaryFile(
@@ -1179,61 +1660,221 @@ class ContextFitNeuralQueryService:
             text_name="context_texts",
         )
         self._validate_discovery(discovery)
-        chunks = embedding_provider.chunk_matrices(bound_row_ids)
-        # The evidence helper accepts a corpus-indexed sequence. Populate only
-        # spent rows; sealed chunk text is never materialized for this call.
-        corpus: list[Sequence[str]] = [()] * self._dataset_row_count
-        for row_id, row_chunks in zip(
-            bound_row_ids,
-            embedding_provider.chunk_texts(bound_row_ids),
-        ):
-            corpus[int(row_id)] = tuple(row_chunks)
-        output: list[dict[str, Any]] = []
-        for bank_index, bank in enumerate(_BANKS):
-            result = discovery["banks"][bank]
-            evidence_rows = build_query_evidence(
-                bank=bank,
-                queries=np.asarray(result["queries"], dtype=np.float32),
-                query_records=result["records"],
-                row_ids=bound_row_ids,
-                chunk_matrices=chunks,
-                all_chunk_texts=corpus,
-                config=copy.deepcopy(self.query_config),
-                device=self.devices[(bank_index + int(device_offset)) % len(self.devices)],
-                seed=int(self.seed + 3_000 + bank_index),
+        plan = self.task_resource_plan
+        if plan is None:
+            chunks: Sequence[np.ndarray] | None = (
+                embedding_provider.chunk_matrices(bound_row_ids)
             )
-            for row in evidence_rows:
-                # Contrastive n-grams and aggregate diagnostics carry the
-                # ontology signal. Raw note excerpts, row IDs, and chunk IDs do
-                # not cross the spent-evidence provider boundary.
-                output.append(
-                    {
-                        "query_id": str(row["query_id"]),
-                        "bank": str(row["bank"]),
-                        "mechanical_role": str(row["mechanical_role"]),
-                        "statistical_gate_applied": False,
-                        "member_count": int(row.get("member_count", 0)),
-                        "fit_standardized_score": (
-                            None
-                            if row.get("fit_standardized_score") is None
-                            else float(row["fit_standardized_score"])
+            chunk_texts: Sequence[Sequence[str]] | None = (
+                embedding_provider.chunk_texts(bound_row_ids)
+            )
+            task_reference = None
+        else:
+            chunks = None
+            chunk_texts = None
+            task_reference = (
+                NeuralQueryAuthenticatedCacheReference.from_bound_provider(
+                    embedding_provider,
+                    allowed_row_ids=bound_row_ids,
+                )
+            )
+        tasks: list[_NeuralQuerySafeEvidenceBankTask] = []
+        for bank_index, bank in enumerate(_BANKS):
+            tasks.append(
+                _NeuralQuerySafeEvidenceBankTask(
+                    arguments={
+                        "bank": bank,
+                        "bank_index": bank_index,
+                        "row_ids": bound_row_ids,
+                        "texts": _texts,
+                        "chunks": chunks,
+                        "chunk_texts": chunk_texts,
+                        "embedding_task_reference": task_reference,
+                        "dataset_row_count": self._dataset_row_count,
+                        "query_config": copy.deepcopy(
+                            self.query_config
                         ),
-                        "top_chunks": [],
-                        "top_contrastive_ngrams": _safe_query_ngram_rows(
-                            row.get("top_contrastive_ngrams"),
-                            max_tokens=int(
-                                self.query_config.evidence_safe_term_max_tokens
-                            ),
-                            max_chars=int(
-                                self.query_config.evidence_safe_term_max_chars
-                            ),
+                        "result": copy.deepcopy(
+                            discovery["banks"][bank]
+                        ),
+                        "evidence_seed": int(
+                            self.seed + 3_000 + bank_index
                         ),
                     }
                 )
+            )
+        if plan is None:
+            rows = tuple(
+                _run_safe_evidence_bank(
+                    task,
+                    self.devices[
+                        (index + int(device_offset))
+                        % len(self.devices)
+                    ],
+                )
+                for index, task in enumerate(tasks)
+            )
+        else:
+            rows, attestation = execute_bounded_neural_query_tasks(
+                tuple(tasks),
+                task_names=tuple(
+                    f"safe_evidence_{bank}_bank"
+                    for bank in _BANKS
+                ),
+                resource_plan=plan,
+                worker=_run_safe_evidence_bank,
+                parallelism=plan.bank_parallelism,
+                phase="safe_evidence_banks",
+            )
+            self._record_operational_attestation(attestation)
+        output: list[dict[str, Any]] = []
+        for bank_index, (bank, result) in enumerate(
+            zip(_BANKS, rows, strict=True)
+        ):
+            if (
+                result.get("bank") != bank
+                or int(result.get("bank_index", -1)) != bank_index
+                or int(result.get("evidence_seed", -1))
+                != int(self.seed + 3_000 + bank_index)
+                or not isinstance(result.get("rows"), list)
+            ):
+                raise RuntimeError(
+                    "neural-query evidence task changed canonical bank or "
+                    "seed order"
+                )
+            output.extend(result["rows"])
         if len(output) != sum(self.query_config.query_count(bank) for bank in _BANKS):
             raise RuntimeError("every context-fitted query must produce safe evidence")
         self.identity()
         return output
+
+    def moments_for_rows(
+        self,
+        *,
+        banks: Mapping[str, Mapping[str, Any]],
+        row_ids: Sequence[int],
+        texts: Sequence[str],
+        row_name: str,
+        text_name: str,
+    ) -> tuple[
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[str, ...],
+        np.ndarray,
+    ]:
+        """Compute three independent moment banks under the same task bounds."""
+
+        self.identity()
+        if not isinstance(banks, Mapping) or set(banks) != set(_BANKS):
+            raise ValueError(
+                "neural-query moments require all three canonical banks"
+            )
+        exact_rows, exact_texts, embedding_provider = (
+            self._bind_rows_and_texts(
+                row_ids,
+                texts,
+                row_name=row_name,
+                text_name=text_name,
+            )
+        )
+        plan = self.task_resource_plan
+        if plan is None:
+            chunks: Sequence[np.ndarray] | None = (
+                embedding_provider.chunk_matrices(exact_rows)
+            )
+            chunk_texts: Sequence[Sequence[str]] | None = (
+                embedding_provider.chunk_texts(exact_rows)
+            )
+            task_reference = None
+        else:
+            chunks = None
+            chunk_texts = None
+            task_reference = (
+                NeuralQueryAuthenticatedCacheReference.from_bound_provider(
+                    embedding_provider,
+                    allowed_row_ids=exact_rows,
+                )
+            )
+        tasks = tuple(
+            _NeuralQueryMomentBankTask(
+                arguments={
+                    "bank": bank,
+                    "bank_index": bank_index,
+                    "row_ids": exact_rows,
+                    "texts": exact_texts,
+                    "chunks": chunks,
+                    "chunk_texts": chunk_texts,
+                    "embedding_task_reference": task_reference,
+                    "query_config": copy.deepcopy(
+                        self.query_config
+                    ),
+                    "queries": np.array(
+                        banks[bank]["queries"],
+                        dtype=np.float32,
+                        copy=True,
+                        order="C",
+                    ),
+                    "records": copy.deepcopy(
+                        banks[bank]["records"]
+                    ),
+                    "expected_query_count": (
+                        self.query_config.query_count(bank)
+                    ),
+                }
+            )
+            for bank_index, bank in enumerate(_BANKS)
+        )
+        if plan is None:
+            results = tuple(
+                _run_moment_bank(
+                    task,
+                    self.devices[index % len(self.devices)],
+                )
+                for index, task in enumerate(tasks)
+            )
+        else:
+            results, attestation = execute_bounded_neural_query_tasks(
+                tasks,
+                task_names=tuple(
+                    f"heldout_moments_{bank}_bank"
+                    for bank in _BANKS
+                ),
+                resource_plan=plan,
+                worker=_run_moment_bank,
+                parallelism=plan.bank_parallelism,
+                phase="heldout_moment_banks",
+            )
+            self._record_operational_attestation(attestation)
+        names: list[str] = []
+        kinds: list[str] = []
+        roles: list[str] = []
+        matrices: list[np.ndarray] = []
+        for bank_index, (bank, result) in enumerate(
+            zip(_BANKS, results, strict=True)
+        ):
+            if (
+                result.get("bank") != bank
+                or int(result.get("bank_index", -1)) != bank_index
+            ):
+                raise RuntimeError(
+                    "neural-query moment task changed canonical bank order"
+                )
+            names.extend(result["names"])
+            kinds.extend(result["kinds"])
+            roles.extend(result["roles"])
+            matrices.append(
+                np.asarray(result["values"], dtype=np.float64)
+            )
+        values = np.column_stack(matrices)
+        if (
+            values.shape != (len(exact_rows), len(names))
+            or not np.isfinite(values).all()
+        ):
+            raise RuntimeError(
+                "neural-query held-out moment matrix is incomplete"
+            )
+        self.identity()
+        return tuple(names), tuple(kinds), tuple(roles), values
 
 
 class NeuralQueryContextBackend:
@@ -1307,73 +1948,22 @@ class NeuralQueryContextBackend:
         self.service._validate_discovery(discovery)
         # Gate text is bound only after the spent-context proposal has been
         # fitted/loaded.  No gate treatment or outcome is accepted here.
-        _gate_rows, _gate_texts, gate_embedding_provider = self.service._bind_rows_and_texts(
-            gate_rows,
-            gate_exact_texts,
+        names, kinds, roles, values = self.service.moments_for_rows(
+            banks=discovery["banks"],
+            row_ids=gate_rows,
+            texts=gate_exact_texts,
             row_name="gate_row_ids",
             text_name="gate_texts",
         )
-        gate_chunks = gate_embedding_provider.chunk_matrices(gate_rows)
-        names: list[str] = []
-        kinds: list[str] = []
-        roles: list[str] = []
-        columns: list[np.ndarray] = []
-        for bank_index, bank in enumerate(_BANKS):
-            result = discovery["banks"][bank]
-            activations = soft_retrieval_activations(
-                gate_chunks,
-                np.asarray(result["queries"], dtype=np.float32),
-                temperature=float(self.service.query_config.temperature),
-                device=self.service.devices[bank_index % len(self.service.devices)],
-                patient_batch_size=int(
-                    self.service.query_config.retrieval_patient_batch_size
-                ),
-            )
-            expected = self.service.query_config.query_count(bank)
-            if (
-                activations.shape != (len(gate_rows), expected)
-                or not np.isfinite(activations).all()
-            ):
-                raise ValueError(f"neural-query {bank} gate activations are invalid")
-            fit_scores = np.asarray(
-                [float(record["fit_standardized_score"]) for record in result["records"]],
-                dtype=float,
-            )
-            if fit_scores.shape != (expected,) or not np.isfinite(fit_scores).all():
-                raise ValueError(f"neural-query {bank} fit standardized scores are invalid")
-            signed_activations = np.asarray(activations, dtype=float) * np.sign(fit_scores)[None, :]
-            signed_descending = np.sort(signed_activations, axis=1, kind="stable")[:, ::-1]
-            bank_names = (
-                f"neural_query_{bank}_signed_mean",
-                f"neural_query_{bank}_absolute_max",
-                *(
-                    f"neural_query_{bank}_signed_order_{rank:02d}"
-                    for rank in range(1, expected + 1)
-                ),
-            )
-            bank_values = np.column_stack(
-                (
-                    np.mean(signed_descending, axis=1),
-                    np.max(np.abs(activations), axis=1),
-                    signed_descending,
-                )
-            )
-            if bank_values.shape != (len(gate_rows), expected + 2):
-                raise RuntimeError(f"neural-query {bank} moment reduction is not rectangular")
-            for column, name in enumerate(bank_names):
-                names.append(name)
-                kinds.append(f"neural_query_{bank}_moments")
-                roles.append(_ROLE_BY_BANK[bank])
-                columns.append(np.asarray(bank_values[:, column], dtype=float))
         prediction = ContextFitUpstreamPrediction(
             gate_row_ids=gate_rows,
             calibrated_source_names=(),
             calibrated_source_kinds=(),
             calibrated_source_values=np.empty((len(gate_rows), 0), dtype=float),
-            feature_names=tuple(names),
-            feature_kinds=tuple(kinds),
-            feature_roles=tuple(roles),
-            feature_values=np.column_stack(columns),
+            feature_names=names,
+            feature_kinds=kinds,
+            feature_roles=roles,
+            feature_values=values,
         )
         self.identity()
         return prediction

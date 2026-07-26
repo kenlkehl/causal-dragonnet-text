@@ -70,9 +70,17 @@ from .neural_numerical_replay import (
     neural_float_arrays_within_tolerance,
     validate_neural_replay_settings,
 )
-from .production_stage1_scope_scheduler import Stage1ScopePlan, Stage1ScopeSpec
+from .production_stage1_scope_scheduler import (
+    Stage1ScopePlan,
+    Stage1ScopeSpec,
+    _enforce_stage1_torch_determinism,
+)
 from .role_neutral_bow_group_execution import (
     AuthenticatedRoleNeutralBoWNuisanceBank,
+)
+from .role_neutral_htr_group_execution import _execute_htr_fold_tasks
+from .stage1_htr_operational_controls import (
+    RoleNeutralHTRFoldResourcePlan,
 )
 
 
@@ -96,6 +104,9 @@ ROLE_NEUTRAL_MATCHED_PAIR_EXACT_INPUT_SCHEMA = (
 )
 ROLE_NEUTRAL_MATCHED_PAIR_CONFIG_SCHEMA = (
     "production_role_neutral_matched_pair_config_v3"
+)
+ROLE_NEUTRAL_MATCHED_PAIR_OPERATIONAL_ATTESTATION_SCHEMA = (
+    "production_role_neutral_matched_pair_operational_attestation_v1"
 )
 
 _SUBPRODUCERS = ("bow", "htr")
@@ -1018,16 +1029,44 @@ class RoleNeutralMatchedPairExactInput:
         }
 
 
-@dataclass
-class _LiveFold:
+@dataclass(frozen=True)
+class _MatchedPairEffectFoldTask:
+    """Spawn-safe authority for one canonical matched-pair effect fold."""
+
+    objective: str
     fold: int
+    split_seed: int
+    htr_seed: int
+    owner_scope_seed: int
+    owner_fit_row_ids: tuple[int, ...]
+    fit_texts: tuple[str, ...]
+    treatment: np.ndarray
+    outcome: np.ndarray
+    propensity_probability: np.ndarray
+    outcome_nuisance_probability: np.ndarray
+    fit_positions: np.ndarray
+    validation_positions: np.ndarray
+    view_configs: tuple[BoWViewConfig, ...]
+    config: Mapping[str, Any]
+    htr_model_path: str | None
+
+
+@dataclass(frozen=True)
+class _MatchedPairEffectFoldResult:
+    """Isolated CPU state returned across the bounded fold barrier."""
+
+    objective: str
+    fold: int
+    split_seed: int
+    htr_seed: int
     fit_positions: np.ndarray
     validation_positions: np.ndarray
     control_positions: np.ndarray
-    bow_models: dict[str, OffsetLogitBoWPairModel]
-    bow_states: dict[str, Mapping[str, Any]]
-    htr_model: HTRPairUpliftNet
-    htr_state: Mapping[str, Any]
+    fold_record: Mapping[str, Any]
+    bow_oof: Mapping[str, Mapping[str, np.ndarray]]
+    htr_oof: Mapping[str, np.ndarray]
+    arrays: Mapping[str, np.ndarray]
+    gpu_peak_allocated_bytes: int | None
 
 
 def _assert_text_capacity(
@@ -1390,125 +1429,137 @@ def _subproducer_evidence(
     }
 
 
-def _fit_models(
+def _new_fold_htr_extractor(
     *,
-    request: RoleNeutralMatchedPairPhysicalGroupRequest,
-    fit_texts: tuple[str, ...],
-    treatment: np.ndarray,
-    outcome: np.ndarray,
-    e_fit: np.ndarray,
-    m_fit: np.ndarray,
-    view_configs: tuple[BoWViewConfig, ...],
     config: Mapping[str, Any],
-    extractor_factory: Callable[[torch.device], HierarchicalTransformerExtractor],
+    htr_model_path: str | None,
     device: torch.device,
-    htr_model_path: Path | str | None,
-    store: _ArrayStore,
-) -> tuple[list[_LiveFold], list[dict[str, Any]], dict[str, np.ndarray]]:
-    owner = request.physical_owner
-    frame = _make_frame(owner.fit_row_ids)
-    split_seed = _derived_seed(
-        owner.scope_seed,
-        purpose="effect_cross_fit_split",
-        fold=0,
-        view="matched_pair",
-    )
-    splitter = KFold(
-        n_splits=int(config["effect_folds"]),
-        shuffle=True,
-        random_state=split_seed,
-    )
-    live_folds: list[_LiveFold] = []
-    records: list[dict[str, Any]] = []
-    bow_oof: dict[str, dict[str, np.ndarray]] = {
-        view.name: {
-            "delta": np.full(len(frame), np.nan, dtype=np.float64),
-            "probability": np.full(len(frame), np.nan, dtype=np.float64),
-            "n_controls": np.zeros(len(frame), dtype=np.float64),
-        }
-        for view in view_configs
-    }
-    htr_oof = {
-        "delta": np.full(len(frame), np.nan, dtype=np.float64),
-        "probability": np.full(len(frame), np.nan, dtype=np.float64),
-        "n_controls": np.zeros(len(frame), dtype=np.float64),
-    }
-    for fold, (raw_fit, raw_validation) in enumerate(splitter.split(frame), start=1):
-        fit_pos = np.asarray(raw_fit, dtype=np.int64)
-        validation_pos = np.asarray(raw_validation, dtype=np.int64)
-        fit_frame = frame.iloc[fit_pos].reset_index(drop=True)
-        validation_frame = frame.iloc[validation_pos].reset_index(drop=True)
-        fit_pairs = build_training_pairs(
-            fit_frame,
-            texts=[fit_texts[int(position)] for position in fit_pos],
-            treatment=treatment[fit_pos],
-            outcome=outcome[fit_pos],
-            propensity=e_fit[fit_pos],
-            outcome_prob=m_fit[fit_pos],
-            **_matching_training_config(config),
-        )
-        if fit_pairs.empty or set(fit_pairs["label"].astype(int)) != {0, 1}:
-            raise RuntimeError(
-                f"matched-pair fold {fold} cannot genuinely fit both subproducers"
+) -> HierarchicalTransformerExtractor:
+    constructor = copy.deepcopy(dict(config["htr_extractor"]))
+    marker = constructor["sentence_encoder_model"]
+    if marker == "authenticated_local_tree":
+        if htr_model_path is None:
+            raise ValueError(
+                "matched-pair fold lacks its authenticated HTR model locator"
             )
-        control_pos = fit_pos[treatment[fit_pos].astype(int) == 0]
-        if not len(control_pos):
-            raise RuntimeError(f"matched-pair fold {fold} has no fit controls")
-        control_frame = frame.iloc[control_pos].reset_index(drop=True)
-        validation_pairs = build_candidate_pairs(
-            validation_frame,
-            control_frame,
-            candidate_texts=[fit_texts[int(position)] for position in validation_pos],
-            control_texts=[fit_texts[int(position)] for position in control_pos],
-            candidate_propensity=e_fit[validation_pos],
-            candidate_outcome_prob=m_fit[validation_pos],
-            control_propensity=e_fit[control_pos],
-            control_outcome_prob=m_fit[control_pos],
-            **_matching_candidate_config(config),
+        constructor["sentence_encoder_model"] = htr_model_path
+    elif marker != "hash" or htr_model_path is not None:
+        raise ValueError("matched-pair fold HTR model locator changed")
+    return HierarchicalTransformerExtractor(**constructor, device=device)
+
+
+def _run_matched_pair_effect_fold(
+    task: _MatchedPairEffectFoldTask,
+    device_name: str,
+) -> _MatchedPairEffectFoldResult:
+    """Own, fit, replay, and close one matched-pair fold in one worker."""
+
+    if not isinstance(task, _MatchedPairEffectFoldTask):
+        raise TypeError("matched-pair worker received another fold task type")
+    if task.objective != MATCHED_PAIR_UPLIFT:
+        raise ValueError("matched-pair worker objective changed")
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    torch.set_num_threads(1)
+    device = torch.device(device_name)
+    if device.type not in {"cpu", "cuda"}:
+        raise ValueError("matched-pair fold lease must be CPU or CUDA")
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+        torch.cuda.reset_peak_memory_stats(device)
+
+    frame = _make_frame(task.owner_fit_row_ids)
+    fit_pos = np.asarray(task.fit_positions, dtype=np.int64)
+    validation_pos = np.asarray(task.validation_positions, dtype=np.int64)
+    fit_frame = frame.iloc[fit_pos].reset_index(drop=True)
+    validation_frame = frame.iloc[validation_pos].reset_index(drop=True)
+    fit_pairs = build_training_pairs(
+        fit_frame,
+        texts=[task.fit_texts[int(position)] for position in fit_pos],
+        treatment=task.treatment[fit_pos],
+        outcome=task.outcome[fit_pos],
+        propensity=task.propensity_probability[fit_pos],
+        outcome_prob=task.outcome_nuisance_probability[fit_pos],
+        **_matching_training_config(task.config),
+    )
+    if fit_pairs.empty or set(fit_pairs["label"].astype(int)) != {0, 1}:
+        raise RuntimeError(
+            f"matched-pair fold {task.fold} cannot genuinely fit both "
+            "subproducers"
         )
-        if validation_pairs.empty:
-            raise RuntimeError(f"matched-pair fold {fold} has no validation witnesses")
-        prefix = f"fold_{fold:04d}"
-        fit_pair_table = _capture_pair_table(
-            store,
-            prefix=f"{prefix}_fit_pairs",
-            pairs=fit_pairs,
+    control_pos = fit_pos[task.treatment[fit_pos].astype(int) == 0]
+    if not len(control_pos):
+        raise RuntimeError(
+            f"matched-pair fold {task.fold} has no fit controls"
         )
-        validation_pair_table = _capture_pair_table(
-            store,
-            prefix=f"{prefix}_validation_pairs",
-            pairs=validation_pairs,
+    control_frame = frame.iloc[control_pos].reset_index(drop=True)
+    validation_pairs = build_candidate_pairs(
+        validation_frame,
+        control_frame,
+        candidate_texts=[
+            task.fit_texts[int(position)] for position in validation_pos
+        ],
+        control_texts=[
+            task.fit_texts[int(position)] for position in control_pos
+        ],
+        candidate_propensity=task.propensity_probability[validation_pos],
+        candidate_outcome_prob=(
+            task.outcome_nuisance_probability[validation_pos]
+        ),
+        control_propensity=task.propensity_probability[control_pos],
+        control_outcome_prob=(
+            task.outcome_nuisance_probability[control_pos]
+        ),
+        **_matching_candidate_config(task.config),
+    )
+    if validation_pairs.empty:
+        raise RuntimeError(
+            f"matched-pair fold {task.fold} has no validation witnesses"
         )
-        bow_models: dict[str, OffsetLogitBoWPairModel] = {}
-        bow_states: dict[str, Mapping[str, Any]] = {}
-        bow_rows: list[dict[str, Any]] = []
-        for view_index, view in enumerate(view_configs):
+
+    store = _ArrayStore()
+    prefix = f"fold_{task.fold:04d}"
+    fit_pair_table = _capture_pair_table(
+        store,
+        prefix=f"{prefix}_fit_pairs",
+        pairs=fit_pairs,
+    )
+    validation_pair_table = _capture_pair_table(
+        store,
+        prefix=f"{prefix}_validation_pairs",
+        pairs=validation_pairs,
+    )
+    bow_rows: list[dict[str, Any]] = []
+    bow_oof: dict[str, dict[str, np.ndarray]] = {}
+    htr_model: HTRPairUpliftNet | None = None
+    replay_model: HTRPairUpliftNet | None = None
+    try:
+        for view_index, view in enumerate(task.view_configs):
             seed = _derived_seed(
-                owner.scope_seed,
+                task.owner_scope_seed,
                 purpose="bow_pair_model",
-                fold=fold,
+                fold=task.fold,
                 view=view.name,
             )
             model = OffsetLogitBoWPairModel(
                 vectorizer_params=_vectorizer_params(view),
-                l2_alpha=float(config["bow_l2_alpha"]),
-                max_iter=int(config["bow_max_iter"]),
+                l2_alpha=float(task.config["bow_l2_alpha"]),
+                max_iter=int(task.config["bow_max_iter"]),
                 random_state=seed,
-                optimizer_method=str(config["bow_optimizer_method"]),
-                optimizer_ftol=float(config["bow_optimizer_ftol"]),
-                optimizer_gtol=float(config["bow_optimizer_gtol"]),
-                optimizer_maxls=int(config["bow_optimizer_maxls"]),
-                optimizer_maxcor=int(config["bow_optimizer_maxcor"]),
-                optimizer_maxfun=int(config["bow_optimizer_maxfun"]),
+                optimizer_method=str(task.config["bow_optimizer_method"]),
+                optimizer_ftol=float(task.config["bow_optimizer_ftol"]),
+                optimizer_gtol=float(task.config["bow_optimizer_gtol"]),
+                optimizer_maxls=int(task.config["bow_optimizer_maxls"]),
+                optimizer_maxcor=int(task.config["bow_optimizer_maxcor"]),
+                optimizer_maxfun=int(task.config["bow_optimizer_maxfun"]),
                 optimizer_tol=(
                     None
-                    if config["bow_optimizer_tol"] is None
-                    else float(config["bow_optimizer_tol"])
+                    if task.config["bow_optimizer_tol"] is None
+                    else float(task.config["bow_optimizer_tol"])
                 ),
                 optimizer_initialization=str(
-                    config["bow_optimizer_initialization"]
+                    task.config["bow_optimizer_initialization"]
                 ),
-                require_optimizer_success=config[
+                require_optimizer_success=task.config[
                     "bow_require_optimizer_success"
                 ],
             ).fit(fit_pairs)
@@ -1530,19 +1581,21 @@ def _fit_models(
                 pair_delta,
                 replay_delta,
                 subproducer="bow",
-                config=config,
+                config=task.config,
             ):
-                raise RuntimeError("live/sealed BoW matched-pair validation differs")
+                raise RuntimeError(
+                    "live/sealed BoW matched-pair validation differs"
+                )
             delta, probability, n_controls = aggregate_pair_predictions(
                 validation_pairs,
                 pair_delta,
                 len(validation_frame),
             )
-            bow_oof[view.name]["delta"][validation_pos] = delta
-            bow_oof[view.name]["probability"][validation_pos] = probability
-            bow_oof[view.name]["n_controls"][validation_pos] = n_controls
-            bow_models[view.name] = model
-            bow_states[view.name] = descriptor
+            bow_oof[view.name] = {
+                "delta": np.ascontiguousarray(delta),
+                "probability": np.ascontiguousarray(probability),
+                "n_controls": np.ascontiguousarray(n_controls),
+            }
             bow_rows.append(
                 {
                     "view_name": view.name,
@@ -1568,16 +1621,20 @@ def _fit_models(
                     ),
                 }
             )
-        htr_seed = _derived_seed(
-            owner.scope_seed,
-            purpose="htr_pair_model",
-            fold=fold,
-            view="htr",
-        )
+
+        def extractor_factory(
+            worker_device: torch.device,
+        ) -> HierarchicalTransformerExtractor:
+            return _new_fold_htr_extractor(
+                config=task.config,
+                htr_model_path=task.htr_model_path,
+                device=worker_device,
+            )
+
         htr_model = _train_htr(
             pairs=fit_pairs,
-            config=config,
-            seed=htr_seed,
+            config=task.config,
+            seed=task.htr_seed,
             extractor_factory=extractor_factory,
             device=device,
         )
@@ -1585,50 +1642,59 @@ def _fit_models(
             htr_model,
             store,
             f"{prefix}_htr",
-            training_configuration=_htr_training_configuration(config),
+            training_configuration=_htr_training_configuration(task.config),
         )
         htr_pair_delta = _predict_live_htr(
             htr_model,
             validation_pairs,
-            batch_size=int(config["htr_batch_size"]),
+            batch_size=int(task.config["htr_batch_size"]),
+        )
+        replay_model = _build_htr_pair_model(
+            htr_state,
+            store.arrays,
+            initialization_texts=task.fit_texts,
+            htr_model_path=task.htr_model_path,
+            device=device,
         )
         replay_htr = _predict_htr_pair(
-            _build_htr_pair_model(
-                htr_state,
-                store.arrays,
-                initialization_texts=fit_texts,
-                htr_model_path=htr_model_path,
-                device=device,
-            ),
+            replay_model,
             validation_pairs,
-            batch_size=int(config["htr_batch_size"]),
+            batch_size=int(task.config["htr_batch_size"]),
         )
         if not _replayed_predictions_match(
             htr_pair_delta,
             replay_htr,
             subproducer="htr",
-            config=config,
+            config=task.config,
         ):
             raise RuntimeError(
                 "live/sealed HTR matched-pair validation differs beyond its "
                 "declared tolerance"
             )
-        htr_delta, htr_probability, htr_n_controls = aggregate_pair_predictions(
-            validation_pairs,
-            htr_pair_delta,
-            len(validation_frame),
+        htr_delta, htr_probability, htr_n_controls = (
+            aggregate_pair_predictions(
+                validation_pairs,
+                htr_pair_delta,
+                len(validation_frame),
+            )
         )
-        htr_oof["delta"][validation_pos] = htr_delta
-        htr_oof["probability"][validation_pos] = htr_probability
-        htr_oof["n_controls"][validation_pos] = htr_n_controls
+        htr_oof = {
+            "delta": np.ascontiguousarray(htr_delta),
+            "probability": np.ascontiguousarray(htr_probability),
+            "n_controls": np.ascontiguousarray(htr_n_controls),
+        }
         fold_record = {
-            "fold": fold,
-            "split_seed": split_seed,
+            "fold": task.fold,
+            "split_seed": task.split_seed,
             "fit_positions": fit_pos.tolist(),
             "validation_positions": validation_pos.tolist(),
-            "fit_row_ids": [int(owner.fit_row_ids[int(position)]) for position in fit_pos],
+            "fit_row_ids": [
+                int(task.owner_fit_row_ids[int(position)])
+                for position in fit_pos
+            ],
             "validation_row_ids": [
-                int(owner.fit_row_ids[int(position)]) for position in validation_pos
+                int(task.owner_fit_row_ids[int(position)])
+                for position in validation_pos
             ],
             "control_positions": store.add(
                 f"{prefix}_control_positions",
@@ -1637,7 +1703,7 @@ def _fit_models(
             "fit_pair_table": fit_pair_table,
             "validation_pair_table": validation_pair_table,
             "bow_states": bow_rows,
-            "htr_seed": htr_seed,
+            "htr_seed": task.htr_seed,
             "htr_model": htr_state,
             "htr_validation_pair_delta": store.add(
                 f"{prefix}_htr_validation_pair_delta",
@@ -1660,28 +1726,413 @@ def _fit_models(
             "registered_heldout_labels_accessed": False,
             "text_truncation_applied": False,
         }
-        records.append(fold_record)
-        live_folds.append(
-            _LiveFold(
-                fold=fold,
-                fit_positions=fit_pos,
-                validation_positions=validation_pos,
-                control_positions=control_pos,
-                bow_models=bow_models,
-                bow_states=bow_states,
-                htr_model=htr_model,
-                htr_state=htr_state,
-            )
+        peak = None
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            peak = int(torch.cuda.max_memory_allocated(device))
+        return _MatchedPairEffectFoldResult(
+            objective=task.objective,
+            fold=task.fold,
+            split_seed=task.split_seed,
+            htr_seed=task.htr_seed,
+            fit_positions=np.ascontiguousarray(fit_pos),
+            validation_positions=np.ascontiguousarray(validation_pos),
+            control_positions=np.ascontiguousarray(control_pos),
+            fold_record=fold_record,
+            bow_oof=bow_oof,
+            htr_oof=htr_oof,
+            arrays={
+                key: np.ascontiguousarray(value)
+                for key, value in store.arrays.items()
+            },
+            gpu_peak_allocated_bytes=peak,
         )
+    finally:
+        del replay_model
+        del htr_model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+
+def _maximum_fold_overlap(
+    intervals: Sequence[Mapping[str, Any]],
+) -> int:
+    boundaries = [
+        (int(row["started_monotonic_ns"]), 1)
+        for row in intervals
+    ] + [
+        (int(row["finished_monotonic_ns"]), -1)
+        for row in intervals
+    ]
+    active = 0
+    maximum = 0
+    for _timestamp, delta in sorted(
+        boundaries,
+        key=lambda value: (value[0], value[1]),
+    ):
+        active += delta
+        if active < 0:
+            raise RuntimeError(
+                "matched-pair fold telemetry released an idle lease"
+            )
+        maximum = max(maximum, active)
+    if active != 0:
+        raise RuntimeError("matched-pair fold telemetry left a lease active")
+    return maximum
+
+
+def _matched_pair_fold_execution_summary(
+    *,
+    events: Sequence[Mapping[str, Any]],
+    resource_plan: RoleNeutralHTRFoldResourcePlan,
+    effect_folds: int,
+) -> dict[str, Any]:
+    starts = [
+        dict(row) for row in events if row.get("event") == "fold_started"
+    ]
+    finishes = [
+        dict(row) for row in events if row.get("event") == "fold_finished"
+    ]
+
+    def key(row: Mapping[str, Any]) -> tuple[str, int]:
+        return str(row.get("objective")), int(row.get("fold", 0))
+
+    starts_by_key = {key(row): row for row in starts}
+    finishes_by_key = {key(row): row for row in finishes}
+    expected = {
+        (MATCHED_PAIR_UPLIFT, fold)
+        for fold in range(1, int(effect_folds) + 1)
+    }
+    if (
+        len(starts) != len(starts_by_key)
+        or len(finishes) != len(finishes_by_key)
+        or set(starts_by_key) != expected
+        or set(finishes_by_key) != expected
+    ):
+        raise RuntimeError(
+            "matched-pair fold telemetry changed canonical coverage"
+        )
+    intervals: list[dict[str, Any]] = []
+    for fold_key in sorted(expected, key=lambda value: value[1]):
+        start = starts_by_key[fold_key]
+        finish = finishes_by_key[fold_key]
+        if (
+            start.get("stage") != "effect"
+            or finish.get("stage") != "effect"
+            or start.get("device") != finish.get("device")
+            or start.get("process_id") != finish.get("process_id")
+            or int(finish["monotonic_ns"]) <= int(start["monotonic_ns"])
+        ):
+            raise RuntimeError(
+                "matched-pair fold telemetry changed one lease interval"
+            )
+        determinism = finish.get("torch_determinism_observed")
+        if (
+            resource_plan.fold_parallel_backend == "processes"
+            and not isinstance(determinism, Mapping)
+        ):
+            raise RuntimeError(
+                "matched-pair process fold lacks Torch determinism telemetry"
+            )
+        if (
+            resource_plan.fold_parallel_backend == "threads"
+            and determinism is not None
+        ):
+            raise RuntimeError(
+                "matched-pair thread fold claimed child determinism telemetry"
+            )
+        intervals.append(
+            {
+                "fold": fold_key[1],
+                "device": str(start["device"]),
+                "process_id": int(start["process_id"]),
+                "thread_id": int(start["thread_id"]),
+                "started_monotonic_ns": int(start["monotonic_ns"]),
+                "finished_monotonic_ns": int(finish["monotonic_ns"]),
+                "gpu_peak_allocated_bytes": finish.get(
+                    "gpu_peak_allocated_bytes"
+                ),
+                "torch_determinism_observed": (
+                    None
+                    if determinism is None
+                    else copy.deepcopy(dict(determinism))
+                ),
+            }
+        )
+    if {row["device"] for row in intervals} != set(resource_plan.devices):
+        raise RuntimeError(
+            "matched-pair folds did not exercise every selected device"
+        )
+    per_device: dict[str, dict[str, Any]] = {}
+    for device in resource_plan.devices:
+        rows = [row for row in intervals if row["device"] == device]
+        maximum = _maximum_fold_overlap(rows)
+        if maximum > resource_plan.fold_slots_per_device:
+            raise RuntimeError(
+                "matched-pair folds exceeded configured per-device slots"
+            )
+        peaks = [
+            int(row["gpu_peak_allocated_bytes"])
+            for row in rows
+            if row["gpu_peak_allocated_bytes"] is not None
+        ]
+        per_device[device] = {
+            "task_count": len(rows),
+            "maximum_concurrent_leases": maximum,
+            "maximum_child_peak_allocated_bytes": (
+                max(peaks) if peaks else None
+            ),
+        }
+    overall = _maximum_fold_overlap(intervals)
+    if overall > resource_plan.fold_parallelism:
+        raise RuntimeError(
+            "matched-pair folds exceeded configured total concurrency"
+        )
+    if (
+        resource_plan.fold_parallelism > 1
+        and len(intervals) > 1
+        and overall < 2
+    ):
+        raise RuntimeError(
+            "configured matched-pair effect folds did not overlap"
+        )
+    if (
+        resource_plan.fold_parallel_backend == "processes"
+        and resource_plan.fold_parallelism > 1
+        and len({row["process_id"] for row in intervals}) < 2
+    ):
+        raise RuntimeError(
+            "parallel matched-pair folds were not process isolated"
+        )
+    return {
+        "resource_plan": resource_plan.as_dict(),
+        "fold_intervals": intervals,
+        "per_device": per_device,
+        "maximum_concurrent_fold_leases": overall,
+        "configured_total_fold_concurrency_respected": True,
+        "configured_per_device_slots_respected": True,
+        "every_selected_device_used": True,
+        "nested_native_worker_threads": (
+            resource_plan.worker_cpu_threads
+        ),
+        "process_isolated_rng_and_torch_determinism": (
+            resource_plan.fold_parallel_backend == "processes"
+        ),
+        "resource_locators_in_scientific_identity": False,
+    }
+
+
+def _fit_models(
+    *,
+    request: RoleNeutralMatchedPairPhysicalGroupRequest,
+    fit_texts: tuple[str, ...],
+    treatment: np.ndarray,
+    outcome: np.ndarray,
+    e_fit: np.ndarray,
+    m_fit: np.ndarray,
+    view_configs: tuple[BoWViewConfig, ...],
+    config: Mapping[str, Any],
+    device: torch.device,
+    htr_model_path: Path | str | None,
+    store: _ArrayStore,
+    resource_plan: RoleNeutralHTRFoldResourcePlan,
+    external_event_sink: (
+        Callable[[Mapping[str, Any]], None] | None
+    ),
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, np.ndarray],
+    tuple[Mapping[str, Any], ...],
+    Mapping[str, Any],
+]:
+    """Build canonical tasks, execute them under leases, and merge by fold."""
+
+    owner = request.physical_owner
+    frame = _make_frame(owner.fit_row_ids)
+    split_seed = _derived_seed(
+        owner.scope_seed,
+        purpose="effect_cross_fit_split",
+        fold=0,
+        view="matched_pair",
+    )
+    splits = tuple(
+        KFold(
+            n_splits=int(config["effect_folds"]),
+            shuffle=True,
+            random_state=split_seed,
+        ).split(frame)
+    )
+    resolved_model_path = (
+        None
+        if htr_model_path is None
+        else str(Path(htr_model_path).resolve())
+    )
+    tasks = tuple(
+        _MatchedPairEffectFoldTask(
+            objective=MATCHED_PAIR_UPLIFT,
+            fold=fold,
+            split_seed=split_seed,
+            htr_seed=_derived_seed(
+                owner.scope_seed,
+                purpose="htr_pair_model",
+                fold=fold,
+                view="htr",
+            ),
+            owner_scope_seed=int(owner.scope_seed),
+            owner_fit_row_ids=tuple(map(int, owner.fit_row_ids)),
+            fit_texts=fit_texts,
+            treatment=np.ascontiguousarray(treatment),
+            outcome=np.ascontiguousarray(outcome),
+            propensity_probability=np.ascontiguousarray(e_fit),
+            outcome_nuisance_probability=np.ascontiguousarray(m_fit),
+            fit_positions=np.asarray(raw_fit, dtype=np.int64),
+            validation_positions=np.asarray(
+                raw_validation,
+                dtype=np.int64,
+            ),
+            view_configs=view_configs,
+            config=copy.deepcopy(dict(config)),
+            htr_model_path=resolved_model_path,
+        )
+        for fold, (raw_fit, raw_validation) in enumerate(splits, start=1)
+    )
+    fold_events: list[Mapping[str, Any]] = []
+
+    def emit(value: Mapping[str, Any]) -> None:
+        closed = json.loads(_canonical_json(dict(value)))
+        fold_events.append(closed)
+        if external_event_sink is not None:
+            external_event_sink(copy.deepcopy(closed))
+
+    raw_results = _execute_htr_fold_tasks(
+        tasks,
+        resource_plan=resource_plan,
+        worker=_run_matched_pair_effect_fold,
+        stage="effect",
+        event_sink=emit,
+    )
+    by_fold: dict[int, _MatchedPairEffectFoldResult] = {}
+    for raw_result in raw_results:
+        if not isinstance(raw_result, _MatchedPairEffectFoldResult):
+            raise TypeError(
+                "matched-pair effect fold returned another result type"
+            )
+        if raw_result.fold in by_fold:
+            raise RuntimeError(
+                "matched-pair effect worker duplicated a canonical fold"
+            )
+        by_fold[raw_result.fold] = raw_result
+    expected_folds = list(range(1, len(tasks) + 1))
+    if sorted(by_fold) != expected_folds:
+        raise RuntimeError(
+            "matched-pair effect workers omitted or substituted a fold"
+        )
+
+    records: list[dict[str, Any]] = []
+    bow_oof: dict[str, dict[str, np.ndarray]] = {
+        view.name: {
+            "delta": np.full(len(frame), np.nan, dtype=np.float64),
+            "probability": np.full(len(frame), np.nan, dtype=np.float64),
+            "n_controls": np.zeros(len(frame), dtype=np.float64),
+        }
+        for view in view_configs
+    }
+    htr_oof = {
+        "delta": np.full(len(frame), np.nan, dtype=np.float64),
+        "probability": np.full(len(frame), np.nan, dtype=np.float64),
+        "n_controls": np.zeros(len(frame), dtype=np.float64),
+    }
+    for task in tasks:
+        result = by_fold[task.fold]
+        expected_control_positions = task.fit_positions[
+            treatment[task.fit_positions].astype(int) == 0
+        ]
+        control_reference = str(
+            result.fold_record.get("control_positions") or ""
+        )
+        if (
+            result.objective != task.objective
+            or result.fold != task.fold
+            or result.split_seed != task.split_seed
+            or result.htr_seed != task.htr_seed
+            or not np.array_equal(
+                result.fit_positions,
+                task.fit_positions,
+            )
+            or not np.array_equal(
+                result.validation_positions,
+                task.validation_positions,
+            )
+            or not np.array_equal(
+                result.control_positions,
+                expected_control_positions,
+            )
+            or result.fold_record.get("fold") != task.fold
+            or result.fold_record.get("split_seed") != task.split_seed
+            or result.fold_record.get("htr_seed") != task.htr_seed
+            or set(result.bow_oof)
+            != {view.name for view in view_configs}
+            or set(result.htr_oof)
+            != {"delta", "probability", "n_controls"}
+            or control_reference not in result.arrays
+            or not np.array_equal(
+                np.asarray(
+                    result.arrays[control_reference],
+                    dtype=np.int64,
+                ),
+                expected_control_positions,
+            )
+        ):
+            raise RuntimeError(
+                "matched-pair effect result changed rows, seeds, or identity"
+            )
+        expected_shape = task.validation_positions.shape
+        if any(
+            set(values) != {"delta", "probability", "n_controls"}
+            or any(
+                np.asarray(array).shape != expected_shape
+                for array in values.values()
+            )
+            for values in result.bow_oof.values()
+        ) or any(
+            np.asarray(array).shape != expected_shape
+            for array in result.htr_oof.values()
+        ):
+            raise RuntimeError(
+                "matched-pair effect result changed validation shape"
+            )
+        if not result.arrays:
+            raise RuntimeError(
+                "matched-pair effect fold returned no private proof arrays"
+            )
+        for key in sorted(result.arrays):
+            store.add(key, result.arrays[key])
+        for view in view_configs:
+            for value_name, values in result.bow_oof[view.name].items():
+                bow_oof[view.name][value_name][
+                    result.validation_positions
+                ] = values
+        for value_name, values in result.htr_oof.items():
+            htr_oof[value_name][result.validation_positions] = values
+        records.append(copy.deepcopy(dict(result.fold_record)))
+
     numerical_bank: dict[str, np.ndarray] = {}
     for view in view_configs:
         for value_name, values in bow_oof[view.name].items():
             numerical_bank[f"bow::{view.name}::{value_name}"] = values
     for value_name, values in htr_oof.items():
         numerical_bank[f"htr::{value_name}"] = values
-    if any(values.shape != (len(frame),) for values in numerical_bank.values()):
+    if any(
+        values.shape != (len(frame),)
+        for values in numerical_bank.values()
+    ):
         raise RuntimeError("matched-pair fit numerical bank changed shape")
-    return live_folds, records, numerical_bank
+    execution_summary = _matched_pair_fold_execution_summary(
+        events=fold_events,
+        resource_plan=resource_plan,
+        effect_folds=int(config["effect_folds"]),
+    )
+    return records, numerical_bank, tuple(fold_events), execution_summary
 
 
 def _write_fit_state(
@@ -1775,7 +2226,7 @@ def _write_fit_state(
         "array_inventory": inventory,
         "array_layout": "one_npy_per_array_mmap_safe_v1",
         "subproducer_coverage": list(_SUBPRODUCERS),
-        "model_objects_retained_in_worker_memory": True,
+        "model_objects_retained_in_worker_memory": False,
         "registered_heldout_text_accessed": False,
         "registered_heldout_labels_accessed": False,
         "oracle_fields_accessed": False,
@@ -1910,6 +2361,7 @@ def _load_fit_state(
         or metadata.get("text_truncation_applied") is not False
         or metadata.get("top_k_evidence_applied") is not False
         or metadata.get("pickle_joblib_npz_loaded_or_written") is not False
+        or metadata.get("model_objects_retained_in_worker_memory") is not False
         or metadata.get("array_layout") != "one_npy_per_array_mmap_safe_v1"
     ):
         raise ValueError("role-neutral matched-pair fit-state envelope changed")
@@ -2328,92 +2780,19 @@ def _sealed_exact_predictions(
             htr_model_path=htr_model_path,
             device=device,
         )
-        pair_delta = _predict_htr_pair(
-            model,
-            pairs,
-            batch_size=int(config["htr_batch_size"]),
-        )
+        try:
+            pair_delta = _predict_htr_pair(
+                model,
+                pairs,
+                batch_size=int(config["htr_batch_size"]),
+            )
+        finally:
+            del model
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
         delta, probability, n_controls = aggregate_pair_predictions(
             pairs,
             pair_delta,
-            count,
-        )
-        htr_values["delta"].append(delta)
-        htr_values["probability"].append(probability)
-        htr_values["n_controls"].append(n_controls)
-    bow_columns: list[str] = []
-    bow_arrays: list[np.ndarray] = []
-    for view in views:
-        name = view["name"]
-        for value_name in ("delta", "probability", "n_controls"):
-            bow_columns.append(f"{name}::{value_name}")
-            bow_arrays.append(
-                _mean_with_nan(bow_values[name][value_name], length=count)
-            )
-    htr_columns = [f"htr::{name}" for name in ("delta", "probability", "n_controls")]
-    htr_arrays = [
-        _mean_with_nan(htr_values[name], length=count)
-        for name in ("delta", "probability", "n_controls")
-    ]
-    return {
-        "bow": (bow_columns, np.column_stack(bow_arrays).astype(np.float64)),
-        "htr": (htr_columns, np.column_stack(htr_arrays).astype(np.float64)),
-    }
-
-
-def _live_exact_predictions(
-    *,
-    request: RoleNeutralMatchedPairPhysicalGroupRequest,
-    fit_texts: tuple[str, ...],
-    exact_input: RoleNeutralMatchedPairExactInput,
-    metadata: Mapping[str, Any],
-    arrays: Mapping[str, np.ndarray],
-    live_folds: Sequence[_LiveFold],
-) -> dict[str, tuple[list[str], np.ndarray]]:
-    config = metadata["scientific_configuration"]["matched_pair"]
-    views = metadata["scientific_configuration"]["bow_views"]
-    count = len(exact_input.row_ids)
-    bow_values: dict[str, dict[str, list[np.ndarray]]] = {
-        view["name"]: {
-            "delta": [],
-            "probability": [],
-            "n_controls": [],
-        }
-        for view in views
-    }
-    htr_values = {"delta": [], "probability": [], "n_controls": []}
-    rows_by_fold = {int(row["fold"]): row for row in metadata["fold_records"]}
-    for live in live_folds:
-        pairs = _candidate_pairs_for_exact(
-            request=request,
-            fit_texts=fit_texts,
-            exact_input=exact_input,
-            metadata=metadata,
-            arrays=arrays,
-            fold_row=rows_by_fold[live.fold],
-        )
-        for view in views:
-            name = view["name"]
-            pair_delta = np.asarray(
-                live.bow_models[name].predict_delta_logit(pairs),
-                dtype=np.float64,
-            )
-            delta, probability, n_controls = aggregate_pair_predictions(
-                pairs,
-                pair_delta,
-                count,
-            )
-            bow_values[name]["delta"].append(delta)
-            bow_values[name]["probability"].append(probability)
-            bow_values[name]["n_controls"].append(n_controls)
-        htr_pair_delta = _predict_live_htr(
-            live.htr_model,
-            pairs,
-            batch_size=int(config["htr_batch_size"]),
-        )
-        delta, probability, n_controls = aggregate_pair_predictions(
-            pairs,
-            htr_pair_delta,
             count,
         )
         htr_values["delta"].append(delta)
@@ -2460,6 +2839,11 @@ def execute_role_neutral_matched_pair_physical_group(
     ],
     device: torch.device | str,
     htr_model_path: Path | str | None = None,
+    fold_resource_plan: RoleNeutralHTRFoldResourcePlan | None = None,
+    operational_attestation_sink: (
+        Callable[[Mapping[str, Any]], None] | None
+    ) = None,
+    fold_event_sink: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> Mapping[str, Any]:
     """Fit/seal both subproducers before opening exact held-out text."""
 
@@ -2524,11 +2908,72 @@ def execute_role_neutral_matched_pair_physical_group(
         raise ValueError("matched-pair execution requires unique typed BoW views")
     if not callable(htr_extractor_factory) or not callable(exact_heldout_input_loader):
         raise TypeError("matched-pair execution requires callable factory/loaders")
+    # The legacy factory remains a caller-compatibility argument. Fold tasks
+    # deliberately carry only the authenticated typed constructor and model
+    # tree locator, because deployment factories are commonly closures and
+    # therefore cannot be part of a spawn-pickleable task.
     resolved_device = torch.device(device)
     if resolved_device.type not in {"cpu", "cuda"}:
         raise ValueError("matched-pair execution device must be CPU or CUDA")
+    # The serial executor runs in this process, so establish the same strict
+    # policy before its one worker can initialize a model or CUDA. Spawned
+    # workers independently re-establish and attest this policy inside the
+    # shared HTR fold executor.
+    _enforce_stage1_torch_determinism()
+    if fold_event_sink is not None and not callable(fold_event_sink):
+        raise TypeError("matched-pair fold event sink must be callable")
+    if fold_resource_plan is None:
+        if operational_attestation_sink is not None:
+            raise ValueError(
+                "matched-pair operational attestation requires an explicit "
+                "HTR fold resource plan"
+            )
+        effective_resource_plan = RoleNeutralHTRFoldResourcePlan(
+            devices=(str(resolved_device),),
+            fold_parallelism=1,
+            fold_slots_per_device=1,
+            owner_cpu_budget=1,
+            fold_parallel_backend="threads",
+        )
+    else:
+        if not isinstance(
+            fold_resource_plan,
+            RoleNeutralHTRFoldResourcePlan,
+        ):
+            raise TypeError(
+                "matched-pair fold resources require the typed HTR plan"
+            )
+        if not callable(operational_attestation_sink):
+            raise TypeError(
+                "matched-pair fold resources require an attestation sink"
+            )
+        effective_resource_plan = fold_resource_plan
+        if str(resolved_device) not in effective_resource_plan.devices:
+            raise ValueError(
+                "matched-pair fold resource plan omits the primary device"
+            )
+        if (
+            len(effective_resource_plan.devices)
+            > int(configuration["effect_folds"])
+        ):
+            raise ValueError(
+                "matched-pair selected devices exceed available effect folds"
+            )
+        if (
+            effective_resource_plan.fold_parallelism > 1
+            and effective_resource_plan.fold_parallel_backend
+            != "processes"
+        ):
+            raise ValueError(
+                "overlapping matched-pair folds require process-isolated RNG"
+            )
     store = _ArrayStore()
-    live_folds, fold_records, numerical_bank = _fit_models(
+    (
+        fold_records,
+        numerical_bank,
+        fold_execution_events,
+        fold_execution_summary,
+    ) = _fit_models(
         request=request,
         fit_texts=texts,
         treatment=treatment,
@@ -2537,10 +2982,11 @@ def execute_role_neutral_matched_pair_physical_group(
         m_fit=m_fit,
         view_configs=views,
         config=configuration,
-        extractor_factory=htr_extractor_factory,
         device=resolved_device,
         htr_model_path=htr_model_path,
         store=store,
+        resource_plan=effective_resource_plan,
+        external_event_sink=fold_event_sink,
     )
     subproducer_evidence = _subproducer_evidence(
         fold_records=fold_records,
@@ -2578,6 +3024,36 @@ def execute_role_neutral_matched_pair_physical_group(
         expected_e_fit=e_fit,
         expected_m_fit=m_fit,
     )
+    if operational_attestation_sink is not None:
+        operational_body = {
+            "schema_version": (
+                ROLE_NEUTRAL_MATCHED_PAIR_OPERATIONAL_ATTESTATION_SCHEMA
+            ),
+            "fold_resource_plan": effective_resource_plan.as_dict(),
+            "fold_execution": copy.deepcopy(
+                dict(fold_execution_summary)
+            ),
+            "fold_execution_events": [
+                copy.deepcopy(dict(value))
+                for value in fold_execution_events
+            ],
+            "canonical_fold_result_merge_order": (
+                "matched_pair_effect_fold_numeric_order_v1"
+            ),
+            "shared_mutable_array_store_used_by_fold_workers": False,
+            "live_models_returned_across_fold_boundary": False,
+            "worker_private_pair_tables_and_model_state": True,
+            "registered_heldout_text_accessed": False,
+            "registered_heldout_labels_accessed": False,
+            "resource_locators_in_scientific_identity": False,
+            "resource_telemetry_persisted_in_scientific_artifact": False,
+        }
+        operational_attestation_sink(
+            {
+                **operational_body,
+                "content_sha256": _sha256_json(operational_body),
+            }
+        )
     logical_root = root / _LOGICAL_DIRECTORY
     logical_root.mkdir(parents=True, exist_ok=False)
     events: list[dict[str, Any]] = [
@@ -2677,14 +3153,6 @@ def execute_role_neutral_matched_pair_physical_group(
         root=root,
         request=request,
     )
-    live_predictions = _live_exact_predictions(
-        request=request,
-        fit_texts=texts,
-        exact_input=exact_input,
-        metadata=metadata,
-        arrays=arrays,
-        live_folds=live_folds,
-    )
     sealed_predictions = _sealed_exact_predictions(
         request=request,
         fit_texts=texts,
@@ -2696,28 +3164,18 @@ def execute_role_neutral_matched_pair_physical_group(
     )
     prediction_registrations: dict[str, dict[str, Any]] = {}
     for subproducer in _SUBPRODUCERS:
-        live_columns, live_matrix = live_predictions[subproducer]
         replay_columns, replay_matrix = sealed_predictions[subproducer]
-        if live_columns != replay_columns or not _replayed_predictions_match(
-            live_matrix,
-            replay_matrix,
-            subproducer=subproducer,
-            config=configuration,
-        ):
-            raise RuntimeError(
-                f"live matched-pair {subproducer} transform differs from sealed state"
-            )
         prediction_path = logical_root / f"{owner.scope_id}.{subproducer}.predictions.npy"
-        _write_new_npy(prediction_path, live_matrix)
+        _write_new_npy(prediction_path, replay_matrix)
         digest, size = _sha256_file(prediction_path)
         prediction_registrations[subproducer] = {
             "relative_path": prediction_path.relative_to(root).as_posix(),
             "sha256": digest,
             "size_bytes": size,
-            "dtype": live_matrix.dtype.str,
-            "shape": list(live_matrix.shape),
-            "content_sha256": _array_sha256(live_matrix),
-            "columns": live_columns,
+            "dtype": replay_matrix.dtype.str,
+            "shape": list(replay_matrix.shape),
+            "content_sha256": _array_sha256(replay_matrix),
+            "columns": replay_columns,
         }
         events.append(
             {
@@ -2751,7 +3209,7 @@ def execute_role_neutral_matched_pair_physical_group(
         "registered_heldout_text_accessed": True,
         "registered_heldout_labels_accessed": False,
         "reuses_live_physical_fit": True,
-        "model_state_reloaded_for_primary_transform": False,
+        "model_state_reloaded_for_primary_transform": True,
         "sealed_state_replay_checked": True,
     }
     exact_view = {**exact_body, "content_sha256": _sha256_json(exact_body)}
@@ -2801,8 +3259,8 @@ def execute_role_neutral_matched_pair_physical_group(
         "fit_completed_before_registered_heldout_text_access": True,
         "both_subproducers_sealed_before_registered_heldout_text_access": True,
         "cumulative_views_published_without_sealed_text": True,
-        "live_model_objects_reused_for_exact_transform": True,
-        "model_state_reloaded_for_primary_transform": False,
+        "live_model_objects_reused_for_exact_transform": False,
+        "model_state_reloaded_for_primary_transform": True,
         "sealed_state_replay_checked": True,
         "registered_heldout_labels_accessed": False,
         "oracle_fields_accessed": False,
@@ -2838,6 +3296,11 @@ def execute_role_neutral_matched_pair_from_bow_nuisance_bank(
     ],
     device: torch.device | str,
     htr_model_path: Path | str | None = None,
+    fold_resource_plan: RoleNeutralHTRFoldResourcePlan | None = None,
+    operational_attestation_sink: (
+        Callable[[Mapping[str, Any]], None] | None
+    ) = None,
+    fold_event_sink: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> Mapping[str, Any]:
     """Execute matched-pair uplift from the authenticated prior BoW component.
 
@@ -2913,6 +3376,9 @@ def execute_role_neutral_matched_pair_from_bow_nuisance_bank(
         exact_heldout_input_loader=exact_input_loader,
         device=device,
         htr_model_path=htr_model_path,
+        fold_resource_plan=fold_resource_plan,
+        operational_attestation_sink=operational_attestation_sink,
+        fold_event_sink=fold_event_sink,
     )
 
 
@@ -2986,8 +3452,8 @@ def validate_role_neutral_matched_pair_group_execution(
         )
         is not True
         or terminal.get("cumulative_views_published_without_sealed_text") is not True
-        or terminal.get("live_model_objects_reused_for_exact_transform") is not True
-        or terminal.get("model_state_reloaded_for_primary_transform") is not False
+        or terminal.get("live_model_objects_reused_for_exact_transform") is not False
+        or terminal.get("model_state_reloaded_for_primary_transform") is not True
         or terminal.get("sealed_state_replay_checked") is not True
         or terminal.get("registered_heldout_labels_accessed") is not False
         or terminal.get("oracle_fields_accessed") is not False
@@ -3079,6 +3545,9 @@ def validate_role_neutral_matched_pair_group_execution(
                 or view.get("registered_heldout_text_accessed") is not True
                 or view.get("view_input_policy")
                 != "authorized_row_text_and_authenticated_nuisance_no_labels_v1"
+                or view.get("model_state_reloaded_for_primary_transform")
+                is not True
+                or view.get("sealed_state_replay_checked") is not True
                 or not isinstance(exact_identity, Mapping)
                 or exact_identity.get("row_ids") != list(member.heldout_row_ids)
                 or exact_identity.get("heldout_treatment_field_present") is not False

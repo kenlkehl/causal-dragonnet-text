@@ -1,10 +1,11 @@
 {
-  "cpu_budget": 8,
+  "cpu_budget": 64,
   "dataset_path": "../synthetic_data/example_synthetic_datasets/one_confounder_one_effect_modifier_nsclc_with_structured/dataset.parquet",
   "devices": [
-    "auto"
+    "cuda:0",
+    "cuda:1"
   ],
-  "durable_artifact_root": "../artifacts/production_all_evidence_one_conf_one_mod_1000_v6_portable_acceptance",
+  "durable_artifact_root": "../artifacts/production_all_evidence_one_conf_one_mod_1000_r14_high_powered",
   "embedding_batch_size": 1,
   "embedding_model_locator": "../artifacts/local_models/qwen3_embedding_8b_materialized",
   "embedding_model_name": "Qwen/Qwen3-Embedding-8B",
@@ -12,17 +13,17 @@
   "endpoint_model": "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic",
   "forest_operational": {
     "ray_remote_func_options": null,
-    "requested_host_cpu_budget": 8,
+    "requested_host_cpu_budget": 64,
     "use_ray": false,
     "verbose": 0
   },
-  "htr_model_locator": "/home/klkehl/.cache/huggingface/hub/models--prajjwal1--bert-tiny/snapshots/6f75de8b60a9f8a2fdf7b69cbd86d9e64bcb3837",
+  "htr_model_locator": "../artifacts/local_models/bert_tiny_6f75de8b60a9_materialized",
   "oracle_ite_column": "true_ite_prob",
   "oracle_source": "../synthetic_data/example_synthetic_datasets/one_confounder_one_effect_modifier_nsclc_with_structured/dataset.parquet",
   "oracle_unit_id_column": "patient_id",
   "query_profile_locator": "production_all_evidence_neural_query_full.json",
   "resource_performance_safety": {
-    "fail_on_external_gpu_occupants": true,
+    "fail_on_external_gpu_occupants": false,
     "first_untouched_gate_max_catalog_atoms": 100000,
     "first_untouched_gate_max_direct_numerical_signals": 16384,
     "first_untouched_gate_max_first_gate_rows": 1000000,
@@ -44,43 +45,43 @@
   "response_concurrency": 8,
   "runtime_compatibility_class": "portable_python_posix_v1",
   "schema_version": "portable_all_evidence_deployment_profile_v9",
-  "scratch_root": "/tmp/causal_dragonnet_nsclc_v6_acceptance",
+  "scratch_root": "/tmp/causal_dragonnet_nsclc_r14_high_powered",
   "stage1_execution": {
     "benchmark_evidence_kind": "none",
     "benchmark_publication_locator": null,
     "benchmark_publication_sha256": null,
-    "benchmark_result_sha256": null,
     "benchmark_result_locator": null,
-    "benchmark_workload_deployment_sha256": null,
+    "benchmark_result_sha256": null,
     "benchmark_workload_deployment_locator": null,
+    "benchmark_workload_deployment_sha256": null,
     "device_count": 2,
     "executor_mode": "persistent_slots",
-    "persistent_slot_startup_timeout_seconds": 1800.0,
     "htr_operational_controls": {
       "chunk_plan_cache_max_entries": 1000,
       "data_loader_workers": 0,
       "fold_parallel_backend": "processes",
-      "fold_parallelism": 5,
-      "fold_slots_per_device": 3,
+      "fold_parallelism": 4,
+      "fold_slots_per_device": 2,
       "reuse_tokenizer_and_chunk_plans": true,
       "schema_version": "production_role_neutral_htr_operational_controls_v2",
       "sentence_encoder_batch_size": 16,
       "tokenized_chunk_cache_max_entries": 150000,
       "training_batch_size": 8
     },
+    "max_parallel_owners": 1,
     "neural_query_operational_controls": {
       "bank_parallelism": 3,
       "fold_parallel_backend": "processes",
-      "fold_slots_per_device": 3,
-      "inner_fold_parallelism": 3,
+      "fold_slots_per_device": 2,
+      "inner_fold_parallelism": 4,
       "schema_version": "production_role_neutral_neural_query_operational_controls_v1",
       "worker_cpu_threads": 1
     },
-    "max_parallel_owners": 2,
     "neural_query_topology": {
-      "mode": "one_context_per_selected_device",
+      "mode": "one_context_spanning_all_selected_devices",
       "schema_version": "portable_stage1_execution_topology_policy_v1"
     },
+    "persistent_slot_startup_timeout_seconds": 1800.0,
     "resource_kind": "accelerator",
     "schema_version": "portable_stage1_execution_profile_v8",
     "selected_candidate": null,
@@ -90,6 +91,6 @@
   },
   "stage1_profile_locator": "production_all_evidence_stage1_full.json",
   "stage2_tokenizer_locator": "../artifacts/local_models/gemma4_26b_a4b_it_fp8_dynamic_tokenizer_materialized",
-  "storage_backend": "sshfs",
+  "storage_backend": "local_posix",
   "cluster_preflight_parquet_compression": "zstd"
 }

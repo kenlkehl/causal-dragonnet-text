@@ -306,6 +306,58 @@ def _deployment_payload(
     }
 
 
+def _stage1_execution_profile_mapping() -> dict[str, object]:
+    return {
+        "schema_version": "portable_stage1_execution_profile_v8",
+        "resource_kind": "cpu",
+        "device_count": 1,
+        "scope_workers_per_device": 1,
+        "max_parallel_owners": 1,
+        "executor_mode": "persistent_slots",
+        "persistent_slot_startup_timeout_seconds": 30.0,
+        "neural_query_topology": {
+            "schema_version": (
+                "portable_stage1_execution_topology_policy_v1"
+            ),
+            "mode": "one_context_per_selected_device",
+        },
+        "htr_operational_controls": {
+            "schema_version": (
+                "production_role_neutral_htr_operational_controls_v2"
+            ),
+            "training_batch_size": 4,
+            "sentence_encoder_batch_size": 8,
+            "data_loader_workers": 0,
+            "fold_parallelism": 1,
+            "fold_parallel_backend": "threads",
+            "fold_slots_per_device": 1,
+            "reuse_tokenizer_and_chunk_plans": False,
+            "chunk_plan_cache_max_entries": 0,
+            "tokenized_chunk_cache_max_entries": 0,
+        },
+        "neural_query_operational_controls": {
+            "schema_version": (
+                "production_role_neutral_neural_query_operational_controls_v1"
+            ),
+            "inner_fold_parallelism": 1,
+            "fold_parallel_backend": "threads",
+            "fold_slots_per_device": 1,
+            "bank_parallelism": 1,
+            "worker_cpu_threads": 1,
+        },
+        "tfidf_parallel_backend": "threads",
+        "selection_method": "operator_configured",
+        "benchmark_evidence_kind": "none",
+        "selected_candidate": None,
+        "benchmark_result_sha256": None,
+        "benchmark_result_locator": None,
+        "benchmark_workload_deployment_sha256": None,
+        "benchmark_workload_deployment_locator": None,
+        "benchmark_publication_sha256": None,
+        "benchmark_publication_locator": None,
+    }
+
+
 def _write_paused_fixture(root: Path) -> tuple[str, dict[str, object]]:
     root.mkdir()
     phase_sequence = [
@@ -320,44 +372,9 @@ def _write_paused_fixture(root: Path) -> tuple[str, dict[str, object]]:
         "phase_sequence": phase_sequence,
         "resolved_stage1_gpu_ids": [],
         "stage1_execution_device_count": 1,
-        "stage1_execution_profile": {
-            "schema_version": "portable_stage1_execution_profile_v7",
-            "resource_kind": "cpu",
-            "device_count": 1,
-            "scope_workers_per_device": 1,
-            "max_parallel_owners": 1,
-            "executor_mode": "persistent_slots",
-            "persistent_slot_startup_timeout_seconds": 30.0,
-            "neural_query_topology": {
-                "schema_version": (
-                    "portable_stage1_execution_topology_policy_v1"
-                ),
-                "mode": "one_context_per_selected_device",
-            },
-            "htr_operational_controls": {
-                "schema_version": (
-                    "production_role_neutral_htr_operational_controls_v2"
-                ),
-                "training_batch_size": 4,
-                "sentence_encoder_batch_size": 8,
-                "data_loader_workers": 0,
-                "fold_parallelism": 1,
-                "fold_parallel_backend": "threads",
-                "fold_slots_per_device": 1,
-                "reuse_tokenizer_and_chunk_plans": False,
-                "chunk_plan_cache_max_entries": 0,
-                "tokenized_chunk_cache_max_entries": 0,
-            },
-            "selection_method": "operator_configured",
-            "benchmark_evidence_kind": "none",
-            "selected_candidate": None,
-            "benchmark_result_sha256": None,
-            "benchmark_result_locator": None,
-            "benchmark_workload_deployment_sha256": None,
-            "benchmark_workload_deployment_locator": None,
-            "benchmark_publication_sha256": None,
-            "benchmark_publication_locator": None,
-        },
+        "stage1_execution_profile": (
+            _stage1_execution_profile_mapping()
+        ),
         "stage1_scope_workers_per_gpu": 1,
         "stage1_preflight_workers": 3,
         "tfidf_workers": 2,
@@ -664,6 +681,9 @@ def test_provider_prepares_once_then_resumes_the_exact_sealed_context(
             "scientific_identity": {
                 "scientific_sha256": "1" * 64,
             },
+            "stage1_execution_profile": (
+                _stage1_execution_profile_mapping()
+            ),
         },
         phases={
             "stage1_preflight": {
@@ -806,8 +826,14 @@ def test_provider_prepares_once_then_resumes_the_exact_sealed_context(
         worker_parameters: dict[str, str]
 
     class FakePersistentExecutor:
-        def __init__(self, *, max_workers_per_resource: int):
+        def __init__(
+            self,
+            *,
+            max_workers_per_resource: int,
+            startup_timeout_seconds: float,
+        ):
             self.max_workers_per_resource = max_workers_per_resource
+            assert startup_timeout_seconds == 30.0
 
         def bind_context(self, manifest_path):
             counts["persistent_bind_context"] += 1
@@ -955,6 +981,9 @@ def _resume_provider_fixture(
                 "architecture_profiles": architecture_profiles,
             },
             "runtime_compatibility_class": "resume-runtime",
+            "stage1_execution_profile": (
+                _stage1_execution_profile_mapping()
+            ),
         },
         phases={},
     )

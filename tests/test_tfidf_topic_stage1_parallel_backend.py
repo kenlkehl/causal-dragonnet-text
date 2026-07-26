@@ -3,11 +3,13 @@ import multiprocessing as mp
 from dataclasses import asdict
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 from joblib import Parallel, delayed, parallel_config
 
+import oci.inference.tfidf_topic_stage1 as tfidf_topic_stage1_module
 from oci.config import AppliedInferenceConfig, ModelArchitectureConfig, MultiModelForestConfig
 from oci.inference.tfidf_topic_discovery import row_set_fingerprint, stable_hash
 from oci.inference.tfidf_topic_stage1 import (
@@ -26,6 +28,7 @@ from scripts.run_tfidf_topic_stage1_from_primary_splits import (
 
 def _config(backend: str = "multiprocessing") -> AppliedInferenceConfig:
     return AppliedInferenceConfig(
+        seed=42,
         outcome_type="binary",
         text_column="clinical_text",
         treatment_column="treatment_indicator",
@@ -228,7 +231,13 @@ def _cached_spec(
         artifact_path = context_dir / f"{artifact_name}.placeholder"
         artifact_path.write_text("sealed\n", encoding="utf-8")
         artifact_paths[artifact_name] = str(artifact_path)
-    artifact_paths["ngram_scores"] = {}
+    ngram_score_paths = {}
+    for bank in ("treatment", "outcome", "effect"):
+        artifact_path = context_dir / f"{bank}_ngram_scores.placeholder"
+        artifact_path.write_text("sealed\n", encoding="utf-8")
+        ngram_score_paths[bank] = str(artifact_path)
+    artifact_paths["ngram_scores"] = ngram_score_paths
+    artifact_paths["topic_score_tests"] = None
     metadata = {
         "fit_row_fingerprint": row_set_fingerprint(fit_df["_oci_row_id"]),
         "heldout_row_fingerprint": row_set_fingerprint(heldout_df["_oci_row_id"]),
@@ -238,6 +247,9 @@ def _cached_spec(
         "dataset_ordered_row_fingerprint": dataset_identity["ordered_row_fingerprint"],
         "split_semantics_hash": split_semantics_hash,
         "heldout_score_tests_enabled": False,
+        "fit_row_ids": [0, 1],
+        "heldout_row_ids": [2],
+        "artifact_inventory": {"fixture": "closed"},
         "artifacts": artifact_paths,
     }
     (context_dir / "context_metadata.json").write_text(
@@ -261,8 +273,43 @@ def _cached_spec(
     or mp.get_context().get_start_method() != "fork",
     reason="joblib multiprocessing Stage1 backend is intentionally Linux-fork-only",
 )
-def test_pickle_safe_context_worker_runs_in_joblib_multiprocessing(tmp_path):
+def test_pickle_safe_context_worker_runs_in_joblib_multiprocessing(
+    monkeypatch,
+    tmp_path,
+):
     config = _config("multiprocessing")
+    config_hash = stable_hash(
+        asdict(config.architecture.multi_model_forest.tfidf_topic)
+    )
+    monkeypatch.setattr(
+        tfidf_topic_stage1_module,
+        "tfidf_context_artifact_inventory",
+        lambda _artifacts: {"fixture": "closed"},
+    )
+    monkeypatch.setattr(
+        tfidf_topic_stage1_module,
+        "load_fitted_topic_context",
+        lambda _path: SimpleNamespace(config_hash=config_hash),
+    )
+    monkeypatch.setattr(
+        tfidf_topic_stage1_module,
+        "load_named_array_bank",
+        lambda _path, *, expected_row_count: {},
+    )
+    monkeypatch.setattr(
+        tfidf_topic_stage1_module.pd,
+        "read_parquet",
+        lambda _path: pd.DataFrame(
+            {
+                "_oci_row_id": [0, 1, 2],
+                "prediction_scope": [
+                    "fit_oof",
+                    "fit_oof",
+                    "external_heldout",
+                ],
+            }
+        ),
+    )
     stage1_hash = "stage1-hash"
     split_semantics_hash = "split-hash"
     dataset_identity = {

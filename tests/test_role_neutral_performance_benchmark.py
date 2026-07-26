@@ -125,7 +125,7 @@ def _config(*, fit_row_count: int) -> RoleNeutralBenchmarkConfig:
                     sentence_encoder_batch_size=8,
                     data_loader_workers=0,
                     fold_parallelism=1,
-                    fold_parallel_backend="processes",
+                    fold_parallel_backend="threads",
                     fold_slots_per_device=1,
                     reuse_tokenizer_and_chunk_plans=False,
                     chunk_plan_cache_max_entries=0,
@@ -144,7 +144,7 @@ def _config(*, fit_row_count: int) -> RoleNeutralBenchmarkConfig:
                     sentence_encoder_batch_size=8,
                     data_loader_workers=0,
                     fold_parallelism=1,
-                    fold_parallel_backend="processes",
+                    fold_parallel_backend="threads",
                     fold_slots_per_device=1,
                     reuse_tokenizer_and_chunk_plans=False,
                     chunk_plan_cache_max_entries=0,
@@ -165,9 +165,9 @@ def _config(*, fit_row_count: int) -> RoleNeutralBenchmarkConfig:
                     fold_parallelism=2,
                     fold_parallel_backend="processes",
                     fold_slots_per_device=2,
-                    reuse_tokenizer_and_chunk_plans=False,
-                    chunk_plan_cache_max_entries=0,
-                    tokenized_chunk_cache_max_entries=0,
+                    reuse_tokenizer_and_chunk_plans=True,
+                    chunk_plan_cache_max_entries=100,
+                    tokenized_chunk_cache_max_entries=1000,
                 ),
             ),
             RoleNeutralBenchmarkCandidate(
@@ -184,9 +184,9 @@ def _config(*, fit_row_count: int) -> RoleNeutralBenchmarkConfig:
                     fold_parallelism=2,
                     fold_parallel_backend="processes",
                     fold_slots_per_device=2,
-                    reuse_tokenizer_and_chunk_plans=False,
-                    chunk_plan_cache_max_entries=0,
-                    tokenized_chunk_cache_max_entries=0,
+                    reuse_tokenizer_and_chunk_plans=True,
+                    chunk_plan_cache_max_entries=100,
+                    tokenized_chunk_cache_max_entries=1000,
                 ),
             ),
             RoleNeutralBenchmarkCandidate(
@@ -203,9 +203,9 @@ def _config(*, fit_row_count: int) -> RoleNeutralBenchmarkConfig:
                     fold_parallelism=2,
                     fold_parallel_backend="processes",
                     fold_slots_per_device=2,
-                    reuse_tokenizer_and_chunk_plans=False,
-                    chunk_plan_cache_max_entries=0,
-                    tokenized_chunk_cache_max_entries=0,
+                    reuse_tokenizer_and_chunk_plans=True,
+                    chunk_plan_cache_max_entries=100,
+                    tokenized_chunk_cache_max_entries=1000,
                 ),
             ),
             RoleNeutralBenchmarkCandidate(
@@ -220,7 +220,7 @@ def _config(*, fit_row_count: int) -> RoleNeutralBenchmarkConfig:
                     sentence_encoder_batch_size=16,
                     data_loader_workers=0,
                     fold_parallelism=1,
-                    fold_parallel_backend="processes",
+                    fold_parallel_backend="threads",
                     fold_slots_per_device=1,
                     reuse_tokenizer_and_chunk_plans=False,
                     chunk_plan_cache_max_entries=0,
@@ -239,7 +239,7 @@ def _config(*, fit_row_count: int) -> RoleNeutralBenchmarkConfig:
                     sentence_encoder_batch_size=8,
                     data_loader_workers=2,
                     fold_parallelism=1,
-                    fold_parallel_backend="processes",
+                    fold_parallel_backend="threads",
                     fold_slots_per_device=1,
                     reuse_tokenizer_and_chunk_plans=True,
                     chunk_plan_cache_max_entries=100,
@@ -258,7 +258,7 @@ def _config(*, fit_row_count: int) -> RoleNeutralBenchmarkConfig:
                     sentence_encoder_batch_size=8,
                     data_loader_workers=0,
                     fold_parallelism=1,
-                    fold_parallel_backend="processes",
+                    fold_parallel_backend="threads",
                     fold_slots_per_device=1,
                     reuse_tokenizer_and_chunk_plans=True,
                     chunk_plan_cache_max_entries=100,
@@ -306,6 +306,78 @@ def _inventory() -> ResourceInventory:
     )
 
 
+class _FakePersistentGpuSource:
+    backend_name = "fake_persistent_nvml_v1"
+
+    def __init__(self, devices, sample):
+        self._devices = tuple(devices)
+        self._sample = sample
+
+    def __enter__(self):
+        return self
+
+    def sample(self):
+        return self._sample(self._devices)
+
+    def __exit__(self, *_exc):
+        return None
+
+
+def _patch_persistent_gpu_samples(monkeypatch, sample) -> None:
+    monkeypatch.setattr(
+        performance_telemetry,
+        "persistent_nvidia_gpu_sampler",
+        lambda devices: _FakePersistentGpuSource(devices, sample),
+    )
+
+
+def test_candidate_gpu_sampler_brackets_acquisitions_and_completes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticks = iter((10, 20, 30, 40, 50))
+    monkeypatch.setattr(
+        benchmark_module,
+        "time",
+        SimpleNamespace(monotonic_ns=lambda: next(ticks)),
+    )
+    _patch_persistent_gpu_samples(
+        monkeypatch,
+        lambda devices: tuple(
+            {
+                "device": device,
+                "uuid": f"uuid-{device}",
+                "utilization_percent": 0.0,
+                "memory_used_bytes": 10,
+                "memory_total_bytes": 100,
+            }
+            for device in devices
+        ),
+    )
+    sampler = benchmark_module._CandidateGpuSampler(
+        devices=("cuda:0", "cuda:1"),
+        interval_seconds=3_600.0,
+    )
+    with sampler:
+        with pytest.raises(RuntimeError, match="has not completed"):
+            _ = sampler.completed_monotonic_ns
+        assert sampler.sampling_backend == "fake_persistent_nvml_v1"
+    assert sampler.completed_monotonic_ns == 50
+    rows = sampler.samples
+    assert len(rows) == 4
+    assert {
+        (
+            row["gpu_sample_acquisition_started_monotonic_ns"],
+            row["gpu_sample_acquisition_finished_monotonic_ns"],
+        )
+        for row in rows
+    } == {(10, 20), (30, 40)}
+    assert all(
+        row["sample_monotonic_seconds"]
+        == row["gpu_sample_acquisition_finished_monotonic_ns"] / 1e9
+        for row in rows
+    )
+
+
 def _patch_measurement_telemetry(monkeypatch) -> None:
     def samples(devices):
         return tuple(
@@ -320,7 +392,7 @@ def _patch_measurement_telemetry(monkeypatch) -> None:
             if device.startswith("cuda:")
         )
 
-    monkeypatch.setattr(performance_telemetry, "sample_nvidia_gpus", samples)
+    _patch_persistent_gpu_samples(monkeypatch, samples)
     monkeypatch.setattr(
         performance_telemetry,
         "_reset_torch_peaks",
@@ -460,7 +532,7 @@ def test_real_role_neutral_callbacks_are_repeated_measured_and_audited_once(
             if device.startswith("cuda:")
         )
 
-    monkeypatch.setattr(performance_telemetry, "sample_nvidia_gpus", samples)
+    _patch_persistent_gpu_samples(monkeypatch, samples)
     monkeypatch.setattr(
         performance_telemetry,
         "_reset_torch_peaks",
