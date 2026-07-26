@@ -1908,6 +1908,34 @@ class PreparedBuildRoleNeutralProducerFactoriesBuilder:
                         htr_model_path=prepared.htr_model_path,
                         device=invocation.resource,
                     )
+                owner_cpu_budget = invocation.owner_cpu_budget
+                if owner_cpu_budget is None:
+                    owner_cpu_budget = prepared.options.num_workers
+                fold_resource_plan = controls.bind_fold_resources(
+                    devices=invocation.htr_fold_devices,
+                    owner_cpu_budget=owner_cpu_budget,
+                )
+                if (
+                    fold_resource_plan.fold_parallelism > 1
+                    and fold_resource_plan.fold_parallel_backend
+                    != "processes"
+                ):
+                    raise ValueError(
+                        "production parallel HTR fold execution requires the "
+                        "process-isolated backend"
+                    )
+                if (
+                    (
+                        fold_resource_plan.fold_parallel_backend
+                        == "processes"
+                        or fold_resource_plan.fold_parallelism > 1
+                    )
+                    and not controls.reuse_tokenizer_and_chunk_plans
+                ):
+                    raise ValueError(
+                        "production process or parallel HTR fold execution "
+                        "requires one reusable complete tokenizer/chunk plan"
+                    )
                 captured: list[Mapping[str, Any]] = []
                 execute_role_neutral_htr_physical_group(
                     request=request,
@@ -1923,6 +1951,7 @@ class PreparedBuildRoleNeutralProducerFactoriesBuilder:
                     htr_model_path=prepared.htr_model_path,
                     device=invocation.resource,
                     operational_controls=controls,
+                    fold_resource_plan=fold_resource_plan,
                     operational_attestation_sink=captured.append,
                 )
                 if len(captured) != 1:

@@ -770,7 +770,7 @@ def test_measured_stage1_execution_requires_reopenable_evidence_locators(
     measured = stage1_execution_profile(
         resource_kind="accelerator",
         device_count=2,
-        scope_workers_per_device=2,
+        scope_workers_per_device=1,
         executor_mode="persistent_slots",
         selection_method="measured_role_neutral_benchmark_v1",
         benchmark_evidence_kind="raw_result_v1",

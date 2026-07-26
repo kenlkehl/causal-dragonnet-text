@@ -567,12 +567,12 @@ class PersistentRoleNeutralExecutionSession:
             raise ValueError(
                 "persistent session requires 1 <= max_workers <= cpu_budget"
             )
-        if len(resource_order) > workers:
-            raise ValueError(
-                "persistent session max_workers is smaller than resource count"
-            )
+        # ``workers`` is the concurrent-owner cap. One owner may atomically
+        # reserve several devices, so the pool still needs at least one
+        # process slot per selected resource when that cap is one.
+        self.max_parallel_owners = workers
         slots_by_resource = {value: 1 for value in resource_order}
-        remaining = workers - len(resource_order)
+        remaining = max(0, workers - len(resource_order))
         while remaining:
             advanced = False
             for value in resource_order:
@@ -840,9 +840,10 @@ class PersistentRoleNeutralExecutionSession:
                 "persistent session CPU budget changed after startup"
             )
         requested = int(max_workers)
-        if requested < 1 or requested > self.active_slot_count:
+        if requested < 1 or requested > self.max_parallel_owners:
             raise ValueError(
-                "persistent session max_workers exceeds its slot allocation"
+                "persistent session max_workers exceeds its concurrent-owner "
+                "allocation"
             )
         if len({task.component_parent for task in rows}) != len(rows):
             raise ValueError("persistent session task roots are duplicated")

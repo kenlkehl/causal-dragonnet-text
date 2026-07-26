@@ -35,9 +35,9 @@ def stage1_execution_profile(
     training_batch_size: int = 4,
     sentence_encoder_batch_size: int = 8,
     data_loader_workers: int = 0,
-    reuse_tokenizer_and_chunk_plans: bool = False,
-    chunk_plan_cache_max_entries: int = 0,
-    tokenized_chunk_cache_max_entries: int = 0,
+    reuse_tokenizer_and_chunk_plans: bool = True,
+    chunk_plan_cache_max_entries: int = 100,
+    tokenized_chunk_cache_max_entries: int = 1000,
     selection_method: str = "operator_configured",
     benchmark_evidence_kind: str = "none",
     selected_candidate: str | None = None,
@@ -68,6 +68,11 @@ def stage1_execution_profile(
             training_batch_size=training_batch_size,
             sentence_encoder_batch_size=sentence_encoder_batch_size,
             data_loader_workers=data_loader_workers,
+            fold_parallelism=device_count,
+            fold_parallel_backend=(
+                "threads" if device_count == 1 else "processes"
+            ),
+            fold_slots_per_device=1,
             reuse_tokenizer_and_chunk_plans=(
                 reuse_tokenizer_and_chunk_plans
             ),

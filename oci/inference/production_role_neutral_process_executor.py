@@ -526,9 +526,17 @@ def _task_execution_resources(
         raise ValueError(
             "owner task neural-query topology changed its primary resource"
         )
-    for device in topology.devices:
+    htr_devices = tuple(str(value) for value in task.htr_fold_devices)
+    if not htr_devices or task.resource not in htr_devices:
+        raise ValueError(
+            "owner task HTR fold resources omit its primary resource"
+        )
+    resources = tuple(
+        dict.fromkeys((*topology.devices, *htr_devices))
+    )
+    for device in resources:
         _gpu_id(device)
-    return topology.devices
+    return resources
 
 
 def _runtime_neural_query_topology_attestation(
@@ -683,7 +691,10 @@ def _native_thread_environment(thread_count: int) -> dict[str, str]:
     count = int(thread_count)
     if count < 1:
         raise ValueError("native thread count must be positive")
-    return {key: str(count) for key in _NATIVE_THREAD_ENVIRONMENT}
+    return {
+        **{key: str(count) for key in _NATIVE_THREAD_ENVIRONMENT},
+        "TOKENIZERS_PARALLELISM": "false",
+    }
 
 
 def _process_io_counters() -> dict[str, int] | None:
@@ -784,15 +795,16 @@ def _spawned_owner_entry(
             task.physical_owner.scope_seed,
             gpu_id=gpu_id,
         )
-        topology_gpu_ids = tuple(
+        execution_gpu_ids = tuple(
             value
             for value in (
-                _gpu_id(device) for device in topology.devices
+                _gpu_id(device)
+                for device in _task_execution_resources(task)
             )
             if value is not None
         )
-        for topology_gpu_id in topology_gpu_ids:
-            torch.cuda.reset_peak_memory_stats(topology_gpu_id)
+        for execution_gpu_id in execution_gpu_ids:
+            torch.cuda.reset_peak_memory_stats(execution_gpu_id)
 
         torch.set_num_threads(int(native_threads))
         try:
@@ -835,13 +847,13 @@ def _spawned_owner_entry(
             f"cuda:{topology_gpu_id}": int(
                 torch.cuda.max_memory_allocated(topology_gpu_id)
             )
-            for topology_gpu_id in topology_gpu_ids
+            for topology_gpu_id in execution_gpu_ids
         }
         peak_reserved_by_device = {
             f"cuda:{topology_gpu_id}": int(
                 torch.cuda.max_memory_reserved(topology_gpu_id)
             )
-            for topology_gpu_id in topology_gpu_ids
+            for topology_gpu_id in execution_gpu_ids
         }
         peak_allocated = (
             None
@@ -1095,7 +1107,14 @@ class ProcessIsolatedRoleNeutralPhysicalOwnerExecutor:
         active: list[_ActiveOwner] = []
         completed: list[RoleNeutralPhysicalOwnerResult] = []
         active_by_resource: dict[str, int] = {}
-        maximum_active = min(workers, len(rows))
+        widest_reservation = max(
+            len(_task_execution_resources(task))
+            for task in rows
+        )
+        maximum_active = min(
+            max(1, workers // widest_reservation),
+            len(rows),
+        )
         native_threads = max(1, budget // maximum_active)
         failure: BaseException | None = None
 

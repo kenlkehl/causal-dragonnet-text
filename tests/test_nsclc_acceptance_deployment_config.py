@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
+
+import pytest
 
 from oci.inference.portable_resource_scheduler import (
     GPUResource,
@@ -113,14 +115,17 @@ def test_acceptance_deployment_is_closed_full_workflow_configuration() -> None:
         deployment.stage1_execution.htr_operational_controls.as_dict()
         == {
             "schema_version": (
-                "production_role_neutral_htr_operational_controls_v1"
+                "production_role_neutral_htr_operational_controls_v2"
             ),
             "training_batch_size": 8,
             "sentence_encoder_batch_size": 16,
             "data_loader_workers": 0,
-            "reuse_tokenizer_and_chunk_plans": False,
-            "chunk_plan_cache_max_entries": 0,
-            "tokenized_chunk_cache_max_entries": 0,
+            "fold_parallelism": 5,
+            "fold_parallel_backend": "processes",
+            "fold_slots_per_device": 3,
+            "reuse_tokenizer_and_chunk_plans": True,
+            "chunk_plan_cache_max_entries": 1000,
+            "tokenized_chunk_cache_max_entries": 150000,
         }
     )
     assert deployment.cpu_budget == 8
@@ -128,6 +133,23 @@ def test_acceptance_deployment_is_closed_full_workflow_configuration() -> None:
     assert deployment.oracle_source == deployment.dataset_path
     assert deployment.oracle_unit_id_column == "patient_id"
     assert deployment.oracle_ite_column == "true_ite_prob"
+    with pytest.raises(ValueError, match="one outer owner slot"):
+        replace(
+            deployment.stage1_execution,
+            scope_workers_per_device=2,
+            max_parallel_owners=4,
+        )
+    reuse_disabled = replace(
+        deployment.stage1_execution.htr_operational_controls,
+        reuse_tokenizer_and_chunk_plans=False,
+        chunk_plan_cache_max_entries=0,
+        tokenized_chunk_cache_max_entries=0,
+    )
+    with pytest.raises(ValueError, match="reusable complete"):
+        replace(
+            deployment.stage1_execution,
+            htr_operational_controls=reuse_disabled,
+        )
 
     # Pause/resume and checkpoint selection are operational RunControl values.
     # They must not be smuggled into either immutable typed input file.

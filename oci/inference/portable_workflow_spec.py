@@ -53,7 +53,7 @@ from .post_extraction_scientific_policy import (
 
 PORTABLE_SPEC_VERSION = "portable_all_evidence_scientific_workflow_v11"
 DEPLOYMENT_PROFILE_VERSION = "portable_all_evidence_deployment_profile_v8"
-STAGE1_EXECUTION_PROFILE_VERSION = "portable_stage1_execution_profile_v6"
+STAGE1_EXECUTION_PROFILE_VERSION = "portable_stage1_execution_profile_v7"
 RESOURCE_PERFORMANCE_SAFETY_VERSION = "portable_resource_performance_safety_policy_v2"
 RUN_CONTROL_VERSION = "portable_all_evidence_run_control_v2"
 BINARY_PROBABILITY_DIFFERENCE = "binary_treatment_binary_outcome_probability_difference_v1"
@@ -1301,6 +1301,52 @@ class Stage1ExecutionProfile:
             raise TypeError(
                 "Stage 1 execution requires typed HTR operational controls"
             )
+        htr_controls = self.htr_operational_controls
+        if (
+            htr_controls.fold_parallelism
+            > self.device_count * htr_controls.fold_slots_per_device
+        ):
+            raise ValueError(
+                "Stage 1 HTR fold parallelism exceeds the configured "
+                "per-device fold-slot capacity"
+            )
+        if (
+            self.device_count > 1
+            and htr_controls.fold_parallelism < self.device_count
+        ):
+            raise ValueError(
+                "Stage 1 HTR fold parallelism must use every selected device"
+            )
+        if (
+            htr_controls.fold_parallelism > 1
+            and htr_controls.fold_parallel_backend != "processes"
+        ):
+            raise ValueError(
+                "parallel HTR fold execution requires the "
+                "process-isolated backend"
+            )
+        if (
+            (
+                htr_controls.fold_parallelism > 1
+                or htr_controls.fold_slots_per_device > 1
+            )
+            and self.scope_workers_per_device != 1
+        ):
+            raise ValueError(
+                "per-owner HTR fold slots require exactly one outer owner "
+                "slot per selected device"
+            )
+        if (
+            (
+                htr_controls.fold_parallel_backend == "processes"
+                or htr_controls.fold_parallelism > 1
+            )
+            and not htr_controls.reuse_tokenizer_and_chunk_plans
+        ):
+            raise ValueError(
+                "process or parallel HTR fold execution requires one "
+                "reusable complete tokenizer/chunk plan"
+            )
         if self.executor_mode not in {
             "fresh_per_fit",
             "persistent_slots",
@@ -1551,6 +1597,14 @@ class DeploymentProfile:
             raise ValueError(
                 "forest_operational.requested_host_cpu_budget must equal "
                 "the deployment cpu_budget"
+            )
+        if (
+            self.stage1_execution.htr_operational_controls.fold_parallelism
+            > self.cpu_budget
+        ):
+            raise ValueError(
+                "HTR fold parallelism exceeds the configured global host "
+                "CPU budget"
             )
         if self.storage_backend not in {"posix", "local_posix", "sshfs"}:
             raise ValueError("unsupported storage backend")

@@ -548,13 +548,21 @@ Implemented validation gates:
   model-tree gate and began HTR on GPU 0 at
   `2026-07-26T06:28:13Z`; complete all-architecture replica equality remains
   pending.
+- At the operator's superseding direction, r12 was stopped on
+  `2026-07-26` rather than spend several more days in serial neural folds.
+  `SIGTERM` was sent only to the verified owned process groups
+  `1100432`, `1113720`, and `1113721`; all exited and released both GPUs.
+  Replica B never launched. Nothing was deleted: r12's terminal preflight,
+  96,751-file completed BoW component, and incomplete HTR scratch remain.
+  The incomplete owner is not being salvaged or migrated.
 - The full production Replica A/B byte-identical canary is no longer the
   intended forward policy. The frozen r12 request cannot skip replica B:
   it has no owner-terminal pause/adoption seam, dispatches B immediately
   after A returns, and its handoff validators require both replicas. Stopping
   would leave A as loose scratch and same-request resume would rerun the
-  entire Stage 1 phase. R12 therefore remains untouched so its running A is
-  not discarded. Working source now uses one authenticated canonical
+  entire Stage 1 phase. R12 is preserved on disk but stopped under the later
+  operator instruction; its loose partial A is neither resumed nor migrated.
+  Working source now uses one authenticated canonical
   execution per physical owner and honestly propagates disabled-canary
   `false`/`false`/`null` claims through the handoff and fresh validator.
   Configuration, ordered rows, seeds, prompts, schemas, provenance, and
@@ -566,6 +574,50 @@ Implemented validation gates:
   three canary/handoff nodes pass, as do targeted compilation and
   `git diff --check`; no broad suite, preflight recomputation, or migration
   framework was introduced.
+- [x] Restore deployment-configured process parallelism in the current
+  role-neutral HTR producer without reviving the legacy estimator. Five
+  nuisance folds now run through bounded isolated leases, all nuisance OOF
+  results merge in canonical fold order, a strict residual barrier completes,
+  and five effect folds then run through the same leases. Device identities,
+  total concurrency, slots per device, and CPU budget are operational
+  configuration; spawned workers enforce and re-observe the Stage-1 Torch
+  determinism policy and use one read-only complete tokenizer/chunk plan.
+  Fold-local arrays merge serially, no mutable array store is shared, and all
+  capacity limits fail closed instead of truncating text.
+- [x] Complete only the focused HTR gates requested for this restoration.
+  Three simulated/process nodes prove nuisance/effect overlap and barrier
+  order, two tasks on one device, use of multiple devices, canonical
+  serial/parallel equality, declared-tolerance neural equality, child-process
+  determinism, and unchanged complete-text coverage. The one deployment
+  propagation assertion passes after retaining encoder microbatch 16.
+  Compilation and `git diff --check` pass; no broad suite was run.
+- [x] Complete the narrow real-GPU check on the two configured 48-GiB A6000s.
+  Two independent batch-16 runs each scheduled five folds concurrently
+  (three leases on `cuda:0`, two on `cuda:1`), enforced the nuisance/effect
+  barrier, used both devices in both stages, and produced identical terminal
+  content under exact discrete and declared-tolerance neural comparison.
+  The runs took 47.92 and 46.14 seconds on the 25 longest complete V5-prepared
+  notes, covering 267,163 words and 3,735 chunks without truncation.
+  Conservative overlapping-child peaks were 19.41 GB and 12.67 GB, leaving
+  at least 31.49 GB headroom. A larger encoder microbatch completed without
+  OOM but failed the complete-artifact equality gate, so it was rejected and
+  batch 16 remains selected. No multi-GPU speedup claim is made without the
+  required single-device baseline.
+- [x] Freeze and independently reopen R13 source snapshot
+  `artifacts/production_source_snapshot_20260725_portable_acceptance_r13`:
+  243 files with path-neutral content SHA-256
+  `50c2420f7ff4beb83791217e315298491e51bec055058d83b41048cfa559f5d9`.
+  The one permitted ordinary adoption attempt of R12's terminal preflight
+  failed closed on scientific/producer compatibility before either R13 work
+  root existed. No retry, migration, exception, or partial-A salvage was
+  introduced. R13 was immediately relaunched from the same frozen source with
+  only the prior V5 preparation/cache attestations; it will recompute
+  preflight against the shared cache with no per-scope embedding or chunk-text
+  copies, then continue through Stage-1 handoff validation. The fresh request
+  is `78dc44196bdae983fa09bf7d30b60f379bd5f93e162a18e19c3b8a9c53017ccf`;
+  its preparation and cache phases are terminal through stat-continuity
+  attestations that explicitly record no payload-byte reauthentication, and
+  its fresh `stage1_preflight` phase is running.
 - A read-only pre-resume Stage 2 audit found one concrete complete-page
   reconciliation contract mismatch without disturbing frozen r11: internally
   authenticated leaf citations contain `start`, `end`, `text`, and `sha256`,

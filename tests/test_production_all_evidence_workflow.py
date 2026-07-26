@@ -539,6 +539,12 @@ def _direct_deployment_args(
         "8",
         "--stage1-htr-data-loader-workers",
         "0",
+        "--stage1-htr-fold-parallelism",
+        "1",
+        "--stage1-htr-fold-parallel-backend",
+        "threads",
+        "--stage1-htr-fold-slots-per-device",
+        "1",
         "--no-stage1-htr-reuse-tokenizer-and-chunk-plans",
         "--stage1-htr-chunk-plan-cache-max-entries",
         "0",
@@ -2691,11 +2697,14 @@ def test_scientific_spec_and_complete_direct_deployment_compile_typed_options(
         parsed.stage1_execution_profile.htr_operational_controls.as_dict()
         == {
             "schema_version": (
-                "production_role_neutral_htr_operational_controls_v1"
+                "production_role_neutral_htr_operational_controls_v2"
             ),
             "training_batch_size": 4,
             "sentence_encoder_batch_size": 8,
             "data_loader_workers": 0,
+            "fold_parallelism": 1,
+            "fold_parallel_backend": "threads",
+            "fold_slots_per_device": 1,
             "reuse_tokenizer_and_chunk_plans": False,
             "chunk_plan_cache_max_entries": 0,
             "tokenized_chunk_cache_max_entries": 0,
@@ -4182,7 +4191,7 @@ def test_resume_revalidation_reopens_measured_benchmark_authorities(
         ),
         "deployment_profile_path": None,
         "stage1_execution_profile": {
-            "schema_version": "portable_stage1_execution_profile_v6",
+            "schema_version": "portable_stage1_execution_profile_v7",
             "resource_kind": "accelerator",
             "device_count": 2,
             "scope_workers_per_device": 2,
@@ -4197,14 +4206,17 @@ def test_resume_revalidation_reopens_measured_benchmark_authorities(
             },
             "htr_operational_controls": {
                 "schema_version": (
-                    "production_role_neutral_htr_operational_controls_v1"
+                "production_role_neutral_htr_operational_controls_v2"
                 ),
                 "training_batch_size": 4,
                 "sentence_encoder_batch_size": 8,
                 "data_loader_workers": 0,
-                "reuse_tokenizer_and_chunk_plans": False,
-                "chunk_plan_cache_max_entries": 0,
-                "tokenized_chunk_cache_max_entries": 0,
+                "fold_parallelism": 2,
+                "fold_parallel_backend": "processes",
+                "fold_slots_per_device": 1,
+                "reuse_tokenizer_and_chunk_plans": True,
+                "chunk_plan_cache_max_entries": 100,
+                "tokenized_chunk_cache_max_entries": 1000,
             },
             "selection_method": "measured_role_neutral_benchmark_v1",
             "benchmark_evidence_kind": "raw_result_v1",

@@ -13910,6 +13910,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage1-htr-training-batch-size", type=int)
     parser.add_argument("--stage1-htr-sentence-encoder-batch-size", type=int)
     parser.add_argument("--stage1-htr-data-loader-workers", type=int)
+    parser.add_argument("--stage1-htr-fold-parallelism", type=int)
+    parser.add_argument(
+        "--stage1-htr-fold-parallel-backend",
+        choices=("threads", "processes"),
+    )
+    parser.add_argument("--stage1-htr-fold-slots-per-device", type=int)
     parser.add_argument(
         "--stage1-htr-reuse-tokenizer-and-chunk-plans",
         action=argparse.BooleanOptionalAction,
@@ -14317,6 +14323,9 @@ _DIRECT_DEPLOYMENT_SHIMS = (
     "stage1_htr_training_batch_size",
     "stage1_htr_sentence_encoder_batch_size",
     "stage1_htr_data_loader_workers",
+    "stage1_htr_fold_parallelism",
+    "stage1_htr_fold_parallel_backend",
+    "stage1_htr_fold_slots_per_device",
     "stage1_htr_reuse_tokenizer_and_chunk_plans",
     "stage1_htr_chunk_plan_cache_max_entries",
     "stage1_htr_tokenized_chunk_cache_max_entries",
@@ -14401,6 +14410,9 @@ def _compile_direct_deployment_profile(
         "stage1_htr_training_batch_size",
         "stage1_htr_sentence_encoder_batch_size",
         "stage1_htr_data_loader_workers",
+        "stage1_htr_fold_parallelism",
+        "stage1_htr_fold_parallel_backend",
+        "stage1_htr_fold_slots_per_device",
         "stage1_htr_reuse_tokenizer_and_chunk_plans",
         "stage1_htr_chunk_plan_cache_max_entries",
         "stage1_htr_tokenized_chunk_cache_max_entries",
@@ -14519,6 +14531,15 @@ def _compile_direct_deployment_profile(
                     ],
                     data_loader_workers=values[
                         "stage1_htr_data_loader_workers"
+                    ],
+                    fold_parallelism=values[
+                        "stage1_htr_fold_parallelism"
+                    ],
+                    fold_parallel_backend=values[
+                        "stage1_htr_fold_parallel_backend"
+                    ],
+                    fold_slots_per_device=values[
+                        "stage1_htr_fold_slots_per_device"
                     ],
                     reuse_tokenizer_and_chunk_plans=values[
                         "stage1_htr_reuse_tokenizer_and_chunk_plans"

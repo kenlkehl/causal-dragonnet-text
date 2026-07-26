@@ -57,12 +57,15 @@
     "executor_mode": "persistent_slots",
     "persistent_slot_startup_timeout_seconds": 1800.0,
     "htr_operational_controls": {
-      "chunk_plan_cache_max_entries": 0,
+      "chunk_plan_cache_max_entries": 1000,
       "data_loader_workers": 0,
-      "reuse_tokenizer_and_chunk_plans": false,
-      "schema_version": "production_role_neutral_htr_operational_controls_v1",
-      "sentence_encoder_batch_size": 16,
-      "tokenized_chunk_cache_max_entries": 0,
+      "fold_parallel_backend": "processes",
+      "fold_parallelism": 4,
+      "fold_slots_per_device": 4,
+      "reuse_tokenizer_and_chunk_plans": true,
+      "schema_version": "production_role_neutral_htr_operational_controls_v2",
+      "sentence_encoder_batch_size": 32,
+      "tokenized_chunk_cache_max_entries": 150000,
       "training_batch_size": 8
     },
     "max_parallel_owners": 1,
@@ -71,7 +74,7 @@
       "schema_version": "portable_stage1_execution_topology_policy_v1"
     },
     "resource_kind": "accelerator",
-    "schema_version": "portable_stage1_execution_profile_v6",
+    "schema_version": "portable_stage1_execution_profile_v7",
     "selected_candidate": null,
     "selection_method": "operator_configured",
     "scope_workers_per_device": 1

@@ -32,11 +32,13 @@ import concurrent.futures
 import hashlib
 import inspect
 import json
+import multiprocessing as mp
 import os
 import re
 import stat
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -45,6 +47,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from sklearn.model_selection import KFold
+from threadpoolctl import threadpool_limits
 
 from ..models.hierarchical_transformer_extractor import (
     HierarchicalTransformerExtractor,
@@ -72,9 +75,16 @@ from .neural_numerical_replay import (
 from .production_stage1_legacy_scope_fragments import (
     LEGACY_STAGE1_FIT_ONLY_FAMILY_SEAL_SCHEMA,
 )
-from .production_stage1_scope_scheduler import Stage1ScopePlan, Stage1ScopeSpec
+from .production_stage1_scope_scheduler import (
+    Stage1ScopePlan,
+    Stage1ScopeSpec,
+    _enforce_stage1_torch_determinism,
+    _observe_stage1_torch_determinism,
+    _validate_torch_determinism_observation,
+)
 from .stage1_htr_operational_controls import (
     ROLE_NEUTRAL_HTR_OPERATIONAL_CONTROLS_SCHEMA,
+    RoleNeutralHTRFoldResourcePlan,
     RoleNeutralHTROperationalControls,
 )
 
@@ -90,6 +100,9 @@ ROLE_NEUTRAL_HTR_GROUP_EXECUTION_SCHEMA = (
 ROLE_NEUTRAL_HTR_COVERAGE_SCHEMA = "production_role_neutral_htr_word_coverage_v1"
 ROLE_NEUTRAL_HTR_REUSABLE_PLAN_SCHEMA = (
     "production_role_neutral_htr_reusable_text_plan_v1"
+)
+ROLE_NEUTRAL_HTR_PROCESS_PLAN_SCHEMA = (
+    "production_role_neutral_htr_process_text_plan_v1"
 )
 ROLE_NEUTRAL_HTR_OPERATIONAL_ATTESTATION_SCHEMA = (
     "production_role_neutral_htr_operational_attestation_v2"
@@ -1783,6 +1796,516 @@ def _install_reusable_text_plan(
         raise RuntimeError("installed HTR chunk plan changed note coverage")
 
 
+@dataclass(frozen=True)
+class _MaterializedReusableTextPlan:
+    """Authenticated locator for one owner-scoped temporary Arrow plan."""
+
+    root: str
+    manifest_sha256: str
+    manifest_size_bytes: int
+    content_sha256: str
+
+    def attestation(self) -> dict[str, Any]:
+        return {
+            "schema_version": ROLE_NEUTRAL_HTR_PROCESS_PLAN_SCHEMA,
+            "manifest_sha256": _require_sha256(
+                self.manifest_sha256,
+                label="HTR process-plan manifest",
+            ),
+            "manifest_size_bytes": int(self.manifest_size_bytes),
+            "content_sha256": _require_sha256(
+                self.content_sha256,
+                label="HTR process-plan content",
+            ),
+            "complete_owner_tokenizer_chunk_plan_built_once": True,
+            "fold_workers_retokenized": False,
+            "fold_workers_rechunked": False,
+            "parent_authenticated_full_bytes_while_publishing": True,
+            "child_duplicate_full_hash_pass": False,
+            "child_reopen_guarded_by_authenticated_stat_inventory": True,
+            "locator_included": False,
+            "raw_text_temporary_only": True,
+            "semantic_truncation_applied": False,
+        }
+
+
+def _write_new_arrow_table(path: Path, table: Any) -> None:
+    """Publish one Arrow IPC file durably without replacing an existing path."""
+
+    try:
+        import pyarrow as pa
+        import pyarrow.ipc as ipc
+    except ImportError as exc:  # pragma: no cover - production dependency guard
+        raise RuntimeError(
+            "process-isolated HTR fold execution requires pyarrow"
+        ) from exc
+    target = Path(path)
+    if target.exists() or target.is_symlink():
+        raise FileExistsError(f"refusing to replace immutable Arrow plan: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not isinstance(table, pa.Table):
+        raise TypeError("HTR temporary Arrow payload must be a pyarrow Table")
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=target.parent,
+        suffix=".arrow",
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        with pa.OSFile(str(temporary), "wb") as sink:
+            with ipc.new_file(sink, table.schema) as writer:
+                writer.write_table(table)
+        file_descriptor = os.open(
+            temporary,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.fsync(file_descriptor)
+        finally:
+            os.close(file_descriptor)
+        os.replace(temporary, target)
+        directory = os.open(
+            target.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _regular_file_stat_identity(path: Path, *, label: str) -> dict[str, int]:
+    observed = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(observed.st_mode) or int(observed.st_nlink) != 1:
+        raise ValueError(f"{label} must be one singly-linked regular file")
+    return {
+        "st_dev": int(observed.st_dev),
+        "st_ino": int(observed.st_ino),
+        "st_mode": int(observed.st_mode),
+        "st_nlink": int(observed.st_nlink),
+        "st_size": int(observed.st_size),
+        "st_mtime_ns": int(observed.st_mtime_ns),
+        "st_ctime_ns": int(observed.st_ctime_ns),
+    }
+
+
+def _materialize_reusable_text_plan(
+    *,
+    root: Path,
+    plan: _ReusableTextPlan,
+    coverage: _CoveragePlan,
+    texts: Sequence[str],
+    row_ids: Sequence[int],
+) -> _MaterializedReusableTextPlan:
+    """Write one complete owner text/token plan for process workers to mmap."""
+
+    try:
+        import pyarrow as pa
+    except ImportError as exc:  # pragma: no cover - production dependency guard
+        raise RuntimeError(
+            "process-isolated HTR fold execution requires pyarrow"
+        ) from exc
+    target = Path(root)
+    if not target.is_absolute():
+        raise ValueError("HTR process-plan root must be absolute")
+    if target.exists() or target.is_symlink():
+        raise FileExistsError("HTR process-plan root must be fresh")
+    values = tuple(texts)
+    rows = tuple(int(value) for value in row_ids)
+    if (
+        rows != plan.ordered_row_ids
+        or len(values) != len(rows)
+        or _text_sha256(rows, values) != plan.text_sha256
+        or tuple(coverage.chunks_by_note)
+        != tuple(
+            dict(plan.text_rows)[text]
+            for text in values
+        )
+    ):
+        raise ValueError("HTR process plan differs from the complete owner plan")
+    target.mkdir(parents=True, exist_ok=False)
+    starts_by_note: list[list[int]] = []
+    ends_by_note: list[list[int]] = []
+    digests_by_note: list[list[bytes]] = []
+    offset = 0
+    for chunk_count in coverage.note_chunk_counts.astype(np.int64):
+        count = int(chunk_count)
+        starts_by_note.append(
+            coverage.chunk_word_starts[offset : offset + count]
+            .astype(np.int64)
+            .tolist()
+        )
+        ends_by_note.append(
+            coverage.chunk_word_ends[offset : offset + count]
+            .astype(np.int64)
+            .tolist()
+        )
+        digests_by_note.append(
+            [
+                bytes(row.tolist())
+                for row in coverage.chunk_sha256_bytes[
+                    offset : offset + count
+                ]
+            ]
+        )
+        offset += count
+    if offset != len(coverage.chunk_note_positions):
+        raise RuntimeError("HTR process plan lost a complete chunk span")
+    notes_schema = pa.schema(
+        [
+            ("position", pa.int64()),
+            ("row_id", pa.int64()),
+            ("text", pa.large_string()),
+            ("chunks", pa.large_list(pa.large_string())),
+            ("note_word_count", pa.int64()),
+            ("chunk_word_starts", pa.large_list(pa.int64())),
+            ("chunk_word_ends", pa.large_list(pa.int64())),
+            ("chunk_sha256", pa.large_list(pa.binary(32))),
+        ]
+    )
+    notes = pa.Table.from_arrays(
+        [
+            pa.array(range(len(values)), type=pa.int64()),
+            pa.array(rows, type=pa.int64()),
+            pa.array(values, type=pa.large_string()),
+            pa.array(coverage.chunks_by_note, type=pa.large_list(pa.large_string())),
+            pa.array(
+                coverage.note_word_counts.astype(np.int64),
+                type=pa.int64(),
+            ),
+            pa.array(starts_by_note, type=pa.large_list(pa.int64())),
+            pa.array(ends_by_note, type=pa.large_list(pa.int64())),
+            pa.array(digests_by_note, type=pa.large_list(pa.binary(32))),
+        ],
+        schema=notes_schema,
+    )
+    tokens_schema = pa.schema(
+        [
+            ("chunk", pa.large_string()),
+            ("input_ids", pa.large_list(pa.int64())),
+            ("attention_mask", pa.large_list(pa.int64())),
+        ]
+    )
+    tokens = pa.Table.from_arrays(
+        [
+            pa.array(
+                [row[0] for row in plan.token_rows],
+                type=pa.large_string(),
+            ),
+            pa.array(
+                [row[1] for row in plan.token_rows],
+                type=pa.large_list(pa.int64()),
+            ),
+            pa.array(
+                [row[2] for row in plan.token_rows],
+                type=pa.large_list(pa.int64()),
+            ),
+        ],
+        schema=tokens_schema,
+    )
+    notes_path = target / "notes.arrow"
+    tokens_path = target / "tokens.arrow"
+    _write_new_arrow_table(notes_path, notes)
+    _write_new_arrow_table(tokens_path, tokens)
+    files: dict[str, Any] = {}
+    for name, path in (("notes", notes_path), ("tokens", tokens_path)):
+        digest, size = _sha256_file(path, label=f"HTR process plan {name}")
+        files[name] = {
+            "relative_path": path.relative_to(target).as_posix(),
+            "sha256": digest,
+            "size_bytes": size,
+            "authenticated_stat_identity": _regular_file_stat_identity(
+                path,
+                label=f"HTR process plan {name}",
+            ),
+        }
+    body = {
+        "schema_version": ROLE_NEUTRAL_HTR_PROCESS_PLAN_SCHEMA,
+        "reusable_plan": plan.attestation(),
+        "coverage_summary": copy.deepcopy(dict(coverage.summary)),
+        "files": files,
+        "file_order": ["notes", "tokens"],
+        "arrow_memory_map_safe": True,
+        "complete_owner_plan_built_once": True,
+        "fold_workers_retokenize": False,
+        "fold_workers_rechunk": False,
+        "parent_authenticated_full_bytes_while_publishing": True,
+        "child_duplicate_full_hash_pass": False,
+        "child_reopen_guarded_by_authenticated_stat_inventory": True,
+        "raw_text_temporary_only": True,
+        "semantic_truncation_applied": False,
+    }
+    manifest = {**body, "content_sha256": _sha256_json(body)}
+    manifest_path = target / "manifest.json"
+    _write_new_json(manifest_path, manifest)
+    manifest_sha256, manifest_size = _sha256_file(
+        manifest_path,
+        label="HTR process-plan manifest",
+    )
+    return _MaterializedReusableTextPlan(
+        root=str(target),
+        manifest_sha256=manifest_sha256,
+        manifest_size_bytes=manifest_size,
+        content_sha256=manifest["content_sha256"],
+    )
+
+
+def _load_materialized_reusable_text_plan(
+    descriptor: _MaterializedReusableTextPlan,
+) -> tuple[tuple[str, ...], tuple[int, ...], _CoveragePlan, _ReusableTextPlan]:
+    """Freshly authenticate and mmap one process worker's complete plan."""
+
+    try:
+        import pyarrow as pa
+        import pyarrow.ipc as ipc
+    except ImportError as exc:  # pragma: no cover - production dependency guard
+        raise RuntimeError(
+            "process-isolated HTR fold execution requires pyarrow"
+        ) from exc
+    if not isinstance(descriptor, _MaterializedReusableTextPlan):
+        raise TypeError("HTR process worker requires a typed plan descriptor")
+    root = Path(descriptor.root)
+    if not root.is_absolute() or root.is_symlink() or not root.is_dir():
+        raise ValueError("HTR process-plan locator is not one real directory")
+    manifest_path = root / "manifest.json"
+    observed_sha256, observed_size = _sha256_file(
+        manifest_path,
+        label="HTR process-plan manifest",
+    )
+    if (
+        observed_sha256 != descriptor.manifest_sha256
+        or observed_size != descriptor.manifest_size_bytes
+    ):
+        raise RuntimeError("HTR process-plan manifest changed")
+    manifest = _read_json(manifest_path, label="HTR process-plan manifest")
+    content_sha256 = manifest.pop("content_sha256", None)
+    if (
+        content_sha256 != descriptor.content_sha256
+        or _sha256_json(manifest) != content_sha256
+        or manifest.get("schema_version") != ROLE_NEUTRAL_HTR_PROCESS_PLAN_SCHEMA
+        or manifest.get("file_order") != ["notes", "tokens"]
+        or manifest.get("arrow_memory_map_safe") is not True
+        or manifest.get("complete_owner_plan_built_once") is not True
+        or manifest.get("fold_workers_retokenize") is not False
+        or manifest.get("fold_workers_rechunk") is not False
+        or manifest.get("parent_authenticated_full_bytes_while_publishing")
+        is not True
+        or manifest.get("child_duplicate_full_hash_pass") is not False
+        or manifest.get(
+            "child_reopen_guarded_by_authenticated_stat_inventory"
+        )
+        is not True
+        or manifest.get("raw_text_temporary_only") is not True
+        or manifest.get("semantic_truncation_applied") is not False
+    ):
+        raise RuntimeError("HTR process-plan manifest content changed")
+    files = manifest.get("files")
+    if not isinstance(files, Mapping) or set(files) != {"notes", "tokens"}:
+        raise ValueError("HTR process-plan inventory changed")
+    tables: dict[str, Any] = {}
+    expected_files = {"manifest.json"}
+    for name in ("notes", "tokens"):
+        record = files[name]
+        if not isinstance(record, Mapping) or set(record) != {
+            "relative_path",
+            "sha256",
+            "size_bytes",
+            "authenticated_stat_identity",
+        }:
+            raise ValueError("HTR process-plan file record changed")
+        relative = str(record["relative_path"])
+        if relative != f"{name}.arrow":
+            raise ValueError("HTR process-plan file locator changed")
+        expected_files.add(relative)
+        path = root / relative
+        expected_stat = record["authenticated_stat_identity"]
+        if (
+            not isinstance(expected_stat, Mapping)
+            or set(expected_stat)
+            != {
+                "st_dev",
+                "st_ino",
+                "st_mode",
+                "st_nlink",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            }
+            or int(expected_stat["st_size"]) != int(record["size_bytes"])
+            or _regular_file_stat_identity(
+                path,
+                label=f"HTR process plan {name}",
+            )
+            != dict(expected_stat)
+        ):
+            raise RuntimeError(f"HTR process-plan {name} locator changed")
+        with pa.memory_map(str(path), "r") as source:
+            tables[name] = ipc.open_file(source).read_all()
+        if _regular_file_stat_identity(
+            path,
+            label=f"HTR process plan {name}",
+        ) != dict(expected_stat):
+            raise RuntimeError(f"HTR process-plan {name} changed while mapped")
+    files_on_disk, directories = _inventory_tree(root)
+    if files_on_disk != expected_files or directories:
+        raise ValueError("HTR process-plan tree contains unregistered entries")
+    notes = tables["notes"]
+    tokens = tables["tokens"]
+    expected_note_columns = (
+        "position",
+        "row_id",
+        "text",
+        "chunks",
+        "note_word_count",
+        "chunk_word_starts",
+        "chunk_word_ends",
+        "chunk_sha256",
+    )
+    expected_token_columns = ("chunk", "input_ids", "attention_mask")
+    if (
+        tuple(notes.column_names) != expected_note_columns
+        or tuple(tokens.column_names) != expected_token_columns
+    ):
+        raise ValueError("HTR process-plan Arrow schema changed")
+    positions = tuple(int(value) for value in notes["position"].to_pylist())
+    if positions != tuple(range(len(positions))):
+        raise ValueError("HTR process-plan note order changed")
+    row_ids = tuple(int(value) for value in notes["row_id"].to_pylist())
+    texts = tuple(str(value) for value in notes["text"].to_pylist())
+    chunks_by_note = tuple(
+        tuple(str(chunk) for chunk in row)
+        for row in notes["chunks"].to_pylist()
+    )
+    note_word_counts = np.asarray(
+        notes["note_word_count"].to_pylist(),
+        dtype=np.int64,
+    )
+    starts_by_note = notes["chunk_word_starts"].to_pylist()
+    ends_by_note = notes["chunk_word_ends"].to_pylist()
+    digests_by_note = notes["chunk_sha256"].to_pylist()
+    note_chunk_counts = np.asarray(
+        [len(row) for row in chunks_by_note],
+        dtype=np.int64,
+    )
+    if any(
+        len({len(chunks), len(starts), len(ends), len(digests)}) != 1
+        for chunks, starts, ends, digests in zip(
+            chunks_by_note,
+            starts_by_note,
+            ends_by_note,
+            digests_by_note,
+            strict=True,
+        )
+    ):
+        raise ValueError("HTR process-plan chunk spans changed")
+    chunk_note_positions = np.repeat(
+        np.arange(len(texts), dtype=np.int64),
+        note_chunk_counts,
+    )
+    chunk_word_starts = np.asarray(
+        [value for row in starts_by_note for value in row],
+        dtype=np.int64,
+    )
+    chunk_word_ends = np.asarray(
+        [value for row in ends_by_note for value in row],
+        dtype=np.int64,
+    )
+    flat_digests = [
+        bytes(value)
+        for row in digests_by_note
+        for value in row
+    ]
+    chunk_sha256_bytes = np.frombuffer(
+        b"".join(flat_digests),
+        dtype=np.uint8,
+    ).reshape(len(flat_digests), 32)
+    coverage = _CoveragePlan(
+        summary=copy.deepcopy(dict(manifest["coverage_summary"])),
+        note_word_counts=note_word_counts,
+        note_chunk_counts=note_chunk_counts,
+        chunk_note_positions=chunk_note_positions,
+        chunk_word_starts=chunk_word_starts,
+        chunk_word_ends=chunk_word_ends,
+        chunk_sha256_bytes=chunk_sha256_bytes,
+        chunks_by_note=chunks_by_note,
+    )
+    reusable_attestation = manifest.get("reusable_plan")
+    if not isinstance(reusable_attestation, Mapping):
+        raise ValueError("HTR process plan lacks its reusable-plan attestation")
+    text_cache: dict[str, tuple[str, ...]] = {}
+    for text, chunks in zip(texts, chunks_by_note, strict=True):
+        previous = text_cache.setdefault(text, chunks)
+        if previous != chunks:
+            raise ValueError("HTR process plan has conflicting duplicate notes")
+    token_rows = tuple(
+        (
+            str(chunk),
+            tuple(int(value) for value in input_ids),
+            tuple(int(value) for value in attention_mask),
+        )
+        for chunk, input_ids, attention_mask in zip(
+            tokens["chunk"].to_pylist(),
+            tokens["input_ids"].to_pylist(),
+            tokens["attention_mask"].to_pylist(),
+            strict=True,
+        )
+    )
+    plan = _ReusableTextPlan(
+        phase=str(reusable_attestation["phase"]),
+        ordered_row_ids=row_ids,
+        text_sha256=str(reusable_attestation["text_sha256"]),
+        configuration_sha256=str(
+            reusable_attestation["configuration_sha256"]
+        ),
+        text_rows=tuple(sorted(text_cache.items())),
+        token_rows=token_rows,
+        unique_note_count=int(reusable_attestation["unique_note_count"]),
+        unique_chunk_count=int(reusable_attestation["unique_chunk_count"]),
+        parallel_plan_task_count=int(
+            reusable_attestation["parallel_plan_task_count"]
+        ),
+        parallel_plan_thread_count=int(
+            reusable_attestation["parallel_plan_thread_count"]
+        ),
+        positive_data_loader_workers_exercised=bool(
+            reusable_attestation[
+                "positive_data_loader_workers_exercised"
+            ]
+        ),
+        content_sha256=str(reusable_attestation["content_sha256"]),
+    )
+    if (
+        plan.attestation() != dict(reusable_attestation)
+        or plan.ordered_row_ids != row_ids
+        or _text_sha256(row_ids, texts) != plan.text_sha256
+        or int(np.sum(note_chunk_counts))
+        != int(coverage.summary["total_chunk_count"])
+        or len(
+            {
+                chunk
+                for chunks in chunks_by_note
+                for chunk in chunks
+            }
+        )
+        != plan.unique_chunk_count
+        or tuple(row[0] for row in token_rows)
+        != tuple(sorted(row[0] for row in token_rows))
+        or any(
+            hashlib.sha256(chunk.encode("utf-8")).digest() != digest
+            for chunks, digests in zip(
+                chunks_by_note,
+                digests_by_note,
+                strict=True,
+            )
+            for chunk, digest in zip(chunks, digests, strict=True)
+        )
+    ):
+        raise RuntimeError("HTR process plan differs from its authenticated content")
+    return texts, row_ids, coverage, plan
+
+
 def _set_operational_encoder_batch_size(
     extractor: HierarchicalTransformerExtractor,
     *,
@@ -2497,6 +3020,1449 @@ def _validate_complete_attention_evidence(
         raise ValueError("HTR attention evidence count changed")
 
 
+@dataclass(frozen=True)
+class _FoldTextAuthority:
+    """One immutable complete-text authority shared by every owner fold."""
+
+    texts: tuple[str, ...] | None
+    row_ids: tuple[int, ...] | None
+    coverage: _CoveragePlan | None
+    reusable_plan: _ReusableTextPlan | None
+    materialized_plan: _MaterializedReusableTextPlan | None
+
+    @classmethod
+    def in_memory(
+        cls,
+        *,
+        texts: Sequence[str],
+        row_ids: Sequence[int],
+        coverage: _CoveragePlan,
+        reusable_plan: _ReusableTextPlan | None,
+    ) -> "_FoldTextAuthority":
+        return cls(
+            texts=tuple(texts),
+            row_ids=tuple(int(value) for value in row_ids),
+            coverage=coverage,
+            reusable_plan=reusable_plan,
+            materialized_plan=None,
+        )
+
+    @classmethod
+    def materialized(
+        cls,
+        descriptor: _MaterializedReusableTextPlan,
+    ) -> "_FoldTextAuthority":
+        return cls(
+            texts=None,
+            row_ids=None,
+            coverage=None,
+            reusable_plan=None,
+            materialized_plan=descriptor,
+        )
+
+
+_PROCESS_TEXT_PLAN_CACHE: dict[
+    str,
+    tuple[tuple[str, ...], tuple[int, ...], _CoveragePlan, _ReusableTextPlan],
+] = {}
+
+
+def _resolve_fold_text_authority(
+    authority: _FoldTextAuthority,
+) -> tuple[tuple[str, ...], tuple[int, ...], _CoveragePlan, _ReusableTextPlan | None]:
+    if not isinstance(authority, _FoldTextAuthority):
+        raise TypeError("HTR fold worker requires one typed text authority")
+    if authority.materialized_plan is not None:
+        if any(
+            value is not None
+            for value in (
+                authority.texts,
+                authority.row_ids,
+                authority.coverage,
+                authority.reusable_plan,
+            )
+        ):
+            raise ValueError("materialized HTR text authority leaked in-memory rows")
+        key = authority.materialized_plan.content_sha256
+        resolved = _PROCESS_TEXT_PLAN_CACHE.get(key)
+        if resolved is None:
+            resolved = _load_materialized_reusable_text_plan(
+                authority.materialized_plan
+            )
+            _PROCESS_TEXT_PLAN_CACHE[key] = resolved
+        return resolved
+    if (
+        authority.texts is None
+        or authority.row_ids is None
+        or authority.coverage is None
+    ):
+        raise ValueError("in-memory HTR text authority is incomplete")
+    if len(authority.texts) != len(authority.row_ids):
+        raise ValueError("HTR text authority row order changed")
+    if authority.reusable_plan is not None and (
+        authority.reusable_plan.ordered_row_ids != authority.row_ids
+        or authority.reusable_plan.text_sha256
+        != _text_sha256(authority.row_ids, authority.texts)
+    ):
+        raise ValueError("HTR reusable plan differs from its in-memory authority")
+    return (
+        authority.texts,
+        authority.row_ids,
+        authority.coverage,
+        authority.reusable_plan,
+    )
+
+
+@dataclass(frozen=True)
+class _NuisanceFoldTask:
+    fold: int
+    split_seed: int
+    model_seed: int
+    fit_positions: np.ndarray
+    validation_positions: np.ndarray
+    treatment: np.ndarray
+    outcome: np.ndarray
+    config: RoleNeutralHTRConfig
+    model_marker: str
+    operational_controls: RoleNeutralHTROperationalControls | None
+    text_authority: _FoldTextAuthority
+    preflight_complete_text: bool
+
+
+@dataclass(frozen=True)
+class _EffectFoldTask:
+    objective: str
+    fold: int
+    split_seed: int
+    model_seed: int
+    fit_positions: np.ndarray
+    eligible_fit_positions: np.ndarray
+    validation_positions: np.ndarray
+    y_residual: np.ndarray
+    t_residual: np.ndarray
+    pseudo_outcome: np.ndarray
+    config: RoleNeutralHTRConfig
+    model_marker: str
+    operational_controls: RoleNeutralHTROperationalControls | None
+    text_authority: _FoldTextAuthority
+
+
+@dataclass(frozen=True)
+class _NuisanceFoldResult:
+    fold: int
+    split_seed: int
+    model_seed: int
+    fit_positions: np.ndarray
+    validation_positions: np.ndarray
+    model: Mapping[str, Any]
+    propensity_calibrator: Mapping[str, Any]
+    outcome_calibrator: Mapping[str, Any]
+    validation_e_hat: np.ndarray
+    validation_m_hat: np.ndarray
+    architecture_evidence: tuple[Mapping[str, Any], ...]
+    extractor_attestation: Mapping[str, Any]
+    arrays: Mapping[str, np.ndarray]
+    gpu_peak_allocated_bytes: int | None
+
+
+@dataclass(frozen=True)
+class _EffectFoldResult:
+    objective: str
+    fold: int
+    split_seed: int
+    model_seed: int
+    fit_positions: np.ndarray
+    eligible_fit_positions: np.ndarray
+    validation_positions: np.ndarray
+    model: Mapping[str, Any]
+    validation_tau: np.ndarray
+    architecture_evidence: tuple[Mapping[str, Any], ...]
+    extractor_attestation: Mapping[str, Any]
+    arrays: Mapping[str, np.ndarray]
+    gpu_peak_allocated_bytes: int | None
+
+
+@dataclass(frozen=True)
+class _CompletedFoldWork:
+    value: Any
+    device: str
+    started_monotonic_ns: int
+    finished_monotonic_ns: int
+    process_id: int
+    thread_id: int
+    gpu_peak_allocated_bytes: int | None
+    torch_determinism_observed: Mapping[str, Any] | None
+
+
+def _prepare_fold_extractor(
+    *,
+    config: RoleNeutralHTRConfig,
+    model_marker: str,
+    device: torch.device,
+    texts: tuple[str, ...],
+    row_ids: tuple[int, ...],
+    fit_positions: np.ndarray,
+    coverage: _CoveragePlan,
+    reusable_plan: _ReusableTextPlan | None,
+    operational_controls: RoleNeutralHTROperationalControls | None,
+    preflight_complete_text: bool,
+) -> tuple[HierarchicalTransformerExtractor, Mapping[str, Any]]:
+    extractor = _new_extractor(
+        config=config,
+        model_marker=model_marker,
+        device=device,
+    )
+    if reusable_plan is not None:
+        if operational_controls is None:
+            raise ValueError("HTR reusable fold plan lacks operational controls")
+        extractor.fit_tokenizer([])
+        _install_reusable_text_plan(
+            extractor=extractor,
+            plan=reusable_plan,
+            texts=texts,
+            row_ids=row_ids,
+            config=config,
+            controls=operational_controls,
+        )
+    else:
+        extractor.fit_tokenizer(
+            [texts[int(position)] for position in fit_positions]
+        )
+        if preflight_complete_text:
+            _preflight_token_lengths(
+                extractor,
+                texts,
+                batch_size=config.prediction_batch_size,
+            )
+    attestation = _attest_extractor(extractor, config=config)
+    if operational_controls is not None:
+        _set_operational_encoder_batch_size(
+            extractor,
+            config=config,
+            controls=operational_controls,
+        )
+    return extractor, attestation
+
+
+def _begin_fold_gpu_telemetry(device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    torch.cuda.set_device(device)
+    torch.cuda.reset_peak_memory_stats(device)
+
+
+def _finish_fold_gpu_telemetry(device: torch.device) -> int | None:
+    if device.type != "cuda":
+        return None
+    torch.cuda.synchronize(device)
+    return int(torch.cuda.max_memory_allocated(device))
+
+
+def _run_nuisance_fold(
+    task: _NuisanceFoldTask,
+    device_name: str,
+) -> _NuisanceFoldResult:
+    if not isinstance(task, _NuisanceFoldTask):
+        raise TypeError("HTR nuisance worker received another task type")
+    device = torch.device(device_name)
+    _begin_fold_gpu_telemetry(device)
+    texts, row_ids, coverage, reusable_plan = _resolve_fold_text_authority(
+        task.text_authority
+    )
+    fit_positions = np.asarray(task.fit_positions, dtype=np.int64)
+    validation_positions = np.asarray(
+        task.validation_positions,
+        dtype=np.int64,
+    )
+    _set_model_seed(task.model_seed, device)
+    extractor, attestation = _prepare_fold_extractor(
+        config=task.config,
+        model_marker=task.model_marker,
+        device=device,
+        texts=texts,
+        row_ids=row_ids,
+        fit_positions=fit_positions,
+        coverage=coverage,
+        reusable_plan=reusable_plan,
+        operational_controls=task.operational_controls,
+        preflight_complete_text=task.preflight_complete_text,
+    )
+    model = _NuisanceNet(
+        extractor=extractor,
+        hidden_dim=task.config.hidden_dim,
+        outcome_type=task.config.outcome_type,
+        head_depth=task.config.nuisance_head_depth,
+        head_activation=task.config.nuisance_head_activation,
+        head_dropout=task.config.nuisance_head_dropout,
+        head_layer_norm=task.config.nuisance_head_layer_norm,
+        head_bias=task.config.nuisance_head_bias,
+    ).to(device)
+    try:
+        _train_nuisance(
+            model,
+            texts=texts,
+            treatment=task.treatment,
+            outcome=task.outcome,
+            positions=fit_positions,
+            config=task.config,
+            seed=task.model_seed,
+            device=device,
+        )
+        fit_raw_e, fit_raw_m = _predict_model(
+            model,
+            [texts[int(position)] for position in fit_positions],
+            kind="nuisance",
+            outcome_type=task.config.outcome_type,
+            batch_size=task.config.prediction_batch_size,
+        )
+        validation_raw_e, validation_raw_m = _predict_model(
+            model,
+            [texts[int(position)] for position in validation_positions],
+            kind="nuisance",
+            outcome_type=task.config.outcome_type,
+            batch_size=task.config.prediction_batch_size,
+        )
+        propensity_calibrator = BinaryProbabilityCalibrator.fit(
+            fit_raw_e,
+            task.treatment[fit_positions],
+            method=task.config.nuisance_calibration,
+        )
+        outcome_calibrator = BinaryProbabilityCalibrator.fit(
+            fit_raw_m,
+            task.outcome[fit_positions],
+            method=task.config.nuisance_calibration,
+        )
+        validation_e = np.asarray(
+            propensity_calibrator.transform(validation_raw_e),
+            dtype=np.float64,
+        )
+        validation_m = np.asarray(
+            outcome_calibrator.transform(validation_raw_m),
+            dtype=np.float64,
+        )
+        evidence = tuple(
+            _complete_attention_evidence(
+                model.extractor,
+                texts=[
+                    texts[int(position)]
+                    for position in validation_positions
+                ],
+                coverage=coverage,
+                row_positions=validation_positions,
+                fold=task.fold,
+                stage="nuisance",
+                objective="joint_treatment_outcome_nuisance",
+                batch_size=task.config.prediction_batch_size,
+            )
+        )
+        if task.operational_controls is not None:
+            _restore_scientific_encoder_batch_size(
+                model.extractor,
+                config=task.config,
+                controls=task.operational_controls,
+            )
+        local_store = _SafeArrayStore()
+        prefix = f"nuisance_{task.fold:04d}"
+        model_descriptor = _capture_model_state(
+            model,
+            local_store,
+            prefix,
+            kind="nuisance",
+            outcome_type=task.config.outcome_type,
+            training_configuration=_training_configuration(
+                task.config,
+                kind="nuisance",
+            ),
+        )
+        propensity_descriptor = _capture_calibrator(
+            propensity_calibrator,
+            local_store,
+            f"{prefix}_propensity",
+        )
+        outcome_descriptor = _capture_calibrator(
+            outcome_calibrator,
+            local_store,
+            f"{prefix}_outcome",
+        )
+        peak = _finish_fold_gpu_telemetry(device)
+        return _NuisanceFoldResult(
+            fold=task.fold,
+            split_seed=task.split_seed,
+            model_seed=task.model_seed,
+            fit_positions=fit_positions,
+            validation_positions=validation_positions,
+            model=model_descriptor,
+            propensity_calibrator=propensity_descriptor,
+            outcome_calibrator=outcome_descriptor,
+            validation_e_hat=validation_e,
+            validation_m_hat=validation_m,
+            architecture_evidence=evidence,
+            extractor_attestation=attestation,
+            arrays={
+                key: np.ascontiguousarray(value)
+                for key, value in local_store.arrays.items()
+            },
+            gpu_peak_allocated_bytes=peak,
+        )
+    finally:
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+
+def _run_effect_fold(
+    task: _EffectFoldTask,
+    device_name: str,
+) -> _EffectFoldResult:
+    if not isinstance(task, _EffectFoldTask):
+        raise TypeError("HTR effect worker received another task type")
+    device = torch.device(device_name)
+    _begin_fold_gpu_telemetry(device)
+    texts, row_ids, coverage, reusable_plan = _resolve_fold_text_authority(
+        task.text_authority
+    )
+    fit_positions = np.asarray(task.fit_positions, dtype=np.int64)
+    eligible_fit_positions = np.asarray(
+        task.eligible_fit_positions,
+        dtype=np.int64,
+    )
+    validation_positions = np.asarray(
+        task.validation_positions,
+        dtype=np.int64,
+    )
+    _set_model_seed(task.model_seed, device)
+    extractor, attestation = _prepare_fold_extractor(
+        config=task.config,
+        model_marker=task.model_marker,
+        device=device,
+        texts=texts,
+        row_ids=row_ids,
+        fit_positions=eligible_fit_positions,
+        coverage=coverage,
+        reusable_plan=reusable_plan,
+        operational_controls=task.operational_controls,
+        preflight_complete_text=False,
+    )
+    model = _EffectNet(
+        extractor=extractor,
+        hidden_dim=task.config.hidden_dim,
+        head_depth=task.config.effect_head_depth,
+        head_activation=task.config.effect_head_activation,
+        head_dropout=task.config.effect_head_dropout,
+        head_layer_norm=task.config.effect_head_layer_norm,
+        head_bias=task.config.effect_head_bias,
+    ).to(device)
+    try:
+        _train_effect(
+            model,
+            texts=texts,
+            positions=eligible_fit_positions,
+            y_residual=task.y_residual,
+            t_residual=task.t_residual,
+            pseudo_outcome=task.pseudo_outcome,
+            objective=task.objective,
+            config=task.config,
+            seed=task.model_seed,
+            device=device,
+        )
+        [validation_tau_raw] = _predict_model(
+            model,
+            [texts[int(position)] for position in validation_positions],
+            kind="effect",
+            outcome_type=task.config.outcome_type,
+            batch_size=task.config.prediction_batch_size,
+        )
+        validation_tau = np.asarray(validation_tau_raw, dtype=np.float64)
+        evidence = tuple(
+            _complete_attention_evidence(
+                model.extractor,
+                texts=[
+                    texts[int(position)]
+                    for position in validation_positions
+                ],
+                coverage=coverage,
+                row_positions=validation_positions,
+                fold=task.fold,
+                stage="effect_modifier",
+                objective=task.objective,
+                batch_size=task.config.prediction_batch_size,
+            )
+        )
+        if task.operational_controls is not None:
+            _restore_scientific_encoder_batch_size(
+                model.extractor,
+                config=task.config,
+                controls=task.operational_controls,
+            )
+        local_store = _SafeArrayStore()
+        prefix = f"effect_{task.objective}_{task.fold:04d}"
+        model_descriptor = _capture_model_state(
+            model,
+            local_store,
+            prefix,
+            kind="effect",
+            outcome_type=task.config.outcome_type,
+            training_configuration=_training_configuration(
+                task.config,
+                kind="effect",
+            ),
+        )
+        peak = _finish_fold_gpu_telemetry(device)
+        return _EffectFoldResult(
+            objective=task.objective,
+            fold=task.fold,
+            split_seed=task.split_seed,
+            model_seed=task.model_seed,
+            fit_positions=fit_positions,
+            eligible_fit_positions=eligible_fit_positions,
+            validation_positions=validation_positions,
+            model=model_descriptor,
+            validation_tau=validation_tau,
+            architecture_evidence=evidence,
+            extractor_attestation=attestation,
+            arrays={
+                key: np.ascontiguousarray(value)
+                for key, value in local_store.arrays.items()
+            },
+            gpu_peak_allocated_bytes=peak,
+        )
+    finally:
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+
+def _invoke_htr_fold_worker(
+    worker: Callable[[Any, str], Any],
+    task: Any,
+    device: str,
+    *,
+    worker_cpu_threads: int,
+    process_isolated: bool,
+) -> _CompletedFoldWork:
+    determinism_before: Mapping[str, Any] | None = None
+    if process_isolated:
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        # Spawned fold processes do not inherit Torch's process-global
+        # determinism switches. Re-establish the one Stage 1 policy before
+        # any worker CUDA/model initialization and fail if training weakens it.
+        determinism_before = _validate_torch_determinism_observation(
+            _enforce_stage1_torch_determinism()
+        )
+        torch.set_num_threads(worker_cpu_threads)
+    started = time.monotonic_ns()
+    with threadpool_limits(limits=worker_cpu_threads):
+        value = worker(task, device)
+    finished = time.monotonic_ns()
+    if finished <= started:
+        raise RuntimeError("HTR fold interval clock did not advance")
+    peak = getattr(value, "gpu_peak_allocated_bytes", None)
+    if peak is not None and (
+        isinstance(peak, bool) or not isinstance(peak, int) or peak < 0
+    ):
+        raise ValueError("HTR fold worker returned invalid GPU peak telemetry")
+    determinism_after: Mapping[str, Any] | None = None
+    if process_isolated:
+        determinism_after = _validate_torch_determinism_observation(
+            _observe_stage1_torch_determinism()
+        )
+        if dict(determinism_after) != dict(determinism_before or {}):
+            raise RuntimeError(
+                "HTR fold worker weakened strict Stage 1 Torch determinism"
+            )
+    return _CompletedFoldWork(
+        value=value,
+        device=str(device),
+        started_monotonic_ns=started,
+        finished_monotonic_ns=finished,
+        process_id=os.getpid(),
+        thread_id=threading.get_ident(),
+        gpu_peak_allocated_bytes=peak,
+        torch_determinism_observed=determinism_after,
+    )
+
+
+class _HTRFoldExecutor:
+    """One stable single-worker executor per configured fold lease."""
+
+    def __init__(self, resource_plan: RoleNeutralHTRFoldResourcePlan) -> None:
+        if not isinstance(resource_plan, RoleNeutralHTRFoldResourcePlan):
+            raise TypeError("HTR fold executor requires a typed resource plan")
+        self.resource_plan = resource_plan
+        self._executors: tuple[concurrent.futures.Executor, ...] = ()
+
+    def __enter__(self) -> "_HTRFoldExecutor":
+        if self._executors:
+            raise RuntimeError("HTR fold executor cannot be entered twice")
+        if self.resource_plan.fold_parallel_backend == "processes":
+            context = mp.get_context("spawn")
+            self._executors = tuple(
+                concurrent.futures.ProcessPoolExecutor(
+                    max_workers=1,
+                    mp_context=context,
+                )
+                for _slot in range(self.resource_plan.fold_parallelism)
+            )
+        else:
+            self._executors = tuple(
+                concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix=f"oci-htr-fold-{slot:02d}",
+                )
+                for slot in range(self.resource_plan.fold_parallelism)
+            )
+        return self
+
+    def submit(
+        self,
+        *,
+        slot: int,
+        worker: Callable[[Any, str], Any],
+        task: Any,
+        device: str,
+    ) -> concurrent.futures.Future[_CompletedFoldWork]:
+        if not self._executors:
+            raise RuntimeError("HTR fold executor is not active")
+        index = int(slot)
+        if index < 0 or index >= len(self._executors):
+            raise ValueError("HTR fold executor received an invalid lease slot")
+        return self._executors[index].submit(
+            _invoke_htr_fold_worker,
+            worker,
+            task,
+            device,
+            worker_cpu_threads=self.resource_plan.worker_cpu_threads,
+            process_isolated=(
+                self.resource_plan.fold_parallel_backend == "processes"
+            ),
+        )
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        executors = self._executors
+        self._executors = ()
+        for executor in executors:
+            executor.shutdown(
+                wait=True,
+                cancel_futures=exc_type is not None,
+            )
+
+
+def _fold_task_identity(task: Any) -> tuple[str, int]:
+    if isinstance(task, _NuisanceFoldTask):
+        return "joint_treatment_outcome_nuisance", int(task.fold)
+    if isinstance(task, _EffectFoldTask):
+        return str(task.objective), int(task.fold)
+    if isinstance(task, Mapping):
+        return str(task.get("objective") or "test"), int(task.get("fold", 0))
+    return str(getattr(task, "objective", "test")), int(
+        getattr(task, "fold", 0)
+    )
+
+
+def _execute_htr_fold_tasks(
+    tasks: Sequence[Any],
+    *,
+    resource_plan: RoleNeutralHTRFoldResourcePlan,
+    worker: Callable[[Any, str], Any],
+    stage: str,
+    event_sink: Callable[[Mapping[str, Any]], None] | None = None,
+    executor: _HTRFoldExecutor | None = None,
+) -> tuple[Any, ...]:
+    """Execute a canonical task sequence under deterministic device leases."""
+
+    rows = tuple(tasks)
+    if not rows:
+        return ()
+    if not isinstance(resource_plan, RoleNeutralHTRFoldResourcePlan):
+        raise TypeError("HTR fold tasks require a typed resource plan")
+    if not callable(worker):
+        raise TypeError("HTR fold worker must be callable")
+    stage_name = str(stage)
+    if stage_name not in {"nuisance", "effect"}:
+        raise ValueError("HTR fold stage is unsupported")
+    if event_sink is not None and not callable(event_sink):
+        raise TypeError("HTR fold event sink must be callable")
+    owned_executor = executor is None
+    active = _HTRFoldExecutor(resource_plan) if owned_executor else executor
+    if not isinstance(active, _HTRFoldExecutor):
+        raise TypeError("HTR fold tasks require a typed executor")
+
+    def run() -> tuple[Any, ...]:
+        completed_by_index: dict[int, _CompletedFoldWork] = {}
+        active_futures: dict[
+            concurrent.futures.Future[_CompletedFoldWork],
+            tuple[int, int],
+        ] = {}
+        next_index = 0
+
+        def submit_to_slot(slot: int) -> None:
+            nonlocal next_index
+            if next_index >= len(rows):
+                return
+            task_index = next_index
+            next_index += 1
+            device = resource_plan.fold_devices[slot]
+            future = active.submit(
+                slot=slot,
+                worker=worker,
+                task=rows[task_index],
+                device=device,
+            )
+            active_futures[future] = (task_index, slot)
+
+        for slot in range(
+            min(resource_plan.fold_parallelism, len(rows))
+        ):
+            submit_to_slot(slot)
+        while active_futures:
+            done, _pending = concurrent.futures.wait(
+                tuple(active_futures),
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            released_slots: list[int] = []
+            for future in sorted(
+                done,
+                key=lambda item: active_futures[item][0],
+            ):
+                task_index, slot = active_futures.pop(future)
+                completed_by_index[task_index] = future.result()
+                released_slots.append(slot)
+            for slot in sorted(released_slots):
+                submit_to_slot(slot)
+        if set(completed_by_index) != set(range(len(rows))):
+            raise RuntimeError("HTR fold executor omitted a canonical task")
+        completed = tuple(
+            completed_by_index[index] for index in range(len(rows))
+        )
+        for task, record in zip(rows, completed, strict=True):
+            objective, fold = _fold_task_identity(task)
+            common = {
+                "stage": stage_name,
+                "objective": objective,
+                "fold": fold,
+                "device": record.device,
+                "process_id": record.process_id,
+                "thread_id": record.thread_id,
+                "gpu_peak_allocated_bytes": record.gpu_peak_allocated_bytes,
+                "torch_determinism_observed": (
+                    None
+                    if record.torch_determinism_observed is None
+                    else copy.deepcopy(
+                        dict(record.torch_determinism_observed)
+                    )
+                ),
+                "resource_locator_in_scientific_identity": False,
+            }
+            if event_sink is not None:
+                event_sink(
+                    {
+                        **common,
+                        "event": "fold_started",
+                        "monotonic_ns": record.started_monotonic_ns,
+                    }
+                )
+                event_sink(
+                    {
+                        **common,
+                        "event": "fold_finished",
+                        "monotonic_ns": record.finished_monotonic_ns,
+                    }
+                )
+        return tuple(record.value for record in completed)
+
+    if owned_executor:
+        with active:
+            return run()
+    return run()
+
+
+def _merge_isolated_fold_arrays(
+    *,
+    target: _SafeArrayStore,
+    arrays: Mapping[str, np.ndarray],
+) -> None:
+    if not isinstance(arrays, Mapping) or not arrays:
+        raise ValueError("HTR fold returned no isolated proof arrays")
+    for key in sorted(arrays):
+        target.add(str(key), arrays[key])
+
+
+@dataclass(frozen=True)
+class _OwnerFoldFitResult:
+    fit_reusable_plan: _ReusableTextPlan | None
+    process_plan_attestation: Mapping[str, Any] | None
+    nuisance_oof_e: np.ndarray
+    nuisance_oof_m: np.ndarray
+    clipped_e: np.ndarray
+    y_residual: np.ndarray
+    t_residual: np.ndarray
+    pseudo_outcome: np.ndarray
+    eligible: np.ndarray
+    effect_oof: Mapping[str, np.ndarray]
+    nuisance_records: tuple[Mapping[str, Any], ...]
+    effect_records: tuple[Mapping[str, Any], ...]
+    architecture_evidence: tuple[Mapping[str, Any], ...]
+    fold_execution_events: tuple[Mapping[str, Any], ...]
+
+
+def _fit_owner_htr_folds(
+    *,
+    owner: Stage1ScopeSpec,
+    texts: tuple[str, ...],
+    treatment: np.ndarray,
+    outcome: np.ndarray,
+    coverage: _CoveragePlan,
+    config: RoleNeutralHTRConfig,
+    model_marker: str,
+    store: _SafeArrayStore,
+    operational_controls: RoleNeutralHTROperationalControls | None,
+    resource_plan: RoleNeutralHTRFoldResourcePlan,
+    scratch_parent: Path,
+    external_event_sink: Callable[[Mapping[str, Any]], None] | None,
+) -> _OwnerFoldFitResult:
+    """Fit both cross-fit stages and merge isolated results canonically."""
+
+    fold_events: list[Mapping[str, Any]] = []
+
+    def emit(value: Mapping[str, Any]) -> None:
+        closed = json.loads(_canonical_json(dict(value)))
+        fold_events.append(closed)
+        if external_event_sink is not None:
+            external_event_sink(copy.deepcopy(closed))
+
+    fit_reusable_plan: _ReusableTextPlan | None = None
+    process_plan_attestation: Mapping[str, Any] | None = None
+    temporary_plan: tempfile.TemporaryDirectory[str] | None = None
+    temporary_plan_path: Path | None = None
+    try:
+        if (
+            operational_controls is not None
+            and operational_controls.reuse_tokenizer_and_chunk_plans
+        ):
+            # Build the complete tokenizer/chunk plan once on CPU before any
+            # fold process can initialize CUDA. All fold workers consume only
+            # this authenticated plan; none rechunk or retokenize owner text.
+            plan_extractor = _new_extractor(
+                config=config,
+                model_marker=model_marker,
+                device=torch.device("cpu"),
+            )
+            try:
+                plan_extractor.fit_tokenizer([])
+                fit_reusable_plan = _build_reusable_text_plan(
+                    extractor=plan_extractor,
+                    texts=texts,
+                    row_ids=owner.fit_row_ids,
+                    coverage=coverage,
+                    config=config,
+                    controls=operational_controls,
+                    phase="fit",
+                )
+            finally:
+                del plan_extractor
+            if resource_plan.fold_parallel_backend == "processes":
+                temporary_plan = tempfile.TemporaryDirectory(
+                    dir=scratch_parent,
+                    prefix=f".htr-{owner.scope_id}-fold-plan-",
+                )
+                temporary_plan_path = Path(temporary_plan.name)
+                descriptor = _materialize_reusable_text_plan(
+                    root=temporary_plan_path / "plan",
+                    plan=fit_reusable_plan,
+                    coverage=coverage,
+                    texts=texts,
+                    row_ids=owner.fit_row_ids,
+                )
+                process_plan_attestation = descriptor.attestation()
+                text_authority = _FoldTextAuthority.materialized(descriptor)
+            else:
+                text_authority = _FoldTextAuthority.in_memory(
+                    texts=texts,
+                    row_ids=owner.fit_row_ids,
+                    coverage=coverage,
+                    reusable_plan=fit_reusable_plan,
+                )
+        else:
+            text_authority = _FoldTextAuthority.in_memory(
+                texts=texts,
+                row_ids=owner.fit_row_ids,
+                coverage=coverage,
+                reusable_plan=None,
+            )
+
+        nuisance_split_seed = _derived_seed(
+            owner.scope_seed,
+            purpose="split",
+            objective="nuisance",
+            fold=0,
+        )
+        nuisance_splits = tuple(
+            KFold(
+                n_splits=config.nuisance_folds,
+                shuffle=True,
+                random_state=nuisance_split_seed,
+            ).split(np.arange(len(texts)))
+        )
+        nuisance_tasks = tuple(
+            _NuisanceFoldTask(
+                fold=fold,
+                split_seed=nuisance_split_seed,
+                model_seed=_derived_seed(
+                    owner.scope_seed,
+                    purpose="fit",
+                    objective="nuisance",
+                    fold=fold,
+                ),
+                fit_positions=np.asarray(fit_pos, dtype=np.int64),
+                validation_positions=np.asarray(
+                    validation_pos,
+                    dtype=np.int64,
+                ),
+                treatment=treatment,
+                outcome=outcome,
+                config=config,
+                model_marker=model_marker,
+                operational_controls=operational_controls,
+                text_authority=text_authority,
+                preflight_complete_text=(
+                    fit_reusable_plan is None and fold == 1
+                ),
+            )
+            for fold, (fit_pos, validation_pos) in enumerate(
+                nuisance_splits,
+                start=1,
+            )
+        )
+        nuisance_oof_e = np.full(len(texts), np.nan, dtype=np.float64)
+        nuisance_oof_m = np.full(len(texts), np.nan, dtype=np.float64)
+        nuisance_records: list[Mapping[str, Any]] = []
+        effect_records: list[Mapping[str, Any]] = []
+        evidence: list[Mapping[str, Any]] = []
+        effect_oof: dict[str, np.ndarray] = {}
+
+        with _HTRFoldExecutor(resource_plan) as fold_executor:
+            nuisance_results = _execute_htr_fold_tasks(
+                nuisance_tasks,
+                resource_plan=resource_plan,
+                worker=_run_nuisance_fold,
+                stage="nuisance",
+                event_sink=emit,
+                executor=fold_executor,
+            )
+            for task, raw_result in zip(
+                nuisance_tasks,
+                nuisance_results,
+                strict=True,
+            ):
+                if not isinstance(raw_result, _NuisanceFoldResult):
+                    raise TypeError("HTR nuisance fold returned another result type")
+                result = raw_result
+                if (
+                    result.fold != task.fold
+                    or result.split_seed != task.split_seed
+                    or result.model_seed != task.model_seed
+                    or not np.array_equal(
+                        result.fit_positions,
+                        task.fit_positions,
+                    )
+                    or not np.array_equal(
+                        result.validation_positions,
+                        task.validation_positions,
+                    )
+                    or result.validation_e_hat.shape
+                    != task.validation_positions.shape
+                    or result.validation_m_hat.shape
+                    != task.validation_positions.shape
+                    or not np.isfinite(result.validation_e_hat).all()
+                    or not np.isfinite(result.validation_m_hat).all()
+                ):
+                    raise RuntimeError(
+                        "HTR nuisance fold result changed rows, seeds, or shape"
+                    )
+                _validate_typed_model_configuration(
+                    result.model,
+                    config=config,
+                    kind="nuisance",
+                )
+                _merge_isolated_fold_arrays(
+                    target=store,
+                    arrays=result.arrays,
+                )
+                nuisance_oof_e[result.validation_positions] = (
+                    result.validation_e_hat
+                )
+                nuisance_oof_m[result.validation_positions] = (
+                    result.validation_m_hat
+                )
+                evidence.extend(result.architecture_evidence)
+                prefix = f"nuisance_{result.fold:04d}"
+                nuisance_records.append(
+                    {
+                        "fold": result.fold,
+                        "split_seed": result.split_seed,
+                        "model_seed": result.model_seed,
+                        "fit_positions": result.fit_positions.tolist(),
+                        "validation_positions": (
+                            result.validation_positions.tolist()
+                        ),
+                        "fit_row_ids": [
+                            owner.fit_row_ids[int(position)]
+                            for position in result.fit_positions
+                        ],
+                        "validation_row_ids": [
+                            owner.fit_row_ids[int(position)]
+                            for position in result.validation_positions
+                        ],
+                        "model": copy.deepcopy(dict(result.model)),
+                        "propensity_calibrator": copy.deepcopy(
+                            dict(result.propensity_calibrator)
+                        ),
+                        "outcome_calibrator": copy.deepcopy(
+                            dict(result.outcome_calibrator)
+                        ),
+                        "validation_e_hat": store.add(
+                            f"{prefix}_validation_e_hat",
+                            result.validation_e_hat,
+                        ),
+                        "validation_m_hat": store.add(
+                            f"{prefix}_validation_m_hat",
+                            result.validation_m_hat,
+                        ),
+                        "extractor_attestation": copy.deepcopy(
+                            dict(result.extractor_attestation)
+                        ),
+                        "registered_heldout_text_accessed": False,
+                        "registered_heldout_labels_accessed": False,
+                    }
+                )
+            if not np.isfinite(nuisance_oof_e).all() or not np.isfinite(
+                nuisance_oof_m
+            ).all():
+                raise RuntimeError("HTR nuisance cross-fit omitted a fit row")
+
+            # This is the strict stage barrier. No effect task is constructed
+            # or submitted until every nuisance result is merged into OOF
+            # order and every derived R-stage quantity is complete.
+            clipped_e = np.clip(
+                nuisance_oof_e,
+                config.e_clip,
+                1.0 - config.e_clip,
+            )
+            y_residual = outcome - nuisance_oof_m
+            t_residual = treatment - clipped_e
+            pseudo_outcome = y_residual / t_residual
+            eligible = (
+                (nuisance_oof_e >= config.r_stage_min_propensity)
+                & (nuisance_oof_e <= config.r_stage_max_propensity)
+                & np.isfinite(pseudo_outcome)
+            )
+            if not np.any(eligible):
+                raise ValueError(
+                    "configured HTR R-stage bounds retain no fit rows"
+                )
+            emit(
+                {
+                    "event": "nuisance_barrier_completed",
+                    "stage": "nuisance_to_effect",
+                    "objective": "all",
+                    "fold": 0,
+                    "device": None,
+                    "process_id": os.getpid(),
+                    "thread_id": threading.get_ident(),
+                    "gpu_peak_allocated_bytes": None,
+                    "monotonic_ns": time.monotonic_ns(),
+                    "all_nuisance_oof_assembled": True,
+                    "residual_quantities_computed": True,
+                    "effect_task_submitted": False,
+                    "resource_locator_in_scientific_identity": False,
+                }
+            )
+
+            effect_tasks: list[_EffectFoldTask] = []
+            for objective in config.effect_objectives:
+                split_seed = _derived_seed(
+                    owner.scope_seed,
+                    purpose="split",
+                    objective=objective,
+                    fold=0,
+                )
+                splits = tuple(
+                    KFold(
+                        n_splits=config.effect_folds,
+                        shuffle=True,
+                        random_state=split_seed,
+                    ).split(np.arange(len(texts)))
+                )
+                for fold, (fit_pos_raw, validation_pos_raw) in enumerate(
+                    splits,
+                    start=1,
+                ):
+                    fit_pos = np.asarray(fit_pos_raw, dtype=np.int64)
+                    validation_pos = np.asarray(
+                        validation_pos_raw,
+                        dtype=np.int64,
+                    )
+                    eligible_fit_pos = fit_pos[eligible[fit_pos]]
+                    if not len(eligible_fit_pos):
+                        raise ValueError(
+                            f"configured HTR {objective} fold {fold} "
+                            "has no eligible fit rows"
+                        )
+                    effect_tasks.append(
+                        _EffectFoldTask(
+                            objective=objective,
+                            fold=fold,
+                            split_seed=split_seed,
+                            model_seed=_derived_seed(
+                                owner.scope_seed,
+                                purpose="fit",
+                                objective=objective,
+                                fold=fold,
+                            ),
+                            fit_positions=fit_pos,
+                            eligible_fit_positions=eligible_fit_pos,
+                            validation_positions=validation_pos,
+                            y_residual=y_residual,
+                            t_residual=t_residual,
+                            pseudo_outcome=pseudo_outcome,
+                            config=config,
+                            model_marker=model_marker,
+                            operational_controls=operational_controls,
+                            text_authority=text_authority,
+                        )
+                    )
+            effect_results = _execute_htr_fold_tasks(
+                tuple(effect_tasks),
+                resource_plan=resource_plan,
+                worker=_run_effect_fold,
+                stage="effect",
+                event_sink=emit,
+                executor=fold_executor,
+            )
+            by_objective_oof = {
+                objective: np.full(
+                    len(texts),
+                    np.nan,
+                    dtype=np.float64,
+                )
+                for objective in config.effect_objectives
+            }
+            for task, raw_result in zip(
+                effect_tasks,
+                effect_results,
+                strict=True,
+            ):
+                if not isinstance(raw_result, _EffectFoldResult):
+                    raise TypeError("HTR effect fold returned another result type")
+                result = raw_result
+                if (
+                    result.objective != task.objective
+                    or result.fold != task.fold
+                    or result.split_seed != task.split_seed
+                    or result.model_seed != task.model_seed
+                    or not np.array_equal(
+                        result.fit_positions,
+                        task.fit_positions,
+                    )
+                    or not np.array_equal(
+                        result.eligible_fit_positions,
+                        task.eligible_fit_positions,
+                    )
+                    or not np.array_equal(
+                        result.validation_positions,
+                        task.validation_positions,
+                    )
+                    or result.validation_tau.shape
+                    != task.validation_positions.shape
+                    or not np.isfinite(result.validation_tau).all()
+                ):
+                    raise RuntimeError(
+                        "HTR effect fold result changed rows, seeds, or shape"
+                    )
+                _validate_typed_model_configuration(
+                    result.model,
+                    config=config,
+                    kind="effect",
+                )
+                _merge_isolated_fold_arrays(
+                    target=store,
+                    arrays=result.arrays,
+                )
+                by_objective_oof[result.objective][
+                    result.validation_positions
+                ] = result.validation_tau
+                evidence.extend(result.architecture_evidence)
+                prefix = f"effect_{result.objective}_{result.fold:04d}"
+                effect_records.append(
+                    {
+                        "effect_objective": result.objective,
+                        "fold": result.fold,
+                        "split_seed": result.split_seed,
+                        "model_seed": result.model_seed,
+                        "fit_positions": result.fit_positions.tolist(),
+                        "eligible_fit_positions": (
+                            result.eligible_fit_positions.tolist()
+                        ),
+                        "validation_positions": (
+                            result.validation_positions.tolist()
+                        ),
+                        "fit_row_ids": [
+                            owner.fit_row_ids[int(position)]
+                            for position in result.fit_positions
+                        ],
+                        "eligible_fit_row_ids": [
+                            owner.fit_row_ids[int(position)]
+                            for position in result.eligible_fit_positions
+                        ],
+                        "validation_row_ids": [
+                            owner.fit_row_ids[int(position)]
+                            for position in result.validation_positions
+                        ],
+                        "model": copy.deepcopy(dict(result.model)),
+                        "validation_tau": store.add(
+                            f"{prefix}_validation_tau",
+                            result.validation_tau,
+                        ),
+                        "extractor_attestation": copy.deepcopy(
+                            dict(result.extractor_attestation)
+                        ),
+                        "registered_heldout_text_accessed": False,
+                        "registered_heldout_labels_accessed": False,
+                    }
+                )
+            for objective in config.effect_objectives:
+                oof = by_objective_oof[objective]
+                if not np.isfinite(oof).all():
+                    raise RuntimeError(
+                        f"HTR {objective} cross-fit omitted a fit row"
+                    )
+                effect_oof[objective] = oof
+    finally:
+        if temporary_plan is not None:
+            temporary_plan.cleanup()
+            if temporary_plan_path is not None and (
+                temporary_plan_path.exists()
+                or temporary_plan_path.is_symlink()
+            ):
+                raise RuntimeError(
+                    "HTR temporary raw-text process plan survived fold fitting"
+                )
+
+    return _OwnerFoldFitResult(
+        fit_reusable_plan=fit_reusable_plan,
+        process_plan_attestation=process_plan_attestation,
+        nuisance_oof_e=nuisance_oof_e,
+        nuisance_oof_m=nuisance_oof_m,
+        clipped_e=clipped_e,
+        y_residual=y_residual,
+        t_residual=t_residual,
+        pseudo_outcome=pseudo_outcome,
+        eligible=eligible,
+        effect_oof=effect_oof,
+        nuisance_records=tuple(nuisance_records),
+        effect_records=tuple(effect_records),
+        architecture_evidence=tuple(evidence),
+        fold_execution_events=tuple(fold_events),
+    )
+
+
+def _fold_execution_summary(
+    *,
+    events: Sequence[Mapping[str, Any]],
+    resource_plan: RoleNeutralHTRFoldResourcePlan,
+    config: RoleNeutralHTRConfig,
+) -> dict[str, Any]:
+    """Validate the stage barrier and actual lease use from worker clocks."""
+
+    rows = tuple(dict(value) for value in events)
+    barriers = [
+        row for row in rows if row.get("event") == "nuisance_barrier_completed"
+    ]
+    starts = [row for row in rows if row.get("event") == "fold_started"]
+    finishes = [row for row in rows if row.get("event") == "fold_finished"]
+    if len(barriers) != 1 or len(starts) != len(finishes):
+        raise RuntimeError("HTR fold telemetry lacks a unique stage barrier")
+
+    def key(row: Mapping[str, Any]) -> tuple[str, str, int]:
+        return (
+            str(row.get("stage")),
+            str(row.get("objective")),
+            int(row.get("fold", 0)),
+        )
+
+    starts_by_key = {key(row): row for row in starts}
+    finishes_by_key = {key(row): row for row in finishes}
+    expected_count = config.nuisance_folds + (
+        config.effect_folds * len(config.effect_objectives)
+    )
+    if (
+        len(starts_by_key) != expected_count
+        or len(finishes_by_key) != expected_count
+        or set(starts_by_key) != set(finishes_by_key)
+    ):
+        raise RuntimeError("HTR fold telemetry changed canonical fold coverage")
+    intervals: list[dict[str, Any]] = []
+    for fold_key in sorted(starts_by_key):
+        start = starts_by_key[fold_key]
+        finish = finishes_by_key[fold_key]
+        if (
+            start.get("device") != finish.get("device")
+            or start.get("process_id") != finish.get("process_id")
+            or int(finish["monotonic_ns"]) <= int(start["monotonic_ns"])
+        ):
+            raise RuntimeError("HTR fold telemetry changed one lease interval")
+        intervals.append(
+            {
+                "stage": fold_key[0],
+                "objective": fold_key[1],
+                "fold": fold_key[2],
+                "device": str(start["device"]),
+                "process_id": int(start["process_id"]),
+                "thread_id": int(start["thread_id"]),
+                "started_monotonic_ns": int(start["monotonic_ns"]),
+                "finished_monotonic_ns": int(finish["monotonic_ns"]),
+                "gpu_peak_allocated_bytes": finish.get(
+                    "gpu_peak_allocated_bytes"
+                ),
+                "torch_determinism_observed": finish.get(
+                    "torch_determinism_observed"
+                ),
+            }
+        )
+    if resource_plan.fold_parallel_backend == "processes":
+        for row in intervals:
+            _validate_torch_determinism_observation(
+                row["torch_determinism_observed"]
+            )
+    elif any(
+        row["torch_determinism_observed"] is not None
+        for row in intervals
+    ):
+        raise RuntimeError(
+            "in-process HTR fold telemetry claimed child determinism enforcement"
+        )
+    nuisance_intervals = [
+        row for row in intervals if row["stage"] == "nuisance"
+    ]
+    effect_intervals = [
+        row for row in intervals if row["stage"] == "effect"
+    ]
+    barrier_ns = int(barriers[0]["monotonic_ns"])
+    if (
+        len(nuisance_intervals) != config.nuisance_folds
+        or len(effect_intervals)
+        != config.effect_folds * len(config.effect_objectives)
+        or max(row["finished_monotonic_ns"] for row in nuisance_intervals)
+        >= barrier_ns
+        or min(row["started_monotonic_ns"] for row in effect_intervals)
+        <= barrier_ns
+    ):
+        raise RuntimeError("HTR effect folds crossed the nuisance barrier")
+
+    selected_devices = tuple(resource_plan.devices)
+    nuisance_devices = {
+        str(row["device"]) for row in nuisance_intervals
+    }
+    effect_devices = {str(row["device"]) for row in effect_intervals}
+    if (
+        nuisance_devices != set(selected_devices)
+        or effect_devices != set(selected_devices)
+    ):
+        raise RuntimeError("HTR folds did not exercise every selected device")
+
+    def maximum_overlap(values: Sequence[Mapping[str, Any]]) -> int:
+        boundaries = [
+            (int(row["started_monotonic_ns"]), 1)
+            for row in values
+        ] + [
+            (int(row["finished_monotonic_ns"]), -1)
+            for row in values
+        ]
+        active = 0
+        maximum = 0
+        # A finishing lease is released before another starts at the same
+        # monotonic tick.
+        for _timestamp, delta in sorted(
+            boundaries,
+            key=lambda value: (value[0], value[1]),
+        ):
+            active += delta
+            if active < 0:
+                raise RuntimeError("HTR lease telemetry released an idle slot")
+            maximum = max(maximum, active)
+        if active != 0:
+            raise RuntimeError("HTR lease telemetry left one fold active")
+        return maximum
+
+    per_device: dict[str, dict[str, Any]] = {}
+    for device in selected_devices:
+        device_rows = [
+            row for row in intervals if row["device"] == device
+        ]
+        peaks = [
+            int(row["gpu_peak_allocated_bytes"])
+            for row in device_rows
+            if row["gpu_peak_allocated_bytes"] is not None
+        ]
+        maximum = maximum_overlap(device_rows)
+        if maximum > resource_plan.fold_slots_per_device:
+            raise RuntimeError("HTR exceeded configured per-device fold slots")
+        per_device[device] = {
+            "task_count": len(device_rows),
+            "maximum_concurrent_leases": maximum,
+            "maximum_child_peak_allocated_bytes": (
+                max(peaks) if peaks else None
+            ),
+            "conservative_sum_of_overlapping_child_peaks_bytes": (
+                max(peaks) * maximum if peaks else None
+            ),
+        }
+    overall_maximum = maximum_overlap(intervals)
+    if overall_maximum > resource_plan.fold_parallelism:
+        raise RuntimeError("HTR exceeded configured total fold concurrency")
+    if (
+        resource_plan.fold_parallelism > 1
+        and min(config.nuisance_folds, len(nuisance_intervals)) > 1
+        and maximum_overlap(nuisance_intervals) < 2
+    ):
+        raise RuntimeError("configured HTR nuisance folds did not overlap")
+    if (
+        resource_plan.fold_parallelism > 1
+        and len(effect_intervals) > 1
+        and maximum_overlap(effect_intervals) < 2
+    ):
+        raise RuntimeError("configured HTR effect folds did not overlap")
+    if (
+        resource_plan.fold_parallel_backend == "processes"
+        and resource_plan.fold_parallelism > 1
+        and len({row["process_id"] for row in intervals}) < 2
+    ):
+        raise RuntimeError("parallel HTR folds were not process isolated")
+    return {
+        "resource_plan": resource_plan.as_dict(),
+        "fold_intervals": intervals,
+        "nuisance_barrier_monotonic_ns": barrier_ns,
+        "nuisance_barrier_enforced": True,
+        "effect_submitted_only_after_nuisance_oof_and_residuals": True,
+        "per_device": per_device,
+        "maximum_concurrent_fold_leases": overall_maximum,
+        "configured_total_fold_concurrency_respected": True,
+        "configured_per_device_slots_respected": True,
+        "every_selected_device_used_by_each_stage": True,
+        "nested_native_worker_threads": resource_plan.worker_cpu_threads,
+        "process_isolated_rng": (
+            resource_plan.fold_parallel_backend == "processes"
+        ),
+        "process_isolated_torch_determinism_enforced_and_observed": (
+            resource_plan.fold_parallel_backend == "processes"
+        ),
+        "multi_gpu_acceleration_claimed": False,
+        "throughput_speedup_claimed": False,
+        "memory_acceptance_thresholds_require_real_gpu_smoke": True,
+        "resource_locators_in_scientific_identity": False,
+    }
+
+
 def _producer_identity() -> str:
     sources = [
         inspect.getsource(RoleNeutralHTRConfig),
@@ -2504,8 +4470,15 @@ def _producer_identity() -> str:
         inspect.getsource(_coverage_plan),
         inspect.getsource(_build_reusable_text_plan),
         inspect.getsource(_install_reusable_text_plan),
+        inspect.getsource(_materialize_reusable_text_plan),
+        inspect.getsource(_load_materialized_reusable_text_plan),
         inspect.getsource(_train_nuisance),
         inspect.getsource(_train_effect),
+        inspect.getsource(_run_nuisance_fold),
+        inspect.getsource(_run_effect_fold),
+        inspect.getsource(_invoke_htr_fold_worker),
+        inspect.getsource(_execute_htr_fold_tasks),
+        inspect.getsource(_fit_owner_htr_folds),
         inspect.getsource(_complete_attention_evidence),
         inspect.getsource(execute_role_neutral_htr_physical_group),
         inspect.getsource(HierarchicalTransformerExtractor),
@@ -3191,9 +5164,11 @@ def execute_role_neutral_htr_physical_group(
     htr_model_path: Path | str | None = None,
     device: torch.device | str = "cpu",
     operational_controls: RoleNeutralHTROperationalControls | None = None,
+    fold_resource_plan: RoleNeutralHTRFoldResourcePlan | None = None,
     operational_attestation_sink: (
         Callable[[Mapping[str, Any]], None] | None
     ) = None,
+    fold_event_sink: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> Mapping[str, Any]:
     """Fit, seal, publish aliases, then transform authorized exact text."""
 
@@ -3209,9 +5184,12 @@ def execute_role_neutral_htr_physical_group(
     if not callable(exact_heldout_text_loader):
         raise TypeError("exact held-out HTR text loader must be callable")
     if operational_controls is None:
-        if operational_attestation_sink is not None:
+        if (
+            operational_attestation_sink is not None
+            or fold_resource_plan is not None
+        ):
             raise ValueError(
-                "HTR operational attestation sink requires typed controls"
+                "HTR operational resources and attestation require typed controls"
             )
     else:
         if not isinstance(
@@ -3224,6 +5202,48 @@ def execute_role_neutral_htr_physical_group(
             raise TypeError(
                 "typed HTR operational controls require an attestation sink"
             )
+        if not isinstance(fold_resource_plan, RoleNeutralHTRFoldResourcePlan):
+            raise TypeError(
+                "typed HTR operational controls require a fold resource plan"
+            )
+        if (
+            fold_resource_plan.fold_parallelism
+            != operational_controls.fold_parallelism
+            or fold_resource_plan.fold_slots_per_device
+            != operational_controls.fold_slots_per_device
+            or fold_resource_plan.fold_parallel_backend
+            != operational_controls.fold_parallel_backend
+        ):
+            raise ValueError(
+                "HTR fold resource plan differs from operational controls"
+            )
+        if (
+            fold_resource_plan.fold_parallelism > 1
+            and fold_resource_plan.fold_parallel_backend != "processes"
+        ):
+            raise ValueError(
+                "overlapping HTR training folds require process-isolated RNG"
+            )
+        if (
+            any(
+                value != "cpu"
+                for value in fold_resource_plan.devices
+            )
+            and fold_resource_plan.fold_parallel_backend != "processes"
+        ):
+            raise ValueError(
+                "CUDA HTR fold execution requires process isolation"
+            )
+        if (
+            fold_resource_plan.fold_parallel_backend == "processes"
+            or fold_resource_plan.fold_parallelism > 1
+        ) and not operational_controls.reuse_tokenizer_and_chunk_plans:
+            raise ValueError(
+                "parallel/process HTR folds require one complete reusable "
+                "owner tokenizer/chunk plan"
+            )
+    if fold_event_sink is not None and not callable(fold_event_sink):
+        raise TypeError("HTR fold event sink must be callable")
     root = Path(output_root)
     if not root.is_absolute():
         raise ValueError("role-neutral HTR output root must be absolute")
@@ -3253,6 +5273,30 @@ def execute_role_neutral_htr_physical_group(
     heldout_reusable_plan: _ReusableTextPlan | None = None
     model_marker = _resolve_model_marker(config, htr_model_path)
     execution_device = torch.device(device)
+    if operational_controls is None:
+        effective_fold_resource_plan = RoleNeutralHTRFoldResourcePlan(
+            devices=(str(execution_device),),
+            fold_parallelism=1,
+            fold_slots_per_device=1,
+            owner_cpu_budget=1,
+            fold_parallel_backend="threads",
+        )
+    else:
+        assert fold_resource_plan is not None
+        effective_fold_resource_plan = fold_resource_plan
+        if str(execution_device) not in effective_fold_resource_plan.devices:
+            raise ValueError(
+                "HTR fold resource plan omits the primary execution device"
+            )
+        if (
+            len(effective_fold_resource_plan.devices)
+            > config.nuisance_folds
+            or len(effective_fold_resource_plan.devices)
+            > config.effect_folds * len(config.effect_objectives)
+        ):
+            raise ValueError(
+                "HTR selected devices exceed folds available in one stage"
+            )
     producer_identity = _producer_identity()
     configuration_identity = _sha256_json(
         {
@@ -3271,197 +5315,38 @@ def execute_role_neutral_htr_physical_group(
         plan=fit_coverage,
         prefix="fit_coverage",
     )
-    nuisance_oof_e = np.full(len(texts), np.nan, dtype=np.float64)
-    nuisance_oof_m = np.full(len(texts), np.nan, dtype=np.float64)
-    nuisance_records: list[dict[str, Any]] = []
-    architecture_evidence: list[dict[str, Any]] = []
-    nuisance_split_seed = _derived_seed(
-        owner.scope_seed,
-        purpose="split",
-        objective="nuisance",
-        fold=0,
+    fold_fit = _fit_owner_htr_folds(
+        owner=owner,
+        texts=texts,
+        treatment=treatment,
+        outcome=outcome,
+        coverage=fit_coverage,
+        config=config,
+        model_marker=model_marker,
+        store=store,
+        operational_controls=operational_controls,
+        resource_plan=effective_fold_resource_plan,
+        scratch_parent=root.parent,
+        external_event_sink=fold_event_sink,
     )
-    nuisance_splits = list(
-        KFold(
-            n_splits=config.nuisance_folds,
-            shuffle=True,
-            random_state=nuisance_split_seed,
-        ).split(np.arange(len(texts)))
+    fit_reusable_plan = fold_fit.fit_reusable_plan
+    process_plan_attestation = fold_fit.process_plan_attestation
+    fold_execution_events = fold_fit.fold_execution_events
+    nuisance_oof_e = np.asarray(
+        fold_fit.nuisance_oof_e,
+        dtype=np.float64,
     )
-    for fold, (fit_pos_raw, validation_pos_raw) in enumerate(
-        nuisance_splits,
-        start=1,
-    ):
-        fit_pos = np.asarray(fit_pos_raw, dtype=np.int64)
-        validation_pos = np.asarray(validation_pos_raw, dtype=np.int64)
-        seed = _derived_seed(
-            owner.scope_seed,
-            purpose="fit",
-            objective="nuisance",
-            fold=fold,
-        )
-        _set_model_seed(seed, execution_device)
-        extractor = _new_extractor(
-            config=config,
-            model_marker=model_marker,
-            device=execution_device,
-        )
-        if (
-            operational_controls is not None
-            and operational_controls.reuse_tokenizer_and_chunk_plans
-        ):
-            extractor.fit_tokenizer([])
-            if fit_reusable_plan is None:
-                fit_reusable_plan = _build_reusable_text_plan(
-                    extractor=extractor,
-                    texts=texts,
-                    row_ids=owner.fit_row_ids,
-                    coverage=fit_coverage,
-                    config=config,
-                    controls=operational_controls,
-                    phase="fit",
-                )
-            _install_reusable_text_plan(
-                extractor=extractor,
-                plan=fit_reusable_plan,
-                texts=texts,
-                row_ids=owner.fit_row_ids,
-                config=config,
-                controls=operational_controls,
-            )
-        else:
-            extractor.fit_tokenizer(
-                [texts[int(position)] for position in fit_pos]
-            )
-        if fold == 1:
-            if fit_reusable_plan is None:
-                _preflight_token_lengths(
-                    extractor,
-                    texts,
-                    batch_size=config.prediction_batch_size,
-                )
-        attestation = _attest_extractor(extractor, config=config)
-        if operational_controls is not None:
-            _set_operational_encoder_batch_size(
-                extractor,
-                config=config,
-                controls=operational_controls,
-            )
-        model = _NuisanceNet(
-            extractor=extractor,
-            hidden_dim=config.hidden_dim,
-            outcome_type=config.outcome_type,
-            head_depth=config.nuisance_head_depth,
-            head_activation=config.nuisance_head_activation,
-            head_dropout=config.nuisance_head_dropout,
-            head_layer_norm=config.nuisance_head_layer_norm,
-            head_bias=config.nuisance_head_bias,
-        ).to(execution_device)
-        _train_nuisance(
-            model,
-            texts=texts,
-            treatment=treatment,
-            outcome=outcome,
-            positions=fit_pos,
-            config=config,
-            seed=seed,
-            device=execution_device,
-        )
-        fit_raw_e, fit_raw_m = _predict_model(
-            model,
-            [texts[int(position)] for position in fit_pos],
-            kind="nuisance",
-            outcome_type=config.outcome_type,
-            batch_size=config.prediction_batch_size,
-        )
-        validation_raw_e, validation_raw_m = _predict_model(
-            model,
-            [texts[int(position)] for position in validation_pos],
-            kind="nuisance",
-            outcome_type=config.outcome_type,
-            batch_size=config.prediction_batch_size,
-        )
-        propensity_calibrator = BinaryProbabilityCalibrator.fit(
-            fit_raw_e,
-            treatment[fit_pos],
-            method=config.nuisance_calibration,
-        )
-        outcome_calibrator = BinaryProbabilityCalibrator.fit(
-            fit_raw_m,
-            outcome[fit_pos],
-            method=config.nuisance_calibration,
-        )
-        validation_e = propensity_calibrator.transform(validation_raw_e)
-        validation_m = outcome_calibrator.transform(validation_raw_m)
-        nuisance_oof_e[validation_pos] = validation_e
-        nuisance_oof_m[validation_pos] = validation_m
-        architecture_evidence.extend(
-            _complete_attention_evidence(
-                model.extractor,
-                texts=[texts[int(position)] for position in validation_pos],
-                coverage=fit_coverage,
-                row_positions=validation_pos,
-                fold=fold,
-                stage="nuisance",
-                objective="joint_treatment_outcome_nuisance",
-                batch_size=config.prediction_batch_size,
-            )
-        )
-        if operational_controls is not None:
-            _restore_scientific_encoder_batch_size(
-                model.extractor,
-                config=config,
-                controls=operational_controls,
-            )
-        prefix = f"nuisance_{fold:04d}"
-        nuisance_records.append(
-            {
-                "fold": fold,
-                "split_seed": nuisance_split_seed,
-                "model_seed": seed,
-                "fit_positions": fit_pos.tolist(),
-                "validation_positions": validation_pos.tolist(),
-                "fit_row_ids": [owner.fit_row_ids[int(pos)] for pos in fit_pos],
-                "validation_row_ids": [
-                    owner.fit_row_ids[int(pos)] for pos in validation_pos
-                ],
-                "model": _capture_model_state(
-                    model,
-                    store,
-                    prefix,
-                    kind="nuisance",
-                    outcome_type=config.outcome_type,
-                    training_configuration=_training_configuration(
-                        config,
-                        kind="nuisance",
-                    ),
-                ),
-                "propensity_calibrator": _capture_calibrator(
-                    propensity_calibrator,
-                    store,
-                    f"{prefix}_propensity",
-                ),
-                "outcome_calibrator": _capture_calibrator(
-                    outcome_calibrator,
-                    store,
-                    f"{prefix}_outcome",
-                ),
-                "validation_e_hat": store.add(
-                    f"{prefix}_validation_e_hat",
-                    validation_e,
-                ),
-                "validation_m_hat": store.add(
-                    f"{prefix}_validation_m_hat",
-                    validation_m,
-                ),
-                "extractor_attestation": attestation,
-                "registered_heldout_text_accessed": False,
-                "registered_heldout_labels_accessed": False,
-            }
-        )
-        del model
-        if execution_device.type == "cuda":
-            torch.cuda.empty_cache()
+    nuisance_oof_m = np.asarray(
+        fold_fit.nuisance_oof_m,
+        dtype=np.float64,
+    )
+    nuisance_records: list[dict[str, Any]] = [
+        copy.deepcopy(dict(value)) for value in fold_fit.nuisance_records
+    ]
+    architecture_evidence: list[dict[str, Any]] = [
+        copy.deepcopy(dict(value))
+        for value in fold_fit.architecture_evidence
+    ]
     if not np.isfinite(nuisance_oof_e).all() or not np.isfinite(
         nuisance_oof_m
     ).all():
@@ -3477,6 +5362,17 @@ def execute_role_neutral_htr_physical_group(
     )
     if not np.any(eligible):
         raise ValueError("configured HTR R-stage bounds retain no fit rows")
+    if any(
+        not np.array_equal(observed, expected)
+        for observed, expected in (
+            (clipped_e, fold_fit.clipped_e),
+            (y_residual, fold_fit.y_residual),
+            (t_residual, fold_fit.t_residual),
+            (pseudo_outcome, fold_fit.pseudo_outcome),
+            (eligible, fold_fit.eligible),
+        )
+    ):
+        raise RuntimeError("HTR nuisance barrier quantities changed after merge")
     derived = {
         "nuisance_oof_e": store.add("nuisance_oof_e", nuisance_oof_e),
         "nuisance_oof_m": store.add("nuisance_oof_m", nuisance_oof_m),
@@ -3489,168 +5385,13 @@ def execute_role_neutral_htr_physical_group(
             eligible.astype(np.uint8),
         ),
     }
-    effect_records: list[dict[str, Any]] = []
+    effect_records: list[dict[str, Any]] = [
+        copy.deepcopy(dict(value)) for value in fold_fit.effect_records
+    ]
     for objective in config.effect_objectives:
-        split_seed = _derived_seed(
-            owner.scope_seed,
-            purpose="split",
-            objective=objective,
-            fold=0,
-        )
-        splits = list(
-            KFold(
-                n_splits=config.effect_folds,
-                shuffle=True,
-                random_state=split_seed,
-            ).split(np.arange(len(texts)))
-        )
-        oof = np.full(len(texts), np.nan, dtype=np.float64)
-        for fold, (fit_pos_raw, validation_pos_raw) in enumerate(splits, start=1):
-            fit_pos = np.asarray(fit_pos_raw, dtype=np.int64)
-            validation_pos = np.asarray(validation_pos_raw, dtype=np.int64)
-            eligible_fit_pos = fit_pos[eligible[fit_pos]]
-            if not len(eligible_fit_pos):
-                raise ValueError(
-                    f"configured HTR {objective} fold {fold} has no eligible fit rows"
-                )
-            seed = _derived_seed(
-                owner.scope_seed,
-                purpose="fit",
-                objective=objective,
-                fold=fold,
-            )
-            _set_model_seed(seed, execution_device)
-            extractor = _new_extractor(
-                config=config,
-                model_marker=model_marker,
-                device=execution_device,
-            )
-            if (
-                operational_controls is not None
-                and operational_controls.reuse_tokenizer_and_chunk_plans
-            ):
-                extractor.fit_tokenizer([])
-                if fit_reusable_plan is None:
-                    raise RuntimeError(
-                        "HTR effect fit lost the authenticated fit-text plan"
-                    )
-                _install_reusable_text_plan(
-                    extractor=extractor,
-                    plan=fit_reusable_plan,
-                    texts=texts,
-                    row_ids=owner.fit_row_ids,
-                    config=config,
-                    controls=operational_controls,
-                )
-            else:
-                extractor.fit_tokenizer(
-                    [texts[int(position)] for position in eligible_fit_pos]
-                )
-            attestation = _attest_extractor(extractor, config=config)
-            if operational_controls is not None:
-                _set_operational_encoder_batch_size(
-                    extractor,
-                    config=config,
-                    controls=operational_controls,
-                )
-            model = _EffectNet(
-                extractor=extractor,
-                hidden_dim=config.hidden_dim,
-                head_depth=config.effect_head_depth,
-                head_activation=config.effect_head_activation,
-                head_dropout=config.effect_head_dropout,
-                head_layer_norm=config.effect_head_layer_norm,
-                head_bias=config.effect_head_bias,
-            ).to(execution_device)
-            _train_effect(
-                model,
-                texts=texts,
-                positions=eligible_fit_pos,
-                y_residual=y_residual,
-                t_residual=t_residual,
-                pseudo_outcome=pseudo_outcome,
-                objective=objective,
-                config=config,
-                seed=seed,
-                device=execution_device,
-            )
-            [validation_tau] = _predict_model(
-                model,
-                [texts[int(position)] for position in validation_pos],
-                kind="effect",
-                outcome_type=config.outcome_type,
-                batch_size=config.prediction_batch_size,
-            )
-            oof[validation_pos] = validation_tau
-            architecture_evidence.extend(
-                _complete_attention_evidence(
-                    model.extractor,
-                    texts=[
-                        texts[int(position)] for position in validation_pos
-                    ],
-                    coverage=fit_coverage,
-                    row_positions=validation_pos,
-                    fold=fold,
-                    stage="effect_modifier",
-                    objective=objective,
-                    batch_size=config.prediction_batch_size,
-                )
-            )
-            if operational_controls is not None:
-                _restore_scientific_encoder_batch_size(
-                    model.extractor,
-                    config=config,
-                    controls=operational_controls,
-                )
-            prefix = f"effect_{objective}_{fold:04d}"
-            effect_records.append(
-                {
-                    "effect_objective": objective,
-                    "fold": fold,
-                    "split_seed": split_seed,
-                    "model_seed": seed,
-                    "fit_positions": fit_pos.tolist(),
-                    "eligible_fit_positions": eligible_fit_pos.tolist(),
-                    "validation_positions": validation_pos.tolist(),
-                    "fit_row_ids": [
-                        owner.fit_row_ids[int(pos)] for pos in fit_pos
-                    ],
-                    "eligible_fit_row_ids": [
-                        owner.fit_row_ids[int(pos)]
-                        for pos in eligible_fit_pos
-                    ],
-                    "validation_row_ids": [
-                        owner.fit_row_ids[int(pos)]
-                        for pos in validation_pos
-                    ],
-                    "model": _capture_model_state(
-                        model,
-                        store,
-                        prefix,
-                        kind="effect",
-                        outcome_type=config.outcome_type,
-                        training_configuration=_training_configuration(
-                            config,
-                            kind="effect",
-                        ),
-                    ),
-                    "validation_tau": store.add(
-                        f"{prefix}_validation_tau",
-                        validation_tau,
-                    ),
-                    "extractor_attestation": attestation,
-                    "registered_heldout_text_accessed": False,
-                    "registered_heldout_labels_accessed": False,
-                }
-            )
-            del model
-            if execution_device.type == "cuda":
-                torch.cuda.empty_cache()
-        if not np.isfinite(oof).all():
-            raise RuntimeError(f"HTR {objective} cross-fit omitted a fit row")
         derived[f"effect_oof_{objective}"] = store.add(
             f"effect_oof_{objective}",
-            oof,
+            fold_fit.effect_oof[objective],
         )
 
     evidence_payload = {
@@ -4081,9 +5822,40 @@ def execute_role_neutral_htr_physical_group(
             raise RuntimeError(
                 "configured positive HTR data-loader workers were not exercised"
             )
+        fold_summary = _fold_execution_summary(
+            events=fold_execution_events,
+            resource_plan=effective_fold_resource_plan,
+            config=config,
+        )
+        if (
+            effective_fold_resource_plan.fold_parallel_backend == "processes"
+        ) != (process_plan_attestation is not None):
+            raise RuntimeError(
+                "HTR process folds and their temporary plan attestation differ"
+            )
         operational_body = {
             "schema_version": ROLE_NEUTRAL_HTR_OPERATIONAL_ATTESTATION_SCHEMA,
             "controls": operational_controls.as_dict(),
+            "fold_resource_plan": effective_fold_resource_plan.as_dict(),
+            "fold_execution": fold_summary,
+            "fold_execution_events": [
+                copy.deepcopy(dict(value))
+                for value in fold_execution_events
+            ],
+            "process_reusable_plan": (
+                None
+                if process_plan_attestation is None
+                else copy.deepcopy(dict(process_plan_attestation))
+            ),
+            "temporary_process_plan_removed_before_artifact_publication": True,
+            "raw_text_persisted_in_temporary_process_plan_after_folds": False,
+            "complete_owner_tokenizer_chunk_plan_built_once": (
+                fit_plan_attestation is not None
+            ),
+            "canonical_fold_result_merge_order": (
+                "nuisance_fold_then_effect_objective_fold_v1"
+            ),
+            "shared_mutable_array_store_used_by_fold_workers": False,
             "scientific_training_batch_size": config.batch_size,
             "training_batch_override_applied": False,
             "scientific_sentence_encoder_batch_size": (

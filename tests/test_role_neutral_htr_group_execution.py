@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
+import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -13,12 +16,14 @@ import torch
 import oci.inference.role_neutral_htr_group_execution as group_module
 from oci.inference.production_stage1_scope_scheduler import (
     build_canonical_stage1_scope_plan,
+    stage1_torch_determinism_policy,
 )
 from tests.stage1_test_support import PHYSICAL_FIT_IDENTITY
 from oci.inference.role_neutral_htr_group_execution import (
     RoleNeutralHTRConfig,
     RoleNeutralHTROperationalControls,
     RoleNeutralHTRPhysicalGroupRequest,
+    _execute_htr_fold_tasks,
     _model_tree_sha256,
     _resolve_model_marker,
     execute_role_neutral_htr_physical_group,
@@ -250,6 +255,157 @@ def _inputs(request: RoleNeutralHTRPhysicalGroupRequest):
     return tuple(fit_texts), treatment, outcome, heldout_texts
 
 
+def _load_fit_artifact(root: Path) -> tuple[dict, dict[str, np.ndarray]]:
+    metadata = json.loads(
+        (root / "fit_state" / "metadata.json").read_text(encoding="utf-8")
+    )
+    arrays = {}
+    for key, registration in metadata["array_inventory"].items():
+        with (
+            root / "fit_state" / registration["relative_path"]
+        ).open("rb") as handle:
+            arrays[key] = np.load(handle, allow_pickle=False)
+    return metadata, arrays
+
+
+def _assert_serial_parallel_science_equal(
+    *,
+    serial_root: Path,
+    parallel_root: Path,
+    request: RoleNeutralHTRPhysicalGroupRequest,
+    config: RoleNeutralHTRConfig,
+) -> None:
+    serial, serial_arrays = _load_fit_artifact(serial_root)
+    parallel, parallel_arrays = _load_fit_artifact(parallel_root)
+
+    # Byte digests may differ for tolerance-valid neural floats. Everything
+    # that defines or indexes the science must remain exact.
+    def discrete_metadata(value: dict) -> dict:
+        projected = copy.deepcopy(value)
+        projected.pop("content_sha256")
+        projected.pop("array_inventory")
+        projected.pop("evidence_payload")
+        return projected
+
+    assert discrete_metadata(parallel) == discrete_metadata(serial)
+    assert set(parallel_arrays) == set(serial_arrays)
+    for key in sorted(serial_arrays):
+        expected = serial_arrays[key]
+        observed = parallel_arrays[key]
+        serial_registration = serial["array_inventory"][key]
+        parallel_registration = parallel["array_inventory"][key]
+        for field in ("relative_path", "dtype", "shape", "size_bytes"):
+            assert parallel_registration[field] == serial_registration[field]
+        assert observed.dtype == expected.dtype
+        assert observed.shape == expected.shape
+        if np.issubdtype(expected.dtype, np.floating):
+            assert np.isfinite(expected).all()
+            assert np.isfinite(observed).all()
+            np.testing.assert_allclose(
+                observed,
+                expected,
+                rtol=config.replay_relative_tolerance,
+                atol=config.replay_absolute_tolerance,
+            )
+        else:
+            np.testing.assert_array_equal(observed, expected)
+
+    serial_evidence = serial["evidence_payload"]
+    parallel_evidence = parallel["evidence_payload"]
+    assert {
+        key: value
+        for key, value in parallel_evidence.items()
+        if key != "architecture_evidence"
+    } == {
+        key: value
+        for key, value in serial_evidence.items()
+        if key != "architecture_evidence"
+    }
+    serial_atoms = serial_evidence["architecture_evidence"]
+    parallel_atoms = parallel_evidence["architecture_evidence"]
+    assert len(parallel_atoms) == len(serial_atoms)
+    for observed, expected in zip(
+        parallel_atoms,
+        serial_atoms,
+        strict=True,
+    ):
+        assert {
+            key: value for key, value in observed.items() if key != "attention"
+        } == {
+            key: value for key, value in expected.items() if key != "attention"
+        }
+        np.testing.assert_allclose(
+            observed["attention"],
+            expected["attention"],
+            rtol=config.replay_relative_tolerance,
+            atol=config.replay_absolute_tolerance,
+        )
+
+    exact_relative = (
+        Path("logical_views")
+        / f"{request.physical_owner.scope_id}.json"
+    )
+    serial_view = json.loads(
+        (serial_root / exact_relative).read_text(encoding="utf-8")
+    )
+    parallel_view = json.loads(
+        (parallel_root / exact_relative).read_text(encoding="utf-8")
+    )
+    for field in (
+        "schema_version",
+        "group_request_content_sha256",
+        "logical_scope_id",
+        "logical_scope_sha256",
+        "logical_purpose",
+        "physical_owner_scope_id",
+        "family",
+        "view_input_policy",
+        "logical_heldout_row_ids",
+        "logical_heldout_text_sha256",
+        "coverage_proof",
+        "registered_heldout_text_accessed",
+        "registered_heldout_labels_accessed",
+        "model_state_reloaded_for_primary_transform",
+        "sealed_state_replay_checked",
+    ):
+        assert parallel_view[field] == serial_view[field]
+    assert set(parallel_view["coverage_artifacts"]) == set(
+        serial_view["coverage_artifacts"]
+    )
+    for key, serial_registration in serial_view[
+        "coverage_artifacts"
+    ].items():
+        parallel_registration = parallel_view["coverage_artifacts"][key]
+        assert parallel_registration == serial_registration
+        with (
+            serial_root / serial_registration["relative_path"]
+        ).open("rb") as handle:
+            serial_coverage = np.load(handle, allow_pickle=False)
+        with (
+            parallel_root / parallel_registration["relative_path"]
+        ).open("rb") as handle:
+            parallel_coverage = np.load(handle, allow_pickle=False)
+        np.testing.assert_array_equal(parallel_coverage, serial_coverage)
+    serial_prediction = serial_view["prediction_artifact"]
+    parallel_prediction = parallel_view["prediction_artifact"]
+    for field in ("dtype", "shape", "columns"):
+        assert parallel_prediction[field] == serial_prediction[field]
+    with (
+        serial_root / serial_prediction["relative_path"]
+    ).open("rb") as handle:
+        serial_values = np.load(handle, allow_pickle=False)
+    with (
+        parallel_root / parallel_prediction["relative_path"]
+    ).open("rb") as handle:
+        parallel_values = np.load(handle, allow_pickle=False)
+    np.testing.assert_allclose(
+        parallel_values,
+        serial_values,
+        rtol=config.replay_relative_tolerance,
+        atol=config.replay_absolute_tolerance,
+    )
+
+
 def test_request_scientific_identity_is_independent_of_device_assignments():
     cpu = _plan(gpu_ids=())
     gpu_zero = _plan(gpu_ids=(0,))
@@ -287,6 +443,9 @@ def test_htr_operational_controls_fail_closed_for_scientific_or_idle_workers():
             training_batch_size=config.batch_size + 1,
             sentence_encoder_batch_size=16,
             data_loader_workers=0,
+            fold_parallelism=1,
+            fold_parallel_backend="threads",
+            fold_slots_per_device=1,
             reuse_tokenizer_and_chunk_plans=False,
             chunk_plan_cache_max_entries=0,
             tokenized_chunk_cache_max_entries=0,
@@ -296,6 +455,9 @@ def test_htr_operational_controls_fail_closed_for_scientific_or_idle_workers():
             training_batch_size=config.batch_size,
             sentence_encoder_batch_size=16,
             data_loader_workers=2,
+            fold_parallelism=1,
+            fold_parallel_backend="threads",
+            fold_slots_per_device=1,
             reuse_tokenizer_and_chunk_plans=False,
             chunk_plan_cache_max_entries=0,
             tokenized_chunk_cache_max_entries=0,
@@ -304,6 +466,332 @@ def test_htr_operational_controls_fail_closed_for_scientific_or_idle_workers():
     del missing["max_chunks"]
     with pytest.raises(ValueError, match="missing=.*max_chunks"):
         RoleNeutralHTRConfig.from_mapping(missing)
+
+
+def test_parallel_fold_scheduler_overlaps_leases_and_enforces_nuisance_barrier():
+    controls = RoleNeutralHTROperationalControls(
+        training_batch_size=_config().batch_size,
+        sentence_encoder_batch_size=16,
+        data_loader_workers=0,
+        fold_parallelism=4,
+        fold_parallel_backend="threads",
+        fold_slots_per_device=2,
+        reuse_tokenizer_and_chunk_plans=False,
+        chunk_plan_cache_max_entries=0,
+        tokenized_chunk_cache_max_entries=0,
+    )
+    resource_plan = controls.bind_fold_resources(
+        devices=("cuda:3", "cuda:9"),
+        owner_cpu_budget=4,
+    )
+    events: list[dict] = []
+    active_lock = threading.Lock()
+    active_total = 0
+    active_by_device = {"cuda:3": 0, "cuda:9": 0}
+    maximum_total = 0
+    maximum_by_device = {"cuda:3": 0, "cuda:9": 0}
+    first_wave_barriers = {
+        "nuisance": threading.Barrier(4),
+        "effect": threading.Barrier(4),
+    }
+
+    def fake_worker(task: dict, device: str) -> tuple[str, int, str]:
+        nonlocal active_total, maximum_total
+        stage = str(task["stage"])
+        fold = int(task["fold"])
+        with active_lock:
+            active_total += 1
+            active_by_device[device] += 1
+            maximum_total = max(maximum_total, active_total)
+            maximum_by_device[device] = max(
+                maximum_by_device[device],
+                active_by_device[device],
+            )
+        try:
+            if fold <= 4:
+                first_wave_barriers[stage].wait(timeout=2.0)
+            time.sleep(0.03)
+            return stage, fold, device
+        finally:
+            with active_lock:
+                active_total -= 1
+                active_by_device[device] -= 1
+
+    nuisance_tasks = tuple(
+        {
+            "stage": "nuisance",
+            "objective": "joint_treatment_outcome_nuisance",
+            "fold": fold,
+        }
+        for fold in range(1, 6)
+    )
+    effect_tasks = tuple(
+        {
+            "stage": "effect",
+            "objective": "squared_r_loss",
+            "fold": fold,
+        }
+        for fold in range(1, 6)
+    )
+    nuisance_values = _execute_htr_fold_tasks(
+        nuisance_tasks,
+        resource_plan=resource_plan,
+        worker=fake_worker,
+        stage="nuisance",
+        event_sink=lambda value: events.append(dict(value)),
+    )
+    barrier_monotonic_ns = time.monotonic_ns()
+    effect_values = _execute_htr_fold_tasks(
+        effect_tasks,
+        resource_plan=resource_plan,
+        worker=fake_worker,
+        stage="effect",
+        event_sink=lambda value: events.append(dict(value)),
+    )
+
+    assert [value[1] for value in nuisance_values] == list(range(1, 6))
+    assert [value[1] for value in effect_values] == list(range(1, 6))
+    assert maximum_total == resource_plan.fold_parallelism
+    assert maximum_by_device == {
+        device: resource_plan.fold_slots_per_device
+        for device in resource_plan.devices
+    }
+    assert set(value[2] for value in nuisance_values) == set(
+        resource_plan.devices
+    )
+    assert set(value[2] for value in effect_values) == set(
+        resource_plan.devices
+    )
+
+    def intervals(stage: str) -> dict[int, tuple[int, int, str]]:
+        by_fold: dict[int, dict[str, dict]] = {}
+        for event in events:
+            if event["stage"] == stage:
+                by_fold.setdefault(int(event["fold"]), {})[
+                    str(event["event"])
+                ] = event
+        return {
+            fold: (
+                values["fold_started"]["monotonic_ns"],
+                values["fold_finished"]["monotonic_ns"],
+                values["fold_started"]["device"],
+            )
+            for fold, values in by_fold.items()
+        }
+
+    nuisance_intervals = intervals("nuisance")
+    effect_intervals = intervals("effect")
+    assert len(nuisance_intervals) == len(effect_intervals) == 5
+    assert max(value[1] for value in nuisance_intervals.values()) < (
+        barrier_monotonic_ns
+    )
+    assert barrier_monotonic_ns < min(
+        value[0] for value in effect_intervals.values()
+    )
+    for stage_intervals in (nuisance_intervals, effect_intervals):
+        first, third = stage_intervals[1], stage_intervals[3]
+        assert first[2] == third[2] == "cuda:3"
+        assert max(first[0], third[0]) < min(first[1], third[1])
+        second, fourth = stage_intervals[2], stage_intervals[4]
+        assert second[2] == fourth[2] == "cuda:9"
+        assert max(second[0], fourth[0]) < min(second[1], fourth[1])
+
+
+def test_process_fold_invocation_enforces_and_reobserves_torch_determinism(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[str] = []
+    observed = {
+        **stage1_torch_determinism_policy(),
+        "torch_available": False,
+        "policy_active": True,
+    }
+
+    def enforce() -> dict:
+        calls.append("enforce")
+        return dict(observed)
+
+    def observe() -> dict:
+        calls.append("observe")
+        return dict(observed)
+
+    monkeypatch.setattr(
+        group_module,
+        "_enforce_stage1_torch_determinism",
+        enforce,
+    )
+    monkeypatch.setattr(
+        group_module,
+        "_observe_stage1_torch_determinism",
+        observe,
+    )
+    completed = group_module._invoke_htr_fold_worker(
+        lambda task, device: (task, device),
+        {"fold": 1},
+        "cpu",
+        worker_cpu_threads=1,
+        process_isolated=True,
+    )
+
+    assert calls == ["enforce", "observe"]
+    assert completed.torch_determinism_observed == observed
+
+
+def test_serial_and_parallel_htr_preserve_science_and_complete_text(
+    tmp_path: Path,
+):
+    request = _request()
+    config = _config()
+    fit_texts, treatment, outcome, heldout_texts = _inputs(request)
+    serial_root = (tmp_path / "serial").resolve()
+    parallel_root = (tmp_path / "parallel").resolve()
+
+    serial_terminal = execute_role_neutral_htr_physical_group(
+        request=request,
+        output_root=serial_root,
+        fit_texts=fit_texts,
+        fit_treatment=treatment,
+        fit_outcome=outcome,
+        config=config,
+        runtime_compatibility_class="torch-cpu-float32-v1",
+        exact_heldout_text_loader=lambda rows: (
+            heldout_texts
+            if rows == request.physical_owner.heldout_row_ids
+            else (_ for _ in ()).throw(AssertionError("unexpected held-out rows"))
+        ),
+        device="cpu",
+    )
+
+    controls = RoleNeutralHTROperationalControls(
+        training_batch_size=config.batch_size,
+        sentence_encoder_batch_size=config.sentence_encoder_batch_size,
+        data_loader_workers=0,
+        fold_parallelism=2,
+        fold_parallel_backend="processes",
+        fold_slots_per_device=2,
+        reuse_tokenizer_and_chunk_plans=True,
+        chunk_plan_cache_max_entries=len(fit_texts),
+        tokenized_chunk_cache_max_entries=len(fit_texts) * config.max_chunks,
+    )
+    resource_plan = controls.bind_fold_resources(
+        devices=("cpu",),
+        owner_cpu_budget=2,
+    )
+    attestations: list[dict] = []
+    fold_events: list[dict] = []
+    parallel_terminal = execute_role_neutral_htr_physical_group(
+        request=request,
+        output_root=parallel_root,
+        fit_texts=fit_texts,
+        fit_treatment=treatment,
+        fit_outcome=outcome,
+        config=config,
+        runtime_compatibility_class="torch-cpu-float32-v1",
+        exact_heldout_text_loader=lambda rows: (
+            heldout_texts
+            if rows == request.physical_owner.heldout_row_ids
+            else (_ for _ in ()).throw(AssertionError("unexpected held-out rows"))
+        ),
+        device="cpu",
+        operational_controls=controls,
+        fold_resource_plan=resource_plan,
+        operational_attestation_sink=lambda value: attestations.append(
+            dict(value)
+        ),
+        fold_event_sink=lambda value: fold_events.append(dict(value)),
+    )
+
+    assert serial_terminal["text_truncation_applied"] is False
+    assert parallel_terminal["text_truncation_applied"] is False
+    assert len(attestations) == 1
+    attestation = attestations[0]
+    assert attestation["controls"] == controls.as_dict()
+    assert attestation["fold_resource_plan"] == resource_plan.as_dict()
+    assert (
+        attestation["complete_owner_tokenizer_chunk_plan_built_once"]
+        is True
+    )
+    assert (
+        attestation["process_reusable_plan"][
+            "complete_owner_tokenizer_chunk_plan_built_once"
+        ]
+        is True
+    )
+    assert (
+        attestation["process_reusable_plan"]["fold_workers_retokenized"]
+        is False
+    )
+    assert (
+        attestation["process_reusable_plan"]["fold_workers_rechunked"]
+        is False
+    )
+    assert attestation["process_reusable_plan"][
+        "semantic_truncation_applied"
+    ] is False
+    assert (
+        attestation[
+            "temporary_process_plan_removed_before_artifact_publication"
+        ]
+        is True
+    )
+    assert (
+        attestation[
+            "raw_text_persisted_in_temporary_process_plan_after_folds"
+        ]
+        is False
+    )
+    assert (
+        attestation["shared_mutable_array_store_used_by_fold_workers"]
+        is False
+    )
+    assert attestation["fit_reusable_plan"]["note_count"] == len(fit_texts)
+    assert (
+        attestation["fit_reusable_plan"]["semantic_truncation_applied"]
+        is False
+    )
+    assert (
+        attestation["fold_execution"]["nuisance_barrier_enforced"]
+        is True
+    )
+    barrier = next(
+        event
+        for event in fold_events
+        if event["event"] == "nuisance_barrier_completed"
+    )
+    nuisance_finishes = [
+        event["monotonic_ns"]
+        for event in fold_events
+        if event["stage"] == "nuisance"
+        and event["event"] == "fold_finished"
+    ]
+    effect_starts = [
+        event["monotonic_ns"]
+        for event in fold_events
+        if event["stage"] == "effect"
+        and event["event"] == "fold_started"
+    ]
+    assert max(nuisance_finishes) <= barrier["monotonic_ns"]
+    assert barrier["monotonic_ns"] <= min(effect_starts)
+
+    _assert_serial_parallel_science_equal(
+        serial_root=serial_root,
+        parallel_root=parallel_root,
+        request=request,
+        config=config,
+    )
+    serial_metadata, _serial_arrays = _load_fit_artifact(serial_root)
+    parallel_metadata, _parallel_arrays = _load_fit_artifact(parallel_root)
+    for metadata in (serial_metadata, parallel_metadata):
+        assert metadata["fit_coverage"]["max_chunks_nonbinding"] is True
+        assert (
+            metadata["fit_coverage"]["semantic_truncation_applied"]
+            is False
+        )
+        assert any(
+            "sentinel_after_former_page_boundary" in atom["chunk_text"]
+            for atom in metadata["evidence_payload"]["architecture_evidence"]
+        )
+    assert len(fit_texts[0]) > 14_000
 
 
 def test_typed_htr_rejects_environment_override(
@@ -426,6 +914,9 @@ def test_operational_encoder_batch_workers_and_complete_plan_reuse_are_exact(
         training_batch_size=config.batch_size,
         sentence_encoder_batch_size=16,
         data_loader_workers=2,
+        fold_parallelism=1,
+        fold_parallel_backend="threads",
+        fold_slots_per_device=1,
         reuse_tokenizer_and_chunk_plans=True,
         chunk_plan_cache_max_entries=len(fit_texts),
         tokenized_chunk_cache_max_entries=(
@@ -450,6 +941,10 @@ def test_operational_encoder_batch_workers_and_complete_plan_reuse_are_exact(
         ),
         device="cpu",
         operational_controls=controls,
+        fold_resource_plan=controls.bind_fold_resources(
+            devices=("cpu",),
+            owner_cpu_budget=1,
+        ),
         operational_attestation_sink=lambda value: attestations.append(
             dict(value)
         ),

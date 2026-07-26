@@ -291,6 +291,7 @@ class RoleNeutralComponentInvocation:
         NeuralQueryExecutionTopology | None
     ) = None
     htr_operational_controls: RoleNeutralHTROperationalControls | None = None
+    htr_fold_devices: tuple[str, ...] = ()
     owner_cpu_budget: int | None = None
 
     def __post_init__(self) -> None:
@@ -335,6 +336,18 @@ class RoleNeutralComponentInvocation:
                 "component invocation HTR controls must use the typed "
                 "deployment-only contract"
             )
+        htr_fold_devices = tuple(str(value) for value in self.htr_fold_devices)
+        if not htr_fold_devices:
+            htr_fold_devices = (str(self.resource),)
+            object.__setattr__(self, "htr_fold_devices", htr_fold_devices)
+        htr_topology = NeuralQueryExecutionTopology(
+            devices=htr_fold_devices,
+        )
+        if self.resource not in htr_topology.devices:
+            raise ValueError(
+                "component invocation HTR fold resources omit its primary "
+                "owner resource"
+            )
         if (
             self.owner_cpu_budget is not None
             and (
@@ -360,6 +373,7 @@ class RoleNeutralComponentInvocation:
             "resource_assignment_included": False,
             "neural_query_device_topology_included": False,
             "htr_operational_controls_included": False,
+            "htr_fold_devices_included": False,
         }
         return {**body, "content_sha256": _sha256_json(body)}
 
@@ -443,6 +457,7 @@ class RoleNeutralPhysicalOwnerTask:
         NeuralQueryExecutionTopology | None
     ) = None
     htr_operational_controls: RoleNeutralHTROperationalControls | None = None
+    htr_fold_devices: tuple[str, ...] = ()
     owner_cpu_budget: int | None = None
 
     def __post_init__(self) -> None:
@@ -481,6 +496,17 @@ class RoleNeutralPhysicalOwnerTask:
             raise TypeError(
                 "physical-owner task HTR controls must use the typed "
                 "deployment-only contract"
+            )
+        htr_fold_devices = tuple(str(value) for value in self.htr_fold_devices)
+        if not htr_fold_devices:
+            htr_fold_devices = (str(self.resource),)
+            object.__setattr__(self, "htr_fold_devices", htr_fold_devices)
+        htr_topology = NeuralQueryExecutionTopology(
+            devices=htr_fold_devices,
+        )
+        if self.resource not in htr_topology.devices:
+            raise ValueError(
+                "physical-owner HTR fold resources omit its primary resource"
             )
         if (
             self.owner_cpu_budget is not None
@@ -562,13 +588,16 @@ class LocalThreadRoleNeutralPhysicalOwnerExecutor:
         if len({task.physical_owner.scope_id for task in rows}) != len(rows):
             raise ValueError("local executor tasks contain duplicate physical owners")
         if any(
-            task.neural_query_execution_topology is not None
-            and task.neural_query_execution_topology.spans_multiple_devices
+            (
+                task.neural_query_execution_topology is not None
+                and task.neural_query_execution_topology.spans_multiple_devices
+            )
+            or len(task.htr_fold_devices) > 1
             for task in rows
         ):
             raise RuntimeError(
                 "the in-process thread executor cannot atomically reserve a "
-                "multi-device neural-query context"
+                "multi-device neural execution context"
             )
         results: list[RoleNeutralPhysicalOwnerResult] = []
         with concurrent.futures.ThreadPoolExecutor(
@@ -653,6 +682,20 @@ class RoleNeutralStage1ExecutionPolicy:
                 "execution policy HTR controls must use the typed "
                 "deployment-only contract"
             )
+        if self.htr_operational_controls is not None:
+            selected_devices = tuple(self.resource_plan.devices)
+            effective_htr_owners = max(
+                1,
+                workers // len(selected_devices),
+            )
+            self.htr_operational_controls.bind_fold_resources(
+                devices=selected_devices,
+                owner_cpu_budget=max(
+                    1,
+                    int(self.resource_plan.cpu_budget)
+                    // effective_htr_owners,
+                ),
+            )
         topologies = dict(self.neural_query_execution_topologies)
         selected = set(self.resource_plan.devices)
         if any(
@@ -717,6 +760,7 @@ def _execute_one_owner(
                 task.neural_query_execution_topology
             ),
             htr_operational_controls=task.htr_operational_controls,
+            htr_fold_devices=task.htr_fold_devices,
             owner_cpu_budget=task.owner_cpu_budget,
         )
         bound = factories[component](invocation)
@@ -745,6 +789,8 @@ def _execute_one_owner(
             resource_ids = tuple(
                 task.neural_query_execution_topology.devices
             )
+        elif component == "htr" and accelerator_associated:
+            resource_ids = tuple(task.htr_fold_devices)
         elif accelerator_associated:
             resource_ids = (task.resource,)
         else:
@@ -852,6 +898,7 @@ def validate_role_neutral_component_execution_intervals(
     expected_physical_owner_scope_id: str,
     expected_primary_resource: str,
     expected_neural_query_resources: Sequence[str],
+    expected_htr_resources: Sequence[str] | None = None,
 ) -> tuple[Mapping[str, Any], ...]:
     """Close one owner's six directly measured architecture envelopes.
 
@@ -894,12 +941,20 @@ def validate_role_neutral_component_execution_intervals(
     neural_resources = tuple(
         str(value) for value in expected_neural_query_resources
     )
+    htr_resources = (
+        (primary_resource,)
+        if expected_htr_resources is None
+        else tuple(str(value) for value in expected_htr_resources)
+    )
     if (
         not owner_scope_id
         or not primary_resource
         or not neural_resources
         or neural_resources[0] != primary_resource
         or len(neural_resources) != len(set(neural_resources))
+        or not htr_resources
+        or primary_resource not in htr_resources
+        or len(htr_resources) != len(set(htr_resources))
     ):
         raise ValueError(
             "expected role-neutral interval capabilities are invalid"
@@ -920,9 +975,13 @@ def validate_role_neutral_component_execution_intervals(
             neural_resources
             if component == "neural_query" and accelerator_associated
             else (
-                (primary_resource,)
-                if accelerator_associated
-                else ("host_cpu",)
+                htr_resources
+                if component == "htr" and accelerator_associated
+                else (
+                    (primary_resource,)
+                    if accelerator_associated
+                    else ("host_cpu",)
+                )
             )
         )
         if (
@@ -1152,6 +1211,7 @@ def _freshly_reauthenticate_owner_result(
         expected_neural_query_resources=(
             task.neural_query_execution_topology.devices
         ),
+        expected_htr_resources=task.htr_fold_devices,
     )
     rebound: list[RoleNeutralComponentArtifactSource] = []
     for component, source in zip(
@@ -1363,10 +1423,19 @@ def execute_and_publish_role_neutral_stage1(
         policy.resource_plan,
     )
     groups = {owner.scope_id: (owner, members) for owner, members in plan.physical_scope_groups}
+    effective_owner_concurrency = (
+        max(
+            1,
+            int(policy.max_parallel_owners)
+            // len(policy.resource_plan.devices),
+        )
+        if policy.htr_operational_controls is not None
+        else int(policy.max_parallel_owners)
+    )
     owner_cpu_budget = max(
         1,
         int(policy.resource_plan.cpu_budget)
-        // int(policy.max_parallel_owners),
+        // effective_owner_concurrency,
     )
 
     destination.mkdir(exist_ok=False)
@@ -1385,6 +1454,11 @@ def execute_and_publish_role_neutral_stage1(
                 )
             ),
             htr_operational_controls=policy.htr_operational_controls,
+            htr_fold_devices=(
+                tuple(policy.resource_plan.devices)
+                if policy.htr_operational_controls is not None
+                else (assigned_resources[owner_scope_id],)
+            ),
             owner_cpu_budget=owner_cpu_budget,
         )
         for owner_scope_id in physical_order
@@ -1507,6 +1581,11 @@ def execute_and_publish_role_neutral_stage1(
                     ),
                     htr_operational_controls=(
                         policy.htr_operational_controls
+                    ),
+                    htr_fold_devices=(
+                        tuple(policy.resource_plan.devices)
+                        if policy.htr_operational_controls is not None
+                        else (selected_task.resource,)
                     ),
                     owner_cpu_budget=selected_task.owner_cpu_budget,
                 )
